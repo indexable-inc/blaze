@@ -193,7 +193,9 @@ fn dwarf_mode(arch: Arch) -> Result<u32, LinkError> {
         Arch::Aarch64 => Ok(ARM64_MODE_DWARF),
         Arch::X86_64 => Ok(X86_64_MODE_DWARF),
         // alloc: error path
-        Arch::Wasm32 | Arch::Wasm64 => Err(error(format!("__unwind_info: {arch:?} has no compact unwind encoding"))),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            Err(error(format!("__unwind_info: {arch:?} has no compact unwind encoding")))
+        }
     }
 }
 
@@ -230,7 +232,11 @@ fn full(
     // in parallel and counted in order.
     // alloc: once per link, one list per piece of rows, empty (no buffer) where all are DWARF mode's
     let counted: Vec<Vec<u32>> = par::map(par::chunks(&rows, CHUNK), |chunk| {
-        chunk.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode).map(|it| it.encoding).collect() // alloc: per piece, none where all are DWARF mode's
+        chunk
+            .iter()
+            .filter(|it| it.encoding & MODE_MASK != dwarf_mode)
+            .map(|it| it.encoding)
+            .collect() // alloc: per piece, none where all are DWARF mode's
     }); // alloc: once per link, one list per piece
     for &encoding in counted.iter().flatten() {
         encodings.count(encoding);
@@ -320,7 +326,14 @@ fn full(
     // regular pages in parallel.
     for slot in slices.iter_mut().filter(|it| it.0.compressed) {
         let page = slot.0;
-        write_page(&mut Out { bytes: &mut *slot.1, at: 0 }, &rows, page, common.len(), &mut encodings, dwarf_mode);
+        write_page(
+            &mut Out { bytes: &mut *slot.1, at: 0 },
+            &rows,
+            page,
+            common.len(),
+            &mut encodings,
+            dwarf_mode,
+        );
     }
     par::for_each(slices, |(page, out)| {
         if !page.compressed {
@@ -446,9 +459,8 @@ fn patch(placed: &Placed<'_>, arch: Arch, delta: &Delta<'_>, last: &mut Last) ->
         }
         let (from, to) = (splice.new.start as usize, splice.new.end as usize);
         let new = binds.get(from..to)?;
-        let in_compact = |addr: u64| {
-            last.compact.iter().any(|it| addr >= it.addr && addr - it.addr < it.size)
-        };
+        let in_compact =
+            |addr: u64| last.compact.iter().any(|it| addr >= it.addr && addr - it.addr < it.size);
         if new.iter().any(|it| in_compact(it.addr)) {
             return None;
         }
@@ -755,7 +767,15 @@ impl Last {
         let before = from.checked_sub(1).map(|at| self.rows[at]);
         self.window.clear();
         self.window_lsdas.clear();
-        merge(placed.plan.base, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
+        merge(
+            placed.plan.base,
+            dwarf_mode,
+            columns,
+            before,
+            &mut self.window,
+            &mut self.window_lsdas,
+        )
+        .ok()?;
         if self.window.len() != to - from {
             return None;
         }
@@ -1147,7 +1167,8 @@ fn rows(
 ) -> Result<Rows, LinkError> {
     let base = placed.plan.base;
     let functions = placed.functions;
-    let last = par::map(functions, |it| it.addr.saturating_add(it.size)).into_iter().fold(base, u64::max);
+    let last =
+        par::map(functions, |it| it.addr.saturating_add(it.size)).into_iter().fold(base, u64::max);
     let sorted = par::all(par::windows(functions, 2), |it| it[0].addr <= it[1].addr);
     // alloc: only for functions out of address order, which `Placed` lists in order
     let mut held = Vec::new();
@@ -1186,7 +1207,8 @@ fn rows(
             _ => columns.between(Some(cuts[nth - 2]), lo).tail(dwarf_mode),
         };
         // alloc: once per piece, its rows and LSDAs
-        let (mut rows, mut lsdas) = (Vec::with_capacity(these.len()), Vec::with_capacity(these.covered.len()));
+        let (mut rows, mut lsdas) =
+            (Vec::with_capacity(these.len()), Vec::with_capacity(these.covered.len()));
         let greatest = merge(base, dwarf_mode, these, before, &mut rows, &mut lsdas)?;
         Ok((rows, lsdas, greatest))
     };
@@ -1454,14 +1476,21 @@ impl Encodings {
 /// whose 24-bit offsets [`Encodings::page`] checks, or one of other encodings).
 fn dwarf_page(rows: &[Row], first: usize, common: usize, dwarf_mode: u32) -> Option<Page> {
     let left = rows.len() - first;
-    let most = (((PAGE - COMPRESSED_HEADER) / COMPRESSED_ENTRY / 2) as usize).min(ENCODINGS_MAX.saturating_sub(common));
+    let most = (((PAGE - COMPRESSED_HEADER) / COMPRESSED_ENTRY / 2) as usize)
+        .min(ENCODINGS_MAX.saturating_sub(common));
     if left <= most {
         return None;
     }
     let window = &rows[first..first + PAGE_ENTRIES.min(left)];
     // A fold, not an early exit, so it is vectorized: 4 KiB a page.
     let other = window.iter().fold(0, |acc, it| acc | ((it.encoding & MODE_MASK) ^ dwarf_mode));
-    (other == 0).then_some(Page { first, count: PAGE_ENTRIES.min(left), compressed: false, locals: 0, at: 0 })
+    (other == 0).then_some(Page {
+        first,
+        count: PAGE_ENTRIES.min(left),
+        compressed: false,
+        locals: 0,
+        at: 0,
+    })
 }
 
 /// A second-level page: its rows, of a compressed one how many encodings of its own, and its
@@ -1585,7 +1614,9 @@ fn covers(at: usize, pc: u64, len: u64) -> Result<(u64, u64), String> {
         return Ok((0, 0));
     }
     // alloc: error path
-    let end = pc.checked_add(len).ok_or_else(|| format!("the FDE at offset {at:#x} covers past the end of the address space"))?;
+    let end = pc.checked_add(len).ok_or_else(|| {
+        format!("the FDE at offset {at:#x} covers past the end of the address space")
+    })?;
     Ok((pc, end))
 }
 
@@ -1594,7 +1625,8 @@ fn covers(at: usize, pc: u64, len: u64) -> Result<(u64, u64), String> {
 fn live_fdes(records: &[Record]) -> Vec<Fde> {
     let live = |it: &&Record| !it.cie() && it.start != 0;
     // alloc: once per link, a count per piece
-    let counts: Vec<usize> = par::map(par::chunks(records, CHUNK), |chunk| chunk.iter().filter(live).count());
+    let counts: Vec<usize> =
+        par::map(par::chunks(records, CHUNK), |chunk| chunk.iter().filter(live).count());
     let len = counts.iter().sum();
     // alloc: once per link, the column, filled in parallel at each piece's place
     let mut fdes: Vec<Fde> = Vec::with_capacity(len);
@@ -1641,21 +1673,29 @@ fn record(
         return Ok((Parsed::End, record));
     };
     let cie = |named: usize| -> Result<u8, &'static str> {
-        let found = cies.binary_search_by_key(&named, |it| it.0).map_err(|_| "its CIE pointer names no CIE")?;
+        let found = cies
+            .binary_search_by_key(&named, |it| it.0)
+            .map_err(|_| "its CIE pointer names no CIE")?;
         Ok(cies[found].1)
     };
     let parsed = match frame(bytes, record, found, section, across, cie).map_err(bad)? {
         Frame::Cie(encoding) => Parsed::Cie(encoding),
         Frame::Fde { pc, len } => {
             // alloc: error path
-            let (start, end) = covers(record, pc, len).map_err(|it| error(format!("__eh_frame at {section:#x}: {it}")))?;
+            let (start, end) = covers(record, pc, len)
+                .map_err(|it| error(format!("__eh_frame at {section:#x}: {it}")))?;
             Parsed::Fde { start, end }
         }
     };
     Ok((parsed, found.1))
 }
 
-fn region_bytes<'p>(placed: &Placed<'p>, index: usize, region: &Region, name: &str) -> Result<View<'p>, LinkError> {
+fn region_bytes<'p>(
+    placed: &Placed<'p>,
+    index: usize,
+    region: &Region,
+    name: &str,
+) -> Result<View<'p>, LinkError> {
     let bytes = placed.view(index);
     usize::try_from(region.size).ok().and_then(|size| bytes.prefix(size)).ok_or_else(|| {
         // alloc: error path
@@ -1710,10 +1750,10 @@ mod tests {
     };
 
     use super::{
-        ARM64_MODE_DWARF, COMMON_MAX, COMPACT_ENTRY, DWARF_OFFSET_MASK, HAS_LSDA, HEADER,
-        Held, INDEX_ENTRY, LSDA_ENTRY, MODE_MASK, PAGE_ENTRY, PAGE_HEADER, PERSONALITY_MASK,
+        ARM64_MODE_DWARF, COMMON_MAX, COMPACT_ENTRY, DWARF_OFFSET_MASK, HAS_LSDA, HEADER, Held,
+        INDEX_ENTRY, LSDA_ENTRY, Last, MODE_MASK, PAGE_ENTRY, PAGE_HEADER, PERSONALITY_MASK,
         PERSONALITY_MAX, PERSONALITY_SHIFT, SECOND_LEVEL_REGULAR, VERSION, X86_64_MODE_DWARF,
-        Last, bound, build, error, kept, named, offset, region_bytes, u32_at, u64_at,
+        bound, build, error, kept, named, offset, region_bytes, u32_at, u64_at,
     };
     use crate::LinkError;
     use crate::model::{Bind, Class, Delta, Function, Placed, Plan, Prot, Region, Splice, View};
@@ -1753,7 +1793,12 @@ mod tests {
             exec_log: false,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
-            triple: match arch { Arch::X86_64 => "x86_64-apple-darwin", _ => "aarch64-apple-darwin" }.into(),
+            link: crate::LinkArgs::default(),
+            triple: match arch {
+                Arch::X86_64 => "x86_64-apple-darwin",
+                _ => "aarch64-apple-darwin",
+            }
+            .into(),
         }
     }
 
@@ -2148,7 +2193,8 @@ mod tests {
         push_fde(&mut eh, 0, &[(TEXT + 0x10).to_le_bytes(), 0x10u64.to_le_bytes()].concat());
         let fde = fde_offsets(&eh);
         assert!(fde[0] <= u64::from(DWARF_OFFSET_MASK) && fde[1] > u64::from(DWARF_OFFSET_MASK));
-        let regions = [region(Class::Text, TEXT, 0x20), region(Class::EhFrame, EH_FRAME, eh.len() as u64)];
+        let regions =
+            [region(Class::Text, TEXT, 0x20), region(Class::EhFrame, EH_FRAME, eh.len() as u64)];
         let contents: [&[u8]; 2] = [&[], &eh];
         let functions = [function(TEXT, 0x10, "near"), function(TEXT + 0x10, 0x10, "far")];
         for (arch, mode) in [(Arch::Aarch64, ARM64_MODE_DWARF), (Arch::X86_64, X86_64_MODE_DWARF)] {
@@ -2406,10 +2452,8 @@ mod tests {
             let case = case(seed);
             let output = output(case.arch);
             let plan = plan();
-            let regions = [
-                region(Class::EhFrame, EH_FRAME, case.eh.len() as u64),
-                compact_region(&case.cu),
-            ];
+            let regions =
+                [region(Class::EhFrame, EH_FRAME, case.eh.len() as u64), compact_region(&case.cu)];
             let contents: [&[u8]; 2] = [&case.eh, &case.cu];
             let first = placed(&output, &plan, &regions, &contents, &case.functions, &case.binds);
             let first = Placed { synthesis: 1, ..first };
@@ -2417,7 +2461,11 @@ mod tests {
             let Ok((bytes, _)) = kept(&first, case.arch, &mut last) else {
                 continue;
             };
-            assert_eq!(&bytes.contiguous()[..], &build(&first, case.arch).unwrap()[..], "seed {seed}");
+            assert_eq!(
+                &bytes.contiguous()[..],
+                &build(&first, case.arch).unwrap()[..],
+                "seed {seed}"
+            );
 
             let mut rng = Rng::new(seed ^ 0x5eed);
             let mut cu = case.cu.clone();
@@ -2435,7 +2483,11 @@ mod tests {
             let second = placed(&output, &plan, &regions, &contents, &case.functions, &case.binds);
             let second = Placed { synthesis: 2, delta: Some(&delta), ..second };
             let (bytes, patched) = kept(&second, case.arch, &mut last).unwrap();
-            assert_eq!(&bytes.contiguous()[..], &build(&second, case.arch).unwrap()[..], "seed {seed}");
+            assert_eq!(
+                &bytes.contiguous()[..],
+                &build(&second, case.arch).unwrap()[..],
+                "seed {seed}"
+            );
             patches += usize::from(patched);
         }
         assert!(patches > 0, "some relinks patched");
@@ -2450,9 +2502,9 @@ mod tests {
 
     /// An FDE appended to `eh` naming the CIE at `cie`, its body after the CIE pointer `rest`.
     fn push_fde(eh: &mut Vec<u8>, cie: usize, rest: &[u8]) {
-    let pointer = (eh.len() + 4 - cie) as u32;
-    let parts: [&[u8]; 2] = [&pointer.to_le_bytes(), rest];
-    let record = record(&parts.concat());
+        let pointer = (eh.len() + 4 - cie) as u32;
+        let parts: [&[u8]; 2] = [&pointer.to_le_bytes(), rest];
+        let record = record(&parts.concat());
         eh.extend_from_slice(&record);
     }
 
@@ -2647,8 +2699,12 @@ mod tests {
     /// Columns of `n` functions 16 bytes apart: some covered by compact entries of a few
     /// encodings (some with LSDAs), some by FDEs, ends short of the next function or at it,
     /// long runs of plain functions whose rows the merge leaves out.
-    fn merge_columns(rng: &mut Rng, n: u64) -> (Vec<Function>, Vec<super::Covered>, Vec<super::Fde>, Vec<u64>) {
-        let (mut functions, mut covered, mut fdes, mut ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    fn merge_columns(
+        rng: &mut Rng,
+        n: u64,
+    ) -> (Vec<Function>, Vec<super::Covered>, Vec<super::Fde>, Vec<u64>) {
+        let (mut functions, mut covered, mut fdes, mut ends) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
             let addr = TEXT + 16 * i;
             functions.push(function(addr, 16, "f"));
@@ -2656,8 +2712,13 @@ mod tests {
             match rng.below(10) {
                 0..=2 => {
                     let lsda = if rng.below(10) == 0 { LSDA + 8 * i } else { 0 };
-                    let encoding = 0x0200_0000 | ((rng.below(3) as u32) << 4) | if lsda != 0 { HAS_LSDA } else { 0 };
-                    covered.push(super::Covered { addr, kind: super::Kind::Compact { encoding, lsda } });
+                    let encoding = 0x0200_0000
+                        | ((rng.below(3) as u32) << 4)
+                        | if lsda != 0 { HAS_LSDA } else { 0 };
+                    covered.push(super::Covered {
+                        addr,
+                        kind: super::Kind::Compact { encoding, lsda },
+                    });
                     ends.push(end);
                 }
                 3..=5 => {
@@ -2675,25 +2736,35 @@ mod tests {
     #[test]
     fn rows_merged_in_pieces_are_the_one_merges() {
         // Sixteen threads, so the merge is cut into pieces on any machine.
-        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(16), false).unwrap().install(|| {
-            for seed in [1u64, 2, 3] {
-                let mut rng = Rng::new(seed);
-                let n = 3 * super::MERGE as u64 + rng.below(5000);
-                let (functions, covered, fdes, ends) = merge_columns(&mut rng, n);
-                let output = output(Arch::Aarch64);
-                let plan = plan();
-                let placed = placed(&output, &plan, &[], &[], &functions, &[]);
-                let got = super::rows(&placed, ARM64_MODE_DWARF, &covered, &fdes, &ends).unwrap();
-                let columns = super::Columns { covered: &covered, fdes: &fdes, starts: super::Starts::Placed(&functions), ends: &ends };
-                let (mut rows, mut lsdas) = (Vec::new(), Vec::new());
-                let greatest = super::merge(BASE, ARM64_MODE_DWARF, columns, None, &mut rows, &mut lsdas).unwrap();
-                assert!(rows.len() < functions.len(), "seed {seed}: some entries add no row");
-                assert_eq!(got.rows, rows, "seed {seed}");
-                assert_eq!(got.lsdas, lsdas, "seed {seed}");
-                assert_eq!(got.last, greatest.max(TEXT + 16 * n), "seed {seed}");
-                assert!(got.sorted);
-            }
-        });
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(16), false)
+            .unwrap()
+            .install(|| {
+                for seed in [1u64, 2, 3] {
+                    let mut rng = Rng::new(seed);
+                    let n = 3 * super::MERGE as u64 + rng.below(5000);
+                    let (functions, covered, fdes, ends) = merge_columns(&mut rng, n);
+                    let output = output(Arch::Aarch64);
+                    let plan = plan();
+                    let placed = placed(&output, &plan, &[], &[], &functions, &[]);
+                    let got =
+                        super::rows(&placed, ARM64_MODE_DWARF, &covered, &fdes, &ends).unwrap();
+                    let columns = super::Columns {
+                        covered: &covered,
+                        fdes: &fdes,
+                        starts: super::Starts::Placed(&functions),
+                        ends: &ends,
+                    };
+                    let (mut rows, mut lsdas) = (Vec::new(), Vec::new());
+                    let greatest =
+                        super::merge(BASE, ARM64_MODE_DWARF, columns, None, &mut rows, &mut lsdas)
+                            .unwrap();
+                    assert!(rows.len() < functions.len(), "seed {seed}: some entries add no row");
+                    assert_eq!(got.rows, rows, "seed {seed}");
+                    assert_eq!(got.lsdas, lsdas, "seed {seed}");
+                    assert_eq!(got.last, greatest.max(TEXT + 16 * n), "seed {seed}");
+                    assert!(got.sorted);
+                }
+            });
     }
 
     /// Pages split with the shortcut for runs of DWARF-mode rows are those the walk splits.
@@ -2705,7 +2776,11 @@ mod tests {
             let rows: Vec<super::Row> = (0..n as u32)
                 .map(|i| {
                     let dwarf = round % 2 == 0 || rng.below(50) != 0;
-                    let encoding = if dwarf { ARM64_MODE_DWARF | i } else { 0x0200_0000 | ((rng.below(4) as u32) << 4) };
+                    let encoding = if dwarf {
+                        ARM64_MODE_DWARF | i
+                    } else {
+                        0x0200_0000 | ((rng.below(4) as u32) << 4)
+                    };
                     super::Row { function: 16 * i, encoding }
                 })
                 .collect();
@@ -2723,7 +2798,12 @@ mod tests {
                 i += page.count;
                 walked.push(page);
             }
-            let shape = |pages: &[super::Page]| pages.iter().map(|it| (it.first, it.count, it.compressed, it.locals)).collect::<Vec<_>>();
+            let shape = |pages: &[super::Page]| {
+                pages
+                    .iter()
+                    .map(|it| (it.first, it.count, it.compressed, it.locals))
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(shape(&got), shape(&walked), "round {round}");
         }
     }
@@ -2770,10 +2850,8 @@ mod tests {
             let case = case(seed);
             let output = output(case.arch);
             let plan = plan();
-            let regions = [
-                region(Class::EhFrame, EH_FRAME, case.eh.len() as u64),
-                compact_region(&case.cu),
-            ];
+            let regions =
+                [region(Class::EhFrame, EH_FRAME, case.eh.len() as u64), compact_region(&case.cu)];
             let contents: [&[u8]; 2] = [&case.eh, &case.cu];
             let placed = placed(&output, &plan, &regions, &contents, &case.functions, &case.binds);
             let new = build(&placed, case.arch).map_err(|it| it.what);

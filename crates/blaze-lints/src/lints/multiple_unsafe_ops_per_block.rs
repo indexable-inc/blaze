@@ -159,7 +159,9 @@ impl<'t> Collector<'_, '_, 't> {
                     self.push("unsafe method call occurs here", expr);
                 }
             }
-            ast::Expr::BinExpr(bin) if matches!(bin.op_kind(), Some(BinaryOp::Assignment { .. })) => {
+            ast::Expr::BinExpr(bin)
+                if matches!(bin.op_kind(), Some(BinaryOp::Assignment { .. })) =>
+            {
                 if bin.lhs().is_some_and(|it| is_static_mut(cx, it.peel_parens())) {
                     self.push("modification of a mutable static occurs here", expr);
                     return Some(bin.rhs().map(|it| it.syntax()));

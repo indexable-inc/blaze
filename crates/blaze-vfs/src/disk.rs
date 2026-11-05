@@ -11,8 +11,8 @@
 use blaze_core::{Cursor, FileName, Names, Stamp};
 use blaze_format::cursor::{self, Put as _, Reader, Wanted};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
+use std::alloc::Global;
 
 use crate::section::Section;
 

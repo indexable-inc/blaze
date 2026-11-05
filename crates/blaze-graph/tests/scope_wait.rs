@@ -30,7 +30,10 @@ fn key(n: u32) -> Key {
 
 /// Runs key 1 and, inside it, a scope of one job that asks for key 1, made to start on another
 /// thread than this one: what the job got, and what this run made of it.
-fn run_key_waiting_on_a_scope_job_that_asks_for_it(pool: &Pool, flights: &Flights<u32>) -> Result<u32, Cancelled> {
+fn run_key_waiting_on_a_scope_job_that_asks_for_it(
+    pool: &Pool,
+    flights: &Flights<u32>,
+) -> Result<u32, Cancelled> {
     flights.get_or_run(key(1), || {
         let started = AtomicBool::new(false);
         let mut asked = None;
@@ -44,7 +47,9 @@ fn run_key_waiting_on_a_scope_job_that_asks_for_it(pool: &Pool, flights: &Flight
                 |it| asked = Some(it),
             );
             // Busy here, so this thread doesn't run the job: another worker does.
-            SpinWait::within("a worker to start the scope's job", LONG, || started.load(Ordering::SeqCst));
+            SpinWait::within("a worker to start the scope's job", LONG, || {
+                started.load(Ordering::SeqCst)
+            });
         });
         match asked.expect("a scope runs its job before it returns") {
             Ok(Err(Cancelled)) => Ok(1),
@@ -54,7 +59,10 @@ fn run_key_waiting_on_a_scope_job_that_asks_for_it(pool: &Pool, flights: &Flight
     })
 }
 
-fn done_in_time(rx: &crossbeam_channel::Receiver<Result<u32, Cancelled>>, owner: &str) -> Result<u32, Cancelled> {
+fn done_in_time(
+    rx: &crossbeam_channel::Receiver<Result<u32, Cancelled>>,
+    owner: &str,
+) -> Result<u32, Cancelled> {
     rx.recv_timeout(LONG).unwrap_or_else(|_| {
         panic!(
             "no answer in {} s: the scope's job waits for key 1, whose runner ({owner}) waits for the \
@@ -91,7 +99,9 @@ fn no_wait_chain_through_a_clients_scope_leaves_every_worker_parked() {
     {
         let (pool, flights) = (pool.clone(), flights.clone());
         // Detached: on the deadlock it never returns, and the test fails on the timeout instead.
-        thread::spawn(move || _ = tx.send(run_key_waiting_on_a_scope_job_that_asks_for_it(&pool, &flights)));
+        thread::spawn(move || {
+            _ = tx.send(run_key_waiting_on_a_scope_job_that_asks_for_it(&pool, &flights))
+        });
     }
     assert_eq!(done_in_time(&rx, "a client thread"), Ok(1), "the scope's job gives way");
     assert_eq!(flights.running(), 0);

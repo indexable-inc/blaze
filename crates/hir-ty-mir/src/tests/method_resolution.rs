@@ -1154,9 +1154,9 @@ fn dyn_trait_super_trait_not_in_scope() {
             51..55 'self': &'? Self
             64..69 '{ 0 }': u32
             66..67 '0': u32
-            176..177 'd': &'? (dyn Trait + 'static)
+            176..177 'd': &'? (dyn Trait + '?)
             191..207 '{     ...o(); }': ()
-            197..198 'd': &'? (dyn Trait + 'static)
+            197..198 'd': &'? (dyn Trait + '?)
             197..204 'd.foo()': u32
         "#]],
     );

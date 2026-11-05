@@ -250,8 +250,7 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         if root_a == root_b {
             return Ok(());
         }
-        let combined =
-            V::unify_values(&self.value[root_a as usize], &self.value[root_b as usize])?;
+        let combined = V::unify_values(&self.value[root_a as usize], &self.value[root_b as usize])?;
         self.unify_roots(root_a, root_b, combined);
         Ok(())
     }
@@ -521,10 +520,8 @@ mod tests {
             let is_root = root == at;
             assert_eq!(table.try_probe_value(Key(at)).is_some(), is_root, "{at} is a root");
         }
-        let roots: Vec<Key> = (0..model.parent.len() as u32)
-            .filter(|&at| model.find(at) == at)
-            .map(Key)
-            .collect();
+        let roots: Vec<Key> =
+            (0..model.parent.len() as u32).filter(|&at| model.find(at) == at).map(Key).collect();
         assert_eq!(table.roots_where(|_| true), roots, "roots");
     }
 
@@ -695,10 +692,7 @@ mod tests {
                     }
                     2..=4 if len > 0 => {
                         let (a, b) = (rng.index(len) as u32, rng.index(len) as u32);
-                        assert_eq!(
-                            table.unify_var_var(Key(a), Key(b)),
-                            model.unify_var_var(a, b)
-                        );
+                        assert_eq!(table.unify_var_var(Key(a), Key(b)), model.unify_var_var(a, b));
                     }
                     5 if len > 0 => {
                         let a = rng.index(len) as u32;

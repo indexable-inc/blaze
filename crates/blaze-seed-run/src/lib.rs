@@ -100,7 +100,10 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RunError::Unsupported { os } => {
-                write!(f, "the seed runner runs on Linux and macOS, not {os}: the seed bootstraps there and nowhere else yet")
+                write!(
+                    f,
+                    "the seed runner runs on Linux and macOS, not {os}: the seed bootstraps there and nowhere else yet"
+                )
             }
             RunError::Config(why) => write!(f, "the seed's arguments or environment: {why}"),
             RunError::Load { step, why } => write!(f, "{step}: {why}"),
@@ -122,7 +125,11 @@ pub fn run(module: &[u8], config: &Config) -> Result<Exit, RunError> {
                 .name("blaze-seed".to_owned()) // alloc: once per run
                 .stack_size(THREAD_STACK)
                 .spawn_scoped(scope, || unix::run(module, config))
-                .map_err(|why| RunError::Thread(format!("could not start it with a {THREAD_STACK}-byte stack: {why}")))?; // alloc: error path
+                .map_err(|why| {
+                    RunError::Thread(format!(
+                        "could not start it with a {THREAD_STACK}-byte stack: {why}"
+                    ))
+                })?; // alloc: error path
             seed.join().map_err(|payload| {
                 // A panic's message is a `&str` or a `String`; anything else says only that.
                 let message = payload
@@ -164,9 +171,14 @@ mod unix {
 
     impl Seed {
         /// Runs `f` on the seed's memory and its host, keeping a [`Stop`] it returns.
-        fn serve<R>(caller: &mut Caller<'_, Seed>, f: impl FnOnce(&mut [u8], &mut Host) -> Result<R, Stop>) -> wasmtime::Result<R> {
+        fn serve<R>(
+            caller: &mut Caller<'_, Seed>,
+            f: impl FnOnce(&mut [u8], &mut Host) -> Result<R, Stop>,
+        ) -> wasmtime::Result<R> {
             let Some(memory) = caller.data().memory else {
-                return Err(wasmtime::Error::msg("the seed called the runner before its memory was found"));
+                return Err(wasmtime::Error::msg(
+                    "the seed called the runner before its memory was found",
+                ));
             };
             let (mem, seed) = memory.data_and_store_mut(caller);
             match f(mem, &mut seed.host) {
@@ -238,13 +250,20 @@ mod unix {
         let engine = engine(config)?;
         let module = Module::new(&engine, bytes).map_err(load("compiling the seed"))?;
         let linker = linker(&engine).map_err(load("linking the seed runner's imports"))?;
-        let mut store = Store::new(&engine, Seed { host, memory: None, stop: None, fibers: Fibers::default() });
-        let instance = linker.instantiate(&mut store, &module).map_err(load("instantiating the seed"))?;
+        let mut store =
+            Store::new(&engine, Seed { host, memory: None, stop: None, fibers: Fibers::default() });
+        let instance =
+            linker.instantiate(&mut store, &module).map_err(load("instantiating the seed"))?;
         let Some(memory) = instance.get_memory(&mut store, "memory") else {
-            return Err(RunError::Load { step: "instantiating the seed", why: "it exports no memory `memory`".to_owned() }); // alloc: error path
+            return Err(RunError::Load {
+                step: "instantiating the seed",
+                why: "it exports no memory `memory`".to_owned(),
+            }); // alloc: error path
         };
         store.data_mut().memory = Some(memory);
-        let start: TypedFunc<(), ()> = instance.get_typed_func(&mut store, "_start").map_err(load("finding the seed's `_start`"))?;
+        let start: TypedFunc<(), ()> = instance
+            .get_typed_func(&mut store, "_start")
+            .map_err(load("finding the seed's `_start`"))?;
         let ran = start.call(&mut store, ());
         Fibers::dispose_all(&mut store);
         let seed = store.data();
@@ -256,8 +275,12 @@ mod unix {
         };
         let size = memory.data_size(&store);
         // SAFETY: the memory's first `size` bytes are mapped, its base page-aligned.
-        let held = unsafe { memory::held(memory.data_ptr(&store), size) }
-            .map_err(|why| RunError::Load { step: "measuring the memory the seed holds (mincore)", why: why.to_string() })?; // alloc: error path
+        let held = unsafe { memory::held(memory.data_ptr(&store), size) }.map_err(|why| {
+            RunError::Load {
+                step: "measuring the memory the seed holds (mincore)",
+                why: why.to_string(),
+            }
+        })?; // alloc: error path
         Ok(Exit { code, memory_bytes: size as u64, held_bytes: held })
     }
 }

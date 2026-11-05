@@ -36,7 +36,8 @@ const MANIFEST_DOMAIN: &str = "blaze v2 global manifest 1";
 const MANIFEST_KEY_DOMAIN: &str = "blaze v2 global manifest key 1";
 const SIGNED_AS: &[u8] = b"bundle";
 
-const CRATES_IO: [&str; 2] = ["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"];
+const CRATES_IO: [&str; 2] =
+    ["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"];
 
 /// A crates.io package of a lock file, as a build enables it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -54,16 +55,23 @@ impl Locked {
     /// version)` is the features the build enables of the package, or `None` when it does not
     /// build it (a dependency of another target). A crates.io package with no checksum is an
     /// error, since nothing then says which bytes it is.
-    pub fn parse(lock: &str, built: impl Fn(&str, &str) -> Option<Vec<String>>) -> Result<Vec<Locked>, String> {
+    pub fn parse(
+        lock: &str,
+        built: impl Fn(&str, &str) -> Option<Vec<String>>,
+    ) -> Result<Vec<Locked>, String> {
         // alloc: an error's message, made only when it fails.
-        let table = lock.parse::<toml::Table>().map_err(|error| format!("Cargo.lock is not TOML: {error}"))?;
+        let table = lock
+            .parse::<toml::Table>()
+            .map_err(|error| format!("Cargo.lock is not TOML: {error}"))?;
         // alloc: setup: once a bundle or its lock file, not a value.
         let Some(packages) = table.get("package") else { return Ok(Vec::new()) };
-        let packages = packages.as_array().ok_or("Cargo.lock's `package` is not an array of tables")?;
+        let packages =
+            packages.as_array().ok_or("Cargo.lock's `package` is not an array of tables")?;
         // alloc: setup: once a bundle or its lock file, not a value.
         let mut locked = Vec::new();
         for package in packages {
-            let package = package.as_table().ok_or("a `package` of Cargo.lock that is not a table")?;
+            let package =
+                package.as_table().ok_or("a `package` of Cargo.lock that is not a table")?;
             let field = |name: &str| package.get(name).and_then(|it| it.as_str());
             let (Some(name), Some(version)) = (field("name"), field("version")) else {
                 // alloc: an error's message, made only when it fails.
@@ -79,12 +87,19 @@ impl Locked {
             })?;
             let checksum = blaze_format::hex::decode::<32>(checksum)
                 // alloc: an error's message, made only when it fails.
-                .ok_or_else(|| format!("{name} {version}'s checksum {checksum:?} is not 64 hex digits"))?;
+                .ok_or_else(|| {
+                    format!("{name} {version}'s checksum {checksum:?} is not 64 hex digits")
+                })?;
             let mut features = features;
             features.sort_unstable();
             features.dedup();
             // alloc: setup: once a bundle or its lock file, not a value.
-            locked.push(Locked { name: name.to_owned(), version: version.to_owned(), checksum, features });
+            locked.push(Locked {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                checksum,
+                features,
+            });
         }
         locked.sort_unstable();
         Ok(locked)
@@ -158,11 +173,19 @@ pub struct Manifest {
 impl Manifest {
     /// The manifest of `entries` as bundle `id`, signed by `publisher`. Each entry's key must
     /// have been shown public ([`Public`]).
-    pub fn sign(id: BundleId, entries: impl IntoIterator<Item = (Public, Record)>, publisher: &crate::Publisher) -> Manifest {
+    pub fn sign(
+        id: BundleId,
+        entries: impl IntoIterator<Item = (Public, Record)>,
+        publisher: &crate::Publisher,
+    ) -> Manifest {
         let mut entries: Vec<Record> = entries
             .into_iter()
             .map(|(public, record)| {
-                assert_eq!((public.key(), public.kind()), (record.key, record.kind), "a record of another key than the one shown public");
+                assert_eq!(
+                    (public.key(), public.kind()),
+                    (record.key, record.kind),
+                    "a record of another key than the one shown public"
+                );
                 record
             })
             // alloc: setup: once a bundle or its lock file, not a value.
@@ -170,9 +193,16 @@ impl Manifest {
         entries.sort_unstable_by_key(|it| it.key);
         entries.dedup();
         if let Some(pair) = entries.windows(2).find(|pair| pair[0].key == pair[1].key) {
-            panic!("two records of {:x} in one bundle: {:?} and {:?}", pair[0].key.0, pair[0], pair[1]);
+            panic!(
+                "two records of {:x} in one bundle: {:?} and {:?}",
+                pair[0].key.0, pair[0], pair[1]
+            );
         }
-        assert!(entries.len() <= ENTRIES_MOST, "a bundle of {} values, more than {ENTRIES_MOST}", entries.len());
+        assert!(
+            entries.len() <= ENTRIES_MOST,
+            "a bundle of {} values, more than {ENTRIES_MOST}",
+            entries.len()
+        );
         let signature = publisher.sign_digest(SIGNED_AS, &digest(&id, &entries));
         Manifest { id, entries, publisher: publisher.key(), signature }
     }
@@ -210,10 +240,17 @@ impl Manifest {
     /// Whether a publisher `trust` pins signed it, and its entries are sorted and each key's
     /// once.
     pub fn verify(&self, trust: &Trust) -> Result<(), String> {
-        trust.verify_digest(SIGNED_AS, &digest(&self.id, &self.entries), &self.publisher, &self.signature)?;
+        trust.verify_digest(
+            SIGNED_AS,
+            &digest(&self.id, &self.entries),
+            &self.publisher,
+            &self.signature,
+        )?;
         match self.entries.windows(2).find(|pair| pair[0].key >= pair[1].key) {
             // alloc: an error's message, made only when it fails.
-            Some(pair) => Err(format!("its records are not sorted by key, each once, at {:x}", pair[1].key.0)),
+            Some(pair) => {
+                Err(format!("its records are not sorted by key, each once, at {:x}", pair[1].key.0))
+            }
             None => Ok(()),
         }
     }
@@ -250,7 +287,14 @@ pub struct Download {
 enum State {
     Asking,
     /// `waiting`: each key fetched and not yet answered, with its length.
-    Fetching { listed: usize, waiting: ByHash<Key, u64, Global>, fetched: usize, bytes: u64, tickets: Vec<Ticket>, failed: Vec<String> },
+    Fetching {
+        listed: usize,
+        waiting: ByHash<Key, u64, Global>,
+        fetched: usize,
+        bytes: u64,
+        tickets: Vec<Ticket>,
+        failed: Vec<String>,
+    },
     Done(Result<Downloaded, String>),
 }
 
@@ -258,7 +302,11 @@ enum State {
 const NAMED_MOST: usize = 8;
 
 impl Download {
-    pub fn start<C: Channels>(id: BundleId, client: &mut Client<C>, effects: &mut Vec<Effect>) -> Download {
+    pub fn start<C: Channels>(
+        id: BundleId,
+        client: &mut Client<C>,
+        effects: &mut Vec<Effect>,
+    ) -> Download {
         let asked = client.bundle(id, effects);
         Download { id, asked, state: State::Asking }
     }
@@ -284,14 +332,17 @@ impl Download {
             }
             self.state = match got.result {
                 // alloc: an error's message, made only when it fails.
-                Err(why) => State::Done(Err(format!("the manifest of bundle {}: {why}", hex(&self.id.0.0)))),
+                Err(why) => {
+                    State::Done(Err(format!("the manifest of bundle {}: {why}", hex(&self.id.0.0))))
+                }
                 Ok(None) => State::Done(Ok(Downloaded::NoBundle)),
                 Ok(Some(manifest)) => {
                     let publics: Vec<Public> =
                         // alloc: setup: once a bundle or its lock file, not a value.
                         manifest.entries.iter().map(|entry| Public::listed(entry.key, entry.kind)).collect();
                     // alloc: setup: once a bundle or its lock file, not a value.
-                    let lens: ByHash<Key, u64, Global> = manifest.entries.iter().map(|it| (it.key, it.len)).collect();
+                    let lens: ByHash<Key, u64, Global> =
+                        manifest.entries.iter().map(|it| (it.key, it.len)).collect();
                     let waiting = client
                         .fetch_many(store, &publics, effects)
                         .into_iter()
@@ -317,7 +368,9 @@ impl Download {
 
     /// Takes how the store's fetches went ([`Store::fetched`]), returning those not its own.
     pub fn fetched(&mut self, fetched: Vec<(Key, Fetched)>) -> Vec<(Key, Fetched)> {
-        let State::Fetching { waiting, fetched: count, bytes, tickets, failed, .. } = &mut self.state else {
+        let State::Fetching { waiting, fetched: count, bytes, tickets, failed, .. } =
+            &mut self.state
+        else {
             return fetched;
         };
         // alloc: setup: once a bundle or its lock file, not a value.
@@ -334,7 +387,9 @@ impl Download {
                     tickets.push(ticket);
                 }
                 // alloc: an error's message, made only when it fails.
-                Fetched::Missing => failed.push(format!("{:x}: the cache lists it and has no value of it", key.0)),
+                Fetched::Missing => {
+                    failed.push(format!("{:x}: the cache lists it and has no value of it", key.0))
+                }
                 // alloc: an error's message, made only when it fails.
                 Fetched::Refused(why) => failed.push(format!("{:x}: {why}", key.0)),
             }
@@ -352,12 +407,20 @@ impl Download {
     }
 
     fn settle(&mut self) {
-        let State::Fetching { listed, waiting, fetched, bytes, tickets, failed } = &mut self.state else { return };
+        let State::Fetching { listed, waiting, fetched, bytes, tickets, failed } = &mut self.state
+        else {
+            return;
+        };
         if !waiting.is_empty() {
             return;
         }
         let result = if failed.is_empty() {
-            Ok(Downloaded::Kept { listed: *listed, fetched: *fetched, bytes: *bytes, tickets: std::mem::take(tickets) })
+            Ok(Downloaded::Kept {
+                listed: *listed,
+                fetched: *fetched,
+                bytes: *bytes,
+                tickets: std::mem::take(tickets),
+            })
         } else {
             // alloc: an error's message, made only when it fails.
             let named = failed.iter().take(NAMED_MOST).cloned().collect::<Vec<_>>().join("; ");

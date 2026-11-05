@@ -5,7 +5,8 @@
 //! a REPL cell (`<repl>.t3`, kind repl). Each object has append-only raw streams (pty, stdout, stderr,
 //! stdin, final_err, messages), one file per (object, stream); the `streams` table says where each
 //! file is (new objects: objects/<id>/<stream>; runs keep their runs/rN/ layout), how big, and whether
-//! it has been compacted into archive/objects/<root>.parquet (a top-level object and its children).
+//! it has been compacted into archive/objects/<root>.parquet (a top-level object and its children). Two streams are never
+//! compacted: `messages`, and `chat` (a chat session's event log, which stays one NDJSON file for good; chat/mod.rs).
 //! The raw files stay the source of the bytes; meta.json stays authoritative for a live run.
 //! Readers (the REPL's `sql`) attach this file read-only. Write failures are logged, never fatal.
 use crate::paths;
@@ -40,6 +41,8 @@ create table if not exists streams(
   archive_path text,
   primary key(object, stream)
 );
+-- A chat's log (objects/<id>/chat) is never compacted (chat/mod.rs); undo what an older daemon compacted of one.
+update streams set compacted_ms = null, archive_path = null where stream = 'chat' and compacted_ms is not null;
 ";
 
 fn conn() -> MutexGuard<'static, Connection> {
@@ -144,7 +147,7 @@ pub fn tree_streams(root: &str) -> Vec<(String, String, PathBuf)> {
     let r = (|| {
         let mut st = c.prepare(
             "select s.object, s.stream, s.path from streams s join objects o on o.id = s.object
-             where (o.id = ?1 or (o.parent = ?1 and o.kind = 'stage')) and s.stream != 'messages' order by o.created_ms, s.object, s.stream",
+             where (o.id = ?1 or (o.parent = ?1 and o.kind = 'stage')) and s.stream not in ('messages', 'chat') order by o.created_ms, s.object, s.stream",
         )?;
         let rows = st.query_map([root], |r| Ok((r.get(0)?, r.get(1)?, PathBuf::from(r.get::<_, String>(2)?))))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -155,7 +158,7 @@ pub fn tree_streams(root: &str) -> Vec<(String, String, PathBuf)> {
 pub fn set_compacted(root: &str, archive: &Path, ms: u64) {
     let r = conn().execute(
         "update streams set compacted_ms = ?3, archive_path = ?2, bytes = coalesce(bytes, 0)
-         where stream != 'messages' and object in (select id from objects where id = ?1 or (parent = ?1 and kind = 'stage'))",
+         where stream not in ('messages', 'chat') and object in (select id from objects where id = ?1 or (parent = ?1 and kind = 'stage'))",
         params![root, archive.display().to_string(), ms as i64],
     );
     log("set_compacted", r);
@@ -168,7 +171,7 @@ pub fn uncompacted_roots() -> Vec<String> {
         let mut st = c.prepare(
             "select distinct coalesce(case when o.kind = 'stage' then o.parent end, o.id) from streams s
              join objects o on o.id = s.object
-             where s.compacted_ms is null and s.stream != 'messages'
+             where s.compacted_ms is null and s.stream not in ('messages', 'chat')
                and (select status from objects r where r.id = coalesce(case when o.kind = 'stage' then o.parent end, o.id)) != 'running'",
         )?;
         let rows = st.query_map([], |r| r.get(0))?;
@@ -181,7 +184,7 @@ pub fn is_compacted(root: &str) -> bool {
     let r = conn()
         .query_row(
             "select count(*) > 0 and count(*) = count(s.compacted_ms) from streams s join objects o on o.id = s.object
-             where (o.id = ?1 or (o.parent = ?1 and o.kind = 'stage')) and s.stream != 'messages'",
+             where (o.id = ?1 or (o.parent = ?1 and o.kind = 'stage')) and s.stream not in ('messages', 'chat')",
             [root],
             |r| r.get::<_, bool>(0),
         )
@@ -210,6 +213,8 @@ pub struct SessionRow<'a> {
     pub argv: &'a [String],
     pub created_ms: u64,
     pub meta: Value,
+    /// Its output's stream: `pty` (a terminal session), or `chat` (a chat session's events, chat/mod.rs).
+    pub stream: &'a str,
 }
 
 /// Reserve `name` among running objects; errors with the holder's id if taken.
@@ -233,7 +238,7 @@ pub fn session_start(s: &SessionRow) {
             args: json!(s.argv), created_ms: Some(s.created_ms as i64), status: Some("running"), meta: s.meta.clone(),
             ..Default::default()
         })?;
-        put_stream(&tx, &id, "pty", &object_dir(&id).join("pty"))?;
+        put_stream(&tx, &id, s.stream, &object_dir(&id).join(s.stream))?;
         tx.commit()
     })();
     log("session_start", r);
@@ -250,7 +255,12 @@ pub fn session_end(id: u64, code: i32, status: &str, ended_ms: u64) {
             params![oid, code, ended_ms as i64, status],
         ),
     );
-    log("session_end bytes", c.execute("update streams set bytes = ?2 where object = ?1 and stream = 'pty'", params![oid, size(&object_dir(&oid).join("pty"))]));
+    for stream in ["pty", "chat"] {
+        let path = object_dir(&oid).join(stream);
+        if path.exists() {
+            log("session_end bytes", c.execute("update streams set bytes = ?3 where object = ?1 and stream = ?2", params![oid, stream, size(&path)]));
+        }
+    }
 }
 
 /// At startup nothing is running yet: sessions the last daemon left open died with it, last heard from when their pty
@@ -261,7 +271,7 @@ pub fn mark_lost_sessions() {
         let mut st = c.prepare("select id from objects where status = 'running' and kind not in ('proc', 'stage', 'repl')")?;
         let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
-            let heard = std::fs::metadata(object_dir(&id).join("pty")).and_then(|m| m.modified()).ok();
+            let heard = ["pty", "chat"].iter().find_map(|f| std::fs::metadata(object_dir(&id).join(f)).and_then(|m| m.modified()).ok());
             let ms = heard.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or_else(crate::runs::now_ms, |d| d.as_millis() as u64);
             c.execute("update objects set status = 'lost', ended_ms = coalesce(ended_ms, ?2) where id = ?1", params![id, ms as i64])?;
         }
@@ -270,28 +280,54 @@ pub fn mark_lost_sessions() {
     log("mark_lost", r);
 }
 
-/// PTY sessions in the shape of daemon::Session::info (for `list` with all: true).
+/// The columns a session row (`sessions`, `session`) reads.
+const SESSION_COLS: &str =
+    "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code, meta from objects where kind not in ('proc', 'stage', 'repl')";
+
+/// One row of `SESSION_COLS` in the shape of daemon::Session::info: its mode (`chat` or `tui`) and model from its meta.
+fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
+    let args: Option<String> = r.get(5)?;
+    let meta: Value = r.get::<_, Option<String>>(10)?.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null);
+    Ok(json!({
+        "id": num(r.get(0)?), "object": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
+        "parent": num(r.get(3)?), "cwd": r.get::<_, Option<String>>(4)?,
+        "argv": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()), "status": r.get::<_, Option<String>>(6)?,
+        "created_ms": r.get::<_, Option<i64>>(7)?, "ended_ms": r.get::<_, Option<i64>>(8)?,
+        "exit": r.get::<_, Option<i64>>(9)?, "title": meta["title"].as_str().unwrap_or(""), "attached": 0,
+        "mode": meta["mode"].as_str().unwrap_or("tui"), "model": meta["model"],
+    }))
+}
+
+/// Sessions in the shape of daemon::Session::info (for `list` with all: true).
 pub fn sessions() -> Vec<Value> {
     let c = conn();
     let r = (|| {
-        let mut st = c.prepare(
-            "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code from objects
-             where kind not in ('proc', 'stage', 'repl') order by created_ms",
-        )?;
-        let rows = st.query_map([], |r| {
-            let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
-            let args: Option<String> = r.get(5)?;
-            Ok(json!({
-                "id": num(r.get(0)?), "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
-                "parent": num(r.get(3)?), "cwd": r.get::<_, Option<String>>(4)?,
-                "argv": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()), "status": r.get::<_, Option<String>>(6)?,
-                "created_ms": r.get::<_, Option<i64>>(7)?, "ended_ms": r.get::<_, Option<i64>>(8)?,
-                "exit": r.get::<_, Option<i64>>(9)?, "title": "", "attached": 0,
-            }))
-        })?;
+        let mut st = c.prepare(&format!("{SESSION_COLS} order by created_ms"))?;
+        let rows = st.query_map([], session_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     })();
     log("sessions", r).unwrap_or_default()
+}
+
+/// Session `sN` as the index knows it (one that ended before this daemon started), in the shape of [`sessions`]' rows.
+pub fn session(id: u64) -> Option<Value> {
+    let r = conn().query_row(&format!("{SESSION_COLS} and id = ?1"), [format!("s{id}")], session_row).optional();
+    log("session", r).flatten()
+}
+
+/// Chat sessions whose index row has no title yet (chat::backfill_titles).
+pub fn chats_without_title() -> Vec<String> {
+    let c = conn();
+    let r = (|| {
+        let mut st = c.prepare(
+            "select id from objects where kind not in ('proc', 'stage', 'repl') and json_extract(meta, '$.mode') = 'chat'
+               and json_extract(meta, '$.title') is null",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+    })();
+    log("chats_without_title", r).unwrap_or_default()
 }
 
 /// Agent sessions with a transcript to mirror into their `messages` stream: (object id, kind, meta).

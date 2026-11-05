@@ -45,7 +45,10 @@ use syntax::{
 use crate::{
     cx::{Cx, def_range_view as def_range},
     lints::code_fact,
-    lower::{Found, Phase, obligation_cause, type_mismatch, type_must_be_known::overlaps, unimplemented_trait::is_lang},
+    lower::{
+        Found, Phase, obligation_cause, type_mismatch, type_must_be_known::overlaps,
+        unimplemented_trait::is_lang,
+    },
     model::{Applicability, Diag, Span},
     print,
 };
@@ -107,7 +110,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TraitSolverError<'db>) -> Ve
         hir::TraitSolverErrorKind::Unreported(code) => Diag::error(
             None,
             // alloc: the error's text, for an error hir found
-            format!("blaze cannot describe this trait solver error ({code:?}), which only rustc's old solver gives"),
+            format!(
+                "blaze cannot describe this trait solver error ({code:?}), which only rustc's old solver gives"
+            ),
             span,
         ),
     };
@@ -117,7 +122,13 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TraitSolverError<'db>) -> Ve
     } = &d.kind
         && let Some(projection) = Projection::of(cx, alias)
     {
-        obligation_cause::note_projection(cx, &mut diag, d.cause, projection.trait_, projection.assoc);
+        obligation_cause::note_projection(
+            cx,
+            &mut diag,
+            d.cause,
+            projection.trait_,
+            projection.assoc,
+        );
     } else if let hir::TraitSolverErrorKind::GoalUnmet { goal, .. }
     | hir::TraitSolverErrorKind::Overflow { goal, .. }
     | hir::TraitSolverErrorKind::ProjectionMismatch { goal, .. } = &d.kind
@@ -140,11 +151,16 @@ fn goal_unmet<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>, span: Span) ->
         hir::SolverGoal::HostEffect { trait_ref, maybe_const } => Diag::error(
             Some("E0277"),
             // alloc: the error's text, for an error hir found
-            format!("the trait bound `{}` is not satisfied", print::host_effect(cx, trait_ref, *maybe_const)),
+            format!(
+                "the trait bound `{}` is not satisfied",
+                print::host_effect(cx, trait_ref, *maybe_const)
+            ),
             span,
         ),
         // alloc: the error's text, for an error hir found
-        hir::SolverGoal::WellFormed(ty) => Diag::error(None, format!("the type `{}` is not well-formed", term(cx, ty)), span),
+        hir::SolverGoal::WellFormed(ty) => {
+            Diag::error(None, format!("the type `{}` is not well-formed", term(cx, ty)), span)
+        }
         hir::SolverGoal::DynCompatible(trait_) => Diag::error(
             None,
             // alloc: the error's text, for an error hir found
@@ -158,7 +174,9 @@ fn goal_unmet<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>, span: Span) ->
             Some(text) => Diag::error(
                 None,
                 // alloc: the error's text, for an error hir found
-                format!("blaze cannot describe the unmet goal `{text}`, which rustc never reports as unmet"),
+                format!(
+                    "blaze cannot describe the unmet goal `{text}`, which rustc never reports as unmet"
+                ),
                 span,
             ),
             None => cannot_print(goal, span),
@@ -170,7 +188,13 @@ fn goal_unmet<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>, span: Span) ->
 /// `const`: "trait `Trait` is implemented but not `const`" on another crate's impl, the
 /// suggestion to make a local one `const`. Err with blaze's error for an impl with
 /// `#[diagnostic::on_const]`, whose message blaze does not evaluate yet.
-fn not_const(cx: &Cx<'_, '_>, diag: &mut Diag, impl_: hir::Impl, trait_: hir::Trait, span: Span) -> Result<(), Diag> {
+fn not_const(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    impl_: hir::Impl,
+    trait_: hir::Trait,
+    span: Span,
+) -> Result<(), Diag> {
     let name = trait_.name(cx.db);
     let src = cx.vsema.source(impl_);
     let on_const = src.as_ref().is_some_and(|src| {
@@ -185,7 +209,9 @@ fn not_const(cx: &Cx<'_, '_>, diag: &mut Diag, impl_: hir::Impl, trait_: hir::Tr
         // alloc: the error's text, for an error hir found
         let note = format!("trait `{}` is implemented but not `const`", name.as_str());
         match &src {
-            Some(src) => diag.span_note(cx.span(src.as_ref().map(|it| def_range(it.syntax()))), note),
+            Some(src) => {
+                diag.span_note(cx.span(src.as_ref().map(|it| def_range(it.syntax()))), note)
+            }
             None => diag.note(note),
         };
     }
@@ -222,7 +248,12 @@ fn not_const(cx: &Cx<'_, '_>, diag: &mut Diag, impl_: hir::Impl, trait_: hir::Tr
 }
 
 /// rustc's `build_overflow_error` (E0275).
-fn overflow<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>, suggest_increasing_limit: bool, span: Span) -> Diag {
+fn overflow<'db>(
+    cx: &Cx<'_, 'db>,
+    goal: &hir::SolverGoal<'db>,
+    suggest_increasing_limit: bool,
+    span: Span,
+) -> Diag {
     let message = match goal {
         hir::SolverGoal::Subtype { a, b } | hir::SolverGoal::Coerce { a, b } => {
             // alloc: the error's text, for an error hir found
@@ -270,7 +301,9 @@ fn projection_mismatch<'db>(
     };
     let values = normalized.map(|found| (expected, found));
     let detailed = match (&projection, values) {
-        (Some(projection), Some((expected, found))) => detailed(cx, projection, expected, found, &span),
+        (Some(projection), Some((expected, found))) => {
+            detailed(cx, projection, expected, found, &span)
+        }
         _ => None,
     };
     let secondary = projection.as_ref().and_then(|it| assoc_definition(cx, it, impl_?));
@@ -321,7 +354,11 @@ fn projection_mismatch<'db>(
             let f = format!("found {what}");
             let width = e.len().max(f.len());
             // alloc: the error's text, for an error hir found
-            diag.note(format!("{e:>width$} `{}`\n{f:>width$} `{}`", term(cx, expected), term(cx, found)));
+            diag.note(format!(
+                "{e:>width$} `{}`\n{f:>width$} `{}`",
+                term(cx, expected),
+                term(cx, found)
+            ));
         }
     }
     diag
@@ -338,9 +375,8 @@ impl<'db> Projection<'db> {
     fn of(cx: &Cx<'_, 'db>, alias: &hir::Type<'db>) -> Option<Self> {
         let TyKind::Alias(_, alias_ty) = alias.to_next_solver().kind() else { return None };
         // A trait method's `impl Trait` is no named associated type: the goal reads as its bounds.
-        let AliasTyKind::Projection {
-            def_id: TraitAssocTyId(AssocTyId::TypeAliasId(assoc)),
-        } = alias_ty.kind
+        let AliasTyKind::Projection { def_id: TraitAssocTyId(AssocTyId::TypeAliasId(assoc)) } =
+            alias_ty.kind
         else {
             return None;
         };
@@ -386,16 +422,23 @@ fn detailed<'db>(
             }
         };
         // alloc: the error's text, for an error hir found
-        let message = format!("expected `{}` to return `{expected}`, but it returns `{found}`", item.as_str());
+        let message = format!(
+            "expected `{}` to return `{expected}`, but it returns `{found}`",
+            item.as_str()
+        );
         return Some((message, at, closure));
     }
     let self_ty = cx.ty(&projection.self_ty);
     let message = if is_lang(cx, projection.trait_, LangItem::Future) {
         // alloc: the error's text, for an error hir found
-        format!("expected `{self_ty}` to be a future that resolves to `{expected}`, but it resolves to `{found}`")
+        format!(
+            "expected `{self_ty}` to be a future that resolves to `{expected}`, but it resolves to `{found}`"
+        )
     } else if is_lang(cx, projection.trait_, LangItem::Iterator) {
         // alloc: the error's text, for an error hir found
-        format!("expected `{self_ty}` to be an iterator that yields `{expected}`, but it yields `{found}`")
+        format!(
+            "expected `{self_ty}` to be an iterator that yields `{expected}`, but it yields `{found}`"
+        )
     } else {
         return None;
     };
@@ -440,7 +483,11 @@ fn closure_head(closure: view::ClosureExpr<'_>) -> TextRange {
 /// `impl_`, the user-written impl selection picks for the goal's trait ref, or the trait's
 /// default it uses (`specialization_graph::assoc_def`). `None` where that definition is not in
 /// this crate.
-fn assoc_definition<'db>(cx: &Cx<'_, 'db>, projection: &Projection<'db>, impl_: hir::Impl) -> Option<Span> {
+fn assoc_definition<'db>(
+    cx: &Cx<'_, 'db>,
+    projection: &Projection<'db>,
+    impl_: hir::Impl,
+) -> Option<Span> {
     let name = projection.assoc.name(cx.db);
     let item = impl_.items(cx.db).into_iter().find_map(|it| match it {
         hir::AssocItem::TypeAlias(it) if it.name(cx.db) == name => Some(it),
@@ -475,7 +522,11 @@ fn cannot_print(goal: &hir::SolverGoal<'_>, span: Span) -> Diag {
         _ => "a goal",
     };
     // alloc: the error's text, for an error hir found
-    Diag::error(None, format!("blaze cannot print the requirement of this trait solver error: {what}"), span)
+    Diag::error(
+        None,
+        format!("blaze cannot print the requirement of this trait solver error: {what}"),
+        span,
+    )
 }
 
 /// A goal as rustc prints its predicate: `T: Trait`, `T: [const] Trait`, `<T as Trait>::Assoc ==
@@ -485,9 +536,13 @@ pub(super) fn goal_text<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>) -> O
     // alloc: the error's text, for an error hir found
     Some(match goal {
         hir::SolverGoal::Trait(pred) => print::predicate(cx, pred),
-        hir::SolverGoal::HostEffect { trait_ref, maybe_const } => print::host_effect(cx, trait_ref, *maybe_const),
+        hir::SolverGoal::HostEffect { trait_ref, maybe_const } => {
+            print::host_effect(cx, trait_ref, *maybe_const)
+        }
         // alloc: the error's text, for an error hir found
-        hir::SolverGoal::Projection { alias, term: to } => format!("{} == {}", term(cx, alias), term(cx, to)),
+        hir::SolverGoal::Projection { alias, term: to } => {
+            format!("{} == {}", term(cx, alias), term(cx, to))
+        }
         hir::SolverGoal::NormalizesTo { .. } => return None,
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::Outlives { a, b } => format!("{}: {b}", term(cx, a)),
@@ -500,15 +555,22 @@ pub(super) fn goal_text<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>) -> O
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::ConstEvaluatable(ct) => format!("the constant `{ct}` can be evaluated"),
         // alloc: the error's text, for an error hir found
-        hir::SolverGoal::ConstArgHasType { ct, ty } => format!("the constant `{ct}` has type `{}`", cx.ty(ty)),
+        hir::SolverGoal::ConstArgHasType { ct, ty } => {
+            format!("the constant `{ct}` has type `{}`", cx.ty(ty))
+        }
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::ConstEquate { a, b } => format!("the constant `{a}` equals `{b}`"),
         hir::SolverGoal::DynCompatible(trait_) => {
             // alloc: the error's text, for an error hir found
-            format!("the trait `{}` is dyn-compatible", print::def_path(cx, ModuleDef::Trait(*trait_)))
+            format!(
+                "the trait `{}` is dyn-compatible",
+                print::def_path(cx, ModuleDef::Trait(*trait_))
+            )
         }
         // alloc: the error's text, for an error hir found
-        hir::SolverGoal::UnstableFeature(feature) => format!("feature({}) is enabled", feature.as_str()),
+        hir::SolverGoal::UnstableFeature(feature) => {
+            format!("feature({}) is enabled", feature.as_str())
+        }
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::Ambiguous => "ambiguous".to_owned(),
     })

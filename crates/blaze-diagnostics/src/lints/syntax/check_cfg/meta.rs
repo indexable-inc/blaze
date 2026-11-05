@@ -41,10 +41,15 @@ pub(super) fn lex(text: &str, edition: Edition) -> Option<Vec<Tok<'_>>> {
         let range = lexed.text_range(i);
         let token = &text[range.start..range.end];
         // An escape that is not one is an error of rustc's lexer.
-        if kind == SyntaxKind::STRING && token.starts_with('"') && token.ends_with('"') && token.len() > 1 {
+        if kind == SyntaxKind::STRING
+            && token.starts_with('"')
+            && token.ends_with('"')
+            && token.len() > 1
+        {
             unescaped(&token[1..token.len() - 1])?;
         }
-        let range = TextRange::new(TextSize::new(range.start as u32), TextSize::new(range.end as u32));
+        let range =
+            TextRange::new(TextSize::new(range.start as u32), TextSize::new(range.end as u32));
         tokens.push(Tok { kind, text: token, range });
     }
     Some(tokens)
@@ -327,7 +332,9 @@ impl<'t, 'a> Parser<'t, 'a> {
             return true;
         }
         let (Some(a), Some(b)) = (self.peek(), self.nth(1)) else { return false };
-        let sep = a.kind == SyntaxKind::COLON && b.kind == SyntaxKind::COLON && a.range.end() == b.range.start();
+        let sep = a.kind == SyntaxKind::COLON
+            && b.kind == SyntaxKind::COLON
+            && a.range.end() == b.range.start();
         if sep {
             self.at += 2;
         }
@@ -341,7 +348,9 @@ impl<'t, 'a> Parser<'t, 'a> {
             return true;
         }
         let (Some(a), Some(b)) = (self.peek(), self.nth(1)) else { return false };
-        let arrow = a.kind == SyntaxKind::EQ && b.kind == SyntaxKind::R_ANGLE && a.range.end() == b.range.start();
+        let arrow = a.kind == SyntaxKind::EQ
+            && b.kind == SyntaxKind::R_ANGLE
+            && a.range.end() == b.range.start();
         if arrow {
             self.at += 2;
         }
@@ -370,8 +379,10 @@ impl<'t, 'a> Parser<'t, 'a> {
 
     /// A delimited token tree (`{ .. }`, `( .. )`, `[ .. ]`), skipped.
     pub(super) fn skip_delimited(&mut self) -> bool {
-        let open = |kind| matches!(kind, SyntaxKind::L_CURLY | SyntaxKind::L_PAREN | SyntaxKind::L_BRACK);
-        let close = |kind| matches!(kind, SyntaxKind::R_CURLY | SyntaxKind::R_PAREN | SyntaxKind::R_BRACK);
+        let open =
+            |kind| matches!(kind, SyntaxKind::L_CURLY | SyntaxKind::L_PAREN | SyntaxKind::L_BRACK);
+        let close =
+            |kind| matches!(kind, SyntaxKind::R_CURLY | SyntaxKind::R_PAREN | SyntaxKind::R_BRACK);
         if !self.peek().is_some_and(|it| open(it.kind)) {
             return false;
         }
@@ -395,7 +406,10 @@ impl<'t, 'a> Parser<'t, 'a> {
     fn segment(&mut self) -> Option<Ident<'a>> {
         let tok = self.peek()?;
         let ident = ident_of(tok)?;
-        if !ident.raw && is_reserved(ident.name, self.edition) && !is_path_segment_keyword(ident.name) {
+        if !ident.raw
+            && is_reserved(ident.name, self.edition)
+            && !is_path_segment_keyword(ident.name)
+        {
             return None;
         }
         self.at += 1;
@@ -481,7 +495,8 @@ impl<'t, 'a> Parser<'t, 'a> {
 /// The name a token is, if it is one (rustc's `Token::ident`): an identifier or a keyword,
 /// raw or not.
 pub(super) fn ident_of(tok: Tok<'_>) -> Option<Ident<'_>> {
-    if matches!(tok.kind, SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW) && !tok.text.starts_with("r#") {
+    if matches!(tok.kind, SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW) && !tok.text.starts_with("r#")
+    {
         return None;
     }
     let (name, raw) = match tok.text.strip_prefix("r#") {
@@ -511,7 +526,9 @@ fn lit_unsuffixed(lit: Lit<'_>) -> bool {
                 Some("0o" | "0b") => (&text[2..], false),
                 _ => (text, false),
             };
-            digits.bytes().all(|it| it == b'_' || it.is_ascii_digit() || (hex && it.is_ascii_hexdigit()))
+            digits
+                .bytes()
+                .all(|it| it == b'_' || it.is_ascii_digit() || (hex && it.is_ascii_hexdigit()))
         }
         LitKind::Float => {
             let mut bytes = text.bytes().peekable();
@@ -541,10 +558,11 @@ pub(super) fn is_path_segment_keyword(name: &str) -> bool {
 /// rustc's `Symbol::is_reserved` in `edition`.
 pub(super) fn is_reserved(name: &str, edition: Edition) -> bool {
     const ALWAYS: &[&str] = &[
-        "_", "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if",
-        "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "abstract",
-        "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+        "_", "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "abstract", "become", "box", "do", "final", "macro", "override",
+        "priv", "typeof", "unsized", "virtual", "yield",
     ];
     ALWAYS.contains(&name)
         || (matches!(name, "async" | "await" | "dyn" | "try") && edition >= Edition::Edition2018)

@@ -1,31 +1,35 @@
-//! [`HyperHttp`]: the [`Http`] blaze asks servers through, over hyper 1 and rustls with ring
-//! (the `net` feature).
+//! [`HyperHttp`]: the [`Http`] blaze asks servers through (the `net` feature), on blaze-http:
+//! its sans-IO HTTP/1.1 client (`blaze_http::Client`: connections kept between requests by
+//! origin, redirects, gzip, TLS through rustls on ring with the machine's roots, every timeout
+//! a deadline) driven by its tokio driver on a runtime of this client's own.
+//!
+//! The name is the first client's, kept so that no caller changes; nothing under it is hyper
+//! any more (no hyper, hyper-util, hyper-rustls or tokio-rustls: docs/v2/plan/observe/no-tracing.md,
+//! 6.1). No proxy is asked through, as none was before.
 
-use std::{io::Read, sync::Arc, time::Duration};
+use std::{io::Read as _, sync::Arc, time::Duration};
 
-use anyhow::Context;
-use http_body_util::{BodyExt, Full};
-use hyper::{
-    Method, Request, StatusCode,
-    body::{Bytes, Incoming},
-    header,
+use anyhow::Context as _;
+use blaze_http::{
+    Client, Config, Event, Kind, Request,
+    tokio_driver::{Answer, Driver},
 };
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use http::Method;
 
-use super::{Bounds, Http, Pending, Refused, Response, Transport};
+use blaze_fetch::{redact, scrub};
 
-/// How many redirects one request follows.
-const REDIRECTS: usize = 10;
+use super::{Bounds, Http, Pending, Refused, Response, Sink, Transport};
+
 /// How many requests [`HyperHttp::get_async`] has in flight at once, each on a connection of
-/// its own (HTTP/1).
+/// its own (HTTP/1), and so the most idle connections the client keeps.
 const IN_FLIGHT: usize = 64;
 
-/// [`Http`] over hyper and rustls, with the machine's certificates, on a runtime of its own
-/// that any number of threads ask through at once.
+/// The most of a streamed request's error body that is read ([`Http::stream`]): enough for
+/// any server's message, and no more.
+const ERROR_BODY_MOST: u64 = 64 << 10;
+
+/// [`Http`] over blaze-http, with the machine's certificates, on a runtime of its own that any
+/// number of threads ask through at once.
 pub struct HyperHttp {
     runtime: tokio::runtime::Runtime,
     client: Requests,
@@ -35,10 +39,8 @@ pub struct HyperHttp {
 /// What one request needs, cheap to clone into a task of the runtime.
 #[derive(Clone)]
 struct Requests {
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
-    user_agent: Arc<str>,
-    /// How long a connection or a transfer may go without a byte, cargo's `http.timeout`.
-    timeout: Duration,
+    /// The driver of the process's one client: its connections, shared by every clone.
+    driver: Driver,
 }
 
 impl HyperHttp {
@@ -48,17 +50,16 @@ impl HyperHttp {
             .thread_name("blaze-registry http")
             .enable_all()
             .build()?;
-        let roots = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
         // No version: this crate is under every build of blaze, and the release blaze is is told
         // only to the engine (its build.rs), so that a release changes no crate below it.
-        let user_agent = "blaze (https://github.com/indexable-inc/blaze)".into();
+        let user_agent = "blaze (https://github.com/indexable-inc/blaze)";
+        let tls = blaze_http::roots::native()?;
+        let config = Config { idle_most: IN_FLIGHT, ..Config::new(tls, user_agent, timeout) };
+        let driver = Driver::spawn(runtime.handle(), Client::new(config));
         Ok(HyperHttp {
             runtime,
-            client: Requests { client, user_agent, timeout },
+            client: Requests { driver },
+            // alloc: the client's one semaphore, made once with it.
             in_flight: Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT)),
         })
     }
@@ -69,7 +70,8 @@ impl HyperHttp {
             clippy::disallowed_types,
             reason = "the process's one HTTP client: its runtime and connection pool are shared by every fetch"
         )]
-        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> = std::sync::OnceLock::new();
+        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> =
+            std::sync::OnceLock::new();
         let shared = SHARED.get_or_init(|| {
             HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
         });
@@ -84,13 +86,7 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(
-            method,
-            url,
-            headers,
-            Bytes::from(body),
-            Bounds::NONE,
-        ))
+        self.runtime.block_on(self.client.fetch(method, url, headers, body, Bounds::NONE, None))
     }
 
     /// [`Http::get`] of `url` held to `bounds`: a body past `bounds.most` stops being read, and
@@ -101,18 +97,15 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Bytes::new(), bounds))
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Vec::new(),
+            bounds,
+            None,
+        ))
     }
-}
-
-/// Where `address` redirecting to `to` (its `Location`, maybe relative) leads, held to
-/// `bounds`: with `https_only`, a redirect off HTTPS is [`Refused::Downgraded`].
-fn redirected(address: &str, to: &str, bounds: Bounds) -> anyhow::Result<String> {
-    let next = url::Url::parse(address)?.join(to)?;
-    if bounds.https_only && next.scheme() != "https" {
-        return Err(Refused::Downgraded { from: address.to_owned(), to: next.to_string() }.into());
-    }
-    Ok(next.to_string())
 }
 
 impl Requests {
@@ -121,90 +114,147 @@ impl Requests {
         method: Method,
         url: &str,
         headers: &[(&str, &str)],
-        body: Bytes,
+        body: Vec<u8>,
         bounds: Bounds,
+        // A 200's body, a piece at a time as it comes, not decoded and not collected: the
+        // answer's `body` is then empty. Any other answer's body is collected, for its error.
+        mut sink: Option<Sink<'_>>,
     ) -> anyhow::Result<Response> {
-        let mut address = url.to_owned();
-        if bounds.https_only && url::Url::parse(url)?.scheme() != "https" {
-            return Err(Refused::NotHttps { url: url.to_owned() }.into());
-        }
-        for _ in 0..=REDIRECTS {
-            let mut request = Request::builder()
-                .method(method.clone())
-                .uri(&address)
-                .header(header::USER_AGENT, &*self.user_agent)
-                .header(header::ACCEPT_ENCODING, "gzip");
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-            let request = request.body(Full::new(body.clone()))?;
-            let answer = tokio::time::timeout(self.timeout, self.client.request(request))
-                .await
-                .map_err(|_| Transport(format!("no answer from {address} in {:?}", self.timeout)))?
-                .map_err(|e| Transport(format!("asking {address}: {e:#}")))?;
-            let status = answer.status();
-            if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
-                let to = answer.headers().get(header::LOCATION).and_then(|it| it.to_str().ok());
-                let to = to.with_context(|| format!("{address} redirects nowhere"))?;
-                address = redirected(&address, to, bounds)?;
-                continue;
-            }
-            let headers: Vec<(String, String)> = answer
-                .headers()
+        let streamed = sink.is_some();
+        let request = Request {
+            method,
+            // alloc: one per request, handed to the client.
+            url: url.to_owned(),
+            // alloc: one per request, its headers handed to the client.
+            headers: headers
                 .iter()
-                .filter_map(|(name, value)| {
-                    Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
-                })
-                .collect();
-            let too_big = |said: Option<u64>, decoded: bool| Refused::TooBig {
-                url: address.clone(),
-                most: bounds.most,
-                said,
-                decoded,
-            };
-            let said = answer
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|it| it.to_str().ok()?.trim().parse::<u64>().ok());
-            if let Some(said) = said.filter(|it| *it > bounds.most) {
-                return Err(too_big(Some(said), false).into());
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            body,
+            // A streamed body is written out as it comes and hashed from there, so it is asked
+            // for as it is kept: not encoded. Any other is asked for as gzip, decoded by the
+            // client and held to `most` once decoded.
+            gzip: !streamed,
+            most: bounds.most,
+            https_only: bounds.https_only,
+        };
+        // Dropping the answer before its end cancels the request, closing its connection.
+        let mut answer = self.driver.ask(request);
+        // `said`, with no userinfo, query or fragment (a redirect's `X-Amz-Signature`), is the
+        // only form of the address that answered any message holds.
+        let (said, status, headers) = match next(&mut answer, url).await? {
+            Event::Head { url, status, headers, .. } => (redact(&url), status, headers),
+            Event::Failed { error, .. } => return Err(failed(error)),
+            Event::Body { .. } | Event::Done { .. } => {
+                anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
             }
-            let mut body = answer.into_body();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = self.next(&mut body, &address).await? {
-                if bytes.len() as u64 + chunk.len() as u64 > bounds.most {
-                    return Err(too_big(None, false).into());
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            let mut response = Response { status: status.as_u16(), headers, body: bytes };
-            if response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
+        };
+        if let Some(sink) = sink.as_mut().filter(|_| status == 200) {
+            let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
+            // A server's answer, not a lost connection: asking again gets the same, so it is
+            // no `Transport` error and never tried again.
+            if let Some((_, encoding)) =
+                encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
             {
-                let mut decoded = Vec::new();
-                flate2::read::GzDecoder::new(&response.body[..])
-                    .take(bounds.most.saturating_add(1))
-                    .read_to_end(&mut decoded)
-                    .map_err(|e| Transport(format!("{address} sent gzip that is not: {e}")))?;
-                if decoded.len() as u64 > bounds.most {
-                    return Err(too_big(None, true).into());
-                }
-                response.body = decoded;
+                anyhow::bail!(
+                    "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
+                );
             }
-            return Ok(response);
+            // Held to `bounds.most` by the client, as sent (nothing is decoded).
+            while let Some(piece) = next_piece(&mut answer, &said).await? {
+                sink(&piece).with_context(|| format!("keeping the body of {said}"))?;
+            }
+            return Ok(Response { status, headers, body: Vec::new() });
         }
-        anyhow::bail!("{url}: more than {REDIRECTS} redirects")
-    }
-
-    async fn next(&self, body: &mut Incoming, address: &str) -> anyhow::Result<Option<Bytes>> {
-        loop {
-            let frame = tokio::time::timeout(self.timeout, body.frame()).await.map_err(|_| {
-                Transport(format!("transfer from {address} stalled for {:?}", self.timeout))
-            })?;
-            let Some(frame) = frame else { return Ok(None) };
-            let frame = frame.map_err(|e| Transport(format!("reading from {address}: {e}")))?;
-            if let Ok(data) = frame.into_data() {
-                return Ok(Some(data));
+        // A streamed request's other answers are read for their error alone: their first
+        // `ERROR_BODY_MOST` bytes, the rest left unread (the answer dropped, its connection
+        // closed), so no server can fill the daemon's memory with a 404 page. Any other request
+        // is held to its bounds by the client.
+        let most = if streamed { ERROR_BODY_MOST.min(bounds.most) } else { bounds.most };
+        let room = usize::try_from(most).unwrap_or(usize::MAX);
+        // alloc: one per answer, its body for the caller.
+        let mut bytes = Vec::new();
+        while let Some(piece) = next_piece(&mut answer, &said).await? {
+            let left = room.saturating_sub(bytes.len());
+            if piece.len() > left {
+                if !streamed {
+                    // The client holds the body to `most` itself; past it is its bug, said here.
+                    let refused =
+                        Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
+                    return Err(refused.into());
+                }
+                bytes.extend_from_slice(&piece[..left]);
+                break;
             }
+            bytes.extend_from_slice(&piece);
+        }
+        drop(answer);
+        let mut response = Response { status, headers, body: bytes };
+        // gzip a streamed request did not ask for, on an error's body: decoded for its message,
+        // as far as `most`. Any other request's gzip the client decoded.
+        if streamed
+            && response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
+        {
+            // alloc: one per gzip error body, at most `most` bytes and one.
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(&response.body[..])
+                .take(most.saturating_add(1))
+                .read_to_end(&mut decoded)
+                .map_err(|e| Transport(format!("{said} sent gzip that is not: {e}")))?;
+            decoded.truncate(room);
+            response.body = decoded;
+        }
+        Ok(response)
+    }
+}
+
+/// `answer`'s next event; `url` is the address asked, said only redacted.
+async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
+    answer.next().await.with_context(|| {
+        format!(
+            "asking {}: blaze-http's driver ended before the answer did (its runtime shut down, or its loop panicked)",
+            redact(url)
+        )
+    })
+}
+
+/// The next piece of `answer`'s body, `None` at its end; `said` is the address that answered.
+async fn next_piece(answer: &mut Answer, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    match next(answer, said).await? {
+        Event::Body { bytes, .. } => Ok(Some(bytes)),
+        Event::Done { .. } => Ok(None),
+        Event::Failed { error, .. } => Err(failed(error)),
+        Event::Head { .. } => anyhow::bail!("{said}: blaze-http's client told of a second head"),
+    }
+}
+
+/// `error`, as blaze-registry's callers read it: a refusal is [`Refused`], a lost connection or
+/// a timeout is [`Transport`] (worth another try), anything else names the address. Every
+/// address is said redacted: `error.url` may hold a credential or a signature.
+fn failed(error: blaze_http::Error) -> anyhow::Error {
+    let said = redact(&error.url);
+    match error.kind {
+        Kind::NotHttps => Refused::NotHttps { url: said }.into(),
+        Kind::Downgraded { to } => Refused::Downgraded { from: said, to: redact(&to) }.into(),
+        Kind::TooBig { most, said: length, decoded } => {
+            Refused::TooBig { url: said, most, said: length, decoded }.into()
+        }
+        Kind::NoAnswer { after, .. } => {
+            Transport(format!("no answer from {said} in {after:?}")).into()
+        }
+        Kind::Stalled { after, .. } => {
+            Transport(format!("transfer from {said} stalled for {after:?}")).into()
+        }
+        Kind::Io { step, host, port, why } => {
+            Transport(scrub(&format!("{step} {host}:{port} for {said}: {why}"))).into()
+        }
+        Kind::Gzip(why) => Transport(format!("{said} sent gzip that is not: {why}")).into(),
+        kind @ (Kind::Url(_)
+        | Kind::Header(_)
+        | Kind::Redirects { .. }
+        | Kind::RedirectsNowhere { .. }
+        | Kind::InUse) => {
+            anyhow::anyhow!("{said}: {kind}")
         }
     }
 }
@@ -212,6 +262,22 @@ impl Requests {
 impl Http for HyperHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         self.send(Method::GET, url, headers, Vec::new())
+    }
+
+    fn stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        sink: Sink<'_>,
+    ) -> anyhow::Result<Response> {
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Vec::new(),
+            Bounds::NONE,
+            Some(sink),
+        ))
     }
 
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
@@ -223,7 +289,7 @@ impl Http for HyperHttp {
             let _turn = in_flight.acquire_owned().await?;
             let headers: Vec<(&str, &str)> =
                 headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-            client.fetch(Method::GET, &url, &headers, Bytes::new(), Bounds::NONE).await
+            client.fetch(Method::GET, &url, &headers, Vec::new(), Bounds::NONE, None).await
         });
         Box::pin(async move { task.await.context("a request's task ended")? })
     }
@@ -238,7 +304,7 @@ impl Http for HyperHttp {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
 
     use super::*;
 
@@ -288,29 +354,145 @@ mod tests {
         assert!(matches!(got.downcast_ref::<Refused>(), Some(Refused::NotHttps { .. })), "{got:#}");
     }
 
-    /// With `https_only` a redirect may move within HTTPS but never off it, to an absolute or
-    /// a scheme-relative `http:` address; without it, any redirect is followed.
+    /// A transfer that stalls after a redirect to a signed address says no part of either
+    /// address's query: no `?`, no `@` (a credential in it) and no signature in its message.
     #[test]
-    fn an_https_only_redirect_to_plain_http_is_refused() {
-        let https_only = Bounds { most: u64::MAX, https_only: true };
-        let from = "https://github.com/o/r/releases/download/v1/a.tar.gz";
-        assert_eq!(
-            redirected(from, "https://objects.example/a?sig=1", https_only).unwrap(),
-            "https://objects.example/a?sig=1"
-        );
-        assert_eq!(redirected(from, "/b", https_only).unwrap(), "https://github.com/b");
-        for to in ["http://objects.example/a", "HTTP://objects.example/a"] {
-            let got = redirected(from, to, https_only).unwrap_err();
-            match got.downcast_ref::<Refused>() {
-                Some(Refused::Downgraded { from: was, to: now }) => {
-                    assert_eq!((was.as_str(), now.as_str()), (from, "http://objects.example/a"));
+    fn a_stalled_transfer_says_no_credential() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let to =
+            format!("http://127.0.0.1:{port}/b?X-Amz-Credential=me@example&X-Amz-Signature=secret");
+        let answers = [
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_owned(),
+        ];
+        std::thread::Builder::new()
+            .name("a server that stalls".to_owned())
+            .spawn(move || {
+                let mut open = Vec::new();
+                for answer in answers {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut asked = [0u8; 4096];
+                    _ = stream.read(&mut asked);
+                    _ = stream.write_all(answer.as_bytes());
+                    open.push(stream);
                 }
-                other => panic!("{to}: {other:?}"),
+                // Holds the second transfer open, 97 bytes short, until the test ends.
+                _ = listener.accept();
+                drop(open);
+            })
+            .unwrap();
+        let http = HyperHttp::new(Duration::from_millis(500)).unwrap();
+        let url = format!("http://127.0.0.1:{port}/a?token=secret@x");
+        let got = http.stream(&url, &[], &mut |_| Ok(())).unwrap_err();
+        let said = format!("{got:#}");
+        assert!(got.downcast_ref::<Transport>().is_some(), "{said}");
+        assert!(said.contains("stalled"), "{said}");
+        assert!(said.contains(&format!("http://127.0.0.1:{port}/b")), "{said}");
+        assert!(!said.contains('?') && !said.contains('@') && !said.contains("secret"), "{said}");
+    }
+
+    /// Requests to one origin take turns on one kept-alive connection, so a server that counts
+    /// its connections sees one for three requests; a port no one listens on is a [`Transport`]
+    /// error (worth another try) naming the host, the port and the step that failed. The one
+    /// test of the tokio driver against real sockets; the client's rules are blaze-http's
+    /// tests, with no IO.
+    #[test]
+    fn requests_reuse_a_pooled_connection_and_a_refused_one_says_where() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let server = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let listener = server.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        // Answers every request on a connection with a two-byte 200 and keeps it open; it
+        // accepts at most four connections, and stops after a minute either way.
+        let serving = async move {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut asked = Vec::new();
+                    let mut piece = [0u8; 1024];
+                    loop {
+                        let end = loop {
+                            if let Some(at) = asked.windows(4).position(|it| it == b"\r\n\r\n") {
+                                break at + 4;
+                            }
+                            match stream.read(&mut piece).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => asked.extend_from_slice(&piece[..n]),
+                            }
+                        };
+                        asked.drain(..end);
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
             }
+        };
+        std::thread::Builder::new()
+            .name("a keep-alive server".to_owned())
+            .spawn(move || {
+                server.block_on(async move {
+                    _ = tokio::time::timeout(Duration::from_secs(60), serving).await
+                })
+            })
+            .unwrap();
+
+        let http = HyperHttp::new(Duration::from_secs(10)).unwrap();
+        let url = format!("http://127.0.0.1:{port}/a");
+        for _ in 0..3 {
+            let got = http.get(&url, &[]).unwrap();
+            assert_eq!((got.status, &got.body[..]), (200, &b"ok"[..]));
         }
         assert_eq!(
-            redirected(from, "http://objects.example/a", Bounds::NONE).unwrap(),
-            "http://objects.example/a"
+            accepted.load(Ordering::SeqCst),
+            1,
+            "three requests should have shared one connection"
         );
+
+        let refusing = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = refusing.local_addr().unwrap().port();
+        drop(refusing);
+        let got = http.get(&format!("http://127.0.0.1:{closed}/a"), &[]).unwrap_err();
+        let said = format!("{got:#}");
+        assert!(got.downcast_ref::<Transport>().is_some(), "{said}");
+        assert!(
+            said.contains(&format!(
+                "connecting to 127.0.0.1:{closed} for http://127.0.0.1:{closed}/a"
+            )),
+            "{said}"
+        );
+    }
+
+    /// A redirect off HTTPS (blaze-http's tests follow one there) is [`Refused::Downgraded`],
+    /// naming both addresses without their queries.
+    #[test]
+    fn an_https_only_redirect_to_plain_http_is_refused() {
+        let error = blaze_http::Error {
+            url: "https://github.com/o/r/releases/download/v1/a.tar.gz?sig=1".to_owned(),
+            kind: Kind::Downgraded { to: "http://objects.example/a?sig=2".to_owned() },
+        };
+        match failed(error).downcast_ref::<Refused>() {
+            Some(Refused::Downgraded { from, to }) => assert_eq!(
+                (from.as_str(), to.as_str()),
+                (
+                    "https://github.com/o/r/releases/download/v1/a.tar.gz",
+                    "http://objects.example/a"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }

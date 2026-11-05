@@ -2,12 +2,15 @@
 
 Every script under harness/v2 takes, in its typed input, an `engine`:
 
-    {"kind": "v1", "blaze": "target/release/blaze", "backend": "cranelift"}
+    {"kind": "v2", "blaze": "target/release/blaze"}
 
 (`backend` is v1's, given it as BLAZE_BACKEND; v2 takes only the default, as it picks each
 unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set. v2 also takes
 `"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend for every function,
-`"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
+`"default"` leaving it to blaze), and does everything through `Engine`. `Engine.of` refuses
+`"kind": "v1"`: v1 is gone, and its adapter (`V1`) read what its workers logged and the
+`loading`/`ready` states `blaze status` printed, which a v2 blaze has none of, so against one it
+would measure nothing without a word. Builds, runs and tests go through the `blaze` command
 line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
 script is the same for both. What only an engine's insides can say (what an edit recompiled,
 the codegen inputs of a build, the critical path of a cold build) is a method here:
@@ -39,11 +42,14 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import blake3
+
+if TYPE_CHECKING:
+    from storelib import BuildFinished
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
@@ -131,6 +137,9 @@ class Ran:
     returncode: int
     stdout: str
     stderr: str
+    # Its `build-finished` line read (harness/storelib.py), where the engine asked for one and
+    # cut `stdout` to what came after it (`V1.build`); None otherwise.
+    finished: "BuildFinished | None" = None
 
     def said(self, tail: int = 3000) -> str:
         return (self.stdout + self.stderr)[-tail:]
@@ -392,10 +401,12 @@ def first_difference_by(proof: Path, a: Path, b: Path) -> str:
     return f"one ends at byte {at:#x}"
 
 
-def toolchain_identity(env: dict[str, str]) -> str:
-    """What the pinned toolchain says it is (`rustc -vV`, `cargo -vV`), for a result to name."""
-    said = [run(f"`{tool} -vV`", [tool, "-vV"], ROOT, env, 300, check=True).stdout for tool in ("rustc", "cargo")]
-    return "\n".join(said)
+def toolchain_identity(blaze: Path, env: dict[str, str]) -> str:
+    """What blaze says its toolchain is (`blaze toolchain --json`: name, nightly, `rustc -V`'s
+    line, commit, host, sysroot), for a result to name. blaze answers; no rustc or cargo runs.
+    Downloads blaze's Rust once when it is not there yet."""
+    return run(f"`{blaze} toolchain --json`", [str(blaze), "toolchain", "--json"], ROOT, env, 900,
+               check=True).stdout.strip()
 
 
 class Engine(ABC):
@@ -422,7 +433,11 @@ class Engine(ABC):
 
     @staticmethod
     def of(spec: EngineSpec) -> "Engine":
-        return V1(spec) if spec.kind == "v1" else V2(spec)
+        if spec.kind == "v1":
+            raise Failed(f"engine.kind 'v1' ({spec.blaze}): v1 is gone, and its adapter reads its workers' logs "
+                         "(`<home>/*/*/log`) and `blaze status`'s `loading`/`ready` lines, which v2 has none of; "
+                         "give `\"kind\": \"v2\"`")
+        return V2(spec)
 
     @property
     def kind(self) -> Kind:
@@ -502,19 +517,38 @@ class Engine(ABC):
 
 
 class V1(Engine):
-    """Today's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
-    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so."""
+    """v1's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
+    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so. `Engine.of` no
+    longer gives it (v1 is gone); only proof.py's check of its log reader still builds one."""
 
     def not_blazes(self, ran: Ran) -> str | None:
         import blaze_cli
 
-        how_built: Callable[[str], str] = getattr(blaze_cli, "how_built")
-        how = how_built(ran.stderr)
-        if how == "daemon" or how.startswith("unchanged"):
+        # Reads `ran.finished`, which `build` filled from the `build-finished` line.
+        how_built: Callable[[Ran], str] = getattr(blaze_cli, "how_built")
+        how = how_built(ran)
+        if how == "daemon":
             return None
-        # `how_built` now says "daemon" or "failed: <error>", never "cargo", and blaze_cli's
-        # `by_rustc` (the check of a refused build that went to cargo) is gone (queue 01087).
+        # `how_built` says "daemon", "served <how>, not by the daemon" or "failed: <error>",
+        # never "cargo", and blaze_cli's `by_rustc` (the check of a refused build that went to
+        # cargo) is gone (queue 01087).
         return how
+
+    def command(self, step: str, command: str, args: list[str], ws: Path, env: dict[str, str],
+                timeout: float = 7200) -> Ran:
+        """`blaze COMMAND ARGS` in `ws`; a command that builds runs with the format its build is
+        read by (`blaze_cli.machine_format`), its `build-finished` line goes to `Ran.finished` and
+        its `stdout` is what came after the line: the program's or the tests' own output."""
+        import blaze_cli
+        import storelib
+
+        machine_format: Callable[[str, Sequence[str]], list[str]] = getattr(blaze_cli, "machine_format")
+        added = machine_format(command, args)
+        ran = run(step, [str(self.blaze), command, *added, *args], ws, env, timeout)
+        if not added:
+            return ran
+        finished, rest = storelib.split_build_output(ran.stdout)
+        return replace(ran, stdout=rest, finished=finished) if finished is not None else ran
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:

@@ -19,7 +19,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
@@ -30,6 +29,7 @@ use blaze_resolve::{
 };
 use blaze_units::read::{self, Root};
 use serde_json::Value;
+use std::alloc::Global;
 use url::Url;
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Result<&'a str> {

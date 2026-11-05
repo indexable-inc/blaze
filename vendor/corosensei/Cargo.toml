@@ -1,0 +1,123 @@
+[package]
+edition = "2021"
+rust-version = "1.59.0"
+name = "corosensei"
+version = "0.3.4"
+authors = ["Amanieu d'Antras <amanieu@gmail.com>"]
+build = "build.rs"
+exclude = [
+    ".github",
+    "ci",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A fast and safe implementation of stackful coroutines"
+readme = "README.md"
+keywords = [
+    "coroutine",
+    "stack",
+    "fiber",
+    "generator",
+]
+categories = [
+    "data-structures",
+    "no-std",
+    "concurrency",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Amanieu/corosensei"
+
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "i686-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "armv7-unknown-linux-gnueabihf",
+    "riscv64gc-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc",
+]
+
+[features]
+asm-unwind = ["unwind"]
+default = [
+    "default-stack",
+    "unwind",
+]
+default-stack = [
+    "libc",
+    "windows-sys",
+]
+sanitizer = []
+unwind = []
+
+[lib]
+name = "corosensei"
+path = "src/lib.rs"
+
+[[example]]
+name = "backtrace"
+path = "examples/backtrace.rs"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "panic"
+path = "examples/panic.rs"
+
+[[bench]]
+name = "coroutine"
+path = "benches/coroutine.rs"
+harness = false
+
+[dependencies.cfg-if]
+version = "1.0.0"
+
+[dependencies.scopeguard]
+version = "1.2.0"
+default-features = false
+
+[dev-dependencies.backtrace]
+version = "0.3.69"
+
+[dev-dependencies.criterion]
+version = "0.5.1"
+
+[build-dependencies.autocfg]
+version = "1.1.0"
+
+# blaze: assembles src/arch/asm/*.S (SOURCE.md).
+[build-dependencies.cc]
+version = "1"
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dev-dependencies.criterion-cycles-per-byte]
+version = "0.6.1"
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2.159"
+optional = true
+
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.59.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+]
+optional = true
+
+[profile.bench]
+debug = 2
+
+[profile.release]
+debug = 2

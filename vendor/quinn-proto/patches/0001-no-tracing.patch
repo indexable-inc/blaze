@@ -1,0 +1,3031 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 818b08e..fa47d3e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -56,7 +56,7 @@ default = [
+     "log",
+     "bloom",
+ ]
+-log = ["tracing/log"]
++log = []
+ platform-verifier = ["dep:rustls-platform-verifier"]
+ qlog = ["dep:qlog"]
+ ring = ["dep:ring"]
+@@ -142,11 +142,6 @@ features = [
+     "alloc",
+ ]
+ 
+-[dependencies.tracing]
+-version = "0.1.10"
+-features = ["std"]
+-default-features = false
+-
+ [dev-dependencies.assert_matches]
+ version = "1.1"
+ 
+@@ -159,17 +154,6 @@ version = "1"
+ [dev-dependencies.rcgen]
+ version = "0.14"
+ 
+-[dev-dependencies.tracing-subscriber]
+-version = "0.3.0"
+-features = [
+-    "env-filter",
+-    "fmt",
+-    "ansi",
+-    "time",
+-    "local-time",
+-]
+-default-features = false
+-
+ [dev-dependencies.wasm-bindgen-test]
+ version = "0.3.45"
+ 
+diff --git a/src/bloom_token_log.rs b/src/bloom_token_log.rs
+index dd5e83d..5f13724 100644
+--- a/src/bloom_token_log.rs
++++ b/src/bloom_token_log.rs
+@@ -8,7 +8,6 @@ use std::{
+ 
+ use fastbloom::BloomFilter;
+ use rustc_hash::FxBuildHasher;
+-use tracing::{trace, warn};
+ 
+ use crate::{Duration, SystemTime, TokenLog, TokenReuseError, UNIX_EPOCH};
+ 
+@@ -60,8 +59,6 @@ impl TokenLog for BloomTokenLog {
+         issued: SystemTime,
+         lifetime: Duration,
+     ) -> Result<(), TokenReuseError> {
+-        trace!(%nonce, "check_and_insert");
+-
+         if lifetime.is_zero() {
+             // avoid divide-by-zero if lifetime is zero
+             return Err(TokenReuseError);
+@@ -78,7 +75,6 @@ impl TokenLog for BloomTokenLog {
+         else {
+             // shouldn't happen unless time travels backwards or lifetime changes or the current
+             // system time is before the Unix epoch
+-            warn!("BloomTokenLog presented with token too far in past");
+             return Err(TokenReuseError);
+         };
+ 
+diff --git a/src/config/transport.rs b/src/config/transport.rs
+index ba00695..23b0d57 100644
+--- a/src/config/transport.rs
++++ b/src/config/transport.rs
+@@ -587,8 +587,6 @@ impl QlogConfig {
+ 
+     /// Construct the [`QlogStream`] described by this configuration
+     pub fn into_stream(self) -> Option<QlogStream> {
+-        use tracing::warn;
+-
+         let writer = self.writer?;
+         let trace = qlog::TraceSeq::new(
+             qlog::VantagePoint {
+@@ -618,10 +616,7 @@ impl QlogConfig {
+ 
+         match streamer.start_log() {
+             Ok(()) => Some(QlogStream(Arc::new(Mutex::new(streamer)))),
+-            Err(e) => {
+-                warn!("could not initialize endpoint qlog streamer: {e}");
+-                None
+-            }
++            Err(_) => None,
+         }
+     }
+ }
+diff --git a/src/connection/cid_state.rs b/src/connection/cid_state.rs
+index 08ad20c..3ec5a1e 100644
+--- a/src/connection/cid_state.rs
++++ b/src/connection/cid_state.rs
+@@ -2,7 +2,6 @@
+ use std::collections::VecDeque;
+ 
+ use rustc_hash::FxHashSet;
+-use tracing::{debug, trace};
+ 
+ use crate::{Duration, Instant, TransportError, shared::IssuedCid};
+ 
+@@ -55,7 +54,6 @@ impl CidState {
+     /// Find the next timestamp when previously issued CID should be retired
+     pub(crate) fn next_timeout(&mut self) -> Option<Instant> {
+         self.retire_timestamp.front().map(|nc| {
+-            trace!("CID {} will expire at {:?}", nc.sequence, nc.timestamp);
+             nc.timestamp
+         })
+     }
+@@ -161,10 +159,6 @@ impl CidState {
+             ));
+         }
+         if sequence > self.issued {
+-            debug!(
+-                sequence,
+-                "got RETIRE_CONNECTION_ID for unissued sequence number"
+-            );
+             return Err(TransportError::PROTOCOL_VIOLATION(
+                 "RETIRE_CONNECTION_ID for unissued sequence number",
+             ));
+diff --git a/src/connection/datagrams.rs b/src/connection/datagrams.rs
+index 411f827..71263bc 100644
+--- a/src/connection/datagrams.rs
++++ b/src/connection/datagrams.rs
+@@ -2,7 +2,6 @@ use std::collections::VecDeque;
+ 
+ use bytes::Bytes;
+ use thiserror::Error;
+-use tracing::{debug, trace};
+ 
+ use super::{Connection, Event};
+ use crate::{
+@@ -143,7 +142,6 @@ impl DatagramState {
+ 
+         let was_empty = self.incoming.is_empty();
+         while self.incoming.memory_used() + size_with_overhead > window {
+-            debug!("dropping stale datagram");
+             self.recv();
+         }
+ 
+@@ -153,10 +151,9 @@ impl DatagramState {
+ 
+     fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
+         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
+-            let Some(prev) = self.outgoing.pop_front() else {
++            let Some(_) = self.outgoing.pop_front() else {
+                 break;
+             };
+-            trace!(len = prev.data.len(), "dropping outgoing datagram");
+         }
+     }
+ 
+@@ -184,11 +181,6 @@ impl DatagramState {
+         self.outgoing.queue.retain(|datagram| {
+             let result = datagram.data.len() <= max_payload;
+             if !result {
+-                trace!(
+-                    "dropping {} byte datagram violating {} byte limit",
+-                    datagram.data.len(),
+-                    max_payload
+-                );
+                 self.outgoing.payload_bytes -= datagram.data.len();
+                 dropped_any = true;
+             }
+@@ -214,7 +206,6 @@ impl DatagramState {
+             return false;
+         }
+ 
+-        trace!(len = datagram.data.len(), "DATAGRAM");
+         datagram.encode(true, buf);
+         true
+     }
+diff --git a/src/connection/mod.rs b/src/connection/mod.rs
+index 5155740..264943d 100644
+--- a/src/connection/mod.rs
++++ b/src/connection/mod.rs
+@@ -12,7 +12,6 @@ use frame::StreamMetaVec;
+ 
+ use rand::{RngExt, SeedableRng, rngs::StdRng};
+ use thiserror::Error;
+-use tracing::{debug, error, trace, trace_span, warn};
+ 
+ use crate::{
+     Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+@@ -597,7 +596,6 @@ impl Connection {
+                     .path
+                     .anti_amplification_blocked(segment_size as u64 * (num_datagrams as u64) + 1)
+                 {
+-                    trace!("blocked by anti-amplification");
+                     break;
+                 }
+ 
+@@ -618,7 +616,6 @@ impl Connection {
+                         congestion_blocked = true;
+                         // We continue instead of breaking here in order to avoid
+                         // blocking loss probes queued for higher spaces.
+-                        trace!("blocked by congestion control");
+                         continue;
+                     }
+ 
+@@ -635,7 +632,6 @@ impl Connection {
+                         congestion_blocked = true;
+                         // Loss probes should be subject to pacing, even though
+                         // they are not congestion controlled.
+-                        trace!("blocked by pacing");
+                         break;
+                     }
+                 }
+@@ -667,10 +663,6 @@ impl Connection {
+                             && !pad_datagram_to_mtu)
+                             || datagram_start + segment_size > buf_capacity
+                         {
+-                            trace!(
+-                                "GSO truncated by demand for {} padding bytes or loss probe",
+-                                segment_size - packet_len_unpadded
+-                            );
+                             builder_storage = Some(builder);
+                             break;
+                         }
+@@ -792,7 +784,6 @@ impl Connection {
+                 space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting);
+ 
+             if close {
+-                trace!("sending CONNECTION_CLOSE");
+                 // Encode ACKs before the ConnectionClose message, to give the receiver
+                 // a better approximate on what data has been processed. This is
+                 // especially important with ack delay, since the peer might not
+@@ -858,7 +849,6 @@ impl Connection {
+                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
+                     // above.
+                     let mut builder = builder_storage.take().unwrap();
+-                    trace!("PATH_RESPONSE {:08x} (off-path)", token);
+                     buf.write(frame::FrameType::PATH_RESPONSE);
+                     buf.write(token);
+                     self.stats.frame_tx.path_response += 1;
+@@ -987,15 +977,12 @@ impl Connection {
+ 
+             self.stats.path.sent_plpmtud_probes += 1;
+             num_datagrams = 1;
+-
+-            trace!(?probe_size, "writing MTUD probe");
+         }
+ 
+         if buf.is_empty() {
+             return None;
+         }
+ 
+-        trace!("sending {} bytes in {} datagrams", buf.len(), num_datagrams);
+         self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
+ 
+         self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
+@@ -1051,7 +1038,6 @@ impl Connection {
+             false,
+             self,
+         )?;
+-        trace!("validating previous path with PATH_CHALLENGE {:08x}", token);
+         buf.write(frame::FrameType::PATH_CHALLENGE);
+         buf.write(token);
+         self.stats.frame_tx.path_challenge += 1;
+@@ -1129,7 +1115,6 @@ impl Connection {
+                 // forbids migration, drop the datagram. This could be relaxed to heuristically
+                 // permit NAT-rebinding-like migration.
+                 if remote != self.path.remote && !self.side.remote_may_migrate() {
+-                    trace!("discarding packet from unrecognized peer {}", remote);
+                     return;
+                 }
+ 
+@@ -1193,7 +1178,6 @@ impl Connection {
+                 continue;
+             }
+             self.timers.stop(timer);
+-            trace!(timer = ?timer, "timeout");
+             match timer {
+                 Timer::Close => {
+                     self.state = State::Drained;
+@@ -1203,7 +1187,6 @@ impl Connection {
+                     self.kill(ConnectionError::TimedOut);
+                 }
+                 Timer::KeepAlive => {
+-                    trace!("sending keep-alive");
+                     self.ping();
+                 }
+                 Timer::LossDetection => {
+@@ -1221,28 +1204,22 @@ impl Connection {
+                     self.prev_crypto = None;
+                 }
+                 Timer::PathValidation => {
+-                    debug!("path validation failed");
+                     if let Some((_, prev)) = self.prev_path.take() {
+                         self.path = prev;
+                     }
+                     self.path.challenge = None;
+                     self.path.challenge_pending = false;
+                 }
+-                Timer::Pacing => trace!("pacing timer expired"),
++                Timer::Pacing => {}
+                 Timer::PushNewCid => {
+                     // Update `retire_prior_to` field in NEW_CONNECTION_ID frame
+                     let num_new_cid = self.local_cid_state.on_cid_timeout().into();
+                     if !self.state.is_closed() {
+-                        trace!(
+-                            "push a new cid to peer RETIRE_PRIOR_TO field {}",
+-                            self.local_cid_state.retire_prior_to()
+-                        );
+                         self.endpoint_events
+                             .push_back(EndpointEventInner::NeedIdentifiers(now, num_new_cid));
+                     }
+                 }
+                 Timer::MaxAckDelay => {
+-                    trace!("max ack delay reached");
+                     // This timer is only armed in the Data space
+                     self.spaces[SpaceId::Data]
+                         .pending_acks
+@@ -1308,13 +1285,11 @@ impl Connection {
+     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
+     pub fn force_key_update(&mut self) {
+         if !self.state.is_established() {
+-            debug!("ignoring forced key update in illegal state");
+             return;
+         }
+         if self.prev_crypto.is_some() {
+             // We already just updated, or are currently updating, the keys. Concurrent key updates
+             // are illegal.
+-            debug!("ignoring redundant forced key update");
+             return;
+         }
+         self.update_keys(None, false);
+@@ -1572,7 +1547,6 @@ impl Connection {
+                 }
+             } else {
+                 // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
+-                debug!("ECN not acknowledged by peer");
+                 self.path.sending_ecn = false;
+             }
+         }
+@@ -1591,8 +1565,7 @@ impl Connection {
+         largest_sent_time: Instant,
+     ) {
+         match self.spaces[space].detect_ecn(newly_acked, ecn) {
+-            Err(e) => {
+-                debug!("halting ECN due to verification failure: {}", e);
++            Err(_) => {
+                 self.path.sending_ecn = false;
+                 // Wipe out the existing value because it might be garbage and could interfere with
+                 // future attempts to use ECN on new paths.
+@@ -1663,16 +1636,9 @@ impl Connection {
+         let (_, space) = match self.pto_time_and_space(now) {
+             Some(x) => x,
+             None => {
+-                error!("PTO expired while unset");
+                 return;
+             }
+         };
+-        trace!(
+-            in_flight = self.path.in_flight.bytes,
+-            count = self.pto_count,
+-            ?space,
+-            "PTO fired"
+-        );
+ 
+         let count = match self.path.in_flight.ack_eliciting {
+             // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
+@@ -1768,10 +1734,6 @@ impl Connection {
+             let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+             self.stats.path.lost_packets += lost_packets.len() as u64;
+             self.stats.path.lost_bytes += size_of_lost_packets;
+-            trace!(
+-                "packets lost: {:?}, bytes lost: {}",
+-                lost_packets, size_of_lost_packets
+-            );
+ 
+             for &packet in &lost_packets {
+                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+@@ -2019,8 +1981,6 @@ impl Connection {
+         packet: InitialPacket,
+         remaining: Option<BytesMut>,
+     ) -> Result<(), ConnectionError> {
+-        let span = trace_span!("first recv");
+-        let _guard = span.enter();
+         debug_assert!(self.side.is_server());
+         let len = packet.header_data.len() + packet.payload.len();
+         self.path.total_recvd = len as u64;
+@@ -2080,13 +2040,11 @@ impl Connection {
+                     };
+                     self.set_peer_params(params);
+                 }
+-                Err(e) => {
+-                    error!("session ticket has malformed transport parameters: {}", e);
++                Err(_) => {
+                     return;
+                 }
+             }
+         }
+-        trace!("0-RTT enabled");
+         self.zero_rtt_enabled = true;
+         self.zero_rtt_crypto = Some(ZeroRttCrypto { header, packet });
+     }
+@@ -2113,10 +2071,6 @@ impl Connection {
+ 
+         let end = crypto.offset + crypto.data.len() as u64;
+         if space < expected && end > self.spaces[space].crypto_stream.bytes_read() {
+-            warn!(
+-                "received new {:?} CRYPTO data when expecting {:?}",
+-                space, expected
+-            );
+             return Err(TransportError::PROTOCOL_VIOLATION(
+                 "new data at unexpected encryption level",
+             ));
+@@ -2134,7 +2088,6 @@ impl Connection {
+             .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
+ 
+         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+-            trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
+             if self.crypto.read_handshake(&chunk.bytes)? {
+                 self.events.push_back(Event::HandshakeDataReady);
+             }
+@@ -2174,7 +2127,6 @@ impl Connection {
+                 }
+             }
+             self.spaces[space].crypto_offset += outgoing.len() as u64;
+-            trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
+             self.spaces[space].pending.crypto.push_back(frame::Crypto {
+                 offset,
+                 data: outgoing,
+@@ -2188,7 +2140,6 @@ impl Connection {
+             self.spaces[space].crypto.is_none(),
+             "already reached packet space {space:?}"
+         );
+-        trace!("{:?} keys ready", space);
+         if space == SpaceId::Data {
+             // Precompute the first key update
+             self.next_crypto = Some(
+@@ -2209,7 +2160,6 @@ impl Connection {
+ 
+     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
+         debug_assert!(space_id != SpaceId::Data);
+-        trace!("discarding {:?} keys", space_id);
+         if space_id == SpaceId::Initial {
+             // No longer needed
+             if let ConnectionSide::Client { token, .. } = &mut self.side {
+@@ -2247,8 +2197,7 @@ impl Connection {
+                     remaining = rest;
+                     self.handle_decode(now, remote, ecn, partial_decode);
+                 }
+-                Err(e) => {
+-                    trace!("malformed header: {}", e);
++                Err(_) => {
+                     return;
+                 }
+             }
+@@ -2281,18 +2230,7 @@ impl Connection {
+         stateless_reset: bool,
+     ) {
+         self.stats.udp_rx.ios += 1;
+-        if let Some(ref packet) = packet {
+-            trace!(
+-                "got {:?} packet ({} bytes) from {} using id {}",
+-                packet.header.space(),
+-                packet.payload.len() + packet.header_data.len(),
+-                remote,
+-                packet.header.dst_cid(),
+-            );
+-        }
+-
+         if self.is_handshaking() && remote != self.path.remote {
+-            debug!("discarding packet with unexpected remote during handshake");
+             return;
+         }
+ 
+@@ -2307,15 +2245,12 @@ impl Connection {
+         };
+         let result = match decrypted {
+             _ if stateless_reset => {
+-                debug!("got stateless reset");
+                 Err(ConnectionError::Reset)
+             }
+             Err(Some(e)) => {
+-                warn!("illegal packet: {}", e);
+                 Err(e.into())
+             }
+             Err(None) => {
+-                debug!("failed to authenticate packet");
+                 self.authentication_failures += 1;
+                 let integrity_limit = self.spaces[self.highest_space]
+                     .crypto
+@@ -2331,19 +2266,11 @@ impl Connection {
+                 }
+             }
+             Ok((packet, number)) => {
+-                let span = match number {
+-                    Some(pn) => trace_span!("recv", space = ?packet.header.space(), pn),
+-                    None => trace_span!("recv", space = ?packet.header.space()),
+-                };
+-                let _guard = span.enter();
+-
+                 let is_duplicate = |n| self.spaces[packet.header.space()].dedup.insert(n);
+                 if number.is_some_and(is_duplicate) {
+-                    debug!("discarding possible duplicate packet");
+                     return;
+                 } else if self.state.is_handshake() && packet.header.is_short() {
+                     // TODO: SHOULD buffer these to improve reordering tolerance.
+-                    trace!("dropping short packet during handshake");
+                     return;
+                 } else {
+                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
+@@ -2352,7 +2279,6 @@ impl Connection {
+                                 // Clients must send the same retry token in every Initial. Initial
+                                 // packets can be spoofed, so we discard rather than killing the
+                                 // connection.
+-                                warn!("discarding Initial with invalid retry token");
+                                 return;
+                             }
+                         }
+@@ -2393,7 +2319,6 @@ impl Connection {
+                     unreachable!("timeouts aren't generated by packet processing");
+                 }
+                 ConnectionError::TransportError(err) => {
+-                    debug!("closing connection due to transport error: {}", err);
+                     State::closed(err)
+                 }
+                 ConnectionError::VersionMismatch => State::Draining,
+@@ -2437,9 +2362,7 @@ impl Connection {
+                 match packet.header.space() {
+                     SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
+-                    _ => {
+-                        trace!("discarding unexpected pre-handshake packet");
+-                    }
++                    _ => {}
+                 }
+                 return Ok(());
+             }
+@@ -2447,10 +2370,7 @@ impl Connection {
+                 for result in frame::Iter::new(packet.payload.freeze())? {
+                     let frame = match result {
+                         Ok(frame) => frame,
+-                        Err(err) => {
+-                            debug!("frame decoding error: {err:?}");
+-                            continue;
+-                        }
++                        Err(_) => continue,
+                     };
+ 
+                     if let Frame::Padding = frame {
+@@ -2460,7 +2380,6 @@ impl Connection {
+                     self.stats.frame_rx.record(&frame);
+ 
+                     if let Frame::Close(_) = frame {
+-                        trace!("draining");
+                         self.state = State::Draining;
+                         break;
+                     }
+@@ -2487,7 +2406,6 @@ impl Connection {
+                                 &packet.payload,
+                             )
+                 {
+-                    trace!("discarding invalid Retry");
+                     // - After the client has received and processed an Initial or Retry
+                     //   packet from the server, it MUST discard any subsequent Retry
+                     //   packets that it receives.
+@@ -2498,7 +2416,6 @@ impl Connection {
+                     return Ok(());
+                 }
+ 
+-                trace!("retrying with CID {}", rem_cid);
+                 let client_hello = state.client_hello.take().unwrap();
+                 self.retry_src_cid = Some(rem_cid);
+                 self.rem_cids.update_initial_cid(rem_cid);
+@@ -2550,10 +2467,6 @@ impl Connection {
+                 ..
+             } => {
+                 if rem_cid != self.rem_handshake_cid {
+-                    debug!(
+-                        "discarding packet with mismatched remote CID: {} != {}",
+-                        self.rem_handshake_cid, rem_cid
+-                    );
+                     return Ok(());
+                 }
+                 self.on_path_validated();
+@@ -2564,7 +2477,6 @@ impl Connection {
+                 }
+ 
+                 if self.crypto.is_handshaking() {
+-                    trace!("handshake ongoing");
+                     return Ok(());
+                 }
+ 
+@@ -2582,7 +2494,6 @@ impl Connection {
+                     if self.has_0rtt() {
+                         if !self.crypto.early_data_accepted().unwrap() {
+                             debug_assert!(self.side.is_client());
+-                            debug!("0-RTT rejected");
+                             self.accepted_0rtt = false;
+                             self.streams.zero_rtt_rejected();
+ 
+@@ -2614,14 +2525,12 @@ impl Connection {
+ 
+                 self.events.push_back(Event::Connected);
+                 self.state = State::Established;
+-                trace!("established");
+                 Ok(())
+             }
+             Header::Initial(InitialHeader {
+                 src_cid: rem_cid, ..
+             }) => {
+                 if !state.rem_cid_set {
+-                    trace!("switching remote CID to {}", rem_cid);
+                     let mut state = state.clone();
+                     self.rem_cids.update_initial_cid(rem_cid);
+                     self.rem_handshake_cid = rem_cid;
+@@ -2629,10 +2538,6 @@ impl Connection {
+                     state.rem_cid_set = true;
+                     self.state = State::Handshake(state);
+                 } else if rem_cid != self.rem_handshake_cid {
+-                    debug!(
+-                        "discarding packet with mismatched remote CID: {} != {}",
+-                        self.rem_handshake_cid, rem_cid
+-                    );
+                     return Ok(());
+                 }
+ 
+@@ -2678,7 +2583,6 @@ impl Connection {
+                 if supported {
+                     return Ok(());
+                 }
+-                debug!("remote doesn't support our version");
+                 Err(ConnectionError::VersionMismatch)
+             }
+             Header::Short { .. } => unreachable!(
+@@ -2698,14 +2602,12 @@ impl Connection {
+         let mut ack_eliciting = false;
+         for result in frame::Iter::new(packet.payload.freeze())? {
+             let frame = result?;
+-            let span = match frame {
+-                Frame::Padding => continue,
+-                _ => Some(trace_span!("frame", ty = %frame.ty())),
+-            };
++            if let Frame::Padding = frame {
++                continue;
++            }
+ 
+             self.stats.frame_rx.record(&frame);
+ 
+-            let _guard = span.as_ref().map(|x| x.enter());
+             ack_eliciting |= frame.is_ack_eliciting();
+ 
+             // Process frames
+@@ -2756,30 +2658,11 @@ impl Connection {
+         let mut ack_eliciting = false;
+         for result in frame::Iter::new(payload)? {
+             let frame = result?;
+-            let span = match frame {
+-                Frame::Padding => continue,
+-                _ => Some(trace_span!("frame", ty = %frame.ty())),
+-            };
+-
+-            self.stats.frame_rx.record(&frame);
+-            // Crypto, Stream and Datagram frames are special cased in order no pollute
+-            // the log with payload data
+-            match &frame {
+-                Frame::Crypto(f) => {
+-                    trace!(offset = f.offset, len = f.data.len(), "got crypto frame");
+-                }
+-                Frame::Stream(f) => {
+-                    trace!(id = %f.id, offset = f.offset, len = f.data.len(), fin = f.fin, "got stream frame");
+-                }
+-                Frame::Datagram(f) => {
+-                    trace!(len = f.data.len(), "got datagram frame");
+-                }
+-                f => {
+-                    trace!("got frame {:?}", f);
+-                }
++            if let Frame::Padding = frame {
++                continue;
+             }
+ 
+-            let _guard = span.as_ref().map(|x| x.enter());
++            self.stats.frame_rx.record(&frame);
+             if packet.header.is_0rtt() {
+                 match frame {
+                     Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
+@@ -2831,7 +2714,6 @@ impl Connection {
+                 }
+                 Frame::PathResponse(token) => {
+                     if self.path.challenge == Some(token) && remote == self.path.remote {
+-                        trace!("new path validated");
+                         self.timers.stop(Timer::PathValidation);
+                         self.path.challenge = None;
+                         self.path.validated = true;
+@@ -2839,8 +2721,6 @@ impl Connection {
+                             prev_path.challenge = None;
+                             prev_path.challenge_pending = false;
+                         }
+-                    } else {
+-                        debug!(token, "ignoring invalid PATH_RESPONSE");
+                     }
+                 }
+                 Frame::MaxData(bytes) => {
+@@ -2857,20 +2737,13 @@ impl Connection {
+                         self.spaces[SpaceId::Data].pending.max_data = true;
+                     }
+                 }
+-                Frame::DataBlocked { offset } => {
+-                    debug!(offset, "peer claims to be blocked at connection level");
+-                }
++                Frame::DataBlocked { .. } => {}
+                 Frame::StreamDataBlocked { id, offset } => {
+                     if id.initiator() == self.side.side() && id.dir() == Dir::Uni {
+-                        debug!("got STREAM_DATA_BLOCKED on send-only {}", id);
+                         return Err(TransportError::STREAM_STATE_ERROR(
+                             "STREAM_DATA_BLOCKED on send-only stream",
+                         ));
+                     }
+-                    debug!(
+-                        stream = %id,
+-                        offset, "peer claims to be blocked at stream level"
+-                    );
+                 }
+                 Frame::StreamsBlocked { dir, limit } => {
+                     if limit > MAX_STREAM_COUNT {
+@@ -2878,15 +2751,10 @@ impl Connection {
+                             "unrepresentable stream limit",
+                         ));
+                     }
+-                    debug!(
+-                        "peer claims to be blocked opening more than {} {} streams",
+-                        limit, dir
+-                    );
+                 }
+                 Frame::StopSending(frame::StopSending { id, error_code }) => {
+                     if id.initiator() != self.side.side() {
+                         if id.dir() == Dir::Uni {
+-                            debug!("got STOP_SENDING on recv-only {}", id);
+                             return Err(TransportError::STREAM_STATE_ERROR(
+                                 "STOP_SENDING on recv-only stream",
+                             ));
+@@ -2910,11 +2778,6 @@ impl Connection {
+                         ));
+                 }
+                 Frame::NewConnectionId(frame) => {
+-                    trace!(
+-                        sequence = frame.sequence,
+-                        id = %frame.id,
+-                        retire_prior_to = frame.retire_prior_to,
+-                    );
+                     if self.rem_cids.active().is_empty() {
+                         return Err(TransportError::PROTOCOL_VIOLATION(
+                             "NEW_CONNECTION_ID when CIDs aren't in use",
+@@ -2937,7 +2800,6 @@ impl Connection {
+                             return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
+                         }
+                         Err(InsertError::Retired) => {
+-                            trace!("discarding already-retired");
+                             // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
+                             // range of connection IDs larger than the active connection ID limit
+                             // was retired all at once via retire_prior_to.
+@@ -2966,7 +2828,6 @@ impl Connection {
+                     if token.is_empty() {
+                         return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
+                     }
+-                    trace!("got new token");
+                     token_store.insert(server_name, token);
+                 }
+                 Frame::Datagram(datagram) => {
+@@ -3061,7 +2922,6 @@ impl Connection {
+     }
+ 
+     fn migrate(&mut self, now: Instant, remote: SocketAddr) {
+-        trace!(%remote, "migration initiated");
+         self.path_counter = self.path_counter.wrapping_add(1);
+         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
+         // Note that the congestion window will not grow until validation terminates. Helps mitigate
+@@ -3176,7 +3036,6 @@ impl Connection {
+ 
+         // PING
+         if mem::replace(&mut space.ping_pending, false) {
+-            trace!("PING");
+             buf.write(frame::FrameType::PING);
+             sent.non_retransmits = true;
+             self.stats.frame_tx.ping += 1;
+@@ -3184,7 +3043,6 @@ impl Connection {
+ 
+         // IMMEDIATE_ACK
+         if mem::replace(&mut space.immediate_ack_pending, false) {
+-            trace!("IMMEDIATE_ACK");
+             buf.write(frame::FrameType::IMMEDIATE_ACK);
+             sent.non_retransmits = true;
+             self.stats.frame_tx.immediate_ack += 1;
+@@ -3217,8 +3075,6 @@ impl Connection {
+                 &self.peer_params,
+             );
+ 
+-            trace!(?max_ack_delay, "ACK_FREQUENCY");
+-
+             frame::AckFrequency {
+                 sequence: sequence_number,
+                 ack_eliciting_threshold: config.ack_eliciting_threshold,
+@@ -3241,7 +3097,6 @@ impl Connection {
+                 self.path.challenge_pending = false;
+                 sent.non_retransmits = true;
+                 sent.requires_padding = true;
+-                trace!("PATH_CHALLENGE {:08x}", token);
+                 buf.write(frame::FrameType::PATH_CHALLENGE);
+                 buf.write(token);
+                 self.stats.frame_tx.path_challenge += 1;
+@@ -3253,7 +3108,6 @@ impl Connection {
+             if let Some(token) = self.path_responses.pop_on_path(self.path.remote) {
+                 sent.non_retransmits = true;
+                 sent.requires_padding = true;
+-                trace!("PATH_RESPONSE {:08x}", token);
+                 buf.write(frame::FrameType::PATH_RESPONSE);
+                 buf.write(token);
+                 self.stats.frame_tx.path_response += 1;
+@@ -3288,11 +3142,6 @@ impl Connection {
+                 offset: frame.offset,
+                 data,
+             };
+-            trace!(
+-                "CRYPTO: off {} len {}",
+-                truncated.offset,
+-                truncated.data.len()
+-            );
+             truncated.encode(buf);
+             self.stats.frame_tx.crypto += 1;
+             sent.retransmits.get_or_create().crypto.push_back(truncated);
+@@ -3318,11 +3167,6 @@ impl Connection {
+                 Some(x) => x,
+                 None => break,
+             };
+-            trace!(
+-                sequence = issued.sequence,
+-                id = %issued.id,
+-                "NEW_CONNECTION_ID"
+-            );
+             frame::NewConnectionId {
+                 sequence: issued.sequence,
+                 retire_prior_to: self.local_cid_state.retire_prior_to(),
+@@ -3340,7 +3184,6 @@ impl Connection {
+                 Some(x) => x,
+                 None => break,
+             };
+-            trace!(sequence = seq, "RETIRE_CONNECTION_ID");
+             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
+             buf.write_var(seq);
+             sent.retransmits.get_or_create().retire_cids.push(seq);
+@@ -3467,12 +3310,6 @@ impl Connection {
+         let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
+         let delay = delay_micros >> ack_delay_exp.into_inner();
+ 
+-        trace!(
+-            "ACK {:?}, Delay = {}us",
+-            space.pending_acks.ranges(),
+-            delay_micros
+-        );
+-
+         let no_acks_len = buf.len();
+         frame::Ack::encode(delay as _, space.pending_acks.ranges(), ecn, buf);
+         if buf.len() > max_size {
+@@ -3485,7 +3322,6 @@ impl Connection {
+     }
+ 
+     fn close_common(&mut self) {
+-        trace!("connection closed");
+         for &timer in &Timer::VALUES {
+             self.timers.stop(timer);
+         }
+@@ -3517,7 +3353,6 @@ impl Connection {
+         self.streams.set_params(&params);
+         self.idle_timeout =
+             negotiate_max_idle_timeout(self.config.max_idle_timeout, Some(params.max_idle_timeout));
+-        trace!("negotiated max idle timeout {:?}", self.idle_timeout);
+         if let Some(ref info) = params.preferred_address {
+             self.rem_cids.insert(frame::NewConnectionId {
+                 sequence: 1,
+@@ -3560,7 +3395,6 @@ impl Connection {
+         }
+ 
+         if result.incoming_key_update {
+-            trace!("key update authenticated");
+             self.update_keys(Some((result.number, now)), true);
+             self.set_key_discard_timer(now, packet.header.space());
+         }
+@@ -3569,7 +3403,6 @@ impl Connection {
+     }
+ 
+     fn update_keys(&mut self, end_packet: Option<(u64, Instant)>, remote: bool) {
+-        trace!("executing key update");
+         // Generate keys for the key phase after the one we're switching to, store them in
+         // `next_crypto`, make the contents of `next_crypto` current, and move the current keys into
+         // `prev_crypto`.
+diff --git a/src/connection/mtud.rs b/src/connection/mtud.rs
+index 0893b29..e84273e 100644
+--- a/src/connection/mtud.rs
++++ b/src/connection/mtud.rs
+@@ -1,6 +1,5 @@
+ use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+ use std::cmp;
+-use tracing::trace;
+ 
+ /// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
+ ///
+@@ -111,7 +110,6 @@ impl MtuDiscovery {
+             .and_then(|state| state.on_probe_acked(pn))
+         {
+             self.current_mtu = new_mtu;
+-            trace!(current_mtu = self.current_mtu, "new MTU detected");
+ 
+             self.black_hole_detector.on_probe_acked(pn, len);
+             true
+diff --git a/src/connection/pacing.rs b/src/connection/pacing.rs
+index 2e46994..531f72d 100644
+--- a/src/connection/pacing.rs
++++ b/src/connection/pacing.rs
+@@ -2,8 +2,6 @@
+ 
+ use crate::{Duration, Instant};
+ 
+-use tracing::warn;
+-
+ /// A simple token-bucket pacer
+ ///
+ /// The pacer's capacity is derived on a fraction of the congestion window
+@@ -80,7 +78,6 @@ impl Pacer {
+         let window = window as u32;
+ 
+         let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+-            warn!("received a timestamp early than a previous recorded time, ignoring");
+             Default::default()
+         });
+ 
+diff --git a/src/connection/packet_builder.rs b/src/connection/packet_builder.rs
+index d67c85a..541c7d8 100644
+--- a/src/connection/packet_builder.rs
++++ b/src/connection/packet_builder.rs
+@@ -1,6 +1,5 @@
+ use bytes::Bytes;
+ use rand::RngExt;
+-use tracing::{debug, trace, trace_span};
+ 
+ use super::{Connection, SentFrames, spaces::SentPacket};
+ use crate::{
+@@ -24,7 +23,6 @@ pub(super) struct PacketBuilder {
+     /// frames
+     pub(super) max_size: usize,
+     pub(super) tag_len: usize,
+-    pub(super) _span: tracing::span::EnteredSpan,
+ }
+ 
+ impl PacketBuilder {
+@@ -47,7 +45,6 @@ impl PacketBuilder {
+         let sent_with_keys = conn.spaces[space_id].sent_with_keys;
+         if space_id == SpaceId::Data {
+             if sent_with_keys >= conn.key_phase_size {
+-                debug!("routine key update due to phase exhaustion");
+                 conn.force_key_update();
+             }
+         } else {
+@@ -84,8 +81,6 @@ impl PacketBuilder {
+             _ => space.get_tx_number(),
+         };
+ 
+-        let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
+-
+         let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+         let header = match space_id {
+             SpaceId::Data if space.crypto.is_some() => Header::Short {
+@@ -186,7 +181,6 @@ impl PacketBuilder {
+             max_size,
+             tag_len,
+             ack_eliciting,
+-            _span: span,
+         })
+     }
+ 
+@@ -259,7 +253,6 @@ impl PacketBuilder {
+     ) -> (usize, bool) {
+         let pad = buffer.len() < self.min_size;
+         if pad {
+-            trace!("PADDING * {}", self.min_size - buffer.len());
+             buffer.resize(self.min_size, 0);
+         }
+ 
+diff --git a/src/connection/packet_crypto.rs b/src/connection/packet_crypto.rs
+index 93db889..e215e74 100644
+--- a/src/connection/packet_crypto.rs
++++ b/src/connection/packet_crypto.rs
+@@ -1,4 +1,3 @@
+-use tracing::{debug, trace};
+ 
+ use crate::Instant;
+ use crate::connection::spaces::PacketSpace;
+@@ -18,18 +17,12 @@ pub(super) fn unprotect_header(
+         if let Some(crypto) = zero_rtt_crypto {
+             Some(&*crypto.header)
+         } else {
+-            debug!("dropping unexpected 0-RTT packet");
+             return None;
+         }
+     } else if let Some(space) = partial_decode.space() {
+         if let Some(ref crypto) = spaces[space].crypto {
+             Some(&*crypto.header.remote)
+         } else {
+-            debug!(
+-                "discarding unexpected {:?} packet ({} bytes)",
+-                space,
+-                partial_decode.len(),
+-            );
+             return None;
+         }
+     } else {
+@@ -50,10 +43,7 @@ pub(super) fn unprotect_header(
+             packet: None,
+             stateless_reset: true,
+         }),
+-        Err(e) => {
+-            trace!("unable to complete packet decoding: {}", e);
+-            None
+-        }
++        Err(_) => None,
+     }
+ }
+ 
+@@ -107,7 +97,6 @@ pub(super) fn decrypt_packet_body(
+     crypto
+         .decrypt(number, &packet.header_data, &mut packet.payload)
+         .map_err(|_| {
+-            trace!("decryption failed with packet number {}", number);
+             None
+         })?;
+ 
+diff --git a/src/connection/paths.rs b/src/connection/paths.rs
+index 1488575..79f0f9d 100644
+--- a/src/connection/paths.rs
++++ b/src/connection/paths.rs
+@@ -1,7 +1,5 @@
+ use std::{cmp, net::SocketAddr};
+ 
+-use tracing::trace;
+-
+ use super::{
+     mtud::MtuDiscovery,
+     pacing::Pacer,
+@@ -381,7 +379,6 @@ impl PathResponses {
+         } else {
+             // We don't expect to ever hit this with well-behaved peers, so we don't bother dropping
+             // older challenges.
+-            trace!("ignoring excessive PATH_CHALLENGE");
+         }
+     }
+ 
+diff --git a/src/connection/qlog.rs b/src/connection/qlog.rs
+index dafba3c..28624e1 100644
+--- a/src/connection/qlog.rs
++++ b/src/connection/qlog.rs
+@@ -15,8 +15,6 @@ use qlog::{
+     },
+     streamer::QlogStreamer,
+ };
+-#[cfg(feature = "qlog")]
+-use tracing::warn;
+ 
+ use crate::{
+     ConnectionId, Instant,
+@@ -37,9 +35,7 @@ impl QlogStream {
+         event.group_id = Some(orig_rem_cid.to_string());
+ 
+         let mut qlog_streamer = self.0.lock().unwrap();
+-        if let Err(e) = qlog_streamer.add_event_with_instant(event, now) {
+-            warn!("could not emit qlog event: {e}");
+-        }
++        let _ = qlog_streamer.add_event_with_instant(event, now);
+     }
+ }
+ 
+diff --git a/src/connection/spaces.rs b/src/connection/spaces.rs
+index f66d5ac..2b7b621 100644
+--- a/src/connection/spaces.rs
++++ b/src/connection/spaces.rs
+@@ -7,7 +7,6 @@ use std::{
+ 
+ use rand::{Rng, RngExt};
+ use rustc_hash::FxHashSet;
+-use tracing::trace;
+ 
+ use super::assembler::Assembler;
+ use crate::{
+@@ -893,7 +892,6 @@ impl PacketNumberFilter {
+             return n;
+         }
+ 
+-        trace!("skipping pn {n}");
+         // Skip this packet number, and choose the next one to skip
+         self.prev_skipped_packet_number = Some(self.next_skipped_packet_number);
+         let next_exponent = self.exponent.saturating_add(1);
+diff --git a/src/connection/streams/mod.rs b/src/connection/streams/mod.rs
+index fe41e73..78b7601 100644
+--- a/src/connection/streams/mod.rs
++++ b/src/connection/streams/mod.rs
+@@ -5,7 +5,6 @@ use std::{
+ 
+ use bytes::Bytes;
+ use thiserror::Error;
+-use tracing::trace;
+ 
+ use super::spaces::{Retransmits, ThinRetransmits};
+ use crate::{
+@@ -236,7 +235,6 @@ impl<'a> SendStream<'a> {
+ 
+     fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {
+         if self.conn_state.is_closed() {
+-            trace!(%self.id, "write blocked; connection draining");
+             return Err(WriteError::Blocked);
+         }
+ 
+@@ -252,10 +250,6 @@ impl<'a> SendStream<'a> {
+             .ok_or(WriteError::ClosedStream)?;
+ 
+         if limit == 0 {
+-            trace!(
+-                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
+-                "write blocked by connection-level flow control or send window"
+-            );
+             if !stream.connection_blocked {
+                 stream.connection_blocked = true;
+                 self.state.connection_blocked.push(self.id);
+@@ -284,7 +278,6 @@ impl<'a> SendStream<'a> {
+         };
+         self.state.data_sent += written.bytes as u64;
+         self.state.buffered_data += written.bytes as u64;
+-        trace!(stream = %self.id, "wrote {} bytes", written.bytes);
+         if !was_pending {
+             self.state.pending.push_pending(self.id, stream.priority);
+         }
+diff --git a/src/connection/streams/recv.rs b/src/connection/streams/recv.rs
+index 5361a22..f1649e4 100644
+--- a/src/connection/streams/recv.rs
++++ b/src/connection/streams/recv.rs
+@@ -2,7 +2,6 @@ use std::collections::hash_map::Entry;
+ use std::mem;
+ 
+ use thiserror::Error;
+-use tracing::debug;
+ 
+ use super::state::get_or_insert_recv;
+ use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
+@@ -59,7 +58,6 @@ impl Recv {
+ 
+         if let Some(final_offset) = self.final_offset() {
+             if end > final_offset || (frame.fin && end != final_offset) {
+-                debug!(end, final_offset, "final size error");
+                 return Err(TransportError::FINAL_SIZE_ERROR(""));
+             }
+         }
+@@ -218,14 +216,6 @@ impl Recv {
+         let prev_end = self.end;
+         let new_bytes = offset.saturating_sub(prev_end);
+         if offset > self.sent_max_stream_data || received + new_bytes > max_data {
+-            debug!(
+-                received,
+-                new_bytes,
+-                max_data,
+-                offset,
+-                stream_max_data = self.sent_max_stream_data,
+-                "flow control error"
+-            );
+             return Err(TransportError::FLOW_CONTROL_ERROR(""));
+         }
+ 
+diff --git a/src/connection/streams/state.rs b/src/connection/streams/state.rs
+index 7a5908d..f492429 100644
+--- a/src/connection/streams/state.rs
++++ b/src/connection/streams/state.rs
+@@ -6,7 +6,6 @@ use std::{
+ 
+ use bytes::BufMut;
+ use rustc_hash::FxHashMap;
+-use tracing::{debug, error, trace};
+ 
+ use super::{
+     PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
+@@ -263,9 +262,7 @@ impl StreamsState {
+         payload_len: usize,
+     ) -> Result<ShouldTransmit, TransportError> {
+         let id = frame.id;
+-        self.validate_receive_id(id).inspect_err(|_e| {
+-            debug!("received illegal STREAM frame");
+-        })?;
++        self.validate_receive_id(id)?;
+ 
+         let rs = match self
+             .recv
+@@ -274,13 +271,11 @@ impl StreamsState {
+         {
+             Some(rs) => rs,
+             None => {
+-                trace!("dropping frame for closed stream");
+                 return Ok(ShouldTransmit(false));
+             }
+         };
+ 
+         if !rs.is_receiving() {
+-            trace!("dropping frame for finished stream");
+             return Ok(ShouldTransmit(false));
+         }
+ 
+@@ -316,9 +311,7 @@ impl StreamsState {
+             error_code,
+             final_offset,
+         } = frame;
+-        self.validate_receive_id(id).inspect_err(|_e| {
+-            debug!("received illegal RESET_STREAM frame");
+-        })?;
++        self.validate_receive_id(id)?;
+ 
+         let rs = match self
+             .recv
+@@ -327,7 +320,6 @@ impl StreamsState {
+         {
+             Some(stream) => stream,
+             None => {
+-                trace!("received RESET_STREAM on closed stream");
+                 return Ok(ShouldTransmit(false));
+             }
+         };
+@@ -452,7 +444,6 @@ impl StreamsState {
+                 Some(x) => x,
+                 None => continue,
+             };
+-            trace!(stream = %id, "RESET_STREAM");
+             retransmits
+                 .get_or_create()
+                 .reset_stream
+@@ -479,7 +470,6 @@ impl StreamsState {
+             // a little by dropping the frame if we specifically know the stream's been reset by the
+             // peer, but we discard that information as soon as the application consumes it, so it
+             // can't be relied upon regardless.
+-            trace!(stream = %frame.id, "STOP_SENDING");
+             frame.encode(buf);
+             retransmits.get_or_create().stop_sending.push(frame);
+             stats.stop_sending += 1;
+@@ -494,7 +484,6 @@ impl StreamsState {
+             // maximum allowed `VarInt` size.
+             let max = VarInt::try_from(self.local_max_data).unwrap_or(VarInt::MAX);
+ 
+-            trace!(value = max.into_inner(), "MAX_DATA");
+             if max > self.sent_max_data {
+                 // Record that a `MAX_DATA` announcing a certain window was sent. This will
+                 // suppress enqueuing further `MAX_DATA` frames unless either the previous
+@@ -532,7 +521,6 @@ impl StreamsState {
+             let (max, _) = rs.max_stream_data(self.stream_receive_window);
+             rs.record_sent_max_stream_data(max);
+ 
+-            trace!(stream = %id, max = max, "MAX_STREAM_DATA");
+             buf.write(frame::FrameType::MAX_STREAM_DATA);
+             buf.write(id);
+             buf.write_var(max);
+@@ -548,10 +536,6 @@ impl StreamsState {
+             pending.max_stream_id[dir as usize] = false;
+             retransmits.get_or_create().max_stream_id[dir as usize] = true;
+             self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
+-            trace!(
+-                value = self.max_remote[dir as usize],
+-                "MAX_STREAMS ({:?})", dir
+-            );
+             buf.write(match dir {
+                 Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
+                 Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
+@@ -569,7 +553,6 @@ impl StreamsState {
+             // The peer may have raised the limit since the frame was queued
+             if self.can_send_data_blocked() {
+                 retransmits.get_or_create().data_blocked = true;
+-                trace!(limit = self.max_data, "DATA_BLOCKED");
+                 buf.write(frame::FrameType::DATA_BLOCKED);
+                 buf.write_var(self.max_data);
+                 stats.data_blocked += 1;
+@@ -587,7 +570,6 @@ impl StreamsState {
+             };
+             retransmits.get_or_create().stream_data_blocked.insert(id);
+ 
+-            trace!(stream = %id, limit, "STREAM_DATA_BLOCKED");
+             buf.write(frame::FrameType::STREAM_DATA_BLOCKED);
+             buf.write(id);
+             buf.write_var(limit);
+@@ -654,7 +636,6 @@ impl StreamsState {
+             }
+ 
+             let meta = frame::StreamMeta { id, offsets, fin };
+-            trace!(id = %meta.id, off = meta.offsets.start, len = meta.offsets.end - meta.offsets.start, fin = meta.fin, "STREAM");
+             meta.encode(encode_length, buf);
+ 
+             // The range might not be retrievable in a single `get` if it is
+@@ -684,7 +665,6 @@ impl StreamsState {
+         let next = &mut self.next_remote[stream.dir() as usize];
+         if stream.index() >= *next {
+             if stream.index() > self.max_remote[stream.dir() as usize] {
+-                error!("tried to implicitly open more streams than permitted; this is a bug");
+                 return;
+             }
+             *next = stream.index() + 1;
+@@ -797,16 +777,13 @@ impl StreamsState {
+         offset: u64,
+     ) -> Result<(), TransportError> {
+         if id.initiator() != self.side && id.dir() == Dir::Uni {
+-            debug!("got MAX_STREAM_DATA on recv-only {}", id);
+             return Err(TransportError::STREAM_STATE_ERROR(
+                 "MAX_STREAM_DATA on recv-only stream",
+             ));
+         }
+         if id.dir() == Dir::Bi {
+             // Ensure we don't implicitly open more streams than permitted
+-            self.validate_receive_id(id).inspect_err(|_| {
+-                debug!("received illegal MAX_STREAM_DATA frame");
+-            })?;
++            self.validate_receive_id(id)?;
+         }
+ 
+         let write_limit = self.write_limit();
+@@ -828,7 +805,6 @@ impl StreamsState {
+                 }
+             }
+         } else if id.initiator() == self.side && self.is_local_unopened(id) {
+-            debug!("got MAX_STREAM_DATA on unopened {}", id);
+             return Err(TransportError::STREAM_STATE_ERROR(
+                 "MAX_STREAM_DATA on unopened stream",
+             ));
+diff --git a/src/endpoint.rs b/src/endpoint.rs
+index 63ccbd8..b9cf299 100644
+--- a/src/endpoint.rs
++++ b/src/endpoint.rs
+@@ -15,7 +15,6 @@ use rand::{
+ use rustc_hash::FxHashMap;
+ use slab::Slab;
+ use thiserror::Error;
+-use tracing::{debug, error, trace, warn};
+ 
+ use crate::{
+     Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
+@@ -117,13 +116,10 @@ impl Endpoint {
+                 if let Some(old) = self.connections[ch].reset_token.replace((remote, token)) {
+                     self.index.connection_reset_tokens.remove(old.0, old.1);
+                 }
+-                if self.index.connection_reset_tokens.insert(remote, token, ch) {
+-                    warn!("duplicate reset token");
+-                }
++                self.index.connection_reset_tokens.insert(remote, token, ch);
+             }
+             RetireConnectionId(now, seq, allow_more_cids) => {
+                 if let Some(cid) = self.connections[ch].loc_cids.remove(&seq) {
+-                    trace!("peer retired CID {}: {}", seq, cid);
+                     self.index.retire(cid);
+                     if allow_more_cids {
+                         return Some(self.send_new_identifiers(now, ch, 1));
+@@ -137,7 +133,6 @@ impl Endpoint {
+                     // This indicates a bug in downstream code, which could cause spurious
+                     // connection loss instead of this error if the CID was (re)allocated prior to
+                     // the illegal call.
+-                    error!(id = ch.0, "unknown connection drained");
+                 }
+             }
+         }
+@@ -175,17 +170,14 @@ impl Endpoint {
+                 version,
+             }) => {
+                 if self.server_config.is_none() {
+-                    debug!("dropping packet with unsupported version");
+                     return None;
+                 }
+                 // RFC 9000 §5.2.2: "Servers MUST drop smaller packets that specify unsupported
+                 // versions." Responding to short packets would let a spoofed source elicit a
+                 // Version Negotiation packet larger than the datagram that triggered it.
+                 if datagram_len < MIN_INITIAL_SIZE as usize {
+-                    debug!("dropping short packet with unsupported version");
+                     return None;
+                 }
+-                trace!("sending version negotiation");
+                 // Negotiate versions
+                 Header::VersionNegotiate {
+                     random: self.rng.random::<u8>() | 0x40,
+@@ -209,8 +201,7 @@ impl Endpoint {
+                     src_ip: local_ip,
+                 }));
+             }
+-            Err(e) => {
+-                trace!("malformed header: {}", e);
++            Err(_) => {
+                 return None;
+             }
+         };
+@@ -251,18 +242,12 @@ impl Endpoint {
+ 
+             self.handle_first_packet(datagram_len, event, addresses, buf)
+         } else if event.first_decode.has_long_header() {
+-            debug!(
+-                "ignoring non-initial packet for unknown connection {}",
+-                dst_cid
+-            );
+             None
+         } else if !event.first_decode.is_initial()
+             && self.local_cid_generator.validate(dst_cid).is_err()
+         {
+-            debug!("dropping packet with invalid CID");
+             None
+         } else if dst_cid.is_empty() {
+-            trace!("dropping unrecognized short packet without ID");
+             None
+         } else {
+             // If we got this far, we're receiving a seemingly valid packet for an unknown
+@@ -284,7 +269,6 @@ impl Endpoint {
+             .last_stateless_reset
+             .is_some_and(|last| last + self.config.min_reset_interval > now)
+         {
+-            debug!("ignoring unexpected packet within minimum stateless reset interval");
+             return None;
+         }
+ 
+@@ -296,18 +280,10 @@ impl Endpoint {
+         let max_padding_len = match inciting_dgram_len.checked_sub(RESET_TOKEN_SIZE) {
+             Some(headroom) if headroom > MIN_PADDING_LEN => headroom - 1,
+             _ => {
+-                debug!(
+-                    "ignoring unexpected {} byte packet: not larger than minimum stateless reset size",
+-                    inciting_dgram_len
+-                );
+                 return None;
+             }
+         };
+ 
+-        debug!(
+-            "sending stateless reset for {} to {}",
+-            dst_cid, addresses.remote
+-        );
+         self.last_stateless_reset = Some(now);
+         // Resets with at least this much padding can't possibly be distinguished from real packets
+         const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
+@@ -353,7 +329,6 @@ impl Endpoint {
+         }
+ 
+         let remote_id = (config.initial_dst_cid_provider)();
+-        trace!(initial_dcid = %remote_id);
+ 
+         let ch = ConnectionHandle(self.connections.vacant_key());
+         let loc_cid = self.new_cid(ch);
+@@ -443,24 +418,18 @@ impl Endpoint {
+         let header = event.first_decode.initial_header().unwrap();
+ 
+         let Some(server_config) = &self.server_config else {
+-            debug!("packet for unrecognized connection {}", dst_cid);
+             return self
+                 .stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf)
+                 .map(DatagramEvent::Response);
+         };
+ 
+         if datagram_len < MIN_INITIAL_SIZE as usize {
+-            debug!("ignoring short initial for connection {}", dst_cid);
+             return None;
+         }
+ 
+         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
+         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
+         if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
+-            debug!(
+-                "ignoring initial for connection {} due to saturation",
+-                dst_cid
+-            );
+             return None;
+         }
+ 
+@@ -469,10 +438,6 @@ impl Endpoint {
+             Err(UnsupportedVersion) => {
+                 // This probably indicates that the user set supported_versions incorrectly in
+                 // `EndpointConfig`.
+-                debug!(
+-                    "ignoring initial packet version {:#x} unsupported by cryptographic layer",
+-                    header.version
+-                );
+                 return None;
+             }
+         };
+@@ -490,14 +455,12 @@ impl Endpoint {
+ 
+         let packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
+             Ok(packet) => packet,
+-            Err(e) => {
+-                trace!("unable to decode initial packet: {}", e);
++            Err(_) => {
+                 return None;
+             }
+         };
+ 
+         if !packet.reserved_bits_valid() {
+-            debug!("dropping connection attempt with invalid reserved bits");
+             return None;
+         }
+ 
+@@ -510,7 +473,6 @@ impl Endpoint {
+         let token = match IncomingToken::from_header(&header, &server_config, addresses.remote) {
+             Ok(token) => token,
+             Err(InvalidRetryTokenError) => {
+-                debug!("rejecting invalid retry token");
+                 return Some(DatagramEvent::Response(self.initial_close(
+                     header.version,
+                     addresses,
+@@ -578,7 +540,6 @@ impl Endpoint {
+                 incoming.received_at + Duration::from_millis(timeout.into()) <= now
+             })
+         {
+-            debug!("abandoning accept of stale initial");
+             self.index.remove_initial(dst_cid);
+             return Err(AcceptError {
+                 cause: ConnectionError::TimedOut,
+@@ -587,7 +548,6 @@ impl Endpoint {
+         }
+ 
+         if self.cids_exhausted() {
+-            debug!("refusing connection");
+             self.index.remove_initial(dst_cid);
+             return Err(AcceptError {
+                 cause: ConnectionError::CidsExhausted,
+@@ -613,7 +573,6 @@ impl Endpoint {
+             )
+             .is_err()
+         {
+-            debug!(packet_number, "failed to authenticate initial packet");
+             self.index.remove_initial(dst_cid);
+             return Err(AcceptError {
+                 cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
+@@ -675,8 +634,6 @@ impl Endpoint {
+             incoming.rest,
+         ) {
+             Ok(()) => {
+-                trace!(id = ch.0, icid = %dst_cid, "new connection");
+-
+                 for event in incoming_buffer.datagrams {
+                     conn.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(event)))
+                 }
+@@ -684,7 +641,6 @@ impl Endpoint {
+                 Ok((ch, conn))
+             }
+             Err(e) => {
+-                debug!("handshake failed: {}", e);
+                 self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
+                 let response = match e {
+                     ConnectionError::TransportError(ref e) => Some(self.initial_close(
+@@ -715,10 +671,6 @@ impl Endpoint {
+             && (header.token_pos.is_empty()
+                 || header.dst_cid.len() != self.local_cid_generator.cid_len())
+         {
+-            debug!(
+-                "rejecting connection due to invalid DCID length {}",
+-                header.dst_cid.len()
+-            );
+             return Err(TransportError::PROTOCOL_VIOLATION(
+                 "invalid destination CID length",
+             ));
+@@ -1249,15 +1201,6 @@ impl IncomingImproperDropWarner {
+     }
+ }
+ 
+-impl Drop for IncomingImproperDropWarner {
+-    fn drop(&mut self) {
+-        warn!(
+-            "quinn_proto::Incoming dropped without passing to Endpoint::accept/refuse/retry/ignore \
+-               (may cause memory leak and eventual inability to accept new connections)"
+-        );
+-    }
+-}
+-
+ /// Errors in the parameters being used to create a new connection
+ ///
+ /// These arise before any I/O has been performed.
+diff --git a/src/tests/mod.rs b/src/tests/mod.rs
+index 0d39a96..626552f 100644
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -22,7 +22,6 @@ use rustls::{
+     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+     server::WebPkiClientVerifier,
+ };
+-use tracing::info;
+ 
+ use super::*;
+ use crate::{
+@@ -47,7 +46,6 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
+ 
+ #[test]
+ fn pending_incoming_survives_server_config_change() {
+-    let _guard = subscribe();
+     let replacement = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+         "replacement-only".into(),
+     ])));
+@@ -88,7 +86,6 @@ fn pending_incoming_survives_server_config_change() {
+ 
+ #[test]
+ fn pending_incoming_can_retry_after_disabling_server() {
+-    let _guard = subscribe();
+     let config = server_config();
+     let mut pair = Pair::new(Default::default(), config.clone());
+     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+@@ -114,7 +111,6 @@ fn pending_incoming_can_retry_after_disabling_server() {
+ 
+ #[test]
+ fn version_negotiate_server() {
+-    let _guard = subscribe();
+     let client_addr = "[::2]:7890".parse().unwrap();
+     let mut server = Endpoint::new(
+         Default::default(),
+@@ -148,7 +144,6 @@ fn version_negotiate_server() {
+ 
+ #[test]
+ fn version_negotiate_client() {
+-    let _guard = subscribe();
+     let server_addr = "[::2]:7890".parse().unwrap();
+     // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
+     // packet
+@@ -194,7 +189,6 @@ fn version_negotiate_client() {
+ 
+ #[test]
+ fn lifecycle() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+@@ -202,7 +196,6 @@ fn lifecycle() {
+     assert!(pair.server_conn_mut(server_ch).using_ecn());
+ 
+     const REASON: &[u8] = b"whee";
+-    info!("closing");
+     pair.client.connections.get_mut(&client_ch).unwrap().close(
+         pair.time,
+         VarInt(42),
+@@ -222,8 +215,6 @@ fn lifecycle() {
+ 
+ #[test]
+ fn draft_version_compat() {
+-    let _guard = subscribe();
+-
+     let mut client_config = client_config();
+     client_config.version(0xff00_0020);
+ 
+@@ -235,7 +226,6 @@ fn draft_version_compat() {
+     assert!(pair.server_conn_mut(server_ch).using_ecn());
+ 
+     const REASON: &[u8] = b"whee";
+-    info!("closing");
+     pair.client.connections.get_mut(&client_ch).unwrap().close(
+         pair.time,
+         VarInt(42),
+@@ -255,7 +245,6 @@ fn draft_version_compat() {
+ 
+ #[test]
+ fn server_stateless_reset() {
+-    let _guard = subscribe();
+     let mut key_material = vec![0; 64];
+     let mut rng = rand::rng();
+     rng.fill_bytes(&mut key_material);
+@@ -273,7 +262,6 @@ fn server_stateless_reset() {
+         Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+     // Force the server to generate the smallest possible stateless reset
+     pair.client.connections.get_mut(&client_ch).unwrap().ping();
+-    info!("resetting");
+     pair.drive();
+     assert_matches!(
+         pair.client_conn_mut(client_ch).poll(),
+@@ -285,7 +273,6 @@ fn server_stateless_reset() {
+ 
+ #[test]
+ fn client_stateless_reset() {
+-    let _guard = subscribe();
+     let mut key_material = vec![0; 64];
+     let mut rng = rand::rng();
+     rng.fill_bytes(&mut key_material);
+@@ -306,7 +293,6 @@ fn client_stateless_reset() {
+         VarInt(42),
+         (&[0xab; 128][..]).into(),
+     );
+-    info!("resetting");
+     pair.drive();
+     assert_matches!(
+         pair.server_conn_mut(server_ch).poll(),
+@@ -319,7 +305,6 @@ fn client_stateless_reset() {
+ /// Verify that stateless resets are rate-limited
+ #[test]
+ fn stateless_reset_limit() {
+-    let _guard = subscribe();
+     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
+     let mut endpoint_config = EndpointConfig::default();
+     endpoint_config.cid_generator(move || Box::new(RandomConnectionIdGenerator::new(8)));
+@@ -358,7 +343,6 @@ fn stateless_reset_limit() {
+ 
+ #[test]
+ fn export_keying_material() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -384,7 +368,6 @@ fn export_keying_material() {
+ 
+ #[test]
+ fn finish_stream_simple() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -424,7 +407,6 @@ fn finish_stream_simple() {
+ 
+ #[test]
+ fn reset_stream() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -434,7 +416,6 @@ fn reset_stream() {
+     pair.client_send(client_ch, s).write(MSG).unwrap();
+     pair.drive();
+ 
+-    info!("resetting stream");
+     const ERROR: VarInt = VarInt(42);
+     pair.client_send(client_ch, s).reset(ERROR).unwrap();
+     pair.drive();
+@@ -453,7 +434,6 @@ fn reset_stream() {
+ 
+ #[test]
+ fn stop_stream() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -462,7 +442,6 @@ fn stop_stream() {
+     pair.client_send(client_ch, s).write(MSG).unwrap();
+     pair.drive();
+ 
+-    info!("stopping stream");
+     const ERROR: VarInt = VarInt(42);
+     pair.server_recv(server_ch, s).stop(ERROR).unwrap();
+     pair.drive();
+@@ -485,9 +464,7 @@ fn stop_stream() {
+ 
+ #[test]
+ fn reject_self_signed_server_cert() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+-    info!("connecting");
+ 
+     // Create a self-signed certificate with a different distinguished name than the default one,
+     // such that path building cannot confuse the default root the server is using and the one
+@@ -513,8 +490,6 @@ fn reject_self_signed_server_cert() {
+ 
+ #[test]
+ fn reject_missing_client_cert() {
+-    let _guard = subscribe();
+-
+     let mut store = RootCertStore::empty();
+     // `WebPkiClientVerifier` requires a non-empty store, so we stick our own certificate into it
+     // because it's convenient.
+@@ -541,7 +516,6 @@ fn reject_missing_client_cert() {
+         ServerConfig::with_crypto(Arc::new(config)),
+     );
+ 
+-    info!("connecting");
+     let client_ch = pair.begin_connect(client_config());
+     pair.drive();
+ 
+@@ -571,7 +545,6 @@ fn reject_missing_client_cert() {
+ 
+ #[test]
+ fn congestion() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+ 
+@@ -592,7 +565,6 @@ fn congestion() {
+ 
+ #[test]
+ fn high_latency_handshake() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.latency = Duration::from_micros(200 * 1000);
+     let (client_ch, server_ch) = pair.connect();
+@@ -604,7 +576,6 @@ fn high_latency_handshake() {
+ 
+ #[test]
+ fn zero_rtt_happypath() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.server.handle_incoming = Box::new(validate_incoming);
+     let config = client_config();
+@@ -624,7 +595,6 @@ fn zero_rtt_happypath() {
+         Ipv6Addr::LOCALHOST.into(),
+         CLIENT_PORTS.lock().unwrap().next().unwrap(),
+     );
+-    info!("resuming session");
+     let client_ch = pair.begin_connect(config);
+     assert!(pair.client_conn_mut(client_ch).has_0rtt());
+     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+@@ -670,7 +640,6 @@ fn zero_rtt_happypath() {
+ 
+ #[test]
+ fn zero_rtt_rejection() {
+-    let _guard = subscribe();
+     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+         "foo".into(),
+         "bar".into(),
+@@ -715,7 +684,6 @@ fn zero_rtt_rejection() {
+ 
+     // Changing protocols invalidates 0-RTT
+     let client_config = ClientConfig::new(client_crypto);
+-    info!("resuming session");
+     let client_ch = pair.begin_connect(client_config);
+     assert!(pair.client_conn_mut(client_ch).has_0rtt());
+     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+@@ -768,7 +736,6 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server:
+     // the last four are dropped due to the buffering limit and must be retransmitted
+     const EXPECTED_DROPPED: u64 = 4;
+ 
+-    let _guard = subscribe();
+     let mut server_config = server_config();
+     configure_server(&mut server_config);
+     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+@@ -789,7 +756,6 @@ fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server:
+         Ipv6Addr::LOCALHOST.into(),
+         CLIENT_PORTS.lock().unwrap().next().unwrap(),
+     );
+-    info!("resuming session");
+     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+     let client_ch = pair.begin_connect(config);
+     assert!(pair.client_conn_mut(client_ch).has_0rtt());
+@@ -867,7 +833,6 @@ fn zero_rtt_incoming_buffer_size_total() {
+ 
+ #[test]
+ fn alpn_success() {
+-    let _guard = subscribe();
+     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+         "foo".into(),
+         "bar".into(),
+@@ -906,7 +871,6 @@ fn alpn_success() {
+ 
+ #[test]
+ fn server_alpn_unset() {
+-    let _guard = subscribe();
+     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config());
+     let client_config = ClientConfig::new(Arc::new(client_crypto_with_alpn(vec!["foo".into()])));
+ 
+@@ -920,7 +884,6 @@ fn server_alpn_unset() {
+ 
+ #[test]
+ fn client_alpn_unset() {
+-    let _guard = subscribe();
+     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+         "foo".into(),
+         "bar".into(),
+@@ -938,7 +901,6 @@ fn client_alpn_unset() {
+ 
+ #[test]
+ fn alpn_mismatch() {
+-    let _guard = subscribe();
+     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+         "foo".into(),
+         "bar".into(),
+@@ -960,7 +922,6 @@ fn alpn_mismatch() {
+ 
+ #[test]
+ fn stream_id_limit() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             max_concurrent_uni_streams: 1u32.into(),
+@@ -1048,7 +1009,6 @@ fn stream_id_limit() {
+ 
+ #[test]
+ fn data_blocked() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             receive_window: 10u32.into(),
+@@ -1126,7 +1086,6 @@ fn data_blocked() {
+ 
+ #[test]
+ fn stream_data_blocked() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             stream_receive_window: 10u32.into(),
+@@ -1204,7 +1163,6 @@ fn stream_data_blocked() {
+ 
+ #[test]
+ fn data_blocked_not_sent_under_limit() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _server_ch) = pair.connect();
+ 
+@@ -1220,7 +1178,6 @@ fn data_blocked_not_sent_under_limit() {
+ 
+ #[test]
+ fn data_blocked_not_sent_for_local_send_window() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _server_ch) = pair.connect();
+ 
+@@ -1248,7 +1205,6 @@ fn data_blocked_not_sent_for_local_send_window() {
+ 
+ #[test]
+ fn data_blocked_dropped_when_limit_raised() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             receive_window: 10u32.into(),
+@@ -1288,7 +1244,6 @@ fn data_blocked_dropped_when_limit_raised() {
+ 
+ #[test]
+ fn stream_data_blocked_not_sent_after_reset() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             stream_receive_window: 10u32.into(),
+@@ -1322,7 +1277,6 @@ fn stream_data_blocked_not_sent_after_reset() {
+ 
+ #[test]
+ fn data_blocked_retransmit() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             receive_window: 10u32.into(),
+@@ -1368,7 +1322,6 @@ fn data_blocked_retransmit() {
+ 
+ #[test]
+ fn key_update_simple() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     let s = pair
+@@ -1398,7 +1351,6 @@ fn key_update_simple() {
+     );
+     let _ = chunks.finalize();
+ 
+-    info!("initiating key update");
+     pair.client_conn_mut(client_ch).force_key_update();
+ 
+     const MSG2: &[u8] = b"hello2";
+@@ -1421,7 +1373,6 @@ fn key_update_simple() {
+ 
+ #[test]
+ fn key_update_reordered() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     let s = pair
+@@ -1440,7 +1391,6 @@ fn key_update_reordered() {
+     pair.client.delay_outbound();
+ 
+     pair.client_conn_mut(client_ch).force_key_update();
+-    info!("updated keys");
+ 
+     const MSG2: &[u8] = b"two";
+     pair.client_send(client_ch, s).write(MSG2).unwrap();
+@@ -1469,7 +1419,6 @@ fn key_update_reordered() {
+ 
+ #[test]
+ fn initial_retransmit() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_ch = pair.begin_connect(client_config());
+     pair.client.drive(pair.time, pair.server.addr);
+@@ -1487,9 +1436,7 @@ fn initial_retransmit() {
+ 
+ #[test]
+ fn instant_close_1() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+-    info!("connecting");
+     let client_ch = pair.begin_connect(client_config());
+     pair.client
+         .connections
+@@ -1512,9 +1459,7 @@ fn instant_close_1() {
+ 
+ #[test]
+ fn instant_close_2() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+-    info!("connecting");
+     let client_ch = pair.begin_connect(client_config());
+     // Unlike `instant_close`, the server sees a valid Initial packet first.
+     pair.drive_client();
+@@ -1543,14 +1488,11 @@ fn instant_close_2() {
+ 
+ #[test]
+ fn instant_server_close() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+-    info!("connecting");
+     pair.begin_connect(client_config());
+     pair.drive_client();
+     pair.server.drive_incoming(pair.time, pair.client.addr);
+     let server_ch = pair.server.assert_accept();
+-    info!("closing");
+     pair.server
+         .connections
+         .get_mut(&server_ch)
+@@ -1570,7 +1512,6 @@ fn instant_server_close() {
+ 
+ #[test]
+ fn idle_timeout() {
+-    let _guard = subscribe();
+     const IDLE_TIMEOUT: u64 = 100;
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+@@ -1612,7 +1553,6 @@ fn idle_timeout() {
+ 
+ #[test]
+ fn connection_close_sends_acks() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _server_ch) = pair.connect();
+ 
+@@ -1636,7 +1576,6 @@ fn connection_close_sends_acks() {
+ 
+ #[test]
+ fn server_hs_retransmit() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_ch = pair.begin_connect(client_config());
+     pair.step();
+@@ -1655,7 +1594,6 @@ fn server_hs_retransmit() {
+ 
+ #[test]
+ fn migration() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     pair.drive();
+@@ -1696,7 +1634,6 @@ fn migration() {
+ }
+ 
+ fn test_flow_control(config: TransportConfig, window_size: usize) {
+-    let _guard = subscribe();
+     let mut pair = Pair::new(
+         Default::default(),
+         ServerConfig {
+@@ -1709,14 +1646,12 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
+ 
+     // Stream reset before read
+     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+-    info!("writing");
+     assert_eq!(pair.client_send(client_ch, s).write(&msg), Ok(window_size));
+     assert_eq!(
+         pair.client_send(client_ch, s).write(&msg[window_size..]),
+         Err(WriteError::Blocked)
+     );
+     pair.drive();
+-    info!("resetting");
+     pair.client_send(client_ch, s).reset(VarInt(42)).unwrap();
+     pair.drive();
+ 
+@@ -1729,7 +1664,6 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
+     let _ = chunks.finalize();
+ 
+     // Happy path
+-    info!("writing");
+     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+     assert_eq!(pair.client_send(client_ch, s).write(&msg), Ok(window_size));
+     assert_eq!(
+@@ -1759,10 +1693,8 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
+     }
+     let _ = chunks.finalize();
+ 
+-    info!("finished reading");
+     assert_eq!(cursor, window_size);
+     pair.drive();
+-    info!("writing");
+     assert_eq!(pair.client_send(client_ch, s).write(&msg), Ok(window_size));
+     assert_eq!(
+         pair.client_send(client_ch, s).write(&msg[window_size..]),
+@@ -1791,7 +1723,6 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
+     }
+     assert_eq!(cursor, window_size);
+     let _ = chunks.finalize();
+-    info!("finished reading");
+ }
+ 
+ #[test]
+@@ -1818,7 +1749,6 @@ fn conn_flow_control() {
+ 
+ #[test]
+ fn stop_opens_bidi() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     assert_eq!(pair.client_streams(client_ch).send_streams(), 0);
+@@ -1863,7 +1793,6 @@ fn stop_opens_bidi() {
+ 
+ #[test]
+ fn implicit_open() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     let s1 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+@@ -1881,7 +1810,6 @@ fn implicit_open() {
+ 
+ #[test]
+ fn zero_length_cid() {
+-    let _guard = subscribe();
+     let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+         || Box::new(RandomConnectionIdGenerator::new(0));
+     let mut pair = Pair::new(
+@@ -1893,7 +1821,6 @@ fn zero_length_cid() {
+     );
+     let (client_ch, server_ch) = pair.connect();
+     // Ensure we can reconnect after a previous connection is cleaned up
+-    info!("closing");
+     pair.client
+         .connections
+         .get_mut(&client_ch)
+@@ -1910,7 +1837,6 @@ fn zero_length_cid() {
+ 
+ #[test]
+ fn keep_alive() {
+-    let _guard = subscribe();
+     const IDLE_TIMEOUT: u64 = 10;
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+@@ -1937,7 +1863,6 @@ fn keep_alive() {
+ 
+ #[test]
+ fn cid_rotation() {
+-    let _guard = subscribe();
+     const CID_TIMEOUT: Duration = Duration::from_secs(2);
+ 
+     let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+@@ -1979,10 +1904,6 @@ fn cid_rotation() {
+                 }
+             }
+         }
+-        info!(
+-            "Checking active cid sequence range before {:?} seconds",
+-            round * CID_TIMEOUT.as_secs()
+-        );
+         let _bound = (left_bound, right_bound);
+         assert_matches!(
+             pair.server_conn_mut(server_ch).active_local_cid_seq(),
+@@ -1997,7 +1918,6 @@ fn cid_rotation() {
+ 
+ #[test]
+ fn cid_retirement() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2032,7 +1952,6 @@ fn cid_retirement() {
+ 
+ #[test]
+ fn finish_stream_flow_control_reordered() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2080,7 +1999,6 @@ fn finish_stream_flow_control_reordered() {
+ 
+ #[test]
+ fn handshake_1rtt_handling() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_ch = pair.begin_connect(client_config());
+     pair.drive_client();
+@@ -2115,7 +2033,6 @@ fn handshake_1rtt_handling() {
+ 
+ #[test]
+ fn stop_before_finish() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2124,7 +2041,6 @@ fn stop_before_finish() {
+     pair.client_send(client_ch, s).write(MSG).unwrap();
+     pair.drive();
+ 
+-    info!("stopping stream");
+     const ERROR: VarInt = VarInt(42);
+     pair.server_recv(server_ch, s).stop(ERROR).unwrap();
+     pair.drive();
+@@ -2137,7 +2053,6 @@ fn stop_before_finish() {
+ 
+ #[test]
+ fn stop_during_finish() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2147,7 +2062,6 @@ fn stop_during_finish() {
+     pair.drive();
+ 
+     assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(stream) if stream == s);
+-    info!("stopping and finishing stream");
+     const ERROR: VarInt = VarInt(42);
+     pair.server_recv(server_ch, s).stop(ERROR).unwrap();
+     pair.drive_server();
+@@ -2162,7 +2076,6 @@ fn stop_during_finish() {
+ // Ensure we can recover from loss of tail packets when the congestion window is full
+ #[test]
+ fn congested_tail_loss() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+ 
+@@ -2178,7 +2091,6 @@ fn congested_tail_loss() {
+     assert!(!pair.server.inbound.is_empty());
+     pair.server.inbound.clear();
+     // Ensure that the congestion state recovers after retransmits occur and are ACKed
+-    info!("recovering");
+     pair.drive();
+     assert!(pair.client_conn_mut(client_ch).congestion_window() > TARGET);
+     pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
+@@ -2187,7 +2099,6 @@ fn congested_tail_loss() {
+ // Send a tail-loss probe when GSO segment_size is less than INITIAL_MTU
+ #[test]
+ fn tail_loss_small_segment_size() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2198,7 +2109,6 @@ fn tail_loss_small_segment_size() {
+     const DGRAM_LEN: usize = 1000; // Below INITIAL_MTU after packet overhead.
+     const DGRAM_NUM: u64 = 5; // Enough to build a GSO batch.
+ 
+-    info!("Sending an ack-eliciting datagram");
+     pair.client_conn_mut(client_ch).ping();
+     pair.drive_client();
+ 
+@@ -2207,7 +2117,6 @@ fn tail_loss_small_segment_size() {
+     pair.server.inbound.clear();
+ 
+     // Doing one step makes the client advance time to the PTO fire time.
+-    info!("stepping forward to PTO");
+     pair.step();
+ 
+     // Still no datagrams frames received by the server.
+@@ -2217,7 +2126,6 @@ fn tail_loss_small_segment_size() {
+     // Now we can send another batch of datagrams, so the PTO can send them instead of
+     // sending a ping.  These are small enough that the segment_size is less than the
+     // INITIAL_MTU.
+-    info!("Sending datagram batch");
+     for _ in 0..DGRAM_NUM {
+         pair.client_datagrams(client_ch)
+             .send(vec![0; DGRAM_LEN].into(), false)
+@@ -2236,7 +2144,6 @@ fn tail_loss_small_segment_size() {
+ // Respect max_datagrams when TLP happens
+ #[test]
+ fn tail_loss_respect_max_datagrams() {
+-    let _guard = subscribe();
+     let client_config = {
+         let mut c_config = client_config();
+         let mut t_config = TransportConfig::default();
+@@ -2251,7 +2158,6 @@ fn tail_loss_respect_max_datagrams() {
+     const DGRAM_LEN: usize = 1000; // High enough so GSO batch could be built
+     const DGRAM_NUM: u64 = 5; // Enough to build a GSO batch.
+ 
+-    info!("Sending an ack-eliciting datagram");
+     pair.client_conn_mut(client_ch).ping();
+     pair.drive_client();
+ 
+@@ -2260,11 +2166,9 @@ fn tail_loss_respect_max_datagrams() {
+     pair.server.inbound.clear();
+ 
+     // Doing one step makes the client advance time to the PTO fire time.
+-    info!("stepping forward to PTO");
+     pair.step();
+ 
+     // start sending datagram batches but the first should be a TLP
+-    info!("Sending datagram batch");
+     for _ in 0..DGRAM_NUM {
+         pair.client_datagrams(client_ch)
+             .send(vec![0; DGRAM_LEN].into(), false)
+@@ -2280,7 +2184,6 @@ fn tail_loss_respect_max_datagrams() {
+ 
+ #[test]
+ fn datagram_send_recv() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+@@ -2301,7 +2204,6 @@ fn datagram_send_recv() {
+ 
+ #[test]
+ fn datagram_recv_buffer_overflow() {
+-    let _guard = subscribe();
+     const PAYLOAD_WINDOW: usize = 100;
+     const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
+     const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
+@@ -2352,7 +2254,6 @@ fn datagram_recv_buffer_overflow() {
+ 
+ #[test]
+ fn datagram_send_buffer_overflow() {
+-    let _guard = subscribe();
+     const PAYLOAD_WINDOW: usize = 100;
+     const METADATA_WINDOW: usize = 2 * size_of::<Datagram>();
+     const WINDOW: usize = PAYLOAD_WINDOW + METADATA_WINDOW;
+@@ -2393,7 +2294,6 @@ fn datagram_send_buffer_overflow() {
+ 
+ #[test]
+ fn datagram_send_buffer_space_preserves_queued_datagrams() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     let mut transport_config = TransportConfig::default();
+@@ -2424,7 +2324,6 @@ fn datagram_send_buffer_space_preserves_queued_datagrams() {
+ 
+ #[test]
+ fn datagram_larger_than_send_buffer_is_too_large() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     let mut transport_config = TransportConfig::default();
+@@ -2446,7 +2345,6 @@ fn datagram_larger_than_send_buffer_is_too_large() {
+ 
+ #[test]
+ fn datagram_send_buffer_metadata_boundaries() {
+-    let _guard = subscribe();
+     for window in [
+         0,
+         size_of::<Datagram>() - 1,
+@@ -2488,7 +2386,6 @@ fn datagram_send_buffer_metadata_boundaries() {
+ 
+ #[test]
+ fn datagram_send_buffer_blocks_until_drained() {
+-    let _guard = subscribe();
+     const LEN: usize = 4;
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+@@ -2526,7 +2423,6 @@ fn datagram_send_buffer_blocks_until_drained() {
+ 
+ #[test]
+ fn datagram_unsupported() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             datagram_receive_buffer_size: None,
+@@ -2548,7 +2444,6 @@ fn datagram_unsupported() {
+ 
+ #[test]
+ fn large_initial() {
+-    let _guard = subscribe();
+     let server_config =
+         ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![vec![0, 0, 0, 42]])));
+ 
+@@ -2581,7 +2476,6 @@ fn large_initial() {
+ /// Ensure that we don't yield a finish event before the actual FIN is acked so the peer isn't left
+ /// hanging
+ fn finish_acked() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2589,9 +2483,7 @@ fn finish_acked() {
+ 
+     const MSG: &[u8] = b"hello";
+     pair.client_send(client_ch, s).write(MSG).unwrap();
+-    info!("client sends data to server");
+     pair.drive_client(); // send data to server
+-    info!("server acknowledges data");
+     pair.drive_server(); // process data and send data ack
+ 
+     // Receive data
+@@ -2615,12 +2507,10 @@ fn finish_acked() {
+     // Finish before receiving data ack
+     pair.client_send(client_ch, s).finish().unwrap();
+     // Send FIN, receive data ack
+-    info!("client receives ACK, sends FIN");
+     pair.drive_client();
+     // Check for premature finish from data ack
+     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+     // Process FIN ack
+-    info!("server ACKs FIN");
+     pair.drive();
+     assert_matches!(
+         pair.client_conn_mut(client_ch).poll(),
+@@ -2636,7 +2526,6 @@ fn finish_acked() {
+ #[test]
+ /// Ensure that we don't yield a finish event while there's still unacknowledged data
+ fn finish_retransmit() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -2684,7 +2573,6 @@ fn finish_retransmit() {
+ /// stream window.
+ #[test]
+ fn repeated_request_response() {
+-    let _guard = subscribe();
+     let server = ServerConfig {
+         transport: Arc::new(TransportConfig {
+             max_concurrent_bidi_streams: 1u32.into(),
+@@ -2733,8 +2621,6 @@ fn repeated_request_response() {
+ /// Ensures that the client sends an anti-deadlock probe after an incomplete server's first flight
+ #[test]
+ fn handshake_anti_deadlock_probe() {
+-    let _guard = subscribe();
+-
+     let (cert, key) = big_cert_and_key();
+     let server = server_config_with_cert(cert.clone(), key);
+     let client = client_config_with_certs(vec![cert]);
+@@ -2765,8 +2651,6 @@ fn handshake_anti_deadlock_probe() {
+ /// before the anti-amplification limit kicks in when MTUs are similar.
+ #[test]
+ fn server_can_send_3_inital_packets() {
+-    let _guard = subscribe();
+-
+     let (cert, key) = big_cert_and_key();
+     let server = server_config_with_cert(cert.clone(), key);
+     let client = client_config_with_certs(vec![cert]);
+@@ -2809,7 +2693,6 @@ fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+ 
+ #[test]
+ fn malformed_token_len() {
+-    let _guard = subscribe();
+     let client_addr = "[::2]:7890".parse().unwrap();
+     let mut server = Endpoint::new(
+         Default::default(),
+@@ -2830,7 +2713,6 @@ fn malformed_token_len() {
+ 
+ #[test]
+ fn loss_probe_requests_immediate_ack() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+     pair.drive();
+@@ -2858,7 +2740,6 @@ fn loss_probe_requests_immediate_ack() {
+ /// This is mostly a sanity check to ensure our testing code is correctly dropping packets above the
+ /// pmtu
+ fn connect_too_low_mtu() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+ 
+     // The maximum payload size is lower than 1200, so no packages will get through!
+@@ -2871,7 +2752,6 @@ fn connect_too_low_mtu() {
+ 
+ #[test]
+ fn connect_lost_mtu_probes_do_not_trigger_congestion_control() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.mtu = 1200;
+ 
+@@ -2894,7 +2774,6 @@ fn connect_lost_mtu_probes_do_not_trigger_congestion_control() {
+ 
+ #[test]
+ fn connect_detects_mtu() {
+-    let _guard = subscribe();
+     let max_udp_payload_and_expected_mtu = &[(1200, 1200), (1400, 1389), (1500, 1452)];
+ 
+     for &(pair_max_udp, expected_mtu) in max_udp_payload_and_expected_mtu {
+@@ -2910,8 +2789,6 @@ fn connect_detects_mtu() {
+ 
+ #[test]
+ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
+-    let _guard = subscribe();
+-
+     let client_max_udp_payload_size: u16 = 1400;
+ 
+     // Set up a client with a max payload size of 1400 (and use the defaults for the server)
+@@ -2967,7 +2844,6 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
+ 
+ #[test]
+ fn connect_runs_mtud_again_after_600_seconds() {
+-    let _guard = subscribe();
+     let mut server_config = server_config();
+     let mut client_config = client_config();
+ 
+@@ -3013,7 +2889,6 @@ fn connect_runs_mtud_again_after_600_seconds() {
+ 
+ #[test]
+ fn blackhole_after_mtu_change_repairs_itself() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.mtu = 1500;
+     let (client_ch, server_ch) = pair.connect();
+@@ -3052,7 +2927,6 @@ fn blackhole_after_mtu_change_repairs_itself() {
+ 
+ #[test]
+ fn mtud_probes_include_immediate_ack() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+     pair.drive();
+@@ -3067,8 +2941,6 @@ fn mtud_probes_include_immediate_ack() {
+ 
+ #[test]
+ fn packet_splitting_with_default_mtu() {
+-    let _guard = subscribe();
+-
+     // The payload needs to be split in 2 in order to be sent, because it is higher than the max MTU
+     let payload = vec![42; 1300];
+ 
+@@ -3089,7 +2961,6 @@ fn packet_splitting_with_default_mtu() {
+ 
+ #[test]
+ fn packet_splitting_not_necessary_after_higher_mtu_discovered() {
+-    let _guard = subscribe();
+     let payload = vec![42; 1300];
+ 
+     let mut pair = Pair::default();
+@@ -3110,7 +2981,6 @@ fn packet_splitting_not_necessary_after_higher_mtu_discovered() {
+ 
+ #[test]
+ fn single_ack_eliciting_packet_triggers_ack_after_delay() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default_with_deterministic_pns();
+     let (client_ch, _) = pair.connect_with(client_config_with_deterministic_pns());
+     pair.drive();
+@@ -3175,7 +3045,6 @@ fn single_ack_eliciting_packet_triggers_ack_after_delay() {
+ 
+ #[test]
+ fn immediate_ack_triggers_ack() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default_with_deterministic_pns();
+     let (client_ch, _) = pair.connect_with(client_config_with_deterministic_pns());
+     pair.drive();
+@@ -3194,7 +3063,6 @@ fn immediate_ack_triggers_ack() {
+ 
+ #[test]
+ fn out_of_order_ack_eliciting_packet_triggers_ack() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default_with_deterministic_pns();
+     let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
+     pair.drive();
+@@ -3252,7 +3120,6 @@ fn out_of_order_ack_eliciting_packet_triggers_ack() {
+ 
+ #[test]
+ fn single_ack_eliciting_packet_with_ce_bit_triggers_immediate_ack() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default_with_deterministic_pns();
+     let (client_ch, _) = pair.connect_with(client_config_with_deterministic_pns());
+     pair.drive();
+@@ -3318,7 +3185,6 @@ fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle,
+ /// Verify that max ACK delay is counted from the first ACK-eliciting packet
+ #[test]
+ fn ack_frequency_ack_delayed_from_first_of_flight() {
+-    let _guard = subscribe();
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(Duration::from_millis(30));
+ 
+     // The client sends the following frames:
+@@ -3375,7 +3241,6 @@ fn ack_frequency_ack_delayed_from_first_of_flight() {
+ 
+ #[test]
+ fn ack_frequency_ack_sent_after_max_ack_delay() {
+-    let _guard = subscribe();
+     let max_ack_delay = Duration::from_millis(30);
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(max_ack_delay);
+ 
+@@ -3414,7 +3279,6 @@ fn ack_frequency_ack_sent_after_max_ack_delay() {
+ 
+ #[test]
+ fn ack_frequency_ack_sent_after_packets_above_threshold() {
+-    let _guard = subscribe();
+     let max_ack_delay = Duration::from_millis(30);
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(max_ack_delay);
+ 
+@@ -3462,7 +3326,6 @@ fn ack_frequency_ack_sent_after_packets_above_threshold() {
+ 
+ #[test]
+ fn ack_frequency_ack_sent_after_reordered_packets_below_threshold() {
+-    let _guard = subscribe();
+     let max_ack_delay = Duration::from_millis(30);
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(max_ack_delay);
+ 
+@@ -3517,7 +3380,6 @@ fn ack_frequency_ack_sent_after_reordered_packets_below_threshold() {
+ 
+ #[test]
+ fn ack_frequency_ack_sent_after_reordered_packets_above_threshold() {
+-    let _guard = subscribe();
+     let max_ack_delay = Duration::from_millis(30);
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(max_ack_delay);
+ 
+@@ -3569,7 +3431,6 @@ fn ack_frequency_ack_sent_after_reordered_packets_above_threshold() {
+ 
+ #[test]
+ fn ack_frequency_update_max_delay() {
+-    let _guard = subscribe();
+     let (mut pair, client_ch, server_ch) = setup_ack_frequency_test(Duration::from_millis(200));
+ 
+     // Ack frequency was sent initially
+@@ -3582,7 +3443,6 @@ fn ack_frequency_update_max_delay() {
+     );
+ 
+     // Client sends a PING
+-    info!("first ping");
+     pair.client_conn_mut(client_ch).ping();
+     pair.drive();
+ 
+@@ -3596,7 +3456,6 @@ fn ack_frequency_update_max_delay() {
+     );
+ 
+     // RTT jumps, client sends another ping
+-    info!("delayed ping");
+     pair.latency *= 10;
+     pair.client_conn_mut(client_ch).ping();
+     pair.drive();
+@@ -3629,7 +3488,6 @@ fn stream_chunks(mut recv: RecvStream) -> Vec<u8> {
+ /// reduces receiver memory use.
+ #[test]
+ fn pure_sender_voluntarily_acks() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -3652,7 +3510,6 @@ fn pure_sender_voluntarily_acks() {
+ /// sending a response: the client times out rather than receiving a CONNECTION_REFUSED.
+ #[test]
+ fn silently_drop_rejected_initials() {
+-    let _guard = subscribe();
+     let mut server_config = server_config();
+     server_config.max_incoming(0);
+     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+@@ -3674,7 +3531,6 @@ fn silently_drop_rejected_initials() {
+ 
+ #[test]
+ fn reject_manually() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Reject);
+ 
+@@ -3694,7 +3550,6 @@ fn reject_manually() {
+ 
+ #[test]
+ fn validate_then_reject_manually() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.server.handle_incoming = Box::new({
+         let mut i = 0;
+@@ -3740,7 +3595,6 @@ fn endpoint_and_connection_impl_send_sync() {
+ 
+ #[test]
+ fn stream_gso() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+ 
+@@ -3750,7 +3604,6 @@ fn stream_gso() {
+ 
+     // Send 20KiB of stream data, which comfortably fits inside two `tests::util::MAX_DATAGRAMS`
+     // datagram batches
+-    info!("sending");
+     for _ in 0..20 {
+         pair.client_send(client_ch, s).write(&[0; 1024]).unwrap();
+     }
+@@ -3762,7 +3615,6 @@ fn stream_gso() {
+ 
+ #[test]
+ fn datagram_gso() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -3778,7 +3630,6 @@ fn datagram_gso() {
+ 
+     // Send 10 datagrams above half the MTU, which fits inside a `tests::util::MAX_DATAGRAMS`
+     // datagram batch
+-    info!("sending");
+     const DATAGRAM_LEN: usize = 1024;
+     const DATAGRAMS: usize = 10;
+     for _ in 0..DATAGRAMS {
+@@ -3799,7 +3650,6 @@ fn datagram_gso() {
+ 
+ #[test]
+ fn gso_truncation() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -3808,7 +3658,6 @@ fn gso_truncation() {
+     // Send three application datagrams such that each is large to be combined with another in a
+     // single MTU, and the second datagram would require an unreasonably large amount of padding to
+     // produce a QUIC packet of the same length as the first.
+-    info!("sending");
+     const SIZES: [usize; 3] = [1024, 768, 768];
+     for len in SIZES {
+         pair.client_datagrams(client_ch)
+@@ -3831,7 +3680,6 @@ fn gso_truncation() {
+ 
+ #[test]
+ fn pad_initial_to_min_mtu() {
+-    let _guard = subscribe();
+     for min_mtu in [INITIAL_MTU, 1280, 1333] {
+         let mut transport = TransportConfig::default();
+         transport
+@@ -3866,7 +3714,6 @@ fn pad_initial_to_min_mtu() {
+ 
+ #[test]
+ fn min_mtu_does_not_pad_application_data() {
+-    let _guard = subscribe();
+     const MTU: u16 = 1333;
+     let mut transport = TransportConfig::default();
+     transport.min_mtu(MTU).mtu_discovery_config(None);
+@@ -3889,7 +3736,6 @@ fn min_mtu_does_not_pad_application_data() {
+ 
+ #[test]
+ fn min_mtu_does_not_pad_zero_rtt_batch_tail() {
+-    let _guard = subscribe();
+     const MTU: u16 = 1333;
+     for pad_to_mtu in [false, true] {
+         let mut transport = TransportConfig::default();
+@@ -3952,7 +3798,6 @@ fn min_mtu_does_not_pad_zero_rtt_batch_tail() {
+ 
+ #[test]
+ fn min_mtu_limits_application_loss_probes() {
+-    let _guard = subscribe();
+     const MIN_MTU: u16 = 1280;
+     const MTU: u16 = 1452;
+     let mut transport = TransportConfig::default();
+@@ -3988,7 +3833,6 @@ fn min_mtu_limits_application_loss_probes() {
+ 
+ #[test]
+ fn pad_server_initial_to_min_mtu() {
+-    let _guard = subscribe();
+     const MIN_MTU: u16 = 1333;
+     let mut transport = TransportConfig::default();
+     transport
+@@ -4012,7 +3856,6 @@ fn pad_server_initial_to_min_mtu() {
+ 
+ #[test]
+ fn min_mtu_respects_peer_max_udp_payload_size() {
+-    let _guard = subscribe();
+     const PEER_MAX: u16 = 1280;
+     let mut transport = TransportConfig::default();
+     transport.min_mtu(1452).mtu_discovery_config(None);
+@@ -4038,7 +3881,6 @@ fn min_mtu_respects_peer_max_udp_payload_size() {
+ /// Verify that UDP datagrams are padded to MTU if specified in the transport config.
+ #[test]
+ fn pad_to_mtu() {
+-    let _guard = subscribe();
+     const MTU: u16 = 1333;
+     let client_config = {
+         let mut c_config = client_config();
+@@ -4057,7 +3899,6 @@ fn pad_to_mtu() {
+     let initial_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+     pair.server.capture_inbound_packets = true;
+ 
+-    info!("sending");
+     // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
+     const LEN_1: usize = 800;
+     const LEN_2: usize = 600;
+@@ -4105,7 +3946,6 @@ fn pad_to_mtu() {
+ /// alongside it is also queued, in exactly 2 UDP datagrams.
+ #[test]
+ fn large_datagram_with_acks() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, server_ch) = pair.connect();
+ 
+@@ -4134,7 +3974,6 @@ fn large_datagram_with_acks() {
+ /// outgoing application datagrams too large to coexist in the same packet with it.
+ #[test]
+ fn voluntary_ack_with_large_datagrams() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let (client_ch, _) = pair.connect();
+ 
+@@ -4162,7 +4001,6 @@ fn voluntary_ack_with_large_datagrams() {
+ 
+ #[test]
+ fn path_changes_unblock_oversized_datagrams() {
+-    let _guard = subscribe();
+     for migrate in [false, true] {
+         let mut pair = Pair::default();
+         let (client_ch, server_ch) = pair.connect();
+@@ -4231,7 +4069,6 @@ fn path_changes_unblock_oversized_datagrams() {
+ /// Verify that dropping oversized datagrams will trigger a DatagramsUnblocked event.
+ #[test]
+ fn oversized_datagrams_trigger_unblock() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     // Start the connection with a large MTU.
+     const INITIAL_MTU: usize = 1300;
+@@ -4277,9 +4114,7 @@ fn oversized_datagrams_trigger_unblock() {
+             SendDatagramError::Blocked(_) => {
+                 // continue with the next step but drain the DatagramsUnblocked events
+                 // emitted datagrams were sent out.
+-                while let Some(event) = pair.client_conn_mut(client_ch).poll() {
+-                    tracing::info!("ignoring connection event: {event:?}");
+-                }
++                while pair.client_conn_mut(client_ch).poll().is_some() {}
+             }
+             SendDatagramError::TooLarge => {
+                 // mtu adjusted, break the loop
+@@ -4311,7 +4146,6 @@ fn oversized_datagrams_trigger_unblock() {
+ 
+ #[test]
+ fn ack_bundled_with_datagrams() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default_with_deterministic_pns();
+     let (client_ch, server_ch) = pair.connect_with(client_config_with_deterministic_pns());
+ 
+@@ -4356,7 +4190,6 @@ fn ack_bundled_with_datagrams() {
+ 
+ #[test]
+ fn reject_short_idcid() {
+-    let _guard = subscribe();
+     let client_addr = "[::2]:7890".parse().unwrap();
+     let mut server = Endpoint::new(
+         Default::default(),
+@@ -4379,7 +4212,6 @@ fn reject_short_idcid() {
+ /// regardless of whether the address is actually used.
+ #[test]
+ fn preferred_address() {
+-    let _guard = subscribe();
+     let mut server_config = server_config();
+     server_config.preferred_address_v6(Some("[::1]:65535".parse().unwrap()));
+ 
+diff --git a/src/tests/token.rs b/src/tests/token.rs
+index d64bd6e..25887e1 100644
+--- a/src/tests/token.rs
++++ b/src/tests/token.rs
+@@ -9,7 +9,6 @@ use crate::packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader};
+ 
+ #[test]
+ fn oversized_cached_initial_token() {
+-    let _guard = subscribe();
+     for (token_len, mtu, fits) in [
+         (0, 1200, true),
+         (1080, 1200, true),
+@@ -57,7 +56,6 @@ fn oversized_cached_initial_token() {
+ 
+ #[test]
+ fn oversized_retry_token() {
+-    let _guard = subscribe();
+     for (token_len, fits) in [
+         (64, true),
+         (1118, true),
+@@ -132,7 +130,6 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
+ 
+ #[test]
+ fn stateless_retry() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     pair.server.handle_incoming = Box::new(validate_incoming);
+     let (client_ch, _server_ch) = pair.connect();
+@@ -150,8 +147,6 @@ fn stateless_retry() {
+ 
+ #[test]
+ fn retry_token_expired() {
+-    let _guard = subscribe();
+-
+     let fake_time = Arc::new(FakeTimeSource::new());
+     let retry_token_lifetime = Duration::from_secs(1);
+ 
+@@ -187,7 +182,6 @@ fn retry_token_expired() {
+ 
+ #[test]
+ fn use_token() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_config = client_config();
+     let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+@@ -222,7 +216,6 @@ fn use_token() {
+ 
+ #[test]
+ fn retry_then_use_token() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_config = client_config();
+     pair.server.handle_incoming = Box::new(validate_incoming);
+@@ -258,7 +251,6 @@ fn retry_then_use_token() {
+ 
+ #[test]
+ fn use_token_then_retry() {
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let client_config = client_config();
+     let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+@@ -327,7 +319,6 @@ fn use_same_token_twice() {
+         }
+     }
+ 
+-    let _guard = subscribe();
+     let mut pair = Pair::default();
+     let mut client_config = client_config();
+     client_config.token_store(Arc::new(EvilTokenStore::default()));
+@@ -380,7 +371,6 @@ fn use_same_token_twice() {
+ 
+ #[test]
+ fn use_token_expired() {
+-    let _guard = subscribe();
+     let fake_time = Arc::new(FakeTimeSource::new());
+     let lifetime = Duration::from_secs(10000);
+     let mut server_config = server_config();
+diff --git a/src/tests/util.rs b/src/tests/util.rs
+index 01189ee..6ce26c3 100644
+--- a/src/tests/util.rs
++++ b/src/tests/util.rs
+@@ -2,11 +2,9 @@ use std::{
+     cmp,
+     collections::{HashMap, HashSet, VecDeque},
+     env,
+-    io::{self, Write},
+     mem,
+     net::{Ipv6Addr, SocketAddr, UdpSocket},
+     ops::RangeFrom,
+-    str,
+     sync::{Arc, Mutex},
+ };
+ 
+@@ -18,7 +16,6 @@ use rustls::{
+     client::WebPkiServerVerifier,
+     pki_types::{CertificateDer, PrivateKeyDer},
+ };
+-use tracing::{info_span, trace};
+ 
+ use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
+ use super::*;
+@@ -102,14 +99,12 @@ impl Pair {
+             Some(t) if Some(t) == client_t => {
+                 if t != self.time {
+                     self.time = self.time.max(t);
+-                    trace!("advancing to {:?} for client", self.time - self.epoch);
+                 }
+                 true
+             }
+             Some(t) if Some(t) == server_t => {
+                 if t != self.time {
+                     self.time = self.time.max(t);
+-                    trace!("advancing to {:?} for server", self.time - self.epoch);
+                 }
+                 true
+             }
+@@ -138,13 +133,10 @@ impl Pair {
+     }
+ 
+     pub(super) fn drive_client(&mut self) {
+-        let span = info_span!("client");
+-        let _guard = span.enter();
+         self.client.drive(self.time, self.server.addr);
+         for (packet, buffer) in self.client.outbound.drain(..) {
+             let packet_size = packet_size(&packet, &buffer);
+             if packet_size > self.mtu {
+-                info!(packet_size, "dropping packet (max size exceeded)");
+                 continue;
+             }
+             if buffer[0] & packet::LONG_HEADER_FORM == 0 {
+@@ -167,13 +159,10 @@ impl Pair {
+     }
+ 
+     pub(super) fn drive_server(&mut self) {
+-        let span = info_span!("server");
+-        let _guard = span.enter();
+         self.server.drive(self.time, self.client.addr);
+         for (packet, buffer) in self.server.outbound.drain(..) {
+             let packet_size = packet_size(&packet, &buffer);
+             if packet_size > self.mtu {
+-                info!(packet_size, "dropping packet (max size exceeded)");
+                 continue;
+             }
+             if let Some(ref socket) = self.server.socket {
+@@ -198,7 +187,6 @@ impl Pair {
+         &mut self,
+         config: ClientConfig,
+     ) -> (ConnectionHandle, ConnectionHandle) {
+-        info!("connecting");
+         let client_ch = self.begin_connect(config);
+         self.drive();
+         let server_ch = self.server.assert_accept();
+@@ -208,8 +196,6 @@ impl Pair {
+ 
+     /// Just start connecting the client
+     pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
+-        let span = info_span!("client");
+-        let _guard = span.enter();
+         let (client_ch, client_conn) = self
+             .client
+             .connect(self.time, config, self.server.addr, "localhost")
+@@ -538,31 +524,6 @@ impl ::std::ops::DerefMut for TestEndpoint {
+     }
+ }
+ 
+-pub(super) fn subscribe() -> tracing::subscriber::DefaultGuard {
+-    let builder = tracing_subscriber::FmtSubscriber::builder()
+-        .with_max_level(tracing::Level::TRACE)
+-        .with_writer(|| TestWriter);
+-    // tracing uses std::time to trace time, which panics in wasm.
+-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+-    let builder = builder.without_time();
+-    tracing::subscriber::set_default(builder.finish())
+-}
+-
+-struct TestWriter;
+-
+-impl Write for TestWriter {
+-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+-        print!(
+-            "{}",
+-            str::from_utf8(buf).expect("tried to log invalid UTF-8")
+-        );
+-        Ok(buf.len())
+-    }
+-    fn flush(&mut self) -> io::Result<()> {
+-        io::stdout().flush()
+-    }
+-}
+-
+ pub(super) fn server_config() -> ServerConfig {
+     let mut config = ServerConfig::with_crypto(Arc::new(server_crypto()));
+     if !cfg!(feature = "bloom") {
+diff --git a/src/token_memory_cache.rs b/src/token_memory_cache.rs
+index e94254e..8384f3d 100644
+--- a/src/token_memory_cache.rs
++++ b/src/token_memory_cache.rs
+@@ -7,7 +7,6 @@ use std::{
+ 
+ use bytes::Bytes;
+ use lru_slab::LruSlab;
+-use tracing::trace;
+ 
+ use crate::token::TokenStore;
+ 
+@@ -28,13 +27,11 @@ impl TokenMemoryCache {
+ 
+ impl TokenStore for TokenMemoryCache {
+     fn insert(&self, server_name: &str, token: Bytes) {
+-        trace!(%server_name, "storing token");
+         self.0.lock().unwrap().store(server_name, token)
+     }
+ 
+     fn take(&self, server_name: &str) -> Option<Bytes> {
+         let token = self.0.lock().unwrap().take(server_name);
+-        trace!(%server_name, found=%token.is_some(), "taking token");
+         token
+     }
+ }

@@ -78,10 +78,7 @@ impl CaseExchange {
     /// what the driver [`provide`](Self::provide)d. `Err` if the engine was
     /// resumed without one, which the driver ABI rules out.
     pub(crate) fn request_proposal(&self) -> RequestProposal<'_> {
-        RequestProposal {
-            exchange: self,
-            requested: false,
-        }
+        RequestProposal { exchange: self, requested: false }
     }
 
     /// Whether the engine is suspended on a proposal the driver has not
@@ -129,10 +126,7 @@ impl CaseExchange {
     /// exchange and suspends; by the alternation protocol it resolves on the
     /// next poll, which the driver performs only once the case is complete.
     pub(crate) fn offer(&self, ds: BoxedDataSource) -> Offer<'_> {
-        Offer {
-            exchange: self,
-            ds: Some(ds),
-        }
+        Offer { exchange: self, ds: Some(ds) }
     }
 
     /// Take the case the engine just offered. `Err` if the engine suspended
@@ -142,10 +136,7 @@ impl CaseExchange {
     #[cfg(any(test, feature = "__bench"))]
     pub(crate) fn take(&self) -> Result<BoxedDataSource, InternalError> {
         let taken = self.slot.lock().take();
-        Ok(hegel_internal_unwrap!(
-            taken,
-            "the engine suspended without offering a test case"
-        ))
+        Ok(hegel_internal_unwrap!(taken, "the engine suspended without offering a test case"))
     }
 }
 
@@ -205,10 +196,7 @@ impl Future for RequestProposal<'_> {
 }
 
 fn unwrap_provided(provided: Option<Next>) -> Result<Next, InternalError> {
-    Ok(hegel_internal_unwrap!(
-        provided,
-        "the engine was resumed without the proposal it requested"
-    ))
+    Ok(hegel_internal_unwrap!(provided, "the engine was resumed without the proposal it requested"))
 }
 
 /// Run an engine future to completion on the calling thread, handing each
@@ -237,10 +225,7 @@ pub(crate) fn drive<F: Future>(
 #[cfg(test)]
 pub(crate) fn drive_no_yield<F: Future>(fut: F) -> F::Output {
     let mut fut = core::pin::pin!(fut);
-    match fut
-        .as_mut()
-        .poll(&mut Context::from_waker(core::task::Waker::noop()))
-    {
+    match fut.as_mut().poll(&mut Context::from_waker(core::task::Waker::noop())) {
         Poll::Ready(out) => out,
         Poll::Pending => unreachable!("future offered a test case but none was expected"),
     }

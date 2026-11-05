@@ -59,9 +59,46 @@ pub struct Output {
     /// LLVM's passes leave to it (MemorySanitizer's options, AddressSanitizer's redzones and
     /// global descriptors, SanitizerCoverage's init calls). Empty for an uninstrumented image.
     pub sanitize: blaze_codegen::settings::Sanitize,
-    /// ELF `DT_RUNPATH` and Mach-O `LC_RPATH` entries, absolute: where the loader finds the
-    /// shared runtimes [`crate::target::locate`] put on the link line.
+    /// ELF `DT_RUNPATH` and Mach-O `LC_RPATH` entries, in order: where the loader finds the
+    /// shared runtimes [`crate::target::locate`] put on the link line (absolute), then the
+    /// link arguments' ([`LinkArgs::rpaths`], as given: `$ORIGIN/..`, `@loader_path/..`).
     pub rpaths: Vec<String>,
+    /// What the link arguments ask of the image beyond its libraries ([`crate::args`]).
+    pub link: LinkArgs,
+}
+
+/// What the link arguments (`-C link-arg`, `-C link-args`, a build script's
+/// `cargo:rustc-link-arg*`) ask of an image that its other fields do not hold, as
+/// [`crate::args::apply`] sets them: the default is an image linked with none. A stack size
+/// is [`Output::stack`], a shared library's name and extra exports are in [`OutputKind`].
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)] // clone: setup, as `Output`'s
+pub struct LinkArgs {
+    /// `-rpath DIR` (ld64, GNU ld, lld), in the order given: [`crate::target::locate`] puts
+    /// them in [`Output::rpaths`] after the runtimes' own.
+    pub rpaths: Vec<String>,
+    /// Mach-O `-headerpad SIZE`: bytes kept free after the load commands, so a tool
+    /// (`install_name_tool`, `codesign`) can add or lengthen one in place. 0 when not given.
+    pub headerpad: u64,
+    /// Mach-O `-headerpad_max_install_names`: room for every library's path (and a shared
+    /// library's own install name) to grow to `MAXPATHLEN`.
+    pub headerpad_max_install_names: bool,
+    /// What a symbol nothing defines becomes: Mach-O `-undefined`, ELF `-z defs`.
+    pub undefined: Undefined,
+    /// ELF `-z nodelete` of a shared library: `DF_1_NODELETE`, never unloaded.
+    pub nodelete: bool,
+}
+
+/// What a symbol nothing on the link line defines becomes.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub enum Undefined {
+    /// An executable's is an error; a shared library's is imported for the loader to find
+    /// in whatever is loaded (Mach-O's flat lookup, ELF's undefined dynamic symbol).
+    #[default]
+    Default,
+    /// An error in a shared library too (Mach-O `-undefined error`, ELF `-z defs`).
+    Error,
+    /// Mach-O `-undefined dynamic_lookup`: imported by flat lookup in an executable too.
+    DynamicLookup,
 }
 
 /// A dev executable (`blaze run`, `blaze test`): its start hook, `blaze_inproc_start`, swaps its
@@ -135,8 +172,12 @@ pub struct Native<'a> {
 pub enum NativeKind {
     Object,
     /// Members taken for undefined symbols, or all of them (`--whole-archive`).
-    Archive { whole: bool },
+    Archive {
+        whole: bool,
+    },
     /// A shared library, a linker script naming them, a `.tbd` stub or an import library;
     /// left out of the image's needs when none of its symbols is used and `as_needed`.
-    Shared { as_needed: bool },
+    Shared {
+        as_needed: bool,
+    },
 }

@@ -38,10 +38,7 @@ impl NativeDataSource {
     /// so one stream aborting on overrun doesn't mark its siblings' sources
     /// aborted.
     fn from_handle(handle: NativeTestCaseHandle) -> Self {
-        NativeDataSource {
-            inner: handle,
-            aborted: AtomicBool::new(false),
-        }
+        NativeDataSource { inner: handle, aborted: AtomicBool::new(false) }
     }
 
     /// Convenience: extract choice nodes from a handle after a test case.
@@ -340,10 +337,8 @@ impl DataSource for NativeDataSource {
                 rule_names.len()
             )));
         }
-        if let Some((rule, weight)) = rule_weights
-            .iter()
-            .enumerate()
-            .find(|(_, w)| !(w.is_finite() && **w > 0.0))
+        if let Some((rule, weight)) =
+            rule_weights.iter().enumerate().find(|(_, w)| !(w.is_finite() && **w > 0.0))
         {
             return Err(DataSourceError::InvalidArgument(format!(
                 "rule weights must be finite and positive, but rule {rule} ({}) has weight \
@@ -516,10 +511,9 @@ impl DataSource for NativeDataSource {
             TestCaseResult::Valid => (Status::Valid, None),
             TestCaseResult::Invalid => (Status::Invalid, None),
             TestCaseResult::Overrun => (Status::EarlyStop, None),
-            TestCaseResult::Interesting(failure) => (
-                Status::Interesting,
-                Some(InterestingOrigin(failure.origin.clone())),
-            ),
+            TestCaseResult::Interesting(failure) => {
+                (Status::Interesting, Some(InterestingOrigin(failure.origin.clone())))
+            }
         };
         ntc.conclude(status, origin);
     }

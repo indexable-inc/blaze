@@ -220,7 +220,8 @@ fn a_request_in_place_allocates_nothing() {
 /// request decoded into its kept buffer allocate nothing.
 #[test]
 fn a_warm_read_and_chunked_request_allocate_nothing() {
-    let chunked = b"POST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let chunked =
+        b"POST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
     let mut parser = RequestParser::new(1 << 20);
     let mut round = |parser: &mut RequestParser| {
         parser.reset();
@@ -231,9 +232,10 @@ fn a_warm_read_and_chunked_request_allocate_nothing() {
     };
     round(&mut parser);
     for _ in 0..10 {
-        let read = blaze_alloc_count::assert_at_most(0, "a warm read and a chunked request", || {
-            round(&mut parser)
-        });
+        let read =
+            blaze_alloc_count::assert_at_most(0, "a warm read and a chunked request", || {
+                round(&mut parser)
+            });
         assert_eq!(read, (2, true));
     }
 }
@@ -245,7 +247,9 @@ fn a_message_is_one_allocation_of_its_size() {
     let headers = [("Content-Type", "application/cbor"), ("X-Request-Id", "18446744073709551615")];
     let body = [5; 300];
     for status in [200, 299, 413, 431, 505] {
-        let bytes = blaze_alloc_count::assert_at_most(1, "a response", || response(status, &headers, &body));
+        let bytes = blaze_alloc_count::assert_at_most(1, "a response", || {
+            response(status, &headers, &body)
+        });
         let mut kept = Vec::with_capacity(1024);
         response_into(&mut kept, status, &headers, &body);
         assert_eq!(kept, bytes);
@@ -257,9 +261,14 @@ fn a_message_is_one_allocation_of_its_size() {
         blaze_alloc_count::assert_at_most(1, "a chunked head", || chunked(status, &headers));
     }
     let long = "/".repeat(2000);
-    let sent = blaze_alloc_count::assert_at_most(1, "a request", || request("PATCH", "api.github.com", &long, &headers, &body));
+    let sent = blaze_alloc_count::assert_at_most(1, "a request", || {
+        request("PATCH", "api.github.com", &long, &headers, &body)
+    });
     let parsed = parse(&sent).unwrap().unwrap();
-    assert_eq!((parsed.method.as_str(), parsed.path.len(), parsed.body.len()), ("PATCH", 2000, 300));
+    assert_eq!(
+        (parsed.method.as_str(), parsed.path.len(), parsed.body.len()),
+        ("PATCH", 2000, 300)
+    );
 }
 
 /// A response longer than one read is read whole, its head moved out of the parser.
@@ -348,7 +357,10 @@ fn both_a_length_and_chunks_are_refused() {
 #[test]
 fn bad_lengths_and_codings_are_refused_naming_them() {
     assert_eq!(status_of(b"POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc"), 400);
-    assert_eq!(status_of(b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n"), 400);
+    assert_eq!(
+        status_of(b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n"),
+        400
+    );
     assert_eq!(status_of(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"), 501);
 }
 
@@ -478,7 +490,8 @@ fn no_content_has_no_body() {
 
 #[test]
 fn a_status_line_without_a_reason_is_read() {
-    let response = read_response(&mut &b"HTTP/1.1 299\r\nContent-Length: 0\r\n\r\n"[..], 1).unwrap();
+    let response =
+        read_response(&mut &b"HTTP/1.1 299\r\nContent-Length: 0\r\n\r\n"[..], 1).unwrap();
     assert_eq!(response.status, 299);
 }
 

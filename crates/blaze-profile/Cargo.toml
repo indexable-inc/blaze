@@ -1,6 +1,6 @@
 [package]
 name = "blaze-profile"
-description = "Where the time of a blaze build goes: the steps of a build, with BLAZE_PROFILE every process's per-thread timeline, the CPU time of each function compiled and of each pass; always on, the flight recorder, the stall watchdog and the CPU sampler"
+description = "Where the time of a blaze build goes: the flight recorder, the profile history the daemon writes (spans, child processes, test runs, the client's rows), BLAZE_PROFILE's trace export, the stall watchdog and the CPU sampler"
 publish = false
 
 version.workspace = true
@@ -15,13 +15,16 @@ doctest = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+base64.workspace = true
 blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-serde.workspace = true
+bytes.workspace = true
 blaze-v2-proof.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true

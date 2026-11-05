@@ -240,9 +240,7 @@ impl<'a, 'db> At<'a, 'db> {
         T: ToTrace<'db>,
     {
         match variance {
-            Variance::Covariant => {
-                self.infcx.sub_raw(self.cause, self.param_env, expected, actual)
-            }
+            Variance::Covariant => self.infcx.sub_raw(self.cause, self.param_env, expected, actual),
             Variance::Invariant => self.eq(expected, actual),
             Variance::Contravariant => {
                 self.infcx.sup_raw(self.cause, self.param_env, expected, actual)

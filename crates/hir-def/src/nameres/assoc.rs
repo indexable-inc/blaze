@@ -46,10 +46,7 @@ impl TraitItems {
     }
 
     #[blaze_query::tracked(returns(ref))]
-    pub fn query_with_diagnostics(
-        db: &Db,
-        tr: TraitId,
-    ) -> (TraitItems, DefDiagnostics) {
+    pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
         let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
@@ -88,7 +85,9 @@ impl TraitItems {
     /// `AssocTag::Type`. [`TraitItems::associated_type_by_name`] compares text alone.
     pub fn associated_type_named(&self, db: &Db, name: Name) -> Option<TypeAliasId> {
         self.items.iter().find_map(|&(item_name, item)| match item {
-            AssocItemId::TypeAliasId(t) if crate::nameres::assoc_item_is(db, item_name, item, name) => {
+            AssocItemId::TypeAliasId(t)
+                if crate::nameres::assoc_item_is(db, item_name, item, name) =>
+            {
                 Some(t)
             }
             _ => None,
@@ -324,10 +323,11 @@ impl<'db> AssocItemCollector<'db> {
                         Some(Namespace::Macros),
                         ctxt,
                     );
-                    let before = path.as_ident().filter(|_| origin == Hygienic::Here).and_then(|name| {
-                        let call = ast_id.erase();
-                        self.def_map.legacy_macro_before(self.db, self.module_id, name, call)
-                    });
+                    let before =
+                        path.as_ident().filter(|_| origin == Hygienic::Here).and_then(|name| {
+                            let call = ast_id.erase();
+                            self.def_map.legacy_macro_before(self.db, self.module_id, name, call)
+                        });
                     if let Some(before) = before {
                         return Some(before.definition(self.db));
                     }

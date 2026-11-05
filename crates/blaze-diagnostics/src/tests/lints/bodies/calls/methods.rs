@@ -14,7 +14,8 @@ use crate::{Options, lints::CommandLine};
 
 /// The options compiletest gives a UI test of `mode`, then the test's own lint flags.
 fn compiletest(mode: crate::tests::Mode, flags: &[&str]) -> Options {
-    let args: Vec<String> = flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
+    let args: Vec<String> =
+        flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
     let own = Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() };
     crate::tests::compiletest(mode, &own)
 }
@@ -432,7 +433,8 @@ pub mod cmp {
 "#;
 
 /// What core's prelude has of [`CORE_CMP`].
-pub(crate) const CORE_CMP_PRELUDE: &str = "        pub use crate::cmp::{Eq, Ord, PartialEq, PartialOrd};\n";
+pub(crate) const CORE_CMP_PRELUDE: &str =
+    "        pub use crate::cmp::{Eq, Ord, PartialEq, PartialOrd};\n";
 
 /// core's `iter` (`Iterator` with `map` and `collect`, `Map`, `IntoIterator`, `FromIterator`)
 /// and `slice` (`[T]::iter`, `[T]::iter_mut`, `[T]::sort`, their iterators), on
@@ -950,7 +952,9 @@ pub(crate) fn ui_library(ui: Ui<'_>, library: &Library<'_>) -> String {
     );
     let mut deps = String::from("std,core");
     for (name, edition, source) in library.aux {
-        fixture.push_str(&format!("//- /{name}.rs crate:{name} edition:{edition} deps:std,core\n{source}"));
+        fixture.push_str(&format!(
+            "//- /{name}.rs crate:{name} edition:{edition} deps:std,core\n{source}"
+        ));
         if !source.ends_with('\n') {
             fixture.push('\n');
         }
@@ -958,7 +962,10 @@ pub(crate) fn ui_library(ui: Ui<'_>, library: &Library<'_>) -> String {
         deps.push_str(name);
     }
     let meta = if ui.meta.is_empty() { String::new() } else { format!(" {}", ui.meta) };
-    fixture.push_str(&format!("//- /{} crate:other:main edition:{} deps:{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
+    fixture.push_str(&format!(
+        "//- /{} crate:other:main edition:{} deps:{deps}{meta}\n{}",
+        ui.name, ui.edition, ui.source
+    ));
     let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(ui.mode, ui.flags))
         .stderr_with(crate::emit::Style { ui_testing: true, ..crate::emit::Style::default() });
     crate::tests::normalized(&stderr)

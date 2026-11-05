@@ -179,6 +179,9 @@
     "version": "0.0.0"
    },
    {
+    "dependencies": [
+     "blaze-mem"
+    ],
     "name": "blaze-bytes",
     "version": "0.0.0"
    },
@@ -230,6 +233,7 @@
      "blaze-protocol",
      "blaze-radix",
      "blaze-reclaim",
+     "blaze-rng",
      "blaze-serde",
      "blaze-spin",
      "corosensei",
@@ -285,20 +289,26 @@
    },
    {
     "dependencies": [
-     "blaze-bytes",
+     "blaze-inproc-rt",
      "blaze-mem",
-     "blaze-spin",
      "crossbeam-channel",
-     "libc",
-     "parking_lot",
-     "windows-sys 0.61.2"
+     "parking_lot"
     ],
     "name": "blaze-inproc",
     "version": "0.0.0"
    },
    {
     "dependencies": [
+     "libc",
+     "windows-sys 0.61.2"
+    ],
+    "name": "blaze-inproc-rt",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blaze-inproc",
+     "blaze-inproc-rt",
      "blaze-sha256"
     ],
     "name": "blaze-live",
@@ -308,7 +318,6 @@
     "dependencies": [
      "blaze-check",
      "blaze-reclaim",
-     "blaze-spin",
      "crossbeam-channel",
      "libc",
      "parking_lot",
@@ -345,6 +354,7 @@
      "blaze-reclaim",
      "blaze-serde",
      "blaze-vfs",
+     "crossbeam-queue",
      "either",
      "hashbrown 0.17.1",
      "indexmap",
@@ -353,6 +363,7 @@
      "serde",
      "smallvec",
      "thin-vec",
+     "tracing",
      "triomphe"
     ],
     "name": "blaze-query",
@@ -2685,6 +2696,7 @@
     "dependencies": [
      "itertools",
      "libc",
+     "parking_lot",
      "stacker",
      "tracing"
     ],
@@ -4064,6 +4076,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-image",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-inproc-rt@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's dev runtime built in blaze's workspace: the run process's side of a dev run and the wire both sides share, from library/blaze_inproc_rt's source (which the standard library's build links into every dev executable)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-inproc-rt",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-inproc-rt",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10056,7 +10085,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -10084,7 +10114,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -10124,7 +10155,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -10212,7 +10244,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -10354,6 +10391,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -10593,28 +10634,45 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -10641,6 +10699,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -10673,10 +10735,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
       },
       {
        "name": "crossbeam_channel",
@@ -10850,6 +10908,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -10880,6 +10942,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -16768,6 +16834,10 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
        "name": "stacker",
        "unit": "stacker@0.1.25 lib stacker build"
       },
@@ -18281,7 +18351,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -18309,7 +18380,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -18349,7 +18421,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -18437,7 +18510,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -18579,6 +18657,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -18818,28 +18900,45 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -18866,6 +18965,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -18898,10 +19001,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
       },
       {
        "name": "crossbeam_channel",
@@ -19075,6 +19174,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -19105,6 +19208,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -25074,6 +25181,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -27429,7 +27540,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -27457,7 +27569,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -27501,7 +27614,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -27589,7 +27703,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -27731,6 +27850,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -27966,28 +28089,45 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -28014,6 +28154,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -28046,10 +28190,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
       },
       {
        "name": "crossbeam_channel",
@@ -28223,6 +28363,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -28253,6 +28397,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -34161,6 +34309,10 @@
        "unit": "libc@0.2.191 lib libc build"
       },
       {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
        "name": "stacker",
        "unit": "stacker@0.1.25 lib stacker build"
       },
@@ -35670,7 +35822,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -35698,7 +35851,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -35742,7 +35896,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -35830,7 +35985,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -35972,6 +36132,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -36211,28 +36375,45 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -36259,6 +36440,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -36291,10 +36476,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
       },
       {
        "name": "crossbeam_channel",
@@ -36468,6 +36649,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -36498,6 +36683,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -42487,6 +42676,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",

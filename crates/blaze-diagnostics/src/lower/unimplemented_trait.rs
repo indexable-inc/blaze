@@ -33,7 +33,10 @@ use hir::{InFile, LangItem};
 use hir_ty::method_resolution::TraitImpls;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
-    view::{self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _, HasGenericArgs as _},
+    view::{
+        self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _,
+        HasGenericArgs as _,
+    },
 };
 
 use crate::{
@@ -205,22 +208,19 @@ impl Cause {
         at: InFile<ast::Node<'db>>,
         is_of: impl Fn(&hir::Type<'db>) -> bool,
     ) -> Cause {
-        let plain = || Cause {
-            span: cx.span(at.map(|it| it.text_range())),
-            callee_span: None,
+        let plain = || Cause { span: cx.span(at.map(|it| it.text_range())), callee_span: None };
+        let (callee_range, args): (TextRange, Option<ast::ArgList<'db>>) = if let Some(path) =
+            ast::PathExpr::cast(at.value)
+            && let Some(call) = path.syntax().parent().and_then(ast::CallExpr::cast)
+            && call.expr().is_some_and(|it| it.syntax() == path.syntax())
+        {
+            (path.syntax().text_range(), call.arg_list())
+        } else if let Some(call) = ast::MethodCallExpr::cast(at.value) {
+            let Some(name) = call.name_ref() else { return plain() };
+            (name.syntax().text_range(), call.arg_list())
+        } else {
+            return plain();
         };
-        let (callee_range, args): (TextRange, Option<ast::ArgList<'db>>) =
-            if let Some(path) = ast::PathExpr::cast(at.value)
-                && let Some(call) = path.syntax().parent().and_then(ast::CallExpr::cast)
-                && call.expr().is_some_and(|it| it.syntax() == path.syntax())
-            {
-                (path.syntax().text_range(), call.arg_list())
-            } else if let Some(call) = ast::MethodCallExpr::cast(at.value) {
-                let Some(name) = call.name_ref() else { return plain() };
-                (name.syntax().text_range(), call.arg_list())
-            } else {
-                return plain();
-            };
         let callee_span = cx.span(at.with_value(callee_range));
         let mut blamed = args
             .into_iter()
@@ -294,7 +294,11 @@ fn note_derived<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>, diag: &
 /// type, "unsatisfied trait bound introduced here" on the impl's `bound` the step went through
 /// ("implicitly introduced here" on the type parameter for an implicit `Sized`). `None` for an
 /// impl of another crate or of a macro's expansion, which rustc notes without a span.
-fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, bound: Option<hir::BoundSource>) -> Option<MultiSpan> {
+fn impl_note(
+    cx: &Cx<'_, '_>,
+    impl_: hir::Impl,
+    bound: Option<hir::BoundSource>,
+) -> Option<MultiSpan> {
     if impl_.module(cx.db).krate(cx.db) != cx.krate {
         return None;
     }
@@ -315,7 +319,9 @@ fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, bound: Option<hir::BoundSource>)
     // alloc: empty, the error's labels, for an error hir found
     let mut at = MultiSpan { primary, labels: Vec::new() };
     let label = match bound {
-        Some(hir::BoundSource::ImplicitSized(_)) => "unsatisfied trait bound implicitly introduced here",
+        Some(hir::BoundSource::ImplicitSized(_)) => {
+            "unsatisfied trait bound implicitly introduced here"
+        }
         _ => "unsatisfied trait bound introduced here",
     };
     if let Some(span) = bound.and_then(|it| obligation_cause::bound_span(cx, it))
@@ -328,11 +334,17 @@ fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, bound: Option<hir::BoundSource>)
 }
 
 /// The `Assoc = ..` constraint on `assoc` written in `bound`'s trait path.
-pub(super) fn constraint_range(cx: &Cx<'_, '_>, bound: ast::TypeBound<'_>, assoc: hir::TypeAlias) -> Option<TextRange> {
+pub(super) fn constraint_range(
+    cx: &Cx<'_, '_>,
+    bound: ast::TypeBound<'_>,
+    assoc: hir::TypeAlias,
+) -> Option<TextRange> {
     let ast::Type::PathType(ty) = bound.ty()? else { return None };
     let name = assoc.name(cx.db);
     ty.path()?.segment()?.generic_arg_list()?.generic_args().find_map(|arg| match arg {
-        ast::GenericArg::AssocTypeArg(it) if it.name_ref().is_some_and(|n| n.text() == name.as_str()) => {
+        ast::GenericArg::AssocTypeArg(it)
+            if it.name_ref().is_some_and(|n| n.text() == name.as_str()) =>
+        {
             Some(it.syntax().text_range())
         }
         _ => None,
@@ -373,7 +385,12 @@ enum Meta {
 }
 
 /// rustc's `OnUnimplementedDirective::evaluate` of the attributes of the trait of `pred`.
-fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct: bool, at: ast::Node<'db>) -> Custom {
+fn on_unimplemented<'db>(
+    cx: &Cx<'_, 'db>,
+    pred: &hir::TraitClause<'db>,
+    direct: bool,
+    at: ast::Node<'db>,
+) -> Custom {
     let tr = pred.trait_ref();
     let trait_ = tr.trait_();
     let Some(src) = cx.vsema.source(trait_) else { return Custom::default() };
@@ -387,7 +404,8 @@ fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct:
         if !is_rustc && path != "diagnostic::on_unimplemented" {
             continue;
         }
-        let mode = if is_rustc { Mode::RustcOnUnimplemented } else { Mode::DiagnosticOnUnimplemented };
+        let mode =
+            if is_rustc { Mode::RustcOnUnimplemented } else { Mode::DiagnosticOnUnimplemented };
         let Some(tt) = meta.token_tree() else { continue };
         let args: &Args = args.get_or_insert_with(|| Args::of(cx, pred, at));
         let metas = parse_metas(tt.syntax());
@@ -400,10 +418,11 @@ fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct:
             match meta {
                 Meta::List(name, inner) if name == "on" && is_rustc => {
                     // alloc: the error's parts, for an error hir found
-                    let (cond, fields) = inner.split_first().map_or((None, Vec::new()), |(c, f)| {
-                        // alloc: the error's parts, for an error hir found
-                        (Some(c), f.iter().collect())
-                    });
+                    let (cond, fields) =
+                        inner.split_first().map_or((None, Vec::new()), |(c, f)| {
+                            // alloc: the error's parts, for an error hir found
+                            (Some(c), f.iter().collect())
+                        });
                     commands.push((cond, fields));
                 }
                 _ => commands[0].1.push(meta),
@@ -454,7 +473,10 @@ fn parse_metas(tt: ast::Node<'_>) -> Vec<Meta> {
             NodeOrToken::Node(_) => {}
             NodeOrToken::Token(token) => match token.kind() {
                 kind if kind.is_trivia() => {}
-                SyntaxKind::COMMA | SyntaxKind::R_PAREN | SyntaxKind::R_BRACK | SyntaxKind::R_CURLY => {
+                SyntaxKind::COMMA
+                | SyntaxKind::R_PAREN
+                | SyntaxKind::R_BRACK
+                | SyntaxKind::R_CURLY => {
                     if let Some(name) = name.take() {
                         out.push(Meta::Word(name));
                     }
@@ -567,7 +589,9 @@ impl Args {
             // alloc: the error's text, for an error hir found
             own.push(lifetime.name(cx.db).as_str().to_owned());
         }
-        for (i, param) in hir::GenericDef::Trait(trait_).type_or_const_params(cx.db).into_iter().enumerate() {
+        for (i, param) in
+            hir::GenericDef::Trait(trait_).type_or_const_params(cx.db).into_iter().enumerate()
+        {
             // alloc: the error's text, for an error hir found
             let name = param.name(cx.db).as_str().to_owned();
             if name != "Self" {
@@ -612,10 +636,9 @@ impl Args {
                     let value = format_filter(value, &self.generics);
                     self.self_matches.iter().any(|it| *it == value)
                 }
-                _ => self
-                    .generics
-                    .iter()
-                    .any(|(param, arg)| param == name && *arg == format_filter(value, &self.generics)),
+                _ => self.generics.iter().any(|(param, arg)| {
+                    param == name && *arg == format_filter(value, &self.generics)
+                }),
             },
             Meta::List(name, inner) => match name.as_str() {
                 "not" => inner.first().is_some_and(|it| !self.holds(it, direct)),
@@ -654,7 +677,9 @@ fn item_context<'db>(cx: &Cx<'_, 'db>, at: ast::Node<'db>) -> &'static str {
                     (true, true) => "an async gen closure",
                     (true, false) => "an async closure",
                     (false, true) => "a gen closure",
-                    (false, false) if closure.attrs().any(|it| it.simple_name() == Some("coroutine")) => {
+                    (false, false)
+                        if closure.attrs().any(|it| it.simple_name() == Some("coroutine")) =>
+                    {
                         "a coroutine"
                     }
                     (false, false) => "a closure",
@@ -679,11 +704,13 @@ fn item_context<'db>(cx: &Cx<'_, 'db>, at: ast::Node<'db>) -> &'static str {
                     (true, true) => "an async gen function",
                     (true, false) => "an async function",
                     (false, true) => "a gen function",
-                    (false, false) => match node.parent().and_then(|it| it.parent()).map(|it| it.kind()) {
-                        Some(SyntaxKind::TRAIT) => "a trait method",
-                        Some(SyntaxKind::IMPL) => "a method",
-                        _ => "a function",
-                    },
+                    (false, false) => {
+                        match node.parent().and_then(|it| it.parent()).map(|it| it.kind()) {
+                            Some(SyntaxKind::TRAIT) => "a trait method",
+                            Some(SyntaxKind::IMPL) => "a method",
+                            _ => "a function",
+                        }
+                    }
                 };
             }
             // A macro call is passed through to the code it expands to.
@@ -753,9 +780,7 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> bool {
     let derivable = match name {
         "Copy" | "Clone" => true,
         _ if matches!(adt, hir::Adt::Union(_)) => false,
-        "PartialEq" | "PartialOrd" => {
-            tr.get_type_argument(1).is_some_and(|rhs| rhs == self_ty)
-        }
+        "PartialEq" | "PartialOrd" => tr.get_type_argument(1).is_some_and(|rhs| rhs == self_ty),
         _ => true,
     };
     if !derivable {
@@ -815,7 +840,10 @@ fn has_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     let id = hir_def::TraitId::from(trait_);
     let module = hir_def::ModuleId::from(trait_.module(cx.db));
     sees(TraitImpls::for_crate(cx.db, cx.krate.into()), id)
-        || module.block(cx.db).and_then(|it| TraitImpls::for_block(cx.db, it)).is_some_and(|it| sees(it, id))
+        || module
+            .block(cx.db)
+            .and_then(|it| TraitImpls::for_block(cx.db, it))
+            .is_some_and(|it| sees(it, id))
 }
 
 fn sees(impls: &TraitImpls<'_>, trait_: hir_def::TraitId) -> bool {

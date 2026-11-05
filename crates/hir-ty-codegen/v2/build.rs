@@ -11,7 +11,7 @@
 //! ones of crates no edit reaches, which the unit's references and key name
 //! ([`super::refs::built_in`]).
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_codegen::{
     Backend,
     settings::{Panic, Spec},
@@ -99,20 +99,23 @@ impl Build {
         }
     }
 
-    /// What a body of `written` is optimized with, `generic` where it is an instance compiled
-    /// per instance, by rustc's rules: the library's crates' MIR at level 2 and inlined, as
+    /// What a body of `written` is optimized with, `per_user` where it is an instance each crate
+    /// that uses it compiles (`Instance::compiled_by_user`: a generic, a closure, an `#[inline]`
+    /// function), by rustc's rules: the library's crates' MIR at level 2 and inlined, as
     /// shipped, and every other at the unit's level, inlined where the unit inlines
     /// ([`Self::inlines`]). The code generator always gives lifetimes. Allocations move to the
     /// stack in every crate but the library's, whose bodies are one for every program.
     ///
     /// UB checks (`CheckAlignment`, `CheckNull`) are `sess.ub_checks()` of the crate whose MIR
     /// it is, `written`: rustc runs them in that crate's `optimized_mir`, wherever the instance
-    /// is later monomorphized. A body that is not generic is compiled in its own crate's unit,
-    /// whose setting this is (as rustc's copy of it in that crate); a generic one has
+    /// is later monomorphized or copied. A body compiled once, in its own crate's unit, has
+    /// that unit's setting (as rustc's copy of it in that crate); one each user compiles has
     /// `written`'s own `-C debug-assertions`, as its cfg says, whichever unit or home crate
-    /// compiles it. Never the home's (`hir_ty_mir::mir::home`), a choice of sharing that no
-    /// store key names: the key (`code`, `args`, the unit's settings) covers `written`, whether
-    /// the instance is generic and this unit's setting, so one key is one body (rule 18). What
+    /// compiles it: an `#[inline]` function of a dependency built without debug assertions
+    /// keeps no alignment or null check in a member built with them. Never the home's
+    /// (`hir_ty_mir::mir::home`), a choice of sharing that no store key names: the key (`code`,
+    /// `args`, the unit's settings) covers `written`, whether the instance is compiled per user
+    /// and this unit's setting, so one key is one body (rule 18). What
     /// `ub_checks()` itself is, the compiling unit's in the library's crates, is
     /// `ub_checks_in`'s, at code generation.
     ///
@@ -121,13 +124,13 @@ impl Build {
     /// of a body built into another to the stack: the inliner's callees have
     /// `heap_to_stack: false`, and a body this side builds into its caller is built under
     /// [`Self::built_in`].
-    pub(crate) fn options(self, db: &Db, written: Crate, generic: bool) -> MirOptions {
+    pub(crate) fn options(self, db: &Db, written: Crate, per_user: bool) -> MirOptions {
         let lang = written.data(db).origin.is_lang();
         let level = match self.optimized || lang {
             true => MirOptLevel::Release,
             false => MirOptLevel::Debug,
         };
-        let ub_checks = match generic {
+        let ub_checks = match per_user {
             false => self.debug_assertions && !lang,
             true => crate::debug_assertions(db, written),
         };

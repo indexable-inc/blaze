@@ -18,14 +18,26 @@
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
 //!   view.
-//! - **As the front end is kept**, its build over.
+//! - **As the front end is kept**, its build over: every MIR goes then, of every goal and
+//!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
+//!   that made it, read again by the next build only as its memo (verified against, made
+//!   again where read), so nothing of it outlives the build that made it.
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
 //! is named by its query's reruns.
 //!
-//! A check (`Goal::Check`) lets go of nothing: its inference is what it made, and what the next
-//! check of the head reads again.
+//! A check (`Goal::Check`) keeps its inference: what it made, and what the next check of the
+//! head reads again. Its MIR goes as its front end is kept, as every build's does, and memory
+//! makes a release of a check due mid-build as of any build: then the MIR, constant values and
+//! solver caches of every crate go and the values kept by bytes are swept under the squeeze's
+//! caps, but no crate's inference is let go by name. A check that let go of nothing (the
+//! release before slowcheck, and before this, a check under no limit) kept every MIR it made in
+//! the kept front end, for the next check and the one after (MIR queries are `lru = 0`: let go
+//! only when asked), so each check grew blaze's heap by what it made (build 19 of coord
+//! nfcheck: 127 GiB live against a budget of 59, 110 GiB of it MIR), and the plane, which grants
+//! a task memory only when what the process holds leaves room, then ran every unit's phase
+//! alone: one worker of 16 busy for the whole 43-minute check.
 
 #![forbid(unsafe_code)]
 
@@ -128,26 +140,34 @@ pub(crate) struct Release<K = Crate> {
     squeeze: Squeeze,
     /// Memory made a release due ([`Squeeze::due`], asked as each unit compiles).
     pressed: bool,
-    /// Whether the build compiles code; a check's front end lets go of nothing.
-    on: bool,
+    /// Whether the build compiles code. A check's front end lets go mid-build only when memory
+    /// makes a release due, and then of no crate's inference by name.
+    compiles: bool,
+    /// The build is over and its front end is to be kept ([`Release::end`]): the next release
+    /// lets go of every MIR, whatever the goal and memory.
+    ended: bool,
 }
 
 /// What one release lets go of, told by [`Release::plan`].
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Plan<K> {
-    /// The crates finished since the last release: their bodies' inference goes.
+    /// The crates finished since the last release: their bodies' inference goes. Always
+    /// empty for a check, whose inference the next check of the head reads again.
     pub(crate) crates: Vec<K>,
     /// Every MIR and constant's value goes too: no unit is open, or memory is short.
     pub(crate) mir: bool,
     /// Memory made it due: the values kept by bytes are swept under the squeeze's caps.
     pub(crate) pressed: bool,
+    /// The build is over ([`Release::end`]): its MIR goes with it.
+    pub(crate) ended: bool,
 }
 
 impl Release<Crate> {
-    /// For a build of `units` units, of the crates `crates` names; `on` unless it is a check.
-    pub(crate) fn new(crates: &Crates, units: usize, on: bool) -> Release {
+    /// For a build of `units` units, of the crates `crates` names; `compiles` unless it is a
+    /// check.
+    pub(crate) fn new(crates: &Crates, units: usize, compiles: bool) -> Release {
         let of = (0..units).map(|unit| crates.krate(unit)).collect(); // alloc: a crate a unit, once per build
-        Release::of(Finished::new(of), on)
+        Release::of(Finished::new(of), compiles)
     }
 
     /// Unit `unit` compiled: whether memory makes a release due is asked now, once a unit,
@@ -161,12 +181,13 @@ impl Release<Crate> {
     /// memory pressure sweeps the values kept by bytes under the squeeze's caps. A span names
     /// what it let go and what blaze held before and after (rule 14).
     pub(crate) fn release(&mut self, lowered: &mut Lowered) {
-        let Some(Plan { crates, mir, pressed }) = self.plan() else { return };
+        let Some(Plan { crates, mir, pressed, ended }) = self.plan() else { return };
         let before = Pressure::now();
         let span = tracing::info_span!(
             target: "blaze",
             "front end release",
             pressed,
+            ended,
             crates = crates.len(),
             mir,
             held = before.held,
@@ -218,7 +239,10 @@ impl Release<Crate> {
         // One line each release in the daemon's log, on its standard error as the memory line
         // is: why, what went, blaze's memory before and after against the limit (B5), and the
         // query storage's largest holders.
-        eprintln!("blaze serve: {}", Said { crates: crates.len(), mir, pressed, dropped, before, after, storage });
+        eprintln!(
+            "blaze serve: {}",
+            Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage }
+        );
     }
 }
 
@@ -228,6 +252,7 @@ pub(crate) struct Said {
     pub(crate) crates: usize,
     pub(crate) mir: bool,
     pub(crate) pressed: bool,
+    pub(crate) ended: bool,
     pub(crate) dropped: hir::evict::Dropped,
     pub(crate) before: Pressure,
     pub(crate) after: Pressure,
@@ -304,16 +329,30 @@ impl std::fmt::Display for Holders {
 impl std::fmt::Display for Said {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
-        let Said { crates, mir, pressed, dropped, before, after, storage: _ } = self;
+        let Said { crates, mir, pressed, ended, dropped, before, after, storage: _ } = self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
-            (true, _) if before.squeezed() => write!(f, "memory: blaze is past the limit's line of {:.2} GiB", gib(before.limit - before.limit / admission::LINE))?,
-            (true, Some(tag)) => write!(f, "memory: {} is past its share of {:.2} GiB", tag.name(), gib(admission::fair_share(tag, before.limit)))?,
+            (true, _) if before.squeezed() => write!(
+                f,
+                "memory: blaze is past the limit's line of {:.2} GiB",
+                gib(before.limit - before.limit / admission::LINE)
+            )?,
+            (true, Some(tag)) => write!(
+                f,
+                "memory: {} is past its share of {:.2} GiB",
+                tag.name(),
+                gib(admission::fair_share(tag, before.limit))
+            )?,
             (true, None) => f.write_str("memory")?,
+            (false, _) if *ended => f.write_str("the build is over")?,
             (false, _) if *mir => f.write_str("no unit is open")?,
             (false, _) => f.write_str("crates finished")?,
         }
-        write!(f, "): let go of {} inference results of {} bodies in {crates} crates", dropped.inference, dropped.bodies)?;
+        write!(
+            f,
+            "): let go of {} inference results of {} bodies in {crates} crates",
+            dropped.inference, dropped.bodies
+        )?;
         if *mir {
             write!(f, ", {} MIR bodies, {} constant values", dropped.mir, dropped.const_eval)?;
         }
@@ -324,7 +363,11 @@ impl std::fmt::Display for Said {
         write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
         match before.held.checked_sub(after.held) {
             Some(freed) => write!(f, " ({:.2} freed)", gib(freed))?,
-            None => write!(f, " ({:.2} more: other tasks grew meanwhile)", gib(after.held - before.held))?,
+            None => write!(
+                f,
+                " ({:.2} more: other tasks grew meanwhile)",
+                gib(after.held - before.held)
+            )?,
         }
         match before.limit {
             u64::MAX => f.write_str(", under no limit")?,
@@ -335,40 +378,71 @@ impl std::fmt::Display for Said {
 }
 
 impl<K: Copy + Eq + Hash> Release<K> {
-    pub(crate) fn of(finished: Finished<K>, on: bool) -> Release<K> {
-        Release { finished, squeeze: Squeeze::default(), pressed: false, on }
+    pub(crate) fn of(finished: Finished<K>, compiles: bool) -> Release<K> {
+        Release { finished, squeeze: Squeeze::default(), pressed: false, compiles, ended: false }
     }
 
     pub(crate) fn began(&mut self, unit: usize) {
         self.finished.began(unit);
     }
 
-    /// Unit `unit` compiled, memory read by `now` (only if it can matter).
+    /// Unit `unit` compiled, memory read by `now` (only if it can matter): a check's as any
+    /// build's, since memory past the limit stays past it until something is let go.
     pub(crate) fn compiled_under(&mut self, unit: usize, now: impl FnOnce() -> Pressure) {
         self.finished.compiled(unit);
-        if self.on && !self.pressed {
+        if !self.pressed {
             self.pressed = self.squeeze.due(now());
         }
     }
 
-    /// Whether the build should stop its readers for a release: memory makes one due, or no
-    /// unit is open and a crate is finished (no reader to wait for).
+    /// The plane holds a task back for memory the process holds besides its tasks
+    /// (`blaze_graph::Plane::short`): a release is due if [`Squeeze::short`] says so, read
+    /// by `now` only if it can matter. Its sweep caps the values the front end keeps by bytes
+    /// at their fair shares and drops every MIR, as one memory made due does.
+    pub(crate) fn short_under(&mut self, now: impl FnOnce() -> Pressure) {
+        if !self.pressed {
+            self.pressed = self.squeeze.short(now());
+        }
+    }
+
+    /// The build is over and its front end is about to be kept, no reader alive: the next
+    /// release lets go of every MIR, of a check as of any build, under any limit or none. What
+    /// a build made of MIR is the build's: kept, it is only what the next build would verify
+    /// its memos against, which needs the memo alone.
+    pub(crate) fn end(&mut self) {
+        self.ended = true;
+    }
+
+    /// Whether the build should stop its readers for a release: memory makes one due, the
+    /// build is over, or the build compiles and no unit is open and a crate is finished (no
+    /// reader to wait for).
     pub(crate) fn due(&self) -> bool {
-        self.on && (self.pressed || (self.finished.idle() && self.finished.has_ready()))
+        self.pressed
+            || self.ended
+            || (self.compiles && self.finished.idle() && self.finished.has_ready())
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);
-    /// none when there is nothing, or the build is a check.
+    /// none when there is nothing. A check's is due to memory or to its end alone and names no
+    /// crate: its MIR, constant values and solver caches go (and under memory, its values are
+    /// swept), its inference kept for the next check of the head except as the sweep's caps
+    /// take it. Every build's last, at its end, lets go of every MIR.
     pub(crate) fn plan(&mut self) -> Option<Plan<K>> {
-        if !self.on {
-            return None;
-        }
         let pressed = std::mem::take(&mut self.pressed);
+        let ended = std::mem::take(&mut self.ended);
+        if !self.compiles {
+            return (pressed || ended).then(|| Plan {
+                crates: Vec::new(),
+                mir: true,
+                pressed,
+                ended,
+            });
+        }
         let crates = self.finished.take();
-        let mir = pressed || self.finished.idle();
-        if crates.is_empty() && !pressed {
+        let mir = pressed || ended || self.finished.idle();
+        if crates.is_empty() && !pressed && !ended {
             return None;
         }
-        Some(Plan { crates, mir, pressed })
+        Some(Plan { crates, mir, pressed, ended })
     }
 }

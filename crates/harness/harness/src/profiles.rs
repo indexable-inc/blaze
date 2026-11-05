@@ -18,6 +18,8 @@ pub struct Ctx<'a> {
     pub sock: &'a std::path::Path,
     pub user_args: &'a [String],
     pub prompt: Option<&'a str>,
+    /// A chat session (chat/mod.rs): the agent speaks its structured protocol on stdin and stdout, not its TUI.
+    pub chat: bool,
 }
 
 pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
@@ -25,7 +27,15 @@ pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
 description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
 process and task tables). Use it for everything. To run another agent, use agents.spawn in ts (never a built-in \
-sub-agent or collaboration tool), so it appears in the harness tree.";
+sub-agent or collaboration tool), so it appears in the harness tree. \
+The person sees every ts cell as it runs, drawn in the chat: its steps in plain words (searches, commands, files read \
+and written, agents started) and its result, with tables drawn as tables and command output as output. So never repeat \
+that in your reply: no markdown table or list restating results you just fetched, no pasted output. Refer to it \
+(\"the third result\", \"the build output above\"), then say what it means and what to do next. \
+To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5 markup \
+(start it with <script> or an element) using Column, Row, Text (tone: ink muted strong error accent success warning), \
+Markdown, Code, Table (rows of records), Badge, Stat (label, value, note), Card (title), Divider and Spacer; runes only \
+($state, $derived, $effect, $props), and the person sees it drawn under the cell.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -69,7 +79,10 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
         },
         other => anyhow::bail!("unknown agent kind {other:?} (expected one of {KINDS:?})"),
     };
-    l.args.extend(ctx.user_args.iter().cloned());
+    // A codex chat already took the user's args into its app-server config (codex()).
+    if !(ctx.chat && kind == "codex") {
+        l.args.extend(ctx.user_args.iter().cloned());
+    }
     if let Some(p) = ctx.prompt {
         l.args.push(p.to_string());
     }
@@ -77,6 +90,10 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
 }
 
 fn claude(ctx: &Ctx) -> Launch {
+    let mut out: Vec<String> = Vec::new();
+    if ctx.chat {
+        out.extend(crate::chat::claude::ARGS.iter().map(|a| (*a).to_owned()));
+    }
     let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": mcp_env(ctx) } } });
     let args = [
         "--strict-mcp-config", "--mcp-config", &mcp.to_string(),
@@ -101,10 +118,15 @@ fn claude(ctx: &Ctx) -> Launch {
         // Show the real cursor at the input instead of hiding it (?25l) and painting an inverse block. Claude takes
         // that from its `tengu_native_cursor` flag, which DISABLE_TELEMETRY / NONESSENTIAL_TRAFFIC leave at false.
         ("CLAUDE_CODE_NATIVE_CURSOR", "1"),
+        // The fullscreen renderer: the alt screen with Claude's own virtualized scrollback, so the input bar stays put
+        // and the wheel (sent as mouse reports, src/app/panes.rs wheel) scrolls the conversation, not the terminal's
+        // history. Same as the `tui: "fullscreen"` setting, which --setting-sources "" would drop.
+        ("CLAUDE_CODE_NO_FLICKER", "1"),
     ] {
         env.insert(k.into(), v.into());
     }
-    Launch { program: "claude".into(), args: args.iter().map(|s| s.to_string()).collect(), env }
+    out.extend(args.iter().map(|s| s.to_string()));
+    Launch { program: "claude".into(), args: out, env }
 }
 
 /// Codex features that add tools or pull in outside config; all switched off.
@@ -146,8 +168,25 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE)),
-        "--dangerously-bypass-approvals-and-sandbox".into(), // yolo: no approvals, no sandbox
     ];
+    if ctx.chat {
+        // `codex app-server` (chat/codex.rs) has no bypass flag: the same yolo as config (thread/start repeats it).
+        args.insert(0, "app-server".into());
+        args.extend(["-c", r#"approval_policy="never""#, "-c", r#"sandbox_mode="danger-full-access""#].map(String::from));
+        // app-server takes only `-c`, `--enable` and `--disable`: a model asked for the TUI's way becomes its config.
+        let mut user = ctx.user_args.iter();
+        while let Some(a) = user.next() {
+            match a.as_str() {
+                "-m" | "--model" => {
+                    let m = user.next().ok_or_else(|| anyhow::anyhow!("codex {a} needs a model name after it"))?;
+                    args.extend(["-c".to_owned(), format!("model={}", toml_str(m))]);
+                }
+                _ => args.push(a.clone()),
+            }
+        }
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".into()); // yolo: no approvals, no sandbox
+    }
     if let Some(catalog) = codex_catalog(&home)? {
         args.push("-c".into());
         args.push(format!("model_catalog_json={}", toml_str(&catalog.display().to_string())));

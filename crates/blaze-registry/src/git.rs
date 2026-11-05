@@ -96,7 +96,8 @@ fn fetch_db(
     }
     if !context.net.retry.quiet {
         let scope = if is_submodule { "submodule" } else { "repository" };
-        eprintln!("    Updating git {scope} `{url}`");
+        // The address as said, never as asked: it may carry a token (AGENTS.md, Security).
+        eprintln!("    Updating git {scope} `{}`", blaze_fetch::redact(url));
     }
     let locked = precise.map_or(reference.clone(), |it| GitReference::Rev(it.to_owned()));
     let rev = checkout_db(context, url, &db, exists, reference, &locked)?;
@@ -391,7 +392,12 @@ fn update_submodule(
     if local(repo, &["config", "-f", ".gitmodules", "--get", &key("update")])
         .is_ok_and(|it| it.trim() == "none")
     {
-        eprintln!("    Skipping git submodule `{url}` due to update strategy in .gitmodules");
+        if !context.net.retry.quiet {
+            eprintln!(
+                "    Skipping git submodule `{}` due to update strategy in .gitmodules",
+                blaze_fetch::redact(&url)
+            );
+        }
         return Ok(());
     }
     let child_url = absolute_submodule_url(parent_url, &url)?;
@@ -609,7 +615,11 @@ fn walk(
     Ok(())
 }
 
-fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut blaze_hash::HashSet<PathBuf, std::alloc::Global>) {
+fn read_nested(
+    dir: &Path,
+    found: &mut Vec<Found>,
+    visited: &mut blaze_hash::HashSet<PathBuf, std::alloc::Global>,
+) {
     if !visited.insert(dir.to_owned()) {
         return;
     }
@@ -686,7 +696,11 @@ mod tests {
         }
         paths.push(PathBuf::from("/w/a").join("/x/../y"));
         for path in &paths {
-            assert_eq!(blaze_manifest::paths::normalize_path(path), old_normalize(path), "{path:?}");
+            assert_eq!(
+                blaze_manifest::paths::normalize_path(path),
+                old_normalize(path),
+                "{path:?}"
+            );
         }
     }
 

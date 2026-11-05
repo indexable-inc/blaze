@@ -642,7 +642,12 @@ fn a_page_sent_frames_of_many_records_is_told_what_one_a_record_told_it() {
         assert!(one.0.0.iter().any(|it| matches!(it, Told::Snapshot(_))), "seed {seed}");
         assert_eq!(one.0.0, many.0.0, "seed {seed}: the page that followed from the start");
         assert_eq!(one.1.0, many.1.0, "seed {seed}: the page that followed from halfway");
-        assert!(many.0.1 < one.0.1, "seed {seed}: {} messages, not fewer than {}", many.0.1, one.0.1);
+        assert!(
+            many.0.1 < one.0.1,
+            "seed {seed}: {} messages, not fewer than {}",
+            many.0.1,
+            one.0.1
+        );
     }
 }
 
@@ -885,8 +890,30 @@ mod old {
 #[test]
 fn a_module_path_read_in_place_is_the_one_collected_step_by_step() {
     const PIECES: [&str; 24] = [
-        "anim", "core", "::", "::", "<", ">", " as ", "&", "&mut ", "dyn ", "{closure#0}", "(",
-        ")", "[", "]", "fn(", "->", "'a ", "Vec", "T", ", ", " ", "é", "::<",
+        "anim",
+        "core",
+        "::",
+        "::",
+        "<",
+        ">",
+        " as ",
+        "&",
+        "&mut ",
+        "dyn ",
+        "{closure#0}",
+        "(",
+        ")",
+        "[",
+        "]",
+        "fn(",
+        "->",
+        "'a ",
+        "Vec",
+        "T",
+        ", ",
+        " ",
+        "é",
+        "::<",
     ];
     let mut rng = SplitMix64::new(11);
     for _ in 0..20_000 {

@@ -56,7 +56,11 @@ pub enum Access {
     /// An atomic load, store, or read-modify-write (the read and the write of one RMW are one
     /// `read` then one `write` with this, with nothing between them). A failed compare-exchange
     /// is one `read` with its failure ordering and `cxchg_failed`, and no write.
-    Atomic { ord: AtomicOrd, rmw: bool, cxchg_failed: bool },
+    Atomic {
+        ord: AtomicOrd,
+        rmw: bool,
+        cxchg_failed: bool,
+    },
 }
 
 /// `core::sync::atomic::Ordering`.
@@ -104,6 +108,16 @@ pub trait Shadow<P>: Clone + Default + std::fmt::Debug {
     /// `other` put over these at `at`, growing them when it ends past them; bytes between
     /// their old end and `at` are uninitialized.
     fn put(&mut self, at: usize, other: &Self);
+    /// These, of `size` bytes, `count` times end to end, as `[x; count]` lays out its
+    /// elements. A shadow that records only its pointers overrides it to cost their number,
+    /// not `count` puts.
+    fn repeat(&self, size: usize, count: usize) -> Self {
+        let mut repeated = Self::default();
+        for i in 0..count {
+            repeated.put(i * size, self);
+        }
+        repeated
+    }
     /// The provenance of the pointer that starts at `at`, if a whole one does.
     fn prov_at(&self, at: usize, size: usize) -> Option<P>;
     /// Calls `f` with the start of each whole pointer of `size` bytes with provenance in the
@@ -153,8 +167,14 @@ pub trait Machine<'db> {
 
     /// A new allocation; returns its root provenance, which the evaluator puts on every
     /// pointer it makes to it itself (a local's place, a constant's address).
-    fn alloc(&mut self, addr: u64, size: u64, align: u64, kind: MemKind, zeroed: bool)
-    -> MResult<Self::Prov>;
+    fn alloc(
+        &mut self,
+        addr: u64,
+        size: u64,
+        align: u64,
+        kind: MemKind,
+        zeroed: bool,
+    ) -> MResult<Self::Prov>;
     fn free(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -165,8 +185,13 @@ pub trait Machine<'db> {
     /// The root provenance of the allocation `addr` is in (for pointers inside a constant's
     /// memory the evaluator lays out itself).
     fn root(&mut self, addr: u64) -> Option<Self::Prov>;
-    fn read(&mut self, ptr: Ptr<Self::Prov>, size: u64, align: u64, access: Access)
-    -> MResult<Self::Shadow>;
+    fn read(
+        &mut self,
+        ptr: Ptr<Self::Prov>,
+        size: u64,
+        align: u64,
+        access: Access,
+    ) -> MResult<Self::Shadow>;
     fn write(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -211,8 +236,12 @@ pub trait Machine<'db> {
     fn fence(&mut self, ord: AtomicOrd, compiler_only: bool) -> MResult<()>;
     /// `ptr_offset_from(a, b)` (`unsigned`: `ptr_offset_from_unsigned`): both in bounds of one
     /// allocation, as rustc's evaluation requires.
-    fn offset_from(&mut self, a: Ptr<Self::Prov>, b: Ptr<Self::Prov>, unsigned: bool)
-    -> MResult<()>;
+    fn offset_from(
+        &mut self,
+        a: Ptr<Self::Prov>,
+        b: Ptr<Self::Prov>,
+        unsigned: bool,
+    ) -> MResult<()>;
 
     /// After every typed copy into `place`: checks the value at `ty` and retags what it holds
     /// by `mode`. `bytes` are the value's bytes, already written.
@@ -300,6 +329,8 @@ impl<P> Shadow<P> for () {
     fn slice(&self, _: Range<usize>) -> Self {}
     #[inline(always)]
     fn put(&mut self, _: usize, _: &Self) {}
+    #[inline(always)]
+    fn repeat(&self, _: usize, _: usize) -> Self {}
     #[inline(always)]
     fn prov_at(&self, _: usize, _: usize) -> Option<P> {
         None

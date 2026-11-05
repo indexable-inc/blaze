@@ -29,7 +29,7 @@ state (`harness-vt`).
 5. **Keys** (`harness-native/scene/20-keys.flecs`): bindings are data, see below.
 
 Rust owns only: the terminal grid (thousands of cells a frame, never entities), key dispatch, the layout solver,
-springs, drawing, the daemon link. Everything a designer would tweak lives in script.
+springs, drawing (shared with harness-video in `harness-native-render`: Metal, text, the paint pass), the daemon link. Everything a designer would tweak lives in script.
 
 ## The primitive vocabulary (SwiftUI's, as components)
 
@@ -37,9 +37,10 @@ springs, drawing, the daemon link. Everything a designer would tweak lives in sc
 | --- | --- |
 | HStack / VStack / ZStack | `ui.Row`, `ui.Column`, `ui.ZStack` (`Flex: {axis, gap, align, justify, wrap}`) |
 | Spacer, Divider | `ui.Spacer`, `ui.Divider` (`hn.Seam` for the 1pt vertical hairline) |
-| .frame / .padding | `Size: {w, h}`, each axis `{kind: Fixed/Grow/Fit/Percent, value, min, max}`; `Padding: {l, r, t, b}` |
+| .frame / .padding | `Size: {w, h}`, each axis `{kind: Fixed/Grow/Fit/Percent, value, min, max}`; `Padding: {l, r, t, b}`. Widths are proposals (SwiftUI's): a Fit node takes the less of its ideal width and the room, `max` is `.frame(maxWidth:)`, `FixedSize` is `.fixedSize()`; text wraps at what it gets (solve.rs's module doc) |
 | Grid / LazyVGrid | `ui.Grid` + `ui.GridRow`/`ui.GridColumn`; `ui.AdaptiveGrid` with `GridColumns: {min, max}` |
 | Long lists | `ui.LazyColumn`/`ui.LazyGrid` (`Lazy: {count, row, overscan}`) in a `ui.Scroll`: only visible rows exist (the Archive) |
+| Words in a hugging plate (chat bubble, callout) | `ui.Bubble` (a Fit `ui.Box` capped by `Size.w.max`; its words wrap past it) |
 | Text | `ui.Words` (wraps) / `ui.Line` / `ui.Lead` + `TextStyle`; `ui.LineMiddle`/`ui.LineHead` or `Truncate: {mode: Head/Middle/Tail}`; one line in rows, never wrap |
 | Who truncates first | `ui.Lead` (`ShrinkFirst`), `LayoutPriority {value}`, `FixedSize {h, v}` (name truncates before badge) |
 | Alignment | `Align: FirstBaseline/LastBaseline`, `AlignSelf`, `AlignmentGuide {dx, dy}` |
@@ -49,8 +50,12 @@ springs, drawing, the daemon link. Everything a designer would tweak lives in sc
 | Button / icon button | `ui.Button`; `ui.IconButton` (square wash hugging one `ui.Symbol`; never a full-width row wash) |
 | Icons | `ui.Symbol` + `Icon: {glyph}` (den's icon set); `ui.Icon` + `Mark: {name}` for brand marks (vector, Slug) |
 | Tooltip | `Tooltip: {text: "..."}` on any node (system tooltip; nearest ancestor's wins) |
-| Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`); the tree's inertia (harness-native-scroll-physics), knob and edge fades are in `harness-native/src/app/sidebar.rs` |
+| Pointer shape | `Cursor: {shape: Text}` on a node (nearest ancestor's wins; makes it a hit target): Text on what takes typing or selection, Arrow on controls, Hand only on links (macOS's conventions); the host's zones (terminal grid, sidebar edge) and drags in `harness-native/src/app/pointer.rs` |
+| Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`) carries `ui.Scroller`, macOS's overlay scroller: knob and track parts (`ScrollerPart`) layout places from `ScrollExtent`, motion fades and widens (`ScrollerState`), input drags and pages (`ScrollerGrip`); tokens `scroller_*`, `NoScroller` turns it off, `ScrollFed` lets a host feed the extent (the terminal), `scroll_quietly` moves without showing it. A host running its own physics (the tree's, harness-native-scroll-physics, in `harness-native/src/app/sidebar.rs`; a chat's) adopts a `ScrollState` the scroller wrote |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
+| Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
+| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens) |
+| Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
 | Clip | `Clip` (the sidebar fold lays out at full width and clips; never relayout at in-between widths) |
 
 New UI need not covered here: add a primitive (component + prim prefab + a gallery example under
@@ -73,6 +78,12 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
   through ChildOf tables (without `@tree ChildOf` the window draws empty), so each top-level scene scope keeps
   `@tree ChildOf` until they read Parent children too.
 - Since 4.2, prefabs, constraint traits, cached queries and query plans are addons: features of `hyperion-flecs-c`.
+- flecs orders the systems of one phase by entity id, not by when they were made (a scene load recycles ids), so a
+  system that must see another's results in the same `progress` goes in a later `Phase` (harness-native-flecs: the
+  layout pass in `Layout`, hits and matched geometry in `AfterLayout`, the pointer's resolve in `Resolve`, the draw pass
+  in `Draw`) and declares what it `reads`/`writes` so flecs merges first. Zoom is a uniform scale: layout, draw and input
+  are in view points (window points over `App::zoom()`), plates snap to device pixels at rest, and matched geometry lands
+  (never slides) when the room changes.
 
 ## Target: reactive templates (4.2 has them; no view uses them yet)
 
@@ -125,7 +136,7 @@ template hn.ObjRow {
 
 `harness-native/scene/20-keys.flecs`: `act.*` action entities (params such as `SpawnKind`, `ZoomStep`, `SelectN`,
 `Bytes` on `act.SendBytes` children; `MenuItem`, `Selector`), `key.* { Keybind: {key, cmd, shift, opt, ctrl};
-(Does, act.X); (When, ctx.Tree) }`. No `When` holds everywhere; the innermost active context wins (`ctx.Palette`,
+(Does, act.X); (When, ctx.Tree) }`. No `When` holds everywhere; the innermost active context wins (`ctx.Palette` or `ctx.Picker`,
 `ctx.Archive`, then `ctx.Tree` over `ctx.Terminal`), later bindings win, unbound keys go to the terminal. The menu bar,
 palette hints and sidebar cmd+1-9 hints are generated from the same entities. User overrides:
 `$HARNESS_HOME/keys.flecs` (default `~/.harness`), run after the scene, reloaded when it changes. A new binding to an
@@ -133,11 +144,18 @@ existing action is entities only; a new action also needs a handler under its na
 
 ## Verify (no focus-taking, ever)
 
+- First, after any `.flecs` change: `CARGO_TARGET_DIR=target cargo test -p harness-native scenes_load` (from
+  `crates/harness/`). It builds the world headless (no window, Metal or daemon), loads every scene script (tokens, prims,
+  the harness scene and its widgets, keys, the prims gallery and every example) and fails with flecs's error and line. A
+  scene that does not load (a prefab named like a component it sets, an entity named by a script keyword such as `new`,
+  an unknown token) otherwise only shows at launch, as an empty window. Run it before every push.
 - Offscreen: `HARNESS_NATIVE_SHOT=out.png HARNESS_NATIVE_SHOT_SECS=2` (default 2.5; + `HARNESS_NATIVE_SHOT_HOVER=x,y,t`
   in window points, `HARNESS_NATIVE_SHOT_KEY=k,t`, `HARNESS_NATIVE_SHOT_SEQ=t0,t1` for frame sequences,
   `HARNESS_NATIVE_SIDEBAR=0`, `HARNESS_NATIVE_APPEARANCE=light`); see `harness-native/src/shot.rs` for the rest.
 - A real window without activation: `HARNESS_NATIVE_NO_ACTIVATE=1`. Never activate windows or synthesize input
   on the user's machine; use a private `HARNESS_HOME` daemon for tests.
+- The system pointer isn't in shots: `HARNESS_NATIVE_CURSOR_LOG=1` logs each shape change, a shot's hovers (`x,y,t;x,y,t`) log
+  theirs, F3's `ptr` line shows it; `HARNESS_NATIVE_GALLERY=prims` draws one of every primitive.
 - F3 shows the stats overlay (fps, cpu/gpu frame times, redraw reason, entity/draw counts); with nothing moving its
   state line must read idle.
 - Read the shot (or a 2x crop) before saying a visual change is done; measure alignment in pixels.

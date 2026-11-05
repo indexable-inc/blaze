@@ -36,7 +36,8 @@ use blaze_codegen::{Arch, RelocKind};
 use crate::LinkError;
 use crate::cow::CowBytes;
 use crate::model::{
-    Apply, Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer,
+    Apply, Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special,
+    Writer,
 };
 use crate::output::{Format, NativeKind, Output, OutputKind};
 
@@ -101,7 +102,9 @@ pub(crate) fn writer(output: &Output) -> Result<Wasm, LinkError> {
         .checked_next_multiple_of(STACK_ALIGN)
         .filter(|&it| memory64 || it < 1 << 32)
         // alloc: error path
-        .ok_or_else(|| error(format!("wasm: a stack of {stack} bytes, past {:?}'s memory", output.arch)))?;
+        .ok_or_else(|| {
+            error(format!("wasm: a stack of {stack} bytes, past {:?}'s memory", output.arch))
+        })?;
     Ok(Wasm { kind: output.kind.clone(), stack, memory64 }) // clone: once per link, kept by it
 }
 
@@ -397,7 +400,11 @@ impl Writer for Wasm {
         // alloc: once per link, the one part of the `File` (the module, written whole, and its
         // `Arc`: wasm keeps no table across links)
         // alloc: none for `debug`: an empty `Vec` holds no buffer
-        Ok(File { len: module.len() as u64, parts: vec![(0, CowBytes::from_vec(module))], debug: Vec::new() })
+        Ok(File {
+            len: module.len() as u64,
+            parts: vec![(0, CowBytes::from_vec(module))],
+            debug: Vec::new(),
+        })
     }
 }
 
@@ -423,6 +430,7 @@ mod tests {
             exec_log: false,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
+            link: crate::LinkArgs::default(),
             triple: "wasm32-unknown-unknown".into(),
         }
     }
@@ -513,7 +521,10 @@ mod tests {
     fn sections_as_rustc_makes_them() {
         let wasm = writer(&output(Arch::Wasm32, command(), None)).unwrap();
         assert_eq!(wasm.section(".init_array", true, false, false), Ok((Class::InitArray, 65535)));
-        assert_eq!(wasm.section(".init_array.101", true, false, false), Ok((Class::InitArray, 101)));
+        assert_eq!(
+            wasm.section(".init_array.101", true, false, false),
+            Ok((Class::InitArray, 101))
+        );
         assert!(wasm.section(".init_array.x", true, false, false).is_err());
         assert!(wasm.section(".init_array.70000", true, false, false).is_err());
         assert!(wasm.section(".fini_array", true, false, false).is_err());
@@ -578,7 +589,10 @@ mod tests {
     fn codegen_relocations() {
         let native = |r_type| Ok(Apply::Native(r_type));
         assert_eq!(codegen_apply(RelocKind::WasmFunction, true), native(reloc::FUNCTION_INDEX_LEB));
-        assert_eq!(codegen_apply(RelocKind::WasmFunction, false), native(reloc::FUNCTION_INDEX_I32));
+        assert_eq!(
+            codegen_apply(RelocKind::WasmFunction, false),
+            native(reloc::FUNCTION_INDEX_I32)
+        );
         assert_eq!(codegen_apply(RelocKind::WasmTable, true), native(reloc::TABLE_INDEX_SLEB));
         assert_eq!(codegen_apply(RelocKind::WasmTable, false), native(reloc::TABLE_INDEX_I32));
         assert_eq!(codegen_apply(RelocKind::WasmMemory, true), native(reloc::MEMORY_ADDR_SLEB));

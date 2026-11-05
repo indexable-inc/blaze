@@ -69,7 +69,7 @@ mod utils;
 mod vec_box;
 
 #[cfg(test)]
-mod disallowed_tests;
+pub(crate) mod disallowed_tests;
 #[cfg(test)]
 pub(crate) mod drops_tests;
 #[cfg(test)]
@@ -421,7 +421,9 @@ fn skip_whitespace(bytes: &[u8], mut at: usize) -> usize {
 /// The lints `clippy::<name>` stands for.
 fn clippy_lints(name: &str) -> On {
     match registry::named(name) {
-        Some(Named::Lint(info)) => Implemented::of(info.index()).map_or(On::EMPTY, Implemented::bit),
+        Some(Named::Lint(info)) => {
+            Implemented::of(info.index()).map_or(On::EMPTY, Implemented::bit)
+        }
         Some(Named::Group(group)) => clippy_where(|info| info.group == group),
         Some(Named::All) => clippy_where(|info| info.group.in_all()),
         Some(Named::Renamed(to)) => to.strip_prefix("clippy::").map_or(On::EMPTY, clippy_lints),
@@ -821,7 +823,9 @@ mod tests {
             assert_eq!(lint.bit(), On::bit(at));
             assert!(!lint.bit().intersects(On::BLAZE));
         }
-        let others = registry::lints().iter().filter(|it| Implemented::ALL.iter().all(|l| l.name() != it.name));
+        let others = registry::lints()
+            .iter()
+            .filter(|it| Implemented::ALL.iter().all(|l| l.name() != it.name));
         for info in others {
             assert_eq!(Implemented::of(info.index()), None, "{}", info.name);
         }
@@ -863,8 +867,15 @@ mod tests {
         for &lint in Implemented::ALL {
             assert!(!lint.bit().intersects(On::BLAZE));
         }
-        let every = Implemented::ALL.iter().map(|it| it.bit()).chain(blaze::Lint::ALL.iter().map(|it| it.bit()));
-        assert_eq!(every.fold(On::EMPTY, |on, it| on | it), On::ALL, "one bit per lint, none past them");
+        let every = Implemented::ALL
+            .iter()
+            .map(|it| it.bit())
+            .chain(blaze::Lint::ALL.iter().map(|it| it.bit()));
+        assert_eq!(
+            every.fold(On::EMPTY, |on, it| on | it),
+            On::ALL,
+            "one bit per lint, none past them"
+        );
     }
 
     #[test]
@@ -879,7 +890,10 @@ mod tests {
 
     /// The names of the lints of `on`, clippy's then blaze's.
     fn named(on: On) -> Vec<String> {
-        let clippy = Implemented::ALL.iter().filter(|it| on.intersects(it.bit())).map(|it| it.name().to_owned());
+        let clippy = Implemented::ALL
+            .iter()
+            .filter(|it| on.intersects(it.bit()))
+            .map(|it| it.name().to_owned());
         let mut blaze: Vec<String> = blaze::Lint::ALL
             .iter()
             .filter(|it| on.intersects(it.bit()))
@@ -926,13 +940,27 @@ mod tests {
         );
         let (general, _) = named_in("#[allow(blaze::general)]");
         let (internal, _) = named_in("#[allow(blaze::internal)]");
-        assert!(general.intersects(blaze::Lint::HashTwice.bit()) && !general.intersects(blaze::Lint::HotAlloc.bit()));
-        assert!(internal.intersects(blaze::Lint::HotAlloc.bit()) && !internal.intersects(blaze::Lint::HashTwice.bit()));
+        assert!(
+            general.intersects(blaze::Lint::HashTwice.bit())
+                && !general.intersects(blaze::Lint::HotAlloc.bit())
+        );
+        assert!(
+            internal.intersects(blaze::Lint::HotAlloc.bit())
+                && !internal.intersects(blaze::Lint::HashTwice.bit())
+        );
         let (pedantic, _) = named_in("#[allow(blaze::pedantic_perf)]");
-        assert!(pedantic.intersects(blaze::Lint::DeepDropAtExit.bit()) && !pedantic.intersects(blaze::Lint::HashTwice.bit()));
-        assert!(!(general.intersects(pedantic) || internal.intersects(pedantic)), "the kinds are disjoint");
+        assert!(
+            pedantic.intersects(blaze::Lint::DeepDropAtExit.bit())
+                && !pedantic.intersects(blaze::Lint::HashTwice.bit())
+        );
+        assert!(
+            !(general.intersects(pedantic) || internal.intersects(pedantic)),
+            "the kinds are disjoint"
+        );
         assert_eq!(general | internal | pedantic, On::BLAZE, "every blaze lint is of one kind");
-        for text in ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"] {
+        for text in
+            ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"]
+        {
             assert_eq!(named_in(text).0, On::EMPTY, "{text:?}");
         }
     }
@@ -946,17 +974,26 @@ mod tests {
         let default = command_line_on(&flags(""));
         assert!(default.intersects(Implemented::NeedlessBool.bit()));
         assert!(!default.intersects(Implemented::DbgMacro.bit()));
-        assert!(default.intersects(blaze::Lint::HashTwice.bit()), "a general lint warns everywhere");
+        assert!(
+            default.intersects(blaze::Lint::HashTwice.bit()),
+            "a general lint warns everywhere"
+        );
         assert!(
             !default.intersects(crate::level::BLAZE_INTERNAL),
             "blaze's internal lints are allowed until turned on"
         );
         // Every check is on by default but restriction's: pedantic and nursery warn too.
-        assert!(default.intersects(Implemented::NeedlessPassByValue.bit()), "pedantic warns by default");
+        assert!(
+            default.intersects(Implemented::NeedlessPassByValue.bit()),
+            "pedantic warns by default"
+        );
         assert!(default.intersects(Implemented::RedundantClone.bit()), "nursery warns by default");
         let without_all = command_line_on(&flags("-A clippy::all"));
         assert!(!without_all.intersects(clippy_where(|it| it.group.in_all())));
-        assert!(without_all.intersects(Implemented::RedundantClone.bit()), "`clippy::all` is clippy's five groups only");
+        assert!(
+            without_all.intersects(Implemented::RedundantClone.bit()),
+            "`clippy::all` is clippy's five groups only"
+        );
         let on = command_line_on(&flags(&format!(
             "{} -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc",
             crate::tests::CLIPPY_OFF

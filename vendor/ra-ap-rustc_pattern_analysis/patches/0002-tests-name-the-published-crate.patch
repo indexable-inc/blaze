@@ -1,0 +1,45 @@
+diff --git a/tests/complexity.rs b/tests/complexity.rs
+index 4754476..0609836 100644
+--- a/tests/complexity.rs
++++ b/tests/complexity.rs
+@@ -2,6 +2,10 @@
+ 
+ #![allow(unused_crate_dependencies)]
+ 
++// blaze: the tests name the crate as rust-lang/rust does; it is published as
++// `ra_ap_rustc_pattern_analysis`.
++extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
++
+ use common::*;
+ use rustc_pattern_analysis::MatchArm;
+ use rustc_pattern_analysis::pat::DeconstructedPat;
+diff --git a/tests/exhaustiveness.rs b/tests/exhaustiveness.rs
+index 4ad64f8..e2bfa39 100644
+--- a/tests/exhaustiveness.rs
++++ b/tests/exhaustiveness.rs
+@@ -2,6 +2,10 @@
+ 
+ #![allow(unused_crate_dependencies)]
+ 
++// blaze: the tests name the crate as rust-lang/rust does; it is published as
++// `ra_ap_rustc_pattern_analysis`.
++extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
++
+ use common::*;
+ use rustc_pattern_analysis::MatchArm;
+ use rustc_pattern_analysis::pat::{DeconstructedPat, WitnessPat};
+diff --git a/tests/intersection.rs b/tests/intersection.rs
+index d4d3905..61c0569 100644
+--- a/tests/intersection.rs
++++ b/tests/intersection.rs
+@@ -2,6 +2,10 @@
+ 
+ #![allow(unused_crate_dependencies)]
+ 
++// blaze: the tests name the crate as rust-lang/rust does; it is published as
++// `ra_ap_rustc_pattern_analysis`.
++extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
++
+ use common::*;
+ use rustc_pattern_analysis::MatchArm;
+ use rustc_pattern_analysis::pat::DeconstructedPat;

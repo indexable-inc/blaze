@@ -98,9 +98,11 @@ pub(super) fn module_at(db: &Db, krate: Crate, path: &[&str]) -> ModuleId {
     let map = crate_local_def_map(db, krate).def_map(db);
     let mut at = map.root;
     for segment in path {
-        at = *map.module(db, at).children(db).get(&name(segment)).unwrap_or_else(|| {
-            panic!("no module `{segment}` of `crate::{}`", path.join("::"))
-        });
+        at = *map
+            .module(db, at)
+            .children(db)
+            .get(&name(segment))
+            .unwrap_or_else(|| panic!("no module `{segment}` of `crate::{}`", path.join("::")));
     }
     at
 }
@@ -241,7 +243,10 @@ pub(super) fn facts_exempt(name: &str) -> Exempt {
 /// edit script made may show.
 fn unresolved_attribute(db: &Db, def_map: &DefMap) -> bool {
     def_map.records(db).diagnostics.iter().any(|it| {
-        matches!(&it.kind, DefDiagnosticKind::UnresolvedMacroCall { ast: MacroCallKind::Attr { .. }, .. })
+        matches!(
+            &it.kind,
+            DefDiagnosticKind::UnresolvedMacroCall { ast: MacroCallKind::Attr { .. }, .. }
+        )
     })
 }
 
@@ -250,7 +255,13 @@ fn unresolved_attribute(db: &Db, def_map: &DefMap) -> bool {
 /// map has an [`unresolved_attribute`]: for a program an edit script made, where no fixture
 /// says), appending each difference to `out` under `what`. A crate served by a frozen image is
 /// not maintained and is skipped.
-pub(in crate::nameres) fn check_db(db: &Db, what: &str, exempt: &Exempt, rejected: bool, out: &mut String) {
+pub(in crate::nameres) fn check_db(
+    db: &Db,
+    what: &str,
+    exempt: &Exempt,
+    rejected: bool,
+    out: &mut String,
+) {
     for &krate in all_crates(db).iter() {
         let pair = crate_local_def_map(db, krate);
         let maintained = pair.def_map(db);
@@ -363,8 +374,11 @@ pub struct S;
     // The module whose `S` the root's `S` is.
     let container = |db: &Db| {
         let map = crate_local_def_map(db, krate).def_map(db);
-        let (def, _) = map.module(db, map.root).scope(db).type_(&name("S")).expect("`S` is in scope");
-        let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else { panic!("`S` is {def:?}") };
+        let (def, _) =
+            map.module(db, map.root).scope(db).type_(&name("S")).expect("`S` is in scope");
+        let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else {
+            panic!("`S` is {def:?}")
+        };
         crate::Lookup::lookup(&it, db).container.name(db)
     };
     assert_eq!(container(&loaded.db), Some(name("b")), "one glob: `b`'s `S`");
@@ -389,14 +403,21 @@ fn an_import_through_a_glob_waits_for_its_modules_expansions() {
     let root = loaded.file("/lib.rs");
     let container = |db: &Db| {
         let map = crate_local_def_map(db, krate).def_map(db);
-        let (def, _) = map.module(db, map.root).scope(db).type_(&name("T")).expect("`T` is in scope");
-        let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else { panic!("`T` is {def:?}") };
+        let (def, _) =
+            map.module(db, map.root).scope(db).type_(&name("T")).expect("`T` is in scope");
+        let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else {
+            panic!("`T` is {def:?}")
+        };
         crate::Lookup::lookup(&it, db).container.name(db)
     };
     assert_eq!(container(&loaded.db), Some(name("foo")), "loaded: `foo`'s expanded `T`");
     let text = format!("{}fn edited() {{}}\n", loaded.text(root));
     loaded.db.set_file_text(root, &text);
-    assert_eq!(container(&loaded.db), Some(name("foo")), "the root rerun alone: `foo`'s expanded `T`");
+    assert_eq!(
+        container(&loaded.db),
+        Some(name("foo")),
+        "the root rerun alone: `foo`'s expanded `T`"
+    );
     let mut failures = String::new();
     check_db(&loaded.db, "an import through a glob", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -407,11 +428,13 @@ fn an_import_through_a_glob_waits_for_its_modules_expansions() {
 /// (`random::batched_edits_over_the_fixtures`, the `sanitize` fixture).
 #[test]
 fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
-    let mut loaded = Loaded::new("//- /lib.rs crate:foo crate-attr:no_std\n#![feature(sanitize)]\nfn f() {}\n");
+    let mut loaded =
+        Loaded::new("//- /lib.rs crate:foo crate-attr:no_std\n#![feature(sanitize)]\nfn f() {}\n");
     let krate = loaded.krate();
     let root = loaded.file("/lib.rs");
     let sanitize = Symbol::intern("sanitize");
-    let enabled = |db: &Db| crate_local_def_map(db, krate).def_map(db).features().is_enabled(&sanitize);
+    let enabled =
+        |db: &Db| crate_local_def_map(db, krate).def_map(db).features().is_enabled(&sanitize);
     assert!(enabled(&loaded.db), "loaded: `sanitize` is enabled");
     loaded.db.set_file_text(root, "fn f() {}\n");
     assert!(!enabled(&loaded.db), "the feature is gone with its attribute");
@@ -424,8 +447,9 @@ fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
 /// file's changed children make the read walk the tree, which still sees the root's new log.
 #[test]
 fn a_write_that_walks_keeps_the_logs_it_compared_before() {
-    let mut loaded =
-        Loaded::new("//- /lib.rs\nmod foo;\n//- /foo/mod.rs\npub mod bar;\n//- /foo/bar.rs\npub struct B;\n");
+    let mut loaded = Loaded::new(
+        "//- /lib.rs\nmod foo;\n//- /foo/mod.rs\npub mod bar;\n//- /foo/bar.rs\npub struct B;\n",
+    );
     let (lib, foo) = (loaded.file("/lib.rs"), loaded.file("/foo/mod.rs"));
     loaded.db.batch(base_db::Trigger::named("the test's edit"), |db| {
         db.set_file_text(lib, "pub struct S;\nmod foo;\n");
@@ -433,7 +457,10 @@ fn a_write_that_walks_keeps_the_logs_it_compared_before() {
     });
     let krate = loaded.krate();
     let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
-    assert!(map.module(&loaded.db, map.root).scope(&loaded.db).get(&name("S")).take_types().is_some(), "`S` is in");
+    assert!(
+        map.module(&loaded.db, map.root).scope(&loaded.db).get(&name("S")).take_types().is_some(),
+        "`S` is in"
+    );
     let mut failures = String::new();
     check_db(&loaded.db, "a write that walks", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -464,7 +491,10 @@ fn editing_a_dependencys_macro_body_expands_its_calls_again() {
     ));
     let std = loaded.file("/std.rs");
     let lib = loaded.file("/lib.rs");
-    let lib = *all_crates(&loaded.db).iter().find(|it| it.data(&loaded.db).root_file_id == lib).expect("`lib`");
+    let lib = *all_crates(&loaded.db)
+        .iter()
+        .find(|it| it.data(&loaded.db).root_file_id == lib)
+        .expect("`lib`");
     let has_s = |db: &Db| {
         let map = crate_local_def_map(db, lib).def_map(db);
         map.module(db, map.root).scope(db).get(&name("S")).take_types().is_some()
@@ -504,7 +534,8 @@ fn editing_the_body_of_a_macro_a_dependencys_macro_made_expands_its_calls_again(
 /// file: a write of the file alone that drops the `#![cfg]` still brings the module in.
 #[test]
 fn removing_a_mod_files_cfg_brings_the_module_in() {
-    let mut loaded = Loaded::new("//- /main.rs\nmod module;\n//- /module.rs\n#![cfg(NEVER)]\nstruct S;\n");
+    let mut loaded =
+        Loaded::new("//- /main.rs\nmod module;\n//- /module.rs\n#![cfg(NEVER)]\nstruct S;\n");
     let file = loaded.file("/module.rs");
     loaded.db.set_file_text(file, "struct S;\n");
     let krate = loaded.krate();
@@ -520,7 +551,8 @@ fn removing_a_mod_files_cfg_brings_the_module_in() {
 /// on load and after an edit adds the second.
 #[test]
 fn a_second_mod_of_a_name_declares_nothing() {
-    let mut loaded = Loaded::new("//- /lib.rs\npub mod a { pub struct S; }\n//- /a.rs\npub struct T;\n");
+    let mut loaded =
+        Loaded::new("//- /lib.rs\npub mod a { pub struct S; }\n//- /a.rs\npub struct T;\n");
     let root = loaded.file("/lib.rs");
     loaded.db.set_file_text(root, "pub mod a { pub struct S; }\npub mod a;\n");
     let krate = loaded.krate();
@@ -560,23 +592,38 @@ fn a_glob_carries_no_unresolved_name() {
 /// map, and renaming it back brings it in again.
 #[test]
 fn a_dependencys_prelude_renamed_away_leaves_the_maintained_map() {
-    const CORE: &str = "pub mod prelude {\n    pub mod rust_2018 {\n        pub struct Rust;\n    }\n}\n";
+    const CORE: &str =
+        "pub mod prelude {\n    pub mod rust_2018 {\n        pub struct Rust;\n    }\n}\n";
     let mut loaded = Loaded::new(&format!(
         "//- /main.rs edition:2018 crate:main deps:core\n#![no_std]\nuse Rust;\n//- /core.rs crate:core\n{CORE}"
     ));
     let core = loaded.file("/core.rs");
     let main = loaded.file("/main.rs");
-    let main =
-        *all_crates(&loaded.db).iter().find(|it| it.data(&loaded.db).root_file_id == main).expect("`main`");
+    let main = *all_crates(&loaded.db)
+        .iter()
+        .find(|it| it.data(&loaded.db).root_file_id == main)
+        .expect("`main`");
     let prelude = |db: &Db| crate_local_def_map(db, main).def_map(db).prelude();
     assert!(prelude(&loaded.db).is_some(), "loaded: `core::prelude::rust_2018` is the prelude");
     loaded.db.set_file_text(core, &CORE.replacen("prelude", "S", 1));
     assert_eq!(prelude(&loaded.db), None, "the prelude is gone with its module");
     let mut failures = String::new();
-    check_db(&loaded.db, "a dependency's prelude renamed away", &Exempt::NONE, false, &mut failures);
+    check_db(
+        &loaded.db,
+        "a dependency's prelude renamed away",
+        &Exempt::NONE,
+        false,
+        &mut failures,
+    );
     loaded.db.set_file_text(core, CORE);
     assert!(prelude(&loaded.db).is_some(), "the prelude is back with its module");
-    check_db(&loaded.db, "a dependency's prelude renamed back", &Exempt::NONE, false, &mut failures);
+    check_db(
+        &loaded.db,
+        "a dependency's prelude renamed back",
+        &Exempt::NONE,
+        false,
+        &mut failures,
+    );
     assert!(failures.is_empty(), "{failures}");
 }
 
@@ -601,7 +648,10 @@ fn a_dependencys_module_ids_outlive_the_crates_maintained_after_it() {
     let db = &loaded.db;
     let crate_of = |root: &str| {
         let file = loaded.file(root);
-        *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("a crate of the root")
+        *all_crates(db)
+            .iter()
+            .find(|it| it.data(db).root_file_id == file)
+            .expect("a crate of the root")
     };
     let (lib, main) = (crate_of("/lib.rs"), crate_of("/main.rs"));
     let string = module_at(db, lib, &["string"]);
@@ -609,7 +659,9 @@ fn a_dependencys_module_ids_outlive_the_crates_maintained_after_it() {
     assert_eq!(module_path(db, string), "crate::string");
     let map = crate_local_def_map(db, main).def_map(db);
     let (def, _) = map.module(db, map.root).scope(db).type_(&name("S")).expect("`S` is imported");
-    let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else { panic!("`S` is {def:?}") };
+    let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else {
+        panic!("`S` is {def:?}")
+    };
     assert_eq!(crate::Lookup::lookup(&it, db).container, string, "`S` is `lib::string::S`");
     let mut failures = String::new();
     check_db(db, "a dependency's module ids", &Exempt::NONE, false, &mut failures);
@@ -632,15 +684,27 @@ pub struct L;
     let main = loaded.krate();
     let lib = *all_crates(&loaded.db).iter().find(|it| **it != main).expect("the crate `lib`");
     let map = crate_local_def_map(&loaded.db, lib).def_map(&loaded.db);
-    assert!(map.module(&loaded.db, map.root).scope(&loaded.db).type_(&name("L")).is_some(), "`lib` is maintained");
-    base_db::set_all_crates_with_durability(&mut loaded.db, [main], blaze_query::db::Durability::LOW);
+    assert!(
+        map.module(&loaded.db, map.root).scope(&loaded.db).type_(&name("L")).is_some(),
+        "`lib` is maintained"
+    );
+    base_db::set_all_crates_with_durability(
+        &mut loaded.db,
+        [main],
+        blaze_query::db::Durability::LOW,
+    );
     let db = &loaded.db;
     let map = crate_local_def_map(db, main).def_map(db);
-    assert!(map.module(db, map.root).scope(db).type_(&name("M")).is_some(), "`main` is still maintained");
+    assert!(
+        map.module(db, map.root).scope(db).type_(&name("M")).is_some(),
+        "`main` is still maintained"
+    );
     let caught = Unmaintained::catch(std::panic::AssertUnwindSafe(|| {
         _ = crate_local_def_map(db, lib);
     }));
-    let Err(error) = caught else { panic!("`lib`'s def map was given with no maintained resolution") };
+    let Err(error) = caught else {
+        panic!("`lib`'s def map was given with no maintained resolution")
+    };
     assert_eq!(error, Unmaintained { krate: lib, name: Some("lib".to_owned()), asking: None });
     let text = error.to_string();
     assert!(text.contains("`lib`") && text.contains("no maintainer ran"), "{text}");
@@ -678,7 +742,10 @@ pub mod prelude {
     let (prelude, _) = map.prelude().expect("the std prelude is injected");
     assert_eq!(prelude.krate(db), std);
     assert_eq!(module_path(db, prelude), "crate::prelude::rust_2021");
-    assert!(map.module(db, map.root).scope(db).type_(&name("Command")).is_some(), "`Command` is imported");
+    assert!(
+        map.module(db, map.root).scope(db).type_(&name("Command")).is_some(),
+        "`Command` is imported"
+    );
     let mut failures = String::new();
     check_db(db, "a noprelude std", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -712,7 +779,10 @@ pub mod error { pub trait Error {} }
         pair.local(db).extern_prelude().map(|(it, _)| it.as_str().to_owned()).collect();
     assert_eq!(prelude, ["core", "std"], "rustc's order: `core`, then `std`");
     let map = pair.def_map(db);
-    assert!(map.module(db, map.root).scope(db).type_(&name("Error")).is_some(), "`Error` is imported");
+    assert!(
+        map.module(db, map.root).scope(db).type_(&name("Error")).is_some(),
+        "`Error` is imported"
+    );
     let mut failures = String::new();
     check_db(db, "a noprelude core", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -780,9 +850,15 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_sets_nothing_the_def_map_reads() {
     let work = work_of(&mut db, krate, |db| db.set_file_text(file, &macro_heavy_text("0")));
     assert_eq!(work.slices, 0, "inputs the maintainer set, though each ends as it was: {work:?}");
     let after = super::publish::Slices::of(&db, krate);
-    assert_eq!(before.differing(&after), Vec::<String>::new(), "fields of the crate's resolution set");
+    assert_eq!(
+        before.differing(&after),
+        Vec::<String>::new(),
+        "fields of the crate's resolution set"
+    );
     assert_eq!(*krate.extra_data(&db), extra, "the crate's extra data");
-    let log = crate::test_db::TestDBExt::executed_in_read_order(&db, || _ = crate_local_def_map(&db, krate));
+    let log = crate::test_db::TestDBExt::executed_in_read_order(&db, || {
+        _ = crate_local_def_map(&db, krate)
+    });
     assert!(log.iter().all(|it| it != "resolution_of" && it != "crate_local_def_map"), "{log:#?}");
 }
 
@@ -823,7 +899,10 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
                 if storage.ingredient_name(database_key.ingredient_index()) == "resolution_of" =>
             {
                 let key = database_key.key_index();
-                let krate = all_crates(&db).iter().copied().find(|it| blaze_query::db::AsId::as_id(it) == key);
+                let krate = all_crates(&db)
+                    .iter()
+                    .copied()
+                    .find(|it| blaze_query::db::AsId::as_id(it) == key);
                 Some(krate.map_or_else(
                     || format!("{key:?}, no crate"),
                     |it| format!("{:?}", it.extra_data(&db).display_name),
@@ -869,7 +948,13 @@ pub mod m {
     loaded.db.set_file_text(root, &text);
     assert!(has(&loaded.db, "B"), "`m` holds the `B` the edit wrote inside the attributed module");
     let mut failures = String::new();
-    check_db(&loaded.db, "an edit inside an attributed module", &Exempt::NONE, false, &mut failures);
+    check_db(
+        &loaded.db,
+        "an edit inside an attributed module",
+        &Exempt::NONE,
+        false,
+        &mut failures,
+    );
     assert!(failures.is_empty(), "{failures}");
 }
 
@@ -907,16 +992,23 @@ fn an_attribute_or_visibility_edit_of_a_deferred_item_changes_the_round_0_log() 
         ops::{DeclOp, MacroOp, MacroOpKind},
         queries,
     };
-    let mut loaded = Loaded::new("//- minicore: derive, clone\n//- /lib.rs\n#[derive(Clone)]\n#[repr(C)]\nstruct S;\nfn f() {}\n");
+    let mut loaded = Loaded::new(
+        "//- minicore: derive, clone\n//- /lib.rs\n#[derive(Clone)]\n#[repr(C)]\nstruct S;\nfn f() {}\n",
+    );
     let krate = loaded.krate();
     let root = loaded.file("/lib.rs");
     let directives = |db: &Db| -> Vec<MacroOp> {
         let ops = &queries::module_decls(db, queries::root_decl(db, krate)).ops;
         // clone: a test's copy of the directives, to compare across a write
-        ops.iter().filter_map(|op| if let DeclOp::Macro(it) = op { Some(it.clone()) } else { None }).collect()
+        ops.iter()
+            .filter_map(|op| if let DeclOp::Macro(it) = op { Some(it.clone()) } else { None })
+            .collect()
     };
     let first = directives(&loaded.db);
-    assert!(matches!(&first[..], [MacroOp { kind: MacroOpKind::Attr { .. }, .. }]), "loaded: {first:?}");
+    assert!(
+        matches!(&first[..], [MacroOp { kind: MacroOpKind::Attr { .. }, .. }]),
+        "loaded: {first:?}"
+    );
     let mut failures = String::new();
     for (what, text, changes) in [
         ("a later attribute", "#[derive(Clone)]\n#[S]\nstruct S;\nfn f() {}\n", true),
@@ -926,7 +1018,12 @@ fn an_attribute_or_visibility_edit_of_a_deferred_item_changes_the_round_0_log() 
         let before = directives(&loaded.db);
         loaded.db.set_file_text(root, text);
         let after = directives(&loaded.db);
-        assert_eq!(after != before, changes, "{what}: the log changed: {}\nbefore {before:?}\nafter {after:?}", after != before);
+        assert_eq!(
+            after != before,
+            changes,
+            "{what}: the log changed: {}\nbefore {before:?}\nafter {after:?}",
+            after != before
+        );
         check_db(&loaded.db, what, &Exempt::NONE, true, &mut failures);
     }
     assert!(failures.is_empty(), "{failures}");
@@ -954,7 +1051,10 @@ fn a_macro_removed_from_a_nested_macro_use_file_leaves_the_textual_scopes() {
     let file = loaded.file("/a/b.rs");
     loaded.db.set_file_text(file, "");
     for path in paths {
-        assert!(!has_m1(&loaded.db, path), "removed: `m1` is still in the textual scope of {path:?}");
+        assert!(
+            !has_m1(&loaded.db, path),
+            "removed: `m1` is still in the textual scope of {path:?}"
+        );
     }
     let mut failures = String::new();
     check_db(&loaded.db, "a nested macro_use macro removed", &Exempt::NONE, true, &mut failures);
@@ -983,7 +1083,10 @@ fn removing_the_macro_that_makes_a_dependencys_trait_item_unresolves_its_import(
         assert!(has_const(&loaded.db), "{import}: loaded: `MACRO_CONST` is not imported");
         let lib = loaded.file("/lib.rs");
         loaded.db.set_file_text(lib, TRAIT);
-        assert!(!has_const(&loaded.db), "{import}: the macro removed: `MACRO_CONST` is still imported");
+        assert!(
+            !has_const(&loaded.db),
+            "{import}: the macro removed: `MACRO_CONST` is still imported"
+        );
         check_db(&loaded.db, import, &Exempt::NONE, true, &mut failures);
     }
     assert!(failures.is_empty(), "{failures}");
@@ -1005,7 +1108,10 @@ fn a_body_edit_beside_a_globbed_enum_runs_no_group_and_a_new_variant_is_imported
     assert!(work.region > 0, "a new variant woke no glob of its enum: {work:?}");
     let root = module_at(&loaded.db, main, &[]);
     let map = crate_local_def_map(&loaded.db, main).def_map(&loaded.db);
-    assert!(map.module(&loaded.db, root).scope(&loaded.db).get(&name("C")).take_types().is_some(), "`C` is not imported");
+    assert!(
+        map.module(&loaded.db, root).scope(&loaded.db).get(&name("C")).take_types().is_some(),
+        "`C` is not imported"
+    );
     let mut failures = String::new();
     check_db(&loaded.db, "a new variant", &Exempt::NONE, true, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -1013,7 +1119,8 @@ fn a_body_edit_beside_a_globbed_enum_runs_no_group_and_a_new_variant_is_imported
 
 #[test]
 fn removing_a_globbed_enum_reads_no_variants_of_it_and_unbinds_them() {
-    let mut loaded = Loaded::new("//- /main.rs crate:main\nenum E { A, B }\nuse E::*;\nfn f() {}\n");
+    let mut loaded =
+        Loaded::new("//- /main.rs crate:main\nenum E { A, B }\nuse E::*;\nfn f() {}\n");
     let main = loaded.krate();
     let file = loaded.file("/main.rs");
     // A touch first, so the enum's variants are the ones its glob last woke on.
@@ -1021,7 +1128,10 @@ fn removing_a_globbed_enum_reads_no_variants_of_it_and_unbinds_them() {
     loaded.db.set_file_text(file, "use E::*;\nfn f() { () }\n");
     let root = module_at(&loaded.db, main, &[]);
     let map = crate_local_def_map(&loaded.db, main).def_map(&loaded.db);
-    assert!(map.module(&loaded.db, root).scope(&loaded.db).get(&name("A")).is_none(), "`A` is still imported");
+    assert!(
+        map.module(&loaded.db, root).scope(&loaded.db).get(&name("A")).is_none(),
+        "`A` is still imported"
+    );
     let mut failures = String::new();
     check_db(&loaded.db, "a globbed enum removed", &Exempt::NONE, true, &mut failures);
     assert!(failures.is_empty(), "{failures}");
@@ -1051,7 +1161,10 @@ fn removing_an_item_of_a_trait_or_enum_unresolves_its_import_in_the_same_module(
         assert!(has(&loaded.db), "{import}: loaded: `{removed}` of `{item}` is not imported");
         let file = loaded.file("/main.rs");
         loaded.db.set_file_text(file, &decls(false));
-        assert!(!has(&loaded.db), "{import}: `{removed}` removed from `{item}`: it is still imported");
+        assert!(
+            !has(&loaded.db),
+            "{import}: `{removed}` removed from `{item}`: it is still imported"
+        );
         check_db(&loaded.db, import, &Exempt::NONE, true, &mut failures);
     }
     assert!(failures.is_empty(), "{failures}");
@@ -1073,21 +1186,31 @@ fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_agai
     let main = loaded.file("/main.rs");
     let db = &loaded.db;
     let main = *all_crates(db).iter().find(|it| it.data(db).root_file_id == main).expect("`main`");
-    let macros = *all_crates(db).iter().find(|it| it.data(db).target_kind.is_proc_macro()).expect("`proc_macros`");
-    let built = ProcMacros::get_for_crate(db, macros).and_then(|it| it.macros().map(<[_]>::to_vec)).expect("listed");
+    let macros = *all_crates(db)
+        .iter()
+        .find(|it| it.data(db).target_kind.is_proc_macro())
+        .expect("`proc_macros`");
+    let built = ProcMacros::get_for_crate(db, macros)
+        .and_then(|it| it.macros().map(<[_]>::to_vec))
+        .expect("listed");
     // The expander of `DeriveIdentity` in `proc_macros`' map, and of the call of it in `main`'s.
     let expanders = |db: &Db| {
         let map = crate_local_def_map(db, macros).def_map(db);
-        let defined = match map.module(db, map.root).scope(db).get(&name("DeriveIdentity")).take_macros() {
-            Some(MacroId::ProcMacroId(it)) => !it.loc(db).expander.is_missing(),
-            other => panic!("`DeriveIdentity` is not a proc macro of `proc_macros`: {other:?}"),
-        };
+        let defined =
+            match map.module(db, map.root).scope(db).get(&name("DeriveIdentity")).take_macros() {
+                Some(MacroId::ProcMacroId(it)) => !it.loc(db).expander.is_missing(),
+                other => panic!("`DeriveIdentity` is not a proc macro of `proc_macros`: {other:?}"),
+            };
         let map = crate_local_def_map(db, main).def_map(db);
         let calls: Vec<bool> = map
             .module(db, map.root)
             .scope(db)
             .derive_macro_invocs()
-            .flat_map(|(_, invocs)| invocs.flat_map(|(_, _, calls)| calls.iter().filter_map(|it| it.and_then(Either::left))))
+            .flat_map(|(_, invocs)| {
+                invocs.flat_map(|(_, _, calls)| {
+                    calls.iter().filter_map(|it| it.and_then(Either::left))
+                })
+            })
             .map(|call| match call.loc(db).def.kind {
                 MacroDefKind::ProcMacro(_, expander, _) => !expander.is_missing(),
                 other => panic!("the derive of `S` calls no proc macro: {other:?}"),
@@ -1101,7 +1224,11 @@ fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_agai
     assert_eq!(expanders(&loaded.db), (false, vec![false]), "its macros not yet built");
 
     ProcMacros::give(&mut loaded.db, [(macros, Ok(built))]);
-    assert_eq!(expanders(&loaded.db), (true, vec![true]), "given its built macros after its map was read");
+    assert_eq!(
+        expanders(&loaded.db),
+        (true, vec![true]),
+        "given its built macros after its map was read"
+    );
     let mut failures = String::new();
     check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
     assert!(failures.is_empty(), "{failures}");

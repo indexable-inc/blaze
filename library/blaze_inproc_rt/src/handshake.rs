@@ -63,7 +63,12 @@ pub struct Hello {
 
 impl Hello {
     pub fn encode(&self, out: &mut Vec<u8>) {
-        Writer::new(out).raw(&self.token).u32(self.pid).u32(self.version).u64(self.page).u64(self.header);
+        Writer::new(out)
+            .raw(&self.token)
+            .u32(self.pid)
+            .u32(self.version)
+            .u64(self.page)
+            .u64(self.header);
     }
 
     pub fn decode(body: &[u8]) -> Result<Hello, Error> {
@@ -204,7 +209,8 @@ impl Grant {
     /// program runs is only ever a word of its own copy of a dependency image's data.
     pub fn check_binds(&self) -> Result<(), Error> {
         if self.writes.len() > MOST_BINDS || self.lookups.len() > MOST_BINDS {
-            return Err(Error::new(format!( // alloc: error path
+            return Err(Error::new(format!(
+                // alloc: error path
                 "a grant of {} writes and {} lookups, past the most of {MOST_BINDS}",
                 self.writes.len(),
                 self.lookups.len()
@@ -229,16 +235,25 @@ impl Grant {
             let name = self
                 .names
                 .get(it.name as usize..(it.name as usize).saturating_add(it.len as usize))
-                .ok_or_else(|| Error::new(format!("a lookup at {:#x} of a name out of the grant's names", it.place)))?; // alloc: error path
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "a lookup at {:#x} of a name out of the grant's names",
+                        it.place
+                    ))
+                })?; // alloc: error path
             if name.is_empty() || name.len() > MOST_NAME || name.as_bytes().contains(&0) {
-                return Err(Error::new(format!( // alloc: error path
+                return Err(Error::new(format!(
+                    // alloc: error path
                     "a lookup at {:#x} of a name of {} bytes: empty, past {MOST_NAME} or with a NUL",
                     it.place,
                     name.len()
                 )));
             }
             if !inside(it.place) {
-                return Err(Error::new(format!("the lookup of `{name}` at {:#x}: {OUTSIDE}", it.place))); // alloc: error path
+                return Err(Error::new(format!(
+                    "the lookup of `{name}` at {:#x}: {OUTSIDE}",
+                    it.place
+                ))); // alloc: error path
             }
         }
         Ok(())
@@ -252,7 +267,8 @@ impl Grant {
         let bad = bad("the daemon's grant");
         let mut read = Reader::new(body);
         let tag = read.u8().map_err(&bad)?;
-        let format = Format::from_tag(tag).ok_or_else(|| Error::new(format!("a grant of format {tag}")))?;
+        let format =
+            Format::from_tag(tag).ok_or_else(|| Error::new(format!("a grant of format {tag}")))?;
         let header = read.u64().map_err(&bad)?;
         let span = read.u64().map_err(&bad)?..read.u64().map_err(&bad)?;
         let count = read.count(9).map_err(&bad)?;
@@ -269,8 +285,13 @@ impl Grant {
             };
             objects.push((len, rights));
         }
-        if objects[0].1 != Rights::Code || objects[1].1 != Rights::Words || objects[2].1 != Rights::Words {
-            return Err(Error::new("a grant whose first objects are not the code memory, the control words and the asks"));
+        if objects[0].1 != Rights::Code
+            || objects[1].1 != Rights::Words
+            || objects[2].1 != Rights::Words
+        {
+            return Err(Error::new(
+                "a grant whose first objects are not the code memory, the control words and the asks",
+            ));
         }
         let count = read.count(OVERLAY_BYTES).map_err(&bad)?;
         if count > MOST {
@@ -283,7 +304,8 @@ impl Grant {
             let len = read.u64().map_err(&bad)?;
             let at = read.u64().map_err(&bad)?;
             let tag = read.u8().map_err(&bad)?;
-            let access = Access::from_tag(tag).ok_or_else(|| Error::new(format!("an overlay of access {tag}")))?;
+            let access = Access::from_tag(tag)
+                .ok_or_else(|| Error::new(format!("an overlay of access {tag}")))?;
             let place = match read.u8().map_err(&bad)? {
                 1 => Place::Code,
                 2 => Place::Reserved,
@@ -295,11 +317,17 @@ impl Grant {
                 other => return Err(Error::new(format!("an overlay of image flag {other}"))), // alloc: error path
             };
             let overlay = Overlay { object, offset, len, at, access, place, image };
-            let Some(&(object_len, rights)) = objects.get(object as usize).filter(|_| object != 1 && object != 2) else {
-                return Err(Error::new(format!("an overlay of object {object} of {}", objects.len())));
+            let Some(&(object_len, rights)) =
+                objects.get(object as usize).filter(|_| object != 1 && object != 2)
+            else {
+                return Err(Error::new(format!(
+                    "an overlay of object {object} of {}",
+                    objects.len()
+                )));
             };
             if image && (object == 0 || rights != Rights::Code || place != Place::Reserved) {
-                return Err(Error::new(format!( // alloc: error path
+                return Err(Error::new(format!(
+                    // alloc: error path
                     "an overlay of object {object} ({rights:?}) at {at:#x} over {place:?} flagged a dependency image: only a \
                      fixed map is one"
                 )));
@@ -328,7 +356,10 @@ impl Grant {
             if let Some(last) = overlays.last()
                 && last.range().end > at
             {
-                return Err(Error::new(format!("overlays at {:#x} and {at:#x} out of order or overlapping", last.at)));
+                return Err(Error::new(format!(
+                    "overlays at {:#x} and {at:#x} out of order or overlapping",
+                    last.at
+                )));
             }
             overlays.push(overlay);
         }
@@ -339,7 +370,9 @@ impl Grant {
         };
         let count = read.count(WRITE_BYTES).map_err(&bad)?;
         if count > MOST_BINDS {
-            return Err(Error::new(format!("a grant of {count} writes, past the most of {MOST_BINDS}"))); // alloc: error path
+            return Err(Error::new(format!(
+                "a grant of {count} writes, past the most of {MOST_BINDS}"
+            ))); // alloc: error path
         }
         let mut writes = Vec::with_capacity(count);
         for _ in 0..count {
@@ -350,7 +383,9 @@ impl Grant {
         }
         let count = read.count(LOOKUP_BYTES).map_err(&bad)?;
         if count > MOST_BINDS {
-            return Err(Error::new(format!("a grant of {count} lookups, past the most of {MOST_BINDS}"))); // alloc: error path
+            return Err(Error::new(format!(
+                "a grant of {count} lookups, past the most of {MOST_BINDS}"
+            ))); // alloc: error path
         }
         let mut lookups = Vec::with_capacity(count);
         let mut names = String::with_capacity(read.left() - (LOOKUP_BYTES - 1) * count);
@@ -360,7 +395,10 @@ impl Grant {
             let weak = flag("a lookup's weak flag", read.u8().map_err(&bad)?)?;
             let name = read.str().map_err(&bad)?;
             if name.is_empty() || name.len() > MOST_NAME {
-                return Err(Error::new(format!("a lookup at {place:#x} of a name of {} bytes", name.len()))); // alloc: error path
+                return Err(Error::new(format!(
+                    "a lookup at {place:#x} of a name of {} bytes",
+                    name.len()
+                ))); // alloc: error path
             }
             let start = names.len() as u32;
             names.push_str(name);
@@ -378,28 +416,43 @@ impl Grant {
     /// header, so a header the system loader moved changes nothing.
     pub fn check(&self, own: &Layout, page: u64) -> Result<(), Error> {
         if self.format != own.format {
-            return Err(Error::new(format!("a grant for a {:?} image, where this one is {:?}", self.format, own.format)));
+            return Err(Error::new(format!(
+                "a grant for a {:?} image, where this one is {:?}",
+                self.format, own.format
+            )));
         }
         let theirs = |at: u64| at.wrapping_sub(self.header);
         let ours = |at: u64| at.wrapping_sub(own.header);
-        if theirs(self.span.start) != ours(own.span.start) || theirs(self.span.end) != ours(own.span.end) {
+        if theirs(self.span.start) != ours(own.span.start)
+            || theirs(self.span.end) != ours(own.span.end)
+        {
             return Err(Error::new(format!(
                 "the daemon's image spans {:#x}..{:#x} from its header {:#x}, this one {:#x}..{:#x} from {:#x}: not the \
                  executable the daemon wrote",
-                self.span.start, self.span.end, self.header, own.span.start, own.span.end, own.header
+                self.span.start,
+                self.span.end,
+                self.header,
+                own.span.start,
+                own.span.end,
+                own.header
             )));
         }
         for overlay in &self.overlays {
             if !(overlay.at | overlay.len | overlay.offset).is_multiple_of(page) {
-                return Err(Error::new(format!("an overlay at {:#x} of {:#x} bytes: not whole pages", overlay.at, overlay.len)));
+                return Err(Error::new(format!(
+                    "an overlay at {:#x} of {:#x} bytes: not whole pages",
+                    overlay.at, overlay.len
+                )));
             }
             let at = theirs(overlay.at);
             let fits = match overlay.place {
-                Place::Code => own.code.iter().any(|it| ours(it.linked) == at && it.offset == overlay.offset && it.len == overlay.len),
-                Place::Reserved => own
-                    .reserved
-                    .iter()
-                    .any(|it| ours(it.start) <= at && at.checked_add(overlay.len).is_some_and(|end| end <= ours(it.end))),
+                Place::Code => own.code.iter().any(|it| {
+                    ours(it.linked) == at && it.offset == overlay.offset && it.len == overlay.len
+                }),
+                Place::Reserved => own.reserved.iter().any(|it| {
+                    ours(it.start) <= at
+                        && at.checked_add(overlay.len).is_some_and(|end| end <= ours(it.end))
+                }),
             };
             if !fits {
                 return Err(Error::new(format!(
@@ -416,7 +469,10 @@ impl Grant {
             }
         }
         for segment in &own.code {
-            let covered = self.overlays.iter().any(|it| it.place == Place::Code && theirs(it.at) == ours(segment.linked));
+            let covered = self
+                .overlays
+                .iter()
+                .any(|it| it.place == Place::Code && theirs(it.at) == ours(segment.linked));
             if !covered {
                 return Err(Error::new(format!(
                     "the code segment at {:#x} has no overlay: it would run from the file, not the code memory",
@@ -438,7 +494,8 @@ pub fn decode_map(body: &[u8]) -> Result<(u32, Access), Error> {
     let mut read = Reader::new(body);
     let object = read.u32().map_err(&bad)?;
     let tag = read.u8().map_err(&bad)?;
-    let access = Access::from_tag(tag).ok_or_else(|| Error::new(format!("a map of access {tag}")))?;
+    let access =
+        Access::from_tag(tag).ok_or_else(|| Error::new(format!("a map of access {tag}")))?;
     read.finish().map_err(&bad)?;
     Ok((object, access))
 }
@@ -475,9 +532,10 @@ pub fn host_var(value: &[u8]) -> Result<(&str, [u8; 16]), Error> {
         .iter()
         .position(|it| *it == b'\t')
         .ok_or_else(|| Error::new(format!("{HOST_VAR} names no token")))?;
-    let address =
-        std::str::from_utf8(&value[..tab]).map_err(|_| Error::new(format!("{HOST_VAR} names an address that is not UTF-8")))?;
-    let token = unhex(&value[tab + 1..])
-        .ok_or_else(|| Error::new(format!("{HOST_VAR} has a token that is not 32 lowercase hex digits")))?;
+    let address = std::str::from_utf8(&value[..tab])
+        .map_err(|_| Error::new(format!("{HOST_VAR} names an address that is not UTF-8")))?;
+    let token = unhex(&value[tab + 1..]).ok_or_else(|| {
+        Error::new(format!("{HOST_VAR} has a token that is not 32 lowercase hex digits"))
+    })?;
     Ok((address, token))
 }

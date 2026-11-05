@@ -4,6 +4,15 @@ mod args;
 
 use std::borrow::Cow;
 
+use self::args::{Arg, Array, IntSuffix, Lit, lit_value};
+use crate::{
+    BuiltinError, EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile,
+    MacroCallId,
+    builtin::quote::{WithDelimiter, dollar_crate, emit, group, str_literal},
+    hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
+    name,
+    tt::{self, DelimSpan, TtElement},
+};
 use base_db::{AnchoredPath, Db};
 use blaze_mem::Frame;
 use cfg::CfgExpr;
@@ -16,15 +25,6 @@ use stdx::edit_distance::edit_distance;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self, AstNode as _},
-};
-use self::args::{Arg, Array, IntSuffix, Lit, lit_value};
-use crate::{
-    BuiltinError, EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile,
-    MacroCallId,
-    builtin::quote::{WithDelimiter, dollar_crate, emit, group, str_literal},
-    hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
-    name,
-    tt::{self, DelimSpan, TtElement},
 };
 
 macro_rules! register_builtin {
@@ -166,8 +166,15 @@ fn mk_pound(span: Span) -> tt::Leaf {
 
 /// The string literal of `text`, a constant: escaped and interned on the first call, then one
 /// acquire load.
-#[expect(clippy::disallowed_types, reason = "the process's one cached literal per caller: each constant is interned once")]
-fn constant_str_literal(cell: &'static std::sync::OnceLock<Symbol>, text: &str, span: Span) -> tt::Literal {
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one cached literal per caller: each constant is interned once"
+)]
+fn constant_str_literal(
+    cell: &'static std::sync::OnceLock<Symbol>,
+    text: &str,
+    span: Span,
+) -> tt::Literal {
     tt::Literal {
         text_and_suffix: *cell.get_or_init(|| str_literal(text, span).text_and_suffix),
         span,
@@ -195,7 +202,10 @@ fn module_path_expand<'f>(
     _tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    #[expect(clippy::disallowed_types, reason = "the process's one module path placeholder symbol: the constant is interned once")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one module path placeholder symbol: the constant is interned once"
+    )]
     static PLACEHOLDER: std::sync::OnceLock<Symbol> = std::sync::OnceLock::new();
     let placeholder = constant_str_literal(&PLACEHOLDER, MODULE_PATH_PLACEHOLDER, span);
     ExpandResult::ok(quote_in! {frame, span =>
@@ -497,7 +507,10 @@ fn file_expand<'f>(
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     // FIXME: RA purposefully lacks knowledge of absolute file names
     // so just return "".
-    #[expect(clippy::disallowed_types, reason = "the process's one file placeholder symbol: the constant is interned once")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one file placeholder symbol: the constant is interned once"
+    )]
     static FILE: std::sync::OnceLock<Symbol> = std::sync::OnceLock::new();
     let file_name = constant_str_literal(&FILE, "file", span);
 
@@ -958,7 +971,9 @@ fn concat_text_in<'f>(
         let (&first, rest) = missing.split_first()?;
         Some(
             BuiltinError::new("expected a literal")
-                .note("only literals (like `\"foo\"`, `-42` and `3.14`) can be passed to `concat!()`")
+                .note(
+                    "only literals (like `\"foo\"`, `-42` and `3.14`) can be passed to `concat!()`",
+                )
                 .also_at(rest)
                 .at(first),
         )
@@ -1008,8 +1023,7 @@ fn concat_bytes_expand<'f>(
                     });
                     match count_value {
                         Some(count) => {
-                            if let Some(byte) =
-                                array_element(db, &element, &mut err, &mut missing)
+                            if let Some(byte) = array_element(db, &element, &mut err, &mut missing)
                             {
                                 let count = usize::try_from(count).unwrap_or(usize::MAX);
                                 let len = bytes.len().saturating_add(count);
@@ -1041,7 +1055,9 @@ fn concat_bytes_expand<'f>(
                 }
             }
         } else if arg.bool().is_some() {
-            err.get_or_insert(BuiltinError::new("cannot concatenate boolean literals").at(arg.span));
+            err.get_or_insert(
+                BuiltinError::new("cannot concatenate boolean literals").at(arg.span),
+            );
         } else {
             missing.push(arg.span);
         }
@@ -1071,7 +1087,9 @@ fn array_element(
 ) -> Option<u8> {
     if let Some(lit) = element.literal() {
         match lit_value(&lit) {
-            Ok(Lit::Int(value, IntSuffix::None | IntSuffix::U8)) if value <= u128::from(u8::MAX) => {
+            Ok(Lit::Int(value, IntSuffix::None | IntSuffix::U8))
+                if value <= u128::from(u8::MAX) =>
+            {
                 return Some(value as u8);
             }
             Ok(Lit::Byte(byte)) => return Some(byte),
@@ -1092,9 +1110,13 @@ fn array_element(
             }
         }
     } else if element.bool().is_some() {
-        err.get_or_insert(BuiltinError::new("cannot concatenate boolean literals").at(element.span));
+        err.get_or_insert(
+            BuiltinError::new("cannot concatenate boolean literals").at(element.span),
+        );
     } else if args::array(db, element).is_some() {
-        err.get_or_insert(BuiltinError::new("cannot concatenate doubly nested array").at(element.span));
+        err.get_or_insert(
+            BuiltinError::new("cannot concatenate doubly nested array").at(element.span),
+        );
     } else {
         missing.push(element.span);
     }
@@ -1172,7 +1194,7 @@ fn included_source(
         Ok(bytes) if std::str::from_utf8(bytes).is_ok() => None,
         // The `io::Error` `read_to_string` gives rustc's file loader for bytes that are not UTF-8.
         Ok(_) => Some("stream did not contain valid UTF-8".to_owned()), // alloc: an error's message, on the error path
-        Err(error) => Some(error.to_string()), // alloc: as above
+        Err(error) => Some(error.to_string()),                          // alloc: as above
     };
     let shown = || db.included_path(path).ok_or_else(unloaded);
     if let Some(error) = unreadable {
@@ -1440,7 +1462,8 @@ fn env_not_defined(var: &str, lit: &tt::Literal, message: Option<Symbol>) -> Bui
     // rustc names the variable by the literal's symbol, its text before unescaping.
     let name = lit.text();
     // alloc: an error's message and helps, on the error path
-    let error = BuiltinError::new(format!("environment variable `{name}` not defined at compile time"));
+    let error =
+        BuiltinError::new(format!("environment variable `{name}` not defined at compile time"));
     if let Some(suggested) = similar_cargo_var(var)
         && suggested != var
     {
@@ -1598,7 +1621,10 @@ fn pattern_type_expand<'f>(
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ty = WithDelimiter {
-        delimiter: tt::Delimiter { kind: tt::DelimiterKind::Invisible, ..tt.top_subtree().delimiter },
+        delimiter: tt::Delimiter {
+            kind: tt::DelimiterKind::Invisible,
+            ..tt.top_subtree().delimiter
+        },
         token_trees: tt.token_trees(),
     };
     let pound = mk_pound(call_site);
@@ -1725,7 +1751,11 @@ mod tests {
             quote! {span => m! #tt}
         };
         let new = WithDelimiter {
-            delimiter: tt::Delimiter { open: span, close: span, kind: tt::DelimiterKind::Parenthesis },
+            delimiter: tt::Delimiter {
+                open: span,
+                close: span,
+                kind: tt::DelimiterKind::Parenthesis,
+            },
             token_trees: tt.token_trees(),
         };
         assert_same(&old, &quote! {span => m! #new});
@@ -1736,7 +1766,10 @@ mod tests {
             quote! {span => pattern_type ( #tt )}
         };
         let new = WithDelimiter {
-            delimiter: tt::Delimiter { kind: tt::DelimiterKind::Invisible, ..tt.top_subtree().delimiter },
+            delimiter: tt::Delimiter {
+                kind: tt::DelimiterKind::Invisible,
+                ..tt.top_subtree().delimiter
+            },
             token_trees: tt.token_trees(),
         };
         assert_same(&old, &quote! {span => pattern_type ( #new )});

@@ -11,13 +11,13 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, InferenceDiagnostic,
     infer::{AllowTwoPhase, AutoBorrowMutability, Expectation, InferenceContext, expr::ExprIsRead},
     method_resolution::{MethodCallee, TreatNotYetDefinedOpaques},
-    solver_errors::StoredGoal,
     next_solver::{
         GenericArgs, TraitRef, Ty, TyKind,
         fulfill::NextSolverError,
         infer::traits::{Obligation, ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
+    solver_errors::StoredGoal,
 };
 
 /// Why an operator's trait does not hold: the errors of its one obligation, at most one, kept

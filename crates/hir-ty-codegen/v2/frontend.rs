@@ -6,38 +6,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
-    backend::{Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit},
+    backend::{
+        Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit,
+    },
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use blaze_query::db::FromId;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
-    GenericParamId, HasModule, Lookup, attrs::AttrFlags, expr_store::ExpressionStore,
-    signatures::FunctionSignature,
+    GenericParamId, HasModule, Lookup, signatures::FunctionSignature,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
-use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
 use hir_ty_identity::{Compiled, OptionsSet, Shim, Subject, instance_identity};
+use hir_ty_mir::mir::MirOptions;
 use hir_ty_mir::mir::dispatch;
 use hir_ty_share::Unshared;
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
 use smallvec::{SmallVec, smallvec};
+use std::alloc::Global;
 
 use super::{
     Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
     undescribed,
 };
-use crate::{
-    Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol,
-};
+use crate::{Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol};
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
@@ -105,7 +104,11 @@ impl<T> ByOrigin<T> {
     /// Made once a build.
     fn of(policy: &Policy, mut each: impl FnMut(&Origin) -> T) -> ByOrigin<T> {
         let mut kinds = |name: Package| {
-            [each(&Origin::Member(name)), each(&Origin::Dependency(name)), each(&Origin::BuildTime(name))]
+            [
+                each(&Origin::Member(name)),
+                each(&Origin::Dependency(name)),
+                each(&Origin::BuildTime(name)),
+            ]
         };
         // No package is named the empty name: these are of one the profile has nothing for.
         let [member, dependency, build_time] = kinds(Package::new(""));
@@ -155,8 +158,8 @@ struct Units {
     /// Whether some unit of the origin MIR-inlines (`Spec::mir_inline`), at the first spec or
     /// one a build tiers it up to.
     inlines: ByOrigin<Result<bool, PlanError>>,
-    /// Some origin's units inline: what a generic, which every origin may ask for, is walked
-    /// with.
+    /// Some origin's units inline: what an instance every origin may ask for and compile (a
+    /// generic, an `#[inline]` function, a closure: [`user_compiled`]) is walked with.
     any: bool,
     /// Whether some unit of the origin tells a debugger of its named locals
     /// ([`DebugInfo::tells_locals`](blaze_codegen::settings::DebugInfo::tells_locals), at the
@@ -164,6 +167,15 @@ struct Units {
     /// a generic it asks for is then keyed by its arguments as well
     /// ([`HirFrontend::generic_args`]).
     tells: ByOrigin<Result<bool, PlanError>>,
+    /// Some origin's units tell a debugger of their named locals: what an instance every
+    /// origin may compile ([`user_compiled`]) is keyed as.
+    tells_any: bool,
+    /// Whether some unit of the origin puts names or places of its own in its compiled code
+    /// beside its positions ([`names_of`]): its template is then kept under its code, never its
+    /// template code ([`Hashes::template_code`]).
+    names: ByOrigin<Result<bool, PlanError>>,
+    /// Some origin's units do, as [`Self::any`] for inlining.
+    names_any: bool,
     /// Every options a unit of the origin may build a body with ([`Build::options`]), by
     /// whether the body is of the library's crates: what a generic it asks for has its compile
     /// identity under ([`hir_ty_identity::instance_identity`]).
@@ -179,6 +191,9 @@ impl Units {
         });
         let any = inlines.values().any(|it| it == &Ok(true));
         let tells = ByOrigin::of(policy, |origin| tells_of(policy, origin));
+        let tells_any = tells.values().any(|it| it == &Ok(true));
+        let names = ByOrigin::of(policy, |origin| names_of(policy, origin));
+        let names_any = names.values().any(|it| it == &Ok(true));
         let crates = base_db::all_crates(db);
         let mut by_build: HashMap<Build, Asked, Global> = HashMap::new_in(Global);
         let options = builds.map(|it| -> Result<Compiled, String> {
@@ -190,7 +205,7 @@ impl Units {
             }
             Ok(Compiled { lang: options_set(&asked.lang)?, other: options_set(&asked.other)? })
         });
-        Units { inlines, any, tells, options }
+        Units { inlines, any, tells, tells_any, names, names_any, options }
     }
 }
 
@@ -201,6 +216,24 @@ fn tells_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
     let choice = policy.choose(origin, None)?;
     let told = |spec: &blaze_codegen::settings::Spec| spec.debuginfo.tells_locals();
     Ok(told(&choice.first) || choice.then.as_ref().is_some_and(told))
+}
+
+/// Whether a unit of `origin` puts in its compiled code names or places a template keyed by
+/// its template code ([`Hashes::template_code`]) would leave out, at its first spec or the spec
+/// a live build tiers it up to: a PGO build's profile record names the function by its path
+/// (`pgo::name`), and a report's rows (`Spec::report`) are of absolute positions in its side
+/// table.
+fn names_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
+    let choice = policy.choose(origin, None)?;
+    // A sanitizing unit reads names too: SanitizerCoverage is off for a `__sanitizer_*`
+    // symbol (`backend::unsanitized`), and LLVM's sanitizers write descriptors that name the
+    // globals and frames they guard.
+    let named = |spec: &blaze_codegen::settings::Spec| {
+        spec.report
+            || !matches!(spec.pgo, blaze_codegen::settings::Pgo::None)
+            || !spec.sanitize.is_empty()
+    };
+    Ok(named(&choice.first) || choice.then.as_ref().is_some_and(named))
 }
 
 /// How the units of `origin` build bodies: at its first spec, at the spec a live build tiers
@@ -316,14 +349,11 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// Whether a unit of `instance` MIR-inlines bodies of crates other than the library's,
-    /// whose code then calls what they call: one of its crate's origin when it is not
-    /// generic, else of any origin, as any may ask for it. What its references are walked
+    /// whose code then calls what they call: one of its crate's origin when it is compiled
+    /// there only, else ([`user_compiled`]: a generic, an `#[inline]` function, a closure) of
+    /// any origin, as any may ask for it. What its references are walked
     /// for ([`refs::walk`]).
-    pub(crate) fn inlines(
-        &self,
-        db: &Db,
-        instance: &HirInstance,
-    ) -> Result<bool, String> {
+    pub(crate) fn inlines(&self, db: &Db, instance: &HirInstance) -> Result<bool, String> {
         self.inlines_as(db, instance, None)
     }
 
@@ -331,22 +361,36 @@ impl<'db> HirFrontend<'db> {
     /// ([`super::devirt::walking`]): what a unit builds its body with.
     pub(crate) fn walking(&self, db: &Db, instance: &HirInstance) -> Result<refs::Walking, String> {
         let inlined = self.inlines(db, instance)?;
-        super::devirt::walking(db, self.devirt.world(), instance, inlined, || self.owner(db, &instance.0))
+        super::devirt::walking(db, self.devirt.world(), instance, inlined, || {
+            self.owner(db, &instance.0)
+        })
     }
 
-    /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin of
-    /// its crate when it is not generic, else of the requester's.
+    /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin
+    /// [`Self::compiled_for`] picks.
     pub(crate) fn inlines_for(
         &self,
         db: &Db,
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<bool, String> {
-        let origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic(&instance.0) => self.origin(db, krate),
-            _ => *requester,
-        };
+        let origin = self.compiled_for(db, instance, requester);
         self.inlines_as(db, instance, Some(&origin))
+    }
+
+    /// The origin `instance` is compiled for when `requester` asks for it: the requester's
+    /// where rustc compiles it into each crate that uses it ([`user_compiled`]), else its own
+    /// crate's, where rustc links every user to one copy. It follows that rule alone, never
+    /// the instance's overflow checks, so turning them on or off moves no code between origins.
+    /// Its callees are asked for by this origin (the driver's walk), so a body that takes its
+    /// caller's overflow checks (core's `#[inline] #[rustc_inherit_overflow_checks]` operator
+    /// impls) reached through other bodies their user compiles (`impl Add<&u8> for u8`,
+    /// `impl Sum<&u8> for u8`) takes the user's.
+    fn compiled_for(&self, db: &Db, instance: &HirInstance, requester: &Origin) -> Origin {
+        match crate_of(db, &instance.0) {
+            Some(krate) if !user_compiled(db, &instance.0) => self.origin(db, krate),
+            _ => *requester,
+        }
     }
 
     /// [`Self::inlines`], with the origin of the instance's crate when the caller has it.
@@ -357,14 +401,36 @@ impl<'db> HirFrontend<'db> {
         origin: Option<&Origin>,
     ) -> Result<bool, String> {
         let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
+        // One answer for every requester of an instance its users compile, as describing it for
+        // one and preparing it (`walking`, which names no requester) must list one walk.
         let of_origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic(&instance.0) => match origin {
+            Some(krate) if !user_compiled(db, &instance.0) => match origin {
                 Some(origin) => units.inlines.get(origin),
                 None => units.inlines.get(&self.origin(db, krate)),
             },
             _ => return Ok(units.any),
         };
         of_origin.as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
+    }
+
+    /// What `of` says of the units of `origin` (by origin, and whether any origin's does) for
+    /// `instance`: as [`Self::inlines_as`], one answer for every requester of an instance its
+    /// users compile.
+    fn units_as(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+        origin: &Origin,
+        of: fn(&Units) -> (&ByOrigin<Result<bool, PlanError>>, bool),
+    ) -> Result<bool, String> {
+        let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
+        let (by_origin, any) = of(units);
+        match crate_of(db, &instance.0) {
+            Some(_) if !user_compiled(db, &instance.0) => {
+                by_origin.get(origin).as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
+            }
+            _ => Ok(any),
+        }
     }
 
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
@@ -378,7 +444,11 @@ impl<'db> HirFrontend<'db> {
     /// `Client::expand1::<F>` or `expand2::<F>` for its `#[proc_macro*]` function `F`. An error
     /// names `func` when it has a const parameter or a type parameter count other than
     /// `items.len()`.
-    pub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, String> {
+    pub fn root_with_fn_items(
+        &self,
+        func: FunctionId,
+        items: &[FunctionId],
+    ) -> Result<HirInstance, String> {
         self.databases.with(|db| root_with_fn_items_in(db, func, items))
     }
 
@@ -393,7 +463,9 @@ impl<'db> HirFrontend<'db> {
         self.with(|db| {
             super::allocator::shim(db, krate, |func| self.root(func))
                 // alloc: the error's message
-                .map_err(|what| undescribed(db, &krate, None, format!("its allocator shim: {what}")))
+                .map_err(|what| {
+                    undescribed(db, &krate, None, format!("its allocator shim: {what}"))
+                })
         })
     }
 
@@ -417,26 +489,63 @@ impl<'db> HirFrontend<'db> {
         // Each failure past here is the front end's of this instance: the error carries its item.
         let fail = |what: String| super::failed_in_front(db, None, Some(item), instance, what);
         let generic = generic(&instance.0);
-        let origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic => self.origin(db, krate),
-            _ => *requester,
-        };
+        let origin = self.compiled_for(db, instance, requester);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let owner = self.owner(db, &instance.0);
-        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner).map_err(fail)?;
+        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner)
+            .map_err(fail)?;
         let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 18). A
         // copy of it built into a caller is built against none: `built_in_code`.
-        let code = super::devirt::code(built_in_code, refs::read(db, instance, walking).map_err(fail)?);
+        let read = refs::read(db, instance, walking).map_err(fail)?;
+        let told =
+            self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
+        // What its compiled function reads of names beside its code (the files its `file!()`
+        // names, its told locals' types) is in every key of it (rule 20), its link code's as
+        // its template code's: read once, folded into both ([`with_names`]).
+        let body = kind_body(&instance.0);
+        let names = body.map(|body| hashes.names_read(db, body, told)).transpose().map_err(fail)?;
+        let code = with_names(super::devirt::code(built_in_code, read), names.map(|it| it.0));
+        // Its template is kept under its template code, which holds no name and no place, when
+        // all its positions are its own tables' and its code is its body's alone: none inlined
+        // from another body (`inlined`, a unit's inliner; `lang`, the library's bodies, which
+        // `Build::options` always inlines as shipped), no report rows or PGO record naming it
+        // (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
+        // The template then holds its positions by table and the instance fills its own
+        // anchors (docs/v2/plan/design/name-free-identity.md).
+        let lang = crate_of(db, &instance.0).is_some_and(|it| it.data(db).origin.is_lang());
+        let named =
+            self.units_as(db, instance, &origin, |it| (&it.names, it.names_any)).map_err(fail)?;
+        let held = match (inlined || lang || named, names) {
+            (false, Some((names, true))) => {
+                template_code_of(db, hashes, &instance.0, names).map_err(fail)?
+            }
+            // A told local's type holding an alias, or no body of its own: kept under its code.
+            _ => None,
+        };
+        let (template_code, anchors) = match held {
+            Some((own, owner)) => {
+                (super::devirt::code(own, read), Some(hashes.anchors(db, owner).map_err(fail)?))
+            }
+            None => (code, None),
+        };
         let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
         let args = match generic {
-            true => self.generic_args(db, &instance.0, &origin, plain).map_err(fail)?,
+            true => {
+                let placement = refs::placement(db, instance, walking).map_err(fail)?;
+                self.generic_args(db, &instance.0, &origin, plain, placement).map_err(fail)?
+            }
             false => plain,
         };
         let identity = identity(db, &instance.0, item, plain);
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
-        let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
+        // Always the origin's profile, which keys it (rule 18). Pinning the setting of one
+        // whose MIR keeps no check would let requesters that differ only in overflow checks
+        // share its key while its callees that take their caller's setting differ between them
+        // (`<u8 as Add>::add` under `impl Add<&u8> for u8`); for one compiled in its own crate
+        // only, the origin's profile is already that crate's setting.
+        let overflow_checks = None;
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
         let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
         asked_by(owner, &mut refs);
@@ -444,10 +553,13 @@ impl<'db> HirFrontend<'db> {
         let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
         // Written in a workspace crate: the complement of what a caller may build in
         // (`always_inlinable_callee`), so nothing patchable is ever built in.
-        let editable = crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
+        let editable =
+            crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
         Ok(Described {
             item,
             code,
+            template_code,
+            anchors,
             built_in_code,
             args,
             origin,
@@ -466,20 +578,37 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// A generic's arguments in its key, compiled as `origin` asks: what its code reads of them
-    /// ([`Self::shared_args`]) and, where a unit of `origin` tells a debugger of its named
-    /// locals ([`Units::tells`]), `plain`, its arguments' content ID ([`args_of`]). A told
-    /// local's type is in the IR's shape and the side table (`side::Variable::ty`), and it is
-    /// the instance's own (`&UnsafeCell<usize>` or `&UnsafeCell<Align8<*mut ()>>` for one body
-    /// of one compile identity), so two instances sharing one key would give the store two
-    /// shapes under it, or one instance the other's debug info (rule 18). Without told locals
-    /// the instances stay one.
-    fn generic_args(&self, db: &Db, kind: &Kind, origin: &Origin, plain: ContentId) -> Result<ContentId, String> {
+    /// ([`Self::shared_args`]) with `placement`, which place of its references each request of
+    /// its code is given ([`refs::placement`]), and, where a unit of `origin` tells a debugger
+    /// of its named locals ([`Units::tells`]), `plain`, its arguments' content ID
+    /// ([`args_of`]). A told local's type is in the IR's shape and the side table
+    /// (`side::Variable::ty`), and it is the instance's own (`&UnsafeCell<usize>` or
+    /// `&UnsafeCell<Align8<*mut ()>>` for one body of one compile identity), so two instances
+    /// sharing one key would give the store two shapes under it, or one instance the other's
+    /// debug info (rule 18). Without told locals the instances stay one.
+    ///
+    /// A compile identity names each callee by its own identity, never by which instance it
+    /// is, so callees of equal identities that are one instance in one instance of the generic
+    /// and two in another (`size_of::<S>` and `size_of::<D>` in `needs_realloc::<S, D>` for
+    /// `S == D` and for two types of one layout) leave it equal, while the reference list,
+    /// which holds each instance once, and so the code, which names a reference by its place,
+    /// differ: `placement` is that one difference (rule 18).
+    fn generic_args(
+        &self,
+        db: &Db,
+        kind: &Kind,
+        origin: &Origin,
+        plain: ContentId,
+        placement: ContentId,
+    ) -> Result<ContentId, String> {
         let shared = self.shared_args(db, kind, origin)?;
-        // Already the instance's own arguments ([`args_of`]): mixing `plain` in again would only
-        // change the key, not what it covers.
+        // Already the instance's own arguments ([`args_of`]), which its walk, and so its
+        // placement, is made from: mixing either in would only change the key, not what it
+        // covers.
         if shared == plain {
             return Ok(shared);
         }
+        let shared = Hasher::new(PLACED_ARGS_DOMAIN).id(&shared).id(&placement).finish();
         match self.tells(origin)? {
             true => Ok(Hasher::new(TOLD_ARGS_DOMAIN).id(&shared).id(&plain).finish()),
             false => Ok(shared),
@@ -498,16 +627,26 @@ impl<'db> HirFrontend<'db> {
     /// ([`args_of`]). Both give exact code. A key that can't be made for any other reason is
     /// an error: the instance is never compiled per instance in its place. A generic callee is
     /// of its caller's origin, so its key here is the one its caller's key holds.
-    fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
+    pub(super) fn shared_args(
+        &self,
+        db: &Db,
+        kind: &Kind,
+        origin: &Origin,
+    ) -> Result<ContentId, String> {
         let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
         let compiled = self.body_options(origin)?;
         // clone: the query's key, a reference count
-        let of = hir_ty_identity::Instance { subject: subject_of(instance.def), args: instance.args.clone() };
+        let of = hir_ty_identity::Instance {
+            subject: subject_of(instance.def),
+            args: instance.args.clone(),
+        };
         match instance_identity(db, &of, env, compiled) {
             Ok(identity) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&identity.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(blaze_query::db::attach(db, || format!("no compile identity for {instance:?}: {why}"))),
+            Err(why) => Err(blaze_query::db::attach(db, || {
+                format!("no compile identity for {instance:?}: {why}")
+            })),
         }
     }
 
@@ -516,7 +655,7 @@ impl<'db> HirFrontend<'db> {
     pub(super) fn body_options(&self, origin: &Origin) -> Result<Compiled, String> {
         match &self.units {
             Some(units) => units.options.get(origin).clone(), // clone: a copy, or an error
-            None => Err(NO_POLICY.to_owned()), // alloc: an error
+            None => Err(NO_POLICY.to_owned()),                // alloc: an error
         }
     }
 
@@ -655,7 +794,8 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn stopped(&self) -> bool {
-        self.stop.is_some_and(|it| it.load(Ordering::Relaxed)) || self.checks.is_some_and(|it| it.stopped())
+        self.stop.is_some_and(|it| it.load(Ordering::Relaxed))
+            || self.checks.is_some_and(|it| it.stopped())
     }
 
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
@@ -695,14 +835,12 @@ fn counted(db: &Db, kind: &Kind) -> Counted {
 }
 
 /// Whether `kind` is collected in its own crate's build only, as rustc's
-/// `should_codegen_locally` is false for it in a crate that uses it: a function with no type or
-/// const arguments that is not `#[inline]` (nor `#[rustc_force_inline]`). A shim, a closure and
-/// a coroutine are built where they are used, as rustc builds them.
+/// `should_codegen_locally` is false for it in a crate that uses it: a function its users do
+/// not compile ([`user_compiled`], the one rule of it). A shim, a closure and a coroutine are
+/// built where they are used, as rustc builds them.
 fn heads_own_path(db: &Db, kind: &Kind) -> bool {
     let Kind::Code(instance, _) = kind else { return false };
-    let InstanceDef::Fn(func) = instance.def else { return false };
-    !instance.is_generic()
-        && !AttrFlags::query(db, func.into()).intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE)
+    matches!(instance.def, InstanceDef::Fn(_)) && !user_compiled(db, kind)
 }
 
 /// What `kind` is an instance of, as rustc's `check_recursion_limit` counts its `DefId`
@@ -720,7 +858,9 @@ fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
     let function = |func| blaze_items::item_key(db, ItemId::Function(func)).0;
     let body = match instance.def {
         InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => function(func),
-        InstanceDef::Closure(id) => blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0,
+        InstanceDef::Closure(id) => {
+            blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0
+        }
         InstanceDef::Coroutine(id) => {
             blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0
         }
@@ -731,19 +871,30 @@ fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
         }
         InstanceDef::DropGlue => shim("drop glue"),
         InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => shim("FnOnce::call_once"),
-        InstanceDef::ReifyShim { receiver: true } => shim("the Fn-trait call of a fn item or pointer"),
-        InstanceDef::ReifyShim { receiver: false } => match instance.args.as_ref().type_at(0).kind() {
-            TyKind::FnDef(def, _) => match def.0 {
-                CallableDefId::FunctionId(func) => function(func),
-                CallableDefId::StructId(it) => blaze_items::item_key(db, ItemId::Adt(AdtId::StructId(it))).0,
-                CallableDefId::EnumVariantId(it) => {
-                    let variant = it.lookup(db);
-                    let parent = blaze_items::item_key(db, ItemId::Adt(AdtId::EnumId(variant.parent))).0;
-                    Hasher::new(SHIM_BODY_DOMAIN).part(b"variant").id(&parent).part(variant.name.as_str().as_bytes()).finish()
-                }
-            },
-            _ => shim("the Fn-trait call of a fn item or pointer"),
-        },
+        InstanceDef::ReifyShim { receiver: true } => {
+            shim("the Fn-trait call of a fn item or pointer")
+        }
+        InstanceDef::ReifyShim { receiver: false } => {
+            match instance.args.as_ref().type_at(0).kind() {
+                TyKind::FnDef(def, _) => match def.0 {
+                    CallableDefId::FunctionId(func) => function(func),
+                    CallableDefId::StructId(it) => {
+                        blaze_items::item_key(db, ItemId::Adt(AdtId::StructId(it))).0
+                    }
+                    CallableDefId::EnumVariantId(it) => {
+                        let variant = it.lookup(db);
+                        let parent =
+                            blaze_items::item_key(db, ItemId::Adt(AdtId::EnumId(variant.parent))).0;
+                        Hasher::new(SHIM_BODY_DOMAIN)
+                            .part(b"variant")
+                            .id(&parent)
+                            .part(variant.name.as_str().as_bytes())
+                            .finish()
+                    }
+                },
+                _ => shim("the Fn-trait call of a fn item or pointer"),
+            }
+        }
     };
     Some(Instantiates { body, drop_glue: matches!(instance.def, InstanceDef::DropGlue) })
 }
@@ -755,7 +906,9 @@ fn limit_crate(db: &Db, kind: &Kind) -> Option<Crate> {
     match kind {
         Kind::Code(instance, env) => match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
-            def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+            def @ (InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)) => {
                 closure_loc(db, def).map(|loc| loc.owner.module(db).krate(db))
             }
             InstanceDef::DropGlue
@@ -794,10 +947,15 @@ fn body_named(db: &Db, def: InstanceDef) -> String {
     match def {
         InstanceDef::Fn(func) => path(func),
         InstanceDef::VtableShim(func) => format!("the vtable shim of {}", path(func)), // alloc: an error's text
-        def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+        def @ (InstanceDef::Closure(_)
+        | InstanceDef::Coroutine(_)
+        | InstanceDef::CoroutineByMove(_)) => {
             match closure_loc(db, def).map(|loc| loc.owner) {
                 Some(InferBodyId::DefWithBodyId(owner)) => {
-                    format!("a closure in {}", blaze_items::key::path(db, ItemId::of_body(db, owner))) // alloc: an error's text
+                    format!(
+                        "a closure in {}",
+                        blaze_items::key::path(db, ItemId::of_body(db, owner))
+                    ) // alloc: an error's text
                 }
                 _ => "a closure in an anonymous constant".to_owned(), // alloc: an error's text
             }
@@ -805,7 +963,7 @@ fn body_named(db: &Db, def: InstanceDef) -> String {
         InstanceDef::DropGlue => "core::ptr::drop_in_place".to_owned(), // alloc: an error's text
         InstanceDef::CallOnceShim => "the `FnOnce::call_once` shim".to_owned(), // alloc: an error's text
         InstanceDef::FnPointerShim => "the fn pointer shim".to_owned(), // alloc: an error's text
-        InstanceDef::ReifyShim { .. } => "the reify shim".to_owned(), // alloc: an error's text
+        InstanceDef::ReifyShim { .. } => "the reify shim".to_owned(),   // alloc: an error's text
     }
 }
 
@@ -825,7 +983,11 @@ fn past_recursion_limit(
     };
     let (body, counted) = match &instance.0 {
         Kind::Code(it, _) => {
-            let quarter = if matches!(it.def, InstanceDef::DropGlue) { ", drop glue counting a quarter" } else { "" };
+            let quarter = if matches!(it.def, InstanceDef::DropGlue) {
+                ", drop glue counting a quarter"
+            } else {
+                ""
+            };
             (body_named(db, it.def), quarter)
         }
         kind => (super::linked::debug_name(db, kind), ""),
@@ -833,7 +995,8 @@ fn past_recursion_limit(
     // The item it is an instance of. It has no instance key: the walk refused it before it
     // described it, and its key is its description's. An `asm!` function and the allocator
     // shim's are never counted, so never here.
-    let item = item_of(db, &instance.0).map_or(ItemKey(ContentId::default()), |it| blaze_items::item_key(db, it));
+    let item = item_of(db, &instance.0)
+        .map_or(ItemKey(ContentId::default()), |it| blaze_items::item_key(db, it));
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item,
@@ -982,8 +1145,12 @@ fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInst
 /// caller's code. The callee's node holds this code and [`inlined`] names it by it, so the two
 /// compare (`blaze-codegen` `driver`'s `unkept_inline`); its own unit's code may hash the dyn
 /// facts it read beside it ([`super::devirt::code`]).
+///
+/// A copy bakes in the names of the files its `file!()` reads as its own unit's does, so they
+/// are folded in ([`with_names`], untold: a copy's locals are its caller's to tell).
 pub(crate) fn built_in_code(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
-    code_of(db, hashes, kind)
+    let names = kind_body(kind).map(|body| hashes.names_read(db, body, false)).transpose()?;
+    Ok(with_names(code_of(db, hashes, kind)?, names.map(|it| it.0)))
 }
 
 /// The code hashes of the bodies the compile of `instance` built in, sorted, each once, each by
@@ -1010,14 +1177,20 @@ pub(crate) fn inlined(
         }
         Kind::Allocator(_) | Kind::Asm(..) => {
             // alloc: the error's message
-            return Err(format!("{instance:?} built in {built_in:?}, though nothing of its kind builds a body in"));
+            return Err(format!(
+                "{instance:?} built in {built_in:?}, though nothing of its kind builds a body in"
+            ));
         }
     };
     let mut found = Vec::with_capacity(built_in.len()); // alloc: the list returned
     for it in built_in {
-        let FrontRef::Function(callee) = super::places::call_ref(db, it.def, it.args.as_ref(), &env)? else {
+        let FrontRef::Function(callee) =
+            super::places::call_ref(db, it.def, it.args.as_ref(), &env)?
+        else {
             // alloc: the error's message
-            return Err(format!("{instance:?} built in {it:?}, which its callers name as no function"));
+            return Err(format!(
+                "{instance:?} built in {it:?}, which its callers name as no function"
+            ));
         };
         found.push(built_in_code(db, hashes, &callee.0)?);
     }
@@ -1097,18 +1270,16 @@ pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
         InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => {
             lang(lang_items().FnOnce_call_once, "FnOnce::call_once")
         }
-        InstanceDef::ReifyShim { .. } => {
-            match instance.args.as_ref().type_at(0).kind() {
-                TyKind::FnDef(def, _) => Ok(match def.0 {
-                    CallableDefId::FunctionId(it) => ItemId::Function(it),
-                    CallableDefId::StructId(it) => ItemId::Adt(AdtId::StructId(it)),
-                    CallableDefId::EnumVariantId(it) => {
-                        ItemId::Adt(AdtId::EnumId(it.lookup(db).parent))
-                    }
-                }),
-                _ => lang(lang_items().FnOnce_call_once, "FnOnce::call_once"),
-            }
-        }
+        InstanceDef::ReifyShim { .. } => match instance.args.as_ref().type_at(0).kind() {
+            TyKind::FnDef(def, _) => Ok(match def.0 {
+                CallableDefId::FunctionId(it) => ItemId::Function(it),
+                CallableDefId::StructId(it) => ItemId::Adt(AdtId::StructId(it)),
+                CallableDefId::EnumVariantId(it) => {
+                    ItemId::Adt(AdtId::EnumId(it.lookup(db).parent))
+                }
+            }),
+            _ => lang(lang_items().FnOnce_call_once, "FnOnce::call_once"),
+        },
     }
 }
 
@@ -1119,6 +1290,8 @@ const ASM_DOMAIN: &str = "blaze v2 asm 1";
 const START_DOMAIN: &str = "blaze v2 start 1";
 /// A cached function's code with the code of its body it writes ([`fncache::written_code`]).
 const CACHED_DOMAIN: &str = "blaze v2 cached function 1";
+/// A code with what its body reads of names beside it ([`with_names`]).
+const WITH_NAMES_DOMAIN: &str = "blaze v2 code with names read 1";
 /// The PGO name of an instance hashes this ID ([`blaze_items::pgo`]), so the profile lints
 /// compute a plain function's name with the same domain.
 use blaze_items::pgo::ARGS_DOMAIN;
@@ -1127,6 +1300,9 @@ const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 2";
 /// A compile identity and the arguments' content ID, for a generic whose told locals' types
 /// are in its shape ([`HirFrontend::generic_args`]).
 const TOLD_ARGS_DOMAIN: &str = "blaze v2 told args 1";
+/// A compile identity with which place of its references each request of the code is given
+/// ([`refs::placement`]), for a generic shared under it ([`HirFrontend::generic_args`]).
+const PLACED_ARGS_DOMAIN: &str = "blaze v2 placed args 1";
 
 /// Whether an instance with no compile identity for `why` is compiled for its arguments alone:
 /// [`Unshared::is_per_instance`], which compile identity reads for a caller too.
@@ -1172,24 +1348,7 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
     };
     match instance.def {
         InstanceDef::Fn(func) => {
-            let code = hashes.code(db, Body::Item(func.into()))?;
-            let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
-            let Some(written) = written else {
-                return Ok(code);
-            };
-            let mut hasher = Hasher::new(CACHED_DOMAIN);
-            hasher.id(&code.0);
-            match written {
-                Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
-                Err(fncache::Uncached::Impure(why)) => hasher.update(&[1]).update(why.as_bytes()),
-                // The body has no code identity: the function has no code either (rule 3).
-                // clone: the error owns its text; the query keeps its own
-                Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
-                // The body reaches what blaze can't compile: the function has no code either.
-                // alloc: the error's message
-                Err(fncache::Uncached::Uncompiled(it)) => return Err(it.to_string()),
-            };
-            Ok(CodeHash(hasher.finish()))
+            cached(db, hashes.code(db, Body::Item(func.into()))?, func, instance, env)
         }
         InstanceDef::Closure(id) => hashes.code(db, Body::Closure(id)),
         InstanceDef::Coroutine(id) => hashes.code(db, Body::Coroutine(id)),
@@ -1209,6 +1368,86 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
             shim(if receiver { 5 } else { 4 }, adapted)
         }
     }
+}
+
+/// `code`, of the body of `func` as `instance` runs it in `env`, with what the function cache
+/// keys of it ([`fncache::written_code`]): [`code_of`]'s and [`template_code_of`]'s one rule.
+fn cached(
+    db: &Db,
+    code: CodeHash,
+    func: FunctionId,
+    instance: &Instance,
+    env: &hir_ty::traits::StoredParamEnvAndCrate,
+) -> Result<CodeHash, String> {
+    let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
+    let Some(written) = written else {
+        return Ok(code);
+    };
+    let mut hasher = Hasher::new(CACHED_DOMAIN);
+    hasher.id(&code.0);
+    match written {
+        Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
+        Err(fncache::Uncached::Impure(why)) => hasher.update(&[1]).update(why.as_bytes()),
+        // The body has no code identity: the function has no code either (rule 3).
+        // clone: the error owns its text; the query keeps its own
+        Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
+        // The body reaches what blaze can't compile: the function has no code either.
+        // alloc: the error's message
+        Err(fncache::Uncached::Uncompiled(it)) => return Err(it.to_string()),
+    };
+    Ok(CodeHash(hasher.finish()))
+}
+
+/// What the template of `kind` is kept under when its positions are its own body's, as
+/// [`code_of`] makes its code: its body's [`Hashes::template_code`] with `names`, what it reads
+/// of names ([`Hashes::names_read`], folded into its code as well), and
+/// the body whose span tables its positions are in. `None` for an instance whose template may
+/// hold what is not its own (a shim's declaration of the function it adapts, `main`'s start,
+/// the allocator's, `asm!`), or whose body is written in no body of its own: kept under its
+/// code.
+fn template_code_of(
+    db: &Db,
+    hashes: &HashSource,
+    kind: &Kind,
+    names: ContentId,
+) -> Result<Option<(CodeHash, DefWithBodyId)>, String> {
+    let Kind::Code(instance, env) = kind else { return Ok(None) };
+    let Some(body) = kind_body(kind) else { return Ok(None) };
+    let Some(owner) = blaze_query::db::attach(db, || super::hashes::span_owner(db, body)) else {
+        return Ok(None);
+    };
+    let code = with_names(hashes.template_code(db, body)?, Some(names));
+    match instance.def {
+        InstanceDef::Fn(func) => Ok(Some((cached(db, code, func, instance, env)?, owner))),
+        _ => Ok(Some((code, owner))),
+    }
+}
+
+/// The body `kind` is compiled from, `None` for a shim, `main`'s start, the allocator's or
+/// `asm!`, which are written in no body of their own.
+fn kind_body(kind: &Kind) -> Option<Body> {
+    let Kind::Code(instance, _) = kind else { return None };
+    match instance.def {
+        InstanceDef::Fn(func) => Some(Body::Item(func.into())),
+        InstanceDef::Closure(id) => Some(Body::Closure(id)),
+        InstanceDef::Coroutine(id) => Some(Body::Coroutine(id)),
+        InstanceDef::CoroutineByMove(id) => Some(Body::CoroutineByMove(id)),
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::VtableShim(_)
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => None,
+    }
+}
+
+/// `code` with what its compiled body reads of names beside it ([`Hashes::names_read`]):
+/// the files its `file!()` names and its told locals' types. A body with none of its own (a
+/// shim, `main`'s start, the allocator's, `asm!`) keeps `code`.
+fn with_names(code: CodeHash, names: Option<ContentId>) -> CodeHash {
+    let Some(names) = names else { return code };
+    let mut hasher = Hasher::new(WITH_NAMES_DOMAIN);
+    hasher.id(&code.0).id(&names);
+    CodeHash(hasher.finish())
 }
 
 /// The content ID of an instance's generic arguments, regions left out.
@@ -1285,9 +1524,7 @@ fn names_workspace(db: &Db, ty: Ty<'_>, ours: &impl Fn(Crate) -> bool) -> bool {
         TyKind::FnDef(def, _) => ours(def.0.krate(db)),
         TyKind::Closure(id, _) => closure(id.0.loc(db).owner),
         TyKind::CoroutineClosure(id, _) => closure(id.0.loc(db).owner),
-        TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => {
-            closure(id.0.loc(db).owner)
-        }
+        TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => closure(id.0.loc(db).owner),
         TyKind::Dynamic(predicates, _) => (predicates.principal_def_id().into_iter())
             .chain(predicates.auto_traits())
             .any(|it| ours(GenericDefId::TraitId(it.0).krate(db))),
@@ -1305,25 +1542,29 @@ const INSTANCE_BOUND_DOMAIN: &str = "blaze v2 instance bound 1";
 fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
     let mut hasher = Hasher::new(IDENTITY_DOMAIN);
     match kind {
-        Kind::Code(instance, _) => match instance.def {
-            InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
-            InstanceDef::Closure(id) => hasher
-                .update(&[1])
-                .id(&blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0),
-            InstanceDef::Coroutine(id) => hasher
-                .update(&[2])
-                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
-            InstanceDef::CoroutineByMove(id) => hasher
-                .update(&[3])
-                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
-            InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
-            InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
-            InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
-            InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
-            InstanceDef::ReifyShim { receiver } => {
-                hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+        Kind::Code(instance, _) => {
+            match instance.def {
+                InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
+                InstanceDef::Closure(id) => hasher.update(&[1]).id(&blaze_items::key::closure_key(
+                    db,
+                    InternedClosureId::from_id(id),
+                )
+                .0),
+                InstanceDef::Coroutine(id) => hasher
+                    .update(&[2])
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                InstanceDef::CoroutineByMove(id) => hasher
+                    .update(&[3])
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
+                InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
+                InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
+                InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
+                InstanceDef::ReifyShim { receiver } => {
+                    hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+                }
             }
-        },
+        }
         Kind::Start(_) => hasher.update(&[10]).id(&item.0),
         Kind::Asm(..) => hasher.update(&[11]).id(&item.0),
         Kind::Allocator(forward) => hasher.update(&[12]).part(forward.symbol.as_bytes()),
@@ -1351,32 +1592,12 @@ fn bound(db: &Db, kind: &Kind, code: CodeHash, args: ContentId) -> Result<Conten
     Ok(hasher.finish())
 }
 
-/// The overflow checks the MIR of a generic says, as rustc builds a crate's MIR with its own:
-/// none in the standard library's, and the instantiating crate's where the body inherits them.
-fn written_checks(db: &Db, kind: &Kind) -> Option<bool> {
-    let Kind::Code(instance, _) = kind else { return None };
-    let (krate, inherits) = match instance.def {
-        InstanceDef::Fn(func) => (
-            func.krate(db),
-            AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS),
-        ),
-        def => {
-            let loc = closure_loc(db, def)?;
-            let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
-            (loc.owner.module(db).krate(db), store.inherits_overflow_checks(loc.expr))
-        }
-    };
-    if inherits {
-        return None;
-    }
-    Some(match crate_checks_overflow(db, krate) {
-        Some(checked) => checked,
-        // A crate of the toolchain (`origin.is_lang()`), which has no `-C overflow-checks` of
-        // its own: the standard library ships built without them, so a body of it that does
-        // not inherit its callers' setting is written unchecked. Not a guess for a missing
-        // value: it is what the toolchain's MIR says.
-        None => false,
-    })
+/// [`crate::Instance::compiled_by_user`] of `kind`'s instance: the one rule of which origin an
+/// instance is compiled for ([`HirFrontend::compiled_for`]) and which units' walk its
+/// references are listed for ([`HirFrontend::inlines`]), so the two never disagree.
+fn user_compiled(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, _) = kind else { return false };
+    instance.compiled_by_user(db)
 }
 
 /// The symbol outside code names an instance by: `#[no_mangle]`, `#[export_name]`, the

@@ -1,12 +1,12 @@
 //! MIR definitions and implementation
 
+use std::alloc::Global;
 use std::{
     collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
     iter,
 };
-use std::alloc::Global;
 
 use base_db::{Db, target::TargetLoadError};
 use either::Either;
@@ -126,6 +126,15 @@ impl<'db> Operand {
         }
     }
 
+    /// A constant of `bytes` with no memory map, interned without copying `bytes` when it is
+    /// there already.
+    pub fn from_scalar_bytes(bytes: &[u8], ty: Ty<'db>) -> Self {
+        Operand {
+            kind: OperandKind::Allocation { allocation: Allocation::of_bytes(ty, bytes).store() },
+            span: None,
+        }
+    }
+
     pub fn from_bytes(data: Box<[u8]>, ty: Ty<'db>) -> Self {
         Operand::from_concrete_const(data, MemoryMap::default(), ty)
     }
@@ -231,9 +240,8 @@ impl ComptimeBinder {
     pub fn of(ty: Ty<'_>) -> Option<ComptimeBinder> {
         let TyKind::Placeholder(placeholder) = ty.kind() else { return None };
         let rustc_type_ir::BoundTy { var, kind } = placeholder.bound;
-        (var == rustc_type_ir::BoundVar::ZERO
-            && matches!(kind, rustc_type_ir::BoundTyKind::Anon))
-        .then(|| ComptimeBinder(placeholder.universe.as_u32()))
+        (var == rustc_type_ir::BoundVar::ZERO && matches!(kind, rustc_type_ir::BoundTyKind::Anon))
+            .then(|| ComptimeBinder(placeholder.universe.as_u32()))
     }
 
     /// `F` itself.
@@ -561,13 +569,19 @@ pub struct Terminator {
 /// What a failed [`TerminatorKind::Assert`] panics with: rustc's `AssertKind`.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AssertKind {
-    BoundsCheck { len: Operand, index: Operand },
+    BoundsCheck {
+        len: Operand,
+        index: Operand,
+    },
     Overflow(BinOp, Operand, Operand),
     OverflowNeg(Operand),
     DivisionByZero(Operand),
     RemainderByZero(Operand),
     /// rustc's `CheckAlignment`: `found` is the address, `required` its type's alignment.
-    MisalignedPointerDereference { required: Operand, found: Operand },
+    MisalignedPointerDereference {
+        required: Operand,
+        found: Operand,
+    },
     /// rustc's `CheckNull` on a dereference.
     NullPointerDereference,
     /// rustc's `CheckNull` on a reference made from a raw pointer.
@@ -906,7 +920,12 @@ pub enum TerminatorKind {
     /// is a loop head with successors `body` and `after`: the body may run any number of times.
     /// Monomorphization unrolls it once the domain is known (the copies of the blocks `body`
     /// dominates, in declaration order); no monomorphic body has one.
-    ComptimeFor { binder: ComptimeBinder, domain: StoredTy, body: BasicBlockId, after: BasicBlockId },
+    ComptimeFor {
+        binder: ComptimeBinder,
+        domain: StoredTy,
+        body: BasicBlockId,
+        after: BasicBlockId,
+    },
 
     /// The end of one iteration of the `ComptimeFor` in block `head`: goes back to it.
     ComptimeNext { head: BasicBlockId },
@@ -1499,7 +1518,8 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand_mut(f);
             }
-            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter_mut().for_each(f);
             }
@@ -1526,7 +1546,8 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand(f);
             }
-            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter().for_each(f);
             }
@@ -1799,8 +1820,16 @@ impl Inlined<'_> {
     }
 
     fn shrink_to_fit(&mut self) {
-        let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: _ } =
-            self;
+        let Inlined {
+            callees,
+            scopes,
+            spans,
+            bindings,
+            promoted,
+            devirtualized,
+            specialized,
+            moved_to_frame: _,
+        } = self;
         devirtualized.shrink_to_fit();
         callees.shrink_to_fit();
         scopes.shrink_to_fit();
@@ -2455,14 +2484,16 @@ impl<'db> PlaceTy<'db> {
             ProjectionElem::Deref => {
                 let ty = structurally_normalize(self.ty);
                 PlaceTy::from_ty(
-                    ty.builtin_deref(true)
-                        .unwrap_or_else(|| panic!("deref projection of non-dereferenceable {ty:?}")),
+                    ty.builtin_deref(true).unwrap_or_else(|| {
+                        panic!("deref projection of non-dereferenceable {ty:?}")
+                    }),
                 )
             }
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 let ty = structurally_normalize(self.ty);
                 PlaceTy::from_ty(
-                    ty.builtin_index().unwrap_or_else(|| panic!("index projection of non-indexable {ty:?}")),
+                    ty.builtin_index()
+                        .unwrap_or_else(|| panic!("index projection of non-indexable {ty:?}")),
                 )
             }
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
@@ -2484,11 +2515,11 @@ impl<'db> PlaceTy<'db> {
             }
             // Not normalized: nothing is known of `F::Type` but `F`'s bounds, which the
             // body's own environment does not have.
-            ProjectionElem::ReflectedField(binder) => PlaceTy::from_ty(
-                binder.field_ty(tcx).unwrap_or_else(|| {
+            ProjectionElem::ReflectedField(binder) => {
+                PlaceTy::from_ty(binder.field_ty(tcx).unwrap_or_else(|| {
                     panic!("`.[ ]` of {self:?} where `core` has no `core::field::Field::Type`")
-                }),
-            ),
+                }))
+            }
         }
     }
 }
@@ -2617,7 +2648,12 @@ pub fn same_dyn_type<'db>(interner: DbInterner<'db>, a: Ty<'db>, b: Ty<'db>) -> 
     same_predicates(interner, a, b, true)
 }
 
-fn same_predicates<'db>(interner: DbInterner<'db>, a: Ty<'db>, b: Ty<'db>, auto_traits: bool) -> bool {
+fn same_predicates<'db>(
+    interner: DbInterner<'db>,
+    a: Ty<'db>,
+    b: Ty<'db>,
+    auto_traits: bool,
+) -> bool {
     use crate::next_solver::{BoundExistentialPredicate, BoundExistentialPredicates};
     use rustc_type_ir::ExistentialPredicate;
     let (TyKind::Dynamic(a_bounds, _), TyKind::Dynamic(b_bounds, _)) = (a.kind(), b.kind()) else {
@@ -2634,7 +2670,9 @@ fn same_predicates<'db>(interner: DbInterner<'db>, a: Ty<'db>, b: Ty<'db>, auto_
     };
     // A handful of predicates each, so a scan with no allocation.
     let within = |of: BoundExistentialPredicates<'db>, all: BoundExistentialPredicates<'db>| {
-        of.iter().filter_map(erased).all(|it| all.iter().filter_map(erased).any(|other| other == it))
+        of.iter()
+            .filter_map(erased)
+            .all(|it| all.iter().filter_map(erased).any(|other| other == it))
     };
     within(a_bounds, b_bounds) && within(b_bounds, a_bounds)
 }
@@ -3121,8 +3159,7 @@ mod tests {
         assert_eq!(locals_visited(&mut misaligned), (vec![1, 2], vec![1, 2]));
         let mut invalid_enum = AssertKind::InvalidEnumConstruction(copy_of(3));
         assert_eq!(locals_visited(&mut invalid_enum), (vec![3], vec![3]));
-        for mut null in [AssertKind::NullPointerDereference, AssertKind::NullReferenceConstructed]
-        {
+        for mut null in [AssertKind::NullPointerDereference, AssertKind::NullReferenceConstructed] {
             assert_eq!(locals_visited(&mut null), (vec![], vec![]));
         }
     }
@@ -3217,7 +3254,9 @@ mod tests {
         assert_eq!(hash(&scoped), hash(&scoped.clone()));
     }
 
-    fn digest(map: &blaze_hash::HashMap<u32, Vec<u32>, std::alloc::Global>) -> blaze_ids::ContentId {
+    fn digest(
+        map: &blaze_hash::HashMap<u32, Vec<u32>, std::alloc::Global>,
+    ) -> blaze_ids::ContentId {
         let mut hasher = blaze_ids::Hasher::new("hir-ty test");
         hash_by_key(map, |key| key, |raw| raw, &mut blaze_hash::Blake3Hasher(&mut hasher));
         hasher.finish()

@@ -120,10 +120,7 @@ impl GrammarConstraint {
                     .iter()
                     .filter(|term| term.is_placeholder())
                     .flat_map(|term| {
-                        placeholder(&term.name)
-                            .chars()
-                            .map(u32::from)
-                            .collect::<Vec<_>>()
+                        placeholder(&term.name).chars().map(u32::from).collect::<Vec<_>>()
                     })
                     .collect();
                 marked.sort_unstable();
@@ -151,11 +148,7 @@ impl GrammarConstraint {
             max_size,
             max_depth,
             simplest: OnceBox::new(),
-            known: Mutex::new(Known {
-                trees: HashMap::default(),
-                nodes: 0,
-                node_cap: KNOWN_NODES,
-            }),
+            known: Mutex::new(Known { trees: HashMap::default(), nodes: 0, node_cap: KNOWN_NODES }),
             intervals: Arc::new(intervals),
             smallest: Mutex::new(smallest),
             alphabet: alphabet.cloned(),
@@ -211,10 +204,7 @@ impl GrammarConstraint {
         if let Some(tree) = self.known.lock().trees.get(text) {
             return Some(Arc::clone(tree));
         }
-        let chars: Vec<char> = text
-            .iter()
-            .map(|&cp| char::from_u32(cp))
-            .collect::<Option<_>>()?;
+        let chars: Vec<char> = text.iter().map(|&cp| char::from_u32(cp)).collect::<Option<_>>()?;
         let tree = Arc::new(self.parser.parse(&self.lexer, &chars).ok()?);
         let layout = Layout::new(&tree);
         if !self.within_cap(&layout, text)
@@ -258,14 +248,9 @@ impl GrammarConstraint {
         let leaves = Self::leaves(layout);
         leaves.iter().enumerate().all(|(i, leaf)| {
             !self.is_placeholder_leaf(leaf)
-                || [i.checked_sub(1), Some(i + 1)]
-                    .into_iter()
-                    .flatten()
-                    .all(|j| {
-                        leaves
-                            .get(j)
-                            .is_none_or(|beside| matches!(beside.part, Part::Ignored(_)))
-                    })
+                || [i.checked_sub(1), Some(i + 1)].into_iter().flatten().all(|j| {
+                    leaves.get(j).is_none_or(|beside| matches!(beside.part, Part::Ignored(_)))
+                })
         })
     }
 
@@ -291,14 +276,9 @@ impl GrammarConstraint {
             .enumerate()
             .filter(|(i, leaf)| {
                 matches!(leaf.part, Part::Ignored(_))
-                    && [i.checked_sub(1), Some(i + 1)]
-                        .into_iter()
-                        .flatten()
-                        .any(|j| {
-                            leaves
-                                .get(j)
-                                .is_some_and(|beside| self.is_placeholder_leaf(beside))
-                        })
+                    && [i.checked_sub(1), Some(i + 1)].into_iter().flatten().any(|j| {
+                        leaves.get(j).is_some_and(|beside| self.is_placeholder_leaf(beside))
+                    })
             })
             .map(|(_, leaf)| (leaf.start, leaf.end))
             .collect()
@@ -315,10 +295,7 @@ impl GrammarConstraint {
                 Part::Group | Part::Repeat => continue,
             };
             let derived = &text[node.start..node.end];
-            if slot
-                .as_deref()
-                .is_none_or(|known| self.smaller(derived, known))
-            {
+            if slot.as_deref().is_none_or(|known| self.smaller(derived, known)) {
                 *slot = Some(derived.to_vec());
             }
         }

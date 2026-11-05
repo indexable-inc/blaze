@@ -1,7 +1,7 @@
 use expect_test::expect;
 use hir_def::{AdtId, ModuleDefId};
-use rustc_type_ir::inherent::IntoKind as _;
 use hir_expand::fixture;
+use rustc_type_ir::inherent::IntoKind as _;
 
 use crate::{
     db::HirDatabase,
@@ -745,7 +745,7 @@ fn main() {
             210..272 '{     ...32>; }': ()
             220..221 '_': &'? (dyn Map<MapValue = u32, Key = u32> + '?)
             224..227 '&()': &'? ()
-            224..269 '&()   ...e=u32>': &'? (dyn Map<MapValue = u32, Key = u32> + 'static)
+            224..269 '&()   ...e=u32>': &'? (dyn Map<MapValue = u32, Key = u32> + '?)
             225..227 '()': ()
         "#]],
     );

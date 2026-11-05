@@ -43,8 +43,10 @@ pub mod keys {
         key("blaze v2 store release template 2", &[blob])
     }
 
+    /// 2: the value is [`crate::summary::Summary::encode`]'s bytes, not JSON, so no JSON
+    /// summary is found under a key of now.
     pub fn summary(instance: &InstanceKey) -> Key {
-        key("blaze v2 store summary 1", &[&instance.0])
+        key("blaze v2 store summary 2", &[&instance.0])
     }
 
     pub fn masked(instance: &InstanceKey) -> Key {

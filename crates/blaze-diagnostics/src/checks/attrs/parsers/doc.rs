@@ -22,7 +22,10 @@ use std::mem;
 use hir::InFile;
 use syntax::{
     SyntaxKind, TextRange,
-    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasModuleItem as _, HasName as _},
+    view::{
+        self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasModuleItem as _,
+        HasName as _,
+    },
 };
 
 use super::{Accepted, Finalize, GroupId};
@@ -91,13 +94,19 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
             }
             return Accepted::Group("doc");
         }
-        ["diagnostic", "do_not_recommend"] => return Accepted::Single(Some(Parsed::Other("DoNotRecommend"))),
+        ["diagnostic", "do_not_recommend"] => {
+            return Accepted::Single(Some(Parsed::Other("DoNotRecommend")));
+        }
         ["diagnostic", "on_const"] => ("on_const", Some("diagnostic_on_const")),
         ["diagnostic", "on_move"] => ("on_move", Some("diagnostic_on_move")),
         ["diagnostic", "on_type_error"] => ("on_type_error", Some("diagnostic_on_type_error")),
-        ["diagnostic", "on_unimplemented"] | ["rustc_on_unimplemented"] => ("on_unimplemented", None),
+        ["diagnostic", "on_unimplemented"] | ["rustc_on_unimplemented"] => {
+            ("on_unimplemented", None)
+        }
         ["diagnostic", "on_unknown"] => ("on_unknown", Some("diagnostic_on_unknown")),
-        ["diagnostic", "on_unmatched_args"] => ("on_unmatched_args", Some("diagnostic_on_unmatched_args")),
+        ["diagnostic", "on_unmatched_args"] => {
+            ("on_unmatched_args", Some("diagnostic_on_unmatched_args"))
+        }
         ["diagnostic", "opaque"] => ("opaque", Some("diagnostic_opaque")),
         ["rustc_diagnostic_opaque"] => ("opaque", None),
         path => unreachable!("`{path:?}` is not the doc parsers'"),
@@ -110,7 +119,11 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
     Accepted::Group(group)
 }
 
-pub(crate) fn finalize(state: &mut State, group: &'static str, _fx: &mut Finalize<'_, '_, '_>) -> Option<Parsed> {
+pub(crate) fn finalize(
+    state: &mut State,
+    group: &'static str,
+    _fx: &mut Finalize<'_, '_, '_>,
+) -> Option<Parsed> {
     if group == "doc" {
         return (state.doc_items != 0).then(|| Parsed::Doc(mem::take(&mut state.doc)));
     }
@@ -118,7 +131,13 @@ pub(crate) fn finalize(state: &mut State, group: &'static str, _fx: &mut Finaliz
     (state.diagnostic & (1 << bit) != 0).then(|| Parsed::Other(DIAGNOSTIC[bit].1))
 }
 
-pub(crate) fn check(_group: GroupId, _first: usize, _fx: &mut Finalize<'_, '_, '_>, _parsed: &[ParsedAttr]) {}
+pub(crate) fn check(
+    _group: GroupId,
+    _first: usize,
+    _fx: &mut Finalize<'_, '_, '_>,
+    _parsed: &[ParsedAttr],
+) {
+}
 
 /// rustc's `parse_single_doc_attr_item`: the errors of one element of a `#[doc(..)]`.
 fn doc_item(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, meta: &MetaItem) {
@@ -144,13 +163,18 @@ fn doc_item(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, meta: &MetaItem) {
             if !matches!(args, ArgParser::NoArgs) || !not_crate_level(cx, path, word) {
                 return;
             }
-            let slot = if word == "fake_variadic" { &mut doc.fake_variadic } else { &mut doc.search_unbox };
+            let slot = if word == "fake_variadic" {
+                &mut doc.fake_variadic
+            } else {
+                &mut doc.search_unbox
+            };
             *slot = Some(cx.in_file(path));
         }
         Some("rust_logo") => {
             if matches!(args, ArgParser::NoArgs)
                 && cx.target() == Target::Crate
-                && let Some(diag) = doc_rust_logo(cx.cx, &cx.session.features, cx.attr.in_file(path))
+                && let Some(diag) =
+                    doc_rust_logo(cx.cx, &cx.session.features, cx.attr.in_file(path))
             {
                 cx.emit_err(diag);
             }
@@ -166,7 +190,11 @@ fn not_crate_level(cx: &mut Accept<'_, '_, '_>, range: TextRange, name: &str) ->
         return true;
     }
     // alloc: the error's message
-    let diag = cx.err(None, format!("`#![doc({name} = \"...\")]` isn't allowed as a crate-level attribute"), range);
+    let diag = cx.err(
+        None,
+        format!("`#![doc({name} = \"...\")]` isn't allowed as a crate-level attribute"),
+        range,
+    );
     cx.emit_err(diag);
     false
 }
@@ -248,7 +276,9 @@ fn keyword_or_attribute(
         } else {
             (
                 // alloc: the error's message
-                format!("nonexistent builtin attribute `{value}` used in `#[doc(attribute = \"...\")]`"),
+                format!(
+                    "nonexistent builtin attribute `{value}` used in `#[doc(attribute = \"...\")]`"
+                ),
                 "only existing builtin attributes are allowed in core/std",
             )
         };
@@ -351,7 +381,11 @@ fn cfg(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
         let target = cx.target().name();
         if list.is_empty() {
             // alloc: the error's suggestion
-            cx.push_suggestion(format!("if the {target} should be disabled, use `#[cfg(false)]`"), list.range, "(false)");
+            cx.push_suggestion(
+                format!("if the {target} should be disabled, use `#[cfg(false)]`"),
+                list.range,
+                "(false)",
+            );
         } else if let Some(args) = cx.cx.snippet(&cx.span(list.range)).map(str::to_owned) {
             cx.push_suggestion(
                 // alloc: the error's suggestion
@@ -450,8 +484,12 @@ fn error(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, message: impl 
 fn check_alias(fx: &mut Finalize<'_, '_, '_>, alias: &str, range: InFile<TextRange>) {
     let target = fx.target();
     let location = match target {
-        Target::AssocTy if container_is(fx, SyntaxKind::IMPL) => Some("type alias in implementation block"),
-        Target::AssocConst if container_is_trait_impl(fx) => Some("associated constant in trait implementation block"),
+        Target::AssocTy if container_is(fx, SyntaxKind::IMPL) => {
+            Some("type alias in implementation block")
+        }
+        Target::AssocConst if container_is_trait_impl(fx) => {
+            Some("associated constant in trait implementation block")
+        }
         Target::Param => return,
         Target::Expression
         | Target::Statement
@@ -491,7 +529,9 @@ fn container_is(fx: &Finalize<'_, '_, '_>, kind: SyntaxKind) -> bool {
 }
 
 fn container_is_trait_impl(fx: &Finalize<'_, '_, '_>) -> bool {
-    container(fx.cx, fx.owner.node).and_then(ast::Impl::cast).is_some_and(|it| it.trait_().is_some())
+    container(fx.cx, fx.owner.node)
+        .and_then(ast::Impl::cast)
+        .is_some_and(|it| it.trait_().is_some())
 }
 
 /// Whether `alias` is the name rustc's `tcx.opt_item_name` gives the node, as
@@ -521,13 +561,23 @@ fn is_item_name(node: ast::Node<'_>, alias: &str) -> Option<bool> {
             }
         }
         SyntaxKind::TUPLE_FIELD => {
-            let index = node.parent()?.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == node)?;
+            let index = node
+                .parent()?
+                .children()
+                .filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD)
+                .position(|it| it == node)?;
             // alloc: only for an alias of a tuple field
             Some(index.to_string() == alias)
         }
-        SyntaxKind::RECORD_PAT_FIELD => Some(unraw(ast::RecordPatField::cast(node)?.field_name()?.syntax().text())),
-        SyntaxKind::RECORD_EXPR_FIELD => Some(unraw(ast::RecordExprField::cast(node)?.field_name()?.text())),
-        SyntaxKind::LIFETIME_PARAM => Some(ast::LifetimeParam::cast(node)?.lifetime()?.text() == alias),
+        SyntaxKind::RECORD_PAT_FIELD => {
+            Some(unraw(ast::RecordPatField::cast(node)?.field_name()?.syntax().text()))
+        }
+        SyntaxKind::RECORD_EXPR_FIELD => {
+            Some(unraw(ast::RecordExprField::cast(node)?.field_name()?.text()))
+        }
+        SyntaxKind::LIFETIME_PARAM => {
+            Some(ast::LifetimeParam::cast(node)?.lifetime()?.text() == alias)
+        }
         _ => Some(unraw(ast::AnyHasName::cast(node)?.name()?.text())),
     }
 }
@@ -537,10 +587,12 @@ fn is_item_name(node: ast::Node<'_>, alias: &str) -> Option<bool> {
 fn empty_module(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, name: &str) {
     let node = fx.owner.node;
     let empty = match node.value.kind() {
-        SyntaxKind::MODULE => ast::Module::cast(node.value).map(|module| match fx.cx.vsema.to_def(module) {
-            Some(def) => module_is_empty(fx.cx, def),
-            None => module.item_list().is_none_or(|it| it.items().next().is_none()),
-        }),
+        SyntaxKind::MODULE => {
+            ast::Module::cast(node.value).map(|module| match fx.cx.vsema.to_def(module) {
+                Some(def) => module_is_empty(fx.cx, def),
+                None => module.item_list().is_none_or(|it| it.items().next().is_none()),
+            })
+        }
         SyntaxKind::SOURCE_FILE if fx.target() == Target::Mod => {
             fx.cx.vsema.hir_file_to_module_def(node.file_id).map(|def| module_is_empty(fx.cx, def))
         }
@@ -595,14 +647,18 @@ fn single_type_arg(ty: ast::Type<'_>) -> Option<OneArg<'_>> {
         return Some(OneArg::Inputs(list.type_args().count()));
     }
     let mut args = segment.generic_arg_list()?.generic_args();
-    let (Some(ast::GenericArg::TypeArg(arg)), None) = (args.next(), args.next()) else { return None };
+    let (Some(ast::GenericArg::TypeArg(arg)), None) = (args.next(), args.next()) else {
+        return None;
+    };
     arg.ty().map(OneArg::Ty)
 }
 
 fn is_one_tuple(arg: OneArg<'_>) -> bool {
     match arg {
         OneArg::Inputs(inputs) => inputs == 1,
-        OneArg::Ty(ty) => matches!(unparen(ty), ast::Type::TupleType(tuple) if tuple.fields().count() == 1),
+        OneArg::Ty(ty) => {
+            matches!(unparen(ty), ast::Type::TupleType(tuple) if tuple.fields().count() == 1)
+        }
     }
 }
 
@@ -621,7 +677,9 @@ fn unparen(mut ty: ast::Type<'_>) -> ast::Type<'_> {
 fn variadic_self_ty(ty: ast::Type<'_>) -> bool {
     match unparen(ty) {
         ast::Type::TupleType(tuple) => tuple.fields().count() == 1,
-        ast::Type::FnPtrType(fn_ptr) => fn_ptr.param_list().is_some_and(|it| it.params().count() == 1),
+        ast::Type::FnPtrType(fn_ptr) => {
+            fn_ptr.param_list().is_some_and(|it| it.params().count() == 1)
+        }
         ty => match single_type_arg(ty) {
             Some(OneArg::Ty(ty)) => variadic_self_ty(ty),
             Some(OneArg::Inputs(inputs)) => inputs == 1,
@@ -633,16 +691,22 @@ fn variadic_self_ty(ty: ast::Type<'_>) -> bool {
 /// `check_doc_search_unbox`.
 fn search_unbox(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
     let node = fx.owner.node.value;
-    let generic = |list: Option<ast::GenericParamList<'_>>| list.is_some_and(|it| it.generic_params().next().is_some());
+    let generic = |list: Option<ast::GenericParamList<'_>>| {
+        list.is_some_and(|it| it.generic_params().next().is_some())
+    };
     let valid = match fx.target() {
-        Target::Struct => ast::Struct::cast(node).is_some_and(|it| generic(it.generic_param_list())),
+        Target::Struct => {
+            ast::Struct::cast(node).is_some_and(|it| generic(it.generic_param_list()))
+        }
         Target::Enum => ast::Enum::cast(node).is_some_and(|it| generic(it.generic_param_list())),
-        Target::TyAlias => ast::TypeAlias::cast(node).is_some_and(|it| generic(it.generic_param_list())),
+        Target::TyAlias => {
+            ast::TypeAlias::cast(node).is_some_and(|it| generic(it.generic_param_list()))
+        }
         Target::Trait => ast::Trait::cast(node).is_some_and(|it| {
             generic(it.generic_param_list())
-                || it
-                    .assoc_item_list()
-                    .is_some_and(|list| list.assoc_items().any(|it| matches!(it, ast::AssocItem::TypeAlias(_))))
+                || it.assoc_item_list().is_some_and(|list| {
+                    list.assoc_items().any(|it| matches!(it, ast::AssocItem::TypeAlias(_)))
+                })
         }),
         _ => false,
     };

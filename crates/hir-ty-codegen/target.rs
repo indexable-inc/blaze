@@ -33,19 +33,36 @@ const _: () = assert!(MOST_FEATURE_SETS <= u8::MAX as usize + 1);
 /// The sets [`Features`] number, past the baseline's (0, never set), in the order they were
 /// first named, each once. Only added to, under [`ADDING`], in order, so a slot that is not
 /// set yet ends the sets; read with no lock.
-#[expect(clippy::disallowed_types, reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock")]
-static FEATURE_SETS: [std::sync::OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock"
+)]
+static FEATURE_SETS: [std::sync::OnceLock<FeatureSet>; MOST_FEATURE_SETS] =
     [const { std::sync::OnceLock::new() }; MOST_FEATURE_SETS];
+
+/// What a [`Features`] numbers: the CPU code is made for and the features past that target's
+/// baseline it is made with. Two sets of one list and two CPUs are two numbers, so everything
+/// kept by `Features` (a target machine of LLVM's, an ISA of Cranelift's, a function's set) is
+/// kept per CPU too.
+#[derive(PartialEq, Eq, Debug)]
+struct FeatureSet {
+    /// `-C target-cpu` resolved (`native` is the host's name), or `None` for the target's own
+    /// ([`Target::cpu`]), which every target has another name of.
+    cpu: Option<Box<str>>,
+    names: Box<[String]>,
+}
 
 /// Held while a set is added to [`FEATURE_SETS`].
 static ADDING: Mutex<()> = Mutex::new(());
 
-/// A set of target features past the baseline of [`Target::cpu`] that code is compiled with:
-/// `+name` and `-name` in rustc's names, sorted, each once, as `blaze_codegen::Toolchain::features`
-/// has them. Numbered for the process ([`Target::features_of`]), so that a code generator is
-/// one per set and a function's set is a byte. The set changes the code only: it is in a
-/// unit's key through `Toolchain::features` and a function's `#[target_feature]` through its
-/// shape, and never in `cfg(target_feature)`, which comes from the flags.
+/// A CPU and a set of target features past the baseline of [`Target::cpu`] that code is
+/// compiled with: `+name` and `-name` in rustc's names, sorted, each once, as
+/// `blaze_codegen::Toolchain::features` has them, and the CPU `Toolchain::cpu` names when it is
+/// not the target's own ([`Self::cpu`]). Numbered for the process ([`Target::features_of`]), so
+/// that a code generator is one per CPU and set and a function's set is a byte. They change the
+/// code only: they are in a unit's key through `Toolchain::cpu` and `Toolchain::features` and a
+/// function's `#[target_feature]` through its shape, and never in `cfg(target_feature)`, which
+/// comes from the flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Features(u8);
 
@@ -56,9 +73,14 @@ impl Features {
     /// The features of the set, as [`Target::features_of`] was given them.
     pub fn names(self) -> &'static [String] {
         match FEATURE_SETS[self.index()].get() {
-            Some(set) => set,
+            Some(set) => &set.names,
             None => &[],
         }
+    }
+
+    /// The CPU of the set when it is not its target's own ([`Target::cpu_of`] gives either).
+    pub fn cpu(self) -> Option<&'static str> {
+        FEATURE_SETS[self.index()].get().and_then(|set| set.cpu.as_deref())
     }
 
     pub fn is_baseline(self) -> bool {
@@ -69,18 +91,21 @@ impl Features {
         usize::from(self.0)
     }
 
-    /// The number of `features`, given it is sorted and each once: a scan of the sets named so
-    /// far with no lock, and a new number under [`ADDING`] for a set first named. More than
-    /// [`MOST_FEATURE_SETS`] is an error naming the set.
-    fn interned(features: &[String]) -> Result<Features, String> {
-        if features.is_empty() {
+    /// The number of `cpu` (`None` for the target's own) and `features`, given it is sorted
+    /// and each once: a scan of the sets named so far with no lock, and a new number under
+    /// [`ADDING`] for a set first named. More than [`MOST_FEATURE_SETS`] is an error naming the
+    /// set.
+    fn interned(cpu: Option<&str>, features: &[String]) -> Result<Features, String> {
+        if cpu.is_none() && features.is_empty() {
             return Ok(Features::BASELINE);
         }
         // The set's number, or the first slot not set yet from `from` on.
         let find = |from: usize| -> Result<Features, usize> {
             for at in from..MOST_FEATURE_SETS {
                 match FEATURE_SETS[at].get() {
-                    Some(set) if **set == *features => return Ok(Features(at as u8)),
+                    Some(set) if set.cpu.as_deref() == cpu && *set.names == *features => {
+                        return Ok(Features(at as u8));
+                    }
                     Some(_) => {}
                     None => return Err(at),
                 }
@@ -99,12 +124,13 @@ impl Features {
         if free == MOST_FEATURE_SETS {
             // alloc: an error
             return Err(format!(
-                "the target features {features:?}: one process compiles with at most \
-                 {MOST_FEATURE_SETS} sets of target features, and this is one more"
+                "the target features {features:?} of CPU {cpu:?}: one process compiles with at \
+                 most {MOST_FEATURE_SETS} sets of a CPU and target features, and this is one more"
             ));
         }
-        // alloc: once per set a process compiles with, its names
-        FEATURE_SETS[free].get_or_init(|| features.into());
+        // alloc: once per set a process compiles with, its CPU's name and features' names
+        FEATURE_SETS[free]
+            .get_or_init(|| FeatureSet { cpu: cpu.map(Box::from), names: features.into() });
         Ok(Features(free as u8))
     }
 }
@@ -258,7 +284,9 @@ impl Target {
         }
         if named.len() >= MOST_TARGETS {
             // alloc: an error
-            return Err(format!("{triple} is past the {MOST_TARGETS} targets one process lowers for"));
+            return Err(format!(
+                "{triple} is past the {MOST_TARGETS} targets one process lowers for"
+            ));
         }
         let index = named.len() as u8;
         // alloc: leaked once per target named, for the process (setup)
@@ -272,14 +300,24 @@ impl Target {
         usize::from(self.index)
     }
 
-    /// The set of target features past the baseline of [`Target::cpu`] that `features` names:
-    /// `-C target-feature` resolved and sorted, as `blaze_codegen::Toolchain::features` has
+    /// The set of code for CPU `cpu` (`Toolchain::cpu`, resolved) with the target features past
+    /// the baseline of [`Target::cpu`] that `features` names: `-C target-cpu`'s and
+    /// `-C target-feature`'s resolved and sorted, as `blaze_codegen::Toolchain::features` has
     /// them (the host's for a dev build that runs where it is built), or such a set with a
     /// function's `#[target_feature]` added. Any number of sets may be named, one for each
     /// toolchain a daemon builds with. A feature that turns off what Cranelift's code of the
     /// target always uses is refused, as are a name that is not `+` or `-` and a feature, a
-    /// list that is not sorted with each once, and a feature both on and off.
-    pub fn features_of(&self, features: &[String]) -> Result<Features, String> {
+    /// list that is not sorted with each once, a feature both on and off, and `native`, which
+    /// the toolchain resolves to the host's name.
+    pub fn features_of(&self, cpu: &str, features: &[String]) -> Result<Features, String> {
+        if cpu == "native" || cpu.is_empty() {
+            // alloc: an error
+            return Err(format!(
+                "the CPU {cpu:?} of {}: a toolchain names the CPU it resolved (`native` is the \
+                 host's)",
+                self.triple
+            ));
+        }
         if !features.is_sorted_by(|a, b| a < b) {
             // alloc: an error
             return Err(format!("the target features {features:?} are not sorted, each once"));
@@ -293,7 +331,14 @@ impl Target {
                 return Err(format!("the target features {features:?} turn {name} on and off"));
             }
         }
-        Features::interned(features)
+        Features::interned((cpu != self.cpu()).then_some(cpu), features)
+    }
+
+    /// The CPU code of `features` is made for: its own ([`Features::cpu`]) or the target's
+    /// baseline ([`Self::cpu`]). What LLVM's target machine and each function's `target-cpu`
+    /// are told.
+    pub fn cpu_of(&self, features: Features) -> &str {
+        features.cpu().unwrap_or(self.cpu())
     }
 
     /// `features` in LLVM's names, as its target machine and a function's `target-features`
@@ -338,7 +383,9 @@ impl Target {
             Some(("+", name)) if !name.is_empty() => (true, name),
             Some(("-", name)) if !name.is_empty() => (false, name),
             // alloc: an error at setup, read once per ISA made.
-            _ => return Err(format!("the target feature {feature:?} is not `+` or `-` and a name")),
+            _ => {
+                return Err(format!("the target feature {feature:?} is not `+` or `-` and a name"));
+            }
         };
         let (table, always): (&[(&str, &str)], &[&str]) = match self.arch {
             Arch::X86_64 => (&X86_FEATURES, &["x87", "fxsr", "sse", "sse2", "cmpxchg16b"]),
@@ -346,7 +393,9 @@ impl Target {
             Arch::Wasm32 | Arch::Wasm64 => (&[], &[]),
         };
         if always.contains(&name) {
-            if !on && name != "cmpxchg16b" {
+            // Cranelift's code has no x87, `fxsave` or unasked `cmpxchg16b` instruction, so a
+            // CPU without them (`-C target-cpu=generic` on x86-64 has no `fxsr`) changes none.
+            if !on && !matches!(name, "cmpxchg16b" | "x87" | "fxsr") {
                 // alloc: an error at setup, read once per ISA made.
                 return Err(format!(
                     "-{name}: Cranelift's code for {} always uses it",
@@ -417,7 +466,9 @@ impl Target {
         // AAPCS64 on AArch64, which Apple's differs from in what goes on the stack.
         let (object_format, unwind, call_conv) = match (system, arch) {
             // The calling convention is the one of the ISA whose settings are borrowed.
-            (_, Arch::Wasm32 | Arch::Wasm64) => (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV),
+            (_, Arch::Wasm32 | Arch::Wasm64) => {
+                (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV)
+            }
             (Some("linux"), _) => (ObjectFormat::Elf, UnwindFormat::EhFrame, CallConv::SystemV),
             (Some("darwin"), Arch::Aarch64) => {
                 (ObjectFormat::MachO, UnwindFormat::EhFrame, CallConv::AppleAarch64)
@@ -547,6 +598,31 @@ impl Target {
         // from the frame (see `unwind::seh`), which the frame pointer finds. Variable
         // arguments that are all on the stack are found from it too.
         !self.exception_in_register() || self.variable_arguments() == Some(VariableArguments::Stack)
+    }
+
+    /// Whether the target's ABI wants a frame record in every function that calls, whatever
+    /// the flags say: Apple's (arm64 and x86-64), as rustc's Apple target specs have
+    /// `frame_pointer: NonLeaf`. libunwind's compact `FRAME` mode and every walk by the frame
+    /// chain (sampling profilers, `backtrace` without tables) find the caller through it;
+    /// a function that calls and keeps no frame record leaves its return address where only
+    /// its DWARF rows say. `-C force-frame-pointers=no` cannot take it away, as in rustc
+    /// (`FramePointer::ratchet`).
+    pub(crate) fn requires_frame_pointers(&self) -> bool {
+        self.triple().contains("-apple-")
+    }
+
+    /// LLVM's `"frame-pointer"` attribute of a function of this target: `all` when its unit
+    /// forces them (`forced`, `-C force-frame-pointers=yes`: its `Toolchain::frame_pointers`),
+    /// else `non-leaf` where the ABI wants a frame record in every function that calls
+    /// ([`Target::requires_frame_pointers`]), else none, LLVM's default. rustc's
+    /// `frame_pointer_type_attr`, for every function blaze gives LLVM, whichever path it
+    /// comes by (v1's units and exports have no toolchain and pass `forced: false`).
+    pub(crate) fn llvm_frame_pointer(&self, forced: bool) -> Option<&'static str> {
+        match (forced, self.requires_frame_pointers()) {
+            (true, _) => Some("all"),
+            (false, true) => Some("non-leaf"),
+            (false, false) => None,
+        }
     }
 
     /// The processor code is made for: the baseline of the target, as rustc compiles for.
@@ -686,7 +762,16 @@ impl Target {
         let (pic, tls) = self.addressing();
         // `isa` leaves Cranelift's `probestack_size_log2` at its default: a page of 4 KiB.
         // Code counts nothing unless its unit's spec says it does (`Spec::counted`).
-        Some(blaze_stencil::Target { arch, os, cpu, pic, tls, probe_stack: true, probe_log2: 12, counts: false })
+        Some(blaze_stencil::Target {
+            arch,
+            os,
+            cpu,
+            pic,
+            tls,
+            probe_stack: true,
+            probe_log2: 12,
+            counts: false,
+        })
     }
 
     /// The settings of Cranelift's ISA that the [`cpu`](Self::cpu) rustc compiles for has:
@@ -705,7 +790,11 @@ impl Target {
 /// rustc's `to_llvm_features` gives them for LLVM 23: what LLVM spells otherwise, what rustc
 /// ties to it (`neon` and `fp-armv8` both ways; `sse4.2` turns `crc32` on), and nothing for
 /// a feature this LLVM no longer has. `None` where LLVM spells it as rustc does.
-fn renamed_for_llvm(arch: Arch, name: &str, on: bool) -> Option<&'static [&'static str]> {
+pub(crate) fn renamed_for_llvm(
+    arch: Arch,
+    name: &str,
+    on: bool,
+) -> Option<&'static [&'static str]> {
     Some(match arch {
         Arch::X86_64 => match name {
             "sse4.2" if on => &["sse4.2", "crc32"],
@@ -758,10 +847,10 @@ mod tests {
     #[test]
     fn a_set_is_one_number_and_two_sets_two() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        assert_eq!(x86.features_of(&[]), Ok(Features::BASELINE));
-        let avx2 = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
-        let again = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
-        let ssse3 = x86.features_of(&names(&["+ssse3"])).expect("a set");
+        assert_eq!(x86.features_of(x86.cpu(), &[]), Ok(Features::BASELINE));
+        let avx2 = x86.features_of(x86.cpu(), &names(&["+avx", "+avx2"])).expect("a set");
+        let again = x86.features_of(x86.cpu(), &names(&["+avx", "+avx2"])).expect("a set");
+        let ssse3 = x86.features_of(x86.cpu(), &names(&["+ssse3"])).expect("a set");
         assert_eq!(avx2, again);
         assert_ne!(avx2, ssse3);
         assert!(!avx2.is_baseline() && Features::BASELINE.is_baseline());
@@ -769,14 +858,32 @@ mod tests {
         assert!(Features::BASELINE.names().is_empty());
     }
 
+    /// rustc's frame pointers: `all` when forced, Apple's `non-leaf` whatever the flags, else
+    /// LLVM's default.
+    #[test]
+    fn frame_pointers_are_forced_or_the_abis() {
+        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let apple = Target::of(apple).expect("a target");
+            assert!(apple.requires_frame_pointers());
+            assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
+            assert_eq!(apple.llvm_frame_pointer(true), Some("all"));
+        }
+        for other in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let other = Target::of(other).expect("a target");
+            assert!(!other.requires_frame_pointers(), "{}", other.triple());
+            assert_eq!(other.llvm_frame_pointer(false), None);
+            assert_eq!(other.llvm_frame_pointer(true), Some("all"));
+        }
+    }
+
     #[test]
     fn a_set_out_of_order_twice_or_on_and_off_is_refused() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        assert!(x86.features_of(&names(&["+avx2", "+avx"])).is_err());
-        assert!(x86.features_of(&names(&["+avx", "+avx"])).is_err());
-        assert!(x86.features_of(&names(&["+popcnt", "-popcnt"])).is_err());
-        assert!(x86.features_of(&names(&["-sse2"])).is_err());
-        assert!(x86.features_of(&names(&["avx2"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+avx2", "+avx"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+avx", "+avx"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+popcnt", "-popcnt"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["-sse2"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["avx2"])).is_err());
     }
 
     /// Sets are numbered from many threads at once: each set gets one number.
@@ -787,7 +894,11 @@ mod tests {
         let numbered: Vec<Vec<Features>> = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
-                    scope.spawn(|| sets.iter().map(|it| x86.features_of(it).expect("a set")).collect::<Vec<_>>())
+                    scope.spawn(|| {
+                        sets.iter()
+                            .map(|it| x86.features_of(x86.cpu(), it).expect("a set"))
+                            .collect::<Vec<_>>()
+                    })
                 })
                 .collect();
             threads.into_iter().map(|it| it.join().expect("a thread")).collect()
@@ -805,15 +916,20 @@ mod tests {
     #[test]
     fn each_set_has_its_own_isa() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let avx2 = x86.features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
-        let ssse3 = x86.features_of(&names(&["+sse3", "+ssse3"])).expect("a set");
+        let avx2 = x86
+            .features_of(
+                x86.cpu(),
+                &names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"]),
+            )
+            .expect("a set");
+        let ssse3 = x86.features_of(x86.cpu(), &names(&["+sse3", "+ssse3"])).expect("a set");
         assert_eq!(setting_with(&x86, avx2, "has_avx2"), Some(true));
         assert_eq!(setting_with(&x86, avx2, "has_sse41"), Some(true));
         assert_eq!(setting_with(&x86, ssse3, "has_ssse3"), Some(true));
         assert_eq!(setting_with(&x86, ssse3, "has_avx2"), Some(false));
         assert_eq!(setting(&x86, "has_ssse3"), Some(false));
         let arm = Target::of("aarch64-apple-darwin").expect("a target");
-        let off = arm.features_of(&names(&["-lse"])).expect("a set");
+        let off = arm.features_of(arm.cpu(), &names(&["-lse"])).expect("a set");
         assert_eq!(setting_with(&arm, off, "has_lse"), Some(false));
         assert_eq!(setting(&arm, "has_lse"), Some(true));
     }
@@ -824,19 +940,28 @@ mod tests {
         let linux = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(linux.llvm_features(Features::BASELINE), "");
         let set = linux
-            .features_of(&names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
+            .features_of(linux.cpu(), &names(&[
+                "+avx2",
+                "+bmi1",
+                "+lahfsahf",
+                "+pclmulqdq",
+                "+sse4.2",
+                "-cmpxchg16b",
+            ]))
             .expect("a set");
         assert_eq!(linux.llvm_features(set), "+avx2,+bmi,+sahf,+pclmul,+sse4.2,+crc32,-cx16");
-        let off = linux.features_of(&names(&["-sse4.2"])).expect("a set");
+        let off = linux.features_of(linux.cpu(), &names(&["-sse4.2"])).expect("a set");
         assert_eq!(linux.llvm_features(off), "-sse4.2");
         let windows = Target::of("x86_64-pc-windows-msvc").expect("a target");
         assert_eq!(windows.llvm_features(Features::BASELINE), "+cx16");
-        let avx = windows.features_of(&names(&["+avx"])).expect("a set");
+        let avx = windows.features_of(windows.cpu(), &names(&["+avx"])).expect("a set");
         assert_eq!(windows.llvm_features(avx), "+cx16,+avx");
         let arm = Target::of("aarch64-unknown-linux-gnu").expect("a target");
-        let set = arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
+        let set = arm
+            .features_of(arm.cpu(), &names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"]))
+            .expect("a set");
         assert_eq!(arm.llvm_features(set), "+fullfp16,+pauth,+rcpc-immo");
-        let neon = arm.features_of(&names(&["+fhm", "+neon"])).expect("a set");
+        let neon = arm.features_of(arm.cpu(), &names(&["+fhm", "+neon"])).expect("a set");
         assert_eq!(arm.llvm_features(neon), "+fp16fml,+neon,+fp-armv8");
     }
 
@@ -872,7 +997,9 @@ mod tests {
         for triple in triples {
             let target = Target::of(triple).expect("a target");
             let stencil = target.stencil().expect("a stencil target");
-            let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+            let isa = target
+                .isa(Features::BASELINE, "backtracking", false, OptLevel::None)
+                .expect("the ISA");
             let flags = isa.flags();
             assert_eq!(stencil.pic, flags.is_pic(), "{triple}");
             let tls = match flags.tls_model() {
@@ -887,10 +1014,22 @@ mod tests {
             let lse = setting(&target, "has_lse") == Some(true);
             assert_eq!(stencil.cpu == blaze_stencil::Cpu::AppleM1, lse, "{triple}");
         }
-        let apple = Target::of("aarch64-apple-darwin").expect("a target").stencil().expect("a stencil target");
-        assert_eq!((apple.arch, apple.os), (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs));
-        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target").stencil().expect("a stencil target");
-        assert_eq!((windows.arch, windows.os), (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows));
+        let apple = Target::of("aarch64-apple-darwin")
+            .expect("a target")
+            .stencil()
+            .expect("a stencil target");
+        assert_eq!(
+            (apple.arch, apple.os),
+            (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs)
+        );
+        let windows = Target::of("x86_64-pc-windows-msvc")
+            .expect("a target")
+            .stencil()
+            .expect("a stencil target");
+        assert_eq!(
+            (windows.arch, windows.os),
+            (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows)
+        );
         assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
     }
 
@@ -904,7 +1043,8 @@ mod tests {
     #[test]
     fn blazes_wasm_feature_decides_nothing_of_a_targets_code() {
         fn walk(dir: &std::path::Path, root: &std::path::Path, uses: &mut Vec<(String, usize)>) {
-            let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
+            let mut entries: Vec<_> =
+                std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
             entries.sort();
             for path in entries {
                 if path.is_dir() {
@@ -913,7 +1053,8 @@ mod tests {
                     let text = std::fs::read_to_string(&path).unwrap();
                     let count = text.matches(concat!("feature = ", "\"wasm\"")).count();
                     if count != 0 {
-                        let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                        let name =
+                            path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
                         uses.push((name, count));
                     }
                 }
@@ -923,16 +1064,22 @@ mod tests {
         let mut uses = Vec::new();
         walk(root, root, &mut uses);
         let expected = [("target.rs".to_owned(), 2), ("v2/toolchain.rs".to_owned(), 1)];
-        assert_eq!(uses, expected, "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id");
+        assert_eq!(
+            uses, expected,
+            "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id"
+        );
     }
 
     #[test]
     fn cranelift_checks_nothing_blazes_verifier_checked() {
         let target = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        let isa =
+            target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         assert!(!isa.flags().enable_verifier());
         assert_eq!(isa.flags().opt_level(), OptLevel::None);
-        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::Speed).expect("the ISA");
+        let isa = target
+            .isa(Features::BASELINE, "backtracking", false, OptLevel::Speed)
+            .expect("the ISA");
         assert_eq!(isa.flags().opt_level(), OptLevel::Speed);
     }
 
@@ -961,9 +1108,14 @@ mod tests {
         let apple = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
         assert!(crate::f16_f128::soft_floats(&apple));
-        assert!(crate::f16_f128::soft_floats(&Target::of("aarch64-unknown-linux-gnu").expect("a target")));
-        assert!(!crate::f16_f128::soft_floats(&Target::of("x86_64-pc-windows-msvc").expect("a target")));
-        let isa = apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        assert!(crate::f16_f128::soft_floats(
+            &Target::of("aarch64-unknown-linux-gnu").expect("a target")
+        ));
+        assert!(!crate::f16_f128::soft_floats(
+            &Target::of("x86_64-pc-windows-msvc").expect("a target")
+        ));
+        let isa =
+            apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         let mut signature = ir::Signature::new(apple.call_conv);
         signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
         signature.returns.extend([AbiParam::new(types::F128), AbiParam::new(types::F16)]);

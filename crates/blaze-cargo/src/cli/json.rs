@@ -12,8 +12,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use blaze_api::{
-    Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef, UnitOfRef, UnitTarget,
-    UnitTargetRef,
+    Applicability, Artifact, Basis, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef,
+    TestOutcome, TestResult, UnitOfRef, UnitTarget, UnitTargetRef,
 };
 use blaze_hash::FixedState;
 use std::alloc::Global;
@@ -180,30 +180,36 @@ struct TargetFields<'s, K, C> {
 /// A target as cargo's `SerializedTarget` writes it. `required-features` is written only for a
 /// target that has some, which [`UnitTarget`] does not say.
 pub fn target(out: &mut String, target: &UnitTarget) {
-    target_with(out, TargetFields {
-        kinds: target.kinds(),
-        crate_types: target.crate_types.iter().copied(),
-        name: &target.name,
-        src_path: &target.src_path,
-        edition: &target.edition,
-        doc: target.doc,
-        doctest: target.doctest,
-        test: target.test,
-    });
+    target_with(
+        out,
+        TargetFields {
+            kinds: target.kinds(),
+            crate_types: target.crate_types.iter().copied(),
+            name: &target.name,
+            src_path: &target.src_path,
+            edition: &target.edition,
+            doc: target.doc,
+            doctest: target.doctest,
+            test: target.test,
+        },
+    );
 }
 
 /// [`target`] of one read in place.
 pub fn target_ref(out: &mut String, target: UnitTargetRef<'_>) {
-    target_with(out, TargetFields {
-        kinds: target.kinds(),
-        crate_types: target.crate_types.iter(),
-        name: target.name,
-        src_path: target.src_path,
-        edition: target.edition,
-        doc: target.doc,
-        doctest: target.doctest,
-        test: target.test,
-    });
+    target_with(
+        out,
+        TargetFields {
+            kinds: target.kinds(),
+            crate_types: target.crate_types.iter(),
+            name: target.name,
+            src_path: target.src_path,
+            edition: target.edition,
+            doc: target.doc,
+            doctest: target.doctest,
+            test: target.test,
+        },
+    );
 }
 
 fn target_with<'s>(
@@ -285,11 +291,170 @@ pub fn build_script(out: &mut String, ran: BuildScriptRanRef<'_>) {
     out.push('}');
 }
 
-/// `build-finished`, without its newline.
-pub fn build_finished(out: &mut String, success: bool) {
-    out.push_str(r#"{"reason":"build-finished","success":"#);
-    boolean(out, success);
+/// A test's outcome as `blaze-test-result` names it.
+fn outcome(out: &mut String, outcome: TestOutcome) {
+    quote(out, match outcome {
+        TestOutcome::Passed => "passed",
+        TestOutcome::Failed => "failed",
+        TestOutcome::Ignored => "ignored",
+        TestOutcome::Unreached => "unreached",
+    });
+}
+
+/// `blaze-test-result`, blaze's own (cargo has none), without its newline: one
+/// [`TestResult`] of `blaze test --reached` whole, so a harness or an agent reads what ran,
+/// what stood in for a run (`cached`: the run kept, by what, and why when by reach) and what
+/// ran outside the sandbox (`outside`) from fields, not from libtest's text.
+pub fn test_result(out: &mut String, result: &TestResult) {
+    out.push_str(r#"{"reason":"blaze-test-result","binary":"#);
+    quote(out, &result.binary);
+    out.push_str(r#","executable":"#);
+    num(out, u64::from(result.executable));
+    out.push_str(r#","name":"#);
+    quote(out, &result.name);
+    out.push_str(r#","outcome":"#);
+    outcome(out, result.outcome);
+    out.push_str(r#","millis":"#);
+    num(out, result.millis);
+    out.push_str(r#","outside":"#);
+    boolean(out, result.outside);
+    out.push_str(r#","cached":"#);
+    match &result.cached {
+        None => out.push_str("null"),
+        Some(cached) => {
+            let (basis, why) = match &cached.basis {
+                Basis::Executed => ("executed", None),
+                Basis::Reached { why } => ("reached", Some(why.as_str())),
+            };
+            out.push_str(r#"{"basis":"#);
+            quote(out, basis);
+            out.push_str(r#","why":"#);
+            opt(out, why);
+            out.push_str(r#","millis":"#);
+            num(out, cached.millis);
+            out.push_str(r#","outcome":"#);
+            outcome(out, cached.outcome);
+            out.push('}');
+        }
+    }
+    out.push_str(r#","output":"#);
+    // alloc: only for output that is not UTF-8, which is written with U+FFFD in its place
+    quote(out, &String::from_utf8_lossy(&result.output));
     out.push('}');
+}
+
+/// How a build was served: by the daemon `blaze` connects to (or starts), or by the engine the
+/// seed runs in its own process for the one command (docs/future/bootstrap.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Served {
+    Daemon,
+    InProcess,
+}
+
+impl Served {
+    /// This blaze's: the daemon where it is built with blaze-cargo's `native` feature.
+    pub const HERE: Served = if cfg!(feature = "native") { Served::Daemon } else { Served::InProcess };
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Served::Daemon => "daemon",
+            Served::InProcess => "in-process",
+        }
+    }
+}
+
+/// What the request's units came to ([`blaze_api::Worked`]): units made again and units
+/// replayed from the store as they were, then each image linked by how.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Work {
+    /// The daemon's id of the build: the history's `build_id`, which `blaze slow --build N`
+    /// and `blaze debug sql` take.
+    pub build_id: Option<u64>,
+    pub built: u64,
+    pub replayed: u64,
+    pub first: u64,
+    pub spliced: u64,
+    pub unchanged: u64,
+    pub full: u64,
+}
+
+impl Work {
+    pub fn of(worked: &blaze_api::Worked) -> Work {
+        let mut work = Work {
+            build_id: worked.build_id,
+            built: worked.compiled,
+            replayed: worked.found,
+            ..Work::default()
+        };
+        for it in &worked.links {
+            match it.how {
+                blaze_api::LinkHow::First => work.first += 1,
+                blaze_api::LinkHow::Spliced => work.spliced += 1,
+                blaze_api::LinkHow::Unchanged => work.unchanged += 1,
+                blaze_api::LinkHow::Full { .. } => work.full += 1,
+            }
+        }
+        work
+    }
+}
+
+/// What `build-finished` says of a build, beyond cargo's `success`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Finished<'a> {
+    pub success: bool,
+    /// The profile's name (`dev`, `release`, a custom one), once the build placed its outputs.
+    pub profile: Option<&'a str>,
+    pub served: Served,
+    /// From the command's start to the build's end, in milliseconds.
+    pub took_ms: u64,
+    /// `None` for a request that sent no work report (a failed load, `doc`).
+    pub work: Option<Work>,
+}
+
+/// `build-finished`, without its newline: cargo's `reason` and `success` first, then blaze's
+/// own fields, each always present (`null` where unknown), so a reader's shape never varies:
+/// `{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,
+/// "build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,
+/// "full":0}}`. docs/cargo.md names each field.
+pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
+    out.push_str(r#"{"reason":"build-finished","success":"#);
+    boolean(out, finished.success);
+    out.push_str(r#","profile":"#);
+    opt(out, finished.profile);
+    out.push_str(r#","served":"#);
+    quote(out, finished.served.name());
+    out.push_str(r#","took_ms":"#);
+    num(out, finished.took_ms);
+    out.push_str(r#","build_id":"#);
+    match finished.work.and_then(|it| it.build_id) {
+        Some(id) => num(out, id),
+        None => out.push_str("null"),
+    }
+    match finished.work {
+        Some(work) => {
+            out.push_str(r#","units":{"built":"#);
+            num(out, work.built);
+            out.push_str(r#","replayed":"#);
+            num(out, work.replayed);
+            out.push_str(r#"},"links":{"first":"#);
+            num(out, work.first);
+            out.push_str(r#","spliced":"#);
+            num(out, work.spliced);
+            out.push_str(r#","unchanged":"#);
+            num(out, work.unchanged);
+            out.push_str(r#","full":"#);
+            num(out, work.full);
+            out.push_str("}}");
+        }
+        None => out.push_str(r#","units":null,"links":null}"#),
+    }
+}
+
+/// The name of the profile a `Finished` text names (`` `dev` profile [unoptimized + debuginfo]
+/// ``, blaze-units' `plan::finished`): what is between its backticks. `None` for a text not of
+/// that form, which no build of this blaze sends.
+pub fn profile_name(finished: &str) -> Option<&str> {
+    finished.strip_prefix('`')?.split_once('`').map(|(name, _)| name)
 }
 
 /// `compiler-message` of `unit`, without its newline. With `ansi`
@@ -298,7 +463,13 @@ pub fn build_finished(out: &mut String, success: bool) {
 /// `CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap, code: Option<DiagnosticCode> }`:
 /// `rendered` first, then every other field sorted by key (at every depth, as `serde_json::Value`
 /// maps are), then the outermost `code` last.
-pub fn compiler_message(out: &mut String, unit: UnitOfRef<'_>, diagnostic: DiagnosticRef<'_>, ansi: bool, sources: &mut Sources) {
+pub fn compiler_message(
+    out: &mut String,
+    unit: UnitOfRef<'_>,
+    diagnostic: DiagnosticRef<'_>,
+    ansi: bool,
+    sources: &mut Sources,
+) {
     let dir = unit.manifest_path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
     out.push_str(r#"{"reason":"compiler-message","package_id":"#);
     quote(out, unit.package_id);
@@ -337,7 +508,14 @@ fn code(out: &mut String, diagnostic: DiagnosticRef<'_>) {
 }
 
 /// rustc's `Diagnostic`: `$message_type` on the outermost only, `rendered` `null` on children.
-fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: bool, order: Order, sources: &mut Sources, dir: &str) {
+fn diagnostic_json(
+    out: &mut String,
+    diagnostic: DiagnosticRef<'_>,
+    outermost: bool,
+    order: Order,
+    sources: &mut Sources,
+    dir: &str,
+) {
     let spans = |out: &mut String, sources: &mut Sources| {
         out.push('[');
         for (at, span) in diagnostic.spans.iter().enumerate() {
@@ -477,7 +655,13 @@ fn span_json(out: &mut String, span: SpanRef<'_>, order: Order, sources: &mut So
 /// rustc's `DiagnosticSpanLine`s of `span` (`SourceMap::span_to_lines`): each line it covers,
 /// highlighted from its start column on the first and to its end column on the last, in
 /// 1-based columns of characters. `[]` when the span is outside the file as it is on disk.
-fn span_text(out: &mut String, span: SpanRef<'_>, order: Order, sources: &Sources, file: Option<u32>) {
+fn span_text(
+    out: &mut String,
+    span: SpanRef<'_>,
+    order: Order,
+    sources: &Sources,
+    file: Option<u32>,
+) {
     let (first, last) = (span.line as usize, span.end_line as usize);
     let lines = file.map_or(0, |file| sources.line_count(file));
     out.push('[');

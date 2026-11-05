@@ -51,9 +51,15 @@ impl<T> Table<T> {
             // alloc: a chunk of the process's ids, once per 16384 ids, kept for its life; made on
             // the heap, never on the (fiber's) stack
             let slots: Box<[T]> = (0..CHUNK).map(|_| (self.empty)()).collect();
-            let slots: Box<[T; CHUNK]> = slots.try_into().unwrap_or_else(|_| unreachable!("a chunk is CHUNK slots"));
+            let slots: Box<[T; CHUNK]> =
+                slots.try_into().unwrap_or_else(|_| unreachable!("a chunk is CHUNK slots"));
             let made = Box::into_raw(slots);
-            ptr = match slot.compare_exchange(std::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
+            ptr = match slot.compare_exchange(
+                std::ptr::null_mut(),
+                made,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => made,
                 Err(theirs) => {
                     // SAFETY: `made` came from `Box::into_raw` above and was published nowhere.

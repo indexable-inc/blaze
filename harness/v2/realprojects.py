@@ -139,9 +139,8 @@ class Run:
     commit          the commit of this repository the workspace `blaze` is
     commit_label    what that commit's build script is told it is (empty: the commit); the VM's
                     copy of a commit is another commit of the same tree
-    home            a daemon home per project (its toolchains linked to `toolchains`), or one
-                    for the whole run
-    toolchains      blaze's toolchains a per-project home links to; empty: ~/.blaze/toolchains
+    home            a daemon home per project, or one for the whole run (either reads the
+                    machine's toolchain, ~/.blaze/toolchains, whatever BLAZE_HOME says)
     baseline        an earlier result.json to say against what newly broke and got fixed
     write_baseline  where this run's result.json is copied for the next run; empty: nowhere
     write_locks     have blaze resolve a missing harness lock and write it to harness/v2/locks
@@ -160,7 +159,6 @@ class Run:
     commit: str = "HEAD"
     commit_label: str = ""
     home: Literal["per-project", "shared"] = "per-project"
-    toolchains: str = ""
     baseline: str = ""
     write_baseline: str = ""
     write_locks: bool = False
@@ -1003,7 +1001,6 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
         return 0
 
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    linked_toolchains(home, args.toolchains)
     try:
         ok = (await step(project, "fetch", ["git", "fetch", ws.repo, rev or args.commit], fetch, logged=True)
               and await step(project, "lock", [], lock)
@@ -1024,18 +1021,6 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
     result = project.result()
     print(f"{ws.name}: {result.verdict} ({summary_line(result)})", flush=True)
     return result
-
-
-def linked_toolchains(home: Path, given: str) -> None:
-    """A per-project home's `toolchains` is the machine's (BLAZE_HOME moves where blaze keeps
-    them), so each project does not fetch its own copy of the pinned nightly."""
-    shared = Path(given).expanduser() if given else Path.home() / ".blaze" / "toolchains"
-    shared.mkdir(parents=True, exist_ok=True)
-    link = home / "toolchains"
-    try:
-        link.symlink_to(shared, target_is_directory=True)
-    except FileExistsError:
-        pass
 
 
 async def stop_daemon(project: Project, blaze: Path, checkout: Path, env: Mapping[str, str]) -> None:

@@ -4,7 +4,10 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core, normalized, ui},
+    tests::{
+        Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core,
+        normalized, ui,
+    },
 };
 
 #[test]
@@ -221,7 +224,10 @@ pub const fn foo<T: A>() -> bool {
 
 fn main() {}
 "#;
-    assert_reports(&ui_core("issue-88155.rs", "2015", "sized", source), &[error(8, &["`<T as A>::assoc`"])]);
+    assert_reports(
+        &ui_core("issue-88155.rs", "2015", "sized", source),
+        &[error(8, &["`<T as A>::assoc`"])],
+    );
 }
 
 #[test]
@@ -594,10 +600,12 @@ fn lints(fixture: &str) -> Vec<String> {
 
 #[test]
 fn an_impure_const_fn_is_told_where_cached_functions_are_used() {
-    let fixture = format!("//- /main.rs crate:other:main deps:blaze\n{IMPURE}\n//- /blaze.rs crate:blaze\n");
-    assert_eq!(lints(&fixture), [
-        "blaze::const_impure: const fn reads or writes mutable state: `COUNT` is a `static mut`"
-    ]);
+    let fixture =
+        format!("//- /main.rs crate:other:main deps:blaze\n{IMPURE}\n//- /blaze.rs crate:blaze\n");
+    assert_eq!(
+        lints(&fixture),
+        ["blaze::const_impure: const fn reads or writes mutable state: `COUNT` is a `static mut`"]
+    );
 }
 
 #[test]

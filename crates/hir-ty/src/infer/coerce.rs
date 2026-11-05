@@ -59,8 +59,7 @@ use crate::{
     infer::{AllowTwoPhase, AutoBorrowMutability, InferenceContext, expr::ExprIsRead},
     next_solver::{
         Binder, CallableIdWrapper, Canonical, CoercePredicate, DbInterner, GenericArgs, Goal,
-        ParamEnv, PolyFnSig, PredicateKind, Region, RegionExt, TraitRef, Ty,
-        TyKind, TypingMode,
+        ParamEnv, PolyFnSig, PredicateKind, Region, RegionExt, TraitRef, Ty, TyKind, TypingMode,
         abi::Safety,
         infer::{
             DbInternerInferExt, InferCtxt, InferOk, InferResult,
@@ -241,10 +240,12 @@ where
     /// fall back to subtyping (`unify_and`).
     fn coerce_from_inference_variable(&mut self, a: Ty<'db>, b: Ty<'db>) -> CoerceResult<'db, 'f> {
         debug!("coerce_from_inference_variable(a={:?}, b={:?})", a, b);
-        debug_assert!(a.is_infer() && self.infcx().shallow_resolve(a) == a);
+        debug_assert!(a.is_ty_var() && self.infcx().shallow_resolve(a) == a);
         debug_assert!(self.infcx().shallow_resolve(b) == b);
 
-        if b.is_infer() {
+        // Only a type variable target defers, as in rustc: an integer or float variable target
+        // is unified with at once.
+        if b.is_ty_var() {
             // Two unresolved type variables: create a `Coerce` predicate.
             let target_ty =
                 if self.use_lub { self.infcx().next_ty_var(self.cause.span()) } else { b };
@@ -571,7 +572,10 @@ where
         if self
             .delegate
             .infcx()
-            .visit_proof_tree(Goal::new(self.infcx().interner, self.param_env(), pred), &mut visitor)
+            .visit_proof_tree(
+                Goal::new(self.infcx().interner, self.param_env(), pred),
+                &mut visitor,
+            )
             .is_break()
         {
             return Err(UnsizeFailed { read_table: visitor.read_table });
@@ -613,7 +617,11 @@ where
         })
     }
 
-    fn coerce_from_fn_pointer(&mut self, fn_ty_a: PolyFnSig<'db>, b: Ty<'db>) -> CoerceResult<'db, 'f> {
+    fn coerce_from_fn_pointer(
+        &mut self,
+        fn_ty_a: PolyFnSig<'db>,
+        b: Ty<'db>,
+    ) -> CoerceResult<'db, 'f> {
         debug!(?fn_ty_a, ?b, "coerce_from_fn_pointer");
         debug_assert!(self.infcx().shallow_resolve(b) == b);
 
@@ -705,7 +713,12 @@ where
         }
     }
 
-    fn coerce_raw_ptr(&mut self, a: Ty<'db>, b: Ty<'db>, mutbl_b: Mutability) -> CoerceResult<'db, 'f> {
+    fn coerce_raw_ptr(
+        &mut self,
+        a: Ty<'db>,
+        b: Ty<'db>,
+        mutbl_b: Mutability,
+    ) -> CoerceResult<'db, 'f> {
         debug!("coerce_raw_ptr(a={:?}, b={:?})", a, b);
         debug_assert!(self.infcx().shallow_resolve(a) == a);
         debug_assert!(self.infcx().shallow_resolve(b) == b);
@@ -1337,8 +1350,11 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
                 self.final_ty = Some(icx.types.types.error);
 
                 let expression = icx.innermost_tail_expr(expression);
-                let (expected, found) =
-                    if label_expression_as_expected { (found, expected) } else { (expected, found) };
+                let (expected, found) = if label_expression_as_expected {
+                    (found, expected)
+                } else {
+                    (expected, found)
+                };
                 icx.emit_type_mismatch_with_cause(expression.into(), expected, found, cause.code());
             }
         }

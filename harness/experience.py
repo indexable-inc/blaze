@@ -271,7 +271,8 @@ def normalized(text, where):
         text = text.replace(path, name)
     text = re.sub(r"\b\d+(\.\d+)?\s?(ms|s|µs|us)\b", "<t>", text)
     text = re.sub(r"\b[0-9a-f]{16,}\b", "<hash>", text)
-    text = re.sub(r"\bpid \d+", "pid <n>", text)
+    # `blaze status`'s `pid: N` (v1's said `daemon: pid N`).
+    text = re.sub(r"\bpid(:?) \d+", r"pid\1 <n>", text)
     text = re.sub(r"\b\d+(\.\d+)? ?(MB|GB|KB|MiB|GiB|KiB|B)\b", "<size>", text)
     lines = [line.rstrip() for line in text.splitlines() if not PROGRESS.match(line)]
     return "\n".join(lines)
@@ -452,6 +453,8 @@ def flow(name, spec, work, env):
         ran = blaze("run --release", "run", "--release", *target, *run_args)
         if says and says[1] not in ran.out:
             rough.append(("run --release", f"printed {ran.out.strip()!r}, not {says[1]!r}", "P0"))
+    # What a user sees of `status`, for the transcript only: its text is for people, and no
+    # fact (a pid, a state) is read from it.
     blaze("status", "status")
     blaze("stop", "stop")
     time.sleep(1)

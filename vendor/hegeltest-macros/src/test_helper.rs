@@ -7,11 +7,9 @@ use crate::common::{extract_ident_from_pat, rewrite_helper_draws_in_block};
 fn is_test_case_type(ty: &Type) -> bool {
     match ty {
         Type::Reference(reference) => is_test_case_type(&reference.elem),
-        Type::Path(path) => path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "TestCase"),
+        Type::Path(path) => {
+            path.path.segments.last().is_some_and(|segment| segment.ident == "TestCase")
+        }
         _ => false,
     }
 }

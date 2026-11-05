@@ -70,7 +70,9 @@ impl<'a> View<'a> {
         }
         let Some(len) = usize::try_from(len).ok().filter(|_| end <= len) else {
             // alloc: error path
-            return Err(format!("the file's bytes run to {end:#x}, past its {len:#x} signed bytes"));
+            return Err(format!(
+                "the file's bytes run to {end:#x}, past its {len:#x} signed bytes"
+            ));
         };
         Ok(View { parts, len, slots: &[], base: 0 })
     }
@@ -84,7 +86,9 @@ impl<'a> View<'a> {
             let at = addr.wrapping_sub(base);
             if addr < base || at % 8 != 0 || at < end || at + 8 > self.len as u64 {
                 // alloc: error path
-                return Err(format!("a chained slot at {addr:#x} is not 8-aligned, in order and in the file"));
+                return Err(format!(
+                    "a chained slot at {addr:#x} is not 8-aligned, in order and in the file"
+                ));
             }
             end = at + 8;
         }
@@ -337,10 +341,15 @@ fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
 
     let kept_hashes = &cache.kept_hashes;
     par::for_each(
-        par::enumerate(par::zip(par::chunks_mut(slots, HASH * GROUP), par::chunks_mut(&mut cache.hashes, GROUP))),
+        par::enumerate(par::zip(
+            par::chunks_mut(slots, HASH * GROUP),
+            par::chunks_mut(&mut cache.hashes, GROUP),
+        )),
         |(group, (slots, hashes))| {
             let mut buf = [0u8; PAGE];
-            for (nth, (slot, hash)) in slots.chunks_exact_mut(HASH).zip(hashes.iter_mut()).enumerate() {
+            for (nth, (slot, hash)) in
+                slots.chunks_exact_mut(HASH).zip(hashes.iter_mut()).enumerate()
+            {
                 let page = group * GROUP + nth;
                 if let Some(k) = place_of(ranges, page) {
                     *hash = kept_hashes[k];
@@ -448,7 +457,8 @@ mod tests {
         let len = 5 * PAGE;
         let parts: Vec<(u64, &[u8])> = vec![(0, &a[..]), (4 * PAGE as u64, &b[..])];
         let slots = [(0x1000_0008, 7u64), (0x1000_0000 + 2 * PAGE as u64, u64::MAX)];
-        let view = View::new(len as u64, parts.clone()).unwrap().with_slots(&slots, 0x1000_0000).unwrap();
+        let view =
+            View::new(len as u64, parts.clone()).unwrap().with_slots(&slots, 0x1000_0000).unwrap();
         let mut file = assembled(len, &parts);
         for &(addr, value) in &slots {
             let at = (addr - 0x1000_0000) as usize;

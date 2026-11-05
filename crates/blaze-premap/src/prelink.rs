@@ -64,13 +64,18 @@ impl Placed for Prelinked {
 
     fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError> {
         if offsets.len() != self.segments.len() {
-            return Err(PremapError::of(format_args!("{} offsets for {} segments", offsets.len(), self.segments.len())));
+            return Err(PremapError::of(format_args!(
+                "{} offsets for {} segments",
+                offsets.len(),
+                self.segments.len()
+            )));
         }
         let mut rest = out;
         let mut consumed = 0;
         for (segment, offset) in self.segments.iter().zip(offsets) {
             let len = segment.bytes.len();
-            let fits = *offset >= consumed && offset.checked_add(len).is_some_and(|end| end - consumed <= rest.len());
+            let fits = *offset >= consumed
+                && offset.checked_add(len).is_some_and(|end| end - consumed <= rest.len());
             if !fits {
                 return Err(PremapError::of(format_args!(
                     "the segment at {:#x} does not fit at offset {offset} of the image",
@@ -79,9 +84,15 @@ impl Placed for Prelinked {
             }
             let (_, from) = std::mem::take(&mut rest).split_at_mut(offset - consumed);
             let (into, after) = from.split_at_mut(len);
-            par::for_each(par::zip(par::chunks_mut(into, COPY_PIECE), par::chunks(&segment.bytes, COPY_PIECE)), |(into, from)| {
-                into.copy_from_slice(from);
-            });
+            par::for_each(
+                par::zip(
+                    par::chunks_mut(into, COPY_PIECE),
+                    par::chunks(&segment.bytes, COPY_PIECE),
+                ),
+                |(into, from)| {
+                    into.copy_from_slice(from);
+                },
+            );
             rest = after;
             consumed = offset + len;
         }
@@ -113,9 +124,9 @@ impl Placed for LinkPlaced {
     }
 
     fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError> {
-        self.placed
-            .write_into(out, offsets)
-            .map_err(|error| PremapError::of(format_args!("writing the dependency image's segments: {error}")))
+        self.placed.write_into(out, offsets).map_err(|error| {
+            PremapError::of(format_args!("writing the dependency image's segments: {error}"))
+        })
     }
 }
 
@@ -123,8 +134,9 @@ impl Prelink for Link {
     type Placed = LinkPlaced;
 
     fn prelink(&self, request: &Request<'_>) -> Result<LinkPlaced, PremapError> {
-        let mut placed = link::prelink_placed(&request.link)
-            .map_err(|error| PremapError::of(format_args!("the prelink of a dependency image: {error}")))?;
+        let mut placed = link::prelink_placed(&request.link).map_err(|error| {
+            PremapError::of(format_args!("the prelink of a dependency image: {error}"))
+        })?;
         let mut linked = from_link(std::mem::take(&mut placed.linked));
         let place = |it: &link::SegmentPlace| Segment {
             addr: it.addr,
@@ -203,9 +215,9 @@ pub const END: u64 = 1 << 39;
 /// - PE: one granule past the executable's base `0x1_4000_0000`, where its headers are.
 pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     match (format, arch) {
-        (Format::Wasm, _) | (_, Arch::Wasm32 | Arch::Wasm64) => {
-            Err(PremapError::of(format_args!("wasm has no dependency image: code is reached by index, not mapped")))
-        }
+        (Format::Wasm, _) | (_, Arch::Wasm32 | Arch::Wasm64) => Err(PremapError::of(format_args!(
+            "wasm has no dependency image: code is reached by index, not mapped"
+        ))),
         (Format::Elf, _) => Ok(0x40_0000),
         (Format::MachO, _) => Ok(0x1_0000_0000),
         (Format::Pe, _) => Ok(0x1_4001_0000),
@@ -233,11 +245,18 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
         exec_log: false,
         sanitize: dev.sanitize,
         rpaths: dev.rpaths.clone(), // clone: setup, once per image made: the output owns them
+        // A dependency image takes none of the dev run's link arguments: its headers,
+        // undefined symbols and exports are its own.
+        link: blaze_link::LinkArgs::default(),
     }
 }
 
 /// The image of `request`, through `linker`, checked and encoded under `key`.
-pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Result<Vec<u8>, PremapError> {
+pub fn build(
+    linker: &impl Prelink,
+    request: &Request<'_>,
+    key: ImageKey,
+) -> Result<Vec<u8>, PremapError> {
     if request.link.output.incremental || request.link.output.live.is_some() {
         return Err(PremapError::of(format_args!(
             "a dependency image is linked whole: its output is neither incremental nor live"
@@ -258,7 +277,13 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     let mut entries: Vec<(SymbolId, Def)> =
         Vec::with_capacity(linked.functions.len() + linked.statics.len() + linked.names.len());
     for (key, addr, size) in &linked.functions {
-        let def = Def { value: *addr, size: *size, kind: Kind::Function, strength: Strength::Strong, order: u32::MAX };
+        let def = Def {
+            value: *addr,
+            size: *size,
+            kind: Kind::Function,
+            strength: Strength::Strong,
+            order: u32::MAX,
+        };
         entries.push((SymbolId::function(key), def));
     }
     for placed in &linked.statics {
@@ -266,14 +291,17 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
             StaticAt::Addr(addr) => (addr, Kind::Data),
             StaticAt::ThreadLocal(offset) => (offset, Kind::ThreadLocal),
         };
-        let def = Def { value, size: placed.size, kind, strength: Strength::Strong, order: u32::MAX };
+        let def =
+            Def { value, size: placed.size, kind, strength: Strength::Strong, order: u32::MAX };
         entries.push((SymbolId::of_static(&placed.item, &placed.instance), def));
     }
     for name in &linked.names {
         entries.push((SymbolId::name(&name.name), name.def));
     }
     let mut table = table::build(&entries)?;
-    let fail = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the prelink of the dependency image {what}")));
+    let fail = |what: std::fmt::Arguments<'_>| {
+        Err(PremapError::of(format_args!("the prelink of the dependency image {what}")))
+    };
     let in_table = |table: &Vec<u8>, id: &SymbolId| TableView::trusted(table).get(id).is_some();
 
     if request.function_digests.len() != request.link.functions.len()
@@ -284,7 +312,8 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
             "the dependency image was asked with digests not one per function, static and debug name"
         )));
     }
-    let mut contents = Vec::with_capacity(request.link.functions.len() + request.link.statics.len());
+    let mut contents =
+        Vec::with_capacity(request.link.functions.len() + request.link.statics.len());
     for (function, digest) in request.link.functions.iter().zip(request.function_digests) {
         let id = SymbolId::function(&function.key);
         if !in_table(&table, &id) {
@@ -315,7 +344,13 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     for name in &linked.reached_directly {
         table::set_reached_directly(&mut table, &SymbolId::name(name))?;
     }
-    let meta = Meta { key, format: request.link.output.format, arch: request.link.output.arch, base: request.link.base, page };
+    let meta = Meta {
+        key,
+        format: request.link.output.format,
+        arch: request.link.output.arch,
+        base: request.link.base,
+        page,
+    };
     let pieces = Pieces {
         table: &table,
         contents: &contents,
@@ -328,15 +363,25 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
 
 /// What came back is what was asked, and maps.
 fn check(request: &Request<'_>, placed: &impl Placed, page: u64) -> Result<(), PremapError> {
-    let fail = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the prelink of the dependency image {what}")));
+    let fail = |what: std::fmt::Arguments<'_>| {
+        Err(PremapError::of(format_args!("the prelink of the dependency image {what}")))
+    };
     let linked = placed.linked();
     let mut end = request.link.base;
     for (at, segment) in linked.segments.iter().enumerate() {
         if segment.addr % page != 0 || segment.addr < end {
-            return fail(format_args!("placed a segment at {:#x}, not page-aligned after {end:#x}", segment.addr));
+            return fail(format_args!(
+                "placed a segment at {:#x}, not page-aligned after {end:#x}",
+                segment.addr
+            ));
         }
         if placed.len(at) > segment.size || segment.size == 0 {
-            return fail(format_args!("made a segment at {:#x} of {} bytes in {}", segment.addr, placed.len(at), segment.size));
+            return fail(format_args!(
+                "made a segment at {:#x} of {} bytes in {}",
+                segment.addr,
+                placed.len(at),
+                segment.size
+            ));
         }
         end = match segment.addr.checked_add(segment.size).filter(|end| *end <= END) {
             Some(end) => end,
@@ -350,7 +395,9 @@ fn check(request: &Request<'_>, placed: &impl Placed, page: u64) -> Result<(), P
     }
     let inside = |addr: u64, len: u64, writable: bool| {
         linked.segments.iter().any(|it| {
-            addr >= it.addr && addr.saturating_add(len) <= it.addr + it.size && (!writable || it.prot == Prot::Data)
+            addr >= it.addr
+                && addr.saturating_add(len) <= it.addr + it.size
+                && (!writable || it.prot == Prot::Data)
         })
     };
 
@@ -361,27 +408,43 @@ fn check(request: &Request<'_>, placed: &impl Placed, page: u64) -> Result<(), P
     }
     for bind in &linked.binds {
         if bind.place % 8 != 0 || !inside(bind.place, 8, true) {
-            return fail(format_args!("binds `{}` at {:#x}, not an aligned cell of a writable segment", bind.name, bind.place));
+            return fail(format_args!(
+                "binds `{}` at {:#x}, not an aligned cell of a writable segment",
+                bind.name, bind.place
+            ));
         }
     }
     for entry in linked.init.iter().chain(&linked.fini) {
         if entry.at % 8 != 0 || !inside(entry.at, u64::from(entry.count) * 8, false) {
-            return fail(format_args!("made an init or fini piece at {:#x} outside its segments", entry.at));
+            return fail(format_args!(
+                "made an init or fini piece at {:#x} outside its segments",
+                entry.at
+            ));
         }
     }
     if let Some(tls) = linked.tls {
-        if tls.init > tls.size || !tls.align.is_power_of_two() || (tls.init > 0 && !inside(tls.template, tls.init, false)) {
-            return fail(format_args!("made a thread-local template at {:#x} that is not one", tls.template));
+        if tls.init > tls.size
+            || !tls.align.is_power_of_two()
+            || (tls.init > 0 && !inside(tls.template, tls.init, false))
+        {
+            return fail(format_args!(
+                "made a thread-local template at {:#x} that is not one",
+                tls.template
+            ));
         }
     }
     for (addr, len) in &linked.unwind {
         if !inside(*addr, *len, false) {
-            return fail(format_args!("made call frame information at {addr:#x} outside its segments"));
+            return fail(format_args!(
+                "made call frame information at {addr:#x} outside its segments"
+            ));
         }
     }
     for (addr, len) in &linked.thread_vars {
         if addr % 8 != 0 || len % 24 != 0 || !inside(*addr, *len, true) {
-            return fail(format_args!("made thread-local descriptors at {addr:#x} outside its writable segments"));
+            return fail(format_args!(
+                "made thread-local descriptors at {addr:#x} outside its writable segments"
+            ));
         }
     }
     Ok(())

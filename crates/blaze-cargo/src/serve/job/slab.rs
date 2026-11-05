@@ -32,7 +32,8 @@ impl<T> Tagged<T> {
     /// Reserves the room of `2^slot_bits` values, committing none.
     pub fn new(slot_bits: u32, generation_bits: u32, tag: MemTag) -> Result<Tagged<T>, MemError> {
         assert!(slot_bits < 32 && generation_bits <= 32 && slot_bits + generation_bits <= 64);
-        let generation_mask = if generation_bits == 32 { u32::MAX } else { (1 << generation_bits) - 1 };
+        let generation_mask =
+            if generation_bits == 32 { u32::MAX } else { (1 << generation_bits) - 1 };
         Ok(Tagged { slab: Slab::new(1 << slot_bits, tag)?, slot_bits, generation_mask })
     }
 
@@ -43,14 +44,19 @@ impl<T> Tagged<T> {
         // are live, every slot ever made is under `2^slot_bits`, so its index packs.
         let wanted = self.slab.len() + 1;
         if wanted > 1 << self.slot_bits {
-            return Err(MemError::TooLarge { tag: self.slab.tag(), what: "values of a tagged slab at once", wanted });
+            return Err(MemError::TooLarge {
+                tag: self.slab.tag(),
+                what: "values of a tagged slab at once",
+                wanted,
+            });
         }
         let handle = self.slab.try_insert(value)?;
         Ok((handle, self.pack(handle)))
     }
 
     fn pack(&self, handle: Handle<T>) -> u64 {
-        u64::from(handle.index()) | u64::from(handle.generation() & self.generation_mask) << self.slot_bits
+        u64::from(handle.index())
+            | u64::from(handle.generation() & self.generation_mask) << self.slot_bits
     }
 
     /// The value `packed` names: its slot holds one whose generation's low bits are `packed`'s.
@@ -61,7 +67,9 @@ impl<T> Tagged<T> {
             return None;
         }
         let slot = (packed & ((1 << self.slot_bits) - 1)) as u32;
-        self.slab.handle_at(slot).filter(|it| u64::from(it.generation() & self.generation_mask) == generation)
+        self.slab
+            .handle_at(slot)
+            .filter(|it| u64::from(it.generation() & self.generation_mask) == generation)
     }
 
     pub fn get(&self, handle: Handle<T>) -> Option<&T> {

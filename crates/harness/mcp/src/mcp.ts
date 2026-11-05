@@ -39,8 +39,10 @@ server.registerTool(
       timeout_ms: z.number().optional().describe("hard limit for the cell, rejecting it; default none"),
     },
   },
-  async ({ code, yield_ms = 10_000, timeout_ms }) => {
-    const t = repl.run(code, timeout_ms);
+  async ({ code, yield_ms = 10_000, timeout_ms }, extra) => {
+    // Claude names the tool call in the request's _meta; the cell carries it so the app draws the cell as that call.
+    const call = extra._meta?.["claudecode/toolUseId"];
+    const t = repl.run(code, timeout_ms, typeof call === "string" ? call : null);
     let timer: Timer | undefined;
     await Promise.race([t.done, new Promise((r) => (timer = setTimeout(r, yield_ms)))]);
     clearTimeout(timer);

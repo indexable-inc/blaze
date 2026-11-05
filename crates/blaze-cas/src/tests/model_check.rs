@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
 
 use super::*;
 
@@ -25,7 +25,10 @@ fn bytes(tc: &TestCase) -> Vec<u8> {
     match tc.draw(gs::integers::<u8>().max_value(2)) {
         0 => tc.draw(gs::binary().max_size(300)),
         1 => noise(tc.draw(gs::integers().max_value(400 << 10)), tc.draw(gs::integers())),
-        _ => text(tc.draw(gs::integers().max_value(1 << 20)), tc.draw(gs::integers().max_value(64 << 10))),
+        _ => text(
+            tc.draw(gs::integers().max_value(1 << 20)),
+            tc.draw(gs::integers().max_value(64 << 10)),
+        ),
     }
 }
 
@@ -96,7 +99,8 @@ fn reads_back_what_a_map_holds(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 

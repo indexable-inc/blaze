@@ -160,7 +160,14 @@ pub enum Side {
 pub enum Finding {
     /// Another number of keys of the kind changed than the case allows; `keys` are those that
     /// did.
-    Changed { what: &'static str, kind: QueryKind, changed: u32, min: u32, max: u32, keys: Vec<QueryKey> },
+    Changed {
+        what: &'static str,
+        kind: QueryKind,
+        changed: u32,
+        min: u32,
+        max: u32,
+        keys: Vec<QueryKey>,
+    },
     /// Neither trace has a result of a kind the case counts.
     Unrecorded { what: &'static str, kind: QueryKind },
     /// Kept by the incremental build though `read`, of a kind the case watches, is not what it
@@ -229,7 +236,9 @@ fn differ(before: &Trace, after: &Trace, kind: QueryKind) -> (Vec<QueryKey>, boo
 /// One pass over each counted kind's keys, one join of the incremental build's reruns against
 /// the build before, and [`under`]'s one pass: the traces are read once each.
 pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) -> Vec<Finding> {
-    let watched = |kind: QueryKind| kinds::RESOLVER.contains(&kind.0) || case.expect.iter().any(|e| e.kind == kind);
+    let watched = |kind: QueryKind| {
+        kinds::RESOLVER.contains(&kind.0) || case.expect.iter().any(|e| e.kind == kind)
+    };
     // alloc: the answer, once a check of a fixture slot's edit; unallocated while nothing is found.
     let mut found = Vec::new();
     for e in case.expect {
@@ -256,7 +265,8 @@ pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) 
         let Some(j) = before.index_from(&mut cursor, &query) else { continue };
         let Some(was) = before.result(j) else { continue };
         let changed = before.edges(j).any(|(read, saw)| {
-            incremental.index(&before.keys[read as usize]).and_then(|r| incremental.result(r)) != Some(saw)
+            incremental.index(&before.keys[read as usize]).and_then(|r| incremental.result(r))
+                != Some(saw)
         });
         if !changed {
             found.push(Finding::Unexplained { query });
@@ -309,8 +319,18 @@ mod tests {
     }
 
     impl Model {
-        fn add(&mut self, kind: QueryKind, name: &str, was: u128, now: u128, reads: &[usize]) -> usize {
-            assert!(reads.iter().all(|&r| r < self.nodes.len()), "{name} reads a node added after it");
+        fn add(
+            &mut self,
+            kind: QueryKind,
+            name: &str,
+            was: u128,
+            now: u128,
+            reads: &[usize],
+        ) -> usize {
+            assert!(
+                reads.iter().all(|&r| r < self.nodes.len()),
+                "{name} reads a node added after it"
+            );
             self.nodes.push(Node { key: key(kind, name), was, now, reads: reads.to_vec() });
             self.nodes.len() - 1
         }
@@ -324,8 +344,14 @@ mod tests {
             let fp = |n: &Node| if now { n.now } else { n.was };
             let mut trace = TraceBuilder::default();
             for node in &self.nodes {
-                let edges: Vec<Edge> =
-                    node.reads.iter().map(|&r| Edge { read: self.nodes[r].key, saw: Fingerprint(fp(&self.nodes[r])) }).collect();
+                let edges: Vec<Edge> = node
+                    .reads
+                    .iter()
+                    .map(|&r| Edge {
+                        read: self.nodes[r].key,
+                        saw: Fingerprint(fp(&self.nodes[r])),
+                    })
+                    .collect();
                 trace.insert(node.key, Fingerprint(fp(node)), &edges, true);
             }
             trace.finish()
@@ -354,7 +380,10 @@ mod tests {
                 let edges: Vec<Edge> = node
                     .reads
                     .iter()
-                    .map(|&r| Edge { read: self.nodes[r].key, saw: Fingerprint(if ran { fp[r] } else { self.nodes[r].was }) })
+                    .map(|&r| Edge {
+                        read: self.nodes[r].key,
+                        saw: Fingerprint(if ran { fp[r] } else { self.nodes[r].was }),
+                    })
                     .collect();
                 trace.insert(node.key, Fingerprint(fp[i]), &edges, ran);
             }
@@ -366,7 +395,12 @@ mod tests {
         }
     }
 
-    fn per_round(m: &mut Model, rounds: u32, prev: &mut Option<usize>, mut add: impl FnMut(&mut Model, u32, &[usize]) -> usize) {
+    fn per_round(
+        m: &mut Model,
+        rounds: u32,
+        prev: &mut Option<usize>,
+        mut add: impl FnMut(&mut Model, u32, &[usize]) -> usize,
+    ) {
         for r in 0..rounds {
             let reads: Vec<usize> = prev.iter().copied().collect();
             *prev = Some(add(m, r, &reads));
@@ -418,7 +452,8 @@ mod tests {
             let reads: Vec<usize> = [decls_helpers].into_iter().chain(helpers).collect();
             let state = m.add(SCC_STATE, &format!("helpers@{r}"), base + 20, base + 21, &reads);
             helpers = Some(state);
-            let handle = m.add(FACT_HANDLE, &format!("helpers@{r}"), base + 30, base + 31, &[state]);
+            let handle =
+                m.add(FACT_HANDLE, &format!("helpers@{r}"), base + 30, base + 31, &[state]);
             let reads: Vec<usize> = [decls_chooser, handle].into_iter().chain(chooser).collect();
             let glob = m.add(SCC_STATE, &format!("chooser@{r}"), base + 40, base + 41, &reads);
             chooser = Some(glob);
@@ -468,7 +503,11 @@ mod tests {
     #[test]
     fn an_item_or_use_added_to_a_module_reruns_only_what_read_it_whatever_the_rounds() {
         for rounds in 1..=4 {
-            assert_eq!(item_model(rounds, false).check("nameres-item", &[]), vec![], "{rounds} rounds");
+            assert_eq!(
+                item_model(rounds, false).check("nameres-item", &[]),
+                vec![],
+                "{rounds} rounds"
+            );
         }
     }
 
@@ -500,11 +539,24 @@ mod tests {
         let (mut helpers, mut chooser, mut left) = (None, None, None);
         per_round(&mut m, 3, &mut helpers, |m, r, prev| {
             let reads: Vec<usize> = [decls_helpers].iter().chain(prev).copied().collect();
-            m.add(SCC_STATE, &format!("helpers@{r}"), 20 + u128::from(r), 120 + u128::from(r), &reads)
+            m.add(
+                SCC_STATE,
+                &format!("helpers@{r}"),
+                20 + u128::from(r),
+                120 + u128::from(r),
+                &reads,
+            )
         });
         per_round(&mut m, 3, &mut chooser, |m, r, prev| {
-            let reads: Vec<usize> = [decls_chooser, helpers.unwrap()].iter().chain(prev).copied().collect();
-            m.add(SCC_STATE, &format!("chooser@{r}"), 40 + u128::from(r), 140 + u128::from(r), &reads)
+            let reads: Vec<usize> =
+                [decls_chooser, helpers.unwrap()].iter().chain(prev).copied().collect();
+            m.add(
+                SCC_STATE,
+                &format!("chooser@{r}"),
+                40 + u128::from(r),
+                140 + u128::from(r),
+                &reads,
+            )
         });
         per_round(&mut m, 3, &mut left, |m, r, prev| {
             let reads: Vec<usize> = [decls_left].iter().chain(prev).copied().collect();
@@ -525,7 +577,11 @@ mod tests {
     #[test]
     fn a_negative_fact_flips_and_its_reader_reruns() {
         for rounds in 1..=3 {
-            assert_eq!(negative_model(rounds, true).check("nameres-negative", &[]), vec![], "{rounds} rounds");
+            assert_eq!(
+                negative_model(rounds, true).check("nameres-negative", &[]),
+                vec![],
+                "{rounds} rounds"
+            );
         }
     }
 
@@ -543,7 +599,17 @@ mod tests {
     #[test]
     fn a_negative_read_with_no_edge_is_under() {
         let found = negative_model(2, false).check("nameres-negative", &[]);
-        assert_eq!(found, vec![Finding::Changed { what: NAMES, kind: RESOLVES, changed: 0, min: 1, max: 1, keys: vec![] }]);
+        assert_eq!(
+            found,
+            vec![Finding::Changed {
+                what: NAMES,
+                kind: RESOLVES,
+                changed: 0,
+                min: 1,
+                max: 1,
+                keys: vec![]
+            }]
+        );
         assert_eq!(found[0].side(), Side::Under);
     }
 
@@ -552,7 +618,10 @@ mod tests {
         let m = item_model(2, false);
         let root = m.at(MODULE_DECLS, "root");
         let k = key(MODULE_DECLS, "root");
-        assert_eq!(m.check("nameres-item", &[(root, true)]), vec![Finding::Unexplained { query: k }, Finding::Needless { query: k }]);
+        assert_eq!(
+            m.check("nameres-item", &[(root, true)]),
+            vec![Finding::Unexplained { query: k }, Finding::Needless { query: k }]
+        );
     }
 
     #[test]
@@ -571,7 +640,14 @@ mod tests {
         let found = bucket_model(true).check("nameres-bucket", &[]);
         assert_eq!(
             found,
-            vec![Finding::Changed { what: BUCKETS, kind: IMPLEMENTS, changed: 1, min: 0, max: 0, keys: vec![key(IMPLEMENTS, "Weight u8")] }]
+            vec![Finding::Changed {
+                what: BUCKETS,
+                kind: IMPLEMENTS,
+                changed: 1,
+                min: 0,
+                max: 0,
+                keys: vec![key(IMPLEMENTS, "Weight u8")]
+            }]
         );
         assert_eq!(found[0].side(), Side::Over);
     }
@@ -582,7 +658,10 @@ mod tests {
         let found = inherent_model(true).check("nameres-inherent", &[]);
         let mut keys = vec![key(METHOD, "Probe name"), key(METHOD, "Marker which")];
         keys.sort();
-        assert_eq!(found, vec![Finding::Changed { what: PROBES, kind: METHOD, changed: 2, min: 1, max: 1, keys }]);
+        assert_eq!(
+            found,
+            vec![Finding::Changed { what: PROBES, kind: METHOD, changed: 2, min: 1, max: 1, keys }]
+        );
         assert_eq!(found[0].side(), Side::Over);
     }
 
@@ -593,7 +672,12 @@ mod tests {
         let before = m.before();
         let reads = [m.at(SCC_STATE, "root@0")];
         let gamma = m.add(RESOLVES, "root gamma", 90, 90, &reads);
-        let found = check(case("nameres-item").unwrap(), &before, &m.incremental(&[(gamma, true)]), &m.scratch());
+        let found = check(
+            case("nameres-item").unwrap(),
+            &before,
+            &m.incremental(&[(gamma, true)]),
+            &m.scratch(),
+        );
         assert_eq!(found, vec![]);
     }
 
@@ -608,7 +692,11 @@ mod tests {
                 let k = key(kind, &rng.below(40).to_string());
                 // Some read a key no build has a result for: named, not counted.
                 let read = key(kind, "only read");
-                let edges = if rng.below(4) == 0 { vec![Edge { read, saw: Fingerprint(0) }] } else { Vec::new() };
+                let edges = if rng.below(4) == 0 {
+                    vec![Edge { read, saw: Fingerprint(0) }]
+                } else {
+                    Vec::new()
+                };
                 trace.insert(k, Fingerprint(u128::from(rng.below(3) as u8)), &edges, true);
             }
             trace.finish()
@@ -631,14 +719,19 @@ mod tests {
                         crate::Apart::OnlyFirst { .. } | crate::Apart::OnlySecond { .. } => None,
                     })
                     .collect();
-                assert_eq!(differ(&a, &b, kind), (want, !x.is_empty() || !y.is_empty()), "seed {seed}");
+                assert_eq!(
+                    differ(&a, &b, kind),
+                    (want, !x.is_empty() || !y.is_empty()),
+                    "seed {seed}"
+                );
             }
         }
     }
 
     #[test]
     fn the_kinds_are_distinct_and_in_their_ranges() {
-        let named = [MODULE_DECLS, SCC_STATE, FACT_HANDLE, MACRO_STEP, MODULE_SCOPE_NAME, MODULE_IMPLS];
+        let named =
+            [MODULE_DECLS, SCC_STATE, FACT_HANDLE, MACRO_STEP, MODULE_SCOPE_NAME, MODULE_IMPLS];
         let mut all: Vec<QueryKind> = named.to_vec();
         all.extend([METHOD, IMPLEMENTS, RESOLVES]);
         let mut sorted = all.clone();
@@ -648,19 +741,36 @@ mod tests {
         assert!(named.iter().all(|k| RESOLVER.contains(&k.0)));
         assert!(blaze_query::kinds::FRONT.contains(&RESOLVER.start));
         assert!(blaze_query::kinds::FRONT.contains(&(RESOLVER.end - 1)));
-        assert!([METHOD, IMPLEMENTS, RESOLVES].iter().all(|k| blaze_query::kinds::FACTS.contains(&k.0)));
+        assert!(
+            [METHOD, IMPLEMENTS, RESOLVES].iter().all(|k| blaze_query::kinds::FACTS.contains(&k.0))
+        );
     }
 
     #[test]
     fn every_case_is_a_slot_of_the_fixture_and_in_its_nameres_regression() {
-        let fixture = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../harness/v2/fixture.py")).unwrap();
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../harness/v2/fixture.py"
+        ))
+        .unwrap();
         let start = fixture.find("\"nameres\": (").expect("fixture.py has a `nameres` regression");
         let regression = &fixture[start..start + fixture[start..].find(")),\n").unwrap()];
         for case in CASES {
-            assert!(fixture.contains(&format!("Slot(\"{}\"", case.slot)), "no slot {} in fixture.py", case.slot);
-            assert!(regression.contains(&format!("(\"{}\",", case.slot)), "the nameres regression never edits {}", case.slot);
+            assert!(
+                fixture.contains(&format!("Slot(\"{}\"", case.slot)),
+                "no slot {} in fixture.py",
+                case.slot
+            );
+            assert!(
+                regression.contains(&format!("(\"{}\",", case.slot)),
+                "the nameres regression never edits {}",
+                case.slot
+            );
             assert!(!case.expect.is_empty() && !case.claim.is_empty());
         }
-        assert_eq!(CASES.iter().map(|c| c.slot).collect::<std::collections::BTreeSet<_>>().len(), CASES.len());
+        assert_eq!(
+            CASES.iter().map(|c| c.slot).collect::<std::collections::BTreeSet<_>>().len(),
+            CASES.len()
+        );
     }
 }

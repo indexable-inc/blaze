@@ -11,8 +11,8 @@ use hir_def::{
     resolver::{HasResolver, Resolver},
     type_ref::{TypeRef, TypeRefId},
 };
-use rustc_type_ir::{InferConst, InferTy, inherent::IntoKind as _};
 use hir_expand::fixture;
+use rustc_type_ir::{InferConst, InferTy, inherent::IntoKind as _};
 use thin_vec::ThinVec;
 
 use crate::{

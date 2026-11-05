@@ -25,14 +25,14 @@ use std::collections::VecDeque;
 
 use blaze_core::Conn;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{
     Handle, Slab, Tag,
     tag::{Rate, Snapshot},
 };
 use blaze_query::QueryKey;
-use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
+use blaze_vfs::{CommitError, OpError, Ticket, Vfs, View, ViewId};
+use std::alloc::Global;
 
 use crate::{
     ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, Targets,
@@ -50,8 +50,12 @@ pub struct Daemon<'a> {
     /// For [`Response::Status`].
     pub pid: u32,
     pub build: &'a crate::Build,
+    /// What the daemon was started with, for [`Status::settings`].
+    pub settings: &'a [crate::Setting],
     pub memory_bytes: u64,
     pub budget_bytes: u64,
+    /// How long the daemon has run, on its driver's clock, for [`Status::uptime_ms`].
+    pub uptime_ms: u64,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
     /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
     pub memory: fn() -> Snapshot,
@@ -156,7 +160,12 @@ impl Sink {
 }
 
 enum Kind {
-    Commit { root: ContentId, rebased: bool, ticket: Ticket, head: String },
+    Commit {
+        root: ContentId,
+        rebased: bool,
+        ticket: Ticket,
+        head: String,
+    },
     /// One job of the build, with the views it holds, and the one whose database view is kept
     /// for [`Request::Why`] when it ends. `owes_work` until a build, test or run has reported
     /// [`Response::Work`]: one that ends without it fails, naming it.
@@ -317,7 +326,8 @@ impl Session {
             !matches!(response, Response::Done { .. } | Response::Error(_)),
             "job {job:?} reported {response:?}: a job ends through `Session::finish`"
         );
-        let Some(&Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.get(it))
+        let Some(&Job::Request { serial, candidate }) =
+            handle(job).and_then(|it| self.jobs.get(it))
         else {
             return;
         };
@@ -374,7 +384,8 @@ impl Session {
         mut queries: Option<ViewId>,
         out: &mut Vec<Reply>,
     ) {
-        let Some(Job::Request { serial, candidate }) = handle(job).and_then(|it| self.jobs.remove(it))
+        let Some(Job::Request { serial, candidate }) =
+            handle(job).and_then(|it| self.jobs.remove(it))
         else {
             if let Some(opened) = self.intents.finish(job) {
                 close(cx, opened);
@@ -578,6 +589,7 @@ impl Session {
                 self.build(cx, req, &view, Work::CodegenInputs(targets))?
             }
             Request::Trace { view, targets } => self.build(cx, req, &view, Work::Trace(targets))?,
+            Request::Lock { view, targets } => self.build(cx, req, &view, Work::Lock(targets))?,
             Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
             Request::Pack { view, targets, program } => {
                 self.build(cx, req, &view, Work::Pack { targets, program })?
@@ -629,7 +641,13 @@ impl Session {
                 })?;
                 let work = if test {
                     // alloc: none, empty lists.
-                    Work::Test { targets, filter: Vec::new(), all: false, args: Vec::new(), ub: None }
+                    Work::Test {
+                        targets,
+                        filter: Vec::new(),
+                        all: false,
+                        args: Vec::new(),
+                        ub: None,
+                    }
                 } else {
                     Work::Check(targets)
                 };
@@ -660,7 +678,8 @@ impl Session {
                     match root.and_then(|root| open(cx, root)) {
                         Ok(opened) => {
                             self.intents.take_over(cx.builder, opened.view.root);
-                            let job = self.job(Job::Request { serial, candidate: Some(best.next()) });
+                            let job =
+                                self.job(Job::Request { serial, candidate: Some(best.next()) });
                             best.started(job, opened);
                             starts.push((job, opened));
                         }
@@ -718,7 +737,10 @@ impl Session {
                 let Some(why) = cx.db.why(queries, &query) else {
                     return Err(ApiError::new(
                         // alloc: error path, a query that did not rerun.
-                        format!("{} did not rerun in the last build of {root:x}", query_name(&query)),
+                        format!(
+                            "{} did not rerun in the last build of {root:x}",
+                            query_name(&query)
+                        ),
                         Some(query_name(&query)),
                     ));
                 };
@@ -734,11 +756,14 @@ impl Session {
                     // clone: the reply's own copy, once per Status.
                     build: cx.build.clone(),
                     requests,
+                    // clone: the reply's own copy, once per Status.
+                    settings: cx.settings.to_vec(),
                     views: self.views(),
                     // alloc: the reply's own copy of an error, once per Status.
                     history: cx.history.map(str::to_owned),
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
+                    uptime_ms: cx.uptime_ms,
                     bugs: (cx.bugs)(),
                 };
                 answer(out, req, Response::Status(status));
@@ -757,15 +782,18 @@ impl Session {
             }
             Request::Explore { .. }
             | Request::Live
-            | Request::Sql { .. }
+            | Request::Flush
             | Request::Gc { .. }
             | Request::Rebuilt { .. }
-            | Request::Launch { .. } => {
+            | Request::Launch { .. }
+            | Request::FetchUrl { .. }
+            | Request::ClientRows { .. } => {
                 return Err(ApiError::new(
-                    "the explorer, the live feed, live SQL, the collector, the last build's \
-                     reasons and the dev runs' launches are answered by the daemon's loop, which \
-                     holds their servers, feeds, collector, reasons and programs; this one handed \
-                     the request on instead",
+                    "the explorer, the live feed, the profile history's flush, the collector, the \
+                     last build's reasons, the dev runs' launches, fetches by digest and clients' \
+                     profile rows are answered by the daemon's loop, which holds their servers, \
+                     feeds, history, collector, reasons, programs and store; this one handed the \
+                     request on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -912,7 +940,10 @@ impl Session {
         let mut requests = std::mem::take(&mut self.buffers.going);
         requests.clear();
         requests.extend(
-            self.live.iter().filter(|(req, _)| req.conn == conn).map(|(req, serial)| (*req, *serial)),
+            self.live
+                .iter()
+                .filter(|(req, _)| req.conn == conn)
+                .map(|(req, serial)| (*req, *serial)),
         );
         radix::sort_copy_by_key_in(&mut requests, |it| it.0.id, &mut self.buffers.going_scratch);
         for &(req, serial) in &requests {
@@ -1020,7 +1051,8 @@ fn incremental(work: &Work) -> bool {
         | Work::Snapshot
         | Work::Tables
         | Work::Edit(_)
-        | Work::Ahead { .. } => false,
+        | Work::Ahead { .. }
+        | Work::Lock(_) => false,
     }
 }
 
@@ -1102,10 +1134,12 @@ fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Explore { .. } => "blaze explore",
         Request::Live => "blaze debug live",
-        Request::Sql { .. } => "blaze debug sql --live",
+        Request::Flush => "a read of the profile history",
         Request::Gc { .. } => "blaze cache gc",
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",
+        Request::FetchUrl { .. } => "blaze fetch-url",
+        Request::ClientRows { .. } => "a client's profile rows",
         _ => "a request",
     }
 }

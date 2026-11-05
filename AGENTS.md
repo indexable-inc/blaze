@@ -18,8 +18,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 4. **superset-of-rust**: Every program the pinned nightly builds builds and behaves the same under
    blaze; blaze refuses only rustc soundness holes, and its extensions are opt-in. Skill:
    `compiler-correctness`.
-5. **useful-not-parity**: rustc and cargo are references, not specs: judge output by usefulness and
-   match them only where real code or tools depend on it. Skill: `compiler-correctness`.
+5. **useful-not-parity**: rustc and cargo are references, not specs: design every output and interface
+   as if from scratch, the best way for people and agents, and match them only where real code or
+   tools depend on it. Skill: `compiler-correctness`.
 6. **blaze-uses-its-extensions**: blaze's own crates use blaze's language extensions (`#[blaze::pure]`,
    effects, contracts, ...) directly, enforced, with no rustc-compatible fallback or cfg guard.
    Skill: `compiler-correctness`.
@@ -34,13 +35,13 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 11. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
     alloc: <why>` on its line. Skill: `runtime-code`.
 12. **standard-structures**: One standard structure per need (parking_lot locks, papaya and blaze_hash
-    maps, crossbeam queues and channels, atomics); a wait on a pool thread goes through the
-    scheduler. Skill: `runtime-code`.
+    maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.
-14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO;
-    drivers do the IO and stay thin. Skill: `runtime-code`.
+14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO,
+    marked `#![blaze::sans_io]` so the lint enforces it; drivers do the IO and stay thin. Skill:
+    `runtime-code`.
 15. **every-wait-says-what**: Every blocking wait opens a span naming what it waits for. Skill:
     `runtime-code`.
 16. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed
@@ -56,44 +57,56 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 21. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
     ran on. Skill: `build-and-test`.
 22. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
-    `build-and-test`.
+    `testing`.
 23. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
     the tree compiles at every save point. Skill: `changing-code`.
 24. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
 25. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
-    fresh build; a restore never silently starts empty. Skill: `changing-code`.
+    fresh build; a restore never silently starts empty. Skill: `testing`.
 26. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
 27. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
     proving it right. Skill: `changing-code`.
-28. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
+28. **spec-then-build**: A change that needs a design gets a spec first, then the same lane builds it
+    right away; a spec is never the deliverable. Skill: `changing-code`.
+29. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-29. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
-    codegen, the store, the daemon and the runtime stay outside. Skill: `compiler-correctness`.
-30. **library-over-language**: Build a feature as a library on the language that exists; when no library
+30. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
+    (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
+    runtime stay outside. Skill: `compiler-correctness`.
+31. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
     `compiler-correctness`.
-31. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
+32. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-32. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
+33. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-33. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
+34. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
     runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
-34. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
+35. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
-35. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
+36. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
-36. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
+37. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-37. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
+38. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
     branch. Skill: `build-and-test`.
-38. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
+39. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
-39. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
+40. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
-40. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
+41. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
+42. **dst-not-review**: Prove concurrent, durable, crash-recovering, billing and data-deletion code with
+    a Hegel deterministic simulation test whose oracle checks the invariant; a code review is not
+    evidence. Skill: `testing`.
+43. **deadline-waits**: Every blocking kernel wait goes through blaze-core's one deadline wait
+    (`blaze_core::wait`); nothing signals pool threads; a fiber parks on the scheduler, never in the
+    kernel. Skill: `runtime-code`.
+44. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
+    sandbox, ...) where it is more efficient or more capable than the public one; comment which and
+    why, and test that its symbol exists. Skill: `runtime-code`.
 
 ## Code Review Rules
 
@@ -119,6 +132,15 @@ approval; they replace neither.
 - Flag unsafe code in the loader, the splice and the live runtime whose soundness rests on an
   unchecked assumption (alignment, lifetime of patched code, aliasing, thread safety of a swap),
   unless a comment states the invariant and where it is upheld.
+
+### Durability and concurrency
+
+- Flag a change to concurrent, durable, crash-recovering, billing or data-deleting code (atomics,
+  locks, lock-free rings, an fsync, a rename used as a commit, a recovery path, a retire or delete,
+  a usage count) that adds or changes behavior without a Hegel deterministic simulation test
+  covering it: one that crashes it, fails its syncs and interleaves it, and checks an oracle stating
+  the invariant, with a planted bug the oracle catches (`dst-not-review`, the `testing` skill). A
+  reviewer's own reasoning about the interleavings is a lead for that test, not a substitute for it.
 
 ### Security
 

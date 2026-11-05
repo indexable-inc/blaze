@@ -354,7 +354,12 @@ impl Records {
 
     /// The record of `bytes`, under `hash`, written with the ID and order key `make` gives if
     /// there is none. `make` runs under the shard's lock, once, only when the bytes are new.
-    pub(crate) fn intern(&self, hash: u64, bytes: &[u8], make: impl FnOnce() -> (u32, u64)) -> Record {
+    pub(crate) fn intern(
+        &self,
+        hash: u64,
+        bytes: &[u8],
+        make: impl FnOnce() -> (u32, u64),
+    ) -> Record {
         // SAFETY: As in `find`: `entry` hands `matches` and returns published values only.
         let same = |at: NonNull<u8>| unsafe { Record::at(at) }.bytes() == bytes;
         let at = match self.store.entry(hash, same) {
@@ -362,7 +367,9 @@ impl Records {
             Entry::Vacant(vacant) => {
                 let (id, key) = make();
                 let len = u32::try_from(bytes.len()).expect("an interned value of 4 GiB or more");
-                vacant.insert(record_layout(bytes.len()), |to| self.write(to, Head { key, id, len }, bytes))
+                vacant.insert(record_layout(bytes.len()), |to| {
+                    self.write(to, Head { key, id, len }, bytes)
+                })
             }
         };
         // SAFETY: As in `same`.

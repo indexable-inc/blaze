@@ -2,8 +2,8 @@
 //! and dynamic libraries (`MH_DYLIB`) on AArch64 and x86-64, laid out as ld64 lays them.
 //!
 //! Segments, in address order: `__PAGEZERO` (an executable's first 4 GiB, unmapped),
-//! `__TEXT` (the headers, code, read-only data, `__unwind_info`, `__eh_frame`: read and
-//! run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
+//! `__TEXT` (the headers, an incremental image's patch code, code, read-only data,
+//! `__unwind_info`, `__eh_frame`: read and run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
 //! initializers, constant data with pointers, the C objects' `__compact_unwind`), `__DATA`
 //! (the jump table's cells, data, thread-locals, zeroed data), a dev run's reservations
 //! (`__BLAZE_ARENA`, `__BLAZE_CELLS`, `__BLAZE_FIXED`: no access and no file bytes, which its
@@ -14,9 +14,17 @@
 //! (`LC_DYLD_INFO_ONLY`), not in chains.
 //!
 //! Every region but a zeroed one is in the file at its address less the base, so a region's
-//! offset never moves while its address doesn't. dyld finds the thread-local variable
-//! descriptors by their section's type (`S_THREAD_LOCAL_VARIABLES`): they are all in
-//! [`Class::ThreadVars`], C objects' too.
+//! offset never moves while its address doesn't. Everything but a dev run's reservations and
+//! zero-fill is within 4 GiB of the base ([`WINDOW`]).
+//!
+//! The patch region ([`Class::Patch`]) is first in `__TEXT`, before `__text`: what a full
+//! link places is then laid out as ld64 lays it, nothing between the code and what it
+//! reaches (its stubs, `__eh_frame`, the GOT), so an incremental image's reach is a full
+//! one's. Patch code reaches `__text` forwards and everything else across it; `__eh_frame`
+//! reaches it with 8-byte FDE addresses ([`crate::unwind::Pointers`]).
+//!
+//! dyld finds the thread-local variable descriptors by their section's type
+//! (`S_THREAD_LOCAL_VARIABLES`): they are all in [`Class::ThreadVars`], C objects' too.
 //!
 //! Names in Mach-O carry a leading underscore and the core's don't ([`push_core_name`],
 //! [`spelled`]); a Mach-O name without one (`section$start$...`) is the core's with a
@@ -40,12 +48,19 @@ pub(crate) use input::{Autolink, asked_libraries, autolink};
 /// dylib's `LC_REEXPORT_DYLIB`s, a stub's re-exports that are no document of it. ld64 loads
 /// each with the library, so the link line has them too ([`crate::target`]). A universal file
 /// is read for `arch`'s slice.
-pub(crate) fn reexported(name: &str, bytes: &[u8], arch: Arch, platform: u32) -> Result<Vec<String>, String> {
+pub(crate) fn reexported(
+    name: &str,
+    bytes: &[u8],
+    arch: Arch,
+    platform: u32,
+) -> Result<Vec<String>, String> {
     let cpu = match arch {
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: a Mach-O library in a {arch:?} link")),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(format!("{name}: a Mach-O library in a {arch:?} link"));
+        }
     };
     let bytes = input::slice(name, bytes, cpu)?;
     let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
@@ -61,10 +76,10 @@ pub(crate) fn reexported(name: &str, bytes: &[u8], arch: Arch, platform: u32) ->
     };
     Ok(shared.inputs)
 }
-#[cfg(test)]
-pub(crate) use input::tests::linking as linking_object;
 #[cfg(feature = "fuzz")]
 pub(crate) use dylib::trie_differential;
+#[cfg(test)]
+pub(crate) use input::tests::linking as linking_object;
 #[cfg(feature = "fuzz")]
 pub(crate) use tbd::differential as tbd_differential;
 
@@ -80,24 +95,39 @@ use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
 use crate::model::{
-    Class, Counts, Data, Delta, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
-    Reserve, SectionKind, SectionName, Special, Writer, zeroed,
+    Class, Counts, Data, Delta, File, Holds, Name, Names, NativeFile, Placed, Plan, Prot, Region,
+    Reserve, SectionKind, SectionName, Special, Window, Writer, zeroed,
 };
-use smallvec::SmallVec;
 use crate::output::Platform;
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
+use smallvec::SmallVec;
 
 /// Where an executable's image starts: after `__PAGEZERO`, which catches 32-bit pointers.
 const BASE: u64 = 0x1_0000_0000;
 /// The room for the header and the load commands, which grow with the libraries and with an
 /// incremental link's sections.
 const HEADERS: u64 = 0x4000;
+/// The room past [`HEADERS`] an image linked with `-headerpad_max_install_names` keeps: each
+/// library's path grown to `MAXPATHLEN` takes about 1 KiB more, so 48 libraries' worth. The
+/// load commands are checked against what the image keeps once they are written.
+const MAX_NAMES_ROOM: u64 = 0xC000;
+/// ld64's `MAXPATHLEN`, which `-headerpad_max_install_names` grows every path to.
+const MAXPATHLEN: usize = 1024;
 const HEADER: usize = 32;
 const SEGMENT: usize = 72;
 const SECTION: usize = 80;
 const NLIST: usize = 16;
 const UNWIND_INFO: &str = "__unwind_info";
+/// How far from the base a Mach-O image's regions reach, their room included: a section's
+/// file offset is 32 bits (and every region's is its address less the base), `__unwind_info`
+/// names a function by a 32-bit offset from the base, and a dev executable runs in 4 GiB of
+/// code memory (blaze-cargo's `inproc::IMAGE`). Zero-fill has no file bytes and no code, so
+/// it is not counted ([`crate::place::past_window`]).
+const WINDOW: Window = Window {
+    bytes: 1 << 32,
+    why: "Mach-O's 32-bit section file offsets and `__unwind_info`'s 32-bit function offsets from the image's base",
+};
 /// The dev runtime's start hook, as the core names it (`_blaze_inproc_start` in Mach-O).
 const START: &str = "blaze_inproc_start";
 
@@ -109,7 +139,9 @@ pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
     let (cpu, subtype, page) = match output.arch {
         Arch::Aarch64 => (macho::CPU_TYPE_ARM64.0, macho::CPU_SUBTYPE_ARM64_ALL.0, 0x4000),
         Arch::X86_64 => (macho::CPU_TYPE_X86_64.0, macho::CPU_SUBTYPE_X86_64_ALL.0, 0x1000),
-        Arch::Wasm32 | Arch::Wasm64 => return Err(error("a Mach-O image for wasm, which has no Mach-O")),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(error("a Mach-O image for wasm, which has no Mach-O"));
+        }
     };
     if output.dev_run.is_some() {
         if output.arch != Arch::Aarch64 {
@@ -179,8 +211,8 @@ pub(super) fn push_core_name(names: &mut Names, name: &[u8]) -> Result<Name, Str
         Some(tail) => {
             tail.copy_from_slice(text.as_bytes());
             buffer[0] = 1;
-            let marked = std::str::from_utf8(&buffer[..=text.len()])
-                .expect("`\\x01` and a `str` are UTF-8");
+            let marked =
+                std::str::from_utf8(&buffer[..=text.len()]).expect("`\\x01` and a `str` are UTF-8");
             names.push(marked)
         }
         // alloc: a name without `_` longer than 255 bytes, which no compiler writes: pushed once
@@ -200,7 +232,7 @@ pub(super) fn macho_name(name: &str) -> String {
 
 /// [`macho_name`] in its two parts, built without allocating: the underscore it gains (or
 /// none), and the rest.
-fn spelled(name: &str) -> (&'static str, &str) {
+pub(crate) fn spelled(name: &str) -> (&'static str, &str) {
     match name.strip_prefix('\x01') {
         Some(rest) => ("", rest),
         None => ("_", name),
@@ -247,7 +279,13 @@ fn locals_into(
     }
     // alloc: one result per 4,096 locals, per link
     let results: Vec<Result<(), LinkError>> = par::map(
-        par::zip(par::zip(par::chunks(locals, CHUNK), par::chunks_mut(&mut nlist[entries_at..], CHUNK * NLIST)), jobs),
+        par::zip(
+            par::zip(
+                par::chunks(locals, CHUNK),
+                par::chunks_mut(&mut nlist[entries_at..], CHUNK * NLIST),
+            ),
+            jobs,
+        ),
         |((chunk, entries), (start, names))| {
             let mut written = 0;
             for (&(addr, name), entry) in chunk.iter().zip(entries.chunks_exact_mut(NLIST)) {
@@ -346,8 +384,13 @@ impl Segment {
 /// The segment of a class and its place in the segment.
 fn place(class: &Class) -> (Segment, u8) {
     match class {
-        Class::Text => (Segment::Text, 0),
-        Class::Patch => (Segment::Text, 1),
+        // First, right after the headers: the patch region's room ([`crate::place`]) is then
+        // between nothing a full link places and what it reaches. Between `__text` and
+        // `__eh_frame` it lengthened every FDE's reach back by the room; between
+        // `__eh_frame` and the GOT, a CIE's personality's (`pcrel|sdata4`, as LLVM writes it)
+        // and `__text`'s GOT loads.
+        Class::Patch => (Segment::Text, 0),
+        Class::Text => (Segment::Text, 1),
         Class::Stubs => (Segment::Text, 2),
         Class::Plt => (Segment::Text, 3),
         Class::Named { name, .. } => match Segment::of(split(name).0) {
@@ -382,7 +425,9 @@ fn split(name: &str) -> (&str, &str) {
 
 /// The segment, name and flags of the section a region is in the file.
 fn section_of(class: &Class) -> (Segment, &str, u32) {
-    let code = macho::S_REGULAR.to_flags().0 | macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
+    let code = macho::S_REGULAR.to_flags().0
+        | macho::S_ATTR_PURE_INSTRUCTIONS.0
+        | macho::S_ATTR_SOME_INSTRUCTIONS.0;
     let (segment, _) = place(class);
     let (name, flags) = match class {
         Class::Text => ("__text", code),
@@ -436,7 +481,8 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
     let alloc = |class| Ok(SectionKind::Alloc(class, u32::MAX));
     let named = |segment: &str, section: &str| {
         // Mach-O's names are at most 16 bytes each, so `SEG,SECT` fits inline.
-        let mut text: SmallVec<[u8; 40]> = SmallVec::with_capacity(segment.len() + 1 + section.len());
+        let mut text: SmallVec<[u8; 40]> =
+            SmallVec::with_capacity(segment.len() + 1 + section.len());
         text.extend_from_slice(segment.as_bytes());
         text.push(b',');
         text.extend_from_slice(section.as_bytes());
@@ -553,7 +599,9 @@ fn section_type(name: &str) -> Option<u32> {
         "thread_local_zerofill" => macho::S_THREAD_LOCAL_ZEROFILL.to_flags().0,
         "thread_local_variables" => macho::S_THREAD_LOCAL_VARIABLES.to_flags().0,
         "thread_local_variable_pointers" => macho::S_THREAD_LOCAL_VARIABLE_POINTERS.to_flags().0,
-        "thread_local_init_function_pointers" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS.to_flags().0,
+        "thread_local_init_function_pointers" => {
+            macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS.to_flags().0
+        }
         _ => return None,
     })
 }
@@ -643,7 +691,7 @@ impl Writer for MachO {
     fn plan(&self) -> Plan {
         Plan {
             base: self.base(),
-            headers: HEADERS,
+            headers: header_room(&self.output.link, self.page),
             page: self.page,
             indexed_code: false,
             got_by_library: false,
@@ -657,6 +705,16 @@ impl Writer for MachO {
 
     fn prot(&self, class: &Class) -> Prot {
         place(class).0.prot()
+    }
+
+    fn window(&self) -> Option<Window> {
+        Some(WINDOW)
+    }
+
+    fn section_name(&self, class: &Class) -> String {
+        let (segment, section, _) = section_of(class);
+        // alloc: error path
+        format!("{},{section}", segment.name())
     }
 
     fn section(
@@ -723,7 +781,8 @@ impl Writer for MachO {
         }
         let name = name.strip_prefix('\x01').unwrap_or(name);
         for (prefix, end) in [("section$start$", false), ("section$end$", true)] {
-            let Some((segment, section)) = name.strip_prefix(prefix).and_then(|it| it.split_once('$'))
+            let Some((segment, section)) =
+                name.strip_prefix(prefix).and_then(|it| it.split_once('$'))
             else {
                 continue;
             };
@@ -790,7 +849,10 @@ impl Writer for MachO {
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
         // alloc: `Writer::synthetic` returns a `Vec`: one entry, once per link
-        vec![(Class::Synthetic(UNWIND_INFO), unwind::bound(counts.functions, counts.fdes, counts.unwind))]
+        vec![(
+            Class::Synthetic(UNWIND_INFO),
+            unwind::bound(counts.functions, counts.fdes, counts.unwind),
+        )]
     }
 
     fn apply(
@@ -844,7 +906,9 @@ const _: () = {
     type E = object::LittleEndian;
     assert!(align_of::<macho::FatHeader>() == 1 && align_of::<macho::FatArch64>() == 1);
     assert!(align_of::<macho::MachHeader64<E>>() == 1 && align_of::<macho::LoadCommand<E>>() == 1);
-    assert!(align_of::<macho::SegmentCommand64<E>>() == 1 && align_of::<macho::Section64<E>>() == 1);
+    assert!(
+        align_of::<macho::SegmentCommand64<E>>() == 1 && align_of::<macho::Section64<E>>() == 1
+    );
     assert!(align_of::<macho::SymtabCommand<E>>() == 1 && align_of::<macho::Nlist64<E>>() == 1);
     assert!(align_of::<macho::Relocation<E>>() == 1 && align_of::<macho::DylibCommand<E>>() == 1);
     assert!(align_of::<macho::DyldInfoCommand<E>>() == 1);
@@ -903,6 +967,27 @@ fn page_up(value: u64, page: u64) -> u64 {
     value.next_multiple_of(page)
 }
 
+/// The room an image keeps for its header and load commands: [`HEADERS`], with what the link
+/// arguments ask after the load commands (`-headerpad`, `-headerpad_max_install_names`) on top,
+/// in whole pages.
+fn header_room(link: &crate::LinkArgs, page: u64) -> u64 {
+    let names = if link.headerpad_max_install_names { MAX_NAMES_ROOM } else { 0 };
+    page_up(HEADERS + link.headerpad + names, page)
+}
+
+/// The bytes ld64 keeps free after the load commands for the link arguments: `-headerpad`'s,
+/// or, under `-headerpad_max_install_names`, what each library path (and a shared library's
+/// own install name) needs to grow to [`MAXPATHLEN`], whichever is more.
+fn header_pad<'a>(link: &crate::LinkArgs, paths: impl Iterator<Item = &'a str>) -> u64 {
+    if !link.headerpad_max_install_names {
+        return link.headerpad;
+    }
+    let grown = (24 + MAXPATHLEN).next_multiple_of(8);
+    let names: usize =
+        paths.map(|it| grown.saturating_sub((24 + it.len() + 1).next_multiple_of(8))).sum();
+    link.headerpad.max(names as u64)
+}
+
 /// `segment$start$SEG` (`END` false) or `segment$end$SEG` of the segment `SEGMENT` in
 /// [`Segment`] order: where its first region starts, or the page after its last region's room.
 /// A segment with no regions is empty, both where it would start.
@@ -911,15 +996,26 @@ fn segment_bound<const SEGMENT: u8, const END: bool, const PAGE: u64>(regions: &
     let end_of = |it: &Region| page_up(it.addr + it.capacity, PAGE);
     let mine = || regions.iter().filter(|it| order(it) == SEGMENT);
     match (mine().map(|it| it.addr).min(), mine().map(end_of).max()) {
-        (Some(start), Some(end)) => if END { end } else { start },
+        (Some(start), Some(end)) => {
+            if END {
+                end
+            } else {
+                start
+            }
+        }
         _ => (regions.iter().filter(|it| order(it) < SEGMENT).map(end_of).max())
             .unwrap_or(BASE + HEADERS),
     }
 }
 
+/// `value` as a 32-bit field of the file (a section's offset, a size): past it is a
+/// [`crate::Refusal::FieldRange`], whose message the stage gives the image's regions.
 fn u32_of(value: u64, what: &str) -> Result<u32, LinkError> {
-    // alloc: error path
-    u32::try_from(value).map_err(|_| error(format!("{what} ({value:#x}) doesn't fit 32 bits")))
+    u32::try_from(value).map_err(|_| LinkError {
+        refusal: Some(crate::Refusal::FieldRange),
+        // alloc: error path
+        ..error(format!("{what} ({value:#x}) doesn't fit 32 bits"))
+    })
 }
 
 /// A segment or section name as a load command holds it; `name` is at most 16 bytes.
@@ -982,9 +1078,13 @@ impl MachO {
         }
         let mut has_tlv = false;
         let reserves = Reserve::ALL.map(Segment::Reserve);
-        for segment in [Segment::Text, Segment::DataConst, Segment::Data].into_iter().chain(reserves) {
-            let regions =
-                || (placed.regions.iter().enumerate()).filter(move |(_, it)| place(&it.class).0 == segment);
+        for segment in
+            [Segment::Text, Segment::DataConst, Segment::Data].into_iter().chain(reserves)
+        {
+            let regions = || {
+                (placed.regions.iter().enumerate())
+                    .filter(move |(_, it)| place(&it.class).0 == segment)
+            };
             let first = regions().next();
             if first.is_none() && segment != Segment::Text {
                 continue;
@@ -1007,7 +1107,11 @@ impl MachO {
             };
             let (mut vmend, mut filend) = (start, start);
             let mut zero_seen = None;
-            let mut sections = Vec::with_capacity(if matches!(segment, Segment::Reserve(_)) { 0 } else { regions().count() });
+            let mut sections = Vec::with_capacity(if matches!(segment, Segment::Reserve(_)) {
+                0
+            } else {
+                regions().count()
+            });
             for (index, region) in regions() {
                 let end = region.addr + region.capacity;
                 if region.addr < start {
@@ -1028,9 +1132,7 @@ impl MachO {
                         region.class, region.addr, last.name
                     )));
                 }
-                if region.size > region.capacity
-                    || placed.len(index) as u64 > region.capacity
-                {
+                if region.size > region.capacity || placed.len(index) as u64 > region.capacity {
                     // alloc: error path
                     return Err(error(format!(
                         "the region of {:?} at {:#x} holds more than its capacity",
@@ -1067,7 +1169,8 @@ impl MachO {
                 };
                 let align = region.align.max(1).trailing_zeros();
                 let (_, name, flags) = section_of(&region.class);
-                has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES.to_flags().0 && region.size != 0;
+                has_tlv |=
+                    flags == macho::S_THREAD_LOCAL_VARIABLES.to_flags().0 && region.size != 0;
                 sections.push(SectionOut {
                     name: field16(name),
                     segment: segment.name(),
@@ -1096,10 +1199,8 @@ impl MachO {
         }
         let last = segments.last().expect("`__TEXT` is always there");
         let mut vm_next = last.vmaddr + last.vmsize;
-        let mut file_next = (segments.iter())
-            .map(|it| page_up(it.fileoff + it.filesize, page))
-            .max()
-            .unwrap_or(0);
+        let mut file_next =
+            (segments.iter()).map(|it| page_up(it.fileoff + it.filesize, page)).max().unwrap_or(0);
 
         // The debug info, in a segment no one runs: the core's sections where `File::debug`
         // says, which the file lays out without a copy here.
@@ -1180,11 +1281,13 @@ impl MachO {
 
         // What the loader fixes up.
         let mut spans: Vec<linkedit::Span> = Vec::with_capacity(segments.len());
-        spans.extend((segments.iter()).filter(|it| it.name != "__DWARF").map(|it| linkedit::Span {
-            name: it.name,
-            start: it.vmaddr,
-            end: it.vmaddr + it.vmsize,
-            writable: it.prot & macho::VM_PROT_WRITE.0 != 0,
+        spans.extend((segments.iter()).filter(|it| it.name != "__DWARF").map(|it| {
+            linkedit::Span {
+                name: it.name,
+                start: it.vmaddr,
+                end: it.vmaddr + it.vmsize,
+                writable: it.prot & macho::VM_PROT_WRITE.0 != 0,
+            }
         }));
         let chained = chained::chained(&self.platform);
         if !chained && !placed.encoded.is_empty() {
@@ -1224,10 +1327,12 @@ impl MachO {
         // chained fixups' page starts. dyld's page-in linking maps every page they count from the
         // file, so a zero-fill page counted is mapped over with the bytes after the segment.
         // alloc: none: at most eight segments, inline
-        let laid: SmallVec<[(u64, u64); 8]> = segments.iter().map(|it| (it.vmaddr, it.filesize)).collect();
+        let laid: SmallVec<[(u64, u64); 8]> =
+            segments.iter().map(|it| (it.vmaddr, it.filesize)).collect();
 
         // alloc: none for a chained image, whose binds are its slots
-        let mut binds = Vec::with_capacity(if chained { 0 } else { placed.binds.len() + placed.got.len() });
+        let mut binds =
+            Vec::with_capacity(if chained { 0 } else { placed.binds.len() + placed.got.len() });
         for bind in placed.binds.iter().filter(|_| !chained) {
             let import = placed.imports.get(bind.import as usize);
             binds.push(linkedit::Bind {
@@ -1281,7 +1386,8 @@ impl MachO {
         };
         let rebases = if chained { 0 } else { placed.rebase.len() };
         // An incremental image builds it in its last link's buffer: see [`linkedit_part`].
-        let mut linkedit = Out(kept.as_deref_mut().map(|it| std::mem::take(&mut it.scratch)).unwrap_or_default());
+        let mut linkedit =
+            Out(kept.as_deref_mut().map(|it| std::mem::take(&mut it.scratch)).unwrap_or_default());
         linkedit.0.clear();
         // alloc: once per link, `__LINKEDIT`'s bytes; none for a relink in place after the
         // first, whose buffer is the last one's
@@ -1426,9 +1532,10 @@ impl MachO {
             }
         }
         if chained {
-            for (command, (at, len)) in
-                [(macho::LC_DYLD_CHAINED_FIXUPS.0, fixups_at), (macho::LC_DYLD_EXPORTS_TRIE.0, trie_at)]
-            {
+            for (command, (at, len)) in [
+                (macho::LC_DYLD_CHAINED_FIXUPS.0, fixups_at),
+                (macho::LC_DYLD_EXPORTS_TRIE.0, trie_at),
+            ] {
                 count += 1;
                 commands.put_u32(command);
                 commands.put_u32(16);
@@ -1523,10 +1630,9 @@ impl MachO {
             count += 1;
             path_command(&mut commands, macho::LC_RPATH.0, 12, rpath, &[]);
         }
-        for (command, (at, len)) in [
-            (macho::LC_FUNCTION_STARTS.0, starts_at),
-            (macho::LC_DATA_IN_CODE.0, in_code_at),
-        ] {
+        for (command, (at, len)) in
+            [(macho::LC_FUNCTION_STARTS.0, starts_at), (macho::LC_DATA_IN_CODE.0, in_code_at)]
+        {
             count += 1;
             commands.put_u32(command);
             commands.put_u32(16);
@@ -1547,7 +1653,30 @@ impl MachO {
                 placed.plan.headers
             )));
         }
-        let mut flags = macho::MH_NOUNDEFS.0 | macho::MH_DYLDLINK.0 | macho::MH_TWOLEVEL.0;
+        let own_name = match &self.output.kind {
+            OutputKind::Shared { name, .. } => Some(name.as_str()),
+            OutputKind::Executable { .. } => None,
+        };
+        let pad = header_pad(
+            &self.output.link,
+            loaded.iter().map(|it| it.0.name.as_str()).chain(own_name),
+        );
+        if (HEADER + commands.0.len()) as u64 + pad > placed.plan.headers {
+            // alloc: error path
+            return Err(error(format!(
+                "the load commands take {} bytes and the link arguments (`-headerpad`, \
+                 `-headerpad_max_install_names`) ask {pad} free after them, more than the {} the \
+                 image keeps",
+                HEADER + commands.0.len(),
+                placed.plan.headers
+            )));
+        }
+        // A symbol imported by flat lookup (`-undefined dynamic_lookup`, a shared library's
+        // undefined symbol) is one the image leaves undefined, as ld64 says it.
+        let mut flags = macho::MH_DYLDLINK.0 | macho::MH_TWOLEVEL.0;
+        if placed.imports.iter().all(|it| it.library.is_some()) {
+            flags |= macho::MH_NOUNDEFS.0;
+        }
         flags |= match shared {
             true => macho::MH_NO_REEXPORTED_DYLIBS.0,
             false => macho::MH_PIE.0,
@@ -1568,7 +1697,8 @@ impl MachO {
 
         // The file as the loader reads it, hashed where its bytes are: the chained slots
         // over the regions.
-        let mut pieces: Vec<(u64, &[u8])> = Vec::with_capacity(placed.regions.len() + debug_at.len() + 2);
+        let mut pieces: Vec<(u64, &[u8])> =
+            Vec::with_capacity(placed.regions.len() + debug_at.len() + 2);
         pieces.push((0, &headers.0[..]));
         for (index, region) in placed.regions.iter().enumerate() {
             if let Some(at) = self.offset(placed, region) {
@@ -1584,15 +1714,30 @@ impl MachO {
         let (text_at, text_len) = (text.fileoff, text.filesize);
         let mut signature = Vec::with_capacity(signature_len as usize);
         match kept.as_deref_mut() {
-            None => sign::signature(&file, identifier, text_at, text_len, !shared, None, &mut signature),
+            None => {
+                sign::signature(&file, identifier, text_at, text_len, !shared, None, &mut signature)
+            }
             Some(kept) => {
                 let written = written_since(placed, kept, &debug_at);
                 let since = (written.as_deref())
                     .zip(placed.delta)
                     .map(|(written, delta)| sign::Since { from: delta.from, written });
                 let compared = [(0, placed.plan.headers), (linkedit_at, code_limit - linkedit_at)];
-                let cached = sign::Cached { cache: &mut kept.sign, synthesis: placed.synthesis, since, kept: &compared };
-                sign::signature(&file, identifier, text_at, text_len, !shared, Some(cached), &mut signature);
+                let cached = sign::Cached {
+                    cache: &mut kept.sign,
+                    synthesis: placed.synthesis,
+                    since,
+                    kept: &compared,
+                };
+                sign::signature(
+                    &file,
+                    identifier,
+                    text_at,
+                    text_len,
+                    !shared,
+                    Some(cached),
+                    &mut signature,
+                );
             }
         }
         if signature.len() as u64 != signature_len {
@@ -1628,7 +1773,8 @@ impl MachO {
         keep: bool,
     ) -> Result<Symbols, LinkError> {
         let base = placed.plan.base;
-        let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
+        let section_at =
+            |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
 
         let exported: blaze_hash::HashSet<&str, std::alloc::Global> =
             // alloc: one set per link, sized once by the exports
@@ -1711,8 +1857,9 @@ impl MachO {
         for &(name, addr, desc, flags) in &defined {
             // The header is in no section; ld64 names it in the first, as it does here.
             let sect = match name == "_mh_execute_header" && !self.shared() {
-                true => (ranges.iter().map(|it| it.2).min())
-                    .ok_or_else(|| error("the image has no section for _mh_execute_header to name"))?,
+                true => (ranges.iter().map(|it| it.2).min()).ok_or_else(|| {
+                    error("the image has no section for _mh_execute_header to name")
+                })?,
                 false => section_at(addr, name)?,
             };
             let at = entry(name, macho::N_SECT.0 | macho::N_EXT.0, sect, desc, addr);
@@ -1729,7 +1876,8 @@ impl MachO {
                 None => u16::from(macho::DYNAMIC_LOOKUP_ORDINAL.0),
             };
             let weak = if import.weak { macho::N_WEAK_REF.0 } else { 0 };
-            import_names[index as usize] = entry(name, macho::N_UNDF.0 | macho::N_EXT.0, 0, library << 8 | weak, 0);
+            import_names[index as usize] =
+                entry(name, macho::N_UNDF.0 | macho::N_EXT.0, 0, library << 8 | weak, 0);
             index_of[index as usize] = first_undefined + nth as u32;
         }
         // Every `n_strx` is a name's start, below the table's length: past 4 GiB one wrapped.
@@ -1781,9 +1929,13 @@ impl MachO {
                 let segment = place(&class).0.name();
                 return Err(error(match self.output.dev_run {
                     // alloc: error path
-                    None => format!("`{segment}` reserves {room:#x} bytes in an image that is not a dev run"),
+                    None => format!(
+                        "`{segment}` reserves {room:#x} bytes in an image that is not a dev run"
+                    ),
                     // alloc: error path
-                    Some(_) => format!("`{segment}` reserves {room:#x} bytes where the dev run asks {asked:#x}"),
+                    Some(_) => format!(
+                        "`{segment}` reserves {room:#x} bytes where the dev run asks {asked:#x}"
+                    ),
                 }));
             }
         }
@@ -1807,20 +1959,31 @@ impl MachO {
             found = Some((at, "slides a pointer", None));
         }
         if let Some(bind) = placed.binds.iter().find(|it| code.contains(&it.addr)) {
-            found = found.filter(|it| it.0 < bind.addr).or(Some((bind.addr, "binds a pointer", Some(bind.import))));
+            found = found.filter(|it| it.0 < bind.addr).or(Some((
+                bind.addr,
+                "binds a pointer",
+                Some(bind.import),
+            )));
         }
         if let Some(cell) = placed.got.iter().find(|it| code.contains(&it.addr)) {
             let import = match cell.holds {
                 Holds::Import(import) => Some(import),
                 _ => None,
             };
-            found = found.filter(|it| it.0 < cell.addr).or(Some((cell.addr, "fixes up a GOT cell", import)));
+            found = found.filter(|it| it.0 < cell.addr).or(Some((
+                cell.addr,
+                "fixes up a GOT cell",
+                import,
+            )));
         }
         let Some((addr, what, import)) = found else { return Ok(()) };
         let section = (placed.regions.iter())
             .find(|it| (it.addr..it.addr + it.capacity.max(it.size)).contains(&addr))
             // alloc: error path
-            .map_or_else(|| "the headers".to_owned(), |it| format!("`__TEXT,{}`", section_of(&it.class).1));
+            .map_or_else(
+                || "the headers".to_owned(),
+                |it| format!("`__TEXT,{}`", section_of(&it.class).1),
+            );
         let symbol = match import.and_then(|it| placed.imports.get(it as usize)) {
             Some(import) => {
                 let (prefix, rest) = spelled(&import.name);
@@ -1884,13 +2047,19 @@ fn function_at<'p>(placed: &'p Placed<'_>, addr: u64) -> Option<&'p str> {
 /// starts on a page in the file and in memory, is all file bytes, is never writable, and
 /// shares no page of memory or of the file with another segment.
 fn code_alone(segments: &[SegmentOut], page: u64) -> Result<(), LinkError> {
-    for (nth, code) in segments.iter().enumerate().filter(|it| it.1.prot & macho::VM_PROT_EXECUTE.0 != 0) {
+    for (nth, code) in
+        segments.iter().enumerate().filter(|it| it.1.prot & macho::VM_PROT_EXECUTE.0 != 0)
+    {
         let memory = code.vmaddr..page_up(code.vmaddr + code.vmsize, page);
         let file = code.fileoff..page_up(code.fileoff + code.filesize, page);
         let shared = (segments.iter().enumerate()).find(|&(other, it)| {
             other != nth
-                && ((it.vmsize != 0 && it.vmaddr < memory.end && memory.start < it.vmaddr + it.vmsize)
-                    || (it.filesize != 0 && it.fileoff < file.end && file.start < it.fileoff + it.filesize))
+                && ((it.vmsize != 0
+                    && it.vmaddr < memory.end
+                    && memory.start < it.vmaddr + it.vmsize)
+                    || (it.filesize != 0
+                        && it.fileoff < file.end
+                        && file.start < it.fileoff + it.filesize))
         });
         let why = if code.prot & macho::VM_PROT_WRITE.0 != 0 {
             // alloc: error path
@@ -2011,7 +2180,8 @@ fn patch_locals(
         }))
         .is_ok()
     };
-    let changed = || delta.functions.iter().flat_map(|it| it.new.start as usize..it.new.end as usize);
+    let changed =
+        || delta.functions.iter().flat_map(|it| it.new.start as usize..it.new.end as usize);
     for nth in changed() {
         let function = &functions[nth];
         let local = symbols.locals_of[nth];
@@ -2031,7 +2201,8 @@ fn patch_locals(
             return Ok(false);
         }
         let entry = local as usize * NLIST;
-        let strx = u32::from_le_bytes(symbols.nlist[entry..entry + 4].try_into().expect("4 bytes")) as usize;
+        let strx = u32::from_le_bytes(symbols.nlist[entry..entry + 4].try_into().expect("4 bytes"))
+            as usize;
         let (prefix, rest) = spelled(name);
         let len = prefix.len() + rest.len();
         let Some(stored) = symbols.strings.get(strx..strx + len + 1) else { return Ok(false) };
@@ -2046,12 +2217,14 @@ fn patch_locals(
         symbols.strings[strx + prefix.len()..strx + len].copy_from_slice(rest.as_bytes());
     }
     // In order: a full build sorts the locals by (address, name) only when they aren't.
-    let key = |nth: usize| (functions[nth].addr, functions[nth].name.as_deref().unwrap_or_default());
+    let key =
+        |nth: usize| (functions[nth].addr, functions[nth].name.as_deref().unwrap_or_default());
     let locals_of = &symbols.locals_of;
     for nth in changed().filter(|&it| locals_of[it] != u32::MAX) {
         let before = (0..nth).rev().find(|&it| locals_of[it] != u32::MAX);
         let after = (nth + 1..functions.len()).find(|&it| locals_of[it] != u32::MAX);
-        if before.is_some_and(|it| key(it) > key(nth)) || after.is_some_and(|it| key(nth) > key(it)) {
+        if before.is_some_and(|it| key(it) > key(nth)) || after.is_some_and(|it| key(nth) > key(it))
+        {
             return Ok(false);
         }
     }
@@ -2079,7 +2252,8 @@ fn linkedit_part(
         // alloc: once per link, `__LINKEDIT`'s `Arc`: an image linked once keeps nothing
         return CowBytes::from_vec(built);
     };
-    let in_place = reused.iter().zip(tables).all(|(reused, table)| reused.is_none_or(|it| it == *table));
+    let in_place =
+        reused.iter().zip(tables).all(|(reused, table)| reused.is_none_or(|it| it == *table));
     match kept.linkedit.as_ref() {
         Some(last) if in_place && last.len() == built.len() => {
             // clone: two reference counts; the writes below copy only the pages they change
@@ -2098,7 +2272,8 @@ fn linkedit_part(
         last => {
             for (reused, &(start, len)) in reused.iter().zip(tables) {
                 if let Some((from, _)) = *reused {
-                    last.expect("a reused table is kept").copy_to(from, &mut built[start..start + len]);
+                    last.expect("a reused table is kept")
+                        .copy_to(from, &mut built[start..start + len]);
                 }
             }
             // alloc: once per link whose `__LINKEDIT` moved, its `Arc`
@@ -2158,7 +2333,11 @@ fn buffer(bytes: &[u8]) -> (usize, usize) {
 /// The file's byte ranges the core wrote since the link `kept` is of, (offset, length), by
 /// offset and merged: the delta's addresses in the file, each chained slot that changed, and
 /// the debug sections that aren't the same buffers. `None` when the core doesn't say.
-fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) -> Option<Vec<(u64, u64)>> {
+fn written_since(
+    placed: &Placed<'_>,
+    kept: &Kept,
+    debug_at: &[(u64, usize)],
+) -> Option<Vec<(u64, u64)>> {
     let delta = placed.delta.filter(|it| it.same_regions)?;
     let base = placed.plan.base;
     // alloc: one buffer per incremental link, of the ranges written
@@ -2193,7 +2372,8 @@ fn written_since(placed: &Placed<'_>, kept: &Kept, debug_at: &[(u64, usize)]) ->
         out.push((at - base, 8));
     }
     let same_debug = kept.debug.len() == debug_at.len()
-        && (debug_at.iter().zip(&kept.debug)).all(|(&(_, nth), &old)| buffer(&placed.debug[nth].1) == old);
+        && (debug_at.iter().zip(&kept.debug))
+            .all(|(&(_, nth), &old)| buffer(&placed.debug[nth].1) == old);
     if !same_debug {
         out.extend(debug_at.iter().map(|&(at, nth)| (at, placed.debug[nth].1.len() as u64)));
     }

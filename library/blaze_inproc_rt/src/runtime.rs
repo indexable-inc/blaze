@@ -140,7 +140,11 @@ pub extern "C" fn blaze_inproc_start() {
 /// Called by the system loader as a TLS callback.
 #[cfg(windows)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn blaze_inproc_start(_: *mut std::ffi::c_void, reason: u32, _: *mut std::ffi::c_void) {
+pub unsafe extern "system" fn blaze_inproc_start(
+    _: *mut std::ffi::c_void,
+    reason: u32,
+    _: *mut std::ffi::c_void,
+) {
     const DLL_PROCESS_ATTACH: u32 = 1;
     if reason != DLL_PROCESS_ATTACH {
         return;
@@ -156,13 +160,18 @@ pub unsafe extern "system" fn blaze_inproc_start(_: *mut std::ffi::c_void, reaso
 
 /// Attaches, or stops the process: a run whose code memory can't be laid over its image must
 /// not run the file's code in its place.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no start hook here"))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code, reason = "no start hook here")
+)]
 fn start(var: Option<Vec<u8>>) {
     if ATTACHED.get().is_some() {
         return;
     }
     let Some(var) = var else {
-        let _ = ATTACHED.set(Err(Error::new(format!("{HOST_VAR} is not set: this program was not started by blaze"))));
+        let _ = ATTACHED.set(Err(Error::new(format!(
+            "{HOST_VAR} is not set: this program was not started by blaze"
+        ))));
         return;
     };
     let mut channel = None;
@@ -182,10 +191,14 @@ fn start(var: Option<Vec<u8>>) {
     }
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no start hook here"))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code, reason = "no start hook here")
+)]
 fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     let (address, token) = host_var(var)?;
-    let format = Format::host().ok_or_else(|| Error::new("no executable format on this platform"))?;
+    let format =
+        Format::host().ok_or_else(|| Error::new("no executable format on this platform"))?;
     let page = sys::page();
     let (header, headers) = sys::own_image()?;
     let own = image::layout(format, headers, page)?;
@@ -202,7 +215,12 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
                 let why = Reader::new(frame.body).str().unwrap_or("(not UTF-8)").to_owned();
                 return Err(Error::new(format!("the daemon refused this run: {why}")));
             }
-            other => return Err(Error::new(format!("the daemon answered hello with a frame of kind {:#06x}", other.0))),
+            other => {
+                return Err(Error::new(format!(
+                    "the daemon answered hello with a frame of kind {:#06x}",
+                    other.0
+                )));
+            }
         }
     };
     grant.check(&own, page)?;
@@ -211,7 +229,10 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     let objects = sys::recv_objects(channel, grant.objects.len())?;
     for (index, (object, (len, _))) in objects.iter().zip(&grant.objects).enumerate() {
         if object.len() != *len {
-            return Err(Error::new(format!("object {index} is {:#x} bytes, where the grant says {len:#x}", object.len())));
+            return Err(Error::new(format!(
+                "object {index} is {:#x} bytes, where the grant says {len:#x}",
+                object.len()
+            )));
         }
     }
     let control = &objects[1];
@@ -246,7 +267,13 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     Writer::new(&mut started).u64(sys::thread_id());
     channel.send(kinds::STARTED, 0, &started)?;
     let channel = out.take().ok_or_else(|| Error::new("the channel went away while starting"))?;
-    Ok(Attached { control: words, asks, stream: channel.into_stream(), slide, pid: std::process::id() })
+    Ok(Attached {
+        control: words,
+        asks,
+        stream: channel.into_stream(),
+        slide,
+        pid: std::process::id(),
+    })
 }
 
 /// The calling thread's slot and the epoch it last reported, and its release when it ends.
@@ -357,7 +384,12 @@ impl Attached {
     /// From any thread, any number at once, and from a signal handler, also one that
     /// interrupted its own thread inside this call: it takes no lock, allocates nothing, and
     /// leaves `errno` as it found it. Errors are made only on failure, and allocate.
-    pub fn request_into(&self, kind: Kind, body: &[u8], answer: &mut [u8]) -> Result<(Kind, usize), Error> {
+    pub fn request_into(
+        &self,
+        kind: Kind,
+        body: &[u8],
+        answer: &mut [u8],
+    ) -> Result<(Kind, usize), Error> {
         ask::request(&self.asks, &self.stream, kind, body, answer)
     }
 }

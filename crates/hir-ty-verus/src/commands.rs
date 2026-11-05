@@ -96,7 +96,9 @@ pub(crate) fn ops(ctx: &mut Ctx, krate: &KrateSst, bucket: &[Fun]) -> Result<Vec
             if function.x.mode == Mode::Spec && !matches!(function.x.item_kind, ItemKind::Const) {
                 continue;
             }
-            if let FunctionKind::TraitMethodImpl { inherit_body_from: Some(..), .. } = &function.x.kind {
+            if let FunctionKind::TraitMethodImpl { inherit_body_from: Some(..), .. } =
+                &function.x.kind
+            {
                 // Inherited from a trait's default method, which is proved in the trait.
                 continue;
             }
@@ -107,7 +109,11 @@ pub(crate) fn ops(ctx: &mut Ctx, krate: &KrateSst, bucket: &[Fun]) -> Result<Vec
             ctx.fun = mk_fun_ctx(function, false);
             let commands = vir::sst_to_air_func::func_sst_to_air(ctx, function, check);
             ctx.fun = None;
-            ops.push(Op::Query { op: QueryOp::Body, function: function.clone(), commands: commands? });
+            ops.push(Op::Query {
+                op: QueryOp::Body,
+                function: function.clone(),
+                commands: commands?,
+            });
         }
 
         ops.extend(post_ops);

@@ -50,8 +50,7 @@ use blaze_mem::Frame;
 use either::Either;
 use mbe::MatchedArmIndex;
 use span::{
-    AstIdMap, Edition, ErasedFileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span,
-    SyntaxContext,
+    AstIdMap, Edition, ErasedFileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SyntaxContext,
 };
 use syntax::{
     Parse, SyntaxError, SyntaxNode, T, TextRange, TextSize,
@@ -194,7 +193,10 @@ pub enum ExpandErrorKind {
     ProcMacroAttrExpansionDisabled,
     /// A macro of proc-macro crate `krate` with no expander, and why, as the proc-macro map
     /// said when the call was expanded.
-    MissingProcMacroExpander { krate: Crate, why: Box<str> },
+    MissingProcMacroExpander {
+        krate: Crate,
+        why: Box<str>,
+    },
     /// The macro for this call is disabled.
     MacroDisabled,
     /// The macro definition has errors.
@@ -665,16 +667,15 @@ impl MacroCallId {
             rev_token_map.dropped_semicolon = semicolon;
             // alloc: only for an expansion whose `${concat(..)}`s made identifiers
             rev_token_map.made_idents = made.into_iter().collect();
+            // Kept as this query's value: counted in `span::kept_maps` until it is dropped.
+            rev_token_map.count_kept();
             let err = err.or_else(|| ignored_semicolon(db, loc, semicolon));
 
             ExpandResult { value: (parse, rev_token_map), err }
         })
     }
 
-    pub fn parse_macro_expansion_error(
-        self,
-        db: &Db,
-    ) -> Option<ExpandResult<Arc<[SyntaxError]>>> {
+    pub fn parse_macro_expansion_error(self, db: &Db) -> Option<ExpandResult<Arc<[SyntaxError]>>> {
         let e: ExpandResult<Arc<[SyntaxError]>> =
             self.parse_macro_expansion(db).as_ref().map(|it| Arc::from(it.0.errors()));
         if e.value.is_empty() && e.err.is_none() { None } else { Some(e) }
@@ -729,7 +730,9 @@ impl MacroCallId {
         let loc = self.loc(db);
 
         if let MacroCallKind::FnLike { eager: Some(_), .. } = &loc.kind {
-            unreachable!("an eager call's argument is its location's, read by `macro_arg_considering_derives`");
+            unreachable!(
+                "an eager call's argument is its location's, read by `macro_arg_considering_derives`"
+            );
         }
 
         let map = loc.kind.file_id().span_map(db);
@@ -901,7 +904,9 @@ impl MacroCallId {
                         .zip_val(None),
                     MacroDefKind::BuiltInDerive(_, it) => {
                         let ExpandResult { value, err } = it.expand(db, frame, self, arg, span);
-                        let at_call = |it: &ExpandError| it.span().range == span.range && it.span().anchor == span.anchor;
+                        let at_call = |it: &ExpandError| {
+                            it.span().range == span.range && it.span().anchor == span.anchor
+                        };
                         let err = match err {
                             Some(err) if at_call(&err) => match derive_path_span(db, loc) {
                                 Some(path) => Some(err.at(path)),
@@ -965,13 +970,21 @@ impl MacroCallId {
     fn proc_macro_expansion(
         self,
         db: &Db,
-    ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads) {
+    ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads, proc_macro::StateUse) {
         let loc = self.loc(db);
         let (macro_arg, undo_info, _) = self.macro_arg_considering_derives(db, &loc.kind);
         if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
             let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
-            db.files().expansions_are_read(loc.krate, base_db::ReadBy::Call(self.into()), Vec::new());
-            return (ExpandResult::new(empty, refusal), proc_macro::ExpansionReads::Nothing);
+            db.files().expansions_are_read(
+                loc.krate,
+                base_db::ReadBy::Call(self.into()),
+                Vec::new(),
+            );
+            return (
+                ExpandResult::new(empty, refusal),
+                proc_macro::ExpansionReads::Nothing,
+                proc_macro::StateUse::Fixed,
+            );
         }
 
         let (ast, expander) = match loc.def.kind {
@@ -984,9 +997,13 @@ impl MacroCallId {
             _ => None,
         };
 
-        // A report left by an expansion that panicked is not this one's.
-        proc_macro::take_reads();
-        let ExpandResult { value: mut tt, err } = {
+        // The expander states what the call read and whether its session's state took part
+        // (`proc_macro::Expanded`): nothing here guesses either for it.
+        let proc_macro::ProcMacroExpansion {
+            result: ExpandResult { value: mut tt, err },
+            reads,
+            state,
+        } = {
             let span = proc_macro_span(db, ast);
             expander.expand(
                 db,
@@ -999,15 +1016,14 @@ impl MacroCallId {
                 span_with_mixed_site_ctxt(db, span, self.into(), loc.def.edition),
             )
         };
-        let reported = proc_macro::take_reads();
-        let reads = match expander.requires_session(db, loc.def.krate) {
-            true => proc_macro::ExpansionReads::Unknown(
-                "its macro keeps a session: an expansion depends on the calls before it",
-            ),
-            false => reported.unwrap_or(proc_macro::ExpansionReads::Unknown(
-                "its expander reported nothing of what it read",
-            )),
-        };
+        // A call whose output may depend on the calls before it read its session's state, which
+        // lives in the expander: it runs again in every revision, in the order its readers ask
+        // for it, so the session is built again in order, and keeps its value when it gives the
+        // same. A call that is fixed by its call and reads (a stateless crate's, or a shown call
+        // of a crate that settles) reads nothing outside the database and is reused.
+        if let proc_macro::StateUse::Session(why) = state {
+            blaze_query::db::report_untracked_read(db, blaze_query::db::Untracked { what: why });
+        }
         // What keys a value by the crate's reads (a unit's record) reads them from the log, which
         // has this call's latest expansion only: one that was unknown and traces now replaces it.
         let logged = match &reads {
@@ -1023,7 +1039,7 @@ impl MacroCallId {
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
-        (ExpandResult { value: tt, err }, reads)
+        (ExpandResult { value: tt, err }, reads, state)
     }
 }
 
@@ -1034,9 +1050,15 @@ impl MacroCallId {
     }
 
     /// What the expansion of this proc-macro call read besides its call, as its expander
-    /// reported it (`proc_macro::report_reads`). Panics for a call of another kind of macro.
+    /// stated it (`proc_macro::Expanded::reads`). Panics for a call of another kind of macro.
     pub fn expansion_reads(self, db: &Db) -> &proc_macro::ExpansionReads {
         &self.proc_macro_expansion(db).1
+    }
+
+    /// Whether what this proc-macro call gave depends on its session's state, as its expander
+    /// stated it (`proc_macro::Expanded::state`). Panics for a call of another kind of macro.
+    pub fn expansion_state(self, db: &Db) -> proc_macro::StateUse {
+        self.proc_macro_expansion(db).2
     }
 
     /// The proc macro this calls, as `def_crate` loaded it, and whether its calls from the
@@ -1045,7 +1067,9 @@ impl MacroCallId {
     pub fn proc_macro_ordered(self, db: &Db) -> Option<(Crate, bool)> {
         let def = self.loc(db).def;
         match def.kind {
-            MacroDefKind::ProcMacro(_, expander, _) => Some((def.krate, expander.ordered(db, def.krate))),
+            MacroDefKind::ProcMacro(_, expander, _) => {
+                Some((def.krate, expander.ordered(db, def.krate)))
+            }
             _ => None,
         }
     }
@@ -1055,7 +1079,9 @@ impl MacroCallId {
     pub fn proc_macro_speculates(self, db: &Db) -> bool {
         let loc = self.loc(db);
         match loc.def.kind {
-            MacroDefKind::ProcMacro(_, expander, _) => expander.speculates(db, loc.def.krate, loc.krate),
+            MacroDefKind::ProcMacro(_, expander, _) => {
+                expander.speculates(db, loc.def.krate, loc.krate)
+            }
             _ => false,
         }
     }
@@ -1147,11 +1173,7 @@ pub(crate) fn token_tree_to_syntax_node(
 /// rustc's error for the `;` an expression's expansion ends in, at `semicolon`, when the macro
 /// is not a `macro_rules!` one: `ParserAnyMacro::make` drops the `;` only for those, and for
 /// any other macro `ensure_complete_parse` reports it, keeping the expression before it.
-fn ignored_semicolon(
-    db: &Db,
-    loc: &MacroCallLoc,
-    semicolon: Option<Span>,
-) -> Option<ExpandError> {
+fn ignored_semicolon(db: &Db, loc: &MacroCallLoc, semicolon: Option<Span>) -> Option<ExpandError> {
     let semicolon = semicolon?;
     let eager_input = matches!(
         (&loc.def.kind, &loc.kind),
@@ -1300,7 +1322,9 @@ impl MacroDefId {
 /// `None` for a call that is no derive, or whose attribute names fewer paths than its index:
 /// its errors stay at the attribute.
 fn derive_path_span(db: &Db, loc: &MacroCallLoc) -> Option<Span> {
-    let MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } = &loc.kind else { return None };
+    let MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } = &loc.kind else {
+        return None;
+    };
     let (_, meta) = derive_attr_index.find_attr_range_view(db, loc.krate, *ast_id);
     let (_, tt) = meta.as_simple_call()?;
     // The paths are counted as the collector numbers them: each run between commas that
@@ -1373,11 +1397,7 @@ impl MacroCallLoc {
         }
     }
 
-    pub fn include_file_id(
-        &self,
-        db: &Db,
-        macro_call_id: MacroCallId,
-    ) -> Option<EditionedFileId> {
+    pub fn include_file_id(&self, db: &Db, macro_call_id: MacroCallId) -> Option<EditionedFileId> {
         if self.def.is_include()
             && let MacroCallKind::FnLike { eager: Some(eager), .. } = &self.kind
             && let Ok(it) = include_input_to_file_id(db, macro_call_id, &eager.arg)
@@ -1464,14 +1484,12 @@ impl MacroCallKind {
                 derive_attr_index.find_attr_range_view(db, krate, *ast_id).1.syntax().text_range()
             }
             // FIXME: handle `cfg_attr`
-            MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-                attr_ids
-                    .invoc_attr()
-                    .find_attr_range_view(db, krate, *ast_id)
-                    .1
-                    .syntax()
-                    .text_range()
-            }
+            MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => attr_ids
+                .invoc_attr()
+                .find_attr_range_view(db, krate, *ast_id)
+                .1
+                .syntax()
+                .text_range(),
         };
 
         let mut range = get_range(self);
@@ -1553,9 +1571,10 @@ impl<'db> ExpansionInfo<'db> {
         }
 
         let root = self.expanded_root;
-        let tokens = self.exp_map.ranges_with_span_exact(span).flat_map(move |(range, ctx)| {
-            root.covering_element(range).into_token().zip(Some(ctx))
-        });
+        let tokens = self
+            .exp_map
+            .ranges_with_span_exact(span)
+            .flat_map(move |(range, ctx)| root.covering_element(range).into_token().zip(Some(ctx)));
 
         Some(InMacroFile::new(self.expanded_file, tokens))
     }
@@ -1573,9 +1592,10 @@ impl<'db> ExpansionInfo<'db> {
         }
 
         let root = self.expanded_root;
-        let tokens = self.exp_map.ranges_with_span(span).flat_map(move |(range, ctx)| {
-            root.covering_element(range).into_token().zip(Some(ctx))
-        });
+        let tokens = self
+            .exp_map
+            .ranges_with_span(span)
+            .flat_map(move |(range, ctx)| root.covering_element(range).into_token().zip(Some(ctx)));
 
         Some(InMacroFile::new(self.expanded_file, tokens))
     }
@@ -1592,11 +1612,7 @@ impl<'db> ExpansionInfo<'db> {
     }
 
     /// Looks up the span at the given offset.
-    pub fn span_for_offset(
-        &self,
-        db: &Db,
-        offset: TextSize,
-    ) -> (FileRange, SyntaxContext) {
+    pub fn span_for_offset(&self, db: &Db, offset: TextSize) -> (FileRange, SyntaxContext) {
         debug_assert!(self.expanded_root.text_range().contains(offset));
         span_for_offset(db, self.exp_map, offset)
     }
@@ -1625,7 +1641,10 @@ impl<'db> ExpansionInfo<'db> {
         match &self.arg_map {
             SpanMap::RealSpanMap(_) => {
                 let range = resolve_span(db, span);
-                InFile { file_id: range.file_id.into(), value: smallvec::SmallVec::from_buf([range.range]) }
+                InFile {
+                    file_id: range.file_id.into(),
+                    value: smallvec::SmallVec::from_buf([range.range]),
+                }
             }
             SpanMap::ExpansionSpanMap(arg_map) => {
                 let Some(arg_node) = self.arg_root else {
@@ -2041,7 +2060,12 @@ impl HirFileId {
     fn syntax_error_ranges(self, db: &Db) -> Box<[TextRange]> {
         let mut ranges: Vec<TextRange> = match self {
             HirFileId::FileId(file_id) => {
-                file_id.parse_errors(db).unwrap_or_default().iter().map(SyntaxError::range).collect() // alloc: the query's value, once per file
+                file_id
+                    .parse_errors(db)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(SyntaxError::range)
+                    .collect() // alloc: the query's value, once per file
             }
             HirFileId::MacroFile(macro_file) => macro_file
                 .parse_macro_expansion(db)
@@ -2089,9 +2113,8 @@ mod tests {
     #[test]
     fn error_ranges_touching() {
         let errors = [range(3, 3), range(10, 20), range(15, 16), range(40, 41)];
-        let naive = |it: TextRange| {
-            errors.iter().any(|e| e.start() <= it.end() && e.end() >= it.start())
-        };
+        let naive =
+            |it: TextRange| errors.iter().any(|e| e.start() <= it.end() && e.end() >= it.start());
         for start in 0..45 {
             for end in start..45 {
                 let it = range(start, end);

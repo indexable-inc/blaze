@@ -24,8 +24,9 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 mod graph;
 pub mod index;
-mod order;
 pub mod load;
+pub mod lock;
+mod order;
 pub mod query;
 pub mod read;
 pub mod schema;
@@ -33,11 +34,11 @@ pub mod sources;
 pub mod stdlib;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::Profiles;
 use blaze_resolve::resolver::ResolvedFeatures;
 use blaze_resolve::{Cfg, PackageId, Platform, Resolve};
+use std::alloc::Global;
 
 pub use read::Read;
 pub use schema::UnitGraph;

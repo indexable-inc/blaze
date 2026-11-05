@@ -273,10 +273,9 @@ impl<'db> InferCtxt<'db> {
             self.register_region_assumption(assumption);
         }
 
-        let user_result: R =
-            query_response
-                // clone: borrowed from the response; for interned values this is a copy.
-                .instantiate_projected(self.interner, &result_args, |q_r| q_r.value.clone());
+        let user_result: R = query_response
+            // clone: borrowed from the response; for interned values this is a copy.
+            .instantiate_projected(self.interner, &result_args, |q_r| q_r.value.clone());
 
         Ok(InferOk { value: user_result, obligations })
     }

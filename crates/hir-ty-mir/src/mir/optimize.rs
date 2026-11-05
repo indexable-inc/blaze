@@ -64,6 +64,7 @@ use super::{
 pub use box_in_place::BOX_IN_PLACE_MIN;
 pub use escape::heap_held;
 pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
+pub(crate) use inline::{shipped_cross_crate_inlinable, written_cross_crate_inlinable};
 pub use specialize::{CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, specialized_mir_body};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -73,11 +74,7 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     match level {
         MirOptLevel::Off => &[],
-        MirOptLevel::Debug => &[
-            "ForceInline",
-            "RemoveZsts",
-            "UnreachableEnumBranching",
-        ],
+        MirOptLevel::Debug => &["ForceInline", "RemoveZsts", "UnreachableEnumBranching"],
         MirOptLevel::Release => &[
             "ForceInline",
             "RemoveZsts",
@@ -353,8 +350,7 @@ fn validate(body: &MirBody<'_>, frame: &Frame) -> std::result::Result<(), String
             }
             continue;
         };
-        if let Some(target) =
-            terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
+        if let Some(target) = terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
         {
             // alloc: error path
             return Err(format!(

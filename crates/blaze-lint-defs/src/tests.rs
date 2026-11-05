@@ -52,17 +52,27 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 82);
+    assert_eq!(blaze_lints().len(), 86);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
-    let built: Vec<&str> = blaze_lints().iter().filter(|it| !it.is_externally_loaded).map(|it| it.name).collect();
-    assert_eq!(built, ["blaze::const_impure", "blaze::vecreport"]);
+    let built: Vec<&str> =
+        blaze_lints().iter().filter(|it| !it.is_externally_loaded).map(|it| it.name).collect();
+    assert_eq!(
+        built,
+        ["blaze::const_impure", "blaze::dead", "blaze::test_only", "blaze::cfg_only", "blaze::vecreport"]
+    );
     let general = group("blaze::general").expect("blaze's general group");
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`).
-    let deny = ["blaze::checkfree", "blaze::nopanic", "blaze::noalloc", "blaze::nonblocking", "blaze::pure"];
+    let deny = [
+        "blaze::checkfree",
+        "blaze::nopanic",
+        "blaze::noalloc",
+        "blaze::nonblocking",
+        "blaze::pure",
+    ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
         let (in_general, in_internal, in_pedantic) = (in_(general), in_(internal), in_(pedantic));
@@ -79,7 +89,11 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         } else {
             Level::Allow
         };
-        assert_eq!(it.default_level, level, "`{}`: a general lint warns, an internal or pedantic_perf one waits", it.name);
+        assert_eq!(
+            it.default_level, level,
+            "`{}`: a general lint warns, an internal or pedantic_perf one waits",
+            it.name
+        );
     }
     let hot = group("blaze::hot").expect("blaze's group");
     let members: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
@@ -100,8 +114,14 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let hot_dyn = super::lint("blaze::hot_dyn").expect("blaze-lints' lint");
     assert_eq!(store.check("hot_dyn", Some(BLAZE_TOOL)), Checked::Tool(hot_dyn.id().alone(), None));
     assert_eq!(store.group_of(hot_dyn), None);
-    assert_eq!(store.check("std_hashmap", Some(BLAZE_TOOL)), Checked::Renamed("blaze::default_hasher"));
-    assert_eq!(store.check("const_impure", Some(BLAZE_TOOL)), Checked::Tool(lint.id().alone(), None));
+    assert_eq!(
+        store.check("std_hashmap", Some(BLAZE_TOOL)),
+        Checked::Renamed("blaze::default_hasher")
+    );
+    assert_eq!(
+        store.check("const_impure", Some(BLAZE_TOOL)),
+        Checked::Tool(lint.id().alone(), None)
+    );
     assert_eq!(store.find_lints("blaze::const_impure"), Some(lint.id().alone()));
     assert!(matches!(store.check("const_purity", Some(BLAZE_TOOL)), Checked::NoLint { .. }));
     assert_eq!(store.check("const_impure", Some("blazer")), Checked::NoTool);
@@ -112,7 +132,10 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
 fn group_of_is_the_first_group_without_aliases() {
     let store = Store::default();
     for lint in lints() {
-        let first = groups().iter().filter(|it| it.alias_of.is_none()).find(|it| it.lints.iter().any(|it| it.name == lint.name));
+        let first = groups()
+            .iter()
+            .filter(|it| it.alias_of.is_none())
+            .find(|it| it.lints.iter().any(|it| it.name == lint.name));
         assert_eq!(store.group_of(lint), first.map(|it| it.name), "{}", lint.name);
     }
 }
@@ -145,10 +168,12 @@ fn counts_are_rustcs() {
             "blaze::general",
             "blaze::pedantic_perf",
             "blaze::internal",
+            "blaze::reach",
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);
-    assert_eq!(renamed().len(), 18);
+    // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
+    assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
     assert_eq!(removed().len(), 66);
 }
 
@@ -213,7 +238,8 @@ fn future_incompatible() {
         "this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!"
     );
     assert!(!lint("static_mut_refs").unwrap().future_incompatible.unwrap().explain_reason);
-    let groups = |name: &str| group(name).unwrap().lints.iter().any(|it| it.name == "bare_trait_objects");
+    let groups =
+        |name: &str| group(name).unwrap().lints.iter().any(|it| it.name == "bare_trait_objects");
     assert!(groups("rust_2021_compatibility"));
     assert!(!groups("future_incompatible"));
     assert!(groups("rust_2018_idioms"));
@@ -248,11 +274,10 @@ fn check_lint_name() {
     assert_eq!(store.check("anything", Some("rustdoc")), Checked::MissingTool);
     assert_eq!(store.check("internal", Some("rustc")), Checked::MissingTool);
     let store = Store { internal: true, registered_tools: Vec::new() };
-    assert!(matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 16));
-    assert_eq!(
-        store.check("default_hash_type", Some("rustc")),
-        Checked::NoLint { suggest: true }
+    assert!(
+        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 16)
     );
+    assert_eq!(store.check("default_hash_type", Some("rustc")), Checked::NoLint { suggest: true });
     assert!(store.is_lint_group("warnings"));
     assert!(store.is_lint_group("unused"));
     assert!(!store.is_lint_group("dead_code"));
@@ -292,7 +317,10 @@ mod by_scan {
             }
         }
         for &(name, members) in names::GROUPS {
-            let lints = members.iter().map(|member| lints().iter().find(|it| it.name == *member).unwrap()).collect();
+            let lints = members
+                .iter()
+                .map(|member| lints().iter().find(|it| it.name == *member).unwrap())
+                .collect();
             groups.push((name, lints, None));
         }
         for &(alias, of) in names::ALIASES {
@@ -300,7 +328,10 @@ mod by_scan {
             groups.push((alias, lints, Some(of)));
         }
         for &(name, members) in names::BLAZE_GROUPS {
-            let lints = members.iter().map(|member| blaze_lints().iter().find(|it| it.name == *member).unwrap()).collect();
+            let lints = members
+                .iter()
+                .map(|member| blaze_lints().iter().find(|it| it.name == *member).unwrap())
+                .collect();
             groups.push((name, lints, None));
         }
         groups
@@ -344,7 +375,9 @@ mod by_scan {
     }
 
     pub(super) fn by_name(store: &Store, name: &str) -> Option<&'static Lint> {
-        lint(name).or_else(|| store.internal.then(|| internal_lints().iter().find(|it| it.name == name)).flatten())
+        lint(name).or_else(|| {
+            store.internal.then(|| internal_lints().iter().find(|it| it.name == name)).flatten()
+        })
     }
 
     pub(super) fn store_group(store: &Store, name: &str) -> Option<&'static Group> {
@@ -365,7 +398,9 @@ mod by_scan {
     }
 
     pub(super) fn has_lints_of(store: &Store, tool: &str) -> bool {
-        let of = |table: &[Lint]| table.iter().any(|it| it.name.split_once("::").is_some_and(|(it, _)| it == tool));
+        let of = |table: &[Lint]| {
+            table.iter().any(|it| it.name.split_once("::").is_some_and(|(it, _)| it == tool))
+        };
         of(lints()) || of(blaze_lints()) || (store.internal && of(internal_lints()))
     }
 
@@ -454,8 +489,13 @@ mod by_scan {
 /// Every name the store has: of every lint table, every group and alias, `rustc::internal`,
 /// the renamed (old and new), removed and ignored names.
 fn every_name() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> =
-        lints().iter().chain(blaze_lints()).chain(internal_lints()).chain(unregistered()).map(|it| it.name).collect();
+    let mut names: Vec<&'static str> = lints()
+        .iter()
+        .chain(blaze_lints())
+        .chain(internal_lints())
+        .chain(unregistered())
+        .map(|it| it.name)
+        .collect();
     names.extend(groups().iter().map(|it| it.name));
     names.push("rustc::internal");
     names.extend(names::RENAMED.iter().flat_map(|&(old, new)| [old, new]));
@@ -492,7 +532,9 @@ fn names_and_misses() -> Vec<String> {
     let mut names: Vec<String> = every_name().into_iter().map(str::to_owned).collect();
     let misses: Vec<String> = every_name().into_iter().flat_map(near_misses).collect();
     names.extend(misses);
-    names.extend(["", "warnings", "unused", "bad_style", "rustc", "clippy::", "::", "a"].map(str::to_owned));
+    names.extend(
+        ["", "warnings", "unused", "bad_style", "rustc", "clippy::", "::", "a"].map(str::to_owned),
+    );
     // Longer than any name of the tables, with and without a tool.
     names.push("x".repeat(index::LONGEST + 1));
     names.push(format!("{}dead_code", "x".repeat(index::LONGEST)));
@@ -504,12 +546,25 @@ fn every_name_is_found_as_by_a_scan() {
     for name in &names_and_misses() {
         let name = name.as_str();
         assert_eq!(lint(name).map(|it| it.name), by_scan::lint(name).map(|it| it.name), "{name:?}");
-        assert!(lint(name).zip(by_scan::lint(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)), "{name:?}");
-        assert_eq!(declared(name).map(|it| it.name), by_scan::declared(name).map(|it| it.name), "{name:?}");
-        assert!(declared(name).zip(by_scan::declared(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)), "{name:?}");
+        assert!(
+            lint(name).zip(by_scan::lint(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)),
+            "{name:?}"
+        );
+        assert_eq!(
+            declared(name).map(|it| it.name),
+            by_scan::declared(name).map(|it| it.name),
+            "{name:?}"
+        );
+        assert!(
+            declared(name).zip(by_scan::declared(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)),
+            "{name:?}"
+        );
         let group = group(name);
         assert_eq!(group.map(|it| it.name), by_scan::group(name).map(|it| it.name), "{name:?}");
-        assert!(group.zip(by_scan::group(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)), "{name:?}");
+        assert!(
+            group.zip(by_scan::group(name)).is_none_or(|(a, b)| std::ptr::eq(a, b)),
+            "{name:?}"
+        );
         assert_eq!(named(name), by_scan::named(name), "{name:?}");
         let renamed = match by_scan::renaming(name) {
             Some(by_scan::Name::Renamed(new)) => Some(new),
@@ -552,15 +607,26 @@ fn check_is_as_by_a_scan() {
     let mut names: Vec<String> = every_name().into_iter().map(str::to_owned).collect();
     let misses: Vec<String> = every_name().into_iter().flat_map(near_misses).collect();
     names.extend(misses);
-    names.extend(["", "warnings", "unused", "bad_style", "rustc", "clippy::", "::", "a"].map(str::to_owned));
+    names.extend(
+        ["", "warnings", "unused", "bad_style", "rustc", "clippy::", "::", "a"].map(str::to_owned),
+    );
     names.push("x".repeat(index::LONGEST + 1));
-    let tools = [None, Some("rustc"), Some("rustdoc"), Some("blaze"), Some("clippy"), Some("tool"), Some("nope")];
+    let tools = [
+        None,
+        Some("rustc"),
+        Some("rustdoc"),
+        Some("blaze"),
+        Some("clippy"),
+        Some("tool"),
+        Some("nope"),
+    ];
     for internal in [false, true] {
         let store = Store { internal, registered_tools: vec!["tool".to_owned()] };
         for name in &names {
             // The checks of a name's tool part: `tool::name` written as rustc's attribute
             // parser splits it, and as given.
-            let mut asked: Vec<(&str, Option<&str>)> = tools.iter().map(|&tool| (name.as_str(), tool)).collect();
+            let mut asked: Vec<(&str, Option<&str>)> =
+                tools.iter().map(|&tool| (name.as_str(), tool)).collect();
             if let Some((tool, rest)) = name.split_once("::") {
                 asked.push((rest, Some(tool)));
             }
@@ -602,7 +668,11 @@ fn groups_are_as_built_by_name() {
 fn group_of_an_internal_lint() {
     let store = Store { internal: true, registered_tools: Vec::new() };
     for lint in internal_lints() {
-        let first = internal_group().lints.iter().any(|it| std::ptr::eq(*it, lint)).then_some("rustc::internal");
+        let first = internal_group()
+            .lints
+            .iter()
+            .any(|it| std::ptr::eq(*it, lint))
+            .then_some("rustc::internal");
         assert_eq!(store.group_of(lint), first, "{}", lint.name);
         assert_eq!(Store::default().group_of(lint), None, "{}", lint.name);
     }
@@ -613,21 +683,31 @@ fn group_of_an_internal_lint() {
 
 #[test]
 fn tools_are_as_by_a_scan() {
-    let mut tools: Vec<&str> = vec!["", "rustc", "rustdoc", "blaze", "clippy", "rust", "blaze:", "rustc::", "r"];
-    tools.extend(every_name().into_iter().filter_map(|it| it.split_once("::").map(|(tool, _)| tool)));
+    let mut tools: Vec<&str> =
+        vec!["", "rustc", "rustdoc", "blaze", "clippy", "rust", "blaze:", "rustc::", "r"];
+    tools.extend(
+        every_name().into_iter().filter_map(|it| it.split_once("::").map(|(tool, _)| tool)),
+    );
     for internal in [false, true] {
         let store = Store { internal, registered_tools: Vec::new() };
         for tool in &tools {
-            assert_eq!(store.has_lints_of(tool), by_scan::has_lints_of(&store, tool), "{tool:?} internal: {internal}");
+            assert_eq!(
+                store.has_lints_of(tool),
+                by_scan::has_lints_of(&store, tool),
+                "{tool:?} internal: {internal}"
+            );
         }
     }
     assert!(Store { internal: true, registered_tools: Vec::new() }.has_lints_of("rustc"));
     assert!(!Store::default().has_lints_of("rustc"));
     assert!(Store::default().has_lints_of(BLAZE_TOOL));
-    for tool in ["rustc", "rustdoc", "blaze", "clippy", "rustfmt", "diagnostic", "miri", "rust_analyzer"] {
+    for tool in
+        ["rustc", "rustdoc", "blaze", "clippy", "rustfmt", "diagnostic", "miri", "rust_analyzer"]
+    {
         assert!(KNOWN_TOOLS.get(tool).is_some(), "{tool}");
         for miss in near_misses(tool) {
-            let known = ["rustc", "rustdoc", BLAZE_TOOL].contains(&miss.as_str()) || PREDEFINED_TOOLS.contains(&miss.as_str());
+            let known = ["rustc", "rustdoc", BLAZE_TOOL].contains(&miss.as_str())
+                || PREDEFINED_TOOLS.contains(&miss.as_str());
             assert_eq!(KNOWN_TOOLS.get(&miss).is_some(), known, "{miss:?}");
         }
     }
@@ -635,7 +715,8 @@ fn tools_are_as_by_a_scan() {
 
 #[test]
 fn joined_names_are_the_bytes_of_the_format() {
-    for (tool, name) in [("clippy", "x"), ("rustc", "default_hash_types"), ("", ""), ("a", "b::c")] {
+    for (tool, name) in [("clippy", "x"), ("rustc", "default_hash_types"), ("", ""), ("a", "b::c")]
+    {
         assert_eq!(index::Joined::new(tool, name).bytes(), format!("{tool}::{name}").as_bytes());
     }
     let long = "x".repeat(index::LONGEST);
@@ -652,10 +733,12 @@ fn level_attrs_are_as_matched() {
         "forbid" => Some(Level::Forbid),
         _ => None,
     };
-    let mut names: Vec<String> = ["allow", "expect", "warn", "deny", "forbid", "force-warn", "force_warn", "doc", "cfg", ""]
-        .map(str::to_owned)
-        .to_vec();
-    let misses: Vec<String> = ["allow", "expect", "warn", "deny", "forbid"].into_iter().flat_map(near_misses).collect();
+    let mut names: Vec<String> =
+        ["allow", "expect", "warn", "deny", "forbid", "force-warn", "force_warn", "doc", "cfg", ""]
+            .map(str::to_owned)
+            .to_vec();
+    let misses: Vec<String> =
+        ["allow", "expect", "warn", "deny", "forbid"].into_iter().flat_map(near_misses).collect();
     names.extend(misses);
     for name in &names {
         assert_eq!(Level::of_attr(name), by_match(name), "{name:?}");
@@ -698,7 +781,16 @@ fn lint_sets_are_as_sets() {
 fn lint_options_are_rustcs_flags_in_order() {
     let args = |args: &[&str]| -> Vec<String> { args.iter().map(|&it| it.to_owned()).collect() };
     let options = LintOptions::parse(&args(&[
-        "-A", "dead-code", "-Wunused", "--force-warn", "x", "--deny=clippy::all", "--forbid", "y", "--cap-lints", "warn",
+        "-A",
+        "dead-code",
+        "-Wunused",
+        "--force-warn",
+        "x",
+        "--deny=clippy::all",
+        "--forbid",
+        "y",
+        "--cap-lints",
+        "warn",
     ]))
     .unwrap();
     assert_eq!(
@@ -718,7 +810,13 @@ fn lint_options_are_rustcs_flags_in_order() {
         LintOptions::parse(&args(&["--cap-lints", "allow", "--cap-lints=deny"])).unwrap_err(),
         "Option 'cap-lints' given more than once"
     );
-    assert_eq!(LintOptions::parse(&args(&["--cap-lints", "expect"])).unwrap_err(), "unknown lint level: `expect`");
-    assert_eq!(LintOptions::parse(&args(&["--cfg", "x"])).unwrap_err(), "`--cfg` is not a lint flag");
+    assert_eq!(
+        LintOptions::parse(&args(&["--cap-lints", "expect"])).unwrap_err(),
+        "unknown lint level: `expect`"
+    );
+    assert_eq!(
+        LintOptions::parse(&args(&["--cfg", "x"])).unwrap_err(),
+        "`--cfg` is not a lint flag"
+    );
     assert!(LintOptions::parse(&args(&["-W", "help"])).is_err());
 }

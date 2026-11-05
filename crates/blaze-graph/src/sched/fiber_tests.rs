@@ -62,7 +62,8 @@ impl Work for &'static Chain {
 #[test]
 fn a_waiting_job_holds_no_thread() {
     let work: &'static Chain = Box::leak(Box::new(Chain { depth: 1000, ended: AtomicU32::new(0) }));
-    let driver = Driver::start(Cores::flat(1).unwrap(), work, config(64 << 10), |_| Ok(())).unwrap();
+    let driver =
+        Driver::start(Cores::flat(1).unwrap(), work, config(64 << 10), |_| Ok(())).unwrap();
     driver.spawn(0, Spawn::root());
     driver.join().unwrap();
     assert_eq!(work.ended.load(Ordering::Relaxed), 1001, "every job of the chain ended");
@@ -164,7 +165,10 @@ fn a_job_waits_on_a_flight_of_another_drivers_job() {
     asker.spawn(false, Spawn::root());
     asker.join().unwrap();
     owner.join().unwrap();
-    assert!(work.resumed_after_end.load(Ordering::Relaxed), "the wait came back before the flight ended");
+    assert!(
+        work.resumed_after_end.load(Ordering::Relaxed),
+        "the wait came back before the flight ended"
+    );
 }
 
 /// Two drivers, one job each, each claiming a key and then waiting on the other's: the wait
@@ -193,7 +197,10 @@ impl Work for &'static CrossedDrivers {
 
 #[test]
 fn a_cycle_of_waits_through_two_drivers_is_refused_once() {
-    let work: &'static CrossedDrivers = Box::leak(Box::new(CrossedDrivers { claimed: AtomicU32::new(0), refused: Mutex::new(Vec::new()) }));
+    let work: &'static CrossedDrivers = Box::leak(Box::new(CrossedDrivers {
+        claimed: AtomicU32::new(0),
+        refused: Mutex::new(Vec::new()),
+    }));
     let first = start(Cores::flat(1).unwrap(), work);
     let second = start(Cores::flat(1).unwrap(), work);
     let a = first.spawn(0, Spawn::root());
@@ -237,7 +244,9 @@ impl Graph {
     }
 
     fn handle(&self, node: u32) -> Handle {
-        *self.handles[node as usize].get().expect("a node is spawned before any node that waits for it")
+        *self.handles[node as usize]
+            .get()
+            .expect("a node is spawned before any node that waits for it")
     }
 
     /// Runs the graph on `cores` and checks every node and every item ran once.
@@ -309,8 +318,12 @@ fn every_job_of_a_dag_of_waits_runs_once_on_fibers(tc: TestCase) {
 #[test]
 fn a_dag_with_maps_runs_every_node_and_item_once() {
     let nodes = 64u32;
-    let deps = (0..nodes).map(|node| (0..node).filter(|earlier| (node + earlier) % 3 == 0).collect()).collect();
-    let maps = (0..nodes).map(|node| (0..node).filter(|earlier| (node * earlier) % 5 == 1).collect()).collect();
+    let deps = (0..nodes)
+        .map(|node| (0..node).filter(|earlier| (node + earlier) % 3 == 0).collect())
+        .collect();
+    let maps = (0..nodes)
+        .map(|node| (0..node).filter(|earlier| (node * earlier) % 5 == 1).collect())
+        .collect();
     Graph::leak(deps, maps).check(4);
 }
 
@@ -343,7 +356,11 @@ impl Work for &'static Pair {
 #[test]
 fn a_cycle_of_waits_on_fibers_is_refused_naming_both_jobs() {
     static PAIR: OnceLock<Pair> = OnceLock::new();
-    let pair = PAIR.get_or_init(|| Pair { first: OnceLock::new(), second: OnceLock::new(), refused: Mutex::new(Vec::new()) });
+    let pair = PAIR.get_or_init(|| Pair {
+        first: OnceLock::new(),
+        second: OnceLock::new(),
+        refused: Mutex::new(Vec::new()),
+    });
     let driver = start(Cores::flat(2).unwrap(), pair);
     let first = driver.spawn(true, Spawn::root());
     pair.first.set(first).unwrap();
@@ -374,9 +391,12 @@ impl Work for &'static Move {
 
     fn run(&self, cx: &Cx<'_, Self>, job: MoveJob) {
         match job {
-            MoveJob::Block => until("the critical job to start", || self.started.load(Ordering::Acquire)),
+            MoveJob::Block => {
+                until("the critical job to start", || self.started.load(Ordering::Acquire))
+            }
             MoveJob::Critical => {
-                let state: [u64; 64] = std::array::from_fn(|at| (at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let state: [u64; 64] =
+                    std::array::from_fn(|at| (at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
                 let before = thread_now();
                 self.started.store(true, Ordering::Release);
                 let deadline = Instant::now() + LONG;
@@ -386,7 +406,8 @@ impl Work for &'static Move {
                     cx.miss();
                     misses += 1;
                 }
-                let again: [u64; 64] = std::array::from_fn(|at| (at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let again: [u64; 64] =
+                    std::array::from_fn(|at| (at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
                 assert_eq!(state, again, "the job's stack came across intact");
                 self.moved.store(true, Ordering::Release);
             }
@@ -397,7 +418,8 @@ impl Work for &'static Move {
 #[test]
 fn a_critical_job_that_never_waits_moves_to_a_freed_fast_core_at_a_miss() {
     static MOVE: OnceLock<Move> = OnceLock::new();
-    let work = MOVE.get_or_init(|| Move { started: AtomicBool::new(false), moved: AtomicBool::new(false) });
+    let work = MOVE
+        .get_or_init(|| Move { started: AtomicBool::new(false), moved: AtomicBool::new(false) });
     let cores = Cores::classes(&[(1024, 1), (512, 1)]).unwrap();
     let driver = start(cores, work);
     driver.spawn(MoveJob::Block, Spawn::root().hint(Affinity::Core(CoreId(0))));
@@ -427,7 +449,8 @@ impl Work for &'static Io {
 #[test]
 fn a_flight_of_the_drivers_wakes_its_waiter() {
     static IO: OnceLock<Io> = OnceLock::new();
-    let work = IO.get_or_init(|| Io { waiting: AtomicBool::new(false), woke: AtomicBool::new(false) });
+    let work =
+        IO.get_or_init(|| Io { waiting: AtomicBool::new(false), woke: AtomicBool::new(false) });
     let driver = start(Cores::flat(2).unwrap(), work);
     assert!(driver.claim(key(7)));
     driver.spawn((), Spawn::root());
@@ -552,7 +575,8 @@ impl Work for &'static OneKey {
                     // Until every other asker waits: a fixed while would let a slow (loaded)
                     // driver run an asker only after the run ended, to run the key again.
                     while self.flights.waiters(key(1)) < ONE_KEY_ASKERS - 1 {
-                        cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+                        cx.wait(Wait::Until(cx.now() + 100_000))
+                            .expect("a timed wait closes no cycle");
                     }
                     Ok(5)
                 });
@@ -615,13 +639,21 @@ impl Work for &'static Crossed {
 #[test]
 fn crossed_runs_on_fibers_give_way_once() {
     static WORK: OnceLock<Crossed> = OnceLock::new();
-    let work = WORK.get_or_init(|| Crossed { flights: crate::pump::Flights::new(), running: AtomicU32::new(0), ended: Mutex::new(Vec::new()) });
+    let work = WORK.get_or_init(|| Crossed {
+        flights: crate::pump::Flights::new(),
+        running: AtomicU32::new(0),
+        ended: Mutex::new(Vec::new()),
+    });
     let driver = start(Cores::flat(1).unwrap(), work);
     driver.spawn(0, Spawn::root());
     driver.join().unwrap();
     let ended = work.ended.lock();
     assert_eq!(ended.len(), 2);
-    assert_eq!(ended.iter().filter(|it| it.is_err()).count(), 1, "exactly one run gave way: {ended:?}");
+    assert_eq!(
+        ended.iter().filter(|it| it.is_err()).count(),
+        1,
+        "exactly one run gave way: {ended:?}"
+    );
     assert!(ended.contains(&Ok(10)), "the other ended with a value: {ended:?}");
     assert_eq!(work.flights.running(), 0);
 }
@@ -722,7 +754,9 @@ impl Drop for Owned {
 /// Carries [`OWNED`] with each job, once for every test of it.
 fn carry_owned() {
     static CARRY: std::sync::Once = std::sync::Once::new();
-    CARRY.call_once(|| fiber::carry(fiber::Carried { take: owned_take, put: owned_put, end: owned_end }));
+    CARRY.call_once(|| {
+        fiber::carry(fiber::Carried { take: owned_take, put: owned_put, end: owned_end })
+    });
 }
 
 #[inline(never)]
@@ -740,7 +774,8 @@ fn owned_put(taken: std::num::NonZeroUsize) {
 #[allow(unsafe_code)]
 fn owned_end(taken: std::num::NonZeroUsize) {
     // SAFETY: every value of `OWNED` is a box `set_owned` leaked, handed to one put or end.
-    let owned = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(taken.get())) };
+    let owned =
+        unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(taken.get())) };
     owned.counts.ended.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -772,7 +807,8 @@ impl Drop for Back {
             OWNED.set(0);
             // SAFETY: the box `set_owned` leaked for this worker, held by its thread again, so
             // never ended by a job.
-            let owned = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(mine)) };
+            let owned =
+                unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(mine)) };
             owned.counts.back.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -804,15 +840,24 @@ impl Work for &'static Forgetful {
 #[test]
 fn a_carried_value_a_job_ends_holding_is_ended_never_leaked() {
     carry_owned();
-    let work: &'static Forgetful = Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
+    let work: &'static Forgetful =
+        Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
     let driver = start(Cores::flat(1).unwrap(), work);
     for mine in 1..=6 {
         driver.spawn(mine, Spawn::root());
     }
     driver.join().unwrap();
     assert_eq!(work.ended.load(Ordering::Relaxed), 6);
-    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 6, "a value a job ended holding was not ended");
-    assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "a value a job ended holding outlived it");
+    assert_eq!(
+        work.counts.ended.load(Ordering::SeqCst),
+        6,
+        "a value a job ended holding was not ended"
+    );
+    assert_eq!(
+        work.counts.live.load(Ordering::SeqCst),
+        0,
+        "a value a job ended holding outlived it"
+    );
 }
 
 /// A worker that holds a carried value of its own (set by its setup, before any job) keeps
@@ -822,22 +867,36 @@ fn a_carried_value_a_job_ends_holding_is_ended_never_leaked() {
 fn a_workers_own_carried_value_is_set_aside_for_each_job_and_back_when_it_ends() {
     carry_owned();
     let worker = OwnedCounts::new();
-    let work: &'static Forgetful = Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
+    let work: &'static Forgetful =
+        Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
     let setup = move |_| {
         set_owned(0, worker);
         BACK.with(|back| back.0.set(OWNED.get()));
         Ok(())
     };
-    let driver = Driver::start(Cores::flat(1).unwrap(), work, config(256 << 10), setup).expect("the driver starts");
+    let driver = Driver::start(Cores::flat(1).unwrap(), work, config(256 << 10), setup)
+        .expect("the driver starts");
     for mine in 1..=6 {
         driver.spawn(mine, Spawn::root());
     }
     driver.join().unwrap();
     assert_eq!(work.ended.load(Ordering::Relaxed), 6);
-    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 6, "a value a job ended holding was not ended");
-    assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "a value a job ended holding outlived it");
+    assert_eq!(
+        work.counts.ended.load(Ordering::SeqCst),
+        6,
+        "a value a job ended holding was not ended"
+    );
+    assert_eq!(
+        work.counts.live.load(Ordering::SeqCst),
+        0,
+        "a value a job ended holding outlived it"
+    );
     assert_eq!(worker.ended.load(Ordering::SeqCst), 0, "a job's end ended its worker's own value");
-    assert_eq!(worker.back.load(Ordering::SeqCst), 1, "the worker did not hold its own value again as it ended");
+    assert_eq!(
+        worker.back.load(Ordering::SeqCst),
+        1,
+        "the worker did not hold its own value again as it ended"
+    );
     assert_eq!(worker.live.load(Ordering::SeqCst), 0, "the worker's own value was lost");
 }
 
@@ -850,7 +909,10 @@ fn a_dropped_record_of_carried_values_ends_what_it_holds() {
     let counts = OwnedCounts::new();
     set_owned(7, counts);
     let (mut job, mut worker) = (fiber::Taken::EMPTY, fiber::Taken::EMPTY);
-    assert!(fiber::go_off(&mut job, &mut worker).is_none(), "taking this thread's carried values panicked");
+    assert!(
+        fiber::go_off(&mut job, &mut worker).is_none(),
+        "taking this thread's carried values panicked"
+    );
     assert_eq!(owned(), None, "the value stayed on the thread");
     assert_eq!(counts.ended.load(Ordering::SeqCst), 0);
     drop(job);
@@ -884,9 +946,17 @@ impl Work for &'static Stranded {
 #[test]
 fn a_failed_drivers_parked_job_has_what_it_carried_ended() {
     carry_owned();
-    let work: &'static Stranded = Box::leak(Box::new(Stranded { counts: OwnedCounts::new(), waiting: AtomicBool::new(false) }));
-    let driver = Driver::start(Cores::flat(1).unwrap(), work, Config { fibers: 1, stack: 256 << 10, spin: 64 }, |_| Ok(()))
-        .expect("the driver starts");
+    let work: &'static Stranded = Box::leak(Box::new(Stranded {
+        counts: OwnedCounts::new(),
+        waiting: AtomicBool::new(false),
+    }));
+    let driver = Driver::start(
+        Cores::flat(1).unwrap(),
+        work,
+        Config { fibers: 1, stack: 256 << 10, spin: 64 },
+        |_| Ok(()),
+    )
+    .expect("the driver starts");
     driver.fail_new_fibers();
     assert!(driver.claim(key(STRANDED)), "the flight is new");
     driver.spawn(1, Spawn::root());
@@ -894,7 +964,11 @@ fn a_failed_drivers_parked_job_has_what_it_carried_ended() {
     driver.spawn(2, Spawn::root());
     let failed = driver.join().expect_err("a driver whose second fiber failed fails");
     assert!(matches!(failed, fiber::DriverError::Stack { .. }), "{failed}");
-    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 1, "the parked job's carried value was not ended");
+    assert_eq!(
+        work.counts.ended.load(Ordering::SeqCst),
+        1,
+        "the parked job's carried value was not ended"
+    );
     assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "the parked job's carried value leaked");
 }
 
@@ -908,7 +982,8 @@ impl Work for &'static Lent {
     type Job = ();
 
     fn run(&self, cx: &Cx<'_, Self>, (): ()) {
-        let other = thread::scope(|scope| scope.spawn(|| cx.wait(Wait::Until(cx.now() + 1_000))).join());
+        let other =
+            thread::scope(|scope| scope.spawn(|| cx.wait(Wait::Until(cx.now() + 1_000))).join());
         self.refused.store(other.is_err(), Ordering::Relaxed);
         cx.wait(Wait::Until(cx.now() + 1_000)).expect("a timed wait closes no cycle");
     }
@@ -939,7 +1014,12 @@ fn recurse<W: Work>(cx: &Cx<'_, W>, left: u32) -> u64 {
             let limit = stdx::fiber_stack_limit();
             assert_ne!(limit, 0, "a job on a fiber has a fiber stack limit");
             cx.wait(Wait::Until(cx.now() + 200_000)).expect("a timed wait closes no cycle");
-            assert_eq!(stdx::fiber_stack_limit(), limit, "job {} lost its stack limit across a wait", cx.job().0);
+            assert_eq!(
+                stdx::fiber_stack_limit(),
+                limit,
+                "job {} lost its stack limit across a wait",
+                cx.job().0
+            );
             return u64::from(frame[0]);
         }
         recurse(cx, left - 1) + u64::from(frame[1023])
@@ -999,7 +1079,11 @@ impl ScopeWait {
         }))
     }
 
-    fn run_on(&'static self, cores: usize, root: ScopeJob) -> (Vec<Result<u32, crate::Cancelled>>, Vec<Result<u32, crate::Cancelled>>) {
+    fn run_on(
+        &'static self,
+        cores: usize,
+        root: ScopeJob,
+    ) -> (Vec<Result<u32, crate::Cancelled>>, Vec<Result<u32, crate::Cancelled>>) {
         let driver = start(Cores::flat(cores).unwrap(), self);
         driver.spawn(root, Spawn::root());
         driver.join().unwrap();
@@ -1018,9 +1102,11 @@ impl Work for &'static ScopeWait {
                 cx.wait_job(owner).expect("a parent's wait for its owner closes no cycle");
             }
             ScopeJob::Owner => {
-                let got = self.flights.get_or_run(key(1), || match cx.map([ScopeJob::Ask], Spawn::root()) {
-                    Ok(()) => Ok(1),
-                    Err(_) => Err(crate::Cancelled),
+                let got = self.flights.get_or_run(key(1), || {
+                    match cx.map([ScopeJob::Ask], Spawn::root()) {
+                        Ok(()) => Ok(1),
+                        Err(_) => Err(crate::Cancelled),
+                    }
                 });
                 self.owner.lock().push(got);
             }

@@ -4,6 +4,7 @@
 #[path = "../tests/db.rs"]
 mod db;
 
+use blaze_cas::Key;
 use blaze_codegen::{
     Instance as UnitInstance, InstanceKey,
     backend::Prepare as _,
@@ -12,7 +13,6 @@ use blaze_codegen::{
     plan::{Mode, OptLevel, Override, Policy, Profile},
     settings::{DebugInfo, Panic, Pgo, Sanitize, Toolchain},
 };
-use blaze_cas::Key;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use hir_def::FunctionId;
@@ -96,7 +96,8 @@ fn spec() -> Spec {
 
 /// What the fixtures' target compiles to: its code position-independent or static as its ISA is.
 fn relocation() -> Relocation {
-    match crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic() {
+    match crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic()
+    {
         true => Relocation::Pic,
         false => Relocation::Static,
     }
@@ -192,7 +193,8 @@ fn the_ir_is_the_stencil_backends() {
         let mut want = function.ir().expect("IR").clone();
         drop(crate::v2::backend::stencil_ir(&mut want));
         let tier = spec();
-        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let Lowering::Ir { func, .. } = lowering else { panic!("{name}: IR") };
         assert_eq!(func.display().to_string(), want.display().to_string(), "{name}");
     }
@@ -206,7 +208,9 @@ fn each_name_is_a_reference_or_the_functions_own_data() {
     let tier = spec();
     let root = frontend.root(function(db, "caller"));
     let refs = refs_of(&frontend, &root);
-    let Lowering::Ir { func, names, data } = lowered(&frontend, &unit(&tier), &tier, &root, &refs).expect("IR") else {
+    let Lowering::Ir { func, names, data } =
+        lowered(&frontend, &unit(&tier), &tier, &root, &refs).expect("IR")
+    else {
         panic!("IR")
     };
     let declared = func.params.user_named_funcs();
@@ -231,7 +235,9 @@ fn what_the_tier_does_not_compile_is_refused_by_name() {
     let refs = refs_of(&frontend, &root);
     let refused = |spec: Spec, what: &str| {
         let unit = unit(&spec);
-        let Err(e) = lowered(&frontend, &unit, &spec, &root, &refs) else { panic!("{what}: lowered") };
+        let Err(e) = lowered(&frontend, &unit, &spec, &root, &refs) else {
+            panic!("{what}: lowered")
+        };
         assert_eq!(e.unit, unit.instance.key(), "{e:?}");
         assert!(e.what.contains(what), "{what}: {e:?}");
     };
@@ -246,7 +252,9 @@ fn what_the_tier_does_not_compile_is_refused_by_name() {
     for (name, what) in [("spins", "`asm!` statements"), ("bare", "a naked function")] {
         let root = frontend.root(function(db, name));
         let refs = refs_of(&frontend, &root);
-        let Err(e) = lowered(&frontend, &unit(&tier), &tier, &root, &refs) else { panic!("{name}: lowered") };
+        let Err(e) = lowered(&frontend, &unit(&tier), &tier, &root, &refs) else {
+            panic!("{name}: lowered")
+        };
         assert!(e.what.contains(what) && e.what.contains(name), "{name}: {e:?}");
     }
 }
@@ -257,7 +265,9 @@ fn assembly_and_the_allocator_shim_are_named() {
     let (db, frontend) = frontend();
     let tier = spec();
     let text = HirInstance(Kind::Asm("nop".to_owned(), false));
-    let Ok(Lowering::Asm(got)) = lowered(&frontend, &unit(&tier), &tier, &text, &[]) else { panic!("asm") };
+    let Ok(Lowering::Asm(got)) = lowered(&frontend, &unit(&tier), &tier, &text, &[]) else {
+        panic!("asm")
+    };
     assert_eq!(got, "nop");
     let forward = crate::v2::allocator::Forward {
         symbol: "__rust_alloc",
@@ -267,7 +277,8 @@ fn assembly_and_the_allocator_shim_are_named() {
         krate: fixture::test_crate(&db),
     };
     let shim = HirInstance(Kind::Allocator(forward));
-    let Ok(Lowering::Allocator(symbol)) = lowered(&frontend, &unit(&tier), &tier, &shim, &[]) else {
+    let Ok(Lowering::Allocator(symbol)) = lowered(&frontend, &unit(&tier), &tier, &shim, &[])
+    else {
         panic!("the allocator shim")
     };
     assert_eq!(symbol, "__rust_alloc");
@@ -292,13 +303,21 @@ fn the_reach_of_a_root_is_the_drivers() {
     let roots = [(root, origin)];
     let backends = Backends::default();
     let memo = Memo::new();
-    let reached = driver::Build::new(&backends, &frontend, &policy, &memo).reach(&roots, &[]).expect("the walk");
-    let built = driver::Build::new(&backends, &frontend, &policy, &memo).run(&roots, &Empty).expect("the build");
-    let keys: Vec<InstanceKey> = reached.functions.iter().map(|(_, unit)| unit.instance.key()).collect();
+    let reached = driver::Build::new(&backends, &frontend, &policy, &memo)
+        .reach(&roots, &[])
+        .expect("the walk");
+    let built = driver::Build::new(&backends, &frontend, &policy, &memo)
+        .run(&roots, &Empty)
+        .expect("the build");
+    let keys: Vec<InstanceKey> =
+        reached.functions.iter().map(|(_, unit)| unit.instance.key()).collect();
     assert_eq!(keys, built.inputs.iter().map(|it| it.0).collect::<Vec<_>>());
     assert!(keys.len() >= 2, "`caller` and `callee`: {keys:?}");
     let marks = built.reached(&built.roots[0]);
-    assert!(reached.functions.iter().all(|(_, unit)| marks.contains(&unit.instance.code)), "{marks:?}");
+    assert!(
+        reached.functions.iter().all(|(_, unit)| marks.contains(&unit.instance.code)),
+        "{marks:?}"
+    );
     assert_eq!(reached.refs.len(), reached.functions.len());
 
     let tier = spec();
@@ -306,7 +325,9 @@ fn the_reach_of_a_root_is_the_drivers() {
         let instance_of = UnitInstance { settings: tier.settings(), ..unit.instance };
         let unit = Unit { instance: instance_of, backend: Backend::Stencil, ..unit.clone() };
         match lowered(&frontend, &unit, &tier, instance, refs) {
-            Ok(Lowering::Ir { names, .. }) => assert!(names.iter().flatten().all(|it| !matches!(it, Target::Counter(_)))),
+            Ok(Lowering::Ir { names, .. }) => {
+                assert!(names.iter().flatten().all(|it| !matches!(it, Target::Counter(_))))
+            }
             Ok(_) => {}
             Err(e) => panic!("{instance:?}: {e:?}"),
         }
@@ -325,23 +346,35 @@ fn become_is_a_return_call_in_the_callers_own_memory() {
     for name in ["swap", "count", "through"] {
         let root = frontend.root(function(db, name));
         let refs = refs_of(&frontend, &root);
-        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let Lowering::Ir { func, .. } = lowering else { panic!("{name}: IR") };
         let shown = func.display();
         let tail: Vec<ir::Inst> = func
             .layout
             .blocks()
             .flat_map(|block| func.layout.block_insts(block))
-            .filter(|&inst| matches!(func.dfg.insts[inst].opcode(), ir::Opcode::ReturnCall | ir::Opcode::ReturnCallIndirect))
+            .filter(|&inst| {
+                matches!(
+                    func.dfg.insts[inst].opcode(),
+                    ir::Opcode::ReturnCall | ir::Opcode::ReturnCallIndirect
+                )
+            })
             .collect();
-        let [tail] = tail[..] else { panic!("{name}: one tail call, not {}:\n{shown}", tail.len()) };
+        let [tail] = tail[..] else {
+            panic!("{name}: one tail call, not {}:\n{shown}", tail.len())
+        };
         let sig = match func.dfg.insts[tail] {
             ir::InstructionData::Call { func_ref, .. } => func.dfg.ext_funcs[func_ref].signature,
             ir::InstructionData::CallIndirect { sig_ref, .. } => sig_ref,
             other => panic!("{name}: {other:?}"),
         };
         let sig = &func.dfg.signatures[sig];
-        assert_eq!((&sig.params, &sig.returns), (&func.signature.params, &func.signature.returns), "{name}:\n{shown}");
+        assert_eq!(
+            (&sig.params, &sig.returns),
+            (&func.signature.params, &func.signature.returns),
+            "{name}:\n{shown}"
+        );
         if name == "swap" {
             let entry = func.layout.entry_block().expect("an entry block");
             let incoming = func.dfg.block_params(entry);

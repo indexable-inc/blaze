@@ -9,8 +9,7 @@ use std::{collections::BTreeMap, ops::Range};
 use smallvec::SmallVec;
 
 use super::machine::{
-    Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Shadow, Site,
-    TypedCx,
+    Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Ptr, RetagMode, Shadow, Site, TypedCx,
 };
 use crate::next_solver::Ty;
 
@@ -77,6 +76,21 @@ impl Shadow<()> for Pointers {
         self.len = self.len.max(end);
     }
 
+    /// The pieces shifted by `size` for each copy, in order and disjoint as they are: no
+    /// put per element, so a `[0u8; 1 << 20]` costs nothing but its length.
+    fn repeat(&self, size: usize, count: usize) -> Self {
+        let mut pieces = SmallVec::new();
+        if !self.pieces.is_empty() {
+            pieces.reserve(self.pieces.len() * count);
+            for i in 0..count {
+                pieces.extend(self.pieces.iter().map(|&(at, len)| (at + i * size, len)));
+            }
+        }
+        // As `count` puts leave it: the last copy ends at its own length.
+        let len = count.checked_sub(1).map_or(0, |last| last * size + self.len);
+        Self { len, pieces }
+    }
+
     #[inline]
     fn prov_at(&self, at: usize, size: usize) -> Option<()> {
         self.pieces.iter().any(|&(start, len)| start == at && len == size).then_some(())
@@ -96,8 +110,11 @@ impl Shadow<()> for Pointers {
 /// checker's to say, not const eval's.
 #[derive(Debug, Default)]
 pub(super) struct Provenance {
-    /// Each live allocation of a nonzero size: its start and size.
-    allocations: BTreeMap<u64, u64>,
+    /// Each live allocation of a nonzero size: its start and size, sorted by start. A sorted
+    /// vector, not a map: allocations come and go as a stack's, at its end, and a vector keeps
+    /// its room, where a B-tree at a node's edge splits and merges a node (two allocations)
+    /// each time a loop's local is made and freed.
+    allocations: Vec<(u64, u64)>,
     /// Each pointer with provenance in memory: its start and length, disjoint.
     pointers: BTreeMap<u64, u64>,
 }
@@ -153,12 +170,17 @@ impl<'db> Machine<'db> for Provenance {
     fn alloc(&mut self, addr: u64, size: u64, _: u64, _: MemKind, _: bool) -> MResult<()> {
         if size > 0 {
             self.cut(addr, addr + size);
-            self.allocations.insert(addr, size);
+            match self.allocations.binary_search_by_key(&addr, |&(at, _)| at) {
+                Ok(at) => self.allocations[at].1 = size,
+                // alloc: grows to the most allocations live at once, then reused
+                Err(at) => self.allocations.insert(at, (addr, size)),
+            }
         }
         Ok(())
     }
     fn free(&mut self, ptr: Ptr<()>, size: Option<u64>, _: Option<u64>, _: MemKind) -> MResult<()> {
-        let live = self.allocations.remove(&ptr.addr);
+        let live = (self.allocations.binary_search_by_key(&ptr.addr, |&(at, _)| at).ok())
+            .map(|at| self.allocations.remove(at).1);
         if let Some(size) = size.or(live) {
             self.cut(ptr.addr, ptr.addr + size);
         }
@@ -167,7 +189,8 @@ impl<'db> Machine<'db> for Provenance {
     /// A pointer the evaluator lays out to `addr` has provenance when `addr` is in a live
     /// allocation or one past its end.
     fn root(&mut self, addr: u64) -> Option<()> {
-        let (&start, &size) = self.allocations.range(..=addr).next_back()?;
+        let below = self.allocations.partition_point(|&(at, _)| at <= addr);
+        let &(start, size) = self.allocations.get(below.checked_sub(1)?)?;
         (addr <= start + size).then_some(())
     }
     #[inline]

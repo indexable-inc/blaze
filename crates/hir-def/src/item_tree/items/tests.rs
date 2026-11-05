@@ -6,8 +6,8 @@ use std::{
 
 use base_db::EditionedFileId;
 use blaze_ids::rng::SplitMix64;
-use syntax::view::HasModuleItem;
 use hir_expand::fixture;
+use syntax::view::HasModuleItem;
 
 use crate::{
     item_tree::{ItemTree, lower_whole, tests::assert_assembled_is_whole},
@@ -322,8 +322,8 @@ fn common_ends_are_the_longest_that_do_not_overlap() {
         let (a, b) = (old.as_bytes(), new.as_bytes());
         let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
         let most = a.len().min(b.len()) - prefix;
-        let suffix = (a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count())
-            .min(most);
+        let suffix =
+            (a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()).min(most);
         assert_eq!(super::common_ends(a, b), (prefix, suffix), "{old:?} to {new:?}");
     }
 }
@@ -363,12 +363,10 @@ fn assembly_allocates_once_a_tree() {
             .collect();
         let marks: Vec<[super::Marks; 2]> =
             alone.iter().map(|it| [super::Marks::default(), super::Marks::ends(it)]).collect();
-        let parts: Vec<super::Rows<'_>> = (alone.iter().zip(&marks))
-            .map(|(tree, marks)| super::Rows { tree, marks })
-            .collect();
+        let parts: Vec<super::Rows<'_>> =
+            (alone.iter().zip(&marks)).map(|(tree, marks)| super::Rows { tree, marks }).collect();
         let mut made = Vec::with_capacity(items * 3 + 1);
-        let (tree, used) =
-            blaze_alloc_count::measure(|| super::assemble(&top, &parts, &mut made));
+        let (tree, used) = blaze_alloc_count::measure(|| super::assemble(&top, &parts, &mut made));
         assert_eq!(tree, lower_whole(&db, file.into(), krate));
         assert_eq!(made.len(), items * 3 + 1, "a mark per item, then the end");
         used.allocations

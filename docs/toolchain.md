@@ -35,21 +35,24 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
-  has no command that prints it or where it is (v1's `blaze toolchain` did).
+  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
+  `blaze toolchain` prints it and where it is, downloading it first when it is not there;
+  `blaze toolchain --json` prints one object (`name`, `nightly`, `rustc`, `release`, `commit`,
+  the host's tuple as `host`, and `sysroot`), which a harness reads instead of running
+  `rustc -vV` (harness/storelib.py, `blaze_toolchain`).
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, the host's `rust-std` and
   wasm32-wasip1's (for wasi-libc, which blaze's linker links every proc macro's module with), unchanged,
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), found
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),
   which also plans the end of this download). The installer downloads it by running
-  `blaze toolchain`, which v2's blaze does not have, and no v2 build downloads it
-  (`toolchain::own::fetch` has no caller): today it must already be there, or a build stops
-  with "blaze's toolchain is not installed".
+  `blaze toolchain`, and every build checks it is there first (`toolchain::ensure`, which
+  fetches it with `toolchain::own::fetch` when it is not).
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
@@ -78,10 +81,12 @@ the standard library is part of a compiler.
 
 Building blaze itself takes one more pinned piece, LLVM: `crates/hir-ty-codegen/llvm.json` names
 its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
-archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flake's
-`blaze-llvm`); outside the shell, `python3 .github/scripts/llvm.py fetch` unpacks the same
-archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
-one. llvm-sys's build script refuses any other prefix with one error before anything links it
+archive. blaze fetches it itself, by that sha256, and hands it to the build scripts that link
+it: the root `Cargo.toml` declares it a pinned native input
+([cargo.md](cargo.md#pinned-native-inputs)), so no Nix and no `LLVM_SYS_231_PREFIX` is needed
+(`nix develop` still sets the variable to the same archive, which blaze's value overrides); a
+stage 0 older than that table needs the variable, from `python3 .github/scripts/llvm.py fetch`.
+For a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds one. llvm-sys's build script refuses any other prefix with one error before anything links it
 ([contributing.md](contributing.md#llvm)). The LLVM inside a blaze binary
 is not a toolchain for projects: it builds them with the toolchain above. Its MC assembler is
 what assembles `asm!`, `naked_asm!` and `global_asm!` in process, never the machine's clang or
@@ -106,7 +111,8 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
-   `crates/blaze-units/src/stdlib/rustc.json`.
+   `crates/blaze-units/src/stdlib/rustc.json`, and `tools/cpus.py` writes the CPU table
+   (`target_features::cpus`) from it.
 3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
    which runs the merge gate, and the release train is started on the branch and on
    `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are

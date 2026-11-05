@@ -88,7 +88,10 @@ pub struct Cached {
 #[derive(PartialEq, Eq, Debug)]
 pub enum Choice {
     /// It runs; `expected` is how long it took when it last ran, if it has.
-    Run { why: Why, expected: Option<Duration> },
+    Run {
+        why: Why,
+        expected: Option<Duration>,
+    },
     Cached(Cached),
 }
 
@@ -127,8 +130,16 @@ impl Why {
         out
     }
 
-    fn write<W: fmt::Write>(&self, out: &mut W, name_of: &impl Fn(&FnId) -> Option<String>) -> fmt::Result {
-        fn named<W: fmt::Write>(out: &mut W, id: &FnId, name_of: &impl Fn(&FnId) -> Option<String>) -> fmt::Result {
+    fn write<W: fmt::Write>(
+        &self,
+        out: &mut W,
+        name_of: &impl Fn(&FnId) -> Option<String>,
+    ) -> fmt::Result {
+        fn named<W: fmt::Write>(
+            out: &mut W,
+            id: &FnId,
+            name_of: &impl Fn(&FnId) -> Option<String>,
+        ) -> fmt::Result {
             match name_of(id) {
                 Some(name) => out.write_str(&name),
                 None => write!(out, "function {}", id.0),
@@ -186,7 +197,10 @@ pub fn choose<P: Passes + ?Sized, I: Inputs>(
     inputs: &mut I,
 ) -> Result<Choice, SelectError<I::Error>> {
     let Some(end) = end(store, given, subject.name)? else {
-        return Ok(Choice::Run { why: if subject.outside { Why::Outside } else { Why::New }, expected: None });
+        return Ok(Choice::Run {
+            why: if subject.outside { Why::Outside } else { Why::New },
+            expected: None,
+        });
     };
     let mut newest = Some(entry(store, given, subject.name, end)?);
     let expected = newest.as_ref().map(|it| it.took);
@@ -218,7 +232,8 @@ pub fn choose<P: Passes + ?Sized, I: Inputs>(
                     why.get_or_insert(Why::NoPass);
                     continue;
                 };
-                let set = SetView::decode(bytes).map_err(|why| SelectError::NotOurs { key: entry.set, why })?;
+                let set = SetView::decode(bytes)
+                    .map_err(|why| SelectError::NotOurs { key: entry.set, why })?;
                 let change = image.changed(&set);
                 looked.push((entry.set, change));
                 change
@@ -362,7 +377,11 @@ pub fn keep<P: Passes + ?Sized>(
 
 /// The set a run is kept under: what it executed when its record is whole, else what it
 /// reaches, saying why.
-pub(crate) fn kept_set(image: &Image, subject: &Subject<'_>, ran: &Ran<'_>) -> Result<(Set, Basis), RecordError> {
+pub(crate) fn kept_set(
+    image: &Image,
+    subject: &Subject<'_>,
+    ran: &Ran<'_>,
+) -> Result<(Set, Basis), RecordError> {
     Ok(match image.of_record(ran.record) {
         Some(set) => (set.map_err(RecordError::Table)?, Basis::Executed),
         None => {
@@ -414,7 +433,11 @@ pub(crate) fn keep_set<P: Passes + ?Sized>(
     if pass && let Some(traced) = &traced {
         let run = RunKey { code: identity(subject.name, &attrs, &key), given };
         // alloc: the store keeps owned bytes, once per kept pass
-        tickets.push(store.put(index::result_key(&run, traced), PASS.to_vec()).map_err(RecordError::Mismatch)?);
+        tickets.push(
+            store
+                .put(index::result_key(&run, traced), PASS.to_vec())
+                .map_err(RecordError::Mismatch)?,
+        );
         let shape = Shape::of(traced).encode();
         put_first_free(store, |n| index::slot(&run, n), 0, &shape, &mut tickets)?;
     }
@@ -429,7 +452,13 @@ pub(crate) fn keep_set<P: Passes + ?Sized>(
         traced: traced.filter(|_| pass || !ran.passed),
     };
     let bytes = entry.encode();
-    let slot = put_first_free(store, |n| history_slot(given, subject.name, n), from, &bytes, &mut tickets)?;
+    let slot = put_first_free(
+        store,
+        |n| history_slot(given, subject.name, n),
+        from,
+        &bytes,
+        &mut tickets,
+    )?;
     Ok(Landed { kept: Kept { tickets, basis: entry.basis, pass }, set: key, attrs, slot })
 }
 
@@ -490,13 +519,16 @@ impl Entry {
             Some(traced) => trace::encode(&Report::Ran(Some(traced.clone()))),
             None => Vec::new(), // alloc: empty, allocates nothing
         };
-        let mut out = Vec::with_capacity(HISTORY.len() + 1 + 64 + 8 + 4 + why.len() + 8 + traced.len());
+        let mut out =
+            Vec::with_capacity(HISTORY.len() + 1 + 64 + 8 + 4 + why.len() + 8 + traced.len());
         out.extend_from_slice(HISTORY);
         let reached = matches!(self.basis, Basis::Reached { .. });
         out.push(u8::from(self.passed) | (u8::from(self.kept) << 1) | (u8::from(reached) << 2));
         out.extend_from_slice(&self.attrs.0);
         out.extend_from_slice(&self.set.0.0);
-        out.extend_from_slice(&(self.took.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
+        out.extend_from_slice(
+            &(self.took.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes(),
+        );
         out.extend_from_slice(&(why.len() as u32).to_le_bytes());
         out.extend_from_slice(why.as_bytes());
         out.extend_from_slice(&(traced.len() as u64).to_le_bytes());
@@ -515,7 +547,8 @@ impl Entry {
         let why_len = u32::from_le_bytes(head[73..77].try_into().expect("4 bytes")) as usize;
         let (why, rest) = rest.split_at_checked(why_len).ok_or_else(short)?;
         // alloc: error path
-        let why = std::str::from_utf8(why).map_err(|_| "a test's history has a reason that is not UTF-8".to_owned())?;
+        let why = std::str::from_utf8(why)
+            .map_err(|_| "a test's history has a reason that is not UTF-8".to_owned())?;
         let (len, traced) = rest.split_at_checked(8).ok_or_else(short)?;
         let len = u64::from_le_bytes(len.try_into().expect("8 bytes"));
         if traced.len() as u64 != len {
@@ -548,7 +581,11 @@ impl Entry {
 }
 
 pub(crate) fn history_slot(given: ContentId, name: &str, n: u32) -> Key {
-    Key(Hasher::new("blaze v2 testsel history slot 1").id(&given).part(name.as_bytes()).update(&n.to_le_bytes()).finish())
+    Key(Hasher::new("blaze v2 testsel history slot 1")
+        .id(&given)
+        .part(name.as_bytes())
+        .update(&n.to_le_bytes())
+        .finish())
 }
 
 /// What reading a test's history can meet.
@@ -572,19 +609,33 @@ impl<E> From<Unread> for SelectError<E> {
     }
 }
 
-pub(crate) fn entry<P: Passes + ?Sized>(store: &P, given: ContentId, name: &str, n: u32) -> Result<Entry, Unread> {
+pub(crate) fn entry<P: Passes + ?Sized>(
+    store: &P,
+    given: ContentId,
+    name: &str,
+    n: u32,
+) -> Result<Entry, Unread> {
     let key = history_slot(given, name, n);
     let Some(bytes) = store.get(&key)? else {
         // alloc: error path
-        return Err(Unread::NotOurs { key, why: "an entry of a test's history is missing below its end".to_owned() });
+        return Err(Unread::NotOurs {
+            key,
+            why: "an entry of a test's history is missing below its end".to_owned(),
+        });
     };
     Entry::decode(bytes).map_err(|why| Unread::NotOurs { key, why })
 }
 
 /// The slot of the last entry of a test's history. Slots are filled from 0 with no gap, so
 /// the end is found by doubling then halving.
-pub(crate) fn end<P: Passes + ?Sized>(store: &P, given: ContentId, name: &str) -> Result<Option<u32>, Corrupt> {
-    let filled = |n: u32| -> Result<bool, Corrupt> { Ok(store.get(&history_slot(given, name, n))?.is_some()) };
+pub(crate) fn end<P: Passes + ?Sized>(
+    store: &P,
+    given: ContentId,
+    name: &str,
+) -> Result<Option<u32>, Corrupt> {
+    let filled = |n: u32| -> Result<bool, Corrupt> {
+        Ok(store.get(&history_slot(given, name, n))?.is_some())
+    };
     if !filled(0)? {
         return Ok(None);
     }

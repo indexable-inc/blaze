@@ -12,12 +12,11 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{FunctionSignature, StructSignature},
 };
+use hir_expand::fixture;
 use hir_ty::mir::MirSpan;
 use hir_ty_mir as _;
-use hir_expand::fixture;
 
 use crate::{Applicability, BorrowckDiagnostic, Mode, PartSpan, Sublevel, borrowck_in_mode};
-
 
 thread_local! {
     /// What the parts of the checks run on this thread took from the global allocator.
@@ -71,6 +70,38 @@ fn e0597() {
     read(r);
 }
 "#;
+
+#[test]
+fn a_question_mark_with_an_uninhabited_output_does_not_leave_an_uninitialized_binding() {
+    let fx = fixture::db(r#"
+//- minicore: sized, copy, result, try, future, from
+enum Void {}
+enum Entered { Model(Void) }
+fn read() -> Result<Void, u32> { Err(1) }
+async fn read_async() -> Result<Void, u32> { Err(1) }
+fn enter() -> Result<Entered, u32> {
+    let definition = read()?;
+    Ok(Entered::Model(definition))
+}
+async fn enter_async() -> Result<Entered, u32> {
+    let definition = read_async().await?;
+    Ok(Entered::Model(definition))
+}
+fn uninitialized() -> u32 { let value; value }
+fn initialized() -> Result<u32, u32> { let value = Ok::<u32, u32>(1)?; Ok(value) }
+"#);
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    for name in ["enter", "enter_async", "initialized"] {
+        for mode in [Mode::Nll, Mode::Polonius, Mode::PoloniusFlow] {
+            let result = borrowck_in_mode(&db, function(&db, name), mode);
+            assert!(result.skipped.is_none() && result.not_checked.is_none(), "{name}: {result:?}");
+            assert!(result.diagnostics.iter().all(|it| !it.code.starts_with('E')), "{name}: {:?}", result.diagnostics);
+        }
+    }
+    let bad = crate::borrowck(&db, function(&db, "uninitialized"));
+    assert!(bad.diagnostics.iter().any(|it| it.code == "E0381"), "{:?}", bad.diagnostics);
+}
 
 fn function(db: &Db, name: &str) -> DefWithBodyId {
     for &krate in all_crates(db).iter() {
@@ -211,7 +242,11 @@ fn drop_label(name: &str) -> String {
     let mut found = None;
     error_in(DROPPED_LATER, name, |_, _, error| {
         assert_eq!(error.code, "E0505", "`{name}`: {error:?}");
-        found = error.labels.iter().find(|(_, text)| text.contains("is dropped")).map(|(_, text)| text.clone());
+        found = error
+            .labels
+            .iter()
+            .find(|(_, text)| text.contains("is dropped"))
+            .map(|(_, text)| text.clone());
         assert!(found.is_some(), "`{name}`: no drop label: {error:?}");
     });
     found.expect("checked above")
@@ -290,7 +325,8 @@ fn a_refmut_dropped_at_scope_end_gets_the_drop_early_note() {
         let [note] = &notes[..] else { panic!("{error:?}") };
         assert_eq!(note.level, Sublevel::Note, "{error:?}");
         assert!(note.message.starts_with("`r`, a `RefMut"), "{}", note.message);
-        let last: Vec<String> = note.labels.iter().map(|(at, _)| part(db, source_map, *at)).collect();
+        let last: Vec<String> =
+            note.labels.iter().map(|(at, _)| part(db, source_map, *at)).collect();
         // The use written last in the statement: the call, or its receiver.
         assert!(matches!(&last[..], [it] if it == "r.touch()" || it == "r"), "{last:?}");
         let suggestion = error
@@ -299,8 +335,11 @@ fn a_refmut_dropped_at_scope_end_gets_the_drop_early_note() {
             .find(|it| it.message == "drop `r` after its last use")
             .unwrap_or_else(|| panic!("{error:?}"));
         assert_eq!(suggestion.applicability, Applicability::MachineApplicable);
-        let parts: Labels =
-            suggestion.parts.iter().map(|(at, text)| (part(db, source_map, *at), text.clone())).collect();
+        let parts: Labels = suggestion
+            .parts
+            .iter()
+            .map(|(at, text)| (part(db, source_map, *at), text.clone()))
+            .collect();
         assert_eq!(parts, owned(&[("line after r.touch()", "drop(r);")]));
     });
 }
@@ -312,10 +351,16 @@ fn a_drop_the_rewrite_would_not_fix_gets_no_note() {
     error_in(DROP_EARLY, "used_with_the_later_borrow", |_, _, error| {
         assert!(error.dropped_at_scope_end.is_some(), "the later use is `r`'s drop: {error:?}");
         assert!(
-            !error.children.iter().any(|it| it.message.contains("is dropped only where its scope ends")),
+            !error
+                .children
+                .iter()
+                .any(|it| it.message.contains("is dropped only where its scope ends")),
             "{error:?}"
         );
-        assert!(!error.suggestions.iter().any(|it| it.message.starts_with("drop `r`")), "{error:?}");
+        assert!(
+            !error.suggestions.iter().any(|it| it.message.starts_with("drop `r`")),
+            "{error:?}"
+        );
     });
 }
 

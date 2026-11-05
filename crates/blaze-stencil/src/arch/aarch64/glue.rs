@@ -15,13 +15,7 @@ use super::{
     frame::{self, Frame},
     inst::{self, FP, SP, X0, X1, X8, X16, X17, X20},
 };
-use crate::{
-    Error, Target, TlsModel,
-    arch::Loc,
-    buf::Buf,
-    code::Name,
-    enc::Form,
-};
+use crate::{Error, Target, TlsModel, arch::Loc, buf::Buf, code::Name, enc::Form};
 
 /// The cells of a function's counters ([`crate::tier`]): its calls, then its back edges.
 const CALLS: i64 = 0;

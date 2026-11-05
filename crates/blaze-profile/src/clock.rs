@@ -65,6 +65,16 @@ pub fn mono_ns() -> i64 {
     }
 }
 
+/// `at` on the schema's clock ([`mono_ns`]): now, less how long ago it was. Both read the
+/// same monotonic clock on Linux and Apple's systems, so the pairing's error is the time
+/// between the two reads.
+pub fn mono_of(at: Instant) -> i64 {
+    let (now, read) = (mono_ns(), Instant::now());
+    let ago = read.saturating_duration_since(at).as_nanos() as i64;
+    let ahead = at.saturating_duration_since(read).as_nanos() as i64;
+    now - ago + ahead
+}
+
 /// A tick and the instant it was read at, once a process: [`crate::began`] takes it first.
 pub fn origin() -> (u64, Instant) {
     static ORIGIN: OnceLock<(u64, Instant)> = OnceLock::new();
@@ -126,10 +136,13 @@ impl Scale {
             // A pairing read less than 100 µs after the origin's would be off by its own
             // skew (tens of ns) over too short a time: wait out the rest of the 100 µs, once.
             if at.duration_since(began).as_micros() < 100 {
-                blaze_graph::spin::busy(std::time::Duration::from_micros(100).saturating_sub(began.elapsed()));
+                blaze_graph::spin::busy(
+                    std::time::Duration::from_micros(100).saturating_sub(began.elapsed()),
+                );
                 (ticks, at, mono) = paired(1.0);
             }
-            let ns_per_tick = at.duration_since(began).as_nanos() as f64 / ticks.wrapping_sub(first).max(1) as f64;
+            let ns_per_tick = at.duration_since(began).as_nanos() as f64
+                / ticks.wrapping_sub(first).max(1) as f64;
             Scale { ticks, at, mono, ns_per_tick }
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -161,6 +174,26 @@ impl Scale {
     pub fn instant(&self, ticks: u64) -> Instant {
         let ago = self.ns(self.ticks.wrapping_sub(ticks));
         self.at.checked_sub(std::time::Duration::from_nanos(ago)).unwrap_or(self.at)
+    }
+
+    /// What maps ticks onto the schema's clock, as plain numbers another process can read: a
+    /// tick, the [`mono_ns`] read with it, and the bits of the nanoseconds a tick lasts. The
+    /// flight recorder's mapping keeps it ([`crate::flight`]'s postmortem), so the rows of a
+    /// process that died read back on the clock it wrote them on.
+    pub(crate) fn line(&self) -> [u64; 3] {
+        [self.ticks, self.mono as u64, self.ns_per_tick.to_bits()]
+    }
+
+    /// The scale of a [`Scale::line`] another process kept. Its [`Scale::instant`] is
+    /// meaningless (an `Instant` is of one process), so only [`Scale::mono`], [`Scale::ns`] and
+    /// [`Scale::ticks_in`] are read of it.
+    pub(crate) fn of_line([ticks, mono, ns_per_tick]: [u64; 3]) -> Scale {
+        Scale {
+            ticks,
+            at: Instant::now(),
+            mono: mono as i64,
+            ns_per_tick: f64::from_bits(ns_per_tick),
+        }
     }
 }
 
@@ -200,4 +233,49 @@ mod tests {
         );
         assert!(scale.mono(ticks()) >= scale.mono(first));
     }
+}
+
+/// The id of the machine's boot, once a process: every `*_ns` instant counts from a boot, so
+/// two instants compare only under one boot id, and a process is `(boot, pid)`, as a pid is
+/// used again after a reboot. Linux's `/proc/sys/kernel/random/boot_id`; macOS's
+/// `kern.bootsessionuuid`. `None` where the OS says none, or elsewhere: a reader takes a file
+/// of no boot as of any boot, so it reads more files, never fewer.
+pub fn boot() -> Option<&'static str> {
+    static BOOT: OnceLock<Option<String>> = OnceLock::new();
+    BOOT.get_or_init(read_boot).as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    // alloc: once a process
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_boot() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: the name is NUL-terminated, `buf` is `len` bytes to write, and no new value is set.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 || len == 0 || len > buf.len() {
+        return None;
+    }
+    let id = std::str::from_utf8(&buf[..len]).ok()?.trim_end_matches('\0').trim();
+    // alloc: once a process
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn read_boot() -> Option<String> {
+    None
 }

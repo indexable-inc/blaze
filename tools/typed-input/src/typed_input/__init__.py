@@ -2,8 +2,8 @@
 
 A script takes a single JSON object, given inline as its one argument, as the path of a file, or
 as `-` for standard input, and reads it into a frozen dataclass whose every field is named and
-typed. `parse` refuses a field the class does not have (never dropping it), one it needs and was
-not given, and a value of another type, naming the field, the class and where in the JSON it is.
+typed. `parse` refuses a field the class does not have, one it needs and was not given, and a
+value of another type, and names the field.
 
     @dataclass(frozen=True)
     class Run:
@@ -80,31 +80,23 @@ def _check(where: str, hint: Any, value: object) -> object:
     raise TypeError(f"typed_input: {where} has a type it does not read: {hint!r}")
 
 
-def _at(where: str) -> str:
-    return f"at {where}" if where else "at the top level"
-
-
 def _of[T](cls: type[T], value: object, where: str) -> T:
     if not isinstance(value, dict):
-        raise InputError(f"{where or 'the input'} is a JSON object ({cls.__name__}), not {json.dumps(value)}")
+        raise InputError(f"{where or 'the input'} is a JSON object, not {json.dumps(value)}")
     given = typing.cast(dict[str, object], value)
-    fields = [f.name for f in dataclasses.fields(typing.cast(Any, cls))]
+    fields = {f.name: f for f in dataclasses.fields(typing.cast(Any, cls))}
     prefix = f"{where}." if where else ""
     if unknown := sorted(set(given) - set(fields)):
-        names = ", ".join(unknown)
-        raise InputError(
-            f"{cls.__name__} {_at(where)} has no field {names} (its fields are {', '.join(sorted(fields))})"
-        )
-    defaulted = {
-        f.name
-        for f in dataclasses.fields(typing.cast(Any, cls))
-        if f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING
-    }
-    if missing := [it for it in fields if it not in given and it not in defaulted]:
-        names = ", ".join(missing)
-        raise InputError(f"{cls.__name__} {_at(where)} needs field {names}")
+        names = ", ".join(prefix + it for it in unknown)
+        raise InputError(f"no field {names} (the fields are {', '.join(sorted(fields))})")
     hints = typing.get_type_hints(cls)
-    return cls(**{name: _check(prefix + name, hints[name], given[name]) for name in fields if name in given})
+    kwargs: dict[str, object] = {}
+    for name, field in fields.items():
+        if name in given:
+            kwargs[name] = _check(prefix + name, hints[name], given[name])
+        elif field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING:
+            raise InputError(f"field {prefix + name} is required")
+    return cls(**kwargs)
 
 
 def parse[T](cls: type[T], text: str, script: str) -> T:

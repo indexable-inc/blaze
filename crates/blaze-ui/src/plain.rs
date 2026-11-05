@@ -2,7 +2,7 @@
 
 use blaze_protocol::events::Record;
 
-use crate::{Build, Change, Count, Dur, HEARTBEAT_NS, NEWS_NS, staying, status};
+use crate::{Build, Change, Count, Dur, HEARTBEAT_NS, NEWS_NS, status, staying};
 
 pub struct Plain {
     build: Build,

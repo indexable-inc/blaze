@@ -14,9 +14,9 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    db::HirDatabase,
     Adjust, Adjustment, AutoBorrow,
     autoderef::{GeneralAutoderef, InferenceContextAutoderef},
+    db::HirDatabase,
     infer::{
         AllowTwoPhase, AutoBorrowMutability, Expectation, InferenceContext, InferenceDiagnostic,
         expr::{ExprIsRead, TupleArgumentsFlag},
@@ -24,7 +24,10 @@ use crate::{
     method_resolution::{MethodCallee, TreatNotYetDefinedOpaques},
     next_solver::{
         ConstKind, FnSig, Ty, TyKind,
-        infer::{BoundRegionConversionTime, traits::{ObligationCause, ObligationCauseCode}},
+        infer::{
+            BoundRegionConversionTime,
+            traits::{ObligationCause, ObligationCauseCode},
+        },
     },
 };
 

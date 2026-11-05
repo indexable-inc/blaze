@@ -87,12 +87,7 @@ impl std::error::Error for Refused {}
 
 /// What a borrow check result lets run: errors first, as they say the most.
 pub(crate) fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused> {
-    let errors: Vec<_> = result
-        .diagnostics
-        .iter()
-        .filter(|it| it.is_error())
-        .cloned()
-        .collect(); // alloc: a refusal's own errors; empty, so no allocation, for a passing body
+    let errors: Vec<_> = result.diagnostics.iter().filter(|it| it.is_error()).cloned().collect(); // alloc: a refusal's own errors; empty, so no allocation, for a passing body
     if !errors.is_empty() {
         return Err(Refused::Errors { owner, errors });
     }

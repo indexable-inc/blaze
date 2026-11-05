@@ -114,7 +114,10 @@ impl<N> CallSite<N> {
 
 impl<N> TailCallErrorKind<N> {
     /// The same refusal, each expression named by `f`'s node, or the first `Err` it gives.
-    pub fn try_map<M, E>(self, mut f: impl FnMut(N) -> Result<M, E>) -> Result<TailCallErrorKind<M>, E> {
+    pub fn try_map<M, E>(
+        self,
+        mut f: impl FnMut(N) -> Result<M, E>,
+    ) -> Result<TailCallErrorKind<M>, E> {
         use TailCallErrorKind::*;
         Ok(match self {
             InClosure => InClosure,
@@ -160,7 +163,9 @@ impl<N> TailCallErrorKind<N> {
             AbiMismatch { .. } => "mismatched function ABIs",
             UnsupportedAbi(_) => "ABI does not support guaranteed tail calls",
             SignatureMismatch { .. } => "mismatched signatures",
-            TrackCallerCaller => "a function marked with `#[track_caller]` cannot perform a tail-call",
+            TrackCallerCaller => {
+                "a function marked with `#[track_caller]` cannot perform a tail-call"
+            }
             CVariadicCaller => "tail-calls are not allowed in c-variadic functions",
             CVariadicCallee => "c-variadic functions can't be tail-called",
             UnsizedArgument(_) => "unsized arguments cannot be used in a tail call",
@@ -244,7 +249,8 @@ pub fn tail_call_check(db: &Db, def: DefWithBodyId) -> TailCallCheck {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     // With what the body's `for const` loops assume of their binders, as inference had it.
-    let env = hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
+    let env =
+        hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
     let mut checker = Checker {
         db,
         interner,
@@ -457,7 +463,9 @@ impl<'db> Checker<'_, 'db> {
                     TyKind::FnDef(def, _) if !matches!(def.0, CallableDefId::FunctionId(_)) => {
                         Err(non_call)
                     }
-                    _ => Ok(Call { ty, fun: callee, site: CallSite { call: value, method: false } }),
+                    _ => {
+                        Ok(Call { ty, fun: callee, site: CallSite { call: value, method: false } })
+                    }
                 }
             }
             Expr::MethodCall { .. } => match overloaded(value) {
@@ -468,18 +476,18 @@ impl<'db> Checker<'_, 'db> {
                 }),
                 None => unreachable!("a method call inference found no error in is resolved"),
             },
-            Expr::UnaryOp { expr, op: UnaryOp::Not | UnaryOp::Neg } => {
-                match overloaded(value) {
-                    Some(it) if !self.infer.expr_ty(expr).is_scalar() => Ok(as_call(it)),
-                    _ => Err(builtin),
-                }
-            }
+            Expr::UnaryOp { expr, op: UnaryOp::Not | UnaryOp::Neg } => match overloaded(value) {
+                Some(it) if !self.infer.expr_ty(expr).is_scalar() => Ok(as_call(it)),
+                _ => Err(builtin),
+            },
             Expr::BinaryOp { lhs, rhs, op: Some(op) } => match op {
                 // `&&` and `||` are THIR's `LogicalOp`, never a call.
                 BinaryOp::LogicOp(_) => Err(non_call),
-                BinaryOp::ArithOp(_) | BinaryOp::CmpOp(_) | BinaryOp::Assignment { op: Some(_) } => {
-                    let scalar = self.infer.expr_ty(lhs).is_scalar()
-                        && self.infer.expr_ty(rhs).is_scalar();
+                BinaryOp::ArithOp(_)
+                | BinaryOp::CmpOp(_)
+                | BinaryOp::Assignment { op: Some(_) } => {
+                    let scalar =
+                        self.infer.expr_ty(lhs).is_scalar() && self.infer.expr_ty(rhs).is_scalar();
                     match overloaded(value) {
                         Some(it) if !scalar => Ok(as_call(it)),
                         _ => Err(builtin),
@@ -558,7 +566,11 @@ impl<'db> Checker<'_, 'db> {
         if let Some(sig) = self.caller_sig {
             return sig;
         }
-        let sig = self.db.callable_item_signature(self.caller.into()).instantiate_identity().skip_norm_wip();
+        let sig = self
+            .db
+            .callable_item_signature(self.caller.into())
+            .instantiate_identity()
+            .skip_norm_wip();
         let sig = self.interner.instantiate_bound_regions_with_erased(sig);
         let sig = self.erase_and_normalize(sig);
         self.caller_sig = Some(sig);
@@ -573,9 +585,10 @@ impl<'db> Checker<'_, 'db> {
         let at = || self.infcx.at(&cause, self.env);
         let normalized = at().deeply_normalize(sig).ok().filter(|it| !it.has_infer());
         let Some(normalized) = normalized else {
-            let ty = sig.inputs_and_output.iter().find(|&ty| {
-                at().deeply_normalize(ty).ok().is_none_or(|it| it.has_infer())
-            });
+            let ty = sig
+                .inputs_and_output
+                .iter()
+                .find(|&ty| at().deeply_normalize(ty).ok().is_none_or(|it| it.has_infer()));
             return Err(ty.unwrap_or(sig.output()));
         };
         // What normalizing gives can name regions of an impl.
@@ -585,7 +598,11 @@ impl<'db> Checker<'_, 'db> {
     /// The caller's signature as rustc's note prints it: of `type_of(caller)`, its late-bound
     /// regions free.
     fn printed_caller_sig(&self) -> Ty<'db> {
-        let sig = self.db.callable_item_signature(self.caller.into()).instantiate_identity().skip_norm_wip();
+        let sig = self
+            .db
+            .callable_item_signature(self.caller.into())
+            .instantiate_identity()
+            .skip_norm_wip();
         let sig = self.interner.liberate_late_bound_regions(self.caller.into(), sig);
         Ty::new_fn_ptr(self.interner, Binder::dummy(sig))
     }
@@ -593,7 +610,8 @@ impl<'db> Checker<'_, 'db> {
     /// The callee's signature as rustc's note prints it: of the callee's type, its late-bound
     /// regions free.
     fn printed_callee_sig(&self, callee: Ty<'db>) -> Ty<'db> {
-        let callee = callee.fold_with(&mut EraseRegions { interner: self.interner, anonymize: false });
+        let callee =
+            callee.fold_with(&mut EraseRegions { interner: self.interner, anonymize: false });
         let Some(sig) = callee.callable_sig(self.interner) else {
             unreachable!("a function definition or pointer has a signature: {callee:?}")
         };
@@ -604,7 +622,11 @@ impl<'db> Checker<'_, 'db> {
     /// Whether the function a tail call of `func` with `args` makes is `#[track_caller]`, as
     /// far as the caller's environment resolves it: rustc's `requires_caller_location` of the
     /// instance codegen makes.
-    fn callee_is_track_caller(&self, func: FunctionId, args: hir_ty::next_solver::GenericArgs<'db>) -> bool {
+    fn callee_is_track_caller(
+        &self,
+        func: FunctionId,
+        args: hir_ty::next_solver::GenericArgs<'db>,
+    ) -> bool {
         if track_caller(self.db, func) {
             return true;
         }
@@ -647,7 +669,8 @@ fn is_builtin_index(infer: &InferenceResult<'_>, base: ExprId, index: ExprId) ->
 /// Whether `func` is `#[track_caller]`, its own attribute or, for an impl's method, that of the
 /// trait's declaration of it: rustc's `codegen_fn_attrs` (as `hir_ty_mir`'s `track_caller`).
 pub fn track_caller(db: &Db, func: FunctionId) -> bool {
-    let has = |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
+    let has =
+        |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
     if has(func) {
         return true;
     }

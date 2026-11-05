@@ -1,6 +1,6 @@
 ---
 name: changing-code
-description: "How a change that spans the tree is made: moves through blaze-lints bans and `blaze check --fix`/`--replace`, whole ports of shared signatures, one concept in one home, the best long-term design, and round-trip tests for persisted state. Load before renaming or moving a type, path or API, changing a shared signature, removing a duplicate, choosing a design, or touching the daemon image, the store or other persisted state."
+description: "How a change that spans the tree is made: moves through blaze-lints bans and `blaze check --fix`/`--replace`, whole ports of shared signatures, one concept in one home, the best long-term design, and a spec before a design. Load before renaming or moving a type, path or API, changing a shared signature, removing a duplicate, or choosing a design. Tests for persisted, durable or concurrent state are the `testing` skill."
 ---
 
 # Changing code across blaze
@@ -26,21 +26,30 @@ caller in the same batch, so the shared tree compiles at every save point. Do it
 check --fix`, `blaze check --replace` or a scoped rewrite, then build, then hand the batch over. A
 half-ported tree blocks every lane's run.
 
-## persisted-state-round-trips (rule 25)
-
-Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores
-it and checks the result equals a fresh build byte for byte, and a budget for restart to first
-answer. A restore that silently starts empty is a failure the daemon reports, naming why.
-
 ## best-long-term-design (rule 27)
 
 Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and
-spend the effort on proving it right: real crates' own test suites passing under blaze, and fuzzing
-of blaze's own invariants.
+spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel
+property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing
+of parsers of hostile bytes.
 
 See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
 
-## one-concept-one-home (rule 28)
+## spec-then-build (rule 28)
+
+Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a
+hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the
+losing alternative in a line, the cost budget, the migration, how it is proven: for concurrent,
+durable, billing or data-deleting code, the DST and the invariant its oracle checks). Have a fresh
+reviewer check it against the code when it is large. Then start building it in the same lane, in the
+same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same
+pull request as the first code that implements it, and is marked `current` (or rewritten to describe
+what was built) once the work lands. A spec with no code behind it is unfinished work, not a result;
+a lane that cannot build what it specified says what blocks it and who it handed the work to.
+
+See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
+
+## one-concept-one-home (rule 29)
 
 Each concept has one type, one rule and one place it is computed: two types for the same thing (a
 `BuiltFor` in two crates), two copies of a rule (where code runs, what a key covers), two paths that

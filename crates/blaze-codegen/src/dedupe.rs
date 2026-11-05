@@ -27,7 +27,10 @@ use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 
-use crate::{CompiledFunction, Data, Init, InstanceKey, Relocs, Static, Target, Unwind, content::code_id, content::data_id};
+use crate::{
+    CompiledFunction, Data, Init, InstanceKey, Relocs, Static, Target, Unwind, content::code_id,
+    content::data_id,
+};
 
 /// The domain of a writable datum's ID once dedupe renamed what it points at: its old ID (its
 /// static's, by [`Data::owned`]) and its new content, so it stays its static's own object and
@@ -90,7 +93,9 @@ impl DedupeError {
         match self {
             DedupeError::NoFixpoint { merging, .. } => merging.0,
             DedupeError::DataOrder { owner: DataOwner::Function(key), .. } => *key,
-            DedupeError::DataOrder { owner: DataOwner::Static(..), .. } => InstanceKey(ContentId::default()),
+            DedupeError::DataOrder { owner: DataOwner::Static(..), .. } => {
+                InstanceKey(ContentId::default())
+            }
         }
     }
 
@@ -137,15 +142,17 @@ fn rename_unwind(
     let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
     let area = |it: Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
     match unwind {
-        Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => Unwind::Dwarf {
-            code_align,
-            data_align,
-            return_address,
-            cie,
-            fde,
-            personality: routine(&personality),
-            lsda: area(lsda),
-        },
+        Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => {
+            Unwind::Dwarf {
+                code_align,
+                data_align,
+                return_address,
+                cie,
+                fde,
+                personality: routine(&personality),
+                lsda: area(lsda),
+            }
+        }
         Unwind::Windows { info, handler, lsda } => {
             Unwind::Windows { info, handler: routine(&handler), lsda: area(lsda) }
         }
@@ -203,12 +210,19 @@ fn rename_data(
 
 /// Renames what `function` calls by `kept`, in place, and makes its data's IDs again; leaves
 /// it as it is, and says so, when it names nothing of `kept`.
-fn rename(function: &mut CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> Result<bool, DedupeError> {
+fn rename(
+    function: &mut CompiledFunction,
+    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+) -> Result<bool, DedupeError> {
     let routine_named = match &function.unwind {
-        Some(Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. }) => names(it, kept),
+        Some(
+            Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. },
+        ) => names(it, kept),
         _ => false,
     };
-    if !names_kept(&function.relocs, kept) && !function.data.iter().any(|it| names_kept(&it.relocs, kept)) && !routine_named
+    if !names_kept(&function.relocs, kept)
+        && !function.data.iter().any(|it| names_kept(&it.relocs, kept))
+        && !routine_named
     {
         return Ok(false);
     }
@@ -220,7 +234,10 @@ fn rename(function: &mut CompiledFunction, kept: &HashMap<InstanceKey, InstanceK
 
 /// Renames what `value` points at by `kept`, in place, and makes its data's IDs again; says
 /// whether anything changed, which changes its digest.
-fn rename_static(value: &mut Static, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> Result<bool, DedupeError> {
+fn rename_static(
+    value: &mut Static,
+    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+) -> Result<bool, DedupeError> {
     let init_names = matches!(&value.init, Init::Bytes { relocs, .. } if names_kept(relocs, kept));
     if !init_names && !value.data.iter().any(|it| names_kept(&it.relocs, kept)) {
         return Ok(false);
@@ -246,9 +263,14 @@ pub fn dedupe(
     // instrumented one its own PGO record: merged, two would share counters.
     let counts = |it: &CompiledFunction| {
         it.profile.is_some_and(|it| it.counted().is_some())
-            || it.relocs.targets().iter().any(|it| matches!(it, Target::Counter(_) | Target::ProfileCounters))
+            || it
+                .relocs
+                .targets()
+                .iter()
+                .any(|it| matches!(it, Target::Counter(_) | Target::ProfileCounters))
     };
-    let candidate = |it: &CompiledFunction| mergeable(&it.key) && it.coverage.is_none() && !counts(it);
+    let candidate =
+        |it: &CompiledFunction| mergeable(&it.key) && it.coverage.is_none() && !counts(it);
     // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
     // Unordered: only grouped, and each group is sorted on its own.
     let mut ids: HashMap<InstanceKey, ContentId, Global> = HashMap::new_in(Global);
@@ -327,7 +349,10 @@ mod tests {
     use super::*;
     use crate::{Arch, RelocKind, Relocation};
 
-    fn run(functions: &mut Vec<CompiledFunction>, mergeable: impl Fn(&InstanceKey) -> bool) -> Deduped {
+    fn run(
+        functions: &mut Vec<CompiledFunction>,
+        mergeable: impl Fn(&InstanceKey) -> bool,
+    ) -> Deduped {
         dedupe(functions, &mut [], mergeable).unwrap().0
     }
 
@@ -366,7 +391,12 @@ mod tests {
     fn an_lsda_follows_its_data_and_a_personality_its_function() {
         // 2 and 3 are equal; 9's personality is 3 and its LSDA points at 3.
         let lsda = |to: u8| {
-            let relocs = vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }];
+            let relocs = vec![Relocation {
+                at: 0,
+                kind: RelocKind::Abs64,
+                target: Target::Direct(key(to)),
+                addend: 0,
+            }];
             Data::new(4, vec![0; 4], relocs.into())
         };
         let mut caller = function(9, 0x55, &[]);
@@ -423,7 +453,12 @@ mod tests {
     fn counting_functions_count_apart() {
         let counting = |n| {
             let mut it = function(n, 0x90, &[]);
-            it.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Counter(key(n)), addend: 4 });
+            it.relocs.push(Relocation {
+                at: 0,
+                kind: RelocKind::PcRel32,
+                target: Target::Counter(key(n)),
+                addend: 4,
+            });
             it
         };
         let mut functions = vec![counting(2), counting(3), function(7, 0xc3, &[3])];
@@ -436,16 +471,32 @@ mod tests {
     /// merge as any code, a mismatched one only with another mismatched.
     #[test]
     fn instrumented_functions_count_apart() {
-        let record = crate::ProfileRecord { name: [1; 16], name_ref: 2, hash: 3, counters: 1, version: 10 };
-        let profiled = |n, profile| CompiledFunction { profile: Some(profile), ..function(n, 0x90, &[]) };
-        let mut functions = vec![profiled(2, crate::Profiled::Counted(record)), profiled(3, crate::Profiled::Counted(record))];
-        functions[0].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
-        functions[1].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
+        let record =
+            crate::ProfileRecord { name: [1; 16], name_ref: 2, hash: 3, counters: 1, version: 10 };
+        let profiled =
+            |n, profile| CompiledFunction { profile: Some(profile), ..function(n, 0x90, &[]) };
+        let mut functions = vec![
+            profiled(2, crate::Profiled::Counted(record)),
+            profiled(3, crate::Profiled::Counted(record)),
+        ];
+        functions[0].relocs.push(Relocation {
+            at: 0,
+            kind: RelocKind::PcRel32,
+            target: Target::ProfileCounters,
+            addend: 4,
+        });
+        functions[1].relocs.push(Relocation {
+            at: 0,
+            kind: RelocKind::PcRel32,
+            target: Target::ProfileCounters,
+            addend: 4,
+        });
         assert!(run(&mut functions, |_| true).merged.is_empty());
         assert_eq!(functions.len(), 2);
 
         let used = |mismatched| crate::Profiled::Used { mismatched, applied: !mismatched };
-        let mut functions = vec![profiled(2, used(true)), profiled(3, used(true)), profiled(4, used(false))];
+        let mut functions =
+            vec![profiled(2, used(true)), profiled(3, used(true)), profiled(4, used(false))];
         let deduped = run(&mut functions, |_| true);
         assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2))]));
         assert_eq!(functions.len(), 2);
@@ -461,7 +512,10 @@ mod tests {
         let mut functions =
             vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
         run(&mut functions, |it| *it != key(7));
-        assert_eq!(functions.iter().find(|it| it.key == key(7)).unwrap().relocs.targets(), [Target::Direct(key(2))]);
+        assert_eq!(
+            functions.iter().find(|it| it.key == key(7)).unwrap().relocs.targets(),
+            [Target::Direct(key(2))]
+        );
     }
 
     #[test]
@@ -470,12 +524,23 @@ mod tests {
             Data::new(
                 8,
                 vec![0; 8],
-                vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }].into(),
+                vec![Relocation {
+                    at: 0,
+                    kind: RelocKind::Abs64,
+                    target: Target::Direct(key(to)),
+                    addend: 0,
+                }]
+                .into(),
             )
         };
         let mut caller = function(9, 0x55, &[]);
         let table = vtable(3);
-        caller.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 });
+        caller.relocs.push(Relocation {
+            at: 0,
+            kind: RelocKind::PcRel32,
+            target: Target::Data(table.id),
+            addend: -4,
+        });
         caller.data.push(table);
         let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
         run(&mut functions, |_| true);
@@ -533,14 +598,16 @@ mod tests {
     /// `static S: (fn(), &T)` whose `fn` is 3 and whose `T`, writable, points at 3 too.
     fn holder(item: u8) -> crate::Static {
         let owner = ContentId([item; 32]);
-        let inner = Data::owned(&owner, 0, 8, vec![0; 8], vec![abs64(0, Target::Function(key(3)))].into());
+        let inner =
+            Data::owned(&owner, 0, 8, vec![0; 8], vec![abs64(0, Target::Function(key(3)))].into());
         crate::Static {
             item: blaze_items::ItemKey(owner),
             instance: ContentId::default(),
             align: 8,
             init: crate::Init::Bytes {
                 bytes: vec![0; 16],
-                relocs: vec![abs64(0, Target::Function(key(3))), abs64(8, Target::Data(inner.id))].into(),
+                relocs: vec![abs64(0, Target::Function(key(3))), abs64(8, Target::Data(inner.id))]
+                    .into(),
             },
             data: vec![inner],
             mutable: false,
@@ -553,7 +620,8 @@ mod tests {
     #[test]
     fn a_static_naming_a_folded_function_names_the_kept_one() {
         let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[])];
-        let untouched = crate::Static { init: crate::Init::Zeroed { size: 8 }, data: Vec::new(), ..holder(30) };
+        let untouched =
+            crate::Static { init: crate::Init::Zeroed { size: 8 }, data: Vec::new(), ..holder(30) };
         let mut statics = vec![untouched.clone(), holder(31)];
         let before = holder(31);
         let (deduped, renamed) = dedupe(&mut functions, &mut statics, |_| true).unwrap();
@@ -566,8 +634,13 @@ mod tests {
         assert_eq!(inner.relocs.targets(), [Target::Function(key(2))]);
         assert!(inner.writable, "a writable datum stays writable");
         assert_ne!(inner.id, before.data[0].id, "it is another object once it points elsewhere");
-        assert_ne!(inner.id, Data::new(8, vec![0; 8], inner.relocs.clone()).id, "and still its static's own");
-        let (mut again, mut statics_again) = (vec![function(3, 0x90, &[]), function(2, 0x90, &[])], vec![untouched, holder(31)]);
+        assert_ne!(
+            inner.id,
+            Data::new(8, vec![0; 8], inner.relocs.clone()).id,
+            "and still its static's own"
+        );
+        let (mut again, mut statics_again) =
+            (vec![function(3, 0x90, &[]), function(2, 0x90, &[])], vec![untouched, holder(31)]);
         dedupe(&mut again, &mut statics_again, |_| true).unwrap();
         assert_eq!(statics_again, statics, "renamed the same whatever the order");
     }
@@ -579,11 +652,20 @@ mod tests {
         let outer = Data::new(8, vec![2; 8], vec![abs64(0, Target::Data(inner.id))].into());
         let caller = |data: Vec<Data>| {
             let mut it = function(9, 0x55, &[]);
-            it.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Data(outer.id), addend: -4 });
+            it.relocs.push(Relocation {
+                at: 0,
+                kind: RelocKind::PcRel32,
+                target: Target::Data(outer.id),
+                addend: -4,
+            });
             it.data = data;
             it
         };
-        let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller(vec![inner.clone(), outer.clone()])];
+        let mut functions = vec![
+            function(2, 0x90, &[]),
+            function(3, 0x90, &[]),
+            caller(vec![inner.clone(), outer.clone()]),
+        ];
         run(&mut functions, |_| true);
         let inner2 = Data::new(8, vec![1; 8], vec![abs64(0, Target::Direct(key(2)))].into());
         let outer2 = Data::new(8, vec![2; 8], vec![abs64(0, Target::Data(inner2.id))].into());
@@ -591,16 +673,35 @@ mod tests {
         assert_eq!(renamed.data, [inner2, outer2.clone()]);
         assert_eq!(renamed.relocs.targets(), [Target::Data(outer2.id)]);
 
-        let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller(vec![outer.clone(), inner.clone()])];
+        let mut functions = vec![
+            function(2, 0x90, &[]),
+            function(3, 0x90, &[]),
+            caller(vec![outer.clone(), inner.clone()]),
+        ];
         let refused = dedupe(&mut functions, &mut [], |_| true).unwrap_err();
-        assert_eq!(refused, DedupeError::DataOrder { owner: DataOwner::Function(key(9)), datum: outer.id, points_at: inner.id });
+        assert_eq!(
+            refused,
+            DedupeError::DataOrder {
+                owner: DataOwner::Function(key(9)),
+                datum: outer.id,
+                points_at: inner.id
+            }
+        );
     }
 
     /// Two chains of 31 that differ in no byte fold one link per round, transitively: the
     /// fixpoint takes one round per link and one more, within its bound.
     #[test]
     fn a_chain_folds_to_its_fixpoint_one_link_a_round() {
-        let chain = |from: u8| (0..31u8).map(move |n| if n == 0 { function(from, 0x90, &[]) } else { function(from + n, 0xcc, &[from + n - 1]) });
+        let chain = |from: u8| {
+            (0..31u8).map(move |n| {
+                if n == 0 {
+                    function(from, 0x90, &[])
+                } else {
+                    function(from + n, 0xcc, &[from + n - 1])
+                }
+            })
+        };
         let mut functions: Vec<CompiledFunction> = chain(1).chain(chain(101)).collect();
         let deduped = run(&mut functions, |_| true);
         assert_eq!(deduped.merged.len(), 31);

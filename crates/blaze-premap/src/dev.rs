@@ -21,7 +21,9 @@ use crate::PremapError;
 use crate::cache::{Images, Pick, Ready};
 use crate::key::{GraphInputs, GraphKey, ImageInputs, ImageKey};
 use crate::prelink::{self, Prelink, Request};
-use crate::split::{Built, Fit, ImagePart, Owned, SidedNative, WorkspacePart, image_part, workspace_part};
+use crate::split::{
+    Built, Fit, ImagePart, Owned, SidedNative, WorkspacePart, image_part, workspace_part,
+};
 use crate::store::Shelf;
 
 /// A dev build, as premap takes it.
@@ -59,7 +61,8 @@ pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, Prema
     let graph = GraphKey::of(&dev.graph);
     let newest = images.newest(graph);
     if let Some(image) = &newest
-        && let Fit::Part(workspace) = workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)?
+        && let Fit::Part(workspace) =
+            workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)?
     {
         let image = Arc::clone(image);
         if workspace.complete() {
@@ -79,18 +82,23 @@ pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, Prema
     }
     let (key, part) = own_key(graph, dev)?;
     match images.want(key) {
-        Pick::Use(image) => match workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)? {
-            Fit::Part(workspace) if workspace.complete() => Ok(Plan::Link { image, workspace, next: None }),
-            Fit::Part(workspace) => Err(PremapError::of(format_args!(
-                "the dependency image {:?} lacks {} functions and {} statics its own pieces have",
-                key.0,
-                workspace.spilled.len(),
-                workspace.spilled_statics.len()
-            ))),
-            Fit::Stale(stale) => {
-                Err(PremapError::of(format_args!("the dependency image {:?} is not of its own pieces: {stale:?}", key.0)))
+        Pick::Use(image) => {
+            match workspace_part(&dev.built, &dev.owned, &image.view(), dev.natives)? {
+                Fit::Part(workspace) if workspace.complete() => {
+                    Ok(Plan::Link { image, workspace, next: None })
+                }
+                Fit::Part(workspace) => Err(PremapError::of(format_args!(
+                    "the dependency image {:?} lacks {} functions and {} statics its own pieces have",
+                    key.0,
+                    workspace.spilled.len(),
+                    workspace.spilled_statics.len()
+                ))),
+                Fit::Stale(stale) => Err(PremapError::of(format_args!(
+                    "the dependency image {:?} is not of its own pieces: {stale:?}",
+                    key.0
+                ))),
             }
-        },
+        }
         Pick::Make => Ok(Plan::Make(Job { graph, key, part, dev })),
         Pick::Wait => Ok(Plan::Wait),
         Pick::Failed(error) => Err(error),
@@ -98,7 +106,10 @@ pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, Prema
 }
 
 /// The dependency pieces of `dev` and the key of their image.
-fn own_key<'a>(graph: GraphKey, dev: &'a Dev<'a>) -> Result<(ImageKey, ImagePart<'a>), PremapError> {
+fn own_key<'a>(
+    graph: GraphKey,
+    dev: &'a Dev<'a>,
+) -> Result<(ImageKey, ImagePart<'a>), PremapError> {
     let part = image_part(&dev.built, &dev.owned, dev.natives)?;
     let key = ImageKey::of(
         graph,
@@ -114,7 +125,11 @@ fn own_key<'a>(graph: GraphKey, dev: &'a Dev<'a>) -> Result<(ImageKey, ImagePart
 
 impl Job<'_> {
     /// The image, from `shelf` when it keeps it, else linked by `linker` and kept there.
-    pub fn make(&self, linker: &impl Prelink, shelf: &mut impl Shelf) -> Result<Ready, PremapError> {
+    pub fn make(
+        &self,
+        linker: &impl Prelink,
+        shelf: &mut impl Shelf,
+    ) -> Result<Ready, PremapError> {
         if let Some(bytes) = shelf.get_image(&self.key)? {
             return Ready::open(self.graph, self.key, bytes);
         }

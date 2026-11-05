@@ -39,7 +39,9 @@ fn diagnostics() -> Vec<TyLoweringDiagnostic> {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::AdtId(AdtId::StructId(it)) if StructSignature::of(&db, it).name.as_str() == "V" => {
+                ModuleDefId::AdtId(AdtId::StructId(it))
+                    if StructSignature::of(&db, it).name.as_str() == "V" =>
+                {
                     Some(it)
                 }
                 _ => None,
@@ -84,7 +86,9 @@ fn a_second_non_auto_trait_is_e0225() {
 fn two_values_of_one_associated_type_are_e0719() {
     let found = diagnostics();
     assert!(
-        found.iter().any(|it| matches!(it, TyLoweringDiagnostic::ConflictingAssocTypeBindings { .. })),
+        found
+            .iter()
+            .any(|it| matches!(it, TyLoweringDiagnostic::ConflictingAssocTypeBindings { .. })),
         "{found:?}",
     );
 }

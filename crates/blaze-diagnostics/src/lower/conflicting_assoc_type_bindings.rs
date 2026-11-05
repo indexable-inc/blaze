@@ -16,7 +16,8 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConflictingAssocTypeBindings) -> Vec<Found> {
     let span = cx.span(cx.node_view(d.bound).map(|it| it.syntax().text_range()));
     let name = d.assoc.name(cx.db).expect("an associated type has a name");
-    let trait_ = d.assoc.container_trait(cx.db).expect("a trait object's associated type is its trait's");
+    let trait_ =
+        d.assoc.container_trait(cx.db).expect("a trait object's associated type is its trait's");
     let mut diag = Diag::error(
         Some("E0719"),
         // alloc: the error's text, for an error hir found

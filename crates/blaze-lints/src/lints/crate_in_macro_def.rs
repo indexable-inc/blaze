@@ -48,8 +48,7 @@ fn unhygienic_crate(tt: ast::Node<'_>) -> Option<TextRange> {
         if trees.clone().next().is_none() {
             break;
         }
-        if !prev_is_dollar && tree.kind() == SyntaxKind::CRATE_KW && path_sep_next(trees.clone())
-        {
+        if !prev_is_dollar && tree.kind() == SyntaxKind::CRATE_KW && path_sep_next(trees.clone()) {
             return Some(tree.text_range());
         }
         if let NodeOrToken::Node(node) = tree

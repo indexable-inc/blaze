@@ -22,16 +22,11 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BadRtn) -> Vec<Found> {
     let rtn = cx.node_view(d.rtn);
     let file = rtn.file_id;
-    let ty = rtn
-        .value
-        .syntax()
-        .parent()
-        .and_then(ast::PathSegment::cast)
-        .and_then(|segment| {
-            let path = segment.parent_path();
-            let top = path.top_path();
-            (path == top).then(|| top.syntax().parent().and_then(ast::PathType::cast))?
-        });
+    let ty = rtn.value.syntax().parent().and_then(ast::PathSegment::cast).and_then(|segment| {
+        let path = segment.parent_path();
+        let top = path.top_path();
+        (path == top).then(|| top.syntax().parent().and_then(ast::PathType::cast))?
+    });
     let (range, phase) = match ty {
         Some(ty) => (ty.syntax().text_range(), Phase::Items),
         None => (rtn.value.syntax().text_range(), Phase::Resolve),

@@ -1,18 +1,35 @@
 //! The input pass, a hot-swappable module. A collect system gathers every hoverable `Node` with its `Laid` and draw key; a
 //! step system, run once a frame by the `PointerState` singleton the host writes from window events, resolves the topmost
-//! hit (by layer, `Z`, depth, then creation order) into `(Hovered, node)` on the app entity; a press on a Pressable sets
+//! hit (by layer, `Z`, depth, then creation order; a node on its way out, `Leaving` or under one, is never hit) into
+//! `(Hovered, node)` on the app entity; a press on a Pressable sets
 //! `(Pressed, node)`, on a Focusable `(Focused, node)`; letting go over the same Pressable tags it `Activated` so feature
 //! systems can observe the `Action`. With no hoverable node in the world the pass does nothing (the chrome that is not yet
 //! nodes keeps its own `Hovered`). The host ends the frame with [`end_frame`].
 //!
-//! The only state is the per-frame hit list shared by the two systems, rebuilt every frame; everything else is in the world.
+//! The same step resolves the pointer's shape: the topmost hit's `Cursor`, or its nearest ancestor's (the arrow when none
+//! says one), held from a press until its release, into the `PointerShape` singleton when it changes. The host puts its own
+//! zones and drags over it and sets the system pointer (harness-native's `App::pointer_shape` and window.rs).
+//!
+//! A third system drives every scroll's overlay scroller (`Scroller`, layout-api): the pointer near an edge widens it, a
+//! press on its knob drags it, a press on its track pages (`ScrollerGrip`, and `ScrollState` itself).
+//!
+//! The state is the per-frame hit list shared by the systems, rebuilt every frame, the topmost hit and the shape a press
+//! holds; everything else is in the world.
+use core::cell::Cell;
 use core::cell::RefCell;
 use std::rc::Rc;
 
 use harness_native_flecs::prelude::*;
 use harness_native_api::APP;
-use harness_native_ui_input_api::{Activated, Focusable, Focused, Hoverable, Hovered, PointerState, Pressable, Pressed};
-use harness_native_ui_node_api::{Clip, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_input_api::{
+    Activated, Cursor, Focusable, Focused, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
+};
+use harness_native_ui_layout_api::{
+    NoScroller, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, axis_bit, scroller_axis,
+};
+use harness_native_ui_motion_api::{Leaving, Motion};
+use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_spring_api::{Spring, Tune};
 
 struct Hit {
     id: u64,
@@ -23,18 +40,39 @@ struct Hit {
     key: (Level, f32, u32, u64),
     pressable: bool,
     focusable: bool,
+    /// Its `Cursor`, or its nearest ancestor's.
+    cursor: Option<Pointer>,
+}
+
+/// What the topmost hit under the pointer is: its id, whether it is Pressable and Focusable, and its pointer shape.
+#[derive(Clone, Copy)]
+struct Top {
+    id: u64,
+    pressable: bool,
+    focusable: bool,
+    cursor: Pointer,
 }
 
 /// Create the input systems in the module scope; deleting that scope removes them before unloading.
 pub fn install(world: WorldRef<'_>) {
     let hits: Rc<RefCell<Vec<Hit>>> = Rc::default();
     let sink = hits.clone();
-    world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).each_entity(move |e, (_, laid)| {
+    // After layout (this pass's places; its `(&Node, &Laid)` terms make flecs merge layout's writes first), then the
+    // pointer's resolve after every hit is in.
+    world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).phase(Phase::AfterLayout).each_entity(move |e, (_, laid)| {
         let (mut depth, mut root) = (0u32, e);
         let mut clip: Option<Laid> = None;
+        let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
+        // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer; one
+        // layout left out (Hidden: a ViewThatFits variant, a scroller's part while it is hidden) takes none either.
+        let mut leaving = e.has(Leaving::id()) || e.has(Hidden::id());
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
+            leaving |= p.has(Leaving::id()) || p.has(Hidden::id());
+            if cursor.is_none() {
+                cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
+            }
             if p.has(Clip::id()) && let Some(c) = p.try_cloned::<&Laid>() {
                 clip = Some(match clip {
                     None => c,
@@ -45,7 +83,7 @@ pub fn install(world: WorldRef<'_>) {
                 });
             }
         }
-        if root.has(Offscreen::id()) || root.has(Hosted::id()) {
+        if leaving || root.has(Offscreen::id()) || root.has(Hosted::id()) {
             return;
         }
         let level = root.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
@@ -57,23 +95,169 @@ pub fn install(world: WorldRef<'_>) {
             key: (level, z, depth, *e.id()),
             pressable: e.has(Pressable::id()),
             focusable: e.has(Focusable::id()),
+            cursor,
         });
     });
     let app = *world.lookup(APP).id();
-    world.system_named::<&PointerState>("UiPointer").each_iter(move |it, _, p| {
+    // The shape a press holds until its release (None: the press was on no node), while the button is down.
+    let held: Cell<Option<Option<Pointer>>> = Cell::new(None);
+    // The topmost hit this pass, for the scrollers after it.
+    let topmost: Rc<Cell<Option<u64>>> = Rc::default();
+    let top_out = topmost.clone();
+    world.system_named::<&PointerState>("UiPointer").phase(Phase::Resolve).each_iter(move |it, _, p| {
         let mut hits = hits.borrow_mut();
-        if hits.is_empty() {
-            return;
-        }
         hits.sort_by(|a, b| a.key.0.cmp(&b.key.0).then(a.key.1.total_cmp(&b.key.1)).then(a.key.2.cmp(&b.key.2)).then(a.key.3.cmp(&b.key.3)));
-        let top = hits.iter().rev().find(|h| h.laid.contains(p.x, p.y) && h.clip.is_none_or(|c| c.contains(p.x, p.y))).map(|h| (h.id, h.pressable, h.focusable));
+        let top = hits
+            .iter()
+            .rev()
+            .find(|h| h.laid.contains(p.x, p.y) && h.clip.is_none_or(|c| c.contains(p.x, p.y)))
+            .map(|h| Top { id: h.id, pressable: h.pressable, focusable: h.focusable, cursor: h.cursor.unwrap_or_default() });
+        let any = !hits.is_empty();
         hits.clear();
-        apply(it.world().entity_from_id(app), top, *p);
+        top_out.set(top.map(|t| t.id));
+        let w = it.world();
+        shape(w, &held, top.map(|t| t.cursor), *p);
+        if any {
+            apply(w.entity_from_id(app), top, *p);
+        }
     });
+    world
+        .system_named::<(&Scroller, &ScrollState, &Laid)>("UiScroller")
+        .without(NoScroller::id())
+        // After the pointer's resolve (flecs orders a phase's systems by id), so `topmost` is this pass's.
+        .phase(Phase::Draw)
+        .reads(ScrollExtent::id())
+        .reads(ScrollerState::id())
+        .each_iter(move |it, row, (c, s, l)| {
+            let (e, w) = (it.entity(row), it.world());
+            let Some(p) = w.try_get::<&PointerState>(|p| *p) else { return };
+            scroller(e, w, *c, *s, *l, p, topmost.get(), it.delta_time());
+        });
 }
 
-fn apply(app: EntityView<'_>, top: Option<(u64, bool, bool)>, p: PointerState) {
-    let now = top.map(|t| t.0);
+/// One pass of a scroll's overlay scroller under the pointer (`Scroller`, layout-api): which edges the pointer is near
+/// (they widen; only when what is on top is the scroll or inside it), a press on its knob taking hold of it and a press on
+/// its track paging toward the press (a glide on the `ui.spring.scroller_page` spring), the held knob scrolling in
+/// proportion as the pointer moves. It writes `ScrollState` itself; a host that runs a scroll's physics adopts that.
+#[allow(clippy::too_many_arguments)]
+fn scroller(e: EntityView<'_>, w: WorldRef<'_>, c: Scroller, s: ScrollState, l: Laid, p: PointerState, top: Option<u64>, dt: f32) {
+    let Some(x) = e.try_cloned::<&ScrollExtent>() else { return };
+    let st = e.try_cloned::<&ScrollerState>().unwrap_or_default();
+    let was = e.try_cloned::<&ScrollerGrip>().unwrap_or_default();
+    let mut g = was;
+    let (laid, ext, at) = ([l.x, l.y, l.w, l.h], [x.w, x.h], [s.x, s.y]);
+    let axes = [ScrollAxis::Y, ScrollAxis::X];
+    let geom = |a: ScrollAxis| scroller_axis(&c, laid, ext, at, st.wide(a), a);
+    // What is on top is this scroll or inside it (or nothing), and the pointer is inside every clip around it.
+    let ours = top.is_none_or(|t| std::iter::successors(Some(w.entity_from_id(t)), |n| n.parent()).any(|n| n.id() == e.id()));
+    let seen = clipped(e, l);
+    g.near = 0;
+    if ours && seen.contains(p.x, p.y) {
+        for a in axes {
+            let edge = match a {
+                ScrollAxis::Y => p.x >= l.x + l.w - c.grab,
+                ScrollAxis::X => p.y >= l.y + l.h - c.grab,
+            };
+            if edge && geom(a).is_some() {
+                g.near |= axis_bit(a);
+            }
+        }
+    }
+    if !p.down {
+        g.held = false;
+        g.drag = 0;
+    } else if p.went_down && !g.held {
+        // The press is taken once, however many passes the frame runs.
+        g.held = true;
+        let part = top.map(|t| w.entity_from_id(t)).filter(|t| t.parent().is_some_and(|q| q.id() == e.id()));
+        if let Some(part) = part.and_then(|t| t.try_cloned::<&ScrollerPart>())
+            && let Some(ax) = geom(part.axis)
+        {
+            let along = [p.x, p.y][part.axis.index()];
+            let knob = ax.knob_at(part.axis);
+            g.page = 0;
+            if part.track && !(along >= knob && along <= knob + ax.knob[2 + part.axis.index()]) {
+                let page = (ax.view - c.keep).max(ax.view * 0.5);
+                let now = at[part.axis.index()];
+                g.page = axis_bit(part.axis);
+                g.goal = (if along < knob { now - page } else { now + page }).clamp(0.0, ax.max);
+                g.glide = Spring::at(now);
+            } else {
+                g.drag = axis_bit(part.axis);
+                g.grab = along - knob;
+            }
+        }
+    }
+    let mut next = s;
+    for a in axes {
+        let i = a.index();
+        if g.drag == axis_bit(a)
+            && let Some(ax) = geom(a)
+        {
+            let to = ax.scroll_for([p.x, p.y][i] - g.grab);
+            if (to - at[i]).abs() > 0.01 {
+                if i == 0 { next.x = to } else { next.y = to }
+            }
+        } else if g.page == axis_bit(a) {
+            // Moved by someone else (a wheel) since the glide's last step: the glide lets go.
+            if (at[i] - g.glide.x).abs() > 0.5 {
+                g.page = 0;
+                continue;
+            }
+            let tune = w
+                .try_lookup("ui::spring::scroller_page")
+                .and_then(|t| t.try_cloned::<&Motion>())
+                .map_or(Tune { omega: 24.0, zeta: 1.0 }, |m| Tune { omega: m.omega, zeta: m.zeta });
+            if harness_native_api::settle(&mut g.glide, g.goal, tune, dt) {
+                harness_native_api::moving(&w);
+            } else {
+                g.glide = Spring::at(g.goal);
+                g.page = 0;
+            }
+            if i == 0 { next.x = g.glide.x } else { next.y = g.glide.x }
+        }
+    }
+    if next != s {
+        e.set(next);
+    }
+    if g != was {
+        e.set(g);
+    }
+}
+
+/// `l` cut to every `Clip` around `e`: where the pointer can reach it.
+fn clipped(e: EntityView<'_>, l: Laid) -> Laid {
+    let mut r = l;
+    let mut at = e.parent();
+    while let Some(n) = at.filter(|n| n.has(Node::id())) {
+        if n.has(Clip::id())
+            && let Some(c) = n.try_cloned::<&Laid>()
+        {
+            let (x, y) = (r.x.max(c.x), r.y.max(c.y));
+            r = Laid { x, y, w: ((r.x + r.w).min(c.x + c.w) - x).max(0.0), h: ((r.y + r.h).min(c.y + c.h) - y).max(0.0) };
+        }
+        at = n.parent();
+    }
+    r
+}
+
+/// Resolve the pointer's shape from `over` (the topmost hit's) and the press that may hold one, into `PointerShape` when it
+/// changes.
+fn shape(w: WorldRef<'_>, held: &Cell<Option<Option<Pointer>>>, over: Option<Pointer>, p: PointerState) {
+    if p.went_down && p.down {
+        held.set(Some(over));
+    } else if !p.down {
+        held.set(None);
+    }
+    let now = held.get().unwrap_or(over);
+    let want = PointerShape { shape: now.unwrap_or_default(), node: now.is_some() };
+    if w.try_get::<&PointerShape>(|s| *s) != Some(want) {
+        w.set(want);
+    }
+}
+
+fn apply(app: EntityView<'_>, top: Option<Top>, p: PointerState) {
+    let now = top.map(|t| t.id);
     let was = app.target(Hovered::id(), 0).map(|e| *e.id());
     // What the chrome that is not yet nodes has under the pointer is its own: only a node's hover is taken off here.
     let was_node = app.target(Hovered::id(), 0).is_some_and(|e| e.has(Node::id()));
@@ -102,8 +286,8 @@ fn apply(app: EntityView<'_>, top: Option<(u64, bool, bool)>, p: PointerState) {
 }
 
 /// The button went down over `top`: it is Pressed if Pressable, and focus goes to it or nowhere. The node pressed, if any.
-fn press(app: EntityView<'_>, top: Option<(u64, bool, bool)>) -> Option<u64> {
-    let Some((id, pressable, focusable)) = top else {
+fn press(app: EntityView<'_>, top: Option<Top>) -> Option<u64> {
+    let Some(Top { id, pressable, focusable, .. }) = top else {
         app.remove((Focused::id(), flecs::Wildcard::ID));
         return None;
     };
@@ -168,5 +352,11 @@ pub fn cycle_focus(world: WorldRef<'_>, forward: bool) {
 harness_native_api::module!(
     "input",
     install,
-    [harness_native_api::API_LAYOUTS, harness_native_ui_node_api::API_LAYOUTS, harness_native_ui_input_api::API_LAYOUTS]
+    [
+        harness_native_api::API_LAYOUTS,
+        harness_native_ui_node_api::API_LAYOUTS,
+        harness_native_ui_input_api::API_LAYOUTS,
+        harness_native_ui_layout_api::API_LAYOUTS,
+        harness_native_ui_motion_api::API_LAYOUTS
+    ]
 );

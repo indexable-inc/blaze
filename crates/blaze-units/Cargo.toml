@@ -32,6 +32,8 @@ semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 blaze-sha256.workspace = true
+# The CPUs of `-C target-cpu` and their features (target_features::cpus).
+target-features.workspace = true
 toml.workspace = true
 url.workspace = true
 

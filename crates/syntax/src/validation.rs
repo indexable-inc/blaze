@@ -300,7 +300,8 @@ fn validate_visibility(vis: ast::Visibility<'_>, errors: &mut Vec<SyntaxError>) 
         false
     };
     if path_without_in_token {
-        errors.push(SyntaxError::new("incorrect visibility restriction", vis.syntax().text_range()));
+        errors
+            .push(SyntaxError::new("incorrect visibility restriction", vis.syntax().text_range()));
     }
     let parent = match vis.syntax().parent() {
         Some(it) => it,
@@ -318,7 +319,8 @@ fn validate_visibility(vis: ast::Visibility<'_>, errors: &mut Vec<SyntaxError>) 
     // FIXME: disable validation if there's an attribute, since some proc macros use this syntax.
     // ideally the validation would run only on the fully expanded code, then this wouldn't be necessary.
     if impl_def.trait_().is_some() && impl_def.attrs().next().is_none() {
-        errors.push(SyntaxError::new("Unnecessary visibility qualifier", vis.syntax().text_range()));
+        errors
+            .push(SyntaxError::new("Unnecessary visibility qualifier", vis.syntax().text_range()));
     }
 }
 

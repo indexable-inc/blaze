@@ -20,14 +20,6 @@ pub mod official;
 ))]
 pub mod servil;
 
-#[cfg(all(
-    target_endian = "little",
-    any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
-    ),
-))]
-use servil as backend;
 #[cfg(not(all(
     target_endian = "little",
     any(
@@ -36,6 +28,14 @@ use servil as backend;
     ),
 )))]
 use official as backend;
+#[cfg(all(
+    target_endian = "little",
+    any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+    ),
+))]
+use servil as backend;
 
 #[cfg(all(
     test,
@@ -60,6 +60,9 @@ pub const BACKEND: &str = backend::NAME;
 
 /// A message's hash, in BLAKE3's own mode, its key the IV.
 #[inline]
+#[blaze::pure(
+    trusted = "the backend picks its kernels by CPU detection it caches in statics once (and blake3-servil self-tests once before its first call): every kernel gives the same bytes, so no result depends on whether or when that ran"
+)]
 pub fn hash(bytes: &[u8]) -> [u8; 32] {
     backend::hash(bytes)
 }
@@ -67,6 +70,9 @@ pub fn hash(bytes: &[u8]) -> [u8; 32] {
 /// `context`'s key for [`derive_key_with`] and [`Hasher::new_from_context_key`]: official
 /// BLAKE3's `hazmat::hash_derive_key_context`.
 #[inline]
+#[blaze::pure(
+    trusted = "the backend picks its kernels by CPU detection it caches in statics once (and blake3-servil self-tests once before its first call): every kernel gives the same bytes, so no result depends on whether or when that ran"
+)]
 pub fn context_key(context: &str) -> ContextKey {
     backend::context_key(context)
 }
@@ -74,6 +80,9 @@ pub fn context_key(context: &str) -> ContextKey {
 /// `material`'s derived key under the context whose [`context_key`] is `key`: what a
 /// [`Hasher::new_from_context_key`] fed `material` finalizes to, with no hasher.
 #[inline]
+#[blaze::pure(
+    trusted = "the backend picks its kernels by CPU detection it caches in statics once (and blake3-servil self-tests once before its first call): every kernel gives the same bytes, so no result depends on whether or when that ran"
+)]
 pub fn derive_key_with(key: &ContextKey, material: &[u8]) -> [u8; 32] {
     backend::derive_key_with(key, material)
 }

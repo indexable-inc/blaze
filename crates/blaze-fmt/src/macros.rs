@@ -592,6 +592,61 @@ fn replace_names(input: &str) -> Option<(String, HashMap<String, String>)> {
     Some((result, substs))
 }
 
+/// The column a macro branch's body is indented from in the source, the source's twin of the
+/// `body_indent` the branch is formatted with: the column the branch starts its line at, one
+/// level in when the body is not itself a block. `None` when something other than spaces comes
+/// before the branch on its line (a one-line `macro_rules!`, a `macro` with one branch), where
+/// no source column matches the formatter's.
+fn source_body_indent(
+    context: &RewriteContext<'_>,
+    branch: Span,
+    has_block_body: bool,
+) -> Option<usize> {
+    let provider = context.snippet_provider;
+    let at = branch
+        .lo()
+        .to_usize()
+        .checked_sub(provider.start_pos().to_usize())?;
+    let before = provider.entire_snippet().get(..at)?;
+    let line = &before[before.rfind('\n').map_or(0, |newline| newline + 1)..];
+    if !line.bytes().all(|byte| byte == b' ') {
+        return None;
+    }
+    Some(if has_block_body {
+        line.len()
+    } else {
+        line.len() + context.config.tab_spaces()
+    })
+}
+
+/// `body` (trimmed, so its first line starts at column 0) with `indent` spaces taken off each
+/// later line that the reindent after formatting indents: every line but an empty one and one
+/// inside a string literal, decided by `indent_next_line` as the reindent decides it. `None`
+/// when such a line starts with fewer than `indent` spaces: no whole shift moves it right, and
+/// the body is formatted from its source columns.
+fn dedent_macro_body(body: &str, indent: usize, config: &crate::config::Config) -> Option<String> {
+    if indent == 0 {
+        return None;
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut need_indent = true;
+    for (i, (kind, line)) in LineClasses::new(body).enumerate() {
+        let mut kept = line.as_str();
+        if i > 0 {
+            out.push('\n');
+            if need_indent && !is_empty_line(kept) {
+                if kept.len() < indent || !kept.as_bytes()[..indent].iter().all(|&b| b == b' ') {
+                    return None;
+                }
+                kept = &kept[indent..];
+            }
+        }
+        out.push_str(kept);
+        need_indent = indent_next_line(kind, &line, config);
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone)]
 enum MacroArgKind {
     /// e.g., `$x: expr`.
@@ -1348,19 +1403,34 @@ impl MacroBranch {
         // `$$`). We'll try and format like an AST node, but we'll substitute
         // variables for new names with the same length first.
 
-        let (body_str, substs) =
-            replace_names(old_body).macro_error(MacroErrorKind::ReplaceMacroVariable, self.span)?;
+        let body_indent = if has_block_body {
+            shape.indent
+        } else {
+            shape.indent.block_indent(context.config)
+        };
+
+        // The body is formatted as a file of its own, at column 0, and indented by `body_indent`
+        // after. A span the formatter keeps as written (an attribute that is no meta item, such
+        // as `#[tracked(returns(ref))]`) keeps the columns its lines had in the source, so those
+        // lines are moved to the formatter's columns first: in by the source's own body indent
+        // less, which the reindent below adds back as `body_indent`. Without it each run moved
+        // such lines right by `body_indent` again, and the formatter was not idempotent.
+        let dedent = source_body_indent(context, self.span, has_block_body).and_then(|indent| {
+            dedent_macro_body(old_body, indent, context.config).map(|body| (body, indent))
+        });
+        let (old_body_at_zero, source_indent) = match dedent {
+            Some((body, indent)) => (Cow::Owned(body), indent),
+            None => (Cow::Borrowed(old_body), 0),
+        };
+
+        let (body_str, substs) = replace_names(&old_body_at_zero)
+            .macro_error(MacroErrorKind::ReplaceMacroVariable, self.span)?;
 
         let mut config = context.config.clone();
         config.set().show_parse_errors(false);
 
         result += " {";
 
-        let body_indent = if has_block_body {
-            shape.indent
-        } else {
-            shape.indent.block_indent(&config)
-        };
         config.reduce_max_width(body_indent.width());
 
         // First try to format as items, then as statements.
@@ -1394,16 +1464,20 @@ impl MacroBranch {
 
         // Indent the body since it is in a block.
         let indent_str = body_indent.to_string(&config);
+        // A line left unformatted (a macro call the formatter could not parse, a skipped item)
+        // goes back to the column it had in the source: what `dedent_macro_body` took off.
+        let source_indent_str = " ".repeat(source_indent);
         let mut new_body = LineClasses::new(new_body_snippet.snippet.trim_end())
             .enumerate()
             .fold(
                 (String::new(), true),
                 |(mut s, need_indent), (i, (kind, ref l))| {
-                    if !is_empty_line(l)
-                        && need_indent
-                        && !new_body_snippet.is_line_non_formatted(i + 1)
-                    {
-                        s += &indent_str;
+                    if !is_empty_line(l) && need_indent {
+                        if new_body_snippet.is_line_non_formatted(i + 1) {
+                            s += &source_indent_str;
+                        } else {
+                            s += &indent_str;
+                        }
                     }
                     (s + l + "\n", indent_next_line(kind, l, &config))
                 },

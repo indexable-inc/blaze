@@ -1,11 +1,12 @@
 //! The dep-info check of an identity: what building the closure's crates read, as cargo's
 //! dep-info and build-script output in a target directory say, held to what the identity is of.
 //! A test of a package the program's closure is built for calls [`hold`] on its own target
-//! directory: hir-ty-codegen's for [`crate::CODEGEN`], blaze-cargo's for [`crate::FRONT_END`].
+//! directory: hir-ty-codegen's for [`crate::CODEGEN`], blaze-cargo's for [`crate::FRONT_END`] and
+//! [`crate::RECORD`].
 
 use std::path::{Path, PathBuf};
 
-use crate::{Workspace, Worked};
+use crate::{Worked, Workspace};
 
 /// What [`hold`] found: every read not covered, and what it could not check.
 #[derive(Debug, Default)]
@@ -35,8 +36,15 @@ impl Held {
         if !self.unchecked.is_empty() {
             eprintln!("not built for this test, so not checked: {}", self.unchecked.join(", "));
         }
-        assert!(self.crates > 0 && self.read > 0, "no dep-info of {what}'s crates is in the target directory");
-        assert!(self.missing.is_empty(), "{what} read what its code identity is not of:\n{}", self.missing.join("\n"));
+        assert!(
+            self.crates > 0 && self.read > 0,
+            "no dep-info of {what}'s crates is in the target directory"
+        );
+        assert!(
+            self.missing.is_empty(),
+            "{what} read what its code identity is not of:\n{}",
+            self.missing.join("\n")
+        );
     }
 }
 
@@ -50,7 +58,12 @@ impl Held {
 /// works out an identity (only the program's does, a leaf past every closure), so none may read
 /// or watch the lock. Anything else would be an input missing from every key the identity is in
 /// (AGENTS.md rule 18), and is named in [`Held::missing`].
-pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> Result<Held, String> {
+pub fn hold(
+    workspace: &Workspace,
+    worked: &Worked,
+    made: &Path,
+    exe: &Path,
+) -> Result<Held, String> {
     // The target directory, the parent of the `tmp` cargo gives integration tests (the
     // executable may run from a copy elsewhere): every unit's dep-info is under it, in either of
     // cargo's layouts, and so is everything build scripts made.
@@ -85,10 +98,14 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
         let parts: Vec<&str> = below.iter().map(|it| it.to_str()).collect::<Option<_>>()?;
         let at = parts.iter().position(|it| matches!(*it, "build" | ".fingerprint" | "deps"))?;
         let hex = |it: &str| it.len() == 16 && it.bytes().all(|b| b.is_ascii_hexdigit());
-        let suffix = |it: &str| it.rsplit_once('-').map(|(_, unit)| unit.to_owned()).filter(|unit| hex(unit));
+        let suffix = |it: &str| {
+            it.rsplit_once('-').map(|(_, unit)| unit.to_owned()).filter(|unit| hex(unit))
+        };
         match parts[at] {
             "build" => match (parts.get(at + 2), parts.get(at + 3)) {
-                (Some(unit), Some(&("fingerprint" | "out" | "run"))) if hex(unit) => Some((*unit).to_owned()),
+                (Some(unit), Some(&("fingerprint" | "out" | "run"))) if hex(unit) => {
+                    Some((*unit).to_owned())
+                }
                 _ => suffix(parts.get(at + 1)?),
             },
             ".fingerprint" => suffix(parts.get(at + 1)?),
@@ -104,12 +121,19 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     // them.
     let mut by_fingerprint: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
-    let mut jsons: std::collections::BTreeMap<String, Vec<&Path>> = std::collections::BTreeMap::new();
+    let mut jsons: std::collections::BTreeMap<String, Vec<&Path>> =
+        std::collections::BTreeMap::new();
     for path in &fingerprints {
-        let (Some(name), Some(unit)) = (path.file_name().and_then(|it| it.to_str()), unit_of(path)) else { continue };
+        let (Some(name), Some(unit)) = (path.file_name().and_then(|it| it.to_str()), unit_of(path))
+        else {
+            continue;
+        };
         if name.ends_with(".json") {
             jsons.entry(unit).or_default().push(path);
-        } else if !(name.starts_with("dep-") || name.starts_with("output-") || name == "invoked.timestamp") {
+        } else if !(name.starts_with("dep-")
+            || name.starts_with("output-")
+            || name == "invoked.timestamp")
+        {
             let Ok(hash) = std::fs::read_to_string(path) else { continue };
             by_fingerprint.entry(hash.trim().to_owned()).or_default().insert(unit);
         }
@@ -127,8 +151,10 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     let mut queue = vec![own_unit.clone()];
     while let Some(unit) = queue.pop() {
         for json in jsons.get(&unit).into_iter().flatten() {
-            let text = std::fs::read_to_string(json).map_err(|e| format!("{}: {e}", json.display()))?;
-            let deps = dep_fingerprints(&text).ok_or_else(|| format!("no `deps` of cargo's form in {}", json.display()))?;
+            let text =
+                std::fs::read_to_string(json).map_err(|e| format!("{}: {e}", json.display()))?;
+            let deps = dep_fingerprints(&text)
+                .ok_or_else(|| format!("no `deps` of cargo's form in {}", json.display()))?;
             for (name, fingerprint) in deps {
                 let hex = format!("{:016x}", fingerprint.swap_bytes());
                 let Some(made_by) = by_fingerprint.get(&hex) else {
@@ -150,7 +176,12 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     // `build/<package>/<hash>/run/stdout`, or `build/<package>-<hash>/output`.
     let package_of = |output: &Path| {
         if output.ends_with("run/stdout") {
-            output.ancestors().nth(3).and_then(|it| it.file_name()).and_then(|it| it.to_str()).map(str::to_owned)
+            output
+                .ancestors()
+                .nth(3)
+                .and_then(|it| it.file_name())
+                .and_then(|it| it.to_str())
+                .map(str::to_owned)
         } else {
             output
                 .parent()
@@ -169,21 +200,33 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
         }
         let Ok(output) = std::fs::read_to_string(output) else { continue };
         for line in output.lines() {
-            let set = line.strip_prefix("cargo:rustc-env=").or_else(|| line.strip_prefix("cargo::rustc-env="));
+            let set = line
+                .strip_prefix("cargo:rustc-env=")
+                .or_else(|| line.strip_prefix("cargo::rustc-env="));
             if let Some((name, _)) = set.and_then(|it| it.split_once('=')) {
                 set_by_scripts.insert(name.to_owned());
             }
         }
     }
+    // `CARGO_MANIFEST_LINKS` is the manifest's `links` (ring's build script says it reads it).
     let derived = |name: &str| {
         name.starts_with("CARGO_PKG_")
             || name.starts_with("CARGO_CFG_")
-            || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "OUT_DIR")
+            || matches!(
+                name,
+                "CARGO_MANIFEST_DIR"
+                    | "CARGO_MANIFEST_PATH"
+                    | "CARGO_MANIFEST_LINKS"
+                    | "CARGO_CRATE_NAME"
+                    | "CARGO_PRIMARY_PACKAGE"
+                    | "OUT_DIR"
+            )
     };
     let hashed_env: std::collections::BTreeSet<&str> =
         worked.inputs.iter().filter(|it| it.kind == "env").map(|it| it.name.as_str()).collect();
 
-    let files: std::collections::BTreeSet<PathBuf> = worked.files.iter().filter_map(|it| it.canonicalize().ok()).collect();
+    let files: std::collections::BTreeSet<PathBuf> =
+        worked.files.iter().filter_map(|it| it.canonicalize().ok()).collect();
     // A file of a package of the checkout counts only if hashed (not one of its skipped
     // `tests/` or dotfiles); one of a registry package (`<registry>/src/<index>/<name>-<version>/`)
     // by its checksum; one of the target directory only as what a closure package's build script
@@ -194,7 +237,9 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     let in_registry = |path: &Path| {
         let parts: Vec<&std::ffi::OsStr> = path.iter().collect();
         parts.windows(4).any(|it| {
-            it[0] == "registry" && it[1] == "src" && it[3].to_str().is_some_and(|package| registry.contains(package))
+            it[0] == "registry"
+                && it[1] == "src"
+                && it[3].to_str().is_some_and(|package| registry.contains(package))
         })
     };
     let made_dir = made.canonicalize().map_err(|why| format!("{}: {why}", made.display()))?;
@@ -203,7 +248,9 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
         let parts: Vec<&str> = below.iter().filter_map(|it| it.to_str()).collect();
         parts.iter().position(|it| *it == "build").is_some_and(|at| {
             let (package, out) = match (parts.get(at + 1), parts.get(at + 2)) {
-                (Some(unit), Some(&"out")) => (unit.rsplit_once('-').map_or(*unit, |(name, _)| name), at + 2),
+                (Some(unit), Some(&"out")) => {
+                    (unit.rsplit_once('-').map_or(*unit, |(name, _)| name), at + 2)
+                }
                 (Some(package), Some(_)) => (*package, at + 3),
                 _ => return false,
             };
@@ -226,7 +273,9 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
             path.strip_prefix(dir).is_ok_and(|below| {
                 let parts: Vec<&str> = below.iter().filter_map(|it| it.to_str()).collect();
                 !parts.iter().any(|it| it.starts_with('.'))
-                    && !parts.first().is_some_and(|it| matches!(*it, "target" | "tests" | "benches" | "examples"))
+                    && !parts.first().is_some_and(|it| {
+                        matches!(*it, "target" | "tests" | "benches" | "examples")
+                    })
             })
         })
     };
@@ -249,7 +298,10 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
             let package = dep_info.ancestors().nth(3).zip(dep_info.parent()).map(|(new, old)| {
                 if dep_info.parent().is_some_and(|it| it.ends_with("out")) { new } else { old }
             });
-            let Some(package) = package.and_then(|it| it.file_name()).and_then(|it| it.to_str()) else { continue };
+            let Some(package) = package.and_then(|it| it.file_name()).and_then(|it| it.to_str())
+            else {
+                continue;
+            };
             let package = if dep_info.parent().is_some_and(|it| it.ends_with("out")) {
                 package.to_owned()
             } else {
@@ -264,7 +316,8 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
         if !worked.crates.contains(krate) {
             continue;
         }
-        let text = std::fs::read_to_string(&dep_info).map_err(|why| format!("{}: {why}", dep_info.display()))?;
+        let text = std::fs::read_to_string(&dep_info)
+            .map_err(|why| format!("{}: {why}", dep_info.display()))?;
         let mut reads = Vec::new();
         let mut vars = Vec::new();
         for line in text.lines() {
@@ -289,13 +342,19 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
         }
         // Another package whose library has the name (another version, built for a crate
         // outside the identity) reads nothing of the closure's packages.
-        if !reads.iter().any(|path| in_registry(path) || dirs.iter().any(|dir| path.starts_with(dir))) {
+        if !reads
+            .iter()
+            .any(|path| in_registry(path) || dirs.iter().any(|dir| path.starts_with(dir)))
+        {
             continue;
         }
         crates += 1;
         seen.insert(krate.to_owned());
         for var in vars {
-            if !(derived(&var) || hashed_env.contains(var.as_str()) || set_by_scripts.contains(&var)) {
+            if !(derived(&var)
+                || hashed_env.contains(var.as_str())
+                || set_by_scripts.contains(&var))
+            {
                 missing.push(format!("{krate} reads ${var} ({})", dep_info.display()));
             }
         }
@@ -309,10 +368,14 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     // C5 of the review: what the closure's build scripts say they read (`rerun-if-env-changed`,
     // `rerun-if-changed`, in their newest output) is an input too, or a variable named no input
     // (the C compiler's) or derived by cargo.
-    let checkout: std::collections::BTreeMap<&str, &Path> = workspace.checkout().into_iter().collect();
-    let mut newest: std::collections::BTreeMap<String, (std::time::SystemTime, PathBuf)> = std::collections::BTreeMap::new();
+    let checkout: std::collections::BTreeMap<&str, &Path> =
+        workspace.checkout().into_iter().collect();
+    let mut newest: std::collections::BTreeMap<String, (std::time::SystemTime, PathBuf)> =
+        std::collections::BTreeMap::new();
     for output in &outputs {
-        let Some(package) = package_of(output).filter(|it| worked.packages.contains(it)) else { continue };
+        let Some(package) = package_of(output).filter(|it| worked.packages.contains(it)) else {
+            continue;
+        };
         let Ok(modified) = std::fs::metadata(output).and_then(|it| it.modified()) else { continue };
         if newest.get(&package).is_none_or(|(was, _)| *was < modified) {
             newest.insert(package, (modified, output.clone()));
@@ -322,16 +385,24 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     for (package, (_, output)) in &newest {
         let text = std::fs::read_to_string(output).unwrap_or_default();
         for line in text.lines() {
-            let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) else { continue };
+            let Some(directive) =
+                line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))
+            else {
+                continue;
+            };
             if let Some(var) = directive.strip_prefix("rerun-if-env-changed=") {
                 directives += 1;
                 let keyed = hashed_env.contains(var)
                     || derived(var)
                     || var.starts_with("CARGO_FEATURE_")
-                    || (var == crate::LLVM_PREFIX && worked.inputs.iter().any(|it| it.kind == "llvm"))
+                    || (var == crate::LLVM_PREFIX
+                        && worked.inputs.iter().any(|it| it.kind == "llvm"))
                     || crate::unkeyed_env(var).is_some();
                 if !keyed {
-                    missing.push(format!("{package}'s build script reads ${var} ({})", output.display()));
+                    missing.push(format!(
+                        "{package}'s build script reads ${var} ({})",
+                        output.display()
+                    ));
                 }
             } else if let Some(path) = directive.strip_prefix("rerun-if-changed=") {
                 directives += 1;
@@ -382,13 +453,24 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
     let mut unchecked: Vec<String> = worked
         .crates
         .iter()
-        .filter(|it| !seen.contains(it.as_str()) && !worked.registry.iter().any(|(name, _)| name.replace('-', "_") == **it))
+        .filter(|it| {
+            !seen.contains(it.as_str())
+                && !worked.registry.iter().any(|(name, _)| name.replace('-', "_") == **it)
+        })
         .cloned()
         .collect();
     unchecked.sort();
     missing.sort();
     missing.dedup();
-    Ok(Held { units: units.len(), crates, read, scripts: newest.len(), directives, missing, unchecked })
+    Ok(Held {
+        units: units.len(),
+        crates,
+        read,
+        scripts: newest.len(),
+        directives,
+        missing,
+        unchecked,
+    })
 }
 
 /// The `(name, fingerprint)` of each unit a cargo fingerprint (`<kind>-<name>.json`) lists in

@@ -2,7 +2,8 @@
 //! drawn instead of the app's view, in the same App and Renderer. Every other root node is made `Offscreen`; the window's
 //! title-bar strip is the gallery root's `SafeAreaInset`; a system keeps the lazy example's rows to the ones in view and,
 //! one second in, moves the selection pill, inserts and removes chips, removes a list row and retargets the animated bar, so a shot shortly
-//! after (`HARNESS_NATIVE_SHOT_SECS`) catches them mid-spring.
+//! after (`HARNESS_NATIVE_SHOT_SECS`) catches them mid-spring. `HARNESS_NATIVE_GALLERY=prims` draws the primitives gallery
+//! instead (scene/gallery.flecs in the prims crate: one of every primitive, a button, a toggle and a field among them).
 use std::time::Instant;
 
 use harness_native_flecs::prelude::*;
@@ -25,22 +26,30 @@ fn at<'a>(w: WorldRef<'a>, path: &str) -> Option<EntityView<'a>> {
     w.try_lookup(&format!("{ROOT}::{path}"))
 }
 
-/// Load the examples and make them the only thing drawn; `strip` is the title-bar strip (points) to inset.
-pub fn load(app: &App, strip: f32) -> Result<(), String> {
+/// Load the examples (or, `prims`, the primitives gallery) and make them the only thing drawn; `strip` is the title-bar strip
+/// (points) to inset.
+pub fn load(app: &App, strip: f32, prims: bool) -> Result<(), String> {
     let world = &app.world;
     world.component::<GalleryStep>();
-    for (name, src) in harness_native_ui_prims::EXAMPLES {
+    let (scenes, root): (&[(&str, &str)], &str) = if prims {
+        (core::slice::from_ref(&harness_native_ui_prims::GALLERY), "gallery")
+    } else {
+        (harness_native_ui_prims::EXAMPLES, ROOT)
+    };
+    for (name, src) in scenes {
         let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
         let err = e.try_get::<&flecs::Script>(|s| {
             // SAFETY: `error` is null or a NUL-terminated string owned by the EcsScript component, alive for this call.
-            (!s.error.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned())
+            (!s.error.is_null()).then(|| {
+                unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned()
+            })
         });
         if let Some(Some(err)) = err {
             return Err(format!("gallery scene {name}: {err}"));
         }
     }
     let w = world.world_ref();
-    let root = w.try_lookup(ROOT).ok_or("the gallery scene has no swiftui_gallery")?;
+    let root = w.try_lookup(root).ok_or_else(|| format!("the gallery scene has no {root}"))?;
     root.set(SafeAreaInset { l: 0.0, r: 0.0, t: strip, b: 0.0 });
     root.set(GalleryStep::default());
     let root_id = *root.id();
@@ -52,9 +61,12 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
     });
     // Wall time from load, the same clock the shot's HARNESS_NATIVE_SHOT_SECS counts.
     let start = Instant::now();
+    let mut heights = view::Heights::default();
     w.system_named::<&mut GalleryStep>("GalleryDrive").each_iter(move |it, _, step| {
         let w = it.world();
         lazy_rows(w);
+        table_rows(w);
+        stack_rows(w, &mut heights);
         let time = start.elapsed().as_secs_f32();
         label_chips(w);
         if time >= 1.0 && !step.changed {
@@ -68,19 +80,80 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
 /// The lazy example's rows: only those in view, and a line saying how many exist.
 fn lazy_rows(w: WorldRef<'_>) {
     let Some(rows) = at(w, "cards::lazy::scroll::rows") else { return };
-    let live = view::lazy_for_each(View::of(rows), "ui.Words", 10_000, |i| format!("r{i}"), |v, i, _| {
-        v.text(&format!("Row {i}  \u{b7}  session s{}", (i * 7) % 997));
-    });
+    let live = view::lazy_for_each(
+        View::of(rows),
+        "ui.Words",
+        10_000,
+        |i| format!("r{i}"),
+        |v, i, _| {
+            v.text(&format!("Row {i}  \u{b7}  session s{}", (i * 7) % 997));
+        },
+    );
     let r = rows.try_cloned::<&LazyRange>().unwrap_or_default();
     if let Some(status) = at(w, "cards::lazy::status") {
         View::of(status).text(&format!("{live} of 10 000 exist (rows {}..{})", r.first, r.last));
     }
 }
 
+/// The table example: 1 000 rows of made-up search results, an index column, a url column shown as its host, a bool
+/// column as marks and a number column at the end (measured by the monospace estimate: a gallery has no typesetter).
+fn table_rows(w: WorldRef<'_>) {
+    use harness_native_ui_layout::typeset::{Estimate, Measure};
+    use view::table::{Align, Cell, Column, Kind, Opts, Table};
+    let Some(grid) = at(w, "cards::table::scroll::grid") else { return };
+    let sites = ["https://bun.com/docs", "https://en.wikipedia.org/wiki/Rust", "https://sqlite.org/lang.html", "https://docs.rs/flecs"];
+    let col = |name: &str, align| Column { name: name.into(), align };
+    let data = Table {
+        cols: vec![col("#", Align::End), col("title", Align::Auto), col("url", Align::Auto), col("resolved", Align::Auto), col("score", Align::Auto)],
+        rows: (0..1_000u32)
+            .map(|i| {
+                vec![
+                    Cell::new(Kind::Dim, i.to_string()),
+                    Cell::new(Kind::Text, format!("Result {i}: a title long enough to be cut at the column's edge")),
+                    Cell::new(Kind::Url, sites[i as usize % sites.len()]),
+                    Cell::new(Kind::Bool, if i % 3 == 0 { "false" } else { "true" }),
+                    Cell::new(Kind::Number, format!("{:.1}", f64::from((i * 37) % 100) / 10.0)),
+                ]
+            })
+            .collect(),
+        head: true,
+    };
+    let opts = Opts { look: "ui.Table", shown: data.rows.len(), action: None, open: Some(2) };
+    view::table(View::of(grid), &data, opts, &mut |s, st, _| Estimate.width(0, s, st));
+}
+
 /// The inserted chips' words, once their parts exist (a chip made in a system is instantiated when the system ends).
+/// The lazy stack's rows: every third one wraps to a few lines, so rows are of different heights.
+fn stack_rows(w: WorldRef<'_>, heights: &mut view::Heights) {
+    let Some(rows) = at(w, "cards::stack::scroll::rows") else { return };
+    let room = at(w, "cards::stack::scroll")
+        .and_then(|s| s.try_cloned::<&harness_native_ui_node_api::Laid>())
+        .map_or(132.0, |l| l.h);
+    let mut live = 0;
+    let s = view::lazy_stack(
+        View::of(rows),
+        heights,
+        0.0,
+        room,
+        2_000,
+        |i| format!("r{i}"),
+        |_| "ui.Words",
+        |v, i, _| {
+            live += 1;
+            let long = if i % 3 == 0 { " that runs on and on until it wraps onto a second line and maybe a third" } else { "" };
+            v.text(&format!("Row {i}{long}"));
+        },
+    );
+    if let Some(status) = at(w, "cards::stack::status") {
+        View::of(status).text(&format!("{live} of 2 000 exist, {:.0} points in all", s.content));
+    }
+}
+
 fn label_chips(w: WorldRef<'_>) {
     let Some(chips) = at(w, "cards::transition::chips") else { return };
-    for (name, words) in [("c_fade", "Opacity"), ("c_slide", "Slide"), ("c_scale", "Scale"), ("c_move", "Move")] {
+    for (name, words) in
+        [("c_fade", "Opacity"), ("c_slide", "Slide"), ("c_scale", "Scale"), ("c_move", "Move")]
+    {
         if let Some(words_view) = View::of(chips).part(name).and_then(|c| c.part("words")) {
             words_view.text(words);
         }
@@ -100,7 +173,12 @@ fn change(w: WorldRef<'_>) {
         if let Some(first) = chips.part("first") {
             view::leave(first);
         }
-        for (name, prefab) in [("c_fade", "ex.Chip"), ("c_slide", "ex.ChipSlide"), ("c_scale", "ex.ChipScale"), ("c_move", "ex.ChipMove")] {
+        for (name, prefab) in [
+            ("c_fade", "ex.Chip"),
+            ("c_slide", "ex.ChipSlide"),
+            ("c_scale", "ex.ChipScale"),
+            ("c_move", "ex.ChipMove"),
+        ] {
             chips.child(prefab).named(name);
         }
     }

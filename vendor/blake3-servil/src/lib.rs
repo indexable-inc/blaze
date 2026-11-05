@@ -323,7 +323,9 @@ const MAX_DEPTH: usize = 54; // 2^54 * CHUNK_LEN = 2^64
 type CVWords = [u32; 8];
 type CVBytes = [u8; 32]; // little-endian
 
-const IV: &CVWords = &[0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19];
+const IV: &CVWords = &[
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
 
 // These are the internal flags that we use to domain separate root/non-root,
 // chunk/parent, and chunk beginning/middle/end. These get set at the high end
@@ -578,7 +580,13 @@ impl Output {
     }
 
     fn root_output_block(&self) -> [u8; 2 * OUT_LEN] {
-        self.platform.compress_xof(&self.input_chaining_value, &self.block, self.block_len, self.counter, self.flags | ROOT)
+        self.platform.compress_xof(
+            &self.input_chaining_value,
+            &self.block,
+            self.block_len,
+            self.counter,
+            self.flags | ROOT,
+        )
     }
 }
 
@@ -600,12 +608,27 @@ type ChunkState = hasher::ChunkState<Platform>;
 
 impl hasher::Blocks for Platform {
     #[inline(always)]
-    fn compress_in_place(&self, cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) {
+    fn compress_in_place(
+        &self,
+        cv: &mut CVWords,
+        block: &[u8; BLOCK_LEN],
+        block_len: u8,
+        counter: u64,
+        flags: u8,
+    ) {
         Platform::compress_in_place(self, cv, block, block_len, counter, flags)
     }
 
     #[inline(always)]
-    fn compress_blocks(&self, cv: &mut CVWords, blocks: &[u8], count: usize, counter: u64, flags: u8, flags_start: u8) {
+    fn compress_blocks(
+        &self,
+        cv: &mut CVWords,
+        blocks: &[u8],
+        count: usize,
+        counter: u64,
+        flags: u8,
+        flags_start: u8,
+    ) {
         Platform::compress_blocks(self, cv, blocks, count, counter, flags, flags_start)
     }
 }
@@ -698,7 +721,14 @@ fn spare_lane(platform: Platform, whole: usize, partial: usize) -> Option<usize>
 // on a single thread. Write out the chunk chaining values and return the
 // number of chunks hashed. These chunks are never the root and never empty;
 // those cases use a different codepath.
-fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, platform: Platform, out: &mut [u8]) -> usize {
+fn compress_chunks_parallel(
+    input: &[u8],
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    platform: Platform,
+    out: &mut [u8],
+) -> usize {
     debug_assert!(!input.is_empty(), "empty chunks below the root");
     debug_assert!(input.len() <= MAX_SIMD_DEGREE * CHUNK_LEN);
 
@@ -710,20 +740,47 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
     // A whole chunk and a partial one, on AVX2 or AVX-512: their first
     // blocks side by side (pair.rs).
     if pair::takes(platform, input.len()) {
-        out[..2 * OUT_LEN].copy_from_slice(&pair::parent(input, key, chunk_counter, flags, platform));
+        out[..2 * OUT_LEN].copy_from_slice(&pair::parent(
+            input,
+            key,
+            chunk_counter,
+            flags,
+            platform,
+        ));
         return 2;
     }
     // Whole chunks that leave a lane spare, and a partial one: one pass,
     // the partial chunk in the spare lane.
     #[cfg(blake3_sse41_ffi)]
-    if let (false, Some(lanes)) = (chunks_exact.remainder().is_empty(), spare_lane(platform, chunks_array.len(), chunks_exact.remainder().len())) {
+    if let (false, Some(lanes)) = (
+        chunks_exact.remainder().is_empty(),
+        spare_lane(platform, chunks_array.len(), chunks_exact.remainder().len()),
+    ) {
         let (whole, partial) = (&chunks_array[..], chunks_exact.remainder());
         // Sound: spare_lane admits each width only on a platform whose CPU
         // has its instructions.
         if lanes == 4 {
-            unsafe { ffi_partial::hash_chunks_with_partial_sse41(whole, partial, key, chunk_counter, flags, out) };
+            unsafe {
+                ffi_partial::hash_chunks_with_partial_sse41(
+                    whole,
+                    partial,
+                    key,
+                    chunk_counter,
+                    flags,
+                    out,
+                )
+            };
         } else {
-            unsafe { ffi_partial::hash_chunks_with_partial_avx2(whole, partial, key, chunk_counter, flags, out) };
+            unsafe {
+                ffi_partial::hash_chunks_with_partial_avx2(
+                    whole,
+                    partial,
+                    key,
+                    chunk_counter,
+                    flags,
+                    out,
+                )
+            };
         }
         return whole.len() + 1;
     }
@@ -742,11 +799,29 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
     {
         // Safe: the kernel exists for this count and the CPU has SHA-3.
         unsafe {
-            neon_hybrid::hash_chunks_with_partial(&chunks_array, chunks_exact.remainder(), key, chunk_counter, flags, CHUNK_START, CHUNK_END, out);
+            neon_hybrid::hash_chunks_with_partial(
+                &chunks_array,
+                chunks_exact.remainder(),
+                key,
+                chunk_counter,
+                flags,
+                CHUNK_START,
+                CHUNK_END,
+                out,
+            );
         }
         return chunks_array.len() + 1;
     }
-    platform.hash_many(&chunks_array, key, chunk_counter, IncrementCounter::Yes, flags, CHUNK_START, CHUNK_END, out);
+    platform.hash_many(
+        &chunks_array,
+        key,
+        chunk_counter,
+        IncrementCounter::Yes,
+        flags,
+        CHUNK_START,
+        CHUNK_END,
+        out,
+    );
 
     // Hash the remaining partial chunk, if there is one. Note that the empty
     // chunk (meaning the empty message) is a different codepath.
@@ -755,7 +830,8 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
         let counter = chunk_counter + chunks_so_far as u64;
         let mut chunk_state = ChunkState::new(key, counter, flags, platform);
         chunk_state.update(chunks_exact.remainder());
-        *<&mut [u8; OUT_LEN]>::try_from(&mut out[chunks_so_far * OUT_LEN..][..OUT_LEN]).unwrap() = chunk_state.output().chaining_value();
+        *<&mut [u8; OUT_LEN]>::try_from(&mut out[chunks_so_far * OUT_LEN..][..OUT_LEN]).unwrap() =
+            chunk_state.output().chaining_value();
         chunks_so_far + 1
     } else {
         chunks_so_far
@@ -767,7 +843,13 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
 // number of parents hashed. (If there's an odd input chaining value left over,
 // return it as an additional output.) These parents are never the root and
 // never empty; those cases use a different codepath.
-fn compress_parents_parallel(child_chaining_values: &[u8], key: &CVWords, flags: u8, platform: Platform, out: &mut [u8]) -> usize {
+fn compress_parents_parallel(
+    child_chaining_values: &[u8],
+    key: &CVWords,
+    flags: u8,
+    platform: Platform,
+    out: &mut [u8],
+) -> usize {
     debug_assert_eq!(child_chaining_values.len() % OUT_LEN, 0, "wacky hash bytes");
     let num_children = child_chaining_values.len() / OUT_LEN;
     debug_assert!(num_children >= 2, "not enough children");
@@ -810,7 +892,14 @@ fn compress_parents_parallel(child_chaining_values: &[u8], key: &CVWords, flags:
 // This function is not used on inputs of 1 chunk or less. That's a
 // different codepath. Its arrays live in tree::root_children, out of line.
 #[inline]
-fn compress_subtree_to_parent_node(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u64, flags: u8, platform: Platform) -> [u8; BLOCK_LEN] {
+fn compress_subtree_to_parent_node(
+    input: &[u8],
+    ahead: usize,
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    platform: Platform,
+) -> [u8; BLOCK_LEN] {
     debug_assert!(input.len() > CHUNK_LEN);
     let kernels = tree::PlatformKernels { key, flags, platform };
     let [left, right] = tree::root_children(&kernels, input, ahead, chunk_counter);
@@ -850,7 +939,18 @@ fn hash_one_chunk_root(input: &[u8], key: &CVWords, flags: u8) -> Hash {
     let mut out = [0u8; OUT_LEN];
     // Safe: `input` holds `whole` bytes before `tail`, and blocks is 1..=16.
     unsafe {
-        neon_hybrid::hash_chunk(input.as_ptr(), blocks, last, tail.len() as u8, key, 0, flags, CHUNK_START, CHUNK_END | ROOT, &mut out);
+        neon_hybrid::hash_chunk(
+            input.as_ptr(),
+            blocks,
+            last,
+            tail.len() as u8,
+            key,
+            0,
+            flags,
+            CHUNK_START,
+            CHUNK_END | ROOT,
+            &mut out,
+        );
     }
     Hash(out)
 }
@@ -861,11 +961,22 @@ fn hash_one_chunk_root(input: &[u8], key: &CVWords, flags: u8) -> Hash {
 // tree::hash.
 #[cfg(feature = "std")]
 #[inline]
-fn hash_all_at_once(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, platform: Platform) -> Output {
+fn hash_all_at_once(
+    input: &[u8],
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    platform: Platform,
+) -> Output {
     // The input is a complete subtree at chunk_counter, or the whole
     // input (including empty) at counter zero. Its byte offset fits u64.
     debug_assert!(chunk_counter <= u64::MAX / CHUNK_LEN as u64);
-    debug_assert!(chunk_counter == 0 || (!input.is_empty() && input.len() as u64 <= max_subtree_len(chunk_counter * CHUNK_LEN as u64).unwrap()));
+    debug_assert!(
+        chunk_counter == 0
+            || (!input.is_empty()
+                && input.len() as u64
+                    <= max_subtree_len(chunk_counter * CHUNK_LEN as u64).unwrap())
+    );
 
     // If the whole subtree is one chunk, hash it directly with a ChunkState.
     if input.len() <= CHUNK_LEN {
@@ -1031,8 +1142,13 @@ impl Mode<'_> {
         match self {
             Mode::Plain => (*IV, 0),
             Mode::Keyed(key) => (platform::words_from_le_bytes_32(key), KEYED_HASH),
-            Mode::DeriveKey(context) => (platform::words_from_le_bytes_32(&performance::context_key(context)), DERIVE_KEY_MATERIAL),
-            Mode::DeriveKeyWith(context_key) => (platform::words_from_le_bytes_32(context_key), DERIVE_KEY_MATERIAL),
+            Mode::DeriveKey(context) => (
+                platform::words_from_le_bytes_32(&performance::context_key(context)),
+                DERIVE_KEY_MATERIAL,
+            ),
+            Mode::DeriveKeyWith(context_key) => {
+                (platform::words_from_le_bytes_32(context_key), DERIVE_KEY_MATERIAL)
+            }
         }
     }
 }
@@ -1134,7 +1250,14 @@ const PAIRS_AFTER_PAUSE_UPTO: usize = 8;
 #[cfg(all(blake3_neon, feature = "std"))]
 #[cold]
 #[inline(never)]
-fn batch_after_pause(input: &[u8], message_len: usize, key: &CVWords, flags: u8, out: &mut [[u8; OUT_LEN]], platform: Platform) -> bool {
+fn batch_after_pause(
+    input: &[u8],
+    message_len: usize,
+    key: &CVWords,
+    flags: u8,
+    out: &mut [[u8; OUT_LEN]],
+    platform: Platform,
+) -> bool {
     if !code_may_be_cold() {
         return false;
     }
@@ -1154,12 +1277,23 @@ fn batch_after_pause(input: &[u8], message_len: usize, key: &CVWords, flags: u8,
     }
     many::assert_slots(input, message_len, count);
     neon_hybrid::prefetch_pair_code();
-    let mut table: [&[u8; BLOCK_LEN]; PAIRS_AFTER_PAUSE_UPTO] = [&[0; BLOCK_LEN]; PAIRS_AFTER_PAUSE_UPTO];
+    let mut table: [&[u8; BLOCK_LEN]; PAIRS_AFTER_PAUSE_UPTO] =
+        [&[0; BLOCK_LEN]; PAIRS_AFTER_PAUSE_UPTO];
     for (slot, message) in table.iter_mut().zip(input.chunks_exact(BLOCK_LEN)) {
         *slot = message.try_into().unwrap();
     }
     // Sound: the SHA-3 extension is here (above).
-    unsafe { neon_hybrid::hash_pairs(&table[..count], key, flags, CHUNK_START, CHUNK_END | ROOT, message_len, out.as_flattened_mut()) };
+    unsafe {
+        neon_hybrid::hash_pairs(
+            &table[..count],
+            key,
+            flags,
+            CHUNK_START,
+            CHUNK_END | ROOT,
+            message_len,
+            out.as_flattened_mut(),
+        )
+    };
     true
 }
 
@@ -1234,19 +1368,35 @@ fn hash_serial_on(input: &[u8], key: &CVWords, flags: u8, platform: Platform) ->
 
 /// [`hash_many`] in the mode of `key` and `flags`, on the calling thread.
 #[inline]
-pub(crate) fn hash_many_serial(input: &[u8], message_len: usize, key: &CVWords, flags: u8, out: &mut [[u8; OUT_LEN]]) {
+pub(crate) fn hash_many_serial(
+    input: &[u8],
+    message_len: usize,
+    key: &CVWords,
+    flags: u8,
+    out: &mut [[u8; OUT_LEN]],
+) {
     hash_many_serial_from(Platform::detect(), input, message_len, key, flags, out);
 }
 
 /// [`hash_many_serial`] from `platform` (the self-test's way in, as
 /// [`hash_serial_from`]).
 #[inline]
-fn hash_many_serial_from(platform: Platform, input: &[u8], message_len: usize, key: &CVWords, flags: u8, out: &mut [[u8; OUT_LEN]]) {
+fn hash_many_serial_from(
+    platform: Platform,
+    input: &[u8],
+    message_len: usize,
+    key: &CVWords,
+    flags: u8,
+    out: &mut [[u8; OUT_LEN]],
+) {
     let turn = platform::Sme2Turn::take(platform, many::sme2_sized(message_len, out.len()));
     // A small batch of one-block messages after a pause fetches its kernels'
     // code in parallel (as hash_serial does): its time is mostly that code.
     #[cfg(all(blake3_neon, feature = "std"))]
-    if message_len <= BLOCK_LEN && (1..=PREFETCH_BATCH_BELOW).contains(&out.len()) && batch_after_pause(input, message_len, key, flags, out, turn.platform()) {
+    if message_len <= BLOCK_LEN
+        && (1..=PREFETCH_BATCH_BELOW).contains(&out.len())
+        && batch_after_pause(input, message_len, key, flags, out, turn.platform())
+    {
         return;
     }
     many::hash_many_on(input, message_len, key, flags, out, turn.platform());
@@ -1406,7 +1556,10 @@ impl std::io::Seek for OutputReader {
             std::io::SeekFrom::Start(x) => x as i128,
             std::io::SeekFrom::Current(x) => self.position() as i128 + x as i128,
             std::io::SeekFrom::End(_) => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek from end not supported"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "seek from end not supported",
+                ));
             }
         };
         if target_position < 0 {

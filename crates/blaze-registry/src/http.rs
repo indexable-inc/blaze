@@ -1,7 +1,7 @@
 //! Asking a server for a file: the [`Http`] trait the index and the downloads go through, the
-//! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over the
-//! HTTP stack the rest of blaze uses (hyper 1 and rustls with ring); without the `net` feature
-//! (the seed profile) a [`HyperHttp`] whose every request is [`NoNet`].
+//! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over
+//! blaze-http (blaze's sans-IO HTTP/1.1 client, rustls with ring, driven on tokio); without the
+//! `net` feature (the seed profile) a [`HyperHttp`] whose every request is [`NoNet`].
 
 use std::{
     fmt,
@@ -14,6 +14,11 @@ use std::{
 mod client;
 #[cfg(not(feature = "net"))]
 mod offline;
+
+/// Whether this blaze can ask a server for anything: built with the `net` feature. Without it
+/// every request is [`NoNet`], so what is not in the store or the sources already can't be had,
+/// and a build says so for every such package at once.
+pub const NET: bool = cfg!(feature = "net");
 
 #[cfg(feature = "net")]
 pub use client::HyperHttp;
@@ -39,6 +44,10 @@ impl Response {
 // dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
 pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Where a streamed body goes, a piece at a time ([`Http::stream`]); an error stops the
+/// transfer.
+pub type Sink<'s> = &'s mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send);
+
 /// What asks servers for files. An error is one where no answer came, which is worth trying
 /// again, as cargo tries a connection or a transfer that failed again.
 pub trait Http: Send + Sync {
@@ -48,6 +57,28 @@ pub trait Http: Send + Sync {
     /// requests are in flight at once. By default it is asked and answered on this thread.
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
         Box::pin(std::future::ready(self.get(url, headers)))
+    }
+
+    /// [`Http::get`] whose 200 body goes to `sink` as it comes instead of into the answer, whose
+    /// `body` is then empty; any other answer is given for its error, with at most the first
+    /// 64 KiB of its body (HyperHttp's bound: no error page fills memory). By default (a test's
+    /// fake) the body is collected first and handed over after.
+    fn stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        sink: Sink<'_>,
+    ) -> anyhow::Result<Response> {
+        let mut answer = self.get(url, headers)?;
+        if answer.status == 200 {
+            for piece in answer.body.chunks(64 * 1024) {
+                sink(piece).map_err(|e| {
+                    anyhow::anyhow!("keeping the body of {}: {e}", blaze_fetch::redact(url))
+                })?;
+            }
+            answer.body = Vec::new(); // alloc: empty, allocates nothing
+        }
+        Ok(answer)
     }
 
     /// A wait that holds no thread; by default it holds this one ([`wait_out`]).
@@ -78,7 +109,8 @@ impl HttpNotSuccessful {
         }
     }
 
-    fn is_spurious(&self) -> bool {
+    /// Whether another try may get a better answer: a server error, or too many requests.
+    pub fn is_spurious(&self) -> bool {
         (500..600).contains(&self.code) || self.code == 429
     }
 }
@@ -161,7 +193,10 @@ impl Retry {
         let left = self.retries - *tried;
         if !self.quiet {
             let tries = if left == 1 { "try" } else { "tries" };
-            eprintln!("warning: spurious network error ({left} {tries} remaining): {e:#}");
+            eprintln!(
+                "warning: spurious network error ({left} {tries} remaining): {}",
+                blaze_fetch::scrub(&format!("{e:#}"))
+            );
         }
         *tried += 1;
         let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
@@ -194,7 +229,10 @@ fn sleep_ms(tried: u32, now: SystemTime) -> u64 {
 
 /// Holds this thread for a wait [`Retry::again`] gave: the retries' one timer, where the asker
 /// has no runtime to wait on.
-#[allow(clippy::disallowed_methods, reason = "the retries' timer: `Retry::again` decides the wait, from the time it is given")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the retries' timer: `Retry::again` decides the wait, from the time it is given"
+)]
 fn wait_out(wait: Duration) {
     std::thread::sleep(wait);
 }
@@ -329,33 +367,41 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000);
         let retry = Retry { retries: 3, quiet: true, fixed_sleep_ms: None };
         let failed = |status: u16, after: Option<&str>| -> anyhow::Error {
-            let headers = after.map(|it| vec![("retry-after".to_owned(), it.to_owned())]).unwrap_or_default();
+            let headers =
+                after.map(|it| vec![("retry-after".to_owned(), it.to_owned())]).unwrap_or_default();
             HttpNotSuccessful::new("u", &Response { status, headers, body: Vec::new() }).into()
         };
         let waits = |errors: &[anyhow::Error]| -> Vec<Option<u64>> {
             let mut tried = 0;
-            errors.iter().map(|e| retry.again(&mut tried, e, now).map(|it| u64::try_from(it.as_millis()).unwrap())).collect()
+            errors
+                .iter()
+                .map(|e| {
+                    retry.again(&mut tried, e, now).map(|it| u64::try_from(it.as_millis()).unwrap())
+                })
+                .collect()
         };
-        assert_eq!(waits(&[failed(429, Some("2")), failed(503, Some("4")), failed(429, Some("60"))]), [
-            Some(2000),
-            Some(4000),
-            Some(10000)
-        ]);
-        assert_eq!(waits(&[failed(500, Some("2")), failed(503, None), failed(429, Some("soon"))]), [
-            Some(750),
-            Some(3500),
-            Some(6500)
-        ]);
-        assert_eq!(waits(&[failed(500, None), failed(500, None), failed(500, None), failed(500, None)]), [
-            Some(750),
-            Some(3500),
-            Some(6500),
-            None
-        ]);
+        assert_eq!(
+            waits(&[failed(429, Some("2")), failed(503, Some("4")), failed(429, Some("60"))]),
+            [Some(2000), Some(4000), Some(10000)]
+        );
+        assert_eq!(
+            waits(&[failed(500, Some("2")), failed(503, None), failed(429, Some("soon"))]),
+            [Some(750), Some(3500), Some(6500)]
+        );
+        assert_eq!(
+            waits(&[failed(500, None), failed(500, None), failed(500, None), failed(500, None)]),
+            [Some(750), Some(3500), Some(6500), None]
+        );
         assert_eq!(waits(&[failed(403, Some("2"))]), [None]);
         let fixed = Retry { fixed_sleep_ms: Some(7), ..retry };
         let mut tried = 0;
-        assert_eq!(fixed.again(&mut tried, &failed(429, Some("2")), now), Some(Duration::from_secs(2)));
-        assert_eq!(fixed.again(&mut tried, &failed(500, None), now), Some(Duration::from_millis(7)));
+        assert_eq!(
+            fixed.again(&mut tried, &failed(429, Some("2")), now),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            fixed.again(&mut tried, &failed(500, None), now),
+            Some(Duration::from_millis(7))
+        );
     }
 }

@@ -6,7 +6,10 @@
 //!   refers to by its layout hash and anything else (a trait in a bound) by its interface
 //!   hash: a field's type changing size changes it, transitively.
 //! - **code** (of an item with a body): its interface hash and its body form, each ref by its
-//!   interface hash, so a callee's body edit leaves it as it was.
+//!   interface hash, so a callee's body edit leaves it as it was. A constant the body names
+//!   with no generic parameter left is spelled with the value it evaluates to as well
+//!   (`form::Cx::values`): `<A as Tr>::K` spells `A` by its name-free interface, which tells
+//!   nothing of the impl `A` selects.
 //! - **deep**: the interface and body forms, each ref by its deep hash, for what inlines.
 //! - **signature**: the signature form (the interface form with a marker in place of what a
 //!   body leaks into it), each ref by its signature hash: what a body's identity names an
@@ -31,7 +34,6 @@ use std::{alloc::Allocator, fmt, fmt::Write as _};
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::AdtId;
@@ -39,6 +41,7 @@ use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
 };
+use std::alloc::Global;
 
 use crate::{
     CodeHash, DeepHash, InterfaceHash, ItemHashes, ItemId, LayoutHash, SignatureHash, form, key,
@@ -157,7 +160,11 @@ impl Unhashable {
 /// the first such proc-macro crate. The one check every read of a crate's half-expanded items
 /// goes through: a form's hash, a fact's value, and a job of the crate as it starts
 /// ([`macros_built`]).
-pub(crate) fn macros_built_for(db: &Db, krate: base_db::Crate, of: Unhashed) -> Result<(), Unhashable> {
+pub(crate) fn macros_built_for(
+    db: &Db,
+    krate: base_db::Crate,
+    of: Unhashed,
+) -> Result<(), Unhashable> {
     match form::pending_proc_macro(db, krate) {
         None => Ok(()),
         Some(pending) => {
@@ -178,8 +185,12 @@ pub fn macros_built(db: &Db, krate: base_db::Crate) -> Result<(), Unhashable> {
 impl fmt::Display for Unhashable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.of {
-            Unhashed::Item(item) => write!(f, "{:?} {:?} has no hash: {}", item.kind(), item, self.what),
-            Unhashed::Crate(krate) => write!(f, "what crate {krate:?} reads has no hash: {}", self.what),
+            Unhashed::Item(item) => {
+                write!(f, "{:?} {:?} has no hash: {}", item.kind(), item, self.what)
+            }
+            Unhashed::Crate(krate) => {
+                write!(f, "what crate {krate:?} reads has no hash: {}", self.what)
+            }
         }
     }
 }
@@ -476,7 +487,8 @@ fn component_hash(db: &Db, graph: Graph, root: ItemId) -> Result<ContentId, Unha
     }
     .as_ref()
     .map_err(|it| *it)?;
-    let at = unit.members.binary_search(&root).expect("an item is a member of its component's unit");
+    let at =
+        unit.members.binary_search(&root).expect("an item is a member of its component's unit");
     let mut h = Hasher::new(graph.domain());
     h.update(b"member").id(&unit.whole).update(&u64::from(unit.ranks[at]).to_le_bytes());
     Ok(h.finish())
@@ -736,7 +748,10 @@ impl Components {
     pub(crate) fn get(&self, id: ItemId) -> Option<&[ItemId]> {
         match *self.of.get(&id)? {
             ALONE => Some(&[]),
-            c => Some(&self.members[self.starts[c as usize] as usize..self.starts[c as usize + 1] as usize]),
+            c => Some(
+                &self.members
+                    [self.starts[c as usize] as usize..self.starts[c as usize + 1] as usize],
+            ),
         }
     }
 
@@ -809,7 +824,9 @@ pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> C
                 of.insert(id, c);
             }
             members.extend_from_slice(&found[start..end]);
-            starts.push(u32::try_from(members.len()).expect("blaze-items: a crate past u32::MAX items"));
+            starts.push(
+                u32::try_from(members.len()).expect("blaze-items: a crate past u32::MAX items"),
+            );
         }
         Components { of, members: members.into_boxed_slice(), starts: starts.into_boxed_slice() }
     })

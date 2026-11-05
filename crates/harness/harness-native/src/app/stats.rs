@@ -157,13 +157,26 @@ fn rss_bytes() -> Option<u64> {
     let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
     // SAFETY: task_info writes at most `count` integers of MACH_TASK_BASIC_INFO into `info`, which is that struct.
     #[allow(deprecated)]
-    let kr = unsafe { libc::task_info(libc::mach_task_self(), libc::MACH_TASK_BASIC_INFO, info.as_mut_ptr().cast(), &mut count) };
+    let kr = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
     // SAFETY: task_info succeeded, so it filled the struct (zeroed before in any case).
     (kr == 0).then(|| unsafe { info.assume_init() }.resident_size)
 }
 
 fn mb(b: f64) -> String {
-    if b >= 1024.0 * 1024.0 { format!("{:.1} MB", b / (1024.0 * 1024.0)) } else if b >= 1024.0 { format!("{:.1} KB", b / 1024.0) } else { format!("{b:.0} B") }
+    if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.1} KB", b / 1024.0)
+    } else {
+        format!("{b:.0} B")
+    }
 }
 
 fn rate(d: (u64, u64)) -> String {
@@ -193,7 +206,13 @@ impl App {
         if on {
             let node = View::of(w.entity_from_id(self.ids.main)).child("hn.Stats");
             let (why, gpu) = (self.stats.why, self.stats.gpu_clock.take());
-            self.stats = Stats { shown: true, node: Some(node.id()), why, gpu_clock: gpu, ..Stats::default() };
+            self.stats = Stats {
+                shown: true,
+                node: Some(node.id()),
+                why,
+                gpu_clock: gpu,
+                ..Stats::default()
+            };
         } else {
             if let Some(n) = self.stats.node.take() {
                 w.entity_from_id(n).destruct();
@@ -290,7 +309,8 @@ impl App {
         // Redrawing while something other than this overlay's tick keeps asking for frames (20 or more in the last second:
         // an animation, a stream); the daemon's 400 ms list poll alone (3 frames each) reads as idle.
         let asked = s.stamps.iter().filter(|(_, a)| *a).count();
-        let busy = asked >= 20 && s.last_real.is_some_and(|(t, _)| now - t < TICK + Duration::from_millis(50));
+        let busy = asked >= 20
+            && s.last_real.is_some_and(|(t, _)| now - t < TICK + Duration::from_millis(50));
         let state = if busy {
             "redrawing"
         } else if self.breathing() {
@@ -302,7 +322,7 @@ impl App {
             Some((t, why)) => format!("{why}  {:.1}s ago", (now - t).as_secs_f32()),
             None => format!("{}", s.why),
         };
-        let glyph = (self.cache.hits, self.cache.misses);
+        let glyph = (self.paint.borrow().cache.hits, self.paint.borrow().cache.misses);
         let shape = (self.grid.shape_hits, self.grid.shape_misses);
         let d = |a: (u64, u64), b: (u64, u64)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1));
         let (glyph_hit, shape_hit) = (rate(d(glyph, s.prev.glyph)), rate(d(shape, s.prev.shape)));
@@ -311,22 +331,39 @@ impl App {
         let mut term = (String::new(), 0.0, 0.0, 0.0, 0.0, String::new(), String::new());
         let shown = self.focused_term().map(|t| {
             let te = w.entity_from_id(t);
-            (te.try_cloned::<&TermGrid>().unwrap_or_default(), te.parent().and_then(|p| model::shows(w, *p.id())).map(|e| *e.id()))
+            (
+                te.try_cloned::<&TermGrid>().unwrap_or_default(),
+                te.parent().and_then(|p| model::shows(w, *p.id())).map(|e| *e.id()),
+            )
         });
         if let Some((g, Some(e))) = shown
             && g.cols > 0
         {
             let (label, key, bytes) = match (self.session_of(e), self.run_of(e)) {
                 (Some(sid), _) => (format!("s{sid}"), sid, self.link.session_bytes(sid)),
-                (None, Some((n, k))) => (k.map_or(format!("r{n}"), |k| format!("r{n}.{k}")), n << 8 | u64::from(k.map_or(255, |k| k.min(254) as u8)), self.link.run_bytes(n, k)),
+                (None, Some((n, k))) => (
+                    k.map_or(format!("r{n}"), |k| format!("r{n}.{k}")),
+                    n << 8 | u64::from(k.map_or(255, |k| k.min(254) as u8)),
+                    self.link.run_bytes(n, k),
+                ),
                 _ => ("-".into(), 0, 0),
             };
             let bps = match s.prev.pty {
-                Some((k, b, t)) if k == key && now > t => bytes.saturating_sub(b) as f64 / (now - t).as_secs_f64(),
+                Some((k, b, t)) if k == key && now > t => {
+                    bytes.saturating_sub(b) as f64 / (now - t).as_secs_f64()
+                }
                 _ => 0.0,
             };
             pty = Some((key, bytes, now));
-            term = (label, f64::from(g.cols), f64::from(g.rows), f64::from((self.grid.cw * self.grid.scale).round()), f64::from((self.grid.ch * self.grid.scale).round()), mb(bps), mb(bytes as f64));
+            term = (
+                label,
+                f64::from(g.cols),
+                f64::from(g.rows),
+                f64::from((self.grid.cw * self.grid.scale).round()),
+                f64::from((self.grid.ch * self.grid.scale).round()),
+                mb(bps),
+                mb(bytes as f64),
+            );
         }
         let link = w.lookup(model::LOCAL).target(model::Link::id(), 0).map_or(0, |t| *t.id());
         let link = if link == *w.component_id::<model::Up>() {
@@ -339,6 +376,7 @@ impl App {
         let rtt = self.link.rtt_ms().map_or("-".into(), |r| format!("{r:.2} ms"));
         let pid = self.link.daemon_pid().map_or("-".into(), |p| p.to_string());
         let rss = rss_bytes().map_or("-".into(), |b| mb(b as f64));
+        let pointer = self.pointer_line();
         let top = f64::from(self.chrome.strip / self.zoom());
         let f = |v: f32| Prop::Float(f64::from(v));
         let n = |v: usize| Prop::Float(v as f64);
@@ -363,7 +401,7 @@ impl App {
                 ("panels", n(s.draws[0])),
                 ("glyphs", n(s.draws[1])),
                 ("sprites", n(s.draws[2])),
-                ("atlas", Prop::Float(f64::from(self.cache.fill()) * 100.0)),
+                ("atlas", Prop::Float(f64::from(self.paint.borrow().cache.fill()) * 100.0)),
                 ("glyph_hit", Prop::Str(&glyph_hit)),
                 ("shape_hit", Prop::Str(&shape_hit)),
                 ("term", Prop::Str(&term.0)),
@@ -378,6 +416,7 @@ impl App {
                 ("rtt", Prop::Str(&rtt)),
                 ("pid", Prop::Str(&pid)),
                 ("rss", Prop::Str(&rss)),
+                ("pointer", Prop::Str(&pointer)),
             ],
         );
         self.stats.prev = Prev { glyph, shape, pty };
@@ -386,7 +425,9 @@ impl App {
     /// The sparkline: one bar a frame (newest at the right), as tall as its CPU + GPU time against twice the budget, in
     /// the node's Fill (its `hot` child's over budget), with a faint line at the budget.
     pub(super) fn emit_spark(&self, d: &mut Draw, e: EntityView<'_>, r: [f32; 4], alpha: f32) {
-        let pick = |f: Option<Fill>| f.map_or([1.0; 4], |f| rgba(if self.dark { f.dark } else { f.light }));
+        let pick = |f: Option<Fill>| {
+            f.map_or([1.0; 4], |f| rgba(if self.dark { f.dark } else { f.light }))
+        };
         let ok = pick(e.try_cloned::<&Fill>());
         let hot = pick(e.lookup_child("hot").and_then(|h| h.try_cloned::<&Fill>()));
         let budget = e.try_cloned::<&StatsSpark>().map_or(16.67, |s| s.budget_ms).max(0.1);
@@ -397,7 +438,13 @@ impl App {
         for (i, v) in self.stats.spark.iter().enumerate() {
             let h = (v / full).clamp(0.0, 1.0) * r[3];
             let x = r[0] + r[2] - (n - i) as f32 * bw;
-            d.panel(panel_from(if *v > budget { hot } else { ok }, [0.0; 4], flat, [x, r[1] + r[3] - h.max(0.5), (bw - 0.5).max(0.5), h.max(0.5)], alpha));
+            d.panel(panel_from(
+                if *v > budget { hot } else { ok },
+                [0.0; 4],
+                flat,
+                [x, r[1] + r[3] - h.max(0.5), (bw - 0.5).max(0.5), h.max(0.5)],
+                alpha,
+            ));
         }
         let line = [ok[0], ok[1], ok[2], ok[3] * 0.35];
         d.panel(panel_from(line, [0.0; 4], flat, [r[0], r[1] + r[3] * 0.5, r[2], 0.5], alpha));

@@ -1,11 +1,11 @@
 use base_db::all_crates;
 use hir_def::signatures::ConstSignature;
 use hir_expand::EditionedFileId;
+use hir_expand::fixture;
 use rustc_apfloat::{
     Float,
     ieee::{Half as f16, Quad as f128},
 };
-use hir_expand::fixture;
 use test_utils::skip_slow_tests;
 
 use crate::{
@@ -32,6 +32,7 @@ mod const_traits;
 mod deps;
 mod intrinsics;
 mod memo;
+mod trivial;
 mod word;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
@@ -249,29 +250,80 @@ fn arbitrary_ints_overflow_at_their_width() {
     // A constant checks its own arithmetic.
     let constant = [
         ("const GOAL: u3 = { let x = 7u3; x + 1 };", "attempt to add with overflow at type `u3`"),
-        ("const GOAL: u3 = { let x = 0u3; x - 1 };", "attempt to subtract with overflow at type `u3`"),
-        ("const GOAL: u3 = { let x = 3u3; x * 3 };", "attempt to multiply with overflow at type `u3`"),
+        (
+            "const GOAL: u3 = { let x = 0u3; x - 1 };",
+            "attempt to subtract with overflow at type `u3`",
+        ),
+        (
+            "const GOAL: u3 = { let x = 3u3; x * 3 };",
+            "attempt to multiply with overflow at type `u3`",
+        ),
         ("const GOAL: i7 = { let x = 63i7; x + 1 };", "attempt to add with overflow at type `i7`"),
-        ("const GOAL: i7 = { let x = -64i7; x - 1 };", "attempt to subtract with overflow at type `i7`"),
+        (
+            "const GOAL: i7 = { let x = -64i7; x - 1 };",
+            "attempt to subtract with overflow at type `i7`",
+        ),
         ("const GOAL: i7 = { let x = -64i7; -x };", "attempt to negate with overflow at type `i7`"),
-        ("const GOAL: u3 = { let x = 1u3; x << 3 };", "attempt to shift left with overflow at type `u3`"),
-        ("const GOAL: i7 = { let x = 1i7; x >> 7 };", "attempt to shift right with overflow at type `i7`"),
+        (
+            "const GOAL: u3 = { let x = 1u3; x << 3 };",
+            "attempt to shift left with overflow at type `u3`",
+        ),
+        (
+            "const GOAL: i7 = { let x = 1i7; x >> 7 };",
+            "attempt to shift right with overflow at type `i7`",
+        ),
     ];
     for (body, message) in constant {
         check_fail(&opted(body), panic(message));
     }
     // A function wraps at the width without `overflow-checks`, and panics with them.
     let functions = [
-        ("const fn f(a: u3, b: u3) -> u3 { a + b } const GOAL: u3 = f(7, 1);", 0, "attempt to add with overflow at type `u3`"),
-        ("const fn f(a: u3, b: u3) -> u3 { a - b } const GOAL: u3 = f(0, 1);", 7, "attempt to subtract with overflow at type `u3`"),
-        ("const fn f(a: u3, b: u3) -> u3 { a * b } const GOAL: u3 = f(3, 3);", 1, "attempt to multiply with overflow at type `u3`"),
-        ("const fn f(a: i7, b: i7) -> i7 { a + b } const GOAL: i7 = f(63, 1);", -64, "attempt to add with overflow at type `i7`"),
-        ("const fn f(a: i7, b: i7) -> i7 { a - b } const GOAL: i7 = f(-64, 1);", 63, "attempt to subtract with overflow at type `i7`"),
-        ("const fn f(a: i7, b: i7) -> i7 { a * b } const GOAL: i7 = f(-64, -1);", -64, "attempt to multiply with overflow at type `i7`"),
-        ("const fn f(a: i7) -> i7 { -a } const GOAL: i7 = f(-64);", -64, "attempt to negate with overflow at type `i7`"),
+        (
+            "const fn f(a: u3, b: u3) -> u3 { a + b } const GOAL: u3 = f(7, 1);",
+            0,
+            "attempt to add with overflow at type `u3`",
+        ),
+        (
+            "const fn f(a: u3, b: u3) -> u3 { a - b } const GOAL: u3 = f(0, 1);",
+            7,
+            "attempt to subtract with overflow at type `u3`",
+        ),
+        (
+            "const fn f(a: u3, b: u3) -> u3 { a * b } const GOAL: u3 = f(3, 3);",
+            1,
+            "attempt to multiply with overflow at type `u3`",
+        ),
+        (
+            "const fn f(a: i7, b: i7) -> i7 { a + b } const GOAL: i7 = f(63, 1);",
+            -64,
+            "attempt to add with overflow at type `i7`",
+        ),
+        (
+            "const fn f(a: i7, b: i7) -> i7 { a - b } const GOAL: i7 = f(-64, 1);",
+            63,
+            "attempt to subtract with overflow at type `i7`",
+        ),
+        (
+            "const fn f(a: i7, b: i7) -> i7 { a * b } const GOAL: i7 = f(-64, -1);",
+            -64,
+            "attempt to multiply with overflow at type `i7`",
+        ),
+        (
+            "const fn f(a: i7) -> i7 { -a } const GOAL: i7 = f(-64);",
+            -64,
+            "attempt to negate with overflow at type `i7`",
+        ),
         // Unchecked, a shift is by its amount mod N: 4 mod 3 is 1, and 13 mod 7 is 6.
-        ("const fn f(a: u3, b: u32) -> u3 { a << b } const GOAL: u3 = f(3, 4);", 6, "attempt to shift left with overflow at type `u3`"),
-        ("const fn f(a: i7, b: u32) -> i7 { a << b } const GOAL: i7 = f(1, 13);", -64, "attempt to shift left with overflow at type `i7`"),
+        (
+            "const fn f(a: u3, b: u32) -> u3 { a << b } const GOAL: u3 = f(3, 4);",
+            6,
+            "attempt to shift left with overflow at type `u3`",
+        ),
+        (
+            "const fn f(a: i7, b: u32) -> i7 { a << b } const GOAL: i7 = f(1, 13);",
+            -64,
+            "attempt to shift left with overflow at type `i7`",
+        ),
     ];
     for (body, wrapped, message) in functions {
         check_number(&opted(body), wrapped);
@@ -2697,8 +2749,13 @@ const GOAL: usize = n::<{ S }>() * 10 + of_s([0; 5]);
                     hir_def::ModuleDefId::ConstId(it) => hir_def::DefWithBodyId::ConstId(it),
                     _ => continue,
                 };
-                let infer = crate::InferenceResult::of(&db, crate::InferBodyId::DefWithBodyId(body));
-                assert!(infer.diagnostics().is_empty(), "{body:?} reads a static: {:?}", infer.diagnostics());
+                let infer =
+                    crate::InferenceResult::of(&db, crate::InferBodyId::DefWithBodyId(body));
+                assert!(
+                    infer.diagnostics().is_empty(),
+                    "{body:?} reads a static: {:?}",
+                    infer.diagnostics()
+                );
             }
         }
     });
@@ -2837,10 +2894,7 @@ fn enum_of_many_implicit_discriminants() {
         &format!("enum E {{ V0 = 7, {variants} }}\nconst GOAL: i32 = E::V19999 as i32;"),
         7 + 19_999,
     );
-    check_number(
-        &format!("enum E {{ {variants} }}\nconst GOAL: i32 = E::V19999 as i32;"),
-        19_998,
-    );
+    check_number(&format!("enum E {{ {variants} }}\nconst GOAL: i32 = E::V19999 as i32;"), 19_998);
     check_number(
         r#"
     enum E { A, B, C = 10, D, E, F = -3, G }
@@ -2912,7 +2966,10 @@ fn discriminants_count_in_signed_and_unsigned_reprs() {
 #[test]
 fn implicit_discriminant_past_the_repr_type_is_an_error() {
     // rustc's E0370, which blaze-diagnostics reports: `B` is not silently 256.
-    #[expect(clippy::needless_pass_by_value, reason = "a `check_fail` callback, which `check_fail` hands the error by value")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "a `check_fail` callback, which `check_fail` hands the error by value"
+    )]
     fn overflowed(e: ConstEvalError<'_>) -> bool {
         matches!(e, ConstEvalError::MirLowerError(MirLowerError::HasErrors))
     }
@@ -3019,7 +3076,8 @@ fn every_discriminant_and_the_layout_of_a_big_enum_take_one_pass() {
                     param_env: db.trait_environment(hir_def::GenericDefId::AdtId(adt)),
                     krate: adt.krate(&db),
                 };
-                let layout = db.layout_of_adt(adt, GenericArgs::empty().store(), env.store()).unwrap();
+                let layout =
+                    db.layout_of_adt(adt, GenericArgs::empty().store(), env.store()).unwrap();
                 for index in 0..n {
                     let _ = Layout::for_variant(&layout, RustcEnumVariantIdx(index));
                 }

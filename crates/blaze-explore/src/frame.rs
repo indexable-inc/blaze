@@ -8,7 +8,11 @@
 //!
 //! The live stream, unidirectional, carries frames back to back: `u32 LE` frame length, then a
 //! frame laid out as an answer, its alignment counted from the frame's own first byte (the byte
-//! after its length), since the page copies each frame out of the stream whole.
+//! after its length), since the page copies each frame out of the stream whole. A live frame's
+//! IPC is not a whole stream: it is the next messages of its table's one stream for the session
+//! (blaze-profile's `live::Encoder`), schema and dictionaries once, then a batch and its
+//! dictionaries' new values a frame, and an end-of-stream marker then a new schema where the
+//! stream starts again.
 
 use arrow_array::RecordBatch;
 use arrow_ipc::{
@@ -40,7 +44,11 @@ pub fn head(out: &mut Vec<u8>, header: &Map<String, Value>) -> Result<(), serde_
 
 /// Appends the head of a live frame to `out`: the frame's length, then [`head`], for a frame
 /// whose IPC stream, sent right after, is `ipc_len` bytes.
-pub fn live_head(out: &mut Vec<u8>, header: &Map<String, Value>, ipc_len: usize) -> Result<(), serde_json::Error> {
+pub fn live_head(
+    out: &mut Vec<u8>,
+    header: &Map<String, Value>,
+    ipc_len: usize,
+) -> Result<(), serde_json::Error> {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     head(out, header)?;
@@ -94,7 +102,10 @@ mod tests {
             let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
             assert_eq!(len + 4, out.len());
             let json = &out[4..];
-            assert!(json.len() - json.trim_ascii_end().len() < ALIGN, "padded by less than {ALIGN}");
+            assert!(
+                json.len() - json.trim_ascii_end().len() < ALIGN,
+                "padded by less than {ALIGN}"
+            );
             let back: Map<String, Value> = serde_json::from_slice(json).unwrap();
             assert_eq!(back, header);
         }
@@ -129,7 +140,8 @@ mod tests {
         let batches: Vec<RecordBatch> = (0..3i64)
             .map(|i| {
                 let n: Int64Array = (0..100i64).map(|it| it * i).collect();
-                let s: StringArray = (0..100i64).map(|it| (it % 3 == 0).then(|| format!("row {it}"))).collect();
+                let s: StringArray =
+                    (0..100i64).map(|it| (it % 3 == 0).then(|| format!("row {it}"))).collect();
                 RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(n), Arc::new(s)]).unwrap()
             })
             .collect();

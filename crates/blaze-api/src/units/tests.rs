@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    Installed, LABEL, PLIST_FILE, Place, Step, Unit, UnitFile, captured, files, install, installed, main_file, socket_of,
-    uninstall, unit_dir,
+    Installed, LABEL, PLIST_FILE, Place, Step, Unit, UnitFile, captured, files, install, installed,
+    main_file, socket_of, uninstall, unit_dir,
 };
 use crate::activation::Manager;
 
@@ -13,7 +13,10 @@ fn mac() -> (Unit, Place) {
         log: "/Users/me/.cache/blaze/v2/serve.log".into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into()), ("HOME".into(), "/Users/me".into())],
     };
-    (unit, Place { manager: Manager::Launchd, dir: "/Users/me/Library/LaunchAgents".into(), uid: 501 })
+    (
+        unit,
+        Place { manager: Manager::Launchd, dir: "/Users/me/Library/LaunchAgents".into(), uid: 501 },
+    )
 }
 
 fn linux() -> (Unit, Place) {
@@ -21,9 +24,15 @@ fn linux() -> (Unit, Place) {
         program: "/home/me/my tools/blaze".into(),
         socket: "/run/user/1000/blaze/v2.sock".into(),
         log: "/home/me/.cache/blaze/v2/serve.log".into(),
-        env: vec![("PATH".into(), "/usr/bin:/home/me/100%/bin".into()), ("HOME".into(), "/home/me".into())],
+        env: vec![
+            ("PATH".into(), "/usr/bin:/home/me/100%/bin".into()),
+            ("HOME".into(), "/home/me".into()),
+        ],
     };
-    (unit, Place { manager: Manager::Systemd, dir: "/home/me/.config/systemd/user".into(), uid: 1000 })
+    (
+        unit,
+        Place { manager: Manager::Systemd, dir: "/home/me/.config/systemd/user".into(), uid: 1000 },
+    )
 }
 
 const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -105,7 +114,13 @@ KillMode=mixed\n";
 fn launchd_agent_golden() {
     let (unit, place) = mac();
     let made = files(&unit, &place).unwrap();
-    assert_eq!(made, vec![UnitFile { path: "/Users/me/Library/LaunchAgents/inc.indexable.blaze.plist".into(), text: PLIST.into() }]);
+    assert_eq!(
+        made,
+        vec![UnitFile {
+            path: "/Users/me/Library/LaunchAgents/inc.indexable.blaze.plist".into(),
+            text: PLIST.into()
+        }]
+    );
 }
 
 #[test]
@@ -135,9 +150,17 @@ fn special_text_is_escaped() {
     unit.env = vec![("BLAZE_HOME".into(), "/home/\"q\"\\$x".into())];
     let made = files(&unit, &place).unwrap();
     assert!(made[0].text.contains("\nListenStream=/run/100%%/v2.sock\n"), "{}", made[0].text);
-    assert_eq!(socket_of(Manager::Systemd, &made[0].text), Some(PathBuf::from("/run/100%/v2.sock")));
+    assert_eq!(
+        socket_of(Manager::Systemd, &made[0].text),
+        Some(PathBuf::from("/run/100%/v2.sock"))
+    );
     let service = &made[1].text;
-    assert!(service.contains("\nExecStart=\"/opt/a\\\"b\\\\c$$d;\" serve --activated --socket /run/100%%/v2.sock\n"), "{service}");
+    assert!(
+        service.contains(
+            "\nExecStart=\"/opt/a\\\"b\\\\c$$d;\" serve --activated --socket /run/100%%/v2.sock\n"
+        ),
+        "{service}"
+    );
     assert!(service.contains("\nEnvironment=\"BLAZE_HOME=/home/\\\"q\\\"\\\\$x\"\n"), "{service}");
 }
 
@@ -150,7 +173,12 @@ fn a_plain_word_doubles_its_specifiers_and_dollars() {
     let service = &files(&unit, &place).unwrap()[1].text;
     assert!(service.contains("\nExecStart=/opt/a$$b%%c serve --activated --socket "), "{service}");
     assert!(service.contains("\nEnvironment=\"PATH=/a%%$b\"\n"), "{service}");
-    assert!(service.contains("\nStandardOutput=append:/var/log/100%%\nStandardError=append:/var/log/100%%\n"), "{service}");
+    assert!(
+        service.contains(
+            "\nStandardOutput=append:/var/log/100%%\nStandardError=append:/var/log/100%%\n"
+        ),
+        "{service}"
+    );
     assert_eq!(PLIST_FILE, format!("{LABEL}.plist"));
 }
 
@@ -164,10 +192,16 @@ fn what_no_unit_can_hold_is_refused() {
     let control = Unit { log: "/tmp/a\nb".into(), ..unit.clone() };
     assert!(refused(&control, &place).contains("control character"));
     let long = Unit { socket: PathBuf::from(format!("/{}", "s".repeat(103))), ..unit.clone() };
-    assert!(refused(&long, &place).contains("104 bytes long") && refused(&long, &place).contains("at most 103"));
+    assert!(
+        refused(&long, &place).contains("104 bytes long")
+            && refused(&long, &place).contains("at most 103")
+    );
     let fits = Unit { socket: PathBuf::from(format!("/{}", "s".repeat(102))), ..unit.clone() };
     assert!(files(&fits, &place).is_ok());
-    let twice = Unit { env: vec![("PATH".into(), "/a".into()), ("PATH".into(), "/b".into())], ..unit.clone() };
+    let twice = Unit {
+        env: vec![("PATH".into(), "/a".into()), ("PATH".into(), "/b".into())],
+        ..unit.clone()
+    };
     assert!(refused(&twice, &place).contains("PATH is given twice"));
     let unnamed = Unit { env: vec![("1PATH".into(), "/a".into())], ..unit.clone() };
     assert!(refused(&unnamed, &place).contains("\"1PATH\" is not a variable's name"));
@@ -197,43 +231,54 @@ fn install_and_uninstall_steps() {
         argv: words(&["launchctl", "bootout", &service]),
         loaded: words(&["launchctl", "print", &service]),
     };
-    assert_eq!(install(&unit, &place).unwrap(), vec![
-        Step::MakeDir("/Users/me/Library/LaunchAgents".into()),
-        Step::MakeDir("/Users/me/.cache/blaze".into()),
-        Step::MakeDir("/Users/me/.cache/blaze/v2".into()),
-        bootout.clone(),
-        Step::Write(UnitFile { path: plist.clone(), text: PLIST.into() }),
-        run(&["launchctl", "enable", &service]),
-        run(&["launchctl", "bootstrap", "gui/501", plist.to_str().unwrap()]),
-    ]);
-    assert_eq!(uninstall(&place, &unit.socket), vec![
-        bootout,
-        Step::Remove(plist),
-        Step::Remove(unit.socket.clone()),
-    ]);
+    assert_eq!(
+        install(&unit, &place).unwrap(),
+        vec![
+            Step::MakeDir("/Users/me/Library/LaunchAgents".into()),
+            Step::MakeDir("/Users/me/.cache/blaze".into()),
+            Step::MakeDir("/Users/me/.cache/blaze/v2".into()),
+            bootout.clone(),
+            Step::Write(UnitFile { path: plist.clone(), text: PLIST.into() }),
+            run(&["launchctl", "enable", &service]),
+            run(&["launchctl", "bootstrap", "gui/501", plist.to_str().unwrap()]),
+        ]
+    );
+    assert_eq!(
+        uninstall(&place, &unit.socket),
+        vec![bootout, Step::Remove(plist), Step::Remove(unit.socket.clone()),]
+    );
 
     let (unit, place) = linux();
     let steps = install(&unit, &place).unwrap();
-    assert_eq!(steps[..3], [
-        Step::MakeDir("/home/me/.config/systemd/user".into()),
-        Step::MakeDir("/run/user/1000/blaze".into()),
-        Step::MakeDir("/home/me/.cache/blaze/v2".into()),
-    ]);
+    assert_eq!(
+        steps[..3],
+        [
+            Step::MakeDir("/home/me/.config/systemd/user".into()),
+            Step::MakeDir("/run/user/1000/blaze".into()),
+            Step::MakeDir("/home/me/.cache/blaze/v2".into()),
+        ]
+    );
     assert!(matches!(&steps[3], Step::Write(file) if file.text == SOCKET_UNIT));
     assert!(matches!(&steps[4], Step::Write(file) if file.text == SERVICE_UNIT));
-    assert_eq!(steps[5..], [
-        run(&["systemctl", "--user", "daemon-reload"]),
-        run(&["systemctl", "--user", "enable", "blaze.socket"]),
-        run(&["systemctl", "--user", "restart", "blaze.socket"]),
-    ]);
-    assert_eq!(uninstall(&place, &unit.socket), vec![
-        run(&["systemctl", "--user", "disable", "--now", "blaze.socket"]),
-        run(&["systemctl", "--user", "stop", "blaze.service"]),
-        Step::Remove("/home/me/.config/systemd/user/blaze.socket".into()),
-        Step::Remove("/home/me/.config/systemd/user/blaze.service".into()),
-        run(&["systemctl", "--user", "daemon-reload"]),
-        Step::Remove(unit.socket.clone()),
-    ]);
+    assert_eq!(
+        steps[5..],
+        [
+            run(&["systemctl", "--user", "daemon-reload"]),
+            run(&["systemctl", "--user", "enable", "blaze.socket"]),
+            run(&["systemctl", "--user", "restart", "blaze.socket"]),
+        ]
+    );
+    assert_eq!(
+        uninstall(&place, &unit.socket),
+        vec![
+            run(&["systemctl", "--user", "disable", "--now", "blaze.socket"]),
+            run(&["systemctl", "--user", "stop", "blaze.service"]),
+            Step::Remove("/home/me/.config/systemd/user/blaze.socket".into()),
+            Step::Remove("/home/me/.config/systemd/user/blaze.service".into()),
+            run(&["systemctl", "--user", "daemon-reload"]),
+            Step::Remove(unit.socket.clone()),
+        ]
+    );
     assert_eq!(steps[5].to_string(), "running `systemctl --user daemon-reload`");
 }
 
@@ -250,7 +295,10 @@ fn installed_is_read_from_the_main_file() {
             std::fs::write(&file.path, &file.text).unwrap();
         }
         assert_eq!(installed(&place, &unit.socket), Ok(Installed::Yes));
-        assert_eq!(installed(&place, Path::new("/elsewhere.sock")), Ok(Installed::Elsewhere(unit.socket.clone())));
+        assert_eq!(
+            installed(&place, Path::new("/elsewhere.sock")),
+            Ok(Installed::Elsewhere(unit.socket.clone()))
+        );
         std::fs::write(main_file(&place), "garbage").unwrap();
         let error = installed(&place, &unit.socket).expect_err("a main file of no socket");
         assert!(error.what.contains("names no socket"), "{error}");
@@ -260,20 +308,34 @@ fn installed_is_read_from_the_main_file() {
 
 #[test]
 fn captured_variables_and_unit_dirs() {
-    let env = captured(|name| match name {
+    let env = captured(&["BLAZE_DAEMON_MEMORY_GB", "BLAZE_OPT"], |name| match name {
         "PATH" => Some("/bin".to_owned()),
         "HOME" => Some("/h".to_owned()),
         "BLAZE_HOME" => Some(String::new()),
         "BLAZE_SANDBOX" => Some("off".to_owned()),
+        "BLAZE_DAEMON_MEMORY_GB" => Some("80".to_owned()),
         _ => None,
     });
-    assert_eq!(env, vec![("HOME".to_owned(), "/h".to_owned()), ("PATH".to_owned(), "/bin".to_owned())]);
+    assert_eq!(
+        env,
+        vec![
+            ("HOME".to_owned(), "/h".to_owned()),
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("BLAZE_DAEMON_MEMORY_GB".to_owned(), "80".to_owned())
+        ]
+    );
 
     let home = Path::new("/h");
     assert_eq!(unit_dir(Manager::Launchd, home, None), Path::new("/h/Library/LaunchAgents"));
     assert_eq!(unit_dir(Manager::Systemd, home, None), Path::new("/h/.config/systemd/user"));
-    assert_eq!(unit_dir(Manager::Systemd, home, Some(Path::new("/c"))), Path::new("/c/systemd/user"));
-    assert_eq!(unit_dir(Manager::Systemd, home, Some(Path::new("rel"))), Path::new("/h/.config/systemd/user"));
+    assert_eq!(
+        unit_dir(Manager::Systemd, home, Some(Path::new("/c"))),
+        Path::new("/c/systemd/user")
+    );
+    assert_eq!(
+        unit_dir(Manager::Systemd, home, Some(Path::new("rel"))),
+        Path::new("/h/.config/systemd/user")
+    );
 }
 
 #[cfg(unix)]
@@ -301,8 +363,12 @@ fn steps_run_in_order_and_the_first_failure_is_named() {
     assert_eq!(std::fs::metadata(dir.join("a")).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(std::fs::read_dir(dir.join("a/b")).unwrap().count(), 1, "no temporary is left");
 
-    let still = run(&[Step::Undo { argv: words(&["false"]), loaded: words(&["true"]) }]).unwrap_err();
-    assert!(still.what.contains("running `false`") && still.what.contains("still loaded"), "{still}");
+    let still =
+        run(&[Step::Undo { argv: words(&["false"]), loaded: words(&["true"]) }]).unwrap_err();
+    assert!(
+        still.what.contains("running `false`") && still.what.contains("still loaded"),
+        "{still}"
+    );
     let failed = run(&[Step::Run(words(&["false"])), Step::Remove(file.clone())]).unwrap_err();
     assert!(failed.what.starts_with("running `false`: "), "{failed}");
     assert!(file.exists(), "nothing after the failed step ran");

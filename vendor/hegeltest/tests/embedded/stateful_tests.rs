@@ -20,10 +20,7 @@ fn capturing_test_case() -> (RunHandle, TestCase, Captured) {
     let lines: Captured = Arc::default();
     let sink_lines = Arc::clone(&lines);
     let sink: OutputSink = Arc::new(move |msg: &str| {
-        sink_lines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(msg.to_string());
+        sink_lines.lock().unwrap_or_else(|e| e.into_inner()).push(msg.to_string());
     });
     let tc = TestCase::new(Arc::new(c_tc), true, Some(sink));
     (run, tc, lines)
@@ -57,19 +54,11 @@ fn string_panic(message: &str) -> Box<dyn std::any::Any + Send> {
 }
 
 fn panic_info(location: &str) -> PanicInfo {
-    (
-        "worker-thread".to_string(),
-        "7".to_string(),
-        location.to_string(),
-        Backtrace::disabled(),
-    )
+    ("worker-thread".to_string(), "7".to_string(), location.to_string(), Backtrace::disabled())
 }
 
 fn panicked_event(message: &str, info: Option<PanicInfo>) -> WorkerEvent {
-    WorkerEvent::Panicked {
-        payload: string_panic(message),
-        info,
-    }
+    WorkerEvent::Panicked { payload: string_panic(message), info }
 }
 
 fn resolve_round_unwind(events: Vec<WorkerEvent>, tc: &TestCase) -> Box<dyn std::any::Any + Send> {
@@ -113,10 +102,8 @@ fn resolve_round_control_payloads_win_over_overrun_and_panic() {
 #[test]
 fn resolve_round_overrun_wins_over_panic_and_notes_the_dropped_panic() {
     let (_run, tc, lines) = capturing_test_case();
-    let events = vec![
-        panicked_event("induced panic", Some(panic_info("b.rs:2:2"))),
-        WorkerEvent::Overrun,
-    ];
+    let events =
+        vec![panicked_event("induced panic", Some(panic_info("b.rs:2:2"))), WorkerEvent::Overrun];
     let payload = resolve_round_unwind(events, &tc);
     assert!(payload.downcast_ref::<StopTest>().is_some());
     tc.reporter().emit_rendered_output();
@@ -171,14 +158,8 @@ fn resolve_round_treats_a_dead_worker_as_an_internal_error() {
 
 #[test]
 fn classify_worker_unwind_maps_every_payload() {
-    assert!(matches!(
-        classify_worker_unwind(Box::new(AssumeFailed)),
-        WorkerEvent::Invalid
-    ));
-    assert!(matches!(
-        classify_worker_unwind(Box::new(StopTest)),
-        WorkerEvent::Overrun
-    ));
+    assert!(matches!(classify_worker_unwind(Box::new(AssumeFailed)), WorkerEvent::Invalid));
+    assert!(matches!(classify_worker_unwind(Box::new(StopTest)), WorkerEvent::Overrun));
     assert!(matches!(
         classify_worker_unwind(Box::new(InvalidArgument("bad".to_string()))),
         WorkerEvent::ControlPayload(_)
@@ -187,10 +168,7 @@ fn classify_worker_unwind_maps_every_payload() {
         classify_worker_unwind(Box::new(InternalError("bug".to_string()))),
         WorkerEvent::ControlPayload(_)
     ));
-    assert!(matches!(
-        classify_worker_unwind(Box::new(LoopDone)),
-        WorkerEvent::ControlPayload(_)
-    ));
+    assert!(matches!(classify_worker_unwind(Box::new(LoopDone)), WorkerEvent::ControlPayload(_)));
     run_lifecycle::take_panic_info();
     assert!(matches!(
         classify_worker_unwind(string_panic("raw panic")),
@@ -204,14 +182,9 @@ struct HitCounter {
 
 impl ConcurrentStateMachine for HitCounter {
     fn rules(&self) -> Vec<ConcurrentRule<Self>> {
-        vec![ConcurrentRule::new(
-            "hit",
-            ANONYMOUS_GROUP,
-            1.0,
-            |m, _tc| {
-                m.hits.fetch_add(1, Ordering::SeqCst);
-            },
-        )]
+        vec![ConcurrentRule::new("hit", ANONYMOUS_GROUP, 1.0, |m, _tc| {
+            m.hits.fetch_add(1, Ordering::SeqCst);
+        })]
     }
     fn invariants(&self) -> Vec<ConcurrentInvariant<Self>> {
         Vec::new()
@@ -222,12 +195,7 @@ struct AlwaysPanics;
 
 impl ConcurrentStateMachine for AlwaysPanics {
     fn rules(&self) -> Vec<ConcurrentRule<Self>> {
-        vec![ConcurrentRule::new(
-            "boom",
-            ANONYMOUS_GROUP,
-            1.0,
-            |_m, _tc| panic!("rule boom"),
-        )]
+        vec![ConcurrentRule::new("boom", ANONYMOUS_GROUP, 1.0, |_m, _tc| panic!("rule boom"))]
     }
     fn invariants(&self) -> Vec<ConcurrentInvariant<Self>> {
         Vec::new()
@@ -237,27 +205,15 @@ impl ConcurrentStateMachine for AlwaysPanics {
 #[test]
 fn run_worker_round_executes_the_rounds_rule_and_finishes() {
     let (_run, tc, lines) = capturing_test_case();
-    let m = HitCounter {
-        hits: AtomicI64::new(0),
-    };
+    let m = HitCounter { hits: AtomicI64::new(0) };
     let rules = m.rules();
     let machine = register_machine(&tc, &["hit"], 1);
-    assert!(
-        tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine))
-            .unwrap()
-            .is_some()
-    );
+    assert!(tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine)).unwrap().is_some());
     let event = with_test_context(|| run_worker_round(0, &tc, &m, &rules, &machine));
     assert!(matches!(event, WorkerEvent::RoundDone));
     assert_eq!(m.hits.load(Ordering::SeqCst), 1);
     tc.reporter().emit_rendered_output();
-    assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.contains("Rule: hit"))
-    );
+    assert!(lines.lock().unwrap().iter().any(|line| line.contains("Rule: hit")));
 }
 
 #[test]
@@ -267,11 +223,7 @@ fn run_worker_round_ferries_a_rule_panic_with_its_capture() {
     let m = AlwaysPanics;
     let rules = m.rules();
     let machine = register_machine(&tc, &["boom"], 1);
-    assert!(
-        tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine))
-            .unwrap()
-            .is_some()
-    );
+    assert!(tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine)).unwrap().is_some());
     let event = with_test_context(|| run_worker_round(0, &tc, &m, &rules, &machine));
     let WorkerEvent::Panicked { payload, info } = event else {
         panic!("expected a ferried panic");
@@ -280,28 +232,16 @@ fn run_worker_round_ferries_a_rule_panic_with_its_capture() {
     let (_, _, location, _) = info.unwrap();
     assert!(location.contains("stateful_tests.rs"), "{location}");
     tc.reporter().emit_rendered_output();
-    assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.contains("Rule boom failed:"))
-    );
+    assert!(lines.lock().unwrap().iter().any(|line| line.contains("Rule boom failed:")));
 }
 
 #[test]
 fn run_worker_round_reports_an_exhausted_budget_as_overrun() {
     let (_run, tc, _lines) = capturing_test_case();
-    let m = HitCounter {
-        hits: AtomicI64::new(0),
-    };
+    let m = HitCounter { hits: AtomicI64::new(0) };
     let rules = m.rules();
     let machine = register_machine(&tc, &["hit"], 1);
-    assert!(
-        tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine))
-            .unwrap()
-            .is_some()
-    );
+    assert!(tc.with_ctc(|ctc| ctc.state_machine_next_group(&machine)).unwrap().is_some());
     let exhausted = with_test_context(|| {
         catch_unwind(AssertUnwindSafe(|| {
             loop {
@@ -340,9 +280,7 @@ fn machine_next_group_reports_an_exhausted_budget_as_overrun() {
 #[test]
 fn worker_loop_exits_when_the_event_channel_is_gone() {
     let (_run, tc, _lines) = capturing_test_case();
-    let m = HitCounter {
-        hits: AtomicI64::new(0),
-    };
+    let m = HitCounter { hits: AtomicI64::new(0) };
     let rules = m.rules();
     let machine = register_machine(&tc, &["hit"], 1);
     let (round_tx, round_rx) = mpsc::channel();

@@ -87,7 +87,11 @@ impl Cgroup {
                 return Err(named(
                     &error,
                     // alloc: an error's message, made as it fails.
-                    &format!("making {} (is {} delegated to this process?)", at.display(), parent.display()),
+                    &format!(
+                        "making {} (is {} delegated to this process?)",
+                        at.display(),
+                        parent.display()
+                    ),
                 ));
             }
             // Left by a process of this pid that is gone; it holds nothing once it is empty.
@@ -105,7 +109,8 @@ impl Cgroup {
     pub(crate) fn procs(&self) -> &CStr {
         // Checked rather than `from_bytes_with_nul_unchecked`: one scan of a short path per
         // spawn, against a fork.
-        CStr::from_bytes_with_nul(&self.path).expect("`new` refused a NUL in the directory and `PROCS` ends with one")
+        CStr::from_bytes_with_nul(&self.path)
+            .expect("`new` refused a NUL in the directory and `PROCS` ends with one")
     }
 
     /// Its directory.
@@ -127,18 +132,21 @@ impl Cgroup {
         self.file("memory.peak", |path| {
             let mut bytes = [0u8; 32];
             match read_into(path, &mut bytes) {
-                Ok(text) => std::str::from_utf8(text).ok().and_then(|it| it.trim().parse().ok()).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        // alloc: an error's message, made as it fails.
-                        format!(
-                            "{}: {:?} is not a number of bytes",
-                            path.display(),
+                Ok(text) => std::str::from_utf8(text)
+                    .ok()
+                    .and_then(|it| it.trim().parse().ok())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
                             // alloc: an error's message, made as it fails.
-                            String::from_utf8_lossy(text)
-                        ),
-                    )
-                }),
+                            format!(
+                                "{}: {:?} is not a number of bytes",
+                                path.display(),
+                                // alloc: an error's message, made as it fails.
+                                String::from_utf8_lossy(text)
+                            ),
+                        )
+                    }),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     // alloc: an error's message, made as it fails.
@@ -193,9 +201,11 @@ impl Cgroup {
             write!(rest, "{limit}")?;
             20 - rest.len()
         };
-        self.file("memory.max", |it| write(it, &digits[..len])).map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => not_enabled(),
-            _ => error,
+        self.file("memory.max", |it| write(it, &digits[..len])).map_err(|error| {
+            match error.kind() {
+                io::ErrorKind::NotFound => not_enabled(),
+                _ => error,
+            }
         })?;
         match self.file("memory.swap.max", |it| write(it, b"0")) {
             Ok(()) => Ok(()),
@@ -229,7 +239,10 @@ impl Drop for Cgroup {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
                 // Empty, but the kernel has not let go of it yet.
                 Err(_) if Instant::now() < deadline => {
-                    #[allow(clippy::disallowed_methods, reason = "the rmdir's timer: `cgroup.events` says empty, and nothing says when the kernel lets go")]
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "the rmdir's timer: `cgroup.events` says empty, and nothing says when the kernel lets go"
+                    )]
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(_) => break,
@@ -405,7 +418,8 @@ fn unescape(field: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        let octal = bytes.get(at + 1..at + 4).filter(|it| it.iter().all(|b| (b'0'..=b'7').contains(b)));
+        let octal =
+            bytes.get(at + 1..at + 4).filter(|it| it.iter().all(|b| (b'0'..=b'7').contains(b)));
         match (bytes[at], octal) {
             (b'\\', Some(digits)) => {
                 out.push(digits.iter().fold(0u8, |n, d| n.wrapping_mul(8).wrapping_add(d - b'0')));
@@ -443,16 +457,22 @@ pub(crate) fn kernel() -> String {
 
 fn read(path: &Path) -> io::Result<String> {
     // alloc: once per process, finding and readying the parent cgroup.
-    std::fs::read_to_string(path).map_err(|error| named(&error, &format!("reading {}", path.display())))
+    std::fs::read_to_string(path)
+        .map_err(|error| named(&error, &format!("reading {}", path.display())))
 }
 
 /// `value` written to a file of the cgroup file system, which is never made: a file that is
 /// not there is `NotFound`.
 fn write(path: &Path, value: &[u8]) -> io::Result<()> {
-    OpenOptions::new().write(true).open(path).and_then(|mut file| file.write_all(value)).map_err(|error| {
-        // alloc: an error's message, made as it fails.
-        named(&error, &format!("writing {:?} to {}", String::from_utf8_lossy(value), path.display()))
-    })
+    OpenOptions::new().write(true).open(path).and_then(|mut file| file.write_all(value)).map_err(
+        |error| {
+            // alloc: an error's message, made as it fails.
+            named(
+                &error,
+                &format!("writing {:?} to {}", String::from_utf8_lossy(value), path.display()),
+            )
+        },
+    )
 }
 
 /// What the file at `path` holds, read into `bytes`; an error where it holds more.
@@ -495,7 +515,8 @@ mod tests {
             unified_path(systemd),
             Some("/user.slice/user-1000.slice/user@1000.service/app.slice/blaze.service")
         );
-        let hybrid = "12:memory:/user.slice\n1:name=systemd:/user.slice/s.scope\n0::/user.slice/s.scope\n";
+        let hybrid =
+            "12:memory:/user.slice\n1:name=systemd:/user.slice/s.scope\n0::/user.slice/s.scope\n";
         assert_eq!(unified_path(hybrid), Some("/user.slice/s.scope"));
         assert_eq!(unified_path("0::/gone (deleted)\n"), Some("/gone"));
         assert_eq!(unified_path("12:memory:/user.slice\n1:name=systemd:/x\n"), None);

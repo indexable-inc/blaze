@@ -64,7 +64,9 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
         };
         seen.insert(done.tag.0, shown);
         let next = match done.tag.0 {
-            1 => Effect::Write { file: name("store/a/value"), bytes: b"again".to_vec(), tag: Tag(2) },
+            1 => {
+                Effect::Write { file: name("store/a/value"), bytes: b"again".to_vec(), tag: Tag(2) }
+            }
             2 => Effect::Clone { from: name("store/a/value"), to: name("out/c"), tag: Tag(3) },
             3 => Effect::Link { from: name("store/a/value"), to: name("out/l"), tag: Tag(4) },
             4 => Effect::ReadAll { file: name("out/l"), tag: Tag(5) },
@@ -74,7 +76,9 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             8 => Effect::Remove { file: name("out/l"), tag: Tag(9) },
             9 => Effect::Remove { file: name("out/l"), tag: Tag(10) },
             10 => Effect::ReadAll { file: name("out/l"), tag: Tag(11) },
-            11 => Effect::Append { file: name("store/a/value"), bytes: b"+".to_vec(), tag: Tag(12) },
+            11 => {
+                Effect::Append { file: name("store/a/value"), bytes: b"+".to_vec(), tag: Tag(12) }
+            }
             12 => Effect::ReadAll { file: name("store/a/value"), tag: Tag(13) },
             13 => Effect::Link { from: name("missing"), to: name("out/m"), tag: Tag(14) },
             14 => Effect::Unwatch { tag: Tag(99) },
@@ -130,7 +134,10 @@ fn every_driver_ends_the_script_the_same() {
     assert_eq!(simulated[&17], format!("{:?}", Done::Read(b"agaiXYZ".to_vec())));
     assert_eq!(simulated[&20], format!("{:?}", Done::Stat(None)));
     assert_eq!(simulated[&21], "store/a/, store/a/moved 7");
-    assert_eq!((&simulated[&22][..], &simulated[&23][..], &simulated[&24][..]), ("failed", "failed", "failed"));
+    assert_eq!(
+        (&simulated[&22][..], &simulated[&23][..], &simulated[&24][..]),
+        ("failed", "failed", "failed")
+    );
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");
@@ -150,6 +157,37 @@ fn the_native_driver_runs_the_shared_script_as_threads_does() {
     assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
 }
 
+/// Each step's end, one at a time: two exclusive locks of one file (the second contends, as
+/// another holder's does), the first let go of, the second asked again.
+fn locks(driver: &mut impl Driver) -> Vec<Done> {
+    let lock = name("history/lock");
+    let take =
+        |tag| Effect::Lock { file: lock.clone(), mode: crate::LockMode::Exclusive, tag: Tag(tag) };
+    let steps = [
+        take(1),
+        take(2),
+        Effect::Unlock { lock: Tag(1), tag: Tag(3) },
+        take(4),
+        Effect::Unlock { lock: Tag(4), tag: Tag(5) },
+    ];
+    let mut seen = Vec::new();
+    for step in steps {
+        run_until_idle(driver, &mut vec![step], |done, _| seen.push(done.done));
+    }
+    seen
+}
+
+/// A lock of a file excludes another of it, on the driver the build path makes as on threads,
+/// until it is let go of.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_lock_excludes_another_until_it_is_let_go_of() {
+    let want = vec![Done::Locked, Done::Contended, Done::Unlocked, Done::Locked, Done::Unlocked];
+    assert_eq!(locks(&mut Sim::new(1, Faults::default())), want, "simulated");
+    assert_eq!(locks(&mut Threads::new(&dir("locks-threads"), 1)), want, "threads");
+    assert_eq!(locks(&mut crate::native(&dir("locks-native"), 1).unwrap()), want, "native");
+}
+
 /// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
 /// file system the tests run on keeps it exactly.
 const TIME: u64 = 1_700_000_000_123_456_700;
@@ -160,8 +198,11 @@ const TIME: u64 = 1_700_000_000_123_456_700;
 fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
     let earlier = TIME - 86_400 * 1_000_000_000;
     let mut seen = BTreeMap::new();
-    let mut effects =
-        vec![Effect::Write { file: name("target/build/output"), bytes: b"cargo::rerun-if-changed=build.rs\n".to_vec(), tag: Tag(1) }];
+    let mut effects = vec![Effect::Write {
+        file: name("target/build/output"),
+        bytes: b"cargo::rerun-if-changed=build.rs\n".to_vec(),
+        tag: Tag(1),
+    }];
     run_until_idle(driver, &mut effects, |done, effects| {
         let shown = match &done.done {
             // A directory's own length is the file system's.
@@ -173,19 +214,31 @@ fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
                 .map(|(file, meta)| format!("{file} {}", meta.modified_ns))
                 .collect::<Vec<_>>()
                 .join(", "),
-            Done::Failed(why) if why.0.contains("never-written") || why.0.contains("output") => "failed, named".to_owned(),
+            Done::Failed(why) if why.0.contains("never-written") || why.0.contains("output") => {
+                "failed, named".to_owned()
+            }
             other => format!("{other:?}"),
         };
         seen.insert(done.tag.0, shown);
         let next = match done.tag.0 {
-            1 => Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(2) },
+            1 => {
+                Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(2) }
+            }
             2 => Effect::Stat { file: name("target/build/output"), tag: Tag(3) },
             3 => Effect::Times { file: name("target/build"), modified_ns: earlier, tag: Tag(4) },
             4 => Effect::Stat { file: name("target/build"), tag: Tag(5) },
             5 => Effect::List { dir: name("target"), tag: Tag(6) },
-            6 => Effect::Times { file: name("target/never-written"), modified_ns: TIME, tag: Tag(7) },
-            7 => Effect::Rename { from: name("target/build/output"), to: name("target/moved"), tag: Tag(8) },
-            8 => Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(9) },
+            6 => {
+                Effect::Times { file: name("target/never-written"), modified_ns: TIME, tag: Tag(7) }
+            }
+            7 => Effect::Rename {
+                from: name("target/build/output"),
+                to: name("target/moved"),
+                tag: Tag(8),
+            },
+            8 => {
+                Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(9) }
+            }
             9 => Effect::Stat { file: name("target/moved"), tag: Tag(10) },
             _ => return,
         };
@@ -211,11 +264,23 @@ fn every_driver_sets_a_files_times_as_asked() {
     let root = dir("times-threads");
     assert_eq!(times(&mut Threads::new(&root, 2)), simulated, "threads");
     #[cfg(target_os = "linux")]
-    assert_eq!(times(&mut crate::uring::Uring::new(dir("times-uring")).unwrap()), simulated, "io_uring");
+    assert_eq!(
+        times(&mut crate::uring::Uring::new(dir("times-uring")).unwrap()),
+        simulated,
+        "io_uring"
+    );
     #[cfg(target_os = "macos")]
-    assert_eq!(times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue"), 2).unwrap()), simulated, "kqueue");
+    assert_eq!(
+        times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue"), 2).unwrap()),
+        simulated,
+        "kqueue"
+    );
     #[cfg(windows)]
-    assert_eq!(times(&mut crate::iocp::Iocp::new(&dir("times-iocp"), 2).unwrap()), simulated, "IOCP");
+    assert_eq!(
+        times(&mut crate::iocp::Iocp::new(&dir("times-iocp"), 2).unwrap()),
+        simulated,
+        "IOCP"
+    );
 }
 
 /// `rounds` of the file `f`'s times set: what they allocated on the polling thread.
@@ -225,7 +290,11 @@ fn times_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
     let mut used = 0;
     for round in 0..rounds {
         // The caller's: made before the cycle.
-        effects.push(Effect::Times { file: file.clone(), modified_ns: TIME + 100 * round, tag: Tag(round) });
+        effects.push(Effect::Times {
+            file: file.clone(),
+            modified_ns: TIME + 100 * round,
+            tag: Tag(round),
+        });
         let ((), cycle) = blaze_alloc_count::measure(|| {
             driver.submit(&mut effects);
             poll_for(driver, &mut out, 1);
@@ -244,7 +313,8 @@ fn times_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 #[test]
 fn a_warm_times_set_allocates_nothing() {
     fn write(driver: &mut impl Driver) {
-        let mut effects = vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        let mut effects =
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
     }
     let mut sim = Sim::new(15, Faults::default());
@@ -261,7 +331,11 @@ fn a_warm_times_set_allocates_nothing() {
     write(&mut threads);
     times_rounds(&mut threads, WARM);
     threads.off_thread();
-    assert_eq!(times_rounds(&mut threads, ROUNDS), 0, "threads: {ROUNDS} warm sets of times, on the polling thread");
+    assert_eq!(
+        times_rounds(&mut threads, ROUNDS),
+        0,
+        "threads: {ROUNDS} warm sets of times, on the polling thread"
+    );
     // On Windows the file thread makes its path with `sys::path`, which allocates; `Iocp`, the
     // native driver there, sets times on its polling thread and is held to zero below.
     #[cfg(unix)]
@@ -274,7 +348,11 @@ fn a_warm_times_set_allocates_nothing() {
         let mut ring = crate::uring::Uring::new(&root).unwrap();
         write(&mut ring);
         times_rounds(&mut ring, WARM);
-        assert_eq!(times_rounds(&mut ring, ROUNDS), 0, "io_uring: {ROUNDS} warm sets of times, its utimensat inline");
+        assert_eq!(
+            times_rounds(&mut ring, ROUNDS),
+            0,
+            "io_uring: {ROUNDS} warm sets of times, its utimensat inline"
+        );
         drop(ring);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -284,7 +362,11 @@ fn a_warm_times_set_allocates_nothing() {
         let mut iocp = crate::iocp::Iocp::new(&root, 1).unwrap();
         write(&mut iocp);
         times_rounds(&mut iocp, WARM);
-        assert_eq!(times_rounds(&mut iocp, ROUNDS), 0, "IOCP: {ROUNDS} warm sets of times, SetFileTime inline");
+        assert_eq!(
+            times_rounds(&mut iocp, ROUNDS),
+            0,
+            "IOCP: {ROUNDS} warm sets of times, SetFileTime inline"
+        );
         drop(iocp);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -298,7 +380,10 @@ fn every_driver_fires_timers_in_their_order() {
         let mut effects: Vec<Effect> = [9u64, 0, 4, 0, 13, 2, 7]
             .into_iter()
             .enumerate()
-            .map(|(n, it)| Effect::Timer { after: Duration::from_millis(3 * it), tag: Tag(n as u64) })
+            .map(|(n, it)| Effect::Timer {
+                after: Duration::from_millis(3 * it),
+                tag: Tag(n as u64),
+            })
             .collect();
         effects.push(Effect::Timer { after: Duration::from_secs(1 << 40), tag: Tag(99) });
         driver.submit(&mut effects);
@@ -333,14 +418,15 @@ fn every_driver_fires_timers_in_their_order() {
 #[test]
 fn watches_hear_a_file_written_under_them() {
     fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {
-        let mut effects = vec![
-            Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) },
-        ];
+        let mut effects =
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |_, _| {});
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
-        let mut effects = vec![
-            Effect::Write { file: name("src/deep/lib.rs"), bytes: b"fn f() {}".to_vec(), tag: Tag(2) },
-        ];
+        let mut effects = vec![Effect::Write {
+            file: name("src/deep/lib.rs"),
+            bytes: b"fn f() {}".to_vec(),
+            tag: Tag(2),
+        }];
         let mut heard = Vec::new();
         let mut asked_end = false;
         let mut ended = false;
@@ -382,7 +468,8 @@ fn watches_hear_a_file_written_under_them() {
 /// round; a flush of a watch not in flight fails; nothing is left in flight once the watch ends.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::path::Path) {
-    let mut effects = vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+    let mut effects =
+        vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
     run_until_idle(driver, &mut effects, |_, _| {});
     driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
     let mut done = Vec::new();
@@ -405,7 +492,10 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
                 match it.done {
                     Done::Changed { files, .. } => heard.extend(files),
                     Done::Flushed if it.tag == one || it.tag == two => {
-                        assert!(heard.contains(&name(&file)), "round {round}: flushed first; {heard:?}");
+                        assert!(
+                            heard.contains(&name(&file)),
+                            "round {round}: flushed first; {heard:?}"
+                        );
                         flushed += 1;
                     }
                     other => panic!("round {round}: {other:?}"),
@@ -414,7 +504,8 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
         }
         assert_eq!(flushed, 2, "round {round}: the flushes never came");
     }
-    let mut effects = vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+    let mut effects =
+        vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
     let (mut refused, mut ended) = (false, false);
     run_until_idle(driver, &mut effects, |it, _| match (it.tag.0, it.done) {
         (9, Done::Failed(_)) => refused = true,
@@ -434,7 +525,10 @@ fn every_watching_driver_tells_a_flush_after_the_changes_before_it() {
     #[cfg(target_os = "linux")]
     {
         let root = dir("flush-uring");
-        flushes_follow_the_changes_before_them(&mut crate::uring::Uring::new(&root).unwrap(), &root);
+        flushes_follow_the_changes_before_them(
+            &mut crate::uring::Uring::new(&root).unwrap(),
+            &root,
+        );
     }
 }
 
@@ -567,7 +661,11 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
 
     struct Shell;
     impl Confine for Shell {
-        fn confine(&self, command: &Command, scratch: &std::path::Path) -> Result<Confined, String> {
+        fn confine(
+            &self,
+            command: &Command,
+            scratch: &std::path::Path,
+        ) -> Result<Confined, String> {
             assert!(scratch.is_dir());
             let mut args = vec!["-c".into(), "printf confined; \"$0\" \"$@\"".into()];
             args.push(command.program.clone().into_os_string());
@@ -592,7 +690,13 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
             env: Vec::new(),
             dir: "/".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() },
+            sandbox: Sandbox::On {
+                read: Vec::new(),
+                write: Vec::new(),
+                network: false,
+                trace: true,
+                services: Vec::new(),
+            },
             memory: None,
         })
     }
@@ -641,7 +745,11 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
 #[test]
 fn an_answer_is_its_bytes_and_a_confine_hands_nothing_unless_it_says() {
     use crate::{Answer, Command, Confine, Confined, Handed, Sandbox, Traced};
-    let answers = [Answer { run: 0, code: 0 }, Answer { run: u64::MAX, code: -1 }, Answer { run: 7, code: 125 }];
+    let answers = [
+        Answer { run: 0, code: 0 },
+        Answer { run: u64::MAX, code: -1 },
+        Answer { run: 7, code: 125 },
+    ];
     for answer in answers {
         assert_eq!(Answer::from_bytes(answer.to_bytes()), answer);
     }
@@ -661,7 +769,13 @@ fn an_answer_is_its_bytes_and_a_confine_hands_nothing_unless_it_says() {
         env: Vec::new(),
         dir: ".".into(),
         stdin: Vec::new(),
-        sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() },
+        sandbox: Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        },
         memory: None,
     };
     assert!(Cold.warm().is_none());
@@ -739,7 +853,8 @@ fn file_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 #[test]
 fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
     fn write(driver: &mut impl Driver) {
-        let mut effects = vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        let mut effects =
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
     }
     let mut sim = Sim::new(11, Faults::default());
@@ -788,7 +903,11 @@ fn timer_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 fn a_warm_timer_arm_and_fire_allocates_nothing() {
     let mut sim = Sim::new(12, Faults::default());
     timer_rounds(&mut sim, WARM);
-    assert_eq!(timer_rounds(&mut sim, 10 * ROUNDS), 0, "the simulation: warm timers armed and fired");
+    assert_eq!(
+        timer_rounds(&mut sim, 10 * ROUNDS),
+        0,
+        "the simulation: warm timers armed and fired"
+    );
     let root = dir("budget-timers");
     let mut threads = Threads::new(&root, 1);
     timer_rounds(&mut threads, WARM);
@@ -814,7 +933,8 @@ fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mu
         while !heard {
             assert!(Instant::now() < deadline, "round {round}: the change was never heard");
             edit(driver);
-            let (_, polled) = blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+            let (_, polled) =
+                blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
             used += polled.allocations;
             for it in out.drain(..) {
                 match it.done {
@@ -834,7 +954,10 @@ fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mu
         });
         used += removed.allocations;
         for it in out.drain(..) {
-            assert!(matches!(it.done, Done::Changed { .. } | Done::Unwatched), "round {round}: {it:?}");
+            assert!(
+                matches!(it.done, Done::Changed { .. } | Done::Unwatched),
+                "round {round}: {it:?}"
+            );
         }
         assert_eq!(driver.in_flight(), 0, "round {round}");
     }
@@ -860,7 +983,11 @@ fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
         let mut threads = Threads::new(&root, 1);
         watch_rounds(&mut threads, 2, edit);
         threads.off_thread();
-        assert_eq!(watch_rounds(&mut threads, 4, edit), 0, "threads: warm watch cycles, on the polling thread");
+        assert_eq!(
+            watch_rounds(&mut threads, 4, edit),
+            0,
+            "threads: warm watch cycles, on the polling thread"
+        );
         let (off, payload) = threads.off_thread();
         assert_eq!(
             off - payload,
@@ -875,7 +1002,12 @@ fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
 /// A listen at `at` as `Tag(1)` and a connect to it as `connect`: the accepted end and the
 /// connecting one.
 #[cfg(unix)]
-fn connected(driver: &mut impl Driver, at: &crate::Address, connect: Tag, listen: bool) -> (crate::Conn, crate::Conn) {
+fn connected(
+    driver: &mut impl Driver,
+    at: &crate::Address,
+    connect: Tag,
+    listen: bool,
+) -> (crate::Conn, crate::Conn) {
     let mut effects = Vec::with_capacity(2);
     if listen {
         effects.push(Effect::Listen { at: at.clone(), tag: Tag(1) });
@@ -912,17 +1044,27 @@ fn send_rounds(
         sending.extend_from_slice(b"ping");
         receiving.clear();
         let ((), cycle) = blaze_alloc_count::measure(|| {
-            effects.push(Effect::Send { conn: client, bytes: std::mem::take(sending), tag: Tag(10) });
-            effects.push(Effect::Recv { conn: server, most: 64, into: std::mem::take(receiving), tag: Tag(11) });
+            effects.push(Effect::Send {
+                conn: client,
+                bytes: std::mem::take(sending),
+                tag: Tag(10),
+            });
+            effects.push(Effect::Recv {
+                conn: server,
+                most: 64,
+                into: std::mem::take(receiving),
+                tag: Tag(11),
+            });
             driver.submit(&mut effects);
             poll_for(driver, &mut out, 2);
         });
         used += cycle.allocations;
         out.sort_by_key(|it| it.tag);
         match &mut out[..] {
-            [Completion { done: Done::Sent(sent), .. }, Completion { done: Done::Read(read), .. }]
-                if sent.is_empty() && read == b"ping" =>
-            {
+            [
+                Completion { done: Done::Sent(sent), .. },
+                Completion { done: Done::Read(read), .. },
+            ] if sent.is_empty() && read == b"ping" => {
                 *buffers = [std::mem::take(sent), std::mem::take(read)];
             }
             other => panic!("round {round}: {other:?}"),
@@ -936,8 +1078,15 @@ fn send_rounds(
 /// `Conn`s name nothing, a receive and a send on them fail with their buffers back, and the
 /// new one carries bytes.
 #[cfg(unix)]
-fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (server, client): (crate::Conn, crate::Conn)) {
-    let mut effects = vec![Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }];
+fn hung_up_conns_name_nothing(
+    driver: &mut impl Driver,
+    at: &crate::Address,
+    (server, client): (crate::Conn, crate::Conn),
+) {
+    let mut effects = vec![
+        Effect::Hangup { conn: client, tag: Tag(20) },
+        Effect::Hangup { conn: server, tag: Tag(21) },
+    ];
     let mut out = Vec::new();
     driver.submit(&mut effects);
     poll_for(driver, &mut out, 2);
@@ -973,7 +1122,10 @@ fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (se
     ]);
     let mut done = BTreeMap::new();
     run_until_idle(driver, &mut effects, |it, _| _ = done.insert(it.tag.0, it.done));
-    assert_eq!(done, BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)]));
+    assert_eq!(
+        done,
+        BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)])
+    );
 }
 
 /// A send on one end and a receive on the other of a warm connection, each buffer handed back
@@ -999,7 +1151,11 @@ fn a_warm_send_and_receive_allocates_nothing() {
     let used = send_rounds(&mut threads, conns, ROUNDS, &mut buffers);
     assert_eq!(used, 0, "threads: {ROUNDS} warm sends and receives, on the polling thread");
     let (off, payload) = threads.off_thread();
-    assert_eq!((off, payload), (0, 0), "threads: the errands' allocations, and of them the receives' buffers");
+    assert_eq!(
+        (off, payload),
+        (0, 0),
+        "threads: the errands' allocations, and of them the receives' buffers"
+    );
     hung_up_conns_name_nothing(&mut threads, &at, conns);
     drop(threads);
     std::fs::remove_dir_all(root).unwrap();

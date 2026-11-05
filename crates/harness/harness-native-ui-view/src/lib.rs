@@ -10,9 +10,12 @@
 //! A plain library linked into each module that uses it: an edit swaps those modules in, as an edit of their own code does.
 use std::collections::HashSet;
 
+pub mod table;
+pub use table::table;
+
 use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::Action;
-use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay};
+use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay, ScrollerPart};
 use harness_native_ui_motion_api::{Leaving, Transition};
 use harness_native_ui_node_api::{Clip, Node, Placed};
 use harness_native_ui_text_api::{Icon, Text};
@@ -184,7 +187,8 @@ pub struct PropsHash {
 /// Keep `parent`'s rows in step with `rows`, SwiftUI's `ForEach`: one child per key, made from `prefab` and named by the key
 /// the first time the key is seen, deleted once it is gone, and kept in `rows`' order. `update` runs for every row with
 /// whether it was just made, to set what differs (its words, its state relations). The parent holds only rows (a `ui.List`
-/// or a `ui.Column` of them): a child that is not a row is deleted. A key seen twice keeps its first row.
+/// or a `ui.Column` of them): a child that is not a row is deleted, except a scroll's own scroller parts (`ScrollerPart`:
+/// a `ui.Scroll` may hold its rows directly). A key seen twice keeps its first row.
 ///
 /// Inside a system the rows it makes arrive at the end of the system; reordering waits for the call in which every row
 /// already exists (rows that are only appended keep their order without it).
@@ -221,7 +225,7 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
     }
     let kept: HashSet<u64> = order.iter().copied().collect();
     parent.0.each_child(|c| {
-        if !kept.contains(&*c.id()) && !c.has(Leaving::id()) {
+        if !kept.contains(&*c.id()) && !c.has(Leaving::id()) && !c.has(ScrollerPart::id()) {
             leave(View(c));
         }
     });
@@ -290,7 +294,7 @@ pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
     // Rows no longer in view, free to be bound again.
     let mut spare: Vec<EntityView<'a>> = Vec::new();
     e.each_child(|c| {
-        if c.has(Node::id()) && !c.has(Leaving::id()) && !wanted.contains(c.name().as_str()) {
+        if c.has(Node::id()) && !c.has(Leaving::id()) && !c.has(ScrollerPart::id()) && !wanted.contains(c.name().as_str()) {
             spare.push(c);
         }
     });
@@ -321,4 +325,94 @@ pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
         c.destruct();
     }
     live
+}
+
+/// The heights a [`lazy_stack`] measured its rows at, by key, at the width it was laid out at (a new width forgets them).
+#[derive(Clone, Debug, Default)]
+pub struct Heights {
+    width: f32,
+    h: std::collections::HashMap<String, f32>,
+}
+
+/// What a [`lazy_stack`] call found: how tall all its rows are (measured or estimated), and how far the rows above the
+/// view grew since the last call (the scroll moves by it to keep what is in view still).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stacked {
+    pub content: f32,
+    pub shift: f32,
+}
+
+/// Keep a `LazyStack` container's rows to the ones in view, rows of any height (a chat's transcript): `count` rows, row
+/// `i` named `key(i)` and made from `prefab(i)`; `top` is how far its content is scrolled and `room` how tall its view is.
+/// Rows are measured from their last layout into `heights`; rows never laid out count the `LazyStack`'s estimate. The rows
+/// above and below the ones that exist are two spacers (`_top`, `_foot`) as tall as they are, so the stack is as long as
+/// all its rows. The stack's `Flex.gap` must be 0 (rows carry their own padding).
+#[allow(clippy::too_many_arguments)]
+pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
+    parent: View<'a>, heights: &mut Heights, top: f32, room: f32, count: usize, key: impl Fn(usize) -> K,
+    prefab: impl Fn(usize) -> &'p str, mut update: impl FnMut(View<'a>, usize, bool),
+) -> Stacked {
+    use harness_native_ui_layout_api::{LazyStack, Size, SizeKind, Sizing};
+    use harness_native_ui_node_api::Laid;
+    let e = parent.0;
+    let spec = e.try_cloned::<&LazyStack>().unwrap_or(LazyStack { estimate: 40.0, overscan: 400.0 });
+    let width = e.try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+    if (width - heights.width).abs() > 0.5 {
+        heights.width = width;
+        heights.h.clear();
+    }
+    // Measure the rows that exist; what changed above the view moves the scroll.
+    let keys: Vec<String> = (0..count).map(|i| key(i).as_ref().to_owned()).collect();
+    let tops = |heights: &Heights| {
+        let mut at = 0.0;
+        let mut v = Vec::with_capacity(count + 1);
+        for k in &keys {
+            v.push(at);
+            at += heights.h.get(k).copied().unwrap_or(spec.estimate);
+        }
+        v.push(at);
+        v
+    };
+    let before = tops(heights);
+    let mut shift = 0.0;
+    e.each_child(|c| {
+        let name = c.name().to_string();
+        if name.starts_with('_') || !c.has(Node::id()) {
+            return;
+        }
+        let Some(l) = c.try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { return };
+        let Some(i) = keys.iter().position(|k| *k == name) else { return };
+        let old = heights.h.get(&name).copied().unwrap_or(spec.estimate);
+        if (old - l.h).abs() > 0.25 {
+            if before[i] + old <= top {
+                shift += l.h - old;
+            }
+            heights.h.insert(name, l.h);
+        }
+    });
+    let tops = tops(heights);
+    let total = tops[count];
+    let (lo, hi) = (top + shift - spec.overscan, top + shift + room + spec.overscan);
+    let first = (0..count).find(|&i| tops[i + 1] > lo).unwrap_or(count);
+    let last = (first..count).find(|&i| tops[i] >= hi).unwrap_or(count);
+    let gap = |h: f32| Size {
+        w: Sizing { kind: SizeKind::Grow, value: 1.0, min: 0.0, max: 0.0 },
+        h: Sizing { kind: SizeKind::Fixed, value: h, min: 0.0, max: 0.0 },
+    };
+    enum Slot {
+        Gap(f32),
+        Row(usize),
+    }
+    let rows = std::iter::once(("_top".to_owned(), "ui.Node", Slot::Gap(tops[first])))
+        .chain((first..last).map(|i| (keys[i].clone(), prefab(i), Slot::Row(i))))
+        .chain(std::iter::once(("_foot".to_owned(), "ui.Node", Slot::Gap(total - tops[last]))));
+    for_each_of(parent, rows, |row, slot, new| match slot {
+        Slot::Gap(h) => {
+            if row.0.try_cloned::<&Size>().is_none_or(|s| (s.h.value - h).abs() > 0.01) {
+                row.0.set(gap(h));
+            }
+        }
+        Slot::Row(i) => update(row, i, new),
+    });
+    Stacked { content: total, shift }
 }

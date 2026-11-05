@@ -1,5 +1,5 @@
-use std::{collections::HashMap, panic::AssertUnwindSafe};
 use std::alloc::Global;
+use std::{collections::HashMap, panic::AssertUnwindSafe};
 
 use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, rng::SplitMix64};
@@ -286,7 +286,11 @@ fn a_restore_never_accepts_a_table_it_cannot_read() {
 }
 
 /// `section` with `patch` applied at byte `at`, as a restore sees it, and `section`'s root.
-fn patched(section: &[u8], at: impl FnOnce(&Root) -> u64, patch: &[u8]) -> (Result<Table, RestoreError>, Root) {
+fn patched(
+    section: &[u8],
+    at: impl FnOnce(&Root) -> u64,
+    patch: &[u8],
+) -> (Result<Table, RestoreError>, Root) {
     let image = image_of(section);
     let root = *image.value::<Root>(&image.section(ID, SCHEMA).unwrap(), 0).unwrap();
     let at = at(&root) as usize;
@@ -303,11 +307,16 @@ fn patched(section: &[u8], at: impl FnOnce(&Root) -> u64, patch: &[u8]) -> (Resu
 fn a_start_past_the_values_is_refused_where_it_is() {
     let table = Table::new(shape());
     let mut live = Live::new();
-    [&b"first value"[..], b"second", b"third"].iter().for_each(|value| live.mark_id(table.intern(value)));
+    [&b"first value"[..], b"second", b"third"]
+        .iter()
+        .for_each(|value| live.mark_id(table.intern(value)));
     let section = section_bytes(&table, &live);
     let (restored, root) = patched(&section, |root| root.starts + 4, &u32::MAX.to_le_bytes());
     let what = "a value's bytes out of order or past the values";
-    assert_eq!(restored.err(), Some(RestoreError::Invalid { section: ID, what, at: root.starts + 4 }));
+    assert_eq!(
+        restored.err(),
+        Some(RestoreError::Invalid { section: ID, what, at: root.starts + 4 })
+    );
 }
 
 /// A value that is not UTF-8 in a text table is refused at its first byte.
@@ -332,9 +341,13 @@ fn with_run(section: &[u8], from: usize, len: usize) -> (Result<Table, RestoreEr
     let root = *image.value::<Root>(&image.section(ID, SCHEMA).unwrap(), 0).unwrap();
     let (ctrl, ids, slots) = (root.ctrl as usize, root.ids as usize, root.groups as usize * GROUP);
     let tag = |bytes: &[u8], slot: usize| bytes[ctrl + slot];
-    let id = |bytes: &[u8], slot: usize| u32::from_le_bytes(bytes[ids + 4 * slot..][..4].try_into().unwrap());
-    let full: Vec<(u8, u32)> =
-        (0..slots).filter(|&slot| tag(section, slot) != 0).map(|slot| (tag(section, slot), id(section, slot))).collect();
+    let id = |bytes: &[u8], slot: usize| {
+        u32::from_le_bytes(bytes[ids + 4 * slot..][..4].try_into().unwrap())
+    };
+    let full: Vec<(u8, u32)> = (0..slots)
+        .filter(|&slot| tag(section, slot) != 0)
+        .map(|slot| (tag(section, slot), id(section, slot)))
+        .collect();
     assert!(full.len() >= len * GROUP, "{} slots to fill {len} groups", full.len());
     let mut bytes = section.to_vec();
     bytes[ctrl..ctrl + slots].fill(0);
@@ -368,7 +381,11 @@ fn a_long_run_of_full_groups_is_refused_where_it_starts() {
     for from in [0, CHUNK / GROUP - refused / 2, groups - refused / 2] {
         let (restored, _) = with_run(&section, from, refused);
         let at = root.ctrl + 8 * from as u64;
-        assert_eq!(restored.err(), Some(RestoreError::Invalid { section: ID, what, at }), "a run from group {from}");
+        assert_eq!(
+            restored.err(),
+            Some(RestoreError::Invalid { section: ID, what, at }),
+            "a run from group {from}"
+        );
         let (restored, _) = with_run(&section, from, refused - 1);
         assert!(
             !matches!(restored, Err(RestoreError::Invalid { what: refused_for, .. }) if refused_for == what),
@@ -398,7 +415,11 @@ fn an_index_under_another_key_is_refused() {
         assert!(restore(&section).is_ok(), "{statics} compiled in: the image as written");
         let mut bytes = section.clone();
         bytes[at as usize..][..8].iter_mut().for_each(|byte| *byte ^= 0x5a);
-        assert_eq!(restore(&bytes).err(), Some(RestoreError::Invalid { section: ID, what, at }), "{statics} compiled in");
+        assert_eq!(
+            restore(&bytes).err(),
+            Some(RestoreError::Invalid { section: ID, what, at }),
+            "{statics} compiled in"
+        );
     }
 }
 
@@ -421,7 +442,8 @@ fn interning_agrees_with_a_map_model() {
     for seed in 0..3 {
         let mut rng = SplitMix64::new(0x5eed + seed);
         let table = Table::new(shape());
-        let mut model: blaze_hash::HashMap<Vec<u8>, u32, Global> = blaze_hash::HashMap::new_in(Global); // alloc: a test's model
+        let mut model: blaze_hash::HashMap<Vec<u8>, u32, Global> =
+            blaze_hash::HashMap::new_in(Global); // alloc: a test's model
         let mut next = table.end();
         // Text, as the shape's restore checks: short names, numbered ones, long runs, digits.
         let value = |rng: &mut SplitMix64| -> Vec<u8> {
@@ -435,7 +457,11 @@ fn interning_agrees_with_a_map_model() {
                 }
             }
         };
-        let check = |table: &Table, model: &mut blaze_hash::HashMap<Vec<u8>, u32, Global>, next: &mut u32, bytes: Vec<u8>| { // alloc: a test's model
+        let check = |table: &Table,
+                     model: &mut blaze_hash::HashMap<Vec<u8>, u32, Global>,
+                     next: &mut u32,
+                     bytes: Vec<u8>| {
+            // alloc: a test's model
             let id = table.intern(&bytes);
             let expect = match model.get(&bytes) {
                 Some(&id) => id,
@@ -553,10 +579,14 @@ fn names_with_one_name_hash(n: usize) -> Vec<String> {
     const STATE: u64 = 0x0123_4567_89ab_cdef;
     // NAME_K's inverse mod 2^64, by Newton's iteration: each step doubles the bits that hold.
     let mut inverse = NAME_K;
-    (0..6).for_each(|_| inverse = inverse.wrapping_mul(2u64.wrapping_sub(NAME_K.wrapping_mul(inverse))));
+    (0..6).for_each(|_| {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(NAME_K.wrapping_mul(inverse)))
+    });
     assert_eq!(NAME_K.wrapping_mul(inverse), 1);
     let before = STATE.rotate_right(26).wrapping_mul(inverse);
-    let hex = |word: u64| -> [u8; 8] { std::array::from_fn(|at| b"0123456789abcdef"[(word >> (4 * at)) as usize & 15]) };
+    let hex = |word: u64| -> [u8; 8] {
+        std::array::from_fn(|at| b"0123456789abcdef"[(word >> (4 * at)) as usize & 15])
+    };
     let mut names = Vec::with_capacity(n);
     for tries in 0u64.. {
         if names.len() == n {
@@ -604,10 +634,16 @@ fn names_with_one_name_hash_take_bounded_probes() {
     }
     let found_in_image = probes::take();
     let bound = 16 * N as u64;
-    for (what, probes) in
-        [("interning", interned), ("finding", found), ("writing the index", written), ("finding in the image", found_in_image)]
-    {
-        assert!(probes <= bound, "{what} {N} names with one name_hash loaded {probes} control words, over {bound}");
+    for (what, probes) in [
+        ("interning", interned),
+        ("finding", found),
+        ("writing the index", written),
+        ("finding in the image", found_in_image),
+    ] {
+        assert!(
+            probes <= bound,
+            "{what} {N} names with one name_hash loaded {probes} control words, over {bound}"
+        );
     }
 }
 
@@ -644,15 +680,20 @@ fn a_parallel_restore_is_the_serial_one() {
         corrupt[section.at as usize + group * group_len + 17] ^= 0x40;
     }
     let serial_error = {
-        let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
+        let image: &'static Image<Vec<u8>> =
+            Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
         Table::restore(shape(), image, &section, &serial).err().unwrap()
     };
     for _ in 0..8 {
-        let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
+        let image: &'static Image<Vec<u8>> =
+            Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
         let error = Table::restore(shape(), image, &section, &four_threads).err().unwrap();
         assert_eq!(error, serial_error);
     }
-    assert!(matches!(serial_error, RestoreError::Corrupt(Corrupt { group: 3, .. })), "{serial_error}");
+    assert!(
+        matches!(serial_error, RestoreError::Corrupt(Corrupt { group: 3, .. })),
+        "{serial_error}"
+    );
 }
 
 /// Interning a value the table holds, finding it and reading it allocate nothing: from the
@@ -696,11 +737,16 @@ fn misses_allocate_nothing() {
     let table = Table::new(shape());
     table.intern(b"warm");
     let ids = blaze_alloc_count::assert_at_most(0, "interning new values", || {
-        (0..20_000u32).map(|n| table.intern(&n.to_le_bytes())).fold(0u64, |sum, id| sum + u64::from(id))
+        (0..20_000u32)
+            .map(|n| table.intern(&n.to_le_bytes()))
+            .fold(0u64, |sum, id| sum + u64::from(id))
     });
     assert!(ids > 0);
     for n in 0..20_000u32 {
-        assert_eq!(table.find(&n.to_le_bytes()).and_then(|id| table.get(id)), Some(&n.to_le_bytes()[..]));
+        assert_eq!(
+            table.find(&n.to_le_bytes()).and_then(|id| table.get(id)),
+            Some(&n.to_le_bytes()[..])
+        );
     }
 }
 

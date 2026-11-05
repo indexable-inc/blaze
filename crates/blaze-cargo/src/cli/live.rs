@@ -26,7 +26,11 @@
 
 #![cfg_attr(
     not(feature = "native"),
-    allow(dead_code, unused_imports, reason = "without `native`, only `wanted` and the refusing `drive` are reached")
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "without `native`, only `wanted` and the refusing `drive` are reached"
+    )
 )]
 
 use std::{
@@ -76,17 +80,30 @@ const ROWS: u16 = 8;
 /// is in the pipe by then, so only a process it started and left running, which inherited its
 /// stdout or stderr, holds the pipe open past this; the runner then stops reading and says so.
 const DRAIN: Duration = Duration::from_secs(2);
-const PLAIN_ARGS: [&str; 9] = ["--format", "--list", "--nocapture", "--no-capture", "--logfile", "-q", "--quiet", "-h", "--help"];
+const PLAIN_ARGS: [&str; 9] = [
+    "--format",
+    "--list",
+    "--nocapture",
+    "--no-capture",
+    "--logfile",
+    "-q",
+    "--quiet",
+    "-h",
+    "--help",
+];
 
 /// Whether `blaze test` draws its live view: a test run (not `--no-run`, `--reached`, a bench)
 /// whose stdout and stderr are terminals big enough, printed for a person (not JSON, `-q` or
-/// `-v`), with libtest's own output left as the view reads it, and not on CI ([`ci`]), whose
+/// `-v`), with libtest's own output left as the view reads it, and not on CI ([`blaze_units::lock::ci_says`]), whose
 /// workers may hand it a pseudo-terminal whose log is read as text.
 pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
     let plain_ui = std::env::var_os("BLAZE_UI").is_some_and(|it| it == "plain");
     let dumb = std::env::var_os("TERM").is_some_and(|it| it == "dumb");
     if asked.command() != Command::Test
-        || ci(|name| std::env::var_os(name))
+        || blaze_units::lock::ci_says(
+            std::env::var("CI").ok().as_deref(),
+            std::env::var("TF_BUILD").ok().as_deref(),
+        )
         || asked.flags.no_run
         || asked.flags.reached
         || asked.flags.ub
@@ -110,7 +127,8 @@ pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
 /// Whether the terminal is big enough for the view.
 #[cfg(feature = "native")]
 fn fits() -> bool {
-    ratatui::crossterm::terminal::size().is_ok_and(|(columns, rows)| columns >= COLUMNS && rows >= ROWS)
+    ratatui::crossterm::terminal::size()
+        .is_ok_and(|(columns, rows)| columns >= COLUMNS && rows >= ROWS)
 }
 
 /// Without `native` there is no terminal library to ask the size, and the view is what this run
@@ -136,14 +154,6 @@ pub fn drive<A: Api>(
     _started: Instant,
 ) -> io::Result<Then> {
     Err(io::Error::other(NO_TUI))
-}
-
-/// Whether this runs on CI: `CI` set to anything but empty, `0` or `false` (GitHub Actions,
-/// GitLab, Buildkite, CircleCI, Travis and most others set it), or `TF_BUILD` set (Azure
-/// Pipelines, which sets no `CI`).
-fn ci(var: impl Fn(&str) -> Option<OsString>) -> bool {
-    let ci = var("CI").is_some_and(|it| !(it.is_empty() || it == "0" || it.eq_ignore_ascii_case("false")));
-    ci || var("TF_BUILD").is_some_and(|it| !it.is_empty())
 }
 
 /// What the screen is sent: the view's events in the order they happened, then its end.
@@ -189,9 +199,9 @@ pub fn drive<A: Api>(
     signals::catch();
     let (to_screen, screen_gets) = unbounded::<Msg>();
     let (to_runner, runner_gets) = unbounded::<Run>();
-    let screen = thread::Builder::new()
-        .name("blaze test screen".into())
-        .spawn(move || Screen { terminal, view: TestView::new(paint), broken: false, started }.run(&screen_gets))?;
+    let screen = thread::Builder::new().name("blaze test screen".into()).spawn(move || {
+        Screen { terminal, view: TestView::new(paint), broken: false, started }.run(&screen_gets)
+    })?;
     let runner = {
         let to_screen = to_screen.clone();
         let to_runner = to_runner.clone();
@@ -199,22 +209,36 @@ pub fn drive<A: Api>(
         // "to rerun pass" always names the package: `-p calc --lib` reruns it in any workspace.
         let cores = blaze_core::cores::get().map_err(io::Error::other)?;
         let runner = Runner::new(asked, cores, to_screen, to_runner, true, shown.color);
-        thread::Builder::new().name("blaze test runner".into()).spawn(move || runner.run(&runner_gets))?
+        thread::Builder::new()
+            .name("blaze test runner".into())
+            .spawn(move || runner.run(&runner_gets))?
     };
 
     let (mut out, mut err) = (Above::new(to_screen.clone()), Above::new(to_screen.clone()));
     let mut printer = Printer::new(shown, &place.root, &mut out, &mut err);
+    printer.place(std::env::var("HOME").ok(), super::observe::last_failure());
     let mut failed_units: HashSet<u32, Global> = HashSet::default(); // alloc: one a command
     let mut unwritten = None;
     let view = |event: Event| {
         let _ = to_screen.send(Msg::View(event));
     };
     let called = api.call(request, |response, more| {
+        if let ResponseRef::Work(worked) = &response {
+            super::client_rows::heard(worked.build_id);
+        }
         let printed = match response {
             // The build row stands for cargo's `Compiling` lines.
             ResponseRef::Unit(_) => Ok(()),
             ResponseRef::UnitBegan(unit) => {
-                view(Event::UnitBegan { id: unit.id, label: unit_label(say::package_name(unit.package_id), unit.target.kind, unit.target.name, unit.test) });
+                view(Event::UnitBegan {
+                    id: unit.id,
+                    label: unit_label(
+                        say::package_name(unit.package_id),
+                        unit.target.kind,
+                        unit.target.name,
+                        unit.test,
+                    ),
+                });
                 Ok(())
             }
             ResponseRef::UnitEnded(unit) => {
@@ -229,6 +253,15 @@ pub fn drive<A: Api>(
                     view(Event::UnitFailed { id: unit.id });
                 }
                 printer.on(ResponseRef::Diagnostic(diagnostic))
+            }
+            ResponseRef::Report { unit, report } => {
+                if report.severity == blaze_api::Severity::Error
+                    && let Some(unit) = &unit
+                    && failed_units.insert(unit.id)
+                {
+                    view(Event::UnitFailed { id: unit.id });
+                }
+                printer.on(ResponseRef::Report { unit, report })
             }
             ResponseRef::TestReady(artifact) => {
                 let _ = to_runner.send(Run::Ready(artifact));
@@ -250,7 +283,9 @@ pub fn drive<A: Api>(
             // alloc: the error a build ends with, once
             let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
                 Some(Ok(died)) => format!("{error}: {died}"),
-                Some(Err(why)) => format!("{error}, and what came of the daemon is not known: {why:#}"),
+                Some(Err(why)) => {
+                    format!("{error}, and what came of the daemon is not known: {why:#}")
+                }
                 None => error.to_string(),
             };
             if let Err(error) = printer.err().write_all(say::error(&what, shown.color).as_bytes()) {
@@ -280,7 +315,9 @@ pub fn drive<A: Api>(
     let code = runner.join().unwrap_or(Exit::Failed.code());
     let _ = to_screen.send(Msg::Finish);
     drop(to_screen);
-    let shown = screen.join().map_err(|_| io::Error::other("the live test view's screen thread panicked"))?;
+    let shown = screen
+        .join()
+        .map_err(|_| io::Error::other("the live test view's screen thread panicked"))?;
     shown?;
     if let Some(error) = unwritten {
         return Err(error);
@@ -293,7 +330,10 @@ pub fn drive<A: Api>(
 fn open() -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
     let (_, rows) = ratatui::crossterm::terminal::size()?;
     let height = REGION.min(rows.saturating_sub(4)).max(3);
-    Terminal::with_options(CrosstermBackend::new(io::stderr()), TerminalOptions { viewport: Viewport::Inline(height) })
+    Terminal::with_options(
+        CrosstermBackend::new(io::stderr()),
+        TerminalOptions { viewport: Viewport::Inline(height) },
+    )
 }
 
 /// `calc lib test`, `calc test it`, `calc build script`: a unit as the build row names it.
@@ -413,7 +453,9 @@ impl Screen {
         self.broken = true;
         let _ = self.terminal.clear();
         let _ = self.terminal.show_cursor();
-        let said = format!("the live test view stopped drawing: {why}; the rest is printed as plain lines");
+        let said = format!(
+            "the live test view stopped drawing: {why}; the rest is printed as plain lines"
+        );
         eprint!("{}", say::error(&said, false));
     }
 
@@ -454,7 +496,10 @@ impl Screen {
 
 /// `lines` printed above the region, into the scrollback.
 #[cfg(feature = "native")]
-fn above(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>, lines: &[Line<'static>]) -> io::Result<()> {
+fn above(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    lines: &[Line<'static>],
+) -> io::Result<()> {
     // A chunk at most a screen's worth of rows, so no height overflows.
     for chunk in lines.chunks(256) {
         terminal.insert_before(chunk.len() as u16, |buf| {
@@ -566,7 +611,16 @@ impl Runner {
         color: bool,
     ) -> Runner {
         let told = std::env::var_os(RUST_TEST_THREADS).is_some();
-        Runner::of(asked.test_args(), asked.flags.fail_fast, cores, told, to_screen, to_runner, spec_flag, color)
+        Runner::of(
+            asked.test_args(),
+            asked.flags.fail_fast,
+            cores,
+            told,
+            to_screen,
+            to_runner,
+            spec_flag,
+            color,
+        )
     }
 
     /// `told`: whether the command's environment sets `RUST_TEST_THREADS` itself.
@@ -596,13 +650,13 @@ impl Runner {
             spec_flag,
             to_screen,
             to_runner,
-            binaries: Vec::new(),      // alloc: one a command
+            binaries: Vec::new(),     // alloc: one a command
             seen: HashSet::default(), // alloc: one a command
-            queued: Vec::new(),        // alloc: one a command
-            running: Vec::new(),       // alloc: one a command
+            queued: Vec::new(),       // alloc: one a command
+            running: Vec::new(),      // alloc: one a command
             slots,
             threads: (!told).then(|| cores.split(slots).get()),
-            failed: Vec::new(),        // alloc: one a command
+            failed: Vec::new(), // alloc: one a command
             stopping: false,
             build: None,
             color,
@@ -620,7 +674,12 @@ impl Runner {
                 return self.code();
             }
             // The first exited executable whose output is still open: its drain's deadline.
-            let deadline = self.running.iter().filter_map(|it| it.exited).min().map(|exited| exited + self.drain);
+            let deadline = self
+                .running
+                .iter()
+                .filter_map(|it| it.exited)
+                .min()
+                .map(|exited| exited + self.drain);
             let got = {
                 let _waiting = tracing::info_span!(
                     target: "blaze",
@@ -687,7 +746,8 @@ impl Runner {
         }
         let doc = artifact.kind == ArtifactKind::Doctest;
         let kind = if doc { Kind::Doctest } else { Kind::Test };
-        let (name, version) = (say::package_name(&artifact.package), say::package_version(&artifact.package));
+        let (name, version) =
+            (say::package_name(&artifact.package), say::package_version(&artifact.package));
         let rank = match artifact.target.kind {
             TargetKind::Lib => 0,
             TargetKind::Bin => 1,
@@ -698,7 +758,12 @@ impl Runner {
         };
         // cargo's: every unit test executable by package and target, then the doc tests.
         // alloc: one key and label an executable
-        let order = format!("{} {name} {version} {} {rank} {}", u8::from(doc), artifact.package, artifact.target.name);
+        let order = format!(
+            "{} {name} {version} {} {rank} {}",
+            u8::from(doc),
+            artifact.package,
+            artifact.target.name
+        );
         let label = match (doc, artifact.target.kind) {
             (true, _) => format!("{name} doctests"),
             (false, TargetKind::Lib) => format!("{name} lib"),
@@ -720,7 +785,11 @@ impl Runner {
     fn start(&mut self) {
         while !self.stopping && self.running.len() < self.slots && !self.queued.is_empty() {
             let at = (0..self.queued.len())
-                .min_by(|a, b| self.binaries[self.queued[*a] as usize].order.cmp(&self.binaries[self.queued[*b] as usize].order))
+                .min_by(|a, b| {
+                    self.binaries[self.queued[*a] as usize]
+                        .order
+                        .cmp(&self.binaries[self.queued[*b] as usize].order)
+                })
                 .unwrap_or(0);
             let binary = self.queued.remove(at);
             self.spawn(binary);
@@ -731,10 +800,15 @@ impl Runner {
         let it = &self.binaries[binary as usize];
         let mut args = self.args.clone();
         if it.json {
-            args.extend(["--format", "json", "-Z", "unstable-options", "--report-time"].map(OsString::from));
+            args.extend(
+                ["--format", "json", "-Z", "unstable-options", "--report-time"].map(OsString::from),
+            );
         }
-        let executable = PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
-        let root = std::path::Path::new(&it.artifact.manifest_path).parent().map_or_else(PathBuf::new, std::path::Path::to_owned);
+        let executable =
+            PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
+        let root = std::path::Path::new(&it.artifact.manifest_path)
+            .parent()
+            .map_or_else(PathBuf::new, std::path::Path::to_owned);
         let exec = Exec::of(&it.artifact, executable, args, root);
         let mut command = exec.command();
         if let Some(threads) = self.threads {
@@ -747,9 +821,14 @@ impl Runner {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let why = format!("could not execute process {} (never executed): {error}", exec.shown());
+                let why =
+                    format!("could not execute process {} (never executed): {error}", exec.shown());
                 let order = self.binaries[binary as usize].order.clone();
-                self.say(Event::BinaryEnded { binary, end: BinaryEnd::NeverRan { why }, output: String::new() });
+                self.say(Event::BinaryEnded {
+                    binary,
+                    end: BinaryEnd::NeverRan { why },
+                    output: String::new(),
+                });
                 self.failed(order, None, binary);
                 return;
             }
@@ -764,11 +843,12 @@ impl Runner {
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let captured = Arc::new(Mutex::new(Captured::default())); // alloc: one an executable run
         let read = {
-            let (to_screen, to_runner, captured) = (self.to_screen.clone(), self.to_runner.clone(), captured.clone());
+            let (to_screen, to_runner, captured) =
+                (self.to_screen.clone(), self.to_runner.clone(), captured.clone());
             let label = self.binaries[binary as usize].label.clone();
-            thread::Builder::new()
-                .name("blaze test output".into())
-                .spawn(move || read(binary, &label, json, stdout, stderr, &captured, &to_screen, &to_runner))
+            thread::Builder::new().name("blaze test output".into()).spawn(move || {
+                read(binary, &label, json, stdout, stderr, &captured, &to_screen, &to_runner)
+            })
         };
         // Its exit is waited for apart from its output: a process it started may hold its
         // pipes open long after it exited.
@@ -776,17 +856,25 @@ impl Runner {
             let to_runner = self.to_runner.clone();
             let label = self.binaries[binary as usize].label.clone();
             thread::Builder::new().name("blaze test wait".into()).spawn(move || {
-                let _waiting = tracing::info_span!(target: "blaze", "test.wait_exit", test = %label, pid).entered();
-                let waited = crate::raw::process::wait_exited(pid).map_err(|error| error.to_string());
+                let _waiting =
+                    tracing::info_span!(target: "blaze", "test.wait_exit", test = %label, pid)
+                        .entered();
+                let waited =
+                    crate::raw::process::wait_exited(pid).map_err(|error| error.to_string());
                 let _ = to_runner.send(Run::Exited { binary, waited });
             })
         });
         if let Err(error) = wait {
             let _ = child.kill();
             let _ = child.wait();
-            let why = format!("could not read the output of {} or wait for it: {error}", exec.shown());
+            let why =
+                format!("could not read the output of {} or wait for it: {error}", exec.shown());
             let order = self.binaries[binary as usize].order.clone();
-            self.say(Event::BinaryEnded { binary, end: BinaryEnd::NeverRan { why }, output: String::new() });
+            self.say(Event::BinaryEnded {
+                binary,
+                end: BinaryEnd::NeverRan { why },
+                output: String::new(),
+            });
             self.failed(order, None, binary);
             return;
         }
@@ -810,7 +898,8 @@ impl Runner {
                      stderr close, which a process it started and left running can hold off",
                     running.pid
                 );
-                let _ = self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
+                let _ =
+                    self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
             }
         }
     }
@@ -880,7 +969,11 @@ impl Runner {
             say::Ended::Code(code) => Some(code),
             say::Ended::Signal(_) => None,
         };
-        self.say(Event::BinaryEnded { binary, end: BinaryEnd::Failed { status: say::ended(ended) }, output });
+        self.say(Event::BinaryEnded {
+            binary,
+            end: BinaryEnd::Failed { status: say::ended(ended) },
+            output,
+        });
         self.failed(order, code, binary);
     }
 
@@ -921,7 +1014,8 @@ fn read(
     to_screen: &Sender<Msg>,
     to_runner: &Sender<Run>,
 ) {
-    let _reading = tracing::info_span!(target: "blaze", "test.read_output", test = %label).entered();
+    let _reading =
+        tracing::info_span!(target: "blaze", "test.read_output", test = %label).entered();
     let errors = stderr.map(|mut stderr| {
         let (captured, into) = (captured.clone(), captured.clone());
         let read = thread::Builder::new().name("blaze test stderr".into()).spawn(move || {
@@ -933,7 +1027,8 @@ fn read(
                     Ok(n) => captured.lock().err.extend_from_slice(&chunk[..n]),
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) => {
-                        let said = format!("\nblaze stopped reading this executable's stderr: {error}\n");
+                        let said =
+                            format!("\nblaze stopped reading this executable's stderr: {error}\n");
                         captured.lock().err.extend_from_slice(said.as_bytes());
                         return;
                     }
@@ -991,8 +1086,12 @@ fn said(binary: u32, line: &str) -> Option<Event> {
                 "failed" => Verdict::Failed,
                 _ => Verdict::Ignored,
             };
-            let took = value.get("exec_time").and_then(serde_json::Value::as_f64).and_then(|it| Duration::try_from_secs_f64(it).ok());
-            let mut output = value.get("stdout").and_then(|it| it.as_str()).unwrap_or_default().to_owned();
+            let took = value
+                .get("exec_time")
+                .and_then(serde_json::Value::as_f64)
+                .and_then(|it| Duration::try_from_secs_f64(it).ok());
+            let mut output =
+                value.get("stdout").and_then(|it| it.as_str()).unwrap_or_default().to_owned();
             if let Some(message) = value.get("message").and_then(|it| it.as_str())
                 && verdict == Verdict::Failed
             {
@@ -1007,26 +1106,12 @@ fn said(binary: u32, line: &str) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, time::Duration};
+    use std::time::Duration;
 
     use blaze_ui::test_view::{BinaryEnd, Event, Verdict};
     use crossbeam_channel::unbounded;
 
-    use super::{Msg, Run, Runner, ci, said};
-
-    #[test]
-    fn ci_is_told_by_its_variables() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| pairs.iter().find(|it| it.0 == name).map(|it| OsString::from(it.1))
-        };
-        assert!(ci(env(&[("CI", "true")])));
-        assert!(ci(env(&[("CI", "1")])));
-        assert!(ci(env(&[("TF_BUILD", "True")])));
-        assert!(!ci(env(&[])));
-        assert!(!ci(env(&[("CI", "false")])));
-        assert!(!ci(env(&[("CI", "0")])));
-        assert!(!ci(env(&[("CI", "")])));
-    }
+    use super::{Msg, Run, Runner, said};
 
     /// A test executable that starts a process which inherits its stdout and outlives it ends
     /// when it exits, its output read until then: the runner does not wait for the pipe to
@@ -1035,27 +1120,34 @@ mod tests {
     #[test]
     fn a_test_whose_child_outlives_it_ends_when_it_exits() {
         let dir = tempfile::tempdir().unwrap();
-        let mut artifact = crate::cli::run::tests::artifact("calc", "test", "it", true, Some("deps/it-0"));
+        let mut artifact =
+            crate::cli::run::tests::artifact("calc", "test", "it", true, Some("deps/it-0"));
         artifact.harness = false;
         artifact.manifest_path = dir.path().join("Cargo.toml").to_string_lossy().into_owned();
         // The executable is `sh`'s `$0`: the script starts a process holding its stdout, says
         // its pid, and exits 0.
-        artifact.runner = ["/bin/sh", "-c", "sleep 60 & echo \"child $!\""].map(str::to_owned).to_vec();
+        artifact.runner =
+            ["/bin/sh", "-c", "sleep 60 & echo \"child $!\""].map(str::to_owned).to_vec();
         let (to_screen, screen_gets) = unbounded::<Msg>();
         let (to_runner, runner_gets) = unbounded::<Run>();
         let one = std::num::NonZero::<usize>::MIN;
-        let cores = blaze_core::cores::Cores::resolve(blaze_core::cores::Setting::Exactly(one), one);
-        let mut runner = Runner::of(Vec::new(), true, cores, true, to_screen, to_runner.clone(), true, false);
+        let cores =
+            blaze_core::cores::Cores::resolve(blaze_core::cores::Setting::Exactly(one), one);
+        let mut runner =
+            Runner::of(Vec::new(), true, cores, true, to_screen, to_runner.clone(), true, false);
         runner.drain = Duration::from_millis(300);
         to_runner.send(Run::BuildOver { ok: true, artifacts: vec![artifact] }).unwrap();
         let (done, finished) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || done.send(runner.run(&runner_gets)));
         let code = finished.recv_timeout(Duration::from_secs(20));
 
-        let events: Vec<Event> = screen_gets.try_iter().filter_map(|msg| match msg {
-            Msg::View(event) => Some(event),
-            Msg::Finish => None,
-        }).collect();
+        let events: Vec<Event> = screen_gets
+            .try_iter()
+            .filter_map(|msg| match msg {
+                Msg::View(event) => Some(event),
+                Msg::Finish => None,
+            })
+            .collect();
         let output = events.iter().find_map(|event| match event {
             Event::BinaryEnded { end: BinaryEnd::Passed, output, .. } => Some(output.clone()),
             _ => None,
@@ -1074,8 +1166,13 @@ mod tests {
     fn libtest_json_becomes_the_views_events() {
         let started = said(3, r#"{ "type": "suite", "event": "started", "test_count": 2 }"#);
         assert!(matches!(started, Some(Event::SuiteTotal { binary: 3, tests: 2 })));
-        let failed = said(3, r#"{ "type": "test", "name": "a::b", "event": "failed", "exec_time": 0.25, "stdout": "boom\n" }"#);
-        let Some(Event::TestEnded { name, verdict, took, output, .. }) = failed else { panic!("{failed:?}") };
+        let failed = said(
+            3,
+            r#"{ "type": "test", "name": "a::b", "event": "failed", "exec_time": 0.25, "stdout": "boom\n" }"#,
+        );
+        let Some(Event::TestEnded { name, verdict, took, output, .. }) = failed else {
+            panic!("{failed:?}")
+        };
         assert_eq!((name.as_str(), verdict, output.as_str()), ("a::b", Verdict::Failed, "boom\n"));
         assert_eq!(took, Some(std::time::Duration::from_millis(250)));
         assert!(said(3, r#"{ "type": "suite", "event": "ok", "passed": 2 }"#).is_none());

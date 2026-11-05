@@ -15,14 +15,14 @@ pub(super) use outputs::macro_dir;
 use blaze_hash::hash_map::Entry;
 use std::path::Path;
 
+use blaze_hash::{HashMap, HashSet};
 use blaze_manifest::Config;
-use blaze_manifest::files::Files;
 use blaze_manifest::config::CompileKind;
+use blaze_manifest::files::Files;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::TargetKind;
 use blaze_resolve::PackageId;
-use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 
 use self::flags::KindInfo;
@@ -91,11 +91,20 @@ pub(crate) struct PlanOutput {
 }
 
 /// The rustflags of every unit for `triple` in a build for `target`.
-pub(crate) fn platform_rustflags<F: Files>(config: &Config<F>, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<String>, LoadError> {
+pub(crate) fn platform_rustflags<F: Files>(
+    config: &Config<F>,
+    triple: &str,
+    host: &str,
+    target: Option<&str>,
+) -> Result<Vec<String>, LoadError> {
     let kind = match target {
         Some(target) if target == triple => Some(triple),
         _ if triple == host => None,
-        _ => return Err(error(format!("a build for {target:?} on `{host}` has no units for `{triple}`"))),
+        _ => {
+            return Err(error(format!(
+                "a build for {target:?} on `{host}` has no units for `{triple}`"
+            )));
+        }
     };
     Ok(flags::kind_info(config, host, target, kind)?.rustflags)
 }
@@ -189,14 +198,19 @@ fn use_metadata<F: Files>(shared: &Shared<'_, F>, facts: &Facts<'_>) -> (bool, b
         if kind.is_custom_build() {
             return (false, true);
         }
-        if (kind.is_dylib() || kind.is_cdylib() || kind.is_executable()) && shared.default_lib_metadata.is_none() {
+        if (kind.is_dylib() || kind.is_cdylib() || kind.is_executable())
+            && shared.default_lib_metadata.is_none()
+        {
             return (false, true);
         }
         return (true, true);
     }
     let triple = shared.kinds[facts.kind].triple.as_str();
     let exe = kind.is_executable();
-    let named = kind.is_dylib() || kind.is_cdylib() || (exe && triple == "wasm32-unknown-emscripten") || (exe && triple.contains("msvc"));
+    let named = kind.is_dylib()
+        || kind.is_cdylib()
+        || (exe && triple == "wasm32-unknown-emscripten")
+        || (exe && triple.contains("msvc"));
     if named && facts.pkg.id.source_id().is_path() && shared.default_lib_metadata.is_none() {
         return (false, false);
     }
@@ -204,37 +218,45 @@ fn use_metadata<F: Files>(shared: &Shared<'_, F>, facts: &Facts<'_>) -> (bool, b
 }
 
 /// The target of the manifest a unit builds, for its `bin_name` and its kind.
-fn manifest_target<'a>(manifest: &'a Manifest, kind: &TargetKind, name: &str) -> Result<&'a blaze_manifest::targets::Target, LoadError> {
+fn manifest_target<'a>(
+    manifest: &'a Manifest,
+    kind: &TargetKind,
+    name: &str,
+) -> Result<&'a blaze_manifest::targets::Target, LoadError> {
     let same = |theirs: &TargetKind| match (kind, theirs) {
         (TargetKind::Lib(_), TargetKind::Lib(_))
         | (TargetKind::Bin, TargetKind::Bin)
         | (TargetKind::Test, TargetKind::Test)
         | (TargetKind::Bench, TargetKind::Bench)
-        | (TargetKind::ExampleLib(_) | TargetKind::ExampleBin, TargetKind::ExampleLib(_) | TargetKind::ExampleBin)
+        | (
+            TargetKind::ExampleLib(_) | TargetKind::ExampleBin,
+            TargetKind::ExampleLib(_) | TargetKind::ExampleBin,
+        )
         | (TargetKind::CustomBuild, TargetKind::CustomBuild) => true,
         _ => false,
     };
-    manifest
-        .targets
-        .iter()
-        .find(|it| it.name == name && same(&it.kind))
-        .ok_or_else(|| error(format!("`{}` has no {kind:?} target `{name}`", manifest.package_id.name)))
+    manifest.targets.iter().find(|it| it.name == name && same(&it.kind)).ok_or_else(|| {
+        error(format!("`{}` has no {kind:?} target `{name}`", manifest.package_id.name))
+    })
 }
 
 /// The configuration file clippy's driver finds for the package of `manifest_path`, with its
 /// text (`clippy_config::lookup_conf_file`): `.clippy.toml`, then `clippy.toml`, in
 /// `CLIPPY_CONF_DIR` (from the workspace's root, where cargo runs it, when relative) or the
 /// package's directory, then in each directory above.
-fn clippy_conf<F: Files>(input: &PlanInput<'_, F>, manifest_path: &Path) -> Result<Option<(String, String)>, LoadError> {
+fn clippy_conf<F: Files>(
+    input: &PlanInput<'_, F>,
+    manifest_path: &Path,
+) -> Result<Option<(String, String)>, LoadError> {
     const NAMES: [&str; 2] = [".clippy.toml", "clippy.toml"];
     let files = input.config.files();
     let start = match input.config.env("CLIPPY_CONF_DIR") {
         Some(dir) => input.ws_root.join(dir),
         None => manifest_path.parent().unwrap_or(manifest_path).to_owned(),
     };
-    let start = files
-        .canonicalize(&start)
-        .map_err(|why| error(format!("clippy's configuration is looked for from `{}`: {why}", start.display())))?;
+    let start = files.canonicalize(&start).map_err(|why| {
+        error(format!("clippy's configuration is looked for from `{}`: {why}", start.display()))
+    })?;
     for dir in start.ancestors() {
         for name in NAMES {
             let path = dir.join(name);
@@ -242,9 +264,12 @@ fn clippy_conf<F: Files>(input: &PlanInput<'_, F>, manifest_path: &Path) -> Resu
                 continue;
             }
             let shown = path.display().to_string();
-            let bytes = files.read(&path).map_err(|why| error(format!("error reading `{shown}`: {why}")))?;
-            let text = String::from_utf8(bytes.into_owned())
-                .map_err(|_| error(format!("error reading `{shown}`: stream did not contain valid UTF-8")))?;
+            let bytes = files
+                .read(&path)
+                .map_err(|why| error(format!("error reading `{shown}`: {why}")))?;
+            let text = String::from_utf8(bytes.into_owned()).map_err(|_| {
+                error(format!("error reading `{shown}`: stream did not contain valid UTF-8"))
+            })?;
             return Ok(Some((shown, text)));
         }
     }
@@ -254,18 +279,27 @@ fn clippy_conf<F: Files>(input: &PlanInput<'_, F>, manifest_path: &Path) -> Resu
 fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadError> {
     let units = input.units;
     if input.std_plans.len() != units.len() {
-        return Err(error(format!("{} standard library plans for {} units", input.std_plans.len(), units.len())));
+        return Err(error(format!(
+            "{} standard library plans for {} units",
+            input.std_plans.len(),
+            units.len()
+        )));
     }
     if let Some(root) = input.roots.iter().find(|&&at| at >= units.len()) {
         return Err(error(format!("the unit graph's root {root} is no unit")));
     }
     let config = input.config;
     let workspace_lints = flags::workspace_lints(input.ws_metadata, input.ws_manifest)?;
-    let lint_profile = flags::workspace_profile(input.ws_metadata, input.ws_manifest, input.ws_root)?;
+    let lint_profile =
+        flags::workspace_profile(input.ws_metadata, input.ws_manifest, input.ws_root)?;
 
     let wrapper = match config.env("RUSTC_WORKSPACE_WRAPPER") {
         Some(it) => !it.is_empty(),
-        None => config.build_config().map_err(|e| load_error(&e, None))?.rustc_workspace_wrapper.is_some(),
+        None => config
+            .build_config()
+            .map_err(|e| load_error(&e, None))?
+            .rustc_workspace_wrapper
+            .is_some(),
     };
     if wrapper && input.packages.values().any(|(_, package)| package.is_member) {
         return Err(error("blaze runs no rustc wrapper: `RUSTC_WORKSPACE_WRAPPER` (`build.rustc-workspace-wrapper`) is set".to_owned()));
@@ -277,7 +311,12 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     if let Some(target) = input.target {
         kinds.push(flags::kind_info(config, input.host, input.target, Some(target))?);
         kind_hashes.push(hash::kind_fingerprint_hash(Some(target))?);
-        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(target), input.profile_dir));
+        layouts.push(Layout::new(
+            input.target_dir,
+            input.build_dir,
+            Some(target),
+            input.profile_dir,
+        ));
     }
     let macro_kind = kinds.len();
     // It may be the target's triple (`--target wasm32-wasip1`): its hash and its directory
@@ -286,7 +325,12 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     if let Some(triple) = input.macro_wasm {
         kinds.push(flags::macro_wasm_info(triple)?);
         kind_hashes.push(hash::macro_kind_hash(triple)?);
-        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(&outputs::macro_dir(triple)), input.profile_dir));
+        layouts.push(Layout::new(
+            input.target_dir,
+            input.build_dir,
+            Some(&outputs::macro_dir(triple)),
+            input.profile_dir,
+        ));
     }
     if let Intent::Doc { open } = input.intent {
         flags::doc_unhonored(config, input.host, input.target, &kinds, open)?;
@@ -302,12 +346,19 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             runners.push(Vec::new());
             continue;
         }
-        let kind = if at == 0 { CompileKind::Host } else { CompileKind::Target(info.triple.clone()) };
-        let linker = config.target_linker(&kind, input.host, &info.cfgs).map_err(|e| load_error(&e, None))?;
+        let kind =
+            if at == 0 { CompileKind::Host } else { CompileKind::Target(info.triple.clone()) };
+        let linker = config
+            .target_linker(&kind, input.host, &info.cfgs)
+            .map_err(|e| load_error(&e, None))?;
         linkers.push(linker.map(|it| it.display().to_string()));
-        let runner = config.target_runner(&kind, input.host, &info.cfgs).map_err(|e| load_error(&e, None))?;
+        let runner = config
+            .target_runner(&kind, input.host, &info.cfgs)
+            .map_err(|e| load_error(&e, None))?;
         runners.push(match runner {
-            Some((program, args)) => std::iter::once(program.display().to_string()).chain(args).collect(),
+            Some((program, args)) => {
+                std::iter::once(program.display().to_string()).chain(args).collect()
+            }
             None => Vec::new(),
         });
     }
@@ -324,23 +375,27 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         input,
         kinds,
         kind_hashes,
-        rustc: RustcVersion::of(platform::rustc_version(), || platform::rustc_verbose_version(input.host))?,
+        rustc: RustcVersion::of(platform::rustc_version(), || {
+            platform::rustc_verbose_version(input.host)
+        })?,
         default_lib_metadata: config.env("__CARGO_DEFAULT_LIB_METADATA"),
         new_layout: config.env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT") != Some("1"),
     };
-    let stop_rlib_uplift = shared.rustc.is_nightly() && config.env("__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT") != Some("1");
+    let stop_rlib_uplift = shared.rustc.is_nightly()
+        && config.env("__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT") != Some("1");
 
     // What each unit planned here is, and the dependencies its hashes take.
     if u32::try_from(units.len()).is_err() {
         return Err(error(format!("{} units are more than a unit's index holds", units.len())));
     }
     let mut facts: Vec<Option<Facts<'_>>> = Vec::with_capacity(units.len());
-    let mut deps = Csr::with_capacity(units.len(), units.iter().map(|it| it.dependencies.len()).sum());
+    let mut deps =
+        Csr::with_capacity(units.len(), units.iter().map(|it| it.dependencies.len()).sum());
     for (at, unit) in units.iter().enumerate() {
         for dep in &unit.dependencies {
-            let to = units
-                .get(dep.index)
-                .ok_or_else(|| error(format!("unit {at} depends on unit {}, which there is not", dep.index)))?;
+            let to = units.get(dep.index).ok_or_else(|| {
+                error(format!("unit {at} depends on unit {}, which there is not", dep.index))
+            })?;
             if !to.is_std || unit.is_std || input.build_std {
                 deps.edges.push(dep.index as u32);
             }
@@ -350,10 +405,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             facts.push(None);
             continue;
         }
-        let (id, package) = input
-            .packages
-            .get(&unit.pkg_id)
-            .ok_or_else(|| error(format!("the unit graph's package `{}` is not in the resolve", unit.pkg_id)))?;
+        let (id, package) = input.packages.get(&unit.pkg_id).ok_or_else(|| {
+            error(format!("the unit graph's package `{}` is not in the resolve", unit.pkg_id))
+        })?;
         let (manifest_path, manifest) = *input
             .manifests
             .get(id)
@@ -375,7 +429,10 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         };
         let profile = HashedProfile::of(&unit.profile)?;
         if profile.trim_paths != TrimPaths::None {
-            return Err(error(format!("blaze does not trim paths (`trim-paths` of `{}`'s profile)", unit.pkg_id)));
+            return Err(error(format!(
+                "blaze does not trim paths (`trim-paths` of `{}`'s profile)",
+                unit.pkg_id
+            )));
         }
         facts.push(Some(Facts {
             unit,
@@ -390,7 +447,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     // `lto::generate`, over the units planned here.
     let mut lto_deps = Csr::with_capacity(units.len(), deps.edges.len());
     for at in 0..units.len() {
-        lto_deps.edges.extend(deps.of(at).iter().copied().filter(|&to| facts[to as usize].is_some()));
+        lto_deps
+            .edges
+            .extend(deps.of(at).iter().copied().filter(|&to| facts[to as usize].is_some()));
         lto_deps.close();
     }
     let mut lto_units: Vec<Option<LtoUnit<'_>>> = Vec::with_capacity(units.len());
@@ -409,7 +468,8 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for at in 0..units.len() {
         meta_of(&shared, &facts, &deps, &ltos, &mut metas, at, 0)?;
     }
-    let metas: Vec<Meta> = metas.into_iter().map(|it| it.expect("every unit's metadata is computed")).collect();
+    let metas: Vec<Meta> =
+        metas.into_iter().map(|it| it.expect("every unit's metadata is computed")).collect();
 
     // cargo's `pkg_dir` of each unit planned here.
     let mut pkg_dirs: Vec<String> = Vec::with_capacity(units.len());
@@ -460,10 +520,11 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             Entry::Vacant(slot) => {
                 let env = env::package_env(it.pkg.id, it.pkg.manifest, it.pkg.manifest_path)?;
                 // A package's units are all the standard library's or all not.
-                let (mut lints, lint_check_cfg) = match it.pkg.id.source_id().is_path() && !unit.is_std {
-                    true => flags::lints(it.pkg.manifest)?,
-                    false => (Vec::new(), Vec::new()),
-                };
+                let (mut lints, lint_check_cfg) =
+                    match it.pkg.id.source_id().is_path() && !unit.is_std {
+                        true => flags::lints(it.pkg.manifest)?,
+                        false => (Vec::new(), Vec::new()),
+                    };
                 if it.pkg.is_member && !unit.is_std {
                     lints.splice(0..0, workspace_lints.iter().cloned());
                 }
@@ -527,7 +588,8 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         let crate_name = unit.target.name.replace('-', "_");
         // clone: each plan owns its flags (`UnitPlan`), made once per package. A library's
         // `[lints]` are its own code's: rustdoc builds none of its examples with them.
-        let lints = if it.mode == CompileMode::Doctest { Vec::new() } else { package.lints.clone() };
+        let lints =
+            if it.mode == CompileMode::Doctest { Vec::new() } else { package.lints.clone() };
         let check_cfg = package.check_cfg.clone();
 
         let out_dir = unit
@@ -541,7 +603,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             for bin in it.pkg.manifest.targets.iter().filter(|it| it.is_bin()) {
                 let name = bin.bin_name.as_deref().unwrap_or(&bin.name);
                 let path = if artifact_dir {
-                    outputs::bin_link(layout, &info.triple, &bin.name, bin.bin_name.as_deref())?.display().to_string()
+                    outputs::bin_link(layout, &info.triple, &bin.name, bin.bin_name.as_deref())?
+                        .display()
+                        .to_string()
                 } else {
                     format!("placeholder:{name}")
                 };
@@ -552,7 +616,10 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             env::CompileEnv {
                 package: package_env,
                 crate_name: &crate_name,
-                bin_name: it.target_kind.is_executable().then(|| target.bin_name.as_deref().unwrap_or(&target.name)),
+                bin_name: it
+                    .target_kind
+                    .is_executable()
+                    .then(|| target.bin_name.as_deref().unwrap_or(&target.name)),
                 tmpdir: test_or_bench.then(|| layout.tmp().display().to_string()),
                 out_dir,
                 bin_exes,
@@ -580,7 +647,12 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         })?;
 
         let name = it.pkg.id.name();
-        let rustflags = flags::unit_rustflags(&unit.profile.rustflags, &unit.profile.panic, name.as_str(), &info.rustflags)?;
+        let rustflags = flags::unit_rustflags(
+            &unit.profile.rustflags,
+            &unit.profile.panic,
+            name.as_str(),
+            &info.rustflags,
+        )?;
         let mut cfgs = flags::cfgs(&unit.profile.rustflags, &unit.features, &info.rustflags);
         // As cargo-clippy wraps the workspace's rustc (`RUSTC_WORKSPACE_WRAPPER`): the
         // workspace's crates, not the registry's.
@@ -588,7 +660,10 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             true => {
                 cfgs.push("clippy".to_owned());
                 // clone: the workspace's profile keys, once per member unit linted
-                Some(Clippy { conf: clippy_conf(input, it.pkg.manifest_path)?, profile: lint_profile.clone() })
+                Some(Clippy {
+                    conf: clippy_conf(input, it.pkg.manifest_path)?,
+                    profile: lint_profile.clone(),
+                })
             }
             false => None,
         };
@@ -617,8 +692,47 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         }));
     }
 
+    one_unit_per_path(units, &plans)?;
     let base = input.base_profile;
-    Ok(PlanOutput { plans, finished: finished(input.requested_profile, &base.opt_level, base.debuginfo.is_turned_on()) })
+    Ok(PlanOutput {
+        plans,
+        finished: finished(input.requested_profile, &base.opt_level, base.debuginfo.is_turned_on()),
+    })
+}
+
+/// One path, one unit: two units planned to write one file (a binary's or an example's copy in
+/// the profile's directory, a test's program in its `deps`, of two packages' targets of one
+/// name) are refused, naming both and the file, where cargo warns and the last to finish wins:
+/// what is there would hang on which unit was placed last.
+fn one_unit_per_path(units: &[Unit], plans: &[Option<UnitPlan>]) -> Result<(), LoadError> {
+    let count = plans.iter().flatten().map(|it| it.outputs.len()).sum();
+    // alloc: once per plan, a key per output path, dropped when checked
+    let mut owner: HashMap<&str, usize, Global> = HashMap::with_capacity_in(count, Global);
+    for (at, plan) in plans.iter().enumerate() {
+        let Some(plan) = plan else { continue };
+        for path in &plan.outputs {
+            match owner.entry(path.as_str()) {
+                Entry::Vacant(it) => {
+                    it.insert(at);
+                }
+                Entry::Occupied(it) if *it.get() == at => {}
+                Entry::Occupied(it) => {
+                    let (first, second) = (&units[*it.get()], &units[at]);
+                    return Err(error(format!(
+                        "`{}`'s {:?} target `{}` and `{}`'s {:?} target `{}` would both be placed at `{path}`, and one path is \
+                         one unit's [one-unit-per-path]: rename one of the targets, or build one package at a time",
+                        first.pkg_id,
+                        first.mode,
+                        first.target.name,
+                        second.pkg_id,
+                        second.mode,
+                        second.target.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The unit's `Metadata`, its dependencies' first.
@@ -637,7 +751,10 @@ fn meta_of<F: Files>(
     let input = shared.input;
     let unit = &input.units[at];
     if depth > input.units.len() {
-        return Err(error(format!("the unit graph has a cycle through `{}`'s `{}`", unit.pkg_id, unit.target.name)));
+        return Err(error(format!(
+            "the unit graph has a cycle through `{}`'s `{}`",
+            unit.pkg_id, unit.target.name
+        )));
     }
     let meta = match &facts[at] {
         None => {
@@ -651,10 +768,18 @@ fn meta_of<F: Files>(
                 dep_metas.push(meta_of(shared, facts, deps, ltos, metas, dep as usize, depth + 1)?);
             }
             let lto = ltos[at].as_ref().ok_or_else(|| {
-                error(format!("`{}`'s `{}` is reached from no root of the unit graph", unit.pkg_id, unit.target.name))
+                error(format!(
+                    "`{}`'s `{}` is reached from no root of the unit graph",
+                    unit.pkg_id, unit.target.name
+                ))
             })?;
             let root = if unit.is_std {
-                input.sysroot.ok_or_else(|| error(format!("`{}` is a standard library unit, and no sysroot was given", unit.pkg_id)))?
+                input.sysroot.ok_or_else(|| {
+                    error(format!(
+                        "`{}` is a standard library unit, and no sysroot was given",
+                        unit.pkg_id
+                    ))
+                })?
             } else {
                 input.ws_root
             };

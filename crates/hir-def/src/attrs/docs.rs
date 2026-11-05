@@ -12,14 +12,12 @@ use std::{
     ops::{ControlFlow, Range},
 };
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
-    AstId, ExpandTo, HirFileId, InFile, MacroCallId,
-    attrs::expand_cfg_attr_with_doc_comments_view,
-    mod_path::ModPath,
-    span_map::SpanMap,
+    AstId, ExpandTo, HirFileId, InFile, MacroCallId, attrs::expand_cfg_attr_with_doc_comments_view,
+    mod_path::ModPath, span_map::SpanMap,
 };
 use span::AstIdMap;
 use syntax::view::{self as ast, AstNode, HasAttrs, IsString};
@@ -556,9 +554,10 @@ fn get_horizontal_trim<'a>(
         ast::CommentShape::Block => {
             // Whatever happens, we skip the first line.
             // clone: a cursor
-            let skip = lines.clone().next().map_or(0, |l| {
-                if l.trim_start().starts_with('*') { 0 } else { 1 }
-            });
+            let skip = lines
+                .clone()
+                .next()
+                .map_or(0, |l| if l.trim_start().starts_with('*') { 0 } else { 1 });
             // The first and one past the last line from `skip` on that is not blank; both the
             // end when every one is blank, as rustc's two trims meet there.
             let (mut start, mut end) = (len, len);
@@ -926,11 +925,10 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use expect_test::expect;
     use hir_expand::InFile;
-    use syntax::view::{self as ast, AstNode, AstToken, block_may_start_with_inner_attr};
     use hir_expand::fixture;
+    use syntax::view::{self as ast, AstNode, AstToken, block_may_start_with_inner_attr};
     use thin_vec::ThinVec;
     use tt::{TextRange, TextSize};
-
 
     use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
 
@@ -1208,9 +1206,8 @@ mod tests {
         let fx = fixture::db("");
         let file_id = fx.only_file();
         let _db = fx.into_db();
-        let lines = [
-            "", " ", "  a", "\tb", " \t ü", "ü", "   日本", "x", "  ", " 🦀 c", "\t\td", "    e",
-        ];
+        let lines =
+            ["", " ", "  a", "\tb", " \t ü", "ü", "   日本", "x", "  ", " 🦀 c", "\t\td", "    e"];
         let kinds = [
             DocCommentKind::Sugared(ast::CommentShape::Line),
             DocCommentKind::Sugared(ast::CommentShape::Block),
@@ -1512,7 +1509,8 @@ mod tests {
                 let base = TextSize::new(3);
                 let kind = DocCommentKind::Sugared(shape);
                 docs.push_doc_lines(&doc, Some(base), kind, &mut Indent::default());
-                let mut want = Docs { docs: String::new(), docs_source_map: Vec::new(), ..docs.clone() };
+                let mut want =
+                    Docs { docs: String::new(), docs_source_map: Vec::new(), ..docs.clone() };
                 let mut indent = Indent::default();
                 for (line, offset) in reference_push_lines(&doc, shape) {
                     want.push_doc_line(line, Some(base + offset), kind, &mut indent);

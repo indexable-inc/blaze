@@ -17,20 +17,30 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Documented, Edited, FactRead, FetchVerb, Hot, Level, Rebuilt, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
-    Table, TargetKind, TestOutcome, TestResult, Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb,
-    Worked,
+    Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Ranked,
+    Reach, Rebuilt, Report, Response, Span, Status, Table, TargetKind, TestOutcome, TestResult,
+    Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb, Worked,
 };
 
 /// [`Response`], read where it lies.
 #[derive(Deserialize, Clone, Debug)]
 pub enum ResponseRef<'a> {
-    Committed { root: ContentId, rebased: bool },
+    Committed {
+        root: ContentId,
+        rebased: bool,
+    },
     Diagnostic(#[serde(borrow)] DiagnosticRef<'a>),
-    Built { members: u32, profile: String, artifacts: Vec<Artifact> },
+    Built {
+        members: u32,
+        profile: String,
+        artifacts: Vec<Artifact>,
+    },
     Unit(#[serde(borrow)] UnitStartedRef<'a>),
     UnitEnded(#[serde(borrow)] UnitOfRef<'a>),
-    Fetched { verb: FetchVerb, what: &'a str },
+    Fetched {
+        verb: FetchVerb,
+        what: &'a str,
+    },
     BuildScript(#[serde(borrow)] BuildScriptRanRef<'a>),
     Work(Worked),
     Unchecked(Unchecked),
@@ -42,12 +52,18 @@ pub enum ResponseRef<'a> {
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
         stdout: &'a [u8],
     },
-    Diff { changes: Vec<Change> },
+    Diff {
+        changes: Vec<Change>,
+    },
     Why(Why),
     Status(Status),
-    Done { ok: bool },
-    Error(#[serde(borrow)] ApiErrorRef<'a>),
-    Opened { root: ContentId },
+    Done {
+        ok: bool,
+    },
+    Error(ApiError),
+    Opened {
+        root: ContentId,
+    },
     Reached(Reach),
     Of {
         #[serde(borrow)]
@@ -55,13 +71,19 @@ pub enum ResponseRef<'a> {
         candidate: u32,
     },
     Ranked(Vec<Ranked>),
-    Verified { mismatches: Vec<Mismatch> },
-    Snapshotted { heads: Vec<(String, ContentId)> },
+    Verified {
+        mismatches: Vec<Mismatch>,
+    },
+    Snapshotted {
+        heads: Vec<(String, ContentId)>,
+    },
     CodegenInputs(Vec<(ContentId, ContentId)>),
     Trace(Vec<Traced>),
     Tables(Vec<Table>),
     Edited(Edited),
-    Announced { root: ContentId },
+    Announced {
+        root: ContentId,
+    },
     Memory(Memory),
     Packed {
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
@@ -73,24 +95,42 @@ pub enum ResponseRef<'a> {
         path: &'a str,
     },
     Documented(Documented),
-    Explored { link: &'a str },
+    Explored {
+        link: &'a str,
+    },
     Profiled {
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
         trace: &'a [u8],
     },
     Live(#[serde(borrow)] LiveFrameRef<'a>),
-    Queried {
-        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
-        ipc: &'a [u8],
-        rows: u64,
+    Flushed {
+        seq: u64,
     },
     Hot(Hot),
-    Collected { report: &'a str },
+    Collected {
+        report: &'a str,
+    },
     UnitBegan(#[serde(borrow)] UnitOfRef<'a>),
     TestReady(Artifact),
     Rebuilt(Rebuilt),
-    Launched { live: bool, env: Vec<(String, String)> },
-    Stopping { doing: &'a str },
+    Launched {
+        live: bool,
+        env: Vec<(String, String)>,
+    },
+    Stopping {
+        doing: &'a str,
+    },
+    Stored {
+        #[serde(borrow)]
+        path: Option<&'a str>,
+        blake3: &'a str,
+    },
+    /// Rare (a failure's): its report is read owned.
+    Report {
+        #[serde(borrow)]
+        unit: Option<UnitOfRef<'a>>,
+        report: Report,
+    },
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -258,14 +298,6 @@ pub enum BasisRef<'a> {
     Reached { why: &'a str },
 }
 
-/// [`ApiError`], read where it lies.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ApiErrorRef<'a> {
-    #[serde(borrow)]
-    pub at: Option<&'a str>,
-    pub what: &'a str,
-}
-
 /// `text`, owned: every `into_owned` below allocates only through these four, for a response
 /// kept past its frame (another request's, a result held to the end); the path that prints
 /// reads in place.
@@ -291,7 +323,9 @@ impl ResponseRef<'_> {
         match self {
             ResponseRef::Committed { root, rebased } => Response::Committed { root, rebased },
             ResponseRef::Diagnostic(it) => Response::Diagnostic(it.into_owned()),
-            ResponseRef::Built { members, profile, artifacts } => Response::Built { members, profile, artifacts },
+            ResponseRef::Built { members, profile, artifacts } => {
+                Response::Built { members, profile, artifacts }
+            }
             ResponseRef::Unit(it) => Response::Unit(it.into_owned()),
             ResponseRef::UnitEnded(it) => Response::UnitEnded(it.into_owned()),
             ResponseRef::Fetched { verb, what } => Response::Fetched { verb, what: owned(what) },
@@ -306,7 +340,7 @@ impl ResponseRef<'_> {
             ResponseRef::Why(it) => Response::Why(it),
             ResponseRef::Status(it) => Response::Status(it),
             ResponseRef::Done { ok } => Response::Done { ok },
-            ResponseRef::Error(it) => Response::Error(it.into_owned()),
+            ResponseRef::Error(it) => Response::Error(it),
             ResponseRef::Opened { root } => Response::Opened { root },
             ResponseRef::Reached(it) => Response::Reached(it),
             ResponseRef::Of { response, candidate } => {
@@ -323,12 +357,14 @@ impl ResponseRef<'_> {
             ResponseRef::Announced { root } => Response::Announced { root },
             ResponseRef::Memory(it) => Response::Memory(it),
             ResponseRef::Packed { pack } => Response::Packed { pack: bytes(pack) },
-            ResponseRef::DocPage { path, page } => Response::DocPage { path: owned(path), page: bytes(page) },
+            ResponseRef::DocPage { path, page } => {
+                Response::DocPage { path: owned(path), page: bytes(page) }
+            }
             ResponseRef::Documented(it) => Response::Documented(it),
             ResponseRef::Explored { link } => Response::Explored { link: owned(link) },
             ResponseRef::Profiled { trace } => Response::Profiled { trace: bytes(trace) },
             ResponseRef::Live(it) => Response::Live(it.into_owned()),
-            ResponseRef::Queried { ipc, rows } => Response::Queried { ipc: bytes(ipc), rows },
+            ResponseRef::Flushed { seq } => Response::Flushed { seq },
             ResponseRef::Hot(it) => Response::Hot(it),
             ResponseRef::Collected { report } => Response::Collected { report: owned(report) },
             ResponseRef::UnitBegan(it) => Response::UnitBegan(it.into_owned()),
@@ -336,6 +372,12 @@ impl ResponseRef<'_> {
             ResponseRef::Rebuilt(it) => Response::Rebuilt(it),
             ResponseRef::Launched { live, env } => Response::Launched { live, env },
             ResponseRef::Stopping { doing } => Response::Stopping { doing: owned(doing) },
+            ResponseRef::Stored { path, blake3 } => {
+                Response::Stored { path: maybe(path), blake3: owned(blake3) }
+            }
+            ResponseRef::Report { unit, report } => {
+                Response::Report { unit: unit.map(UnitOfRef::into_owned), report }
+            }
         }
     }
 }
@@ -456,12 +498,6 @@ impl CachedRef<'_> {
             BasisRef::Reached { why } => Basis::Reached { why: owned(why) },
         };
         Cached { basis, millis: self.millis, outcome: self.outcome }
-    }
-}
-
-impl ApiErrorRef<'_> {
-    pub fn into_owned(self) -> ApiError {
-        ApiError { at: maybe(self.at), what: owned(self.what) }
     }
 }
 

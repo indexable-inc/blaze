@@ -14,8 +14,21 @@ use serde_state::{DeserializeState, SerializeState};
 use crate::{ast::*, impl_from_enum};
 
 /// The index of a binder, counting from the innermost. See [`DeBruijnVar`] for details.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde(transparent)]
 #[cfg_attr(feature = "charon_on_charon", charon::transparent)]
 pub struct DeBruijnId {
@@ -60,8 +73,21 @@ impl DeBruijnId {
 ///                                      |                            |
 ///                                  Bound(0, c)                 Bound(1, c)
 /// ```
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum DeBruijnVar<Id> {
     /// A variable attached to the nth binder, counting from the innermost.
     Bound(#[serde_state(stateless)] DeBruijnId, Id),
@@ -83,8 +109,21 @@ generate_index_type!(TraitClauseId, "TraitClause");
 generate_index_type!(TraitTypeConstraintId, "TraitTypeConstraint");
 
 /// The variance of a lifetime or type parameter.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum Variance {
     Covariant,
     Invariant,
@@ -111,8 +150,20 @@ impl Variance {
 }
 
 /// A type variable in a signature or binder.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct TypeParam {
     /// Index identifying the variable among other variables bound at the same level.
     pub index: TypeVarId,
@@ -123,8 +174,20 @@ pub struct TypeParam {
 }
 
 /// A region variable in a signature or binder.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct RegionParam {
     /// Index identifying the variable among other variables bound at the same level.
     pub index: RegionId,
@@ -143,9 +206,9 @@ pub struct RegionParam {
 
 /// The nature of locations where a given lifetime parameter is used. If this lifetime ever flows
 /// to be used as the lifetime of a mutable reference `&'a mut` then we consider it mutable.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumAsInner, Serialize, Deserialize,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Lt"))]
 pub enum LifetimeMutability {
     /// A lifetime that is used for a mutable reference.
@@ -157,8 +220,20 @@ pub enum LifetimeMutability {
 }
 
 /// A const generic variable in a signature or binder.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct ConstGenericParam {
     /// Index identifying the variable among other variables bound at the same level.
     pub index: ConstGenericVarId,
@@ -170,8 +245,7 @@ pub struct ConstGenericParam {
 
 /// A trait predicate in a signature, of the form `Type: Trait<Args>`. This functions like a
 /// variable binder, to which variables of the form `TraitRefKind::Clause` can refer to.
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 pub struct TraitParam {
     /// Index identifying the clause among other clauses bound at the same level.
     pub clause_id: TraitClauseId,
@@ -185,8 +259,20 @@ pub struct TraitParam {
 }
 
 /// Where a given predicate came from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum PredicateOrigin {
     // Note: we use this for globals too, but that's only available with an unstable feature.
     // ```
@@ -234,23 +320,13 @@ pub enum PredicateOrigin {
 
 impl TypeParam {
     pub fn new(index: TypeVarId, name: String, variance: Variance) -> Self {
-        Self {
-            index,
-            name,
-            variance,
-        }
+        Self { index, name, variance }
     }
 }
 
 impl RegionParam {
     pub fn new(index: RegionId, name: Option<String>, variance: Variance) -> Self {
-        Self {
-            index,
-            name,
-            variance,
-            mutability: LifetimeMutability::Unknown,
-            late_bound: false,
-        }
+        Self { index, name, variance, mutability: LifetimeMutability::Unknown, late_bound: false }
     }
 }
 
@@ -269,20 +345,12 @@ impl TraitParam {
     /// Like `identity_tref` but uses variables bound at the given depth.
     pub fn identity_tref_at_depth(&self, depth: DeBruijnId) -> PolyTraitRef {
         let regions = self.trait_.identity_region_args();
-        PolyTraitRef(
-            self.trait_
-                .clone()
-                .move_under_binders(depth)
-                .map(|trait_decl_ref| {
-                    TraitRef::new(
-                        TraitRefKind::Clause(
-                            DeBruijnVar::bound(depth.incr(), self.clause_id),
-                            regions,
-                        ),
-                        trait_decl_ref,
-                    )
-                }),
-        )
+        PolyTraitRef(self.trait_.clone().move_under_binders(depth).map(|trait_decl_ref| {
+            TraitRef::new(
+                TraitRefKind::Clause(DeBruijnVar::bound(depth.incr(), self.clause_id), regions),
+                trait_decl_ref,
+            )
+        }))
     }
 }
 
@@ -346,27 +414,19 @@ impl DeBruijnId {
     }
 
     pub fn incr(&self) -> Self {
-        DeBruijnId {
-            index: self.index + 1,
-        }
+        DeBruijnId { index: self.index + 1 }
     }
 
     pub fn decr(&self) -> Self {
-        DeBruijnId {
-            index: self.index - 1,
-        }
+        DeBruijnId { index: self.index - 1 }
     }
 
     pub fn plus(&self, delta: Self) -> Self {
-        DeBruijnId {
-            index: self.index + delta.index,
-        }
+        DeBruijnId { index: self.index + delta.index }
     }
 
     pub fn sub(&self, delta: Self) -> Option<Self> {
-        Some(DeBruijnId {
-            index: self.index.checked_sub(delta.index)?,
-        })
+        Some(DeBruijnId { index: self.index.checked_sub(delta.index)? })
     }
 }
 
@@ -528,8 +588,7 @@ impl<T> BinderSlice<T> {
         Inner: HasIdxVecOf<Id> + 'a,
     {
         let (dbid, varid) = self.as_bound_var(var);
-        self.get(dbid)
-            .and_then(|x| x.borrow().get_idx_vec().get(varid))
+        self.get(dbid).and_then(|x| x.borrow().get_idx_vec().get(varid))
     }
     pub fn get_var_with_outermost_free<'a, Id: Idx, Inner>(
         &'a self,
@@ -540,8 +599,7 @@ impl<T> BinderSlice<T> {
         Inner: HasIdxVecOf<Id> + 'a,
     {
         let (dbid, varid) = self.as_bound_var_with_outermost_free(var);
-        self.get(dbid)
-            .and_then(|x| x.borrow().get_idx_vec().get(varid))
+        self.get(dbid).and_then(|x| x.borrow().get_idx_vec().get(varid))
     }
     pub fn get_mut(&mut self, id: DeBruijnId) -> Option<&mut T> {
         let index = self.real_index(id)?;
@@ -566,23 +624,17 @@ impl<T> BinderSlice<T> {
     pub fn iter_enumerated(
         &self,
     ) -> impl DoubleEndedIterator<Item = (DeBruijnId, &T)> + ExactSizeIterator {
-        self.iter()
-            .enumerate()
-            .map(|(i, x)| (DeBruijnId::new(i), x))
+        self.iter().enumerate().map(|(i, x)| (DeBruijnId::new(i), x))
     }
     /// Iterate over the binding levels, from the innermost (0) out.
     pub fn iter_mut_enumerated(
         &mut self,
     ) -> impl DoubleEndedIterator<Item = (DeBruijnId, &mut T)> + ExactSizeIterator {
-        self.iter_mut()
-            .enumerate()
-            .map(|(i, x)| (DeBruijnId::new(i), x))
+        self.iter_mut().enumerate().map(|(i, x)| (DeBruijnId::new(i), x))
     }
 
     pub fn map_ref<'a, U>(&'a self, f: impl FnMut(&'a T) -> U) -> BindingStack<U> {
-        BindingStack {
-            stack: self.0.iter().map(f).collect(),
-        }
+        BindingStack { stack: self.0.iter().map(f).collect() }
     }
 
     /// Find the outermost binder where the given `U` can be moved to.
@@ -627,9 +679,7 @@ impl<T> DerefMut for BindingStack<T> {
 
 impl<T> Default for BindingStack<T> {
     fn default() -> Self {
-        Self {
-            stack: Default::default(),
-        }
+        Self { stack: Default::default() }
     }
 }
 

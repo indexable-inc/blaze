@@ -125,12 +125,8 @@ impl FlatRoot {
         }
         // clone: once per part, the first time a cursor enters it
         let tree = Arc::clone(self.tree.part(at));
-        let part = FlatRoot {
-            rc: Cell::new(0),
-            tree,
-            file: Some((this, at)),
-            parts: RefCell::default(),
-        };
+        let part =
+            FlatRoot { rc: Cell::new(0), tree, file: Some((this, at)), parts: RefCell::default() };
         // alloc: once per part, the first time a cursor enters it
         let part = ptr::NonNull::from(Box::leak(Box::new(part)));
         self.parts.borrow_mut().insert(at, part);

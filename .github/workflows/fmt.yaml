@@ -1,10 +1,19 @@
 # Formatting, after the merge instead of before it: no check refuses a pull request for it. On
-# each push to main, `cargo fmt --all` (vendor/ too: the forks' rustfmt.toml files are read for
-# their code, and a fork's own edits are held to them like blaze's), and when that changes a
-# file, a commit `fmt` on main. The token that pushes is the one pgo.yaml's pin uses: the
-# ruleset on main refuses a push from the workflow's own token (docs/harness.md, "CI"). Its
-# push starts the train again, on the formatted commit, which is the newest; the run of this
-# workflow it starts finds nothing to format.
+# each push to main, `blaze fmt --all` (AGENTS.md rule blaze-builds-blaze: blaze's own formatter,
+# crates/blaze-fmt, in its process; no cargo, rustfmt or toolchain), with the release
+# .github/blaze-version names, as the other workflows build with. vendor/ is formatted too: the
+# forks' rustfmt.toml files are read for their code, and a fork's own edits are held to them like
+# blaze's. When that changes a file, a commit `fmt` on main. The token that pushes is the one
+# pgo.yaml's pin uses: the ruleset on main refuses a push from the workflow's own token
+# (docs/harness.md, "CI"). Its push starts the train again, on the formatted commit, which is
+# the newest; the run of this workflow it starts finds nothing to format.
+#
+# Style never turns this red: what blaze fmt changes is committed. It fails only when formatting
+# itself cannot run on a file (a `mod` whose file is missing, a parse error, a rustfmt.toml
+# option blaze fmt does not run), and then blaze fmt names each such file, all in one run, and
+# what it could format is still committed. It also fails, pushing nothing, when a second run
+# of blaze fmt changes the first's output: the formatter is not idempotent, and the file it
+# names is a blaze fmt bug.
 name: fmt
 on:
   push:
@@ -25,17 +34,36 @@ env:
 
 jobs:
   fmt:
-    name: cargo fmt
-    runs-on: ubuntu-24.04
+    name: blaze fmt
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
-      - uses: ./.github/actions/toolchain
-        with:
-          components: rustfmt
-      - run: cargo fmt --all
+      # The release .github/blaze-version names, as .github/actions/blaze installs it, but with no
+      # toolchain and no store: blaze fmt compiles nothing.
+      - name: blaze (the release .github/blaze-version names)
+        run: sh site/install.sh --version "$(cat .github/blaze-version)" --no-toolchain --verbose
+      - name: blaze fmt --all
+        id: fmt
+        continue-on-error: true
+        run: blaze fmt --all
+      # A second run changes nothing, or nothing is pushed: a formatter that moves its own output
+      # again commits `fmt` on every run, each push starting the next (it did on 2026-11-04, on an
+      # attribute inside a macro_rules! body). The first run's output is staged, so what the
+      # second run changes is the worktree's diff from it. The second run's exit status is the
+      # first's again (the step above and the last step report it), so it is not checked here.
+      - name: a second blaze fmt --all changes nothing
+        run: |
+          git add -u
+          blaze fmt --all || true
+          if ! git diff --quiet; then
+            echo "::error::blaze fmt is not idempotent: a second run changed $(git diff --name-only | paste -sd ' ' -); nothing is pushed"
+            git diff --stat
+            exit 1
+          fi
+          git reset -q
       - name: commit and push
         run: |
           git diff --quiet && { echo "formatted already"; exit 0; }
@@ -48,4 +76,11 @@ jobs:
             sleep $((attempt * 10))
           done
           echo "::error::main kept moving; five pushes of the fmt commit failed"
+          exit 1
+      # After the commit, so a file blaze fmt could not format keeps none of the others from
+      # being formatted; its log above names each file and the `mod` that points at it.
+      - name: formatting ran on every file
+        if: steps.fmt.outcome == 'failure'
+        run: |
+          echo "::error::blaze fmt --all could not format every file; its step's log names each one"
           exit 1

@@ -16,15 +16,19 @@
 
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use blaze_lower::Db;
+use std::alloc::Global;
 
 use super::{Job, answer_macros_built};
 use crate::serve::work::Failed;
 
 /// The facts of an item that differ from `old` to `new`, each with what it says.
-pub(crate) fn changed_facts(key: ItemKey, old: Option<&ItemHashes>, new: Option<&ItemHashes>) -> Vec<(Fact, String)> {
+pub(crate) fn changed_facts(
+    key: ItemKey,
+    old: Option<&ItemHashes>,
+    new: Option<&ItemHashes>,
+) -> Vec<(Fact, String)> {
     let mut facts = Vec::new();
     let kind = new.or(old).map(|it| it.kind);
     let added = old.is_none();
@@ -56,11 +60,18 @@ fn path(db: &Db, key: ItemKey) -> Option<String> {
 /// The execution table of the test binary unit `at` made, `done`, when it lists the tests its
 /// build listed, in order. Otherwise an error naming the binary (its package and target) and
 /// why it has none, as without it nothing says what its tests reach.
-fn table_of<'a>(from: &Job, at: usize, done: &'a super::compile::Made) -> Result<&'a blaze_codegen::ExecTable, Failed> {
+fn table_of<'a>(
+    from: &Job,
+    at: usize,
+    done: &'a super::compile::Made,
+) -> Result<&'a blaze_codegen::ExecTable, Failed> {
     // alloc: error path
     let binary = || match from.units().graph.units.get(at) {
         Some(unit) => match from.package(unit) {
-            Ok(package) => format!("test binary `{}` of package `{} {}`", unit.target.name, package.name, package.version),
+            Ok(package) => format!(
+                "test binary `{}` of package `{} {}`",
+                unit.target.name, package.name, package.version
+            ),
             Err(_) => format!("test binary `{}` of package `{}`", unit.target.name, unit.pkg_id),
         },
         None => format!("test binary of unit {at}"),
@@ -71,9 +82,18 @@ fn table_of<'a>(from: &Job, at: usize, done: &'a super::compile::Made) -> Result
             done.tests.len()
         ),
         Some(table) if table.tests.len() != done.tests.len() => {
-            format!("its execution table lists {} tests where its build lists {}", table.tests.len(), done.tests.len())
+            format!(
+                "its execution table lists {} tests where its build lists {}",
+                table.tests.len(),
+                done.tests.len()
+            )
         }
-        Some(table) => match table.tests.iter().zip(&done.tests).position(|(kept, listed)| kept.0 != listed.name) {
+        Some(table) => match table
+            .tests
+            .iter()
+            .zip(&done.tests)
+            .position(|(kept, listed)| kept.0 != listed.name)
+        {
             None => return Ok(table),
             Some(n) => format!(
                 "its execution table's test {n} is `{}` where its build lists `{}`",
@@ -109,7 +129,13 @@ pub(crate) fn reach(
         // A member crate's unit, by what it is in every view: its package, target and mode.
         let old_krate = from
             .graph
-            .find(&from.units().graph.units, &unit.pkg_id, &unit.target.name, &unit.target.kind, unit.mode)
+            .find(
+                &from.units().graph.units,
+                &unit.pkg_id,
+                &unit.target.name,
+                &unit.target.kind,
+                unit.mode,
+            )
             .and_then(|it| from.crates.krate(it as usize));
         if to.cancelled() {
             return Err(Failed::Again);
@@ -136,7 +162,9 @@ pub(crate) fn reach(
             if facts.is_empty() {
                 continue;
             }
-            let name = path(after, key).or_else(|| path(before, key)).unwrap_or_else(|| format!("{:?}", key.0));
+            let name = path(after, key)
+                .or_else(|| path(before, key))
+                .unwrap_or_else(|| format!("{:?}", key.0));
             if was.and_then(|it| it.code) != now.and_then(|it| it.code) {
                 if let Some(code) = was.and_then(|it| it.code) {
                     changed_code.insert(code);
@@ -147,7 +175,10 @@ pub(crate) fn reach(
             }
             items.push(ReachedItem {
                 path: name,
-                facts: facts.into_iter().map(|(fact, what)| FactRead { key: fact.key(), what }).collect(),
+                facts: facts
+                    .into_iter()
+                    .map(|(fact, what)| FactRead { key: fact.key(), what })
+                    .collect(),
             });
         }
     }
@@ -156,7 +187,8 @@ pub(crate) fn reach(
         if done.tests.is_empty() {
             continue;
         }
-        let _span = tracing::info_span!(target: "blaze", "test reach", tests = done.tests.len()).entered();
+        let _span =
+            tracing::info_span!(target: "blaze", "test reach", tests = done.tests.len()).entered();
         // Each test's reach is walked from its binary's table, stopping at the first change. A
         // binary without a table that lists its tests can't say what they reach: that is an
         // error naming it, never every test counted reached (no-fallback).

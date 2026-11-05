@@ -13,6 +13,10 @@
 //! copy. The asker's crate is not what the program runs: a `#![feature]`, a
 //! `#![recursion_limit]` or lang items of the asker's would describe a body no build makes,
 //! and a `#[no_mangle]` function would have two.
+//! Its code may still be compiled by each crate that uses it, as rustc compiles an
+//! `#[inline]` function there ([`compiled_by_user`]): then the code-generation settings
+//! (opt-level, overflow checks) are the user's, and so are its callees', asked for by the
+//! user's crate.
 //!
 //! A walk reads its crate only through the interner made of it (`DbInterner::new_with`):
 //! which impls it sees, its lang items, its recursion limit and the features the solver reads.
@@ -58,6 +62,10 @@
 //! - `dyn` calls and function pointers add nothing to what an instance names (a walk follows
 //!   them where the vtable or pointer is made), so a downstream impl behind a `dyn` of an
 //!   upstream trait changes the instance that makes the vtable, which names the type.
+//!   `Devirtualize` keeps this: it makes a `dyn` call direct only for a type whose crates the
+//!   body's crate loads ([`unloaded_crate`]). A direct call of a downstream type from an
+//!   upstream body would be an instance no crate that loads its crates stands for, so it
+//!   would stay in the upstream asker, which sees neither the type's crate nor its impls.
 //! - The callees of `I` are asked from `H`, and [`stands_for`] chains: `H'` for `H` and `H` for
 //!   `S` give `H'` for `S` (inclusion, equalities, and the crates between are covered by one
 //!   check or the other).
@@ -82,6 +90,11 @@ use rustc_type_ir::{
     inherent::IntoKind as _,
 };
 use smallvec::SmallVec;
+
+use crate::mir::{
+    dispatch::Body,
+    optimize::{shipped_cross_crate_inlinable, written_cross_crate_inlinable},
+};
 
 /// The environment an instance is worked out in, asked from `env`: its own crate's where it is
 /// not generic ([`own_crate`]), whatever `env` is; else its [`home`]'s, or `env` itself where
@@ -148,6 +161,22 @@ pub fn home(db: &Db, asker: Crate, code: Option<Crate>, args: GenericArgs<'_>) -
     home_over(db, asker, lowest)
 }
 
+/// The first crate `ty` names (each ADT's, foreign type's, function's, closure's, coroutine's
+/// and object trait's, as [`home`] reads an instance's arguments) that `krate` does not load
+/// ([`loaded_crates`]), if any. A body of `krate` that names such a type resolves what it does
+/// with it where that crate's types and impls are not seen: the module's argument holds only
+/// for a body that names crates its own loads, which every body Rust writes does and a
+/// rewrite (`Devirtualize`'s direct call) must keep.
+pub fn unloaded_crate(db: &Db, krate: Crate, ty: Ty<'_>) -> Option<Crate> {
+    let loaded = loaded_crates(db, krate);
+    frame::task(Tag::Mir, |frame| {
+        let mut named =
+            Named { db, crates: SmallVec::new(), seen: HashSet::new_in(frame), open: false };
+        ty.visit_with(&mut named);
+        named.crates.into_iter().find(|it| !loaded.contains(it))
+    })
+}
+
 /// Whether an instance with `args` is generic: an argument is not a lifetime. The one
 /// definition every reader uses (rule 26): one that is not, a function, closure or coroutine,
 /// is compiled once, in its own crate ([`own_crate`]); a generic one per instantiation.
@@ -160,6 +189,52 @@ pub fn is_generic(args: GenericArgs<'_>) -> bool {
 /// instance, and for a shim whose code its arguments say (`code` is `None`).
 pub fn own_crate(code: Option<Crate>, args: GenericArgs<'_>) -> Option<Crate> {
     code.filter(|_| !is_generic(args))
+}
+
+/// Whether rustc compiles the instance `body<args>` into each crate that uses it, rather than
+/// linking every user to one copy compiled in its own crate: the one rule of which crate's
+/// code-generation settings an instance takes (rule 26): the code generator compiles it for
+/// the crate that asks for it exactly when this holds (`HirFrontend::compiled_for`), under that
+/// crate's overflow checks (`overflow`'s module doc). Its MIR is
+/// still worked out in its own crate ([`own_crate`], [`env_of`]); only how that MIR becomes
+/// code is the user's.
+///
+/// rustc's rule, for an instance of another crate (`rustc_monomorphize/src/collector.rs`
+/// `should_codegen_locally`: not `is_reachable_non_generic`, which `symbol_export.rs` gives
+/// only to a function that is not `cross_crate_inlinable`, and no upstream copy):
+///
+/// - a generic instance (`Instance::upstream_monomorphization` reuses a dependency's copy only
+///   under `-Zshare-generics`, for one it happened to make; blaze compiles each for its user);
+/// - a closure or `async` block (`InstanceKind::requires_inline`: `DefPathData::Closure`);
+/// - a function that is `cross_crate_inlinable` (`rustc_mir_transform/src/
+///   cross_crate_inline.rs`): `#[inline]` in any form but `never`, an intrinsic's fallback
+///   body, `f16` or `f128` in its signature, never one named from outside the crate
+///   (`#[no_mangle]`, `#[export_name]`, `#[linkage]`, linked by name); else, inferred from the
+///   optimized body (a small leaf) where its crate was built optimized and not incremental.
+///   The standard library ships built so, and the inference is ported for its functions
+///   (`shipped_cross_crate_inlinable`). For a crate of the build it is not: cargo builds a
+///   member incrementally and a dev dependency unoptimized, where rustc infers nothing, and an
+///   optimized dependency's inferred answer changes only which unit's settings a small leaf
+///   is compiled under, which differ only under a per-package override.
+pub fn compiled_by_user(db: &Db, body: Body, args: GenericArgs<'_>) -> bool {
+    match written_compiled_by_user(db, body, args) {
+        Some(written) => written,
+        None => matches!(body, Body::Fn(func)
+            if func.krate(db).data(db).origin.is_lang() && shipped_cross_crate_inlinable(db, func)),
+    }
+}
+
+/// [`compiled_by_user`] where the instance's kind and its function's attributes and signature
+/// decide it, reading no body: `None` where rustc infers it from the optimized body, which it
+/// answers yes only for a small leaf, a function that calls nothing.
+fn written_compiled_by_user(db: &Db, body: Body, args: GenericArgs<'_>) -> Option<bool> {
+    if is_generic(args) {
+        return Some(true);
+    }
+    match body {
+        Body::Closure(_) | Body::Coroutine(_) | Body::CoroutineByMove(_) => Some(true),
+        Body::Fn(func) => written_cross_crate_inlinable(db, func),
+    }
 }
 
 /// [`home`] of an instance whose named crates are all loaded by `lowest`, one of them. What

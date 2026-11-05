@@ -14,7 +14,6 @@ use parking_lot::Mutex;
 
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_lint_defs::LintOptions;
 use blaze_mem::Frame;
@@ -23,6 +22,7 @@ use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use span::Edition;
+use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{
@@ -290,9 +290,10 @@ impl CrateOrigin {
     pub fn hash_into<'h>(&self, hasher: &'h mut Hasher) -> &'h mut Hasher {
         match self {
             CrateOrigin::Rustc { name } => hasher.update(&[0]).part(name.as_str().as_bytes()),
-            CrateOrigin::Local { repo, name } => {
-                hasher.update(&[1]).opt_part(repo.as_deref()).opt_part(name.as_ref().map(Symbol::as_str))
-            }
+            CrateOrigin::Local { repo, name } => hasher
+                .update(&[1])
+                .opt_part(repo.as_deref())
+                .opt_part(name.as_ref().map(Symbol::as_str)),
             CrateOrigin::Library { repo, name } => {
                 hasher.update(&[2]).opt_part(repo.as_deref()).part(name.as_str().as_bytes())
             }
@@ -637,8 +638,6 @@ pub struct ExtraCrateData {
     pub potential_cfg_options: Option<CfgOptions>,
     /// What it is built for, as cargo's units tell two builds of one package apart.
     pub built_for: BuiltFor,
-    /// Stable unit identities of the build-script runs this crate reads, in dependency order.
-    pub build_script_runs: Box<[String]>,
 }
 
 /// What a crate is built for: the host (a build without `--target`, or a build script and
@@ -662,7 +661,9 @@ pub struct BuiltFor {
 impl BuiltFor {
     /// What a crate's content ID and keys hash of it: the triple, or none, then the flag.
     pub fn hash_into<'h>(&self, hasher: &'h mut Hasher) -> &'h mut Hasher {
-        hasher.opt_part(self.platform.as_ref().map(Symbol::as_str)).update(&[u8::from(self.macro_wasm)])
+        hasher
+            .opt_part(self.platform.as_ref().map(Symbol::as_str))
+            .update(&[u8::from(self.macro_wasm)])
     }
 }
 
@@ -828,11 +829,17 @@ impl Crate {
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
     pub const DOMAIN: &'static str = "blaze v2 crate 6";
 
-    pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
+    pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db BuiltCrateData {
         self.data_field(db)
     }
 
-    pub fn extra_data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db ExtraCrateData {
+    pub fn extra_data<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db ExtraCrateData {
         self.extra_data_field(db)
     }
 
@@ -843,7 +850,10 @@ impl Crate {
         self.workspace_data_field(db)
     }
 
-    pub fn cfg_options<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db CfgOptions {
+    pub fn cfg_options<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db CfgOptions {
         self.cfg_options_field(db)
     }
 
@@ -855,7 +865,10 @@ impl Crate {
         self.content_field(db).id()
     }
 
-    pub fn lint_options<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db LintOptions {
+    pub fn lint_options<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db LintOptions {
         self.lint_options_field(db)
     }
 
@@ -882,7 +895,10 @@ impl Crate {
     /// [`rust_name`](Crate::rust_name), or for a crate with none the [`UnnamedCrate`] it is,
     /// by its content ID. Never the database's id, a number of one process, which would put
     /// that process into the keys and binaries a message is written into.
-    pub fn named<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> CrateNamed<'db> {
+    pub fn named<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> CrateNamed<'db> {
         CrateNamed(self.rust_name(db))
     }
 
@@ -902,9 +918,8 @@ impl Crate {
             let lints = LintOptions::default();
             let content =
                 Crate::content_of(&*db, root, &data, &extra, &workspace, &cfg, &env, &lints);
-            let krate = Crate::builder(data, extra, workspace, cfg, env, InputId(content))
-                .durability(durability)
-                .new(&*db);
+            let krate =
+                Crate::new(&*db, durability, data, extra, workspace, cfg, env, InputId(content));
             db.crates_map().lock().note(krate, root, true);
             db.set_crate_attr_files(krate, false, Some(durability));
             db.note(Note::Crates);
@@ -971,10 +986,11 @@ impl Crate {
         hasher.update(&(data.edition.number() as u64).to_le_bytes());
         content::len(&mut hasher, data.dependencies.len());
         for dep in &data.dependencies {
-            hasher
-                .id(&dep.crate_id.content(db))
-                .part(dep.name.as_str().as_bytes())
-                .update(&[dep.prelude as u8, dep.sysroot as u8, dep.private as u8]);
+            hasher.id(&dep.crate_id.content(db)).part(dep.name.as_str().as_bytes()).update(&[
+                dep.prelude as u8,
+                dep.sysroot as u8,
+                dep.private as u8,
+            ]);
         }
         data.origin.hash_into(&mut hasher);
         content::len(&mut hasher, data.crate_attrs.len());
@@ -996,10 +1012,7 @@ impl Crate {
             None => hasher.update(&[0]),
             Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
         };
-        content::len(&mut hasher, extra.build_script_runs.len());
-        for run in &extra.build_script_runs {
-            hasher.part(run.as_bytes());
-        }
+        extra.built_for.hash_into(&mut hasher);
         hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content());
         content::len(&mut hasher, lints.opts.len());
         for (lint, level) in &lints.opts {
@@ -1154,7 +1167,12 @@ fn transitive_loaded_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
             }
             deps.push(krate);
             worklist.extend(
-                krate.data(db).dependencies.iter().map(|dep| dep.crate_id).filter(|dep| !dep.loads_only_macros(db)),
+                krate
+                    .data(db)
+                    .dependencies
+                    .iter()
+                    .map(|dep| dep.crate_id)
+                    .filter(|dep| !dep.loads_only_macros(db)),
             );
         }
         Box::from(&deps[..]) // alloc: the memo's value at its size.
@@ -1312,7 +1330,10 @@ impl Walk<'_, '_> {
             false => UniqueCrateData {
                 root_file_id,
                 // alloc: a second crate on one root file is keyed by its data (setup).
-                disambiguator: Some(Box::new((built_data(krate, &deps), krate.cfg_options.to_hashable()))),
+                disambiguator: Some(Box::new((
+                    built_data(krate, &deps),
+                    krate.cfg_options.to_hashable(),
+                ))),
             },
         };
         let (input, changed) = match self.crates.by_data.get(&key) {
@@ -1404,7 +1425,9 @@ impl Walk<'_, '_> {
             &krate.env,
             &LintOptions::default(),
         );
-        let input = Crate::builder(
+        let input = Crate::new(
+            &*db,
+            Durability::MEDIUM,
             data,
             // clone: a new crate's fields (setup).
             krate.extra.clone(),
@@ -1415,9 +1438,7 @@ impl Walk<'_, '_> {
             // clone: a new crate's fields (setup).
             krate.env.clone(),
             InputId(content),
-        )
-        .durability(Durability::MEDIUM)
-        .new(&*db);
+        );
         let changed = self.crates.note(input, root, true);
         (input, changed)
     }
@@ -1529,8 +1550,10 @@ impl CrateGraphBuilder {
                 proc_macro_cwd,
             },
             extra: ExtraCrateData {
-                version, display_name, potential_cfg_options,
-                built_for: BuiltFor::default(), build_script_runs: Box::new([]),
+                version,
+                display_name,
+                potential_cfg_options,
+                built_for: BuiltFor::default(),
             },
             cfg_options,
             env,
@@ -1671,11 +1694,11 @@ impl CrateGraphBuilder {
     ) -> HashMap<CrateBuilderId, CrateBuilderId, Global> {
         // Sorting here is a bit pointless because the input is likely already sorted.
         // However, the overhead is small and it makes the `extend` method harder to misuse.
-        self.arena
-            .iter_mut()
-            .for_each(|(_, data)| {
-                radix::sort_by_key(&mut data.basic.dependencies, |dep| dep.crate_id.into_raw().into_u32())
-            });
+        self.arena.iter_mut().for_each(|(_, data)| {
+            radix::sort_by_key(&mut data.basic.dependencies, |dep| {
+                dep.crate_id.into_raw().into_u32()
+            })
+        });
 
         let m = self.arena.len();
         let topo = other.crates_in_topological_order();
@@ -1688,7 +1711,9 @@ impl CrateGraphBuilder {
                 .dependencies
                 .iter_mut()
                 .for_each(|dep| dep.crate_id = id_map[&dep.crate_id]);
-            radix::sort_by_key(&mut crate_data.basic.dependencies, |dep| dep.crate_id.into_raw().into_u32());
+            radix::sort_by_key(&mut crate_data.basic.dependencies, |dep| {
+                dep.crate_id.into_raw().into_u32()
+            });
 
             let find = self.arena.iter().take(m).find_map(|(k, v)| (v == crate_data).then_some(k));
             // clone: a crate of the graph being merged in (setup).

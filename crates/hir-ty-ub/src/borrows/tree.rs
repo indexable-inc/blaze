@@ -184,7 +184,11 @@ impl LocationState {
 
     /// Whether a foreign access can skip this node and its subtree. Miri:
     /// `LocationState::skip_if_known_noop`.
-    fn skip_if_known_noop(self, access_kind: AccessKind, rel_pos: AccessRelatedness) -> ContinueTraversal {
+    fn skip_if_known_noop(
+        self,
+        access_kind: AccessKind,
+        rel_pos: AccessRelatedness,
+    ) -> ContinueTraversal {
         if rel_pos.is_foreign() {
             let happening_now = IdempotentForeignAccess::from_foreign(access_kind);
             let mut new_access_noop =
@@ -449,7 +453,8 @@ impl Tree {
         assert!(outside_perm.is_initial());
         assert!(!outside_perm.is_unique());
 
-        let default_strongest_idempotent = outside_perm.strongest_idempotent_foreign_access(protected);
+        let default_strongest_idempotent =
+            outside_perm.strongest_idempotent_foreign_access(protected);
         self.nodes.insert(
             idx,
             parent_idx,
@@ -528,7 +533,14 @@ impl Tree {
         alloc_id: AllocId,
         span: SiteId,
     ) -> Result<(), AliasError> {
-        self.perform_access(prov, access_range, AccessKind::Write, AccessCause::Dealloc, alloc_id, span)?;
+        self.perform_access(
+            prov,
+            access_range,
+            AccessKind::Write,
+            AccessCause::Dealloc,
+            alloc_id,
+            span,
+        )?;
 
         let start_idx = prov.map(|tag| self.index_of(tag));
         let Tree { nodes, locations, roots, stack, .. } = self;
@@ -540,38 +552,37 @@ impl Tree {
                 access_range: Some(access_range),
                 access_cause: AccessCause::Dealloc,
             };
-            let mut check_tree = |idx: UniIndex| {
-                TreeVisitor { nodes: &mut *nodes, data: &mut *loc, stack: &mut *stack }
-                    .traverse_this_parents_children_other(
-                        idx,
-                        |_| ContinueTraversal::Recurse,
-                        |args: NodeAppArgs<'_, LocationTree>| {
-                            let perm = args
-                                .data
-                                .perms
-                                .get(args.idx)
-                                .copied()
-                                .unwrap_or_else(|| args.nodes.default_location_state(args.idx));
-                            // A `Cell` doesn't stop a deallocation (`unsafe_cell_deallocate`,
-                            // rust-lang/rust#55005), and only accessed locations are protected
-                            // (miri#4579), counting the write just done.
-                            if args.nodes.protector[args.idx.index()]
-                                == Some(ProtectorKind::StrongProtector)
-                                && !perm.permission().is_cell()
-                                && perm.accessed()
-                            {
-                                Err(build_error(
-                                    TransitionError::ProtectedDealloc,
-                                    &diagnostics,
-                                    &args.nodes.debug[args.idx.index()],
-                                    start_idx.map(|idx| &args.nodes.debug[idx.index()]),
-                                ))
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )
-            };
+            let mut check_tree =
+                |idx: UniIndex| {
+                    TreeVisitor { nodes: &mut *nodes, data: &mut *loc, stack: &mut *stack }
+                        .traverse_this_parents_children_other(
+                            idx,
+                            |_| ContinueTraversal::Recurse,
+                            |args: NodeAppArgs<'_, LocationTree>| {
+                                let perm =
+                                    args.data.perms.get(args.idx).copied().unwrap_or_else(|| {
+                                        args.nodes.default_location_state(args.idx)
+                                    });
+                                // A `Cell` doesn't stop a deallocation (`unsafe_cell_deallocate`,
+                                // rust-lang/rust#55005), and only accessed locations are protected
+                                // (miri#4579), counting the write just done.
+                                if args.nodes.protector[args.idx.index()]
+                                    == Some(ProtectorKind::StrongProtector)
+                                    && !perm.permission().is_cell()
+                                    && perm.accessed()
+                                {
+                                    Err(build_error(
+                                        TransitionError::ProtectedDealloc,
+                                        &diagnostics,
+                                        &args.nodes.debug[args.idx.index()],
+                                        start_idx.map(|idx| &args.nodes.debug[idx.index()]),
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                };
             // The accessed tag's own tree first, so the error names the closest tag; then the
             // others, last first, so no parent comes before its child.
             let accessed_root = start_idx.map(&mut check_tree).transpose()?;
@@ -812,7 +823,14 @@ impl LocationTree {
         min_exposed_child: Option<BorTag>,
     ) -> Result<(), AliasError> {
         let accessed_root = if let Some(idx) = access_source {
-            Some(self.perform_normal_access(idx, nodes, stack, access_kind, visit_children, diagnostics)?)
+            Some(self.perform_normal_access(
+                idx,
+                nodes,
+                stack,
+                access_kind,
+                visit_children,
+                diagnostics,
+            )?)
         } else {
             // Only a protector's end skips children, and it always has a tag.
             assert!(matches!(visit_children, ChildrenVisitMode::VisitChildrenOfAccessed));
@@ -923,7 +941,13 @@ impl LocationTree {
     ) -> Result<(), AliasError> {
         let get_relatedness = |idx: UniIndex, tag: BorTag, loc: &LocationTree| {
             let only_foreign = max_local_tag.is_some_and(|max_local_tag| max_local_tag < tag);
-            loc.exposed_cache.access_relatedness(root, idx, access_kind, is_wildcard_tree, only_foreign)
+            loc.exposed_cache.access_relatedness(
+                root,
+                idx,
+                access_kind,
+                is_wildcard_tree,
+                only_foreign,
+            )
         };
         let mut has_valid_exposed = false;
         TreeVisitor { data: self, nodes, stack }.traverse_children_this(
@@ -956,7 +980,10 @@ impl LocationTree {
                 let LocationTree { perms, exposed_cache } = args.data;
                 let perm = perms.or_insert(args.idx, default);
                 if args.nodes.is_exposed(args.idx)
-                    && perm.permission().strongest_allowed_local_access(protected).allows(access_kind)
+                    && perm
+                        .permission()
+                        .strongest_allowed_local_access(protected)
+                        .allows(access_kind)
                     && max_local_tag.is_none_or(|max_local_tag| max_local_tag >= tag)
                 {
                     has_valid_exposed = true;

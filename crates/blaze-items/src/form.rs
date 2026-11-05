@@ -21,7 +21,6 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{
     ContentId,
     bits::{self, Bits},
@@ -53,7 +52,7 @@ use hir_ty::{
         InternedOpaqueTyId,
     },
     intrinsic::{Intrinsic, intrinsic_of},
-    method_resolution::loaded_crates,
+    method_resolution::{loaded_crates, lookup_impl_const},
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlockId, LocalId, MirBody, MirLowerError,
         MirSpan, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace,
@@ -61,9 +60,10 @@ use hir_ty::{
     },
     next_solver::{
         AliasConstKind, Allocation, AssocTyId, Binder, BoundRegion, Clause, Const, ConstKind,
-        DbInterner,
-        FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term,
-        TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
+        DbInterner, FnSig, FreeConstAliasId, GenericArg, GenericArgs, ImplTraitIdx,
+        InherentAssocConstId, OpaqueTyIdWrapper, ParamEnv, Pattern, Region, StoredTy, Term, TermId,
+        TraitAssocConstId, TraitRef, Ty, TyKind, TypingMode, ValTree,
+        infer::DbInternerInferExt as _, references_non_lt_error,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
@@ -73,10 +73,11 @@ use rustc_abi::ReprOptions;
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
     ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesClause,
-    PatternKind, RegionKind, TermKind, TypeVisitableExt as _, ValTreeKind,
+    PatternKind, RegionKind, TermKind, TypeFlags, TypeVisitableExt as _, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -84,7 +85,7 @@ use crate::{
     key::{self, generic_def_item, item_key},
 };
 
-const DOMAIN: &str = "blaze v2 form 3";
+const DOMAIN: &str = "blaze v2 form 4";
 const SPANS_DOMAIN: &str = "blaze v2 form spans 1";
 
 /// Why a form is not of a program rustc accepts.
@@ -174,7 +175,9 @@ pub(crate) struct Sub {
 
 // The digest and `missed` (33 bytes) and a boxed slice, padded to a word: 56 bytes on a 64-bit
 // target.
-const _: () = assert!(size_of::<Sub>() == (33 + size_of::<Box<[ItemId]>>()).next_multiple_of(align_of::<usize>()));
+const _: () = assert!(
+    size_of::<Sub>() == (33 + size_of::<Box<[ItemId]>>()).next_multiple_of(align_of::<usize>())
+);
 
 /// A body's form and the hash of the positions (MirSpans) of its code, in order: read by what
 /// fills positions in, never by a hash of the item.
@@ -845,7 +848,10 @@ impl<'db> Cx<'db> {
     /// is written with what [`Cx::held`] reads of each coroutine in it, so after its own body
     /// this looks in the closures and coroutines those hidden types hold (an `async fn`'s
     /// future), where the item itself may have no body.
-    pub(crate) fn mir_lowering_error(&self, id: ItemId) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
+    pub(crate) fn mir_lowering_error(
+        &self,
+        id: ItemId,
+    ) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
         let db = self.db;
         let mut scratch = Form::quiet();
         let mut nested = Nests::default();
@@ -891,9 +897,9 @@ impl<'db> Cx<'db> {
             at += 1;
             let body = match next {
                 Nested::Closure(it) => db.mir_body_for_closure(it),
-                Nested::Coroutine(it) => {
-                    db.mir_body_for_coroutine(it).and_then(|body| db.runtime_mir_body_for_coroutine(it).map(|_| body))
-                }
+                Nested::Coroutine(it) => db
+                    .mir_body_for_coroutine(it)
+                    .and_then(|body| db.runtime_mir_body_for_coroutine(it).map(|_| body)),
             };
             match body {
                 Ok(body) => self.mir(scratch, body, nested),
@@ -920,7 +926,10 @@ impl<'db> Cx<'db> {
                 let mut first = |variant: VariantId, name: Option<&str>| {
                     let types = db.field_types(variant);
                     for (field, data) in variant.fields(db).fields().iter() {
-                        if types.get(field).is_none_or(|it| it.ty().skip_binder().references_error()) {
+                        if types
+                            .get(field)
+                            .is_none_or(|it| it.ty().skip_binder().references_error())
+                        {
                             let field = data.name.symbol().as_str();
                             _ = match name {
                                 Some(variant) => write!(said, "field `{variant}.{field}`"),
@@ -2835,7 +2844,9 @@ impl<'db> Cx<'db> {
         match c.number(local) {
             (_, true) => {
                 f.u8(0);
-                self.ty_in(f, c.body.locals[local].ty.as_ref());
+                let ty = c.body.locals[local].ty.as_ref();
+                self.ty_in(f, ty);
+                self.values(f, c, ty.into());
             }
             (number, false) => {
                 f.u8(1);
@@ -2898,6 +2909,7 @@ impl<'db> Cx<'db> {
                 f.u8(2);
                 self.konst(f, konst.as_ref());
                 self.ty_in(f, ty.as_ref());
+                self.values(f, c, konst.as_ref().into());
             }
             OperandKind::Allocation { allocation } => {
                 f.u8(3);
@@ -2976,6 +2988,75 @@ impl<'db> Cx<'db> {
         }
     }
 
+    /// What each constant in `arg` named by a path with no generic parameter left evaluates
+    /// to, in the order its walk meets them, as the code generator's `eval_named_const`
+    /// evaluates it into the compiled body: a trait's constant resolved to its impl's
+    /// (`lookup_impl_const`) in the body's crate, then evaluated.
+    ///
+    /// The constant's own form ([`Cx::konst`]) names the trait's constant and spells its
+    /// arguments by their interface hashes, which hold no name: two types alike but for their
+    /// name (every `impl_intern_key!` id of hir-def) are one spelling, yet each selects its own
+    /// impl and so its own value, which the body holds as data. Without this, the `get` of
+    /// `query_ids!(EnumVariantId, MacroRulesId)` reading `<$ty as Relocate>::KIND` (13 and 0)
+    /// were one code. The value, not the impl, so two bodies that read one value share their
+    /// code whatever type they read it of. A constant left generic is evaluated per instance,
+    /// whose arguments key it (`Instance::args`).
+    fn values(&self, f: &mut Form, c: &Canon<'_, 'db>, arg: GenericArg<'db>) {
+        // A signature form infers no body, and evaluating one would.
+        if f.quiet || self.leak_free || !arg.has_type_flags(TypeFlags::HAS_CONST_ALIAS) {
+            return;
+        }
+        let db = self.db;
+        let krate = c.body.owner.krate(db);
+        let at = f.len_at();
+        let mut count = 0;
+        for it in arg.walk() {
+            let GenericArgKind::Const(konst) = it.kind() else { continue };
+            let ConstKind::Alias(_, alias) = konst.kind() else { continue };
+            let args = alias.args;
+            if args.has_non_region_param()
+                || args.has_infer()
+                || args.has_placeholders()
+                || args.has_escaping_bound_vars()
+                || args.references_error()
+            {
+                continue;
+            }
+            count += 1;
+            let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
+            let (named, value) = match alias.kind {
+                AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+                | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+                | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
+                    let infcx =
+                        DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::Codegen);
+                    let (id, args) = lookup_impl_const(&infcx, env.param_env, id, args);
+                    (Some((id, args)), db.const_eval(id, args, Some(env)).ok())
+                }
+                AliasConstKind::Anon { def_id } => {
+                    (None, db.anon_const_eval(def_id.0, args, Some(env)).ok())
+                }
+                // The code generator refuses one in Self form after type check.
+                AliasConstKind::InherentSelf { .. } => (None, None),
+            };
+            match (value, named) {
+                (Some(value), _) => {
+                    f.u8(0);
+                    self.allocation(f, value);
+                }
+                // One that does not evaluate: the code generator refuses the body, so it is
+                // spelled by the constant it resolves to, which no value can be mistaken for.
+                (None, Some((id, args))) => {
+                    f.u8(1);
+                    f.item(ItemId::Const(id));
+                    self.args(f, args);
+                }
+                (None, None) => f.u8(2),
+            }
+        }
+        f.set_len(at, count);
+    }
+
     fn operands(&self, f: &mut Form, c: &Canon<'_, 'db>, operands: &[Operand]) {
         f.len(operands.len());
         for operand in operands {
@@ -2993,6 +3074,7 @@ impl<'db> Cx<'db> {
                 f.u8(1);
                 self.operand(f, c, operand);
                 self.konst(f, len.as_ref());
+                self.values(f, c, len.as_ref().into());
             }
             Rvalue::Ref(kind, place) => {
                 f.u8(2);
@@ -3340,10 +3422,7 @@ enum Named {
 pub fn observes_names(db: &Db, func: FunctionId) -> bool {
     // A call of an unknown intrinsic is refused when it is lowered; keying it on the names
     // as well misses no input.
-    matches!(
-        intrinsic_of(db, func),
-        Ok(Some(Intrinsic::TypeName | Intrinsic::TypeId)) | Err(_)
-    )
+    matches!(intrinsic_of(db, func), Ok(Some(Intrinsic::TypeName | Intrinsic::TypeId)) | Err(_))
 }
 
 fn same_kind(a: AssocItemId, b: AssocItemId) -> bool {
@@ -3383,21 +3462,11 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
         ItemId::Function(it) => AssocItemId::FunctionId(it).assoc_visibility(db),
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),
         ItemId::Alias(it) => AssocItemId::TypeAliasId(it).assoc_visibility(db),
-        ItemId::Static(it) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::StructId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::EnumId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Adt(AdtId::UnionId(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
-        ItemId::Trait(it) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
+        ItemId::Static(it) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::StructId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::EnumId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Adt(AdtId::UnionId(it)) => written_visibility(db, it, it.lookup(db).id),
+        ItemId::Trait(it) => written_visibility(db, it, it.lookup(db).id),
         // An impl is wherever its types and trait are.
         ItemId::Impl(_) => Visibility::Public,
         // A `macro_rules!` is in scope by text below it, or everywhere once exported.
@@ -3408,9 +3477,7 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
                 Visibility::PubCrate(it.krate(db))
             }
         }
-        ItemId::Macro(MacroId::Macro2Id(it)) => {
-            written_visibility(db, it, it.lookup(db).id)
-        }
+        ItemId::Macro(MacroId::Macro2Id(it)) => written_visibility(db, it, it.lookup(db).id),
         ItemId::Macro(MacroId::ProcMacroId(_)) => Visibility::Public,
     }
 }
@@ -3502,9 +3569,8 @@ impl<'b, 'db> Canon<'b, 'db> {
         let blocks = &c.blocks;
         c.unwinds.extend(body.panic_unwinds.iter().filter_map(|&(block, at, to)| {
             let number = blocks[block_index(block)];
-            (number != UNREACHED && blocks[block_index(to)] != UNREACHED).then_some((
-                number, at, to,
-            ))
+            (number != UNREACHED && blocks[block_index(to)] != UNREACHED)
+                .then_some((number, at, to))
         }));
         radix::sort_copy_by_key(&mut c.unwinds, |&(number, at, _)| {
             radix::pack_64(u64::from(number), at as u64)
@@ -3634,10 +3700,7 @@ pub(crate) mod check {
 
     /// The locals the first walk finds used, by index: with the quiet form it walks with, and
     /// with a form that writes everything, as it walked before.
-    pub(crate) fn uses<'db>(
-        db: &'db Db,
-        body: &MirBody<'db>,
-    ) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn uses<'db>(db: &'db Db, body: &MirBody<'db>) -> (Vec<usize>, Vec<usize>) {
         let used = |mut form: Form| {
             let cx = Cx::new(db);
             let canon = Canon::new(body);

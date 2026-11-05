@@ -563,6 +563,69 @@ fn sha1_aarch64() {
     );
 }
 
+/// x86's gathers: a lane the mask enables is read from `base + index * scale`, the index
+/// signed; a lane it does not keeps `src`'s and its address is never read (here one far out of
+/// bounds); the lanes past those gathered are zero.
+#[test]
+fn gather() {
+    check_number(
+        r#"
+        //- minicore: index, slice
+        extern "C" {
+            #[link_name = "llvm.x86.avx512.gather.qpq.512"]
+            fn qpq(src: [i64; 8], base: *const i8, offsets: [i64; 8], mask: u8, scale: i32) -> [i64; 8];
+            #[link_name = "llvm.x86.avx512.gather.dpi.512"]
+            fn dpi(src: [i32; 16], base: *const i8, offsets: [i32; 16], mask: u16, scale: i32) -> [i32; 16];
+            #[link_name = "llvm.x86.avx2.gather.d.q"]
+            fn dq(src: [i64; 2], base: *const i8, offsets: [i32; 4], mask: [i64; 2], scale: i8) -> [i64; 2];
+            #[link_name = "llvm.x86.avx512.gather3div4.si"]
+            fn qd(src: [i32; 4], base: *const i8, offsets: [i64; 2], mask: u8, scale: i32) -> [i32; 4];
+        }
+        const WIDE: [i64; 8] = [100, 101, 102, 103, 104, 105, 106, 107];
+        const NARROW: [i32; 8] = [200, 201, 202, 203, 204, 205, 206, 207];
+        const GOAL: u32 = unsafe {
+            let mut wrong = 0;
+            // From the middle of the table, so an index can be negative.
+            let (wide, narrow) = (WIDE, NARROW);
+            let wide = &wide[4] as *const i64 as *const i8;
+            let r = qpq([-1; 8], wide, [-4, 3, -1, 0, 1000, 2, -3, 1], 0b1110_1111, 8);
+            let want = [100, 107, 103, 104, -1, 106, 101, 105];
+            let mut i = 0;
+            while i < 8 {
+                if r[i] != want[i] { wrong |= 1; }
+                i += 1;
+            }
+            // Scale 1: the index is in bytes.
+            let r = qpq([-1; 8], wide, [8, 0, 0, 0, 0, 0, 0, 0], 1, 1);
+            if r[0] != 105 || r[1] != -1 { wrong |= 2; }
+            let narrow = &narrow[0] as *const i32 as *const i8;
+            let mut offsets = [0; 16];
+            let mut i = 0;
+            while i < 16 {
+                offsets[i] = (7 - i as i32 % 8) * 2;
+                i += 1;
+            }
+            offsets[15] = -1_000_000;
+            let r = dpi([-2; 16], narrow, offsets, 0x7fff, 2);
+            let mut i = 0;
+            while i < 15 {
+                if r[i] != 207 - i as i32 % 8 { wrong |= 4; }
+                i += 1;
+            }
+            if r[15] != -2 { wrong |= 4; }
+            // AVX2's mask is the sign bits of a vector; two lanes by the low two indices.
+            let r = dq([-3, -3], wide, [-2, 1_000_000, 9, 9], [-1, 0x7fff_ffff_ffff_ffff], 8);
+            if r[0] != 102 || r[1] != -3 { wrong |= 8; }
+            // Two lanes by qword index into four: the upper two are zero.
+            let r = qd([-4; 4], narrow, [12, 0], 0b1111, 1);
+            if r[0] != 203 || r[1] != 200 || r[2] != 0 || r[3] != 0 { wrong |= 16; }
+            wrong
+        };
+        "#,
+        0,
+    );
+}
+
 #[test]
 fn unknown_llvm_intrinsic() {
     check_fail(

@@ -39,8 +39,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstParamTyNotAllowed<'db>)
             diag
         }
         ConstParamTyReason::RawPtr => {
-            let mut diag =
-                Diag::error(None, "using raw pointers as const generic parameters is forbidden", span);
+            let mut diag = Diag::error(
+                None,
+                "using raw pointers as const generic parameters is forbidden",
+                span,
+            );
             diag.note(SUPPORTED);
             diag
         }
@@ -84,7 +87,9 @@ fn not_const_param_ty(
         "using raw pointers as const generic parameters is forbidden".to_owned()
     } else if d.ty.as_adt().is_some() {
         // alloc: the error's text, for an error hir found
-        format!("`{ty}` must implement `ConstParamTy` to be used as the type of a const generic parameter")
+        format!(
+            "`{ty}` must implement `ConstParamTy` to be used as the type of a const generic parameter"
+        )
     } else {
         // alloc: the error's text, for an error hir found
         format!("`{ty}` can't be used as a const parameter type")

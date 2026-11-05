@@ -52,7 +52,7 @@ env:
 jobs:
   platforms:
     name: platforms with a registered runner
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64]
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any: ${{ steps.matrix.outputs.any }}
@@ -97,10 +97,17 @@ jobs:
             sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
       # One blaze for both tiers: every native blaze links LLVM, and the profile picks the backend.
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names, installed into $BENCH_HOME (kept between runs, as its store under ~/.cache/blaze
+      # is, so blaze itself builds incrementally), run in the bench shell for the pinned LLVM and
+      # the C toolchain. Its daemon ends before the measured blaze starts.
       - name: Build blaze
         run: |
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p blaze-engine --release
+          CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+          stage0="$BENCH_HOME/stage0/bin/blaze"
+          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
       - name: Bench
         id: bench
         run: |
@@ -133,7 +140,7 @@ jobs:
     name: README, history and regressions
     needs: [platforms, bench]
     if: always() && needs.platforms.outputs.any == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64, ix-mode-cold]
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -170,24 +177,14 @@ jobs:
           done
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
       - name: Commit to main
         run: |
-          git add README.md docs/benchmarks.md docs/benchmarks/
-          git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -q -m "bench: numbers for ${GITHUB_SHA::10} [skip ci]"
-          # Main may have moved during the run: put the commit on top and try again.
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the bench commit does not apply to main"; exit 1; }
-            if git push -q origin HEAD:main; then
-              gh workflow run site.yaml --ref main
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: numbers for %s [skip ci]", "paths": ["README.md", "docs/benchmarks.md", "docs/benchmarks/"], "site": true}' "${GITHUB_SHA::10}")"
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |

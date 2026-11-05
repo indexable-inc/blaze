@@ -22,7 +22,10 @@ fn a_pass_starts_the_longest_chain_first_and_begins_unstarted_deps_on_the_askers
     assert_eq!(plan.order(), &[0, 1, 6, 7, 2, 3, 4, 5, 8]);
     for (at, &node) in plan.order().iter().enumerate() {
         for dep in plan.deps(node) {
-            assert!(plan.order()[..at].contains(dep), "{node} is ordered after its dependency {dep}");
+            assert!(
+                plan.order()[..at].contains(dep),
+                "{node} is ordered after its dependency {dep}"
+            );
         }
     }
 

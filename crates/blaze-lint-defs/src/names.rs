@@ -65,7 +65,8 @@ pub(super) const ALIASES: &[(&str, &str)] = &[("bad_style", "nonstandard_style")
 /// The groups of blaze's own lints, after rustc's: `blaze::hot`, the lints of hot code
 /// (blaze-lints' `blaze::HOT`, which its tests hold to this); `blaze::general`, the lints on
 /// at `warn` in every workspace; `blaze::internal`, the ones of blaze's own types and
-/// conventions, allowed until a workspace turns them on (blaze-lints' `blaze::Kind`).
+/// conventions, allowed until a workspace turns them on (blaze-lints' `blaze::Kind`);
+/// `blaze::reach`, the cross-configuration reachability lints, which a workspace makes strict.
 pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
     (
         "blaze::hot",
@@ -126,6 +127,9 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::pure",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
+            "blaze::dead",
+            "blaze::test_only",
+            "blaze::cfg_only",
         ],
     ),
     (
@@ -174,8 +178,12 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::query_in_loop",
             "blaze::string_key",
             "blaze::nll_workaround",
+            "blaze::lenient_deserialize",
         ],
     ),
+    // The cross-configuration reachability lints (docs/v2/plan/multiconfig-check.md), also in
+    // `blaze::general`: one name to make them strict, `reach = "deny"`.
+    ("blaze::reach", &["blaze::dead", "blaze::test_only", "blaze::cfg_only"]),
 ];
 
 /// `register_renamed`: the old name and the new.

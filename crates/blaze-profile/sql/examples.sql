@@ -13,19 +13,15 @@ ORDER BY dur_ns DESC
 LIMIT $limit
 
 -- name: slower_between_commits
--- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either)
-WITH runs AS (
-    SELECT builds.commit AS commit, spans.name AS name, spans.dur_ns AS dur_ns
-    FROM spans
-    JOIN builds ON builds.build_id = spans.build_id
-), earlier AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+-- says: the spans whose median time grew most from the commit `earlier` to the commit `later` (prefixes of either), over each build's summary (`build_summary`): a span's median is the median of its builds' medians, so one long build counts once
+WITH earlier AS (
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $earlier)
     GROUP BY name
 ), later AS (
-    SELECT name, median(dur_ns) AS dur_ns, count(*) AS runs
-    FROM runs
+    SELECT name, median(median_ns) AS dur_ns, sum(runs) AS runs, count(*) AS builds
+    FROM build_summary
     WHERE starts_with(commit, $later)
     GROUP BY name
 )
@@ -35,24 +31,30 @@ SELECT
     later.dur_ns / 1e6 AS later_ms,
     (later.dur_ns - earlier.dur_ns) / 1e6 AS slower_ms,
     earlier.runs AS earlier_runs,
-    later.runs AS later_runs
+    later.runs AS later_runs,
+    earlier.builds AS earlier_builds,
+    later.builds AS later_builds
 FROM later
 JOIN earlier ON earlier.name = later.name
 ORDER BY slower_ms DESC
 LIMIT $limit
 
--- name: memo_hit_rate_per_crate
--- says: of the queries a build verified or reran, per crate, how many the memo kept (verified, or reran to the same output)
+-- name: memo_hit_rate_per_query_kind
+-- says: per query function in a build, what the memo kept and what ran and why (`query_counts`): rows verified without running, runs, and runs by cause (a first run, a read changed, an untracked read, a cycle, an evicted value asked for again), with the share kept; null causes are a history from before schema 4
 SELECT
-    crate,
-    count(*) FILTER (WHERE outcome = 'verified') AS verified,
-    count(*) FILTER (WHERE outcome = 'reran-same-output') AS same_output,
-    count(*) FILTER (WHERE outcome = 'reran') AS reran,
-    round(count(*) FILTER (WHERE outcome <> 'reran') / count(*), 3) AS hit_rate
-FROM provenance
+    query,
+    verified,
+    executed,
+    ran_new,
+    ran_changed,
+    ran_untracked,
+    ran_cycle,
+    evicted_asked,
+    round(verified / greatest(verified + executed, 1), 3) AS hit_rate
+FROM query_counts
 WHERE build_id = $build
-GROUP BY crate
-ORDER BY reran DESC
+ORDER BY coalesce(ran_changed, 0) + coalesce(ran_untracked, 0) + coalesce(ran_cycle, 0) + evicted_asked DESC, executed DESC, query
+LIMIT $limit
 
 -- name: critical_path
 -- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
@@ -155,36 +157,143 @@ ORDER BY runs.from_ns, runs.step DESC
 LIMIT $limit
 
 -- name: allocations_per_query_kind
--- says: a build's allocations per query kind: bytes and allocations made while its spans were open (the queries under them too)
+-- says: a build's allocations per query kind: bytes and allocations made while its spans were open (the queries under them too), folded runs counted
 SELECT
     query_kind,
-    count(*) AS runs,
+    sum(runs) AS runs,
     sum(alloc_bytes) AS alloc_bytes,
     sum(allocs) AS allocs,
-    round(sum(alloc_bytes) / count(*)) AS bytes_per_run
-FROM spans
+    round(sum(alloc_bytes) / sum(runs)) AS bytes_per_run
+FROM span_sums
 WHERE build_id = $build AND query_kind IS NOT NULL
 GROUP BY query_kind
 ORDER BY alloc_bytes DESC NULLS LAST
 
 -- name: what_reran
--- says: the queries a build reran, slowest first, with the input or query whose change made each rerun
-SELECT kind, query_key, outcome, cause, dur_ns / 1e6 AS ms, crate, unit
+-- says: the memos a build ran again, each with its cause and the read whose change made it run (`provenance`); first runs are only counted (`query_counts.ran_new`), verified rows too
+SELECT kind, query_key, cause, view, cause_key, cause_kind
 FROM provenance
-WHERE build_id = $build AND outcome <> 'verified'
-ORDER BY dur_ns DESC
+WHERE build_id = $build AND outcome = 'ran'
+ORDER BY kind, query_key, view
+LIMIT $limit
+
+-- name: why_reran
+-- says: what a build's reruns come down to: each memo's chain of changed reads followed through the memos that changed to the input field, untracked read or cycle at its root, and how many memos each root made run again
+WITH RECURSIVE ran AS (
+    SELECT DISTINCT query_key, cause, cause_key, cause_kind
+    FROM provenance
+    WHERE build_id = $build AND outcome = 'ran'
+), chain AS (
+    SELECT query_key AS memo, cause, cause_key, cause_kind, 0 AS depth
+    FROM ran
+    UNION ALL
+    SELECT chain.memo AS memo, ran.cause AS cause, ran.cause_key AS cause_key, ran.cause_kind AS cause_kind, chain.depth + 1 AS depth
+    FROM chain
+    JOIN ran ON ran.query_key = chain.cause_key
+    WHERE chain.cause_kind = 'function' AND chain.depth < 64
+), roots AS (
+    SELECT memo, arg_max(cause, depth) AS root_cause, arg_max(cause_key, depth) AS root, arg_max(cause_kind, depth) AS root_kind, max(depth) AS depth
+    FROM chain
+    GROUP BY memo
+)
+SELECT root_cause, root_kind, root, count(DISTINCT memo) AS memos, max(depth) AS deepest, min(memo) AS example
+FROM roots
+GROUP BY root_cause, root_kind, root
+ORDER BY memos DESC, root_cause, root
+LIMIT $limit
+
+-- name: untracked_reads
+-- says: a build's untracked reads by name (`Untracked { what }`): each memo that made one runs again in every view, so these are the reruns no input change explains
+SELECT what, kind, count(DISTINCT query_key) AS memos, min(query_key) AS example
+FROM provenance
+WHERE build_id = $build AND outcome = 'untracked read'
+GROUP BY what, kind
+ORDER BY memos DESC, what, kind
+LIMIT $limit
+
+-- name: cycle_reruns
+-- says: the memos a build ran again for a cycle, with their runs and views: one that ran many times in one view is a cycle that took many rounds to settle, or never did
+SELECT kind, query_key, count(*) AS runs, count(DISTINCT view) AS views
+FROM provenance
+WHERE build_id = $build AND outcome = 'ran' AND cause = 'cycle'
+GROUP BY kind, query_key
+ORDER BY runs DESC, kind, query_key
+LIMIT $limit
+
+-- name: key_part_diff
+-- says: why a thing missed in build `after`: the parts of its key (`key_parts`) whose hash differs from the last earlier build at or before `before` that computed it too, or that only one of the two has
+WITH later AS (
+    SELECT step, item, part, hash, names, beyond FROM key_parts WHERE build_id = $after
+), latest AS (
+    SELECT step, item, max(build_id) AS build
+    FROM key_parts
+    WHERE build_id <= $before AND item IN (SELECT item FROM later)
+    GROUP BY step, item
+), earlier AS (
+    SELECT key_parts.step AS step, key_parts.item AS item, part, hash, names, beyond, build_id
+    FROM key_parts
+    JOIN latest ON latest.step = key_parts.step AND latest.item = key_parts.item AND latest.build = key_parts.build_id
+)
+SELECT
+    coalesce(later.step, earlier.step) AS step,
+    coalesce(later.item, earlier.item) AS item,
+    coalesce(later.part, earlier.part) AS part,
+    earlier.build_id AS earlier_build,
+    earlier.hash AS earlier_hash,
+    later.hash AS later_hash,
+    coalesce(later.names, earlier.names) AS names,
+    coalesce(later.beyond, earlier.beyond) AS beyond
+FROM earlier
+FULL JOIN later
+    ON later.step = earlier.step AND later.item = earlier.item AND later.part IS NOT DISTINCT FROM earlier.part
+WHERE earlier.hash IS DISTINCT FROM later.hash
+    AND coalesce(later.item, earlier.item) IN (SELECT item FROM earlier)
+ORDER BY step, item, part
+LIMIT $limit
+
+-- name: task_memory
+-- says: a build's daemon tasks by kind (`task` spans): how many ran, the memory the plane granted them against the most they held, how many held more than granted, how many memory held back, and their time
+SELECT
+    function AS task,
+    count(*) AS tasks,
+    round(sum(granted_bytes) / 1048576, 1) AS granted_mib,
+    round(sum(peak_bytes) / 1048576, 1) AS peak_mib,
+    round(max(peak_bytes) / 1048576, 1) AS largest_peak_mib,
+    count(*) FILTER (WHERE peak_bytes > granted_bytes) AS over_grant,
+    count(*) FILTER (WHERE passed > 0) AS held_back,
+    max(passed) AS most_passed,
+    round(sum(dur_ns) / 1e6, 1) AS ms
+FROM spans
+WHERE build_id = $build AND name = 'task'
+GROUP BY function
+ORDER BY peak_mib DESC NULLS LAST, task
+
+-- name: admission_waits
+-- says: what a build's daemon tasks waited for before they started (`admission` spans, from ready to start): per task kind and what held it back (memory, a work or io thread, nothing), how many, their whole and longest wait, and the times memory passed them over; a null waited_for never started
+SELECT
+    function AS task,
+    awaits AS waited_for,
+    count(*) AS tasks,
+    round(sum(dur_ns) / 1e6, 1) AS waited_ms,
+    round(max(dur_ns) / 1e6, 1) AS longest_ms,
+    sum(passed) AS passed,
+    round(max(granted_bytes) / 1048576, 1) AS largest_grant_mib
+FROM spans
+WHERE build_id = $build AND name = 'admission'
+GROUP BY function, awaits
+ORDER BY waited_ms DESC, task, waited_for
 LIMIT $limit
 
 -- name: busiest_threads
--- says: the threads that spent most of a build inside spans, by the time of their outermost spans
+-- says: the threads that spent most of a build inside spans, by the time of their outermost spans, folded ones counted
 SELECT
     process,
     thread,
     any_value(thread_name) AS thread_name,
     sum(dur_ns) / 1e6 AS busy_ms,
-    count(*) AS spans
-FROM spans
-WHERE build_id = $build AND depth = 0
+    sum(runs) AS spans
+FROM span_sums
+WHERE build_id = $build AND root
 GROUP BY process, thread
 ORDER BY busy_ms DESC
 LIMIT $limit
@@ -218,14 +327,14 @@ ORDER BY taken DESC
 LIMIT $limit
 
 -- name: time_by_span_name
--- says: a build's time per span name: how many, their whole time, their own CPU time and the longest
+-- says: a build's time per span name: how many, their whole time, their own CPU time and the longest, folded spans counted
 SELECT
     name,
-    count(*) AS spans,
+    sum(runs) AS spans,
     sum(dur_ns) / 1e6 AS total_ms,
     sum(self_cpu_ns) / 1e6 AS self_cpu_ms,
-    max(dur_ns) / 1e6 AS longest_ms
-FROM spans
+    max(max_dur_ns) / 1e6 AS longest_ms
+FROM span_sums
 WHERE build_id = $build
 GROUP BY name
 ORDER BY total_ms DESC
@@ -297,7 +406,7 @@ GROUP BY seconds.second
 ORDER BY seconds.second
 
 -- name: uncovered_time
--- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 5%
+-- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 1% (`gate::UNCOVERED_MAX_PCT`)
 WITH bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -412,7 +521,7 @@ FROM uncovered
 ORDER BY uncovered_pct DESC
 
 -- name: raw_blocks
--- says: samples of a build's pool workers blocked in the kernel (a mutex, a condition, kevent, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
+-- says: samples of a build's pool workers blocked (off the CPU: a mutex, a condition, a poll, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
 WITH RECURSIVE bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -427,7 +536,7 @@ WITH RECURSIVE bounds AS (
     JOIN workers USING (process, thread)
     CROSS JOIN bounds
     WHERE samples.t_ns BETWEEN t0 AND t1
-        AND regexp_matches(array_to_string(samples.stack, ' > '), '(psynch_mutexwait|psynch_cvwait|kevent|__semwait_signal|(^| > )(read|__read_nocancel)\+)')
+        AND samples.cpu = 'off'
 ), up AS (
     SELECT blocked.process, blocked.span_id AS sampled, spans.span_id, spans.parent, spans.name
     FROM blocked JOIN spans ON spans.process = blocked.process AND spans.span_id = blocked.span_id
@@ -480,10 +589,20 @@ ORDER BY errors DESC, kind
 -- name: reexecution_per_query_kind
 -- says: per query function in a build, the work repeated and what eviction cost: runs, rows verified without running, runs of a row in a view it already ran in, runs for an evicted value, and values a budget's pass let go or dropped (the query engine's counts, `query_counts`), beside its spans' runs, distinct function names and time; a span's `function` is a display name several bodies share, so span_names undercounts keys
 WITH spanned AS (
-    SELECT query_kind, count(*) AS span_runs, count(DISTINCT function) AS span_names, sum(dur_ns) AS span_ns
-    FROM spans
-    WHERE build_id = $build AND query_kind IS NOT NULL
-    GROUP BY query_kind
+    SELECT sums.query_kind, sums.span_runs, named.span_names, sums.span_ns
+    FROM (
+        SELECT query_kind, sum(runs) AS span_runs, sum(dur_ns) AS span_ns
+        FROM span_sums
+        WHERE build_id = $build AND query_kind IS NOT NULL
+        GROUP BY query_kind
+    ) AS sums
+    LEFT JOIN (
+        -- A folded span has no `function`: the names are of the spans with a row.
+        SELECT query_kind, count(DISTINCT function) AS span_names
+        FROM spans
+        WHERE build_id = $build AND query_kind IS NOT NULL
+        GROUP BY query_kind
+    ) AS named USING (query_kind)
 ), counted AS (
     SELECT * FROM query_counts WHERE build_id = $build
 ), kinds AS (
@@ -520,3 +639,53 @@ LEFT JOIN counters ON counters.t_ns >= builds.started_ns AND counters.t_ns <= bu
 GROUP BY builds.build_id
 ORDER BY builds.build_id DESC
 LIMIT $limit
+
+-- name: link_regions
+-- says: each region of each image a build linked, by address, as the stage that laid it out said it (`link region` events, crates/blaze-link/src/shape.rs): its section and class, address, bytes placed, room, and the bytes unused before it
+WITH regions AS (
+    SELECT
+        max(v.value_text) FILTER (WHERE v.key = 'image') AS image,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'generation') AS BIGINT) AS generation,
+        max(v.value_bool) FILTER (WHERE v.key = 'full') AS whole,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'addr') AS BIGINT) AS addr,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'size') AS BIGINT) AS size,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'capacity') AS BIGINT) AS capacity,
+        max(v.value_text) FILTER (WHERE v.key = 'section') AS section,
+        max(v.value_text) FILTER (WHERE v.key = 'class') AS class
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id = $build AND e.message = 'link region'
+    GROUP BY e.process, e.event_id
+)
+SELECT
+    image,
+    generation,
+    whole,
+    section,
+    class,
+    addr,
+    size,
+    capacity,
+    addr - lag(addr + greatest(size, capacity)) OVER (PARTITION BY image, generation ORDER BY addr) AS unused_before
+FROM regions
+ORDER BY image, generation, addr
+
+-- name: link_code
+-- says: the code of each image a build linked (its code, patch, stub and executable named regions), by backend (stencil, cranelift, llvm, native, linker, unsaid) and by crate (the 16 largest, then the rest as one row): pieces and bytes, as the stage that laid it out said it (`link code` events, crates/blaze-link/src/shape.rs); an incremental stage's rows count only the code it placed
+WITH code AS (
+    SELECT
+        max(v.value_text) FILTER (WHERE v.key = 'image') AS image,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'generation') AS BIGINT) AS generation,
+        max(v.value_bool) FILTER (WHERE v.key = 'full') AS whole,
+        max(v.value_text) FILTER (WHERE v.key = 'by') AS summed_by,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'pieces') AS BIGINT) AS pieces,
+        CAST(max(v.value_int) FILTER (WHERE v.key = 'bytes') AS BIGINT) AS code_bytes,
+        max(v.value_text) FILTER (WHERE v.key = 'what') AS what
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id = $build AND e.message = 'link code'
+    GROUP BY e.process, e.event_id
+)
+SELECT image, generation, whole, summed_by, what, pieces, code_bytes
+FROM code
+ORDER BY image, generation, summed_by, code_bytes DESC, what

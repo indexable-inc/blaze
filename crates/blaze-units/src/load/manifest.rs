@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::config::{ConfigChain, ConfigOf, ConfigRead};
 use super::files::{Found, PathKey, Snap, TomlFile, lent, read_through};
 use super::invocation::Asking;
-use super::load_error;
-use super::key_id;
+use super::{Unread, key_id, load_error};
 use crate::query::{Cbor, LoadError, Versioned, producer};
 
 /// A manifest as its [`ManifestQuery`] parsed it.
@@ -65,7 +64,9 @@ mod in_order {
             Value::Boolean(it) => Kept::Boolean(it),
             Value::Datetime(it) => Kept::Datetime(it.to_string()),
             Value::Array(it) => Kept::Array(it.into_iter().map(kept).collect()),
-            Value::Table(it) => Kept::Table(it.into_iter().map(|(key, value)| (key, kept(value))).collect()),
+            Value::Table(it) => {
+                Kept::Table(it.into_iter().map(|(key, value)| (key, kept(value))).collect())
+            }
         }
     }
 
@@ -75,7 +76,9 @@ mod in_order {
             Kept::Integer(it) => Value::Integer(it),
             Kept::Float(it) => Value::Float(f64::from_bits(it)),
             Kept::Boolean(it) => Value::Boolean(it),
-            Kept::Datetime(it) => Value::Datetime(it.parse().map_err(|e| format!("the kept datetime `{it}`: {e}"))?),
+            Kept::Datetime(it) => {
+                Value::Datetime(it.parse().map_err(|e| format!("the kept datetime `{it}`: {e}"))?)
+            }
             Kept::Array(it) => Value::Array(it.into_iter().map(value).collect::<Result<_, _>>()?),
             Kept::Table(it) => {
                 let mut table = toml::Table::with_capacity(it.len());
@@ -118,10 +121,12 @@ impl Query for ManifestQuery {
     fn execute(cx: &mut Cx<'_>, key: &PathKey) -> Result<Cbor<Parsed>, Cancelled> {
         let kept = cx.get::<TomlFile>(key)?.bytes();
         Ok(Cbor(match lent(kept) {
-            Found::Here(bytes) => match blaze_manifest::manifest::parse_manifest(Path::new(&key.path), bytes) {
-                Ok(manifest) => Parsed::Here(manifest),
-                Err(_) => Parsed::Unparsed,
-            },
+            Found::Here(bytes) => {
+                match blaze_manifest::manifest::parse_manifest(Path::new(&key.path), bytes) {
+                    Ok(manifest) => Parsed::Here(manifest),
+                    Err(_) => Parsed::Unparsed,
+                }
+            }
             Found::Absent => Parsed::Absent,
             Found::Unmounted => Parsed::Unmounted,
         }))
@@ -156,8 +161,8 @@ pub(crate) struct WorkspaceRead {
     pub warnings: Vec<String>,
 }
 
-impl Versioned for Result<WorkspaceRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 3");
+impl Versioned for Result<WorkspaceRead, Unread> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 4");
 }
 
 pub(crate) struct WorkspaceQuery;
@@ -165,18 +170,18 @@ pub(crate) struct WorkspaceQuery;
 impl Query for WorkspaceQuery {
     const KIND: QueryKind = QueryKind(0x6017);
     const NAME: &'static str = "cargo workspace";
-    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 4");
     type Key = WorkspaceKey;
-    type Value = Cbor<Result<WorkspaceRead, LoadError>>;
+    type Value = Cbor<Result<WorkspaceRead, Unread>>;
 
     fn input(key: &WorkspaceKey) -> ContentId {
         key_id("blaze v2 cargo workspace key 2", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, Unread>>, Cancelled> {
         let config = match cx.get::<ConfigChain>(&key.config)?.get() {
             Ok(config) => config,
-            Err(error) => return Ok(Cbor(Err(error))),
+            Err(unread) => return Ok(Cbor(Err(unread))),
         };
         let manifest_path = match (&key.manifest, &key.config) {
             (Some(path), _) => Some(path.clone()),
@@ -185,19 +190,26 @@ impl Query for WorkspaceQuery {
                     true => it,
                     false => format!("{}/{it}", asked.cwd),
                 }),
-                Err(error) => return Ok(Cbor(Err(error))),
+                Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
             },
             (None, ConfigOf::Fixed { .. }) => None,
         };
         let found = read_through(cx, &key.config, |files| Ok(read_workspace(&config, files, manifest_path.as_deref())))?;
-        Ok(Cbor(found.and_then(|it| it)))
+        Ok(Cbor(found.and_then(|it| it.map_err(Unread::Failed))))
     }
 }
 
-fn read_workspace(config: &ConfigRead, files: Snap<'_, '_>, manifest_path: Option<&str>) -> Result<WorkspaceRead, LoadError> {
-    let ctx = Context::new(super::config::build(config, files).map_err(|error| load_error(&error, None))?);
+fn read_workspace(
+    config: &ConfigRead,
+    files: Snap<'_, '_>,
+    manifest_path: Option<&str>,
+) -> Result<WorkspaceRead, LoadError> {
+    let ctx = Context::new(
+        super::config::build(config, files).map_err(|error| load_error(&error, None))?,
+    );
     let current = root_manifest(manifest_path, &config.cwd, &files)?;
-    let ws = Workspace::new(Path::new(&current), &ctx).map_err(|error| load_error(&error, Some(current.clone())))?;
+    let ws = Workspace::new(Path::new(&current), &ctx)
+        .map_err(|error| load_error(&error, Some(current.clone())))?;
     let show = |path: &Path| path.display().to_string();
     let members: Vec<String> = ws.members().map(|(path, _)| show(path)).collect();
     let single = members.len() == 1 && ws.root_manifest() == ws.current_manifest();
@@ -222,15 +234,25 @@ fn read_workspace(config: &ConfigRead, files: Snap<'_, '_>, manifest_path: Optio
 
 /// The manifest cargo reads: `--manifest-path`'s, or the nearest `Cargo.toml` from the cwd up,
 /// as cargo's `find_root_manifest_for_wd` and `root_manifest` say it.
-fn root_manifest<F: Files>(manifest_path: Option<&str>, cwd: &str, files: &F) -> Result<String, LoadError> {
+fn root_manifest<F: Files>(
+    manifest_path: Option<&str>,
+    cwd: &str,
+    files: &F,
+) -> Result<String, LoadError> {
     use blaze_manifest::files::FileKind;
     if let Some(path) = manifest_path {
         let path = super::files::normal(Path::new(path)).unwrap_or_else(|| path.to_owned());
         if !path.ends_with("Cargo.toml") {
-            return Err(LoadError { what: "the manifest-path must be a path to a Cargo.toml file".to_owned(), at: Some(path) });
+            return Err(LoadError {
+                what: "the manifest-path must be a path to a Cargo.toml file".to_owned(),
+                at: Some(path),
+            });
         }
         if files.kind(Path::new(&path)).is_none() {
-            return Err(LoadError { what: format!("manifest path `{path}` does not exist"), at: Some(path) });
+            return Err(LoadError {
+                what: format!("manifest path `{path}` does not exist"),
+                at: Some(path),
+            });
         }
         return Ok(path);
     }
@@ -260,7 +282,10 @@ fn root_manifest<F: Files>(manifest_path: Option<&str>, cwd: &str, files: &F) ->
             break;
         }
     }
-    Err(LoadError { what: format!("could not find `Cargo.toml` in `{cwd}` or any parent directory"), at: None })
+    Err(LoadError {
+        what: format!("could not find `Cargo.toml` in `{cwd}` or any parent directory"),
+        at: None,
+    })
 }
 
 /// The workspace `read` describes, read again in one step over `cx` through `config_of`'s
@@ -271,7 +296,7 @@ pub(crate) fn in_workspace<'db, R>(
     read: &WorkspaceRead,
     config_of: &ConfigOf,
     then: impl for<'r, 'a> FnOnce(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) -> Result<R, Cancelled>,
-) -> Result<Result<R, LoadError>, Cancelled> {
+) -> Result<Result<R, Unread>, Cancelled> {
     let answer = read_through(cx, config_of, |files| {
         let config = match super::config::build(&read.config, files) {
             Ok(config) => config,
@@ -285,7 +310,7 @@ pub(crate) fn in_workspace<'db, R>(
         };
         then(&ctx, &ws).map(Ok)
     })?;
-    Ok(answer.and_then(|it| it))
+    Ok(answer.and_then(|it| it.map_err(Unread::Failed)))
 }
 
 #[cfg(test)]
@@ -343,9 +368,13 @@ unused = { level = "warn", priority = -1 }
 [workspace]
 members = ["m/*"]
 "#;
-        let parsed = blaze_manifest::manifest::parse_manifest(Path::new("/w/Cargo.toml"), text.as_bytes()).unwrap();
+        let parsed =
+            blaze_manifest::manifest::parse_manifest(Path::new("/w/Cargo.toml"), text.as_bytes())
+                .unwrap();
         let kept = blaze_protocol::cbor::to_vec(&Parsed::Here(parsed.clone())).unwrap();
-        let Parsed::Here(read) = blaze_protocol::cbor::from_slice::<Parsed>(&kept).unwrap() else { panic!("not here") };
+        let Parsed::Here(read) = blaze_protocol::cbor::from_slice::<Parsed>(&kept).unwrap() else {
+            panic!("not here")
+        };
         assert_eq!(toml::to_string(&read).unwrap(), toml::to_string(&parsed).unwrap());
     }
 }

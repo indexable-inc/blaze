@@ -144,8 +144,8 @@ impl TargetsConfig {
     pub fn to_targets(&self) -> Targets {
         Targets {
             packages: self.packages.clone(), // clone: once per check run, its request
-            profile: self.profile.clone(), // clone: once per check run, its request
-            target: self.target.clone(), // clone: once per check run, its request
+            profile: self.profile.clone(),   // clone: once per check run, its request
+            target: self.target.clone(),     // clone: once per check run, its request
             features: self.features.clone(), // clone: once per check run, its request
             all_features: self.all_features,
             no_default_features: self.no_default_features,
@@ -222,8 +222,8 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
-        let config: Config = serde_json::from_str(text)
-            .map_err(|error| ConfigError { what: error.to_string() })?; // alloc: error path
+        let config: Config =
+            serde_json::from_str(text).map_err(|error| ConfigError { what: error.to_string() })?; // alloc: error path
         config.validate()?;
         Ok(config)
     }
@@ -248,7 +248,8 @@ impl Config {
                     return refuse(format!("a check of {list} has no name"));
                 }
                 if check.name == oracle::CHECK {
-                    return refuse(format!( // alloc: error path, the file is refused
+                    return refuse(format!(
+                        // alloc: error path, the file is refused
                         "check {} of {list} has the oracle's name, which the service posts",
                         check.name
                     ));
@@ -258,7 +259,8 @@ impl Config {
                     return refuse(format!("check {} is named twice in {list}", check.name));
                 }
                 if check.kind != CheckKind::Test && (!check.filter.is_empty() || check.all) {
-                    return refuse(format!( // alloc: error path, the file is refused
+                    return refuse(format!(
+                        // alloc: error path, the file is refused
                         "check {} of {list} has a test filter or `all`, and is not a test",
                         check.name
                     ));
@@ -284,12 +286,16 @@ impl Config {
         }
         if snapshot.keep == 0 {
             // alloc: error path, the file is refused
-            return refuse("snapshot.keep is 0: the snapshot just taken would be removed".to_owned());
+            return refuse(
+                "snapshot.keep is 0: the snapshot just taken would be removed".to_owned(),
+            );
         }
         let standby = &self.standby;
-        for (name, argv) in
-            [("latest", &standby.latest), ("restore", &standby.restore), ("promote", &standby.promote)]
-        {
+        for (name, argv) in [
+            ("latest", &standby.latest),
+            ("restore", &standby.restore),
+            ("promote", &standby.promote),
+        ] {
             if argv.is_empty() {
                 // alloc: error path, the file is refused
                 return refuse(format!("standby.{name} is empty"));
@@ -322,7 +328,9 @@ impl Secret {
         }
         if bytes.is_empty() {
             // alloc: error path
-            return Err(ConfigError { what: format!("the secret file {} is empty", path.display()) });
+            return Err(ConfigError {
+                what: format!("the secret file {} is empty", path.display()),
+            });
         }
         Ok(Secret(bytes))
     }

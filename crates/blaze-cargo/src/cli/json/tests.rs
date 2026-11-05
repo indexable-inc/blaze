@@ -1,5 +1,6 @@
 use blaze_api::{
-    Artifact, ArtifactKind, BuildScriptRan, Diagnostic, Level, Span, TargetKind, UnitOf, UnitProfile, UnitTarget,
+    Artifact, ArtifactKind, BuildScriptRan, Diagnostic, Level, Span, TargetKind, UnitOf,
+    UnitProfile, UnitTarget,
 };
 use blaze_ids::ContentId;
 
@@ -32,8 +33,84 @@ const TARGET: &str = r#"{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_
 
 #[test]
 fn build_finished() {
-    assert_eq!(line(|out| super::build_finished(out, true)), r#"{"reason":"build-finished","success":true}"#);
-    assert_eq!(line(|out| super::build_finished(out, false)), r#"{"reason":"build-finished","success":false}"#);
+    let work = Work {
+        build_id: Some(7),
+        built: 2,
+        replayed: 40,
+        first: 0,
+        spliced: 1,
+        unchanged: 0,
+        full: 0,
+    };
+    let done = Finished {
+        success: true,
+        profile: Some("dev"),
+        served: Served::Daemon,
+        took_ms: 812,
+        work: Some(work),
+    };
+    assert_eq!(
+        line(|out| super::build_finished(out, &done)),
+        r#"{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}"#
+    );
+    let failed = Finished {
+        success: false,
+        profile: None,
+        served: Served::InProcess,
+        took_ms: 3,
+        work: None,
+    };
+    assert_eq!(
+        line(|out| super::build_finished(out, &failed)),
+        r#"{"reason":"build-finished","success":false,"profile":null,"served":"in-process","took_ms":3,"build_id":null,"units":null,"links":null}"#
+    );
+    // Every field is JSON a reader takes as it is.
+    let value: serde_json::Value =
+        serde_json::from_str(&line(|out| super::build_finished(out, &done))).unwrap();
+    assert_eq!(value["units"]["replayed"], 40);
+}
+
+#[test]
+fn a_profile_is_named_by_what_its_finished_text_quotes() {
+    assert_eq!(profile_name("`dev` profile [unoptimized + debuginfo]"), Some("dev"));
+    assert_eq!(profile_name("`release-lto` profile [optimized]"), Some("release-lto"));
+    assert_eq!(profile_name("dev"), None);
+}
+
+#[test]
+fn work_counts_each_link_by_how() {
+    use blaze_api::{LinkHow, Linked};
+    let link = |how| Linked { how, path: "target/debug/foo".to_owned() };
+    let worked = blaze_api::Worked {
+        link: blaze_api::LinkKind::Placed,
+        found: 5,
+        green: 0,
+        links: vec![
+            link(LinkHow::First),
+            link(LinkHow::Spliced),
+            link(LinkHow::Spliced),
+            link(LinkHow::Full { why: vec!["a layout changed".to_owned()] }),
+        ],
+        reran: 0,
+        placed: blaze_api::PlacedBytes::default(),
+        served: Vec::new(),
+        build_id: Some(3),
+        compiled: 1,
+        steps_us: Vec::new(),
+        critical_path_us: 0,
+    };
+    assert_eq!(
+        Work::of(&worked),
+        Work {
+            build_id: Some(3),
+            built: 1,
+            replayed: 5,
+            first: 1,
+            spliced: 2,
+            unchanged: 0,
+            full: 1
+        }
+    );
 }
 
 #[test]
@@ -91,7 +168,12 @@ fn strings_as_serde_json_writes_them() {
     assert_eq!(line(|out| quote(out, text)), serde_json::to_string(text).unwrap());
 }
 
-fn span(file: &str, (line, column): (u32, u32), (end_line, end_column): (u32, u32), bytes: (u32, u32)) -> Span {
+fn span(
+    file: &str,
+    (line, column): (u32, u32),
+    (end_line, end_column): (u32, u32),
+    bytes: (u32, u32),
+) -> Span {
     Span {
         file: file.to_owned(),
         line,
@@ -140,7 +222,8 @@ fn unused(rendered: &str) -> Diagnostic {
 fn checkout() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("src/main.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n").unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n")
+        .unwrap();
     std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
     let root = dir.path().display().to_string();
     (dir, root)
@@ -192,7 +275,9 @@ fn a_compiler_message_as_cargo_writes_it_again() {
     // A coded error carries rustc's markdown for its code as the code's `explanation`.
     let coded = Diagnostic {
         code: Some("E0384".to_owned()),
-        explanation: Some("A variable was assigned twice.\n\n```compile_fail,E0384\n```\n".to_owned()),
+        explanation: Some(
+            "A variable was assigned twice.\n\n```compile_fail,E0384\n```\n".to_owned(),
+        ),
         ..unused(rendered)
     };
     assert!(

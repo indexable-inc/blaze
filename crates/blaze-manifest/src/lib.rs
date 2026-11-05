@@ -20,6 +20,7 @@ pub mod paths;
 pub mod profiles;
 pub mod source;
 pub mod targets;
+pub mod user_config;
 pub mod workspace;
 
 use stdx::edit_distance::cargo as edit_distance;

@@ -13,6 +13,8 @@
 //! - [`emit`]: rustc's text (human, short, colour) and JSON, and its closing lines.
 //! - [`check`]: a crate's diagnostics in the order rustc gives them, stopping where it stops.
 //! - [`api`]: a diagnostic as the agent API sends it.
+//! - [`reach`]: which configurations of a package use each item, and the lints over all of
+//!   them (`blaze::dead`, `blaze::test_only`, `blaze::cfg_only`).
 //!
 //! A check is one task: its tables live in the task's [`blaze_mem::Frame`] ([`Cx::frame`]),
 //! freed in one go when it returns. Only the diagnostics it gives outlive it.
@@ -34,6 +36,7 @@ pub mod lints;
 mod lower;
 pub mod model;
 pub mod print;
+pub mod reach;
 #[cfg(test)]
 mod tests;
 

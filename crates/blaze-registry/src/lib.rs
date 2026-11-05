@@ -1,6 +1,6 @@
 //! Registries read and sources fetched as cargo 1.99 reads and fetches them, with no cargo:
-//! the sparse index with cargo's cache of it, `.crate` files checked by their sha256, kept in
-//! blaze's store by that hash and unpacked where cargo unpacks them, `[source]` replacement,
+//! the sparse index with cargo's cache of it, `.crate` files got through blaze-fetch (checked
+//! by their sha256 and kept in blaze's store) and unpacked where cargo unpacks them, `[source]` replacement,
 //! vendored directories and git checkouts, so that the paths a build sees (`file!()`, panics,
 //! `CARGO_MANIFEST_DIR`) are cargo's and cargo and blaze share `$CARGO_HOME`. What is ported
 //! from where is said at the top of each module; the plan is `docs/self-contained.md`.
@@ -15,6 +15,7 @@ pub mod git;
 mod git_index;
 pub mod http;
 pub mod index;
+pub mod pinned;
 pub mod query;
 pub mod registry;
 pub mod sources;
@@ -73,7 +74,9 @@ pub struct Context {
     pub net: NetConfig,
     // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     pub http: Arc<dyn http::Http>,
-    /// blaze's store, which keeps `.crate` files by their sha256.
+    /// blaze's store, which keeps `.crate` files through blaze-fetch: by BLAKE3, with their
+    /// sha256 as the pin that finds them. With none, a download is still checked, and kept only
+    /// in cargo's cache.
     pub store: Option<&'static blaze_cas::Handle>,
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
@@ -137,7 +140,8 @@ impl PackageCacheLock {
             Ok(file) => file,
             Err(file) => {
                 eprintln!("    Blocking waiting for file lock on package cache");
-                stdx::file_lock::Locked::lock(file).with_context(|| format!("failed to lock `{}`", path.display()))?
+                stdx::file_lock::Locked::lock(file)
+                    .with_context(|| format!("failed to lock `{}`", path.display()))?
             }
         };
         Ok(PackageCacheLock { _file: file })

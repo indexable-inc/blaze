@@ -15,7 +15,7 @@ pub const SCENES: &[(&str, &str)] = &[("06-prims", include_str!("../scene/prims.
 pub const GALLERY: (&str, &str) = ("90-gallery", include_str!("../scene/gallery.flecs"));
 
 /// The SwiftUI-vocabulary examples, one scene per feature (grid, lazy, alignment, truncation, composition and safe area,
-/// motion), then the gallery that lays them all out (`swiftui_gallery`). Loaded after [`SCENES`] by the host's gallery mode
+/// motion, bubble), then the gallery that lays them all out (`swiftui_gallery`). Loaded after [`SCENES`] by the host's gallery mode
 /// (`HARNESS_NATIVE_GALLERY=1`), never by the app's scene.
 pub const EXAMPLES: &[(&str, &str)] = &[
     ("91-ex-card", include_str!("../scene/examples/00-card.flecs")),
@@ -25,6 +25,10 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("95-ex-truncate", include_str!("../scene/examples/truncate.flecs")),
     ("96-ex-compose", include_str!("../scene/examples/compose.flecs")),
     ("97-ex-motion", include_str!("../scene/examples/motion.flecs")),
+    ("98-ex-stack", include_str!("../scene/examples/stack.flecs")),
+    ("98-ex-table", include_str!("../scene/examples/table.flecs")),
+    ("98-ex-bubble", include_str!("../scene/examples/bubble.flecs")),
+    ("98-ex-scroller", include_str!("../scene/examples/scroller.flecs")),
     ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
 ];
 

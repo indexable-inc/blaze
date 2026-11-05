@@ -5,9 +5,9 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Tag, frame};
 use hir_expand::{mod_path::ModPath, name::Name};
+use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{
@@ -151,7 +151,10 @@ pub(crate) enum RoundKind {
     EagerWithErrors,
     /// The reseed of the first unresolved attribute: of `module`, at `index` of its pending
     /// directives (the old `reseed_with_unresolved_attribute`).
-    Reseed { module: ModuleId, index: u32 },
+    Reseed {
+        module: ModuleId,
+        index: u32,
+    },
     /// After the last round: units record their still-unresolved imports and the root of a
     /// proc-macro crate is censored (the old `collect`'s end); no macro step runs.
     Final,
@@ -468,7 +471,9 @@ pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<Dec
 pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> blaze_query::db::Id {
     let decl = key.decl(db);
     let ops = &module_decls(db, key).ops;
-    let scope = frame::task(Tag::Nameres, |frame| unit::local_scope(db, frame, decl.module, &decl.inherited, ops));
+    let scope = frame::task(Tag::Nameres, |frame| {
+        unit::local_scope(db, frame, decl.module, &decl.inherited, ops)
+    });
     let scope = crate::nameres::ModuleScope::new(db, decl.module, scope.scope, scope.children);
     blaze_query::db::AsId::as_id(&scope)
 }
@@ -499,7 +504,9 @@ pub(crate) fn fact_key(db: &Db, round: RoundKey, at: u32) -> FactKey {
     let t = match runs(db, round, at) {
         true => r,
         false => modules.since(at).unwrap_or_else(|| {
-            panic!("nameres facts: {module:?}, new at round {r}, is in a component that does not run")
+            panic!(
+                "nameres facts: {module:?}, new at round {r}, is in a component that does not run"
+            )
         }),
     };
     FactKey::new(db, module, krate, t)
@@ -513,7 +520,9 @@ pub(crate) fn ran_by(db: &Db, round: RoundKey, at: u32) -> u32 {
         return r;
     }
     round_modules(db, round).ran(at).unwrap_or_else(|| {
-        panic!("nameres facts: module {at} of round {r} is new and in a component that does not run")
+        panic!(
+            "nameres facts: module {at} of round {r} is new and in a component that does not run"
+        )
     })
 }
 

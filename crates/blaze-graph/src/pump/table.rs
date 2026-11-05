@@ -54,7 +54,11 @@ pub(super) struct Waiter<V> {
 
 impl<V> Waiter<V> {
     pub(super) fn new() -> Waiter<V> {
-        Waiter { next: UnsafeCell::new(ptr::null()), value: UnsafeCell::new(None), state: AtomicU8::new(RUNNING) }
+        Waiter {
+            next: UnsafeCell::new(ptr::null()),
+            value: UnsafeCell::new(None),
+            state: AtomicU8::new(RUNNING),
+        }
     }
 
     pub(super) fn is_running(&self) -> bool {
@@ -96,7 +100,10 @@ fn word(key: &Key, at: usize) -> u64 {
 /// word, and a linear mix walks consecutive ones through the buckets in step, so two threads
 /// a few keys apart keep meeting in one bucket.
 fn home(key: &Key, mask: usize) -> usize {
-    let mut mixed = word(key, 0) ^ word(key, 8).rotate_left(16) ^ word(key, 16).rotate_left(32) ^ word(key, 24).rotate_left(48);
+    let mut mixed = word(key, 0)
+        ^ word(key, 8).rotate_left(16)
+        ^ word(key, 16).rotate_left(32)
+        ^ word(key, 24).rotate_left(48);
     mixed ^= mixed >> 33;
     mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
     mixed ^= mixed >> 33;
@@ -211,7 +218,8 @@ impl<V> Table<V> {
         let mut last = home;
         // SAFETY: the caller's.
         for bucket in unsafe { chain(home) } {
-            if let Some(at) = (0..ENTRIES).find(|&at| bucket.runs[at].load(Ordering::Acquire) == 0) {
+            if let Some(at) = (0..ENTRIES).find(|&at| bucket.runs[at].load(Ordering::Acquire) == 0)
+            {
                 return (bucket, at, false);
             }
             last = bucket;
@@ -256,7 +264,8 @@ impl<'a, V> Latched<'a, V> {
             (0..ENTRIES)
                 .find(|&at| {
                     // SAFETY: the keys are written only under the latch, held.
-                    bucket.runs[at].load(Ordering::Acquire) != 0 && unsafe { (*bucket.entries.get()).keys[at] } == *key
+                    bucket.runs[at].load(Ordering::Acquire) != 0
+                        && unsafe { (*bucket.entries.get()).keys[at] } == *key
                 })
                 .map(|at| (bucket, at))
         })
@@ -379,7 +388,9 @@ impl<V> Runs<V> {
         let mut paused = false;
         let (latched, bucket, at, seen) = 'ask: loop {
             let latched = self.latch(&key);
-            let Some((bucket, at)) = latched.find(&key) else { return Asked::Run(self.insert(latched, key, mine)) };
+            let Some((bucket, at)) = latched.find(&key) else {
+                return Asked::Run(self.insert(latched, key, mine));
+            };
             let run = &bucket.runs[at];
             let mut seen = run.load(Ordering::Acquire);
             loop {
@@ -405,7 +416,8 @@ impl<V> Runs<V> {
                     while run.load(Ordering::Acquire) == seen && spin.pause() {}
                     continue 'ask;
                 }
-                match run.compare_exchange(seen, seen | WAITED, Ordering::AcqRel, Ordering::Acquire) {
+                match run.compare_exchange(seen, seen | WAITED, Ordering::AcqRel, Ordering::Acquire)
+                {
                     Ok(_) => break 'ask (latched, bucket, at, seen),
                     Err(now) => seen = now,
                 }
@@ -428,7 +440,9 @@ impl<V> Runs<V> {
     pub(super) fn claim_if_idle(&self, key: Key, me: u64, scope: Option<CounterId>) -> Idle<'_> {
         let mine = run_word(me, scope);
         let latched = self.latch(&key);
-        let Some((bucket, at)) = latched.find(&key) else { return Idle::Claimed(self.insert(latched, key, mine)) };
+        let Some((bucket, at)) = latched.find(&key) else {
+            return Idle::Claimed(self.insert(latched, key, mine));
+        };
         let run = &bucket.runs[at];
         match run.load(Ordering::Acquire) {
             0 => {
@@ -455,7 +469,9 @@ impl<V> Runs<V> {
         let waiting = {
             let latched = self.latch(&claim.key);
             let (bucket, at) = latched.find(&claim.key).expect("a run's entry stays until it ends");
-            debug_assert_eq!(
+            // Checked in every build: a word not its own means a waiter claimed this run's
+            // flight for another task, whose end would end it under these waiters.
+            assert_eq!(
                 bucket.runs[at].load(Ordering::Relaxed) & !WAITED,
                 claim.word,
                 "a run's word is its own until it ends"
@@ -520,7 +536,9 @@ impl<V> Runs<V> {
             }
         }
         // The run ended and took the list: its runner is writing each waiter its end.
-        SpinWait::until("a run's end to write its waiter, whose list it took", || !waiter.is_running());
+        SpinWait::until("a run's end to write its waiter, whose list it took", || {
+            !waiter.is_running()
+        });
     }
 
     /// How many keys are running now.
@@ -532,7 +550,10 @@ impl<V> Runs<V> {
             .iter()
             .map(|home| {
                 let latched = Latched { table, home, _held: home.latch.lock() };
-                latched.chain().map(|it| it.runs.iter().filter(|it| it.load(Ordering::Acquire) != 0).count()).sum::<usize>()
+                latched
+                    .chain()
+                    .map(|it| it.runs.iter().filter(|it| it.load(Ordering::Acquire) != 0).count())
+                    .sum::<usize>()
             })
             .sum()
     }
@@ -576,7 +597,8 @@ impl<V> Runs<V> {
                     let mut seen = run.load(Ordering::Acquire);
                     // Only the run's end changes a held run word without the latch: to 0.
                     while seen != 0 {
-                        match run.compare_exchange(seen, MOVED, Ordering::AcqRel, Ordering::Acquire) {
+                        match run.compare_exchange(seen, MOVED, Ordering::AcqRel, Ordering::Acquire)
+                        {
                             Ok(_) => break,
                             Err(now) => seen = now,
                         }
@@ -584,7 +606,11 @@ impl<V> Runs<V> {
                     if seen != 0 {
                         // SAFETY: the latch is held, and nothing else of the entry is borrowed.
                         let entries = unsafe { &mut *bucket.entries.get() };
-                        next.put(entries.keys[at], seen, mem::replace(&mut entries.waiting[at], Waiting::NONE));
+                        next.put(
+                            entries.keys[at],
+                            seen,
+                            mem::replace(&mut entries.waiting[at], Waiting::NONE),
+                        );
                     }
                 }
             }

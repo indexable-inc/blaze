@@ -20,7 +20,7 @@ use cranelift_codegen::isa::CallConv;
 use std::num::NonZeroU32;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
+use inkwell::values::LLVMTailCallKind;
 use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, GlobalVisibility, IntPredicate,
     ThreadLocalMode,
@@ -40,8 +40,8 @@ use inkwell::{
         FunctionValue, InstructionValue, IntValue, PhiValue, PointerValue, VectorValue,
     },
 };
-use inkwell::values::LLVMTailCallKind;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use hir_def::hir::AsmOptions;
 use inkwell::InlineAsmDialect;
@@ -124,7 +124,8 @@ const ABI_ATTRIBUTES: [&str; 10] = [
 pub(super) fn has_musttail(function: FunctionValue<'_>) -> bool {
     function.get_basic_block_iter().any(|block| {
         block.get_instructions().any(|it| {
-            it.get_tail_call_kind().is_ok_and(|kind| kind == LLVMTailCallKind::LLVMTailCallKindMustTail)
+            it.get_tail_call_kind()
+                .is_ok_and(|kind| kind == LLVMTailCallKind::LLVMTailCallKindMustTail)
         })
     })
 }
@@ -491,7 +492,11 @@ impl<'ctx> Debug<'ctx> {
     /// `report`: the lines are for the report of what the optimized code keeps
     /// ([`super::report`]), which reads them from the IR, never from the object, and so on
     /// every format; the object is stripped of them where it is not read back.
-    pub(super) fn of(module: &Module<'ctx>, target: &crate::Target, report: bool) -> Lowered<Option<Debug<'ctx>>> {
+    pub(super) fn of(
+        module: &Module<'ctx>,
+        target: &crate::Target,
+        report: bool,
+    ) -> Lowered<Option<Debug<'ctx>>> {
         // Without a flag that asks for CodeView, the table is DWARF in a COFF object too.
         if !report && !matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff) {
             return Ok(None);
@@ -584,13 +589,19 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     /// Adds the function `defined` is to `module`, with the attributes of its signature,
-    /// keeping its frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`).
+    /// keeping every frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`,
+    /// `-C force-frame-pointers`) and, where the target's ABI wants one, a frame record in
+    /// every function that calls ([`crate::Target::llvm_frame_pointer`]); for the CPU and with
+    /// the target features of `features` (its unit's and its `#[target_feature]`'s): the one
+    /// place a function is told its `target-cpu` and `target-features`, as rustc tells each
+    /// function both.
     pub(super) fn add(
         context: &'ctx Context,
         module: &Module<'ctx>,
         target: &crate::Target,
         defined: &Defined<'_>,
         frame_pointers: bool,
+        features: crate::Features,
     ) -> Lowered<FunctionValue<'ctx>> {
         let func = defined.func;
         let addresses = addresses(func, &Flow::of(func));
@@ -609,12 +620,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         });
         let probe = target.stack_probe().map(|probe| ("probe-stack", probe));
         // Without, LLVM gives the frame pointer's register to values, and code that walks the
-        // frames by it reads one of those.
-        let frame = frame_pointers.then_some(("frame-pointer", "all"));
-        for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame) {
+        // frames by it reads one of those. On Apple's targets every function that calls keeps
+        // a frame record whatever `frame_pointers` says, as the ABI wants and rustc does
+        // (`Target::llvm_frame_pointer`): without it a release function that saves x29/x30
+        // below an unmoved x29 has nothing but its DWARF rows to say where its caller is.
+        let frame = target.llvm_frame_pointer(frame_pointers).map(|it| ("frame-pointer", it));
+        let cpu = ("target-cpu", target.cpu_of(features));
+        for (name, value) in [cpu].into_iter().chain(probe).chain(frame) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }
+        super::mark_features(context, function, target, features)?;
         // Every function gets an unwind table entry, as a panic may cross any of them.
         let uwtable = super::attribute_kind("uwtable");
         function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(uwtable, 2));
@@ -937,9 +953,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             // AArch64 has eight registers of each kind for what comes back, and LLVM gives
             // the fields of a struct the next of its kind in order, as Cranelift does values.
-            many if target.arch == crate::target::Arch::Aarch64
-                && many.len() <= 8 =>
-            {
+            many if target.arch == crate::target::Arch::Aarch64 && many.len() <= 8 => {
                 let fields = many
                     .iter()
                     .map(|it| Self::basic_type(context, it.value_type))
@@ -1200,24 +1214,33 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// `value` in every lane of `ty`: in lane 0, then shuffled into the rest, as LLVM writes a
     /// splat.
-    fn splat(&self, ty: VectorType<'ctx>, value: BasicValueEnum<'ctx>) -> Lowered<VectorValue<'ctx>> {
+    fn splat(
+        &self,
+        ty: VectorType<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> Lowered<VectorValue<'ctx>> {
         let index = self.context.i32_type();
-        let first = self.builder.build_insert_element(ty.get_poison(), value, index.const_zero(), "")?;
+        let first =
+            self.builder.build_insert_element(ty.get_poison(), value, index.const_zero(), "")?;
         let every = index.vec_type(ty.get_size()).const_zero();
         Ok(self.builder.build_shuffle_vector(first, ty.get_poison(), every, "")?)
     }
 
     fn int_intrinsic(&self, name: &str, args: &[IntValue<'ctx>]) -> Lowered<IntValue<'ctx>> {
         let ty = args[0].get_type();
-        let args =
-            args.iter().map(|&it| it.into()).collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
+        let args = args
+            .iter()
+            .map(|&it| it.into())
+            .collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
         Ok(self.intrinsic(name, &[ty.into()], &args)?.into_int_value())
     }
 
     fn float_intrinsic(&self, name: &str, args: &[FloatValue<'ctx>]) -> Lowered<FloatValue<'ctx>> {
         let ty = args[0].get_type();
-        let args =
-            args.iter().map(|&it| it.into()).collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
+        let args = args
+            .iter()
+            .map(|&it| it.into())
+            .collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
         Ok(self.intrinsic(name, &[ty.into()], &args)?.into_float_value())
     }
 
@@ -1317,7 +1340,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             // Each lane of the result is the lane of `l` then `r` its mask byte says; a byte
             // past both is a zero lane, which LLVM's `shufflevector` has no index for.
             InstructionData::Shuffle { args: [l, r], imm, .. } => {
-                let (Operand::Vector(l), Operand::Vector(r)) = (self.operand(l), self.operand(r)) else {
+                let (Operand::Vector(l), Operand::Vector(r)) = (self.operand(l), self.operand(r))
+                else {
                     return Err(Unhandled::Type(dfg.value_type(l)));
                 };
                 let mask = dfg.immediates.get(imm).ok_or(Unhandled::Opcode(opcode))?.as_slice();
@@ -1333,7 +1357,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     .map(|at| flag.const_int(u64::from(within(at)), false))
                     .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
                 let zeroed = !mask.iter().all(within);
-                let shuffled = self.builder.build_shuffle_vector(l, r, VectorType::const_vector(picked.as_slice()), "")?;
+                let shuffled = self.builder.build_shuffle_vector(
+                    l,
+                    r,
+                    VectorType::const_vector(picked.as_slice()),
+                    "",
+                )?;
                 let value = if zeroed {
                     let kept = VectorType::const_vector(kept.as_slice());
                     let zero = shuffled.get_type().const_zero();
@@ -1351,12 +1380,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let value = self.builder.build_extract_element(vector, lane, "")?;
                 self.set(inst, value);
             }
-            InstructionData::TernaryImm8 { opcode: Opcode::Insertlane, args: [vector, value], imm } => {
+            InstructionData::TernaryImm8 {
+                opcode: Opcode::Insertlane,
+                args: [vector, value],
+                imm,
+            } => {
                 let Operand::Vector(vector) = self.operand(vector) else {
                     return Err(Unhandled::Type(dfg.value_type(vector)));
                 };
                 let lane = self.context.i32_type().const_int(u64::from(imm), false);
-                let inserted = self.builder.build_insert_element(vector, self.plain(value)?, lane, "")?;
+                let inserted =
+                    self.builder.build_insert_element(vector, self.plain(value)?, lane, "")?;
                 self.set(inst, Operand::Vector(inserted));
             }
             InstructionData::Load { arg, offset, flags, .. } => {
@@ -1389,7 +1423,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
                 self.tail_call(inst, Tailed::Direct(func_ref), sig, dfg.inst_args(inst))?;
             }
-            InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => {
+            InstructionData::CallIndirect {
+                opcode: Opcode::ReturnCallIndirect, sig_ref, ..
+            } => {
                 let [callee, args @ ..] = dfg.inst_args(inst) else {
                     return Err(Unhandled::Shape("an indirect tail call without a callee"));
                 };
@@ -1483,7 +1519,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
                 let condition = self.condition(arg)?;
-                let cold = [then, otherwise].map(|it| self.func.layout.is_cold(it.block(&dfg.value_lists)));
+                let cold = [then, otherwise]
+                    .map(|it| self.func.layout.is_cold(it.block(&dfg.value_lists)));
                 let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
                 let branch = self.builder.build_conditional_branch(condition, then, otherwise)?;
                 if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
@@ -1731,7 +1768,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             Opcode::Iabs => {
                 let int = self.int(arg)?;
                 let poison = self.context.bool_type().const_zero();
-                self.intrinsic("llvm.abs", &[int.get_type().into()], &[int.into(), poison.into()])?.into()
+                self.intrinsic("llvm.abs", &[int.get_type().into()], &[int.into(), poison.into()])?
+                    .into()
             }
             Opcode::Bitrev => {
                 Operand::Int(self.int_intrinsic("llvm.bitreverse", &[self.int(arg)?])?)
@@ -1768,7 +1806,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     Opcode::VallTrue => "llvm.vector.reduce.and",
                     _ => "llvm.vector.reduce.or",
                 };
-                let held = self.intrinsic(name, &[set.get_type().into()], &[set.into()])?.into_int_value();
+                let held =
+                    self.intrinsic(name, &[set.get_type().into()], &[set.into()])?.into_int_value();
                 Operand::Int(b.build_int_z_extend(held, self.int_ty(result_ty())?, "")?)
             }
             Opcode::Fneg => Operand::Float(b.build_float_neg(self.float(arg)?, "")?),
@@ -1853,7 +1892,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 return Err(Unhandled::Type(shifted));
             };
             let by = b.build_int_cast_sign_flag(by, lane, false, "")?;
-            let by = b.build_and(by, lane.const_int(u64::from(lane.get_bit_width()) - 1, false), "")?;
+            let by =
+                b.build_and(by, lane.const_int(u64::from(lane.get_bit_width()) - 1, false), "")?;
             let by = self.splat(l.get_type(), by.into())?;
             let value = match opcode {
                 Opcode::Ishl => b.build_left_shift(l, by, "")?,
@@ -2156,8 +2196,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 // A metered function's calls of the fuel runtime (`blaze_stencil::fuel`) are by
                 // the runtime's own symbols, which the object's relocations name again.
                 if name.namespace == blaze_stencil::fuel::NAMESPACE {
-                    let symbol = blaze_stencil::fuel::symbol(name.index)
-                        .ok_or(Unhandled::Shape("a fuel runtime function that is none of its two"))?;
+                    let symbol = blaze_stencil::fuel::symbol(name.index).ok_or(
+                        Unhandled::Shape("a fuel runtime function that is none of its two"),
+                    )?;
                     // alloc: the owned name `callees` keeps, once per callee
                     return Ok(symbol.to_owned());
                 }
@@ -2450,7 +2491,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// The parameters of each callee that some call of it passes an address to, by its name:
     /// the callee is declared with pointers there.
-    fn pointer_params(&self, pointerish: &HashSet<Value, Global>) -> HashMap<String, Vec<u32>, Global> {
+    fn pointer_params(
+        &self,
+        pointerish: &HashSet<Value, Global>,
+    ) -> HashMap<String, Vec<u32>, Global> {
         let dfg = &self.func.dfg;
         let mut found: HashMap<String, Vec<u32>, Global> = HashMap::new_in(Global);
         // A tail call is made through the caller's own type ([`Lowering::tail_call`]): its
@@ -2549,7 +2593,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         };
         if unwind::seh::is_guarded(self.func.srcloc(inst)) {
             // alloc: the error's message
-            return refused(format!("{named} is in a guarded region, whose handler it would leave"));
+            return refused(format!(
+                "{named} is in a guarded region, whose handler it would leave"
+            ));
         }
         let caller = &self.func.signature;
         if sig.call_conv != caller.call_conv || sig.returns != caller.returns {
@@ -2570,11 +2616,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             ));
         }
         if args.len() != sig.params.len() {
-            return Err(Unhandled::Shape("a tail call given other arguments than its signature takes"));
+            return Err(Unhandled::Shape(
+                "a tail call given other arguments than its signature takes",
+            ));
         }
         let ty = self.function.get_type();
         let types = ty.get_param_types();
-        let entry = self.func.layout.entry_block().ok_or(Unhandled::Shape("function without blocks"))?;
+        let entry =
+            self.func.layout.entry_block().ok_or(Unhandled::Shape("function without blocks"))?;
         let own = self.func.dfg.block_params(entry);
         let mut passed: SmallVec<[BasicMetadataValueEnum<'ctx>; 8]> = SmallVec::new();
         for (at, ((param, &arg), want)) in sig.params.iter().zip(args).zip(&types).enumerate() {
@@ -2598,7 +2647,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                          convention, which LLVM copies into the frame the tail call leaves"
                     ));
                 }
-                ArgumentPurpose::StructReturn | ArgumentPurpose::StructArgument(_) if !forwarded => {
+                ArgumentPurpose::StructReturn | ArgumentPurpose::StructArgument(_)
+                    if !forwarded =>
+                {
                     // alloc: the error's message
                     return refused(format!(
                         "parameter {at} of {named} is `{param}` and is passed other memory than \

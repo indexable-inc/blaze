@@ -58,15 +58,22 @@ fn param_ident(param: ast::GenericParam<'_>) -> Option<TextRange> {
 
 /// `validate_generic_param_order`: lifetimes declared after a type or const parameter, with
 /// the list rustc suggests instead, printed as its pretty printer prints it.
-fn order<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, list: ast::GenericParamList<'db>, out: &mut Out) {
+fn order<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    list: ast::GenericParamList<'db>,
+    out: &mut Out,
+) {
     let out_of_order = move || {
         let mut seen_type_or_const = false;
-        list.generic_params().filter(move |it| v.kept(it.syntax())).filter_map(move |param| match param {
-            ast::GenericParam::LifetimeParam(_) if seen_type_or_const => param_ident(param),
-            ast::GenericParam::LifetimeParam(_) => None,
-            _ => {
-                seen_type_or_const = true;
-                None
+        list.generic_params().filter(move |it| v.kept(it.syntax())).filter_map(move |param| {
+            match param {
+                ast::GenericParam::LifetimeParam(_) if seen_type_or_const => param_ident(param),
+                ast::GenericParam::LifetimeParam(_) => None,
+                _ => {
+                    seen_type_or_const = true;
+                    None
+                }
             }
         })
     };
@@ -144,7 +151,9 @@ fn bounds(out: &mut String, list: Option<ast::TypeBoundList<'_>>, edition: span:
 
 /// Whether a `for<..>` binder declares any parameter.
 fn binds(binder: Option<ast::ForBinder<'_>>) -> bool {
-    binder.and_then(|it| it.generic_param_list()).is_some_and(|it| it.generic_params().next().is_some())
+    binder
+        .and_then(|it| it.generic_param_list())
+        .is_some_and(|it| it.generic_params().next().is_some())
 }
 
 /// `visit_generics` of a `where` predicate: E0316 for each trait bound with a `for<..>` of
@@ -155,10 +164,16 @@ pub(super) fn where_pred<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mu
         return;
     }
     let Some(list) = pred.type_bound_list() else { return };
-    for bound in list.bounds().filter(|it| it.lifetime().is_none() && it.use_bound_generic_args().is_none()) {
+    for bound in
+        list.bounds().filter(|it| it.lifetime().is_none() && it.use_bound_generic_args().is_none())
+    {
         if binds(bound.for_binder()) {
             let span = v.span(bound.syntax().text_range());
-            v.emit(out, node, Diag::error(Some("E0316"), "nested quantification of lifetimes", span));
+            v.emit(
+                out,
+                node,
+                Diag::error(Some("E0316"), "nested quantification of lifetimes", span),
+            );
         }
     }
 }
@@ -201,7 +216,8 @@ pub(super) fn bound<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out
     if bound.use_bound_generic_args().is_some() {
         if kind != BoundKind::Impl {
             // alloc: the error's message
-            let message = format!("`use<...>` precise capturing syntax not allowed in {}", kind.descr());
+            let message =
+                format!("`use<...>` precise capturing syntax not allowed in {}", kind.descr());
             v.emit(out, node, Diag::error(None, message, v.span(node.text_range())));
         }
         return;
@@ -245,11 +261,16 @@ fn tilde_const_reason<'db>(
         let at_range = |range: TextRange| Some(InFile::new(file, range));
         let range = |node: ast::Node<'_>| at_range(item_range(node));
         match parent.kind() {
-            SyntaxKind::DYN_TRAIT_TYPE => return Some(("trait objects cannot have `[const]` trait bounds", None)),
+            SyntaxKind::DYN_TRAIT_TYPE => {
+                return Some(("trait objects cannot have `[const]` trait bounds", None));
+            }
             SyntaxKind::CONST_ARG => {
                 let expr = ast::ConstArg::cast(parent).and_then(|it| it.expr());
                 let span = expr.map_or(parent.text_range(), |it| it.syntax().text_range());
-                return Some(("anonymous constants cannot have `[const]` trait bounds", at_range(span)));
+                return Some((
+                    "anonymous constants cannot have `[const]` trait bounds",
+                    at_range(span),
+                ));
             }
             SyntaxKind::ARRAY_EXPR => {
                 let count = ast::ArrayExpr::cast(parent)
@@ -263,11 +284,18 @@ fn tilde_const_reason<'db>(
             SyntaxKind::BLOCK_EXPR => {
                 let block = ast::BlockExpr::cast(parent);
                 if let Some(block) = block.filter(|it| it.const_token().is_some()) {
-                    let span = block.stmt_list().map_or(parent.text_range(), |it| it.syntax().text_range());
-                    return Some(("anonymous constants cannot have `[const]` trait bounds", at_range(span)));
+                    let span = block
+                        .stmt_list()
+                        .map_or(parent.text_range(), |it| it.syntax().text_range());
+                    return Some((
+                        "anonymous constants cannot have `[const]` trait bounds",
+                        at_range(span),
+                    ));
                 }
             }
-            SyntaxKind::CLOSURE_EXPR => return Some(("closures cannot have `[const]` trait bounds", None)),
+            SyntaxKind::CLOSURE_EXPR => {
+                return Some(("closures cannot have `[const]` trait bounds", None));
+            }
             SyntaxKind::FN => {
                 let Some(item) = ast::Fn::cast(parent) else { continue };
                 let ctxt = v.ctxt_in(at.file_id, parent);
@@ -275,7 +303,10 @@ fn tilde_const_reason<'db>(
                     return None;
                 }
                 let name = item.name().and_then(|it| at_range(it.syntax().text_range()));
-                return Some(("this function is not `const`, so it cannot have `[const]` trait bounds", name));
+                return Some((
+                    "this function is not `const`, so it cannot have `[const]` trait bounds",
+                    name,
+                ));
             }
             SyntaxKind::TYPE_ALIAS => {
                 let ctxt = v.ctxt_in(at.file_id, parent);
@@ -286,8 +317,12 @@ fn tilde_const_reason<'db>(
                     return None;
                 }
                 let note = match ctxt {
-                    Ctxt::Trait(_) => "associated types in non-`const` traits cannot have `[const]` trait bounds",
-                    Ctxt::TraitImpl(_) => "associated types in non-const impls cannot have `[const]` trait bounds",
+                    Ctxt::Trait(_) => {
+                        "associated types in non-`const` traits cannot have `[const]` trait bounds"
+                    }
+                    Ctxt::TraitImpl(_) => {
+                        "associated types in non-const impls cannot have `[const]` trait bounds"
+                    }
                     _ => "inherent associated types cannot have `[const]` trait bounds",
                 };
                 return Some((note, range(parent)));
@@ -295,7 +330,9 @@ fn tilde_const_reason<'db>(
             SyntaxKind::TRAIT | SyntaxKind::IMPL => {
                 let in_generics = matches!(
                     from.kind(),
-                    SyntaxKind::GENERIC_PARAM_LIST | SyntaxKind::WHERE_CLAUSE | SyntaxKind::TYPE_BOUND_LIST
+                    SyntaxKind::GENERIC_PARAM_LIST
+                        | SyntaxKind::WHERE_CLAUSE
+                        | SyntaxKind::TYPE_BOUND_LIST
                 );
                 if !in_generics {
                     continue;
@@ -312,9 +349,15 @@ fn tilde_const_reason<'db>(
                 };
                 return Some((note, range(parent)));
             }
-            SyntaxKind::STRUCT => return Some(("structs cannot have `[const]` trait bounds", range(parent))),
-            SyntaxKind::ENUM => return Some(("enums cannot have `[const]` trait bounds", range(parent))),
-            SyntaxKind::UNION => return Some(("unions cannot have `[const]` trait bounds", range(parent))),
+            SyntaxKind::STRUCT => {
+                return Some(("structs cannot have `[const]` trait bounds", range(parent)));
+            }
+            SyntaxKind::ENUM => {
+                return Some(("enums cannot have `[const]` trait bounds", range(parent)));
+            }
+            SyntaxKind::UNION => {
+                return Some(("unions cannot have `[const]` trait bounds", range(parent)));
+            }
             _ => {}
         }
     }
@@ -339,7 +382,8 @@ pub(super) fn args<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out)
     let (constraints, generic): (Vec<ast::GenericArg<'db>>, Vec<ast::GenericArg<'db>>) =
         list.generic_args().partition(is_constraint);
     // alloc: on the error path (arguments after a constraint)
-    let constraint_spans: Vec<_> = constraints.iter().map(|it| v.span(it.syntax().text_range())).collect();
+    let constraint_spans: Vec<_> =
+        constraints.iter().map(|it| v.span(it.syntax().text_range())).collect();
     // alloc: as above
     let arg_spans: Vec<_> = generic.iter().map(|it| v.span(it.syntax().text_range())).collect();
     let (one_constraint, one_arg) = (constraints.len() == 1, generic.len() == 1);

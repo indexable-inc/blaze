@@ -34,9 +34,9 @@
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::{Outside, Vfs, Watched, Watcher};
+use std::alloc::Global;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
 const WATCHER_TAGS: u64 = 1 << 32;
@@ -125,6 +125,7 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Tables { view }
         | Request::Pack { view, .. }
         | Request::Doc { view, .. }
+        | Request::Lock { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
         Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
@@ -226,7 +227,13 @@ impl Heads {
 
     /// Takes what arrived: passed on, or held until the watchers of the checkouts it names
     /// have caught up with it.
-    pub fn arrive(&mut self, vfs: &Vfs, arrived: Arrived, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
+    pub fn arrive(
+        &mut self,
+        vfs: &Vfs,
+        arrived: Arrived,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Out>,
+    ) {
         let (from, request) = match arrived {
             Arrived::Gone { conn } => {
                 self.held.retain(|held| held.from.conn != conn);
@@ -236,7 +243,8 @@ impl Heads {
             Arrived::Request { from, request } => (from, request),
         };
         if let Request::Cancel { id } = request
-            && let Some(at) = self.held.iter().position(|it| it.from == RequestRef { conn: from.conn, id })
+            && let Some(at) =
+                self.held.iter().position(|it| it.from == RequestRef { conn: from.conn, id })
         {
             let held = self.held.remove(at);
             answer(out, held.from, None, false);
@@ -276,12 +284,18 @@ impl Heads {
 
     /// A flush of `head`'s checkout's watch, its watcher started first if it has none: the
     /// checkout's slot and the flush's number. Nothing is written into the checkout.
-    fn flush(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
+    fn flush(
+        &mut self,
+        vfs: &Vfs,
+        head: &str,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(u32, u64), ApiError> {
         let slot = match self.slots.get(head) {
             Some(&slot) => slot,
             None => self.watch(vfs, head, effects)?,
         };
-        let checkout = self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
+        let checkout =
+            self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
         let number = self.next_flush;
         self.next_flush += 1;
         let tag = Tag(self.tags + number % (1 << 32));
@@ -321,7 +335,13 @@ impl Heads {
     }
 
     /// Takes a completion of its own; what was held and is now caught up goes on.
-    pub fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
+    pub fn complete(
+        &mut self,
+        vfs: &mut Vfs,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Out>,
+    ) {
         if completion.tag.0.wrapping_sub(self.tags) < 1 << 32 {
             self.flushed(completion, out);
         } else if self.outside.owns(completion.tag) {
@@ -334,7 +354,10 @@ impl Heads {
 
     fn flushed(&mut self, completion: Completion, out: &mut Vec<Out>) {
         let Some((slot, number)) = self.flushing.remove(&completion.tag) else { return };
-        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
+        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut)
+        else {
+            return;
+        };
         match completion.done {
             Done::Flushed => {
                 if let Some(told) = checkout.flushes.get_mut(&number) {
@@ -357,9 +380,18 @@ impl Heads {
         }
     }
 
-    fn watched(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
+    fn watched(
+        &mut self,
+        vfs: &mut Vfs,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Out>,
+    ) {
         let Some(slot) = self.slot_of(completion.tag) else { return };
-        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
+        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut)
+        else {
+            return;
+        };
         let done = match completion.done {
             Done::Journaled(mut batch) => {
                 // A lost subtree under `target/` or `.git` is not rescanned, nor is an excluded
@@ -374,21 +406,28 @@ impl Heads {
             }
             done => done,
         };
-        let watched = checkout.watcher.complete(vfs, Completion { tag: completion.tag, done }, effects);
+        let watched =
+            checkout.watcher.complete(vfs, Completion { tag: completion.tag, done }, effects);
         let head = &checkout.head;
         let mut ended = None;
         for it in watched {
             match it {
-                Watched::Committed(commit) => out.push(Out::Moved { head: head.clone(), root: commit.root }),
+                Watched::Committed(commit) => {
+                    out.push(Out::Moved { head: head.clone(), root: commit.root })
+                }
                 Watched::Lost { .. } | Watched::Scanned => {}
                 Watched::Conflict { path } => {
-                    eprintln!("blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's");
+                    eprintln!(
+                        "blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's"
+                    );
                 }
                 Watched::Unreadable { path, error } if path.is_empty() => {
                     ended = Some(format!("the checkout {head} can't be read: {error}"));
                 }
                 Watched::Unreadable { path, error } => {
-                    ended.get_or_insert_with(|| format!("{head}/{path} changed and can't be read: {error}"));
+                    ended.get_or_insert_with(|| {
+                        format!("{head}/{path} changed and can't be read: {error}")
+                    });
                 }
                 Watched::Ended(error) => {
                     ended.get_or_insert_with(|| match error {
@@ -409,7 +448,13 @@ impl Heads {
     }
 
     /// Fails every held request with a wait `matches` says, naming `what`.
-    fn fail_waiting(&mut self, matches: impl Fn(&(u32, u64)) -> bool, what: &str, head: &str, out: &mut Vec<Out>) {
+    fn fail_waiting(
+        &mut self,
+        matches: impl Fn(&(u32, u64)) -> bool,
+        what: &str,
+        head: &str,
+        out: &mut Vec<Out>,
+    ) {
         for held in self.held.extract_if(.., |it| it.waits.iter().any(&matches)) {
             answer(out, held.from, Some(ApiError::new(what, Some(head.to_owned()))), false);
         }
@@ -425,7 +470,10 @@ impl Heads {
                 it.watcher.idle() && it.flushes.get(number).is_some_and(|told| *told)
             })
         };
-        for held in self.held.extract_if(.., |it| (flushed || !it.outside) && it.waits.iter().all(&caught_up)) {
+        for held in self
+            .held
+            .extract_if(.., |it| (flushed || !it.outside) && it.waits.iter().all(&caught_up))
+        {
             out.push(Out::Pass(Arrived::Request { from: held.from, request: held.request }));
         }
     }
@@ -435,7 +483,9 @@ impl Heads {
         let held = &self.held;
         for (slot, checkout) in (0u32..).zip(&mut self.checkouts) {
             let Some(checkout) = checkout.as_deref_mut() else { continue };
-            checkout.flushes.retain(|number, told| !*told || held.iter().any(|it| it.waits.contains(&(slot, *number))));
+            checkout.flushes.retain(|number, told| {
+                !*told || held.iter().any(|it| it.waits.contains(&(slot, *number)))
+            });
         }
     }
 
@@ -527,7 +577,10 @@ mod tests {
         let from = |id| RequestRef { conn: Conn(1), id };
         let build = |id| Arrived::Request {
             from: from(id),
-            request: Request::Build { view: ViewRef::Head("ci/main".to_owned()), targets: targets.clone() },
+            request: Request::Build {
+                view: ViewRef::Head("ci/main".to_owned()),
+                targets: targets.clone(),
+            },
         };
         let passed = |out: &mut Vec<Out>| -> Vec<u64> {
             out.drain(..)
@@ -552,7 +605,12 @@ mod tests {
             })
             .expect("the new watch is confirmed by a stat");
         let meta = blaze_core::Meta { len: 0, dir: true, modified_ns: 0 };
-        heads.complete(&mut vfs, Completion { tag: stat, done: Done::Stat(Some(meta)) }, &mut effects, &mut out);
+        heads.complete(
+            &mut vfs,
+            Completion { tag: stat, done: Done::Stat(Some(meta)) },
+            &mut effects,
+            &mut out,
+        );
         effects.clear();
 
         heads.arrive(&vfs, build(3), &mut effects, &mut out);
@@ -565,10 +623,20 @@ mod tests {
             .expect("the confirmed watch is flushed");
         assert!(out.is_empty());
         assert_eq!(heads.waiting(), 1);
-        heads.arrive(&vfs, Arrived::Request { from: from(4), request: Request::Status }, &mut effects, &mut out);
+        heads.arrive(
+            &vfs,
+            Arrived::Request { from: from(4), request: Request::Status },
+            &mut effects,
+            &mut out,
+        );
         assert_eq!(passed(&mut out), [4], "what runs no user code waits for no round");
 
-        heads.complete(&mut vfs, Completion { tag: flush, done: Done::Flushed }, &mut effects, &mut out);
+        heads.complete(
+            &mut vfs,
+            Completion { tag: flush, done: Done::Flushed },
+            &mut effects,
+            &mut out,
+        );
         assert_eq!(passed(&mut out), [3]);
         assert_eq!(heads.waiting(), 0);
     }
@@ -587,10 +655,22 @@ mod tests {
         };
         assert!(runs_user_code(&Request::Check { view: view(), targets: targets.clone() }));
         assert!(runs_user_code(&Request::Verify { view: view(), targets: targets.clone() }));
-        let ahead = Request::WillTest { view: view(), filter: Vec::new(), targets: targets.clone(), wait_ms: 0 };
+        let ahead = Request::WillTest {
+            view: view(),
+            filter: Vec::new(),
+            targets: targets.clone(),
+            wait_ms: 0,
+        };
         assert!(runs_user_code(&ahead));
-        let edit = Request::Edit { base: ContentId::of("heads test", b"root"), head: "/w".to_owned(), edits: Vec::new() };
-        assert!(runs_user_code(&edit), "an edit builds its view's proc macros and runs its build scripts first");
+        let edit = Request::Edit {
+            base: ContentId::of("heads test", b"root"),
+            head: "/w".to_owned(),
+            edits: Vec::new(),
+        };
+        assert!(
+            runs_user_code(&edit),
+            "an edit builds its view's proc macros and runs its build scripts first"
+        );
         assert!(!runs_user_code(&Request::Trace { view: view(), targets }));
         assert!(!runs_user_code(&Request::Open { view: view() }));
         assert!(!runs_user_code(&Request::Status));
@@ -610,9 +690,19 @@ mod tests {
         let view = ViewRef::Head("/w".to_owned());
         let ahead = Request::WillTest { view, filter: Vec::new(), targets: targets(), wait_ms: 0 };
         assert_eq!(named(&ahead), ["/w"]);
-        let save = Request::WillSave { ops: Vec::new(), head: "/w".to_owned(), test: true, targets: targets(), wait_ms: 0 };
+        let save = Request::WillSave {
+            ops: Vec::new(),
+            head: "/w".to_owned(),
+            test: true,
+            targets: targets(),
+            wait_ms: 0,
+        };
         assert_eq!(named(&save), ["/w"]);
-        let edit = Request::Edit { base: ContentId::of("heads test", b"root"), head: "/w".to_owned(), edits: Vec::new() };
+        let edit = Request::Edit {
+            base: ContentId::of("heads test", b"root"),
+            head: "/w".to_owned(),
+            edits: Vec::new(),
+        };
         assert!(named(&edit).is_empty());
     }
 
@@ -623,10 +713,14 @@ mod tests {
         let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
         let mut effects = Vec::new();
         let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
-        let numbers: Vec<u64> = (0..40).map(|_| heads.flush(&vfs, "/w", &mut effects).unwrap().1).collect();
+        let numbers: Vec<u64> =
+            (0..40).map(|_| heads.flush(&vfs, "/w", &mut effects).unwrap().1).collect();
         assert_eq!(numbers, (0..40).collect::<Vec<_>>());
         let watch = heads.checkouts[0].as_deref().unwrap().watch;
-        let flushes = effects.iter().filter(|it| matches!(it, Effect::Flush { watch: at, .. } if *at == watch)).count();
+        let flushes = effects
+            .iter()
+            .filter(|it| matches!(it, Effect::Flush { watch: at, .. } if *at == watch))
+            .count();
         assert_eq!(flushes, 40);
         assert!(
             !effects.iter().any(|it| matches!(it, Effect::Write { .. } | Effect::Remove { .. })),

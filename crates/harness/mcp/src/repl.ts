@@ -1,25 +1,60 @@
 // A persistent TypeScript REPL: each cell is TS, top-level declarations survive into later cells,
 // top-level await works, the last expression is the result, and console output is captured per task
 // (see tasks.ts). Cells run concurrently; the caller decides how long to wait before backgrounding.
+//
+// Each cell is posted to harnessd as it runs (`repl_task`): indexed as a `repl` object, and, when the agent said which
+// tool call ran it (`call`), drawn by the app as that call's card. A post is the cell's whole state: its code, status,
+// logs, steps (effects.ts) and, once done, its value as the app shows it (shown.ts). Its first post goes at once, later
+// ones while it runs are coalesced to one per POST_MS; all go out in order, and its end goes at once. A cell that draws UI
+// (Svelte 5 markup, ui/) carries its tree as `ui`; each change to it after the end is posted again, also one per POST_MS.
 import * as acorn from "acorn";
 import { nuon } from "./nuon.ts";
-import { installCapture, inTask, newTask, type Task } from "./tasks.ts";
+import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
 import { req, daemonPresent } from "./daemon.ts";
+import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
+import { shown } from "./shown.ts";
+import { stripCell } from "./ui/compile.ts";
+import { count, installUi, isElement, show } from "./ui/index.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
 export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
 const cap = (s: string, n = 64 << 10) => (s.length > n ? s.slice(0, n) + `… [${s.length - n} more chars]` : s);
-/** Index a cell in harnessd (best effort; the REPL works without the daemon). */
-function post(t: Task) {
-  if (!daemonPresent()) return;
-  req({
-    op: "repl_task", repl: REPL_ID, id: t.id, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,
+const POST_MS = 100;
+const posting = new WeakMap<Task, { chain: Promise<unknown>; timer?: Timer }>();
+
+/** The cell's state as harnessd gets it. */
+export function body(t: Task) {
+  const finished = t.status !== "running";
+  // A value that is one of its steps' results (a cell ending in `await googleSearch(...)`) is shown once, under the step.
+  const value = !finished || t.value === undefined || t.ui !== undefined || rawsOf(t).includes(t.value) ? null
+    // An error's stack as the model got it (the harness frames below the cell cut).
+    : t.status === "error" ? { t: "error" as const, message: t.value instanceof Error ? t.value.message : String(t.value), stack: t.result }
+    : shown(t.value);
+  return {
+    op: "repl_task", repl: REPL_ID, id: t.id, call: t.call, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,
     cwd: process.cwd(), code: cap(t.code), status: t.status, started_ms: t.started.getTime(), ended_ms: t.ended?.getTime() ?? null,
-    logs: cap(t.logs.join("\n")), result: cap(t.result),
-  }).catch(() => {});
+    logs: cap(t.logs.join("\n")), result: cap(t.result), effects: t.effects, effects_dropped: t.effectsDropped, value, ui: t.ui ?? null,
+  };
 }
 
-const transpiler = new Bun.Transpiler({ loader: "ts", target: "bun", trimUnusedImports: false, deadCodeElimination: false });
+/** Index a cell in harnessd (best effort; the REPL works without the daemon): now when it starts or ends (`now`), else within POST_MS. */
+function post(t: Task, now = false) {
+  if (!daemonPresent()) return;
+  const first = !posting.has(t);
+  const p = posting.get(t) ?? posting.set(t, { chain: Promise.resolve() }).get(t)!;
+  const send = () => {
+    p.timer = undefined;
+    // In order: each post waits for the one before it, and reads the task when it goes.
+    p.chain = p.chain.then(() => req(body(t))).catch(() => {});
+  };
+  if (first || now) {
+    clearTimeout(p.timer);
+    send();
+  } else if (!p.timer) {
+    p.timer = setTimeout(send, POST_MS);
+  }
+}
+
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<unknown>;
 
 type Node = acorn.Node & Record<string, any>;
@@ -65,7 +100,7 @@ export function rewrite(js: string): { body: string; names: string[] } {
         else if (s.type === "ImportDefaultSpecifier") parts.push(`${s.local.name} = __m.default`);
         else parts.push(`${s.local.name} = __m[${JSON.stringify(s.imported.name ?? s.imported.value)}]`);
       }
-      text = `;{ const __m = await import(${spec}); ${parts.join("; ")} }`;
+      text = `;{ const __m = await __import(${spec}); ${parts.join("; ")} }`;
     } else if (i === stmts.length - 1 && node.type === "ExpressionStatement") {
       text = `return (${src(node.expression)});`;
     }
@@ -81,21 +116,28 @@ export class Repl {
   readonly scope: Record<string, unknown>;
 
   constructor(globals: Record<string, unknown>) {
-    this.scope = { ...globals };
+    // __import: a cell's `import` (node:fs comes back with its reads and writes recorded as steps, effects.ts).
+    this.scope = { ...globals, __import: async (spec: string) => (await fsFor(spec)) ?? import(spec) };
+    installUi(this.scope);
     installCapture();
+    installEffects();
+    watchTasks(post);
   }
 
-  /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture. */
-  run(code: string, timeoutMs?: number): Task {
-    const t = newTask(code);
+  /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture.
+   *  `call` is the agent's id for the tool call running it, when known. */
+  run(code: string, timeoutMs?: number, call: string | null = null): Task {
+    const t = newTask(code, call);
     post(t);
-    inTask(t, () => this.#run(code, timeoutMs)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t); });
+    inTask(t, () => this.#run(t, code, timeoutMs)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t, true); });
     return t;
   }
 
-  async #run(code: string, timeoutMs?: number): Promise<{ ok: boolean; value: unknown; result: string }> {
+  async #run(t: Task, code: string, timeoutMs?: number): Promise<{ ok: boolean; value: unknown; result: string }> {
     try {
-      const js = transpiler.transformSync(code);
+      // TypeScript with its types erased, or a cell of Svelte markup compiled (ui/compile.ts); the compiler's warnings go to the
+      // cell's logs, which the agent reads.
+      const js = stripCell(code, (w) => t.logs.push(`[svelte] ${w}`));
       const { body, names } = rewrite(js);
       for (const n of names) if (!(n in this.scope)) this.scope[n] = undefined;
       // Sloppy-mode `with` routes bare identifiers to the persistent scope, falling back to globals.
@@ -105,6 +147,12 @@ export class Repl {
         fn(this.scope),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`cell timed out after ${timeoutMs}ms`)), timeoutMs); }),
       ]).finally(() => clearTimeout(timer)));
+      // A cell whose value is a component draws it (the person sees it under the cell); the agent is told it did.
+      if (isElement(value)) {
+        show(t, value);
+        return { ok: true, value: undefined, result: `UI shown (${count(t.ui)} elements)` };
+      }
+      if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${typeof value === "string" ? value : nuon(value, { maxRows: 100 })}`}` };
       return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
       // Drop the harness frames below the cell.

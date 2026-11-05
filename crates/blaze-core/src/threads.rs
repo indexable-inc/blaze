@@ -54,8 +54,7 @@ const CONNECTIONS: u32 = 1 << 20;
 
 /// Why a process or a socket fails here.
 #[cfg(windows)]
-const UNIX_ONLY: &str =
-    "processes and sockets are built on Unix only; Windows' are lane usercode's (AppContainer and job objects)";
+const UNIX_ONLY: &str = "processes and sockets are built on Unix only; Windows' are lane usercode's (AppContainer and job objects)";
 /// Why a process or a socket fails here.
 #[cfg(target_os = "wasi")]
 const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive, a send and a hangup are refused on \
@@ -65,11 +64,14 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
-#[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI keeps no spawns, watches or listens"))]
+#[cfg_attr(
+    target_os = "wasi",
+    allow(dead_code, reason = "WASI keeps no spawns, watches or listens")
+)]
 pub(crate) mod tagged {
     use blaze_hash::HashMap;
-    use std::alloc::Global;
     use blaze_mem::{Slab, Tag as MemTag};
+    use std::alloc::Global;
 
     use crate::Tag;
 
@@ -193,12 +195,20 @@ pub(crate) mod tagged {
                             assert_eq!(old, model.insert(tag, step), "seed {seed} step {step}");
                             ids.push(id);
                         }
-                        2 => assert_eq!(tagged.remove(tag), model.remove(&tag), "seed {seed} step {step}"),
+                        2 => assert_eq!(
+                            tagged.remove(tag),
+                            model.remove(&tag),
+                            "seed {seed} step {step}"
+                        ),
                         _ if !ids.is_empty() => {
                             let id = ids[rng.below(ids.len() as u64) as usize];
                             let live = tagged.by_id(id).map(|(tag, &value)| (tag, value));
                             if let Some((tag, value)) = live {
-                                assert_eq!(model.get(&tag), Some(&value), "seed {seed} step {step}");
+                                assert_eq!(
+                                    model.get(&tag),
+                                    Some(&value),
+                                    "seed {seed} step {step}"
+                                );
                                 assert_eq!(tagged.id(tag), Some(id), "seed {seed} step {step}");
                                 if rng.one_in(2) {
                                     assert_eq!(tagged.remove_id(id), Some((tag, value)));
@@ -258,7 +268,10 @@ impl<T> Mailbox<T> {
     fn new(room: usize) -> Mailbox<T> {
         // alloc: once per driver, the room of what is told between two polls.
         let items = VecDeque::with_capacity(room);
-        Mailbox { state: Mutex::new(Inbox { items, waiting: 0, closed: false }), ready: Condvar::new() }
+        Mailbox {
+            state: Mutex::new(Inbox { items, waiting: 0, closed: false }),
+            ready: Condvar::new(),
+        }
     }
 
     /// `item` put in, or back once the mailbox is closed.
@@ -275,7 +288,10 @@ impl<T> Mailbox<T> {
     }
 
     /// The next item, waiting for one; `None` once it is closed and empty.
-    #[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI has no IO threads to take file effects"))]
+    #[cfg_attr(
+        target_os = "wasi",
+        allow(dead_code, reason = "WASI has no IO threads to take file effects")
+    )]
     fn pop(&self) -> Option<T> {
         let mut state = lock(&self.state);
         loop {
@@ -423,6 +439,8 @@ pub struct Threads {
     /// Each connection's [`crate::Conn`] is its handle's bits.
     #[cfg(unix)]
     conns: Slab<Connection>,
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
 }
 
@@ -484,6 +502,7 @@ impl Threads {
             untold: Vec::with_capacity(4),
             confine: None,
             spawn_dirs,
+            locks: crate::locks::Locks::new(),
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -558,7 +577,10 @@ impl Threads {
     /// So with no timer there is nothing to wait for, and a wait never blocks on the mailbox.
     /// `wait` is already cut to the next timer's deadline by `poll`.
     #[cfg(target_os = "wasi")]
-    #[allow(clippy::disallowed_methods, reason = "the driver's own timer: WASI's one wait is a sleep on its clock")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the driver's own timer: WASI's one wait is a sleep on its clock"
+    )]
     fn take_done(&mut self, wait: Duration) {
         self.shared.done.take_all(&mut self.inbox, Duration::ZERO);
         if self.inbox.is_empty() && !wait.is_zero() && self.timers.next_deadline().is_some() {
@@ -655,7 +677,12 @@ impl Threads {
     /// first, telling nothing more. Returns once the system watches the tree, so a change made
     /// after is heard.
     #[cfg(target_os = "linux")]
-    fn watch(&mut self, dir: crate::FileName, since: Option<crate::Cursor>, tag: Tag) -> io::Result<()> {
+    fn watch(
+        &mut self,
+        dir: crate::FileName,
+        since: Option<crate::Cursor>,
+        tag: Tag,
+    ) -> io::Result<()> {
         if let Some(old) = self.watches.remove(tag) {
             old.control.stop();
             self.in_flight -= 1;
@@ -669,7 +696,8 @@ impl Threads {
         // clone: the watch's control, kept by the driver.
         let (watch, _) = self.watches.insert(tag, Watching { control: control.clone() });
         // clone: the watch's control, for its errand.
-        let errand = Errand::Watch { dir, journal: since.is_some(), control: control.clone(), tag, watch };
+        let errand =
+            Errand::Watch { dir, journal: since.is_some(), control: control.clone(), tag, watch };
         self.dispatch(errand);
         match control.started() {
             Ok(()) => {
@@ -693,7 +721,12 @@ impl Threads {
     /// earlier one where there is one. A watch of `tag` already ends first, telling nothing
     /// more.
     #[cfg(target_os = "macos")]
-    fn watch(&mut self, dir: crate::FileName, since: Option<crate::Cursor>, tag: Tag) -> io::Result<()> {
+    fn watch(
+        &mut self,
+        dir: crate::FileName,
+        since: Option<crate::Cursor>,
+        tag: Tag,
+    ) -> io::Result<()> {
         if self.watches.get(tag).is_some() {
             self.retire(tag, false);
         }
@@ -738,7 +771,10 @@ impl Threads {
         let untold = &mut self.untold;
         watch.stop(|flush| untold.push(flush));
         #[cfg(test)]
-        self.shared.off.allocations.fetch_add(watch.take_overhead(), std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .off
+            .allocations
+            .fetch_add(watch.take_overhead(), std::sync::atomic::Ordering::Relaxed);
         self.shared.done.take_all(&mut self.inbox, Duration::ZERO);
         self.take_told();
         while let Some(flush) = self.untold.pop() {
@@ -775,11 +811,18 @@ impl Threads {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn watch(&mut self, _: crate::FileName, since: Option<crate::Cursor>, _: Tag) -> io::Result<()> {
+    fn watch(
+        &mut self,
+        _: crate::FileName,
+        since: Option<crate::Cursor>,
+        _: Tag,
+    ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             match since {
-                None => "watching files is built on Linux (inotify, fanotify) and macOS (FSEvents) only",
+                None => {
+                    "watching files is built on Linux (inotify, fanotify) and macOS (FSEvents) only"
+                }
                 Some(_) => {
                     "the threads driver reads journals of changes on Linux and macOS only; on \
                      Windows the USN journal is read by the IOCP driver"
@@ -910,7 +953,11 @@ fn work(shared: &Shared, effect: Effect) -> bool {
 }
 
 /// `f` of `file` under `root`, joined in the thread's path buffer.
-fn at<R>(root: &Path, file: &crate::FileName, f: impl FnOnce(&Path) -> io::Result<R>) -> io::Result<R> {
+fn at<R>(
+    root: &Path,
+    file: &crate::FileName,
+    f: impl FnOnce(&Path) -> io::Result<R>,
+) -> io::Result<R> {
     blaze_mem::scratch::with_path(|path| {
         path.push(root);
         path.push(file.as_str());
@@ -979,7 +1026,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::seal(path, mode)?;
             Ok(Done::Moded)
         }),
-        Effect::Private { dir, .. } => Ok(Done::Private(at(root, &dir, |path| fs::private(path, &dir))?)),
+        Effect::Private { dir, .. } => {
+            Ok(Done::Private(at(root, &dir, |path| fs::private(path, &dir))?))
+        }
         Effect::Times { file, modified_ns, .. } => at(root, &file, |path| {
             fs::set_times(path, modified_ns)?;
             Ok(Done::Timed)
@@ -993,11 +1042,15 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Linked)
         }),
         Effect::Stat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, true))?)),
-        Effect::Lstat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?)),
+        Effect::Lstat { file, .. } => {
+            Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?))
+        }
         #[cfg(any(unix, target_os = "wasi"))]
         Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
         #[cfg(any(unix, target_os = "wasi"))]
-        Effect::Entries { dir, .. } => Ok(Done::Entries(at(root, &dir, |path| fs::entries(path, &dir))?)),
+        Effect::Entries { dir, .. } => {
+            Ok(Done::Entries(at(root, &dir, |path| fs::entries(path, &dir))?))
+        }
         #[cfg(windows)]
         Effect::Stamp { files, .. } => Ok(Done::Stamped(crate::iocp::stamps(root, &files)?)),
         #[cfg(windows)]
@@ -1010,6 +1063,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Removed)
         }),
         Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
+        Effect::Lock { .. } | Effect::Unlock { .. } => {
+            unreachable!("file locks are kept by the driver, which takes each as it is asked for")
+        }
         Effect::Timer { .. }
         | Effect::Watch { .. }
         | Effect::Journal { .. }
@@ -1049,7 +1105,10 @@ fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<
     match target.into_os_string().into_string() {
         Ok(target) => Ok(target.replace('\\', "/").into_bytes()),
         // alloc: an error path.
-        Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{file}: a link's target that is not UTF-8"))),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{file}: a link's target that is not UTF-8"),
+        )),
     }
 }
 
@@ -1224,7 +1283,8 @@ fn dispatch(shared: &Arc<Shared>, errand: Errand) {
     drop(errands);
     let pool = Arc::clone(shared); // clone: the state a thread more shares.
     // alloc: a thread more, for the most errands at once; kept for the next.
-    let started = std::thread::Builder::new().name("blaze-errand".into()).spawn(move || errand_thread(&pool));
+    let started =
+        std::thread::Builder::new().name("blaze-errand".into()).spawn(move || errand_thread(&pool));
     if let Err(error) = started {
         let mut errands = lock(&shared.errands);
         let at = errands.errands.iter().rposition(|it| it.tag() == tag);
@@ -1301,9 +1361,15 @@ impl Errand {
                 Some(Told::Exited { spawn, completion: Completion { tag, done } })
             }
             Errand::Connect { tag, .. } => Some(Told::Done(Completion { tag, done })),
-            Errand::Recv { into, tag, .. } => Some(Told::Done(Completion { tag, done: Done::unread(into, why) })),
-            Errand::Send { bytes, tag, .. } => Some(Told::Done(Completion { tag, done: Done::unsent(bytes, why) })),
-            Errand::Listen { listen, tag, .. } => Some(Told::Listened { listen, completion: Completion { tag, done } }),
+            Errand::Recv { into, tag, .. } => {
+                Some(Told::Done(Completion { tag, done: Done::unread(into, why) }))
+            }
+            Errand::Send { bytes, tag, .. } => {
+                Some(Told::Done(Completion { tag, done: Done::unsent(bytes, why) }))
+            }
+            Errand::Listen { listen, tag, .. } => {
+                Some(Told::Listened { listen, completion: Completion { tag, done } })
+            }
             #[cfg(target_os = "linux")]
             Errand::Watch { control, .. } => {
                 control.start(Err(why));
@@ -1438,7 +1504,9 @@ fn accept_until_stopped(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
                 ) => {}
             Err(error) => return failed(error),
         }
@@ -1631,7 +1699,8 @@ mod linux {
                 room.taken.extend(lock(&control.state).flushes.drain(..));
                 let mut gone = false;
                 // What a drain allocates is the batches it reads; `tell` allocates nothing.
-                let drained = shared.payload(|| tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done))));
+                let drained = shared
+                    .payload(|| tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done))));
                 if gone {
                     return None;
                 }
@@ -1704,7 +1773,8 @@ impl Driver for Threads {
             match effect {
                 Effect::Timer { after, tag } => {
                     self.in_flight += 1;
-                    let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                    let due =
+                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
                     self.timers.insert(due, tag);
                 }
                 Effect::Watch { dir, tag } => {
@@ -1722,13 +1792,25 @@ impl Driver for Threads {
                 Effect::Unwatch { tag } => {
                     if !self.unwatch(tag) {
                         // alloc: an error path.
-                        self.tell(tag, Done::Failed(IoError(format!("nothing is watched as {tag:?}"))));
+                        self.tell(
+                            tag,
+                            Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
+                        );
                     }
                 }
                 Effect::Flush { watch, tag } => {
                     if !self.flush(watch, tag) {
                         self.tell(tag, Done::Failed(IoError(no_watch(watch))));
                     }
+                }
+                // A lock never waits, so it is taken here rather than on an IO thread.
+                Effect::Lock { file, mode, tag } => {
+                    let done = self.locks.lock(&self.shared.root, &file, mode, tag);
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
+                }
+                Effect::Unlock { lock, tag } => {
+                    let done = self.locks.unlock(lock);
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
                 }
                 #[cfg(unix)]
                 Effect::Spawn { command, tag } => {
@@ -1776,7 +1858,9 @@ impl Driver for Threads {
                         self.in_flight += 1;
                         self.dispatch(Errand::Recv { socket, most, into, tag });
                     }
-                    None => self.tell(tag, Done::unread(into, format_args!("no connection {conn:?}"))),
+                    None => {
+                        self.tell(tag, Done::unread(into, format_args!("no connection {conn:?}")))
+                    }
                 },
                 #[cfg(unix)]
                 Effect::Send { conn, bytes, tag } => match self.socket(conn) {
@@ -1784,7 +1868,9 @@ impl Driver for Threads {
                         self.in_flight += 1;
                         self.dispatch(Errand::Send { socket, bytes, tag });
                     }
-                    None => self.tell(tag, Done::unsent(bytes, format_args!("no connection {conn:?}"))),
+                    None => {
+                        self.tell(tag, Done::unsent(bytes, format_args!("no connection {conn:?}")))
+                    }
                 },
                 #[cfg(unix)]
                 Effect::Hangup { conn, tag } => {
@@ -1819,7 +1905,9 @@ impl Driver for Threads {
                 effect => {
                     self.in_flight += 1;
                     if self.shared.files.push(effect).is_err() {
-                        unreachable!("the IO threads' queue is closed only as the driver is dropped");
+                        unreachable!(
+                            "the IO threads' queue is closed only as the driver is dropped"
+                        );
                     }
                 }
                 // WASI has no threads: the file call is made here, on the thread that submits
@@ -1828,7 +1916,9 @@ impl Driver for Threads {
                 effect => {
                     self.in_flight += 1;
                     if !work(&self.shared, effect) {
-                        unreachable!("the driver's mailbox is closed only as the driver is dropped");
+                        unreachable!(
+                            "the driver's mailbox is closed only as the driver is dropped"
+                        );
                     }
                 }
             }
@@ -1841,8 +1931,10 @@ impl Driver for Threads {
         let wait = match self.ready.is_empty() {
             true => {
                 let now = wheel::ticks(self.start.elapsed());
-                let until_timer =
-                    self.timers.next_deadline().map(|at| Duration::from_nanos(at.saturating_sub(now)));
+                let until_timer = self
+                    .timers
+                    .next_deadline()
+                    .map(|at| Duration::from_nanos(at.saturating_sub(now)));
                 until_timer.map_or(wait, |it| it.min(wait))
             }
             false => Duration::ZERO,

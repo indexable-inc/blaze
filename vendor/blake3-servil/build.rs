@@ -117,7 +117,8 @@ fn assembles(name: &str, flag: &str, source: &str) -> bool {
 // (Debian 12, Raspberry Pi OS) ship such compilers.
 fn c_compiler_supports_sme2() -> bool {
     let compiler = new_build().get_compiler().path().to_owned();
-    let supported = assembles("sme2", "-march=armv9-a+sme2", ".arch armv9-a+sme2\nsmstart sm\nsmstop sm\n");
+    let supported =
+        assembles("sme2", "-march=armv9-a+sme2", ".arch armv9-a+sme2\nsmstart sm\nsmstop sm\n");
     if !supported {
         warn(&format!(
             "blake3-servil: {compiler:?} cannot assemble SME2 (-march=armv9-a+sme2), so this \
@@ -147,7 +148,11 @@ fn build_sme2_assembly() {
 fn assert_assembles_sha3() {
     let compiler = new_build().get_compiler().path().to_owned();
     assert!(
-        assembles("sha3", "-march=armv8.2-a+sha3", ".arch armv8.2-a+sha3\nxar v0.2d, v1.2d, v2.2d, #1\n"),
+        assembles(
+            "sha3",
+            "-march=armv8.2-a+sha3",
+            ".arch armv8.2-a+sha3\nxar v0.2d, v1.2d, v2.2d, #1\n"
+        ),
         "blake3-servil: {compiler:?} cannot assemble armv8.2-a+sha3, which the AArch64 kernels need \
          (GNU as 2.30 or later, or Clang/LLVM 7 or later); use official BLAKE3 for a build without assembly (https://github.com/BLAKE3-team/BLAKE3)"
     );
@@ -196,7 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // As of Rust 1.80, unrecognized config names are warnings. Give Cargo all of our config names.
     // `shuttle` gates tests/shuttle_*.rs (RUSTFLAGS="--cfg shuttle"); the
     // library compiles the same either way.
-    let all_cfgs = ["blake3_sse41_ffi", "blake3_avx2_ffi", "blake3_avx512_ffi", "blake3_neon", "blake3_sme2", "shuttle"];
+    let all_cfgs = [
+        "blake3_sse41_ffi",
+        "blake3_avx2_ffi",
+        "blake3_avx512_ffi",
+        "blake3_neon",
+        "blake3_sme2",
+        "shuttle",
+    ];
     for cfg_name in all_cfgs {
         // https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script
         println!("cargo::rustc-check-cfg=cfg({cfg_name}, values(none()))");

@@ -3,20 +3,20 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
 use blaze_ids::rng::SplitMix64 as Rng;
+use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use blaze_query::db::Durability;
 use span::{Edition, TextSize};
 use syntax::TextRange;
 use triomphe::Arc;
-use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateType, CrateTypes, CrateWorkspaceData, Db, DependencyBuilder, EditionedFileId, Env,
-    FileText, SourceRoot, SourceRootId, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot,
-    all_crates_content, cfg_options_content,
+    FileText, SourceRoot, SourceRootId, TargetKind, Trigger, ViewChange, ViewError, ViewFile,
+    ViewRoot, all_crates_content, cfg_options_content,
     reparse::{
         REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
         common_suffix_scalar,
@@ -126,9 +126,8 @@ fn equal_content_gives_equal_ids_across_databases() {
 fn a_file_text_edit_changes_its_id_and_its_source_roots() {
     let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
-    let ids = |db: &Db| {
-        (db.file_text(files[1]).content(db), db.source_root(SourceRootId(0)).content(db))
-    };
+    let ids =
+        |db: &Db| (db.file_text(files[1]).content(db), db.source_root(SourceRootId(0)).content(db));
     let before = ids(&db);
     assert_eq!(before.0, FileText::content_of("pub fn f() {}", None));
 
@@ -222,6 +221,38 @@ fn a_dependencys_change_changes_its_dependents_ids() {
     assert_ne!(after.3, before.3);
 
     b.set_env(&mut db, Env::default());
+    assert_eq!(ids(&db), before);
+}
+
+#[test]
+fn a_crates_build_target_changes_its_content_and_its_dependents() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    depend(&mut graph, a, b, "b");
+    let crates = graph.set_in_db(&mut db);
+    let (a, b) = (crates[&a], crates[&b]);
+    let ids = |db: &Db| (a.content(db), b.content(db), all_crates_content(db));
+    let before = ids(&db);
+    let original = b.extra_data(&db).clone(); // clone: test restores the original input
+    let mut seen = vec![before.1]; // alloc: the four target identities under test
+    for built_for in [
+        crate::BuiltFor { platform: Some(Symbol::intern("x86_64-unknown-linux-gnu")), macro_wasm: false },
+        crate::BuiltFor { platform: Some(Symbol::intern("wasm32-wasip1")), macro_wasm: false },
+        crate::BuiltFor { platform: Some(Symbol::intern("wasm32-wasip1")), macro_wasm: true },
+    ] {
+        let mut extra = original.clone(); // clone: change only what the crate is built for
+        extra.built_for = built_for;
+        b.set_extra_data(&mut db, extra);
+        let after = ids(&db);
+        assert_ne!(after.0, before.0, "the dependent's content follows its dependency");
+        assert_ne!(after.2, before.2, "the graph's content follows its crates");
+        assert!(!seen.contains(&after.1), "host, target and proc-macro builds are distinct");
+        seen.push(after.1);
+    }
+    b.set_extra_data(&mut db, original);
     assert_eq!(ids(&db), before);
 }
 
@@ -453,7 +484,13 @@ fn set_view(
     let bytes: Vec<blaze_vfs::Bytes> = files.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
     let files: Vec<ViewFile<'_>> =
         files.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
-    db.set_view_root(ViewRoot { base, built: &[], partition, other: SourceRootId(1), files: &files })
+    db.set_view_root(ViewRoot {
+        base,
+        built: &[],
+        partition,
+        other: SourceRootId(1),
+        files: &files,
+    })
 }
 
 fn file_at(db: &Db, base: &AbsPathBuf, path: &str) -> Option<FileId> {
@@ -489,8 +526,13 @@ fn a_views_text_is_its_bytes() {
     let (base, partition) = checkout(&mut db);
     let bytes = vfs_bytes(b"fn f() {}");
     let files = [view_file("src/lib.rs", &bytes)];
-    let view =
-        ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
+    let view = ViewRoot {
+        base: &base,
+        built: &[],
+        partition: &partition,
+        other: SourceRootId(1),
+        files: &files,
+    };
     db.set_view_root(view).unwrap();
     let file = file_at(&db, &base, "src/lib.rs").unwrap();
     let text = db.file_text(file).text(&db);
@@ -569,7 +611,11 @@ fn the_bytes_of_a_file_without_text_are_its_content() {
     assert_eq!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfe][..]));
     let (content, root_was) = (db.file_content(data), root(&db));
     assert_eq!(content, crate::IncludedFile::content_of(Ok(&[0xff, 0xfe][..])));
-    assert_eq!(set_view(&mut db, &base, &partition, first).unwrap(), ViewChange::default(), "the same bytes write nothing");
+    assert_eq!(
+        set_view(&mut db, &base, &partition, first).unwrap(),
+        ViewChange::default(),
+        "the same bytes write nothing"
+    );
 
     let edited: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfd])];
     let change = set_view(&mut db, &base, &partition, edited).unwrap();
@@ -583,7 +629,11 @@ fn the_bytes_of_a_file_without_text_are_its_content() {
     set_view(&mut db, &base, &partition, text).unwrap();
     assert_eq!(db.raw_file(data), None);
     assert_eq!(db.file_content(data), db.file_text(data).content(&db));
-    assert_ne!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfd][..]), "what read the bytes reruns");
+    assert_ne!(
+        raw.bytes(&db).map(|it| &it[..]),
+        Some(&[0xff, 0xfd][..]),
+        "what read the bytes reruns"
+    );
 
     set_view(&mut db, &base, &partition, first).unwrap();
     assert_eq!(db.raw_file(data), Some(raw), "the input comes back");
@@ -604,8 +654,13 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
             bytes: &main,
         },
     ];
-    let view =
-        ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
+    let view = ViewRoot {
+        base: &base,
+        built: &[],
+        partition: &partition,
+        other: SourceRootId(1),
+        files: &files,
+    };
     let error = db.set_view_root(view).unwrap_err();
     assert!(matches!(&error, ViewError::Mismatch { path, .. } if path == "src/main.rs"));
     assert_eq!(revision(&db), then);
@@ -642,7 +697,11 @@ fn an_alias_is_found_by_its_file_never_by_its_path() {
     assert_eq!(root.resolve_path(from_alias), Some(a));
     assert_eq!(db.resolve_path(from_alias), Some(a));
     assert_eq!(file_at(&db, &base, "src/lib.rs"), Some(lib));
-    assert_eq!(db.source_root(SourceRootId(0)).content(&db), content, "the root's files are as they were");
+    assert_eq!(
+        db.source_root(SourceRootId(0)).content(&db),
+        content,
+        "the root's files are as they were"
+    );
 
     assert_eq!(db.file_source_root(alias).source_root_id(&db), SourceRootId(0));
     assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
@@ -658,8 +717,12 @@ fn a_view_set_again_keeps_every_alias() {
     let (base, partition, lib, alias) = aliased_view(&mut db);
     let path = VfsPath::from(base.join("src/lib.rs"));
     // A view that adds a file rebuilds nothing of the alias, and one the same again writes nothing.
-    let more: &[(&str, &[u8])] =
-        &[("src/lib.rs", b"mod a;"), ("src/a.rs", b"fn f() {}"), ("README.md", b"hello"), ("src/b.rs", b"")];
+    let more: &[(&str, &[u8])] = &[
+        ("src/lib.rs", b"mod a;"),
+        ("src/a.rs", b"fn f() {}"),
+        ("README.md", b"hello"),
+        ("src/b.rs", b""),
+    ];
     for view in [VIEW, more, VIEW, VIEW] {
         let change = set_view(&mut db, &base, &partition, view).unwrap();
         assert!(!change.removed.contains(&alias), "{change:?}");
@@ -688,9 +751,16 @@ fn an_edit_of_a_root_reaches_every_alias_of_it() {
     assert_eq!(&**db.file_text(first).text(&db), "mod a; mod b;");
     assert_eq!(db.file_text(first).content(&db), FileText::content_of("mod a; mod b;", None));
     let appended = "mod a; mod b;\nmod __harness {}";
-    assert_eq!(&**db.file_text(second).text(&db), appended, "its suffix is kept after the new text");
+    assert_eq!(
+        &**db.file_text(second).text(&db),
+        appended,
+        "its suffix is kept after the new text"
+    );
     assert_eq!(db.file_text(second).appended_root_module(&db), Some("__harness"));
-    assert_eq!(db.file_text(second).content(&db), FileText::content_of(appended, Some("__harness")));
+    assert_eq!(
+        db.file_text(second).content(&db),
+        FileText::content_of(appended, Some("__harness"))
+    );
     assert_eq!(&**db.file_text(lib).text(&db), "mod a; mod b;");
     assert_eq!(db.file_text(lib).appended_root_module(&db), None);
 
@@ -705,7 +775,10 @@ fn an_alias_owns_its_suffix() {
     let mut db = Db::for_tests();
     let (_, _, lib, alias) = aliased_view(&mut db);
     let shared = db.file_text(lib).text(&db).as_ptr();
-    assert!(std::ptr::eq(db.file_text(alias).text(&db).as_ptr(), shared), "with no suffix it shares the bytes");
+    assert!(
+        std::ptr::eq(db.file_text(alias).text(&db).as_ptr(), shared),
+        "with no suffix it shares the bytes"
+    );
 
     db.set_alias_appended(alias, Some(("__list", "\nmod __list {}"))).unwrap();
     assert_eq!(&**db.file_text(alias).text(&db), "mod a;\nmod __list {}");
@@ -749,7 +822,10 @@ fn a_file_gone_takes_its_aliases_with_it() {
     assert_eq!(file_at(&db, &base, "src/lib.rs"), Some(lib));
     assert!(db.files().aliases_of(lib).is_empty());
     let again = db.alias(lib).unwrap();
-    assert_ne!(again, alias, "a gone alias's ID keeps its parked text, so it is not handed out again");
+    assert_ne!(
+        again, alias,
+        "a gone alias's ID keeps its parked text, so it is not handed out again"
+    );
 }
 
 #[test]
@@ -1034,7 +1110,13 @@ fn a_view_set_over_others_is_the_view_set_alone() {
         let bytes: Vec<blaze_vfs::Bytes> = view.iter().map(|(_, bytes)| vfs_bytes(bytes)).collect();
         let files: Vec<ViewFile<'_>> =
             view.iter().zip(&bytes).map(|((path, _), bytes)| view_file(path, bytes)).collect();
-        let root = ViewRoot { base: &base, built: &built, partition: &partition, other: SourceRootId(1), files: &files };
+        let root = ViewRoot {
+            base: &base,
+            built: &built,
+            partition: &partition,
+            other: SourceRootId(1),
+            files: &files,
+        };
         let change = db.set_view_root(root).unwrap();
 
         // What the change says, from the two views alone. A file under `target` is built: one
@@ -1078,7 +1160,11 @@ fn a_view_set_over_others_is_the_view_set_alone() {
         for list in [&mut set, &mut added, &mut no_text, &mut removed] {
             list.sort_unstable();
         }
-        assert_eq!((change.set, change.added, change.no_text, change.removed), (set, added, no_text, removed), "step {step}");
+        assert_eq!(
+            (change.set, change.added, change.no_text, change.removed),
+            (set, added, no_text, removed),
+            "step {step}"
+        );
 
         // Built files the view lacks stay; take them into the view for the comparison.
         let mut whole = view.clone();
@@ -1155,7 +1241,8 @@ fn a_private_dependency_reads_back_private_and_changes_the_id() {
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
         let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
-        let dependency = DependencyBuilder::new(CrateName::new("c").unwrap(), c).with_private(private);
+        let dependency =
+            DependencyBuilder::new(CrateName::new("c").unwrap(), c).with_private(private);
         graph.add_dep(a, dependency).unwrap();
         let a = graph.set_in_db(&mut db)[&a];
         assert_eq!(a.data(&db).dependencies[0].is_private(), private);
@@ -1266,7 +1353,10 @@ fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
     put_root(
         &mut db,
         0,
-        &[(lib, "/ws/member/src/lib.rs", "#[path = \"../../shared/m.rs\"] mod m;"), (own, "/ws/member/src/a.rs", "")],
+        &[
+            (lib, "/ws/member/src/lib.rs", "#[path = \"../../shared/m.rs\"] mod m;"),
+            (own, "/ws/member/src/a.rs", ""),
+        ],
     );
     put_root(&mut db, 1, &[(m, "/ws/shared/m.rs", "pub fn f() {}")]);
 
@@ -1294,6 +1384,81 @@ fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
     put_root(&mut db, 2, &[(moved, "/ws/shared/m.rs", "pub fn g() {}")]);
     assert_eq!(shared_module(&db, anchor), Some((moved.index(), 13)));
     assert_eq!(shared_module_runs(), runs + 4);
+}
+
+thread_local! {
+    static DISK_MODULE_RUNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// What a `#[path = "../../shared/m.rs"] mod m;` in the root of `krate` reads when no source
+/// root has that file: the file read from disk and its text's length, as a def map would.
+#[blaze_query::tracked(returns(copy))]
+fn disk_module(db: &Db, krate: Crate) -> Option<(u32, u32)> {
+    DISK_MODULE_RUNS.with(|it| it.set(it.get() + 1));
+    let anchor = krate.data(db).root_file_id;
+    let path = AnchoredPath { anchor, path: "../../shared/m.rs" };
+    let file = db.resolve_path(path).or_else(|| db.module_source(krate, path))?;
+    Some((file.index(), db.file_text(file).text(db).len() as u32))
+}
+
+fn disk_module_runs() -> usize {
+    DISK_MODULE_RUNS.with(Cell::get)
+}
+
+/// A module file outside every source root (crates/blaze-inproc-rt's `#[path]` into
+/// library/) is read from disk as rustc reads it, noted as the crate's read, and its own
+/// modules resolve beside it; an edit of it, or its removal, reruns the reader once the disk
+/// is read again.
+#[test]
+fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns_the_reader() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-module-{}", std::process::id()));
+    let dir = AbsPathBuf::assert_utf8(dir);
+    let (src, shared) = (dir.join("member/src"), dir.join("shared"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    let (m, n) = (shared.join("m.rs"), shared.join("n.rs"));
+    std::fs::write(&m, "pub fn f() {}").unwrap();
+    std::fs::write(&n, "").unwrap();
+
+    let mut db = Db::for_tests();
+    let lib = FileId::from_raw(0);
+    db.set_file_text_with_durability(lib, "", Durability::LOW);
+    db.set_file_source_root_with_durability(lib, SourceRootId(0), Durability::MEDIUM);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(src.join("lib.rs")));
+    let root = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+    let mut graph = CrateGraphBuilder::default();
+    let krate = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let krate = graph.set_in_db(&mut db)[&krate];
+
+    let path = AnchoredPath { anchor: lib, path: "../../shared/m.rs" };
+    assert_eq!(db.resolve_path(path), None, "no source root has it");
+    let runs = disk_module_runs();
+    let (file, len) = disk_module(&db, krate).unwrap();
+    assert_eq!(len, 13);
+    assert_eq!(disk_module(&db, krate), Some((file, len)));
+    assert_eq!(disk_module_runs(), runs + 1);
+    let read: Vec<_> = db.files().included_by(&db, krate).into_iter().map(|it| it.0).collect();
+    assert!(read.contains(&m), "the crate's keys cover what it read: {read:?}");
+
+    // Its own `mod n;` resolves beside it, from its own one-file source root.
+    let file = FileId::from_raw(file);
+    let nested = db.module_source(krate, AnchoredPath { anchor: file, path: "n.rs" }).unwrap();
+    assert_eq!(db.path_for_file(nested), Some(&VfsPath::from(n.clone())));
+
+    // An edit on disk, read again: the reader runs again and reads the new text.
+    std::fs::write(&m, "pub fn f() { 1 }").unwrap();
+    assert!(db.reload_included_files(Trigger::named("a test's edit")).contains(&m));
+    assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
+    assert_eq!(disk_module_runs(), runs + 2);
+
+    // Gone from disk: no module file, never the old text.
+    std::fs::remove_file(&m).unwrap();
+    assert!(db.reload_included_files(Trigger::named("a test's removal")).contains(&m));
+    assert_eq!(disk_module(&db, krate), None);
+    assert_eq!(disk_module_runs(), runs + 3);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -1335,11 +1500,29 @@ fn the_simd_prefix_and_suffix_equal_their_scalar_reference() {
 /// in, or both.
 fn random_edit(rng: &mut Rng, text: &str) -> String {
     const SNIPPETS: &[&str] = &[
-        "", "x", " ", "\n", "{", "}", "(", ")", ";", "\"", "'a", "//", "/*", "*/", "é", "fn g() {}",
-        "1 + 2", "struct S;", "let y = 0;", "mod m { }", "#[cfg(test)]",
+        "",
+        "x",
+        " ",
+        "\n",
+        "{",
+        "}",
+        "(",
+        ")",
+        ";",
+        "\"",
+        "'a",
+        "//",
+        "/*",
+        "*/",
+        "é",
+        "fn g() {}",
+        "1 + 2",
+        "struct S;",
+        "let y = 0;",
+        "mod m { }",
+        "#[cfg(test)]",
     ];
-    let boundaries: Vec<usize> =
-        (0..=text.len()).filter(|&at| text.is_char_boundary(at)).collect();
+    let boundaries: Vec<usize> = (0..=text.len()).filter(|&at| text.is_char_boundary(at)).collect();
     let start = boundaries[rng.below(boundaries.len() as u64) as usize];
     let end = boundaries
         .iter()
@@ -1366,7 +1549,8 @@ fn the_edit_between_two_texts_makes_one_the_other() {
         assert_eq!([&old[..start], &new[start..start + insert], &old[end..]].concat(), new);
         old = new;
     }
-    let same = TextEdit::between("fn f() {}", "fn f() {}", ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
+    let same =
+        TextEdit::between("fn f() {}", "fn f() {}", ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
     assert_eq!((same.delete.len(), same.insert), (TextSize::from(0), TextSize::from(0)));
 }
 
@@ -1378,9 +1562,11 @@ fn reparsed() -> usize {
 /// outline, each parse is the one a whole parse of the text makes, and most are reparses.
 #[test]
 fn a_parse_after_random_edits_is_the_whole_parse() {
-    for (seed, source, library) in
-        [(29, include_str!("target.rs"), false), (31, include_str!("change.rs"), false), (37, include_str!("target.rs"), true)]
-    {
+    for (seed, source, library) in [
+        (29, include_str!("target.rs"), false),
+        (31, include_str!("change.rs"), false),
+        (37, include_str!("target.rs"), true),
+    ] {
         let mut db = Db::for_tests();
         let file = FileId::from_raw(0);
         put_root(&mut db, 0, &[(file, "/a/lib.rs", source)]);
@@ -1504,14 +1690,16 @@ fn a_view_edits_its_roots_files_in_place_as_making_them_again_does() {
         let view = seeded_view(&mut rng);
         let before = root_files(&db);
         let at_before = db.source_root(SourceRootId(0)).source_root_ref(&db) as *const SourceRoot;
-        let files: Vec<(&str, &[u8])> = view.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        let files: Vec<(&str, &[u8])> =
+            view.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
         let change = set_view(&mut db, &base, &partition, &files).unwrap();
 
         let mut expected: Vec<(FileId, VfsPath)> =
             before.into_iter().filter(|(id, _)| !change.removed.contains(id)).collect();
         for (path, _) in &view {
             let path = VfsPath::from(base.join(path));
-            let id = db.source_root(SourceRootId(0)).source_root_ref(&db).file_for_path(&path).copied();
+            let id =
+                db.source_root(SourceRootId(0)).source_root_ref(&db).file_for_path(&path).copied();
             if let Some(id) = id
                 && change.added.contains(&id)
             {
@@ -1616,7 +1804,8 @@ fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
         let mut db = Db::for_tests();
         let texts: Vec<(String, &str)> =
             (0..FILES).map(|at| (format!("/p{at}/lib.rs"), "pub fn f() {}")).collect();
-        let texts: Vec<(&str, &str)> = texts.iter().map(|(path, text)| (path.as_str(), *text)).collect();
+        let texts: Vec<(&str, &str)> =
+            texts.iter().map(|(path, text)| (path.as_str(), *text)).collect();
         let files = load(&mut db, 0, &texts);
         let mut moved = [false; FILES];
         let mut graph: Vec<DrawnCrate> = Vec::new();

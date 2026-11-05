@@ -68,13 +68,16 @@ jobs:
           name: latency-${{ matrix.program }}
           path: ${{ runner.temp }}/latency.json
           if-no-files-found: warn
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   history:
     name: history and regressions
     needs: latency
     # The programs that did run are recorded even when another failed.
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64, ix-mode-cold]
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -101,22 +104,14 @@ jobs:
             echo "regressed=true" >> "$GITHUB_OUTPUT"
           fi
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
       - name: Commit to main
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/benchmarks/history/macos-arm64-live.jsonl
-          git commit -q -m "bench: live latency for ${GITHUB_SHA::10} [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the history commit does not apply to main"; exit 1; }
-            if git push -q origin HEAD:main; then
-              gh workflow run site.yaml --ref main
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: live latency for %s [skip ci]", "paths": ["docs/benchmarks/history/macos-arm64-live.jsonl", "docs/benchmarks/charts/", "README.md", "docs/benchmarks.md"], "site": true}' "${GITHUB_SHA::10}")"
       - name: Open or update the regression issue
         if: steps.history.outputs.regressed == 'true'
         run: |

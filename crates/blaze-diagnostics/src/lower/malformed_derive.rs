@@ -23,16 +23,17 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MalformedDerive) -> Vec<Found> {
     let file = d.range.file_id;
     let root = cx.root(file);
-    let Some(attr) = root.covering_element(d.range.value).ancestors().find_map(ast::Attr::cast) else {
+    let Some(attr) = root.covering_element(d.range.value).ancestors().find_map(ast::Attr::cast)
+    else {
         // alloc: the error's parts, for an error hir found
         return vec![malformed(&cx.span(d.range), "")];
     };
     let inner = if attr.excl_token().is_some() { "!" } else { "" };
-    let meta = attr
-        .skip_cfg_attrs()
-        .find(|it| it.simple_name() == Some("derive"))
-        .map(|it| match it {
-            ast::Meta::UnsafeMeta(unsafe_meta) => unsafe_meta.meta().unwrap_or(ast::Meta::UnsafeMeta(unsafe_meta)),
+    let meta =
+        attr.skip_cfg_attrs().find(|it| it.simple_name() == Some("derive")).map(|it| match it {
+            ast::Meta::UnsafeMeta(unsafe_meta) => {
+                unsafe_meta.meta().unwrap_or(ast::Meta::UnsafeMeta(unsafe_meta))
+            }
             it => it,
         });
     // alloc: the error's parts, for an error hir found
@@ -150,7 +151,8 @@ impl<'t> Element<'t> {
         {
             let at = span(lit.text_range());
             // clone: on the error path
-            let mut diag = Diag::error(Some("E0777"), "expected path to a trait, found literal", at.clone());
+            let mut diag =
+                Diag::error(Some("E0777"), "expected path to a trait, found literal", at.clone());
             diag.span_label(at, "not a trait");
             match cooked_ident(lit.kind(), lit.text()) {
                 // alloc: the error's text, on the error path
@@ -183,7 +185,10 @@ fn is_literal(kind: SyntaxKind) -> bool {
 fn is_path_part(element: ast::Element<'_>) -> bool {
     match element {
         NodeOrToken::Token(token) => {
-            matches!(token.kind(), SyntaxKind::IDENT | T![::] | T![self] | T![super] | T![crate] | T![Self])
+            matches!(
+                token.kind(),
+                SyntaxKind::IDENT | T![::] | T![self] | T![super] | T![crate] | T![Self]
+            )
         }
         NodeOrToken::Node(_) => false,
     }

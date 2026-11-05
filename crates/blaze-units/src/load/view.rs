@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::Manifest;
@@ -14,6 +13,7 @@ use blaze_query::{Cancelled, Cx};
 use blaze_resolve::resolver::{CliFeatures, Members, ResolveBehavior};
 use blaze_resolve::{Cfg, PackageId, PackageIdSpec, Resolve, Summary};
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 use super::files::{Mounts, Snap};
 use super::invocation::Asking;
@@ -104,13 +104,15 @@ pub fn resolve_view<'db, R>(
     };
     let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
-        Err(error) => return Ok(Resolving::Failed(error)),
+        Err(super::Unread::Failed(error)) => return Ok(Resolving::Failed(error)),
+        Err(super::Unread::Needs(fetches)) => return Ok(Resolving::Needs(fetches)),
     };
     let outcome = in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
         super::resolve::resolved(ctx, ws, &spec, |resolved| {
             let member_summaries: Vec<&Summary> =
                 resolved.member_ids.iter().map(|id| &resolved.reads[id].summary).collect();
-            let warnings: Vec<String> = read.warnings.iter().chain(&resolved.warnings).cloned().collect();
+            let warnings: Vec<String> =
+                read.warnings.iter().chain(&resolved.warnings).cloned().collect();
             let view = ViewResolved {
                 ws,
                 config: &ctx.config,
@@ -138,15 +140,20 @@ pub fn resolve_view<'db, R>(
     })?;
     Ok(match outcome {
         Ok(Staged::Done(it)) => Resolving::Done(it),
-        Ok(Staged::Needs(fetches)) => Resolving::Needs(fetches),
-        Ok(Staged::Failed(error)) | Err(error) => Resolving::Failed(error),
+        Ok(Staged::Needs(fetches)) | Err(super::Unread::Needs(fetches)) => Resolving::Needs(fetches),
+        Ok(Staged::Failed(error)) | Err(super::Unread::Failed(error)) => Resolving::Failed(error),
     })
 }
 
 /// `triple`'s cfg as cargo reads `[target.'cfg(..)']` for a build on `host` (with `target`
 /// the build's `--target`): its probe with the configuration's rustflags for it and
 /// `--crate-type proc-macro`.
-pub fn platform_cfg<F: Files>(config: &Config<F>, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<Cfg>, LoadError> {
+pub fn platform_cfg<F: Files>(
+    config: &Config<F>,
+    triple: &str,
+    host: &str,
+    target: Option<&str>,
+) -> Result<Vec<Cfg>, LoadError> {
     let error = |what: String| LoadError { what, at: None };
     let rustflags = super::plan::platform_rustflags(config, triple, host, target)?;
     let args = CfgArgs::from_flags(&rustflags).map_err(error)?;

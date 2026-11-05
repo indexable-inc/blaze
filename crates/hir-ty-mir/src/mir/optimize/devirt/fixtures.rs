@@ -14,6 +14,7 @@ use hir_def::{
     AdtId, FunctionId, HasModule as _, ModuleDefId, TraitId,
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
+use hir_expand::fixture;
 use hir_ty::{
     TyDefId,
     db::HirDatabase,
@@ -27,7 +28,6 @@ use hir_ty_mir::mir::{
     location::name_sources,
     print_mir_body,
 };
-use hir_expand::fixture;
 use parking_lot::Mutex;
 use rustc_type_ir::inherent::IntoKind as _;
 
@@ -64,6 +64,21 @@ impl dep::Shape for Mine { fn area(&self) -> u32 { self.0 * 2 } }
 pub fn run() -> u32 { dep::through(&Mine(1)) + dep::through(&dep::Own(2)) }
 "#;
 
+/// The same with a blanket impl in `dep`: `dep` finds `Shape::area` for `main`'s `Mine`, as it
+/// finds a closure's `Fn::call` (hashbrown's `rehash_in_place` calling its `&dyn Fn` hasher, a
+/// closure over a member's key type), but a direct call would be an instance of `Mine` worked
+/// out in `dep`, which does not load `main` and so sees none of its impls.
+const BLANKET: &str = r#"
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn
+//- /dep.rs crate:dep
+pub trait Shape { fn area(&self) -> u32; }
+impl<T> Shape for T { fn area(&self) -> u32 { 5 } }
+pub fn through(shape: &dyn Shape) -> u32 { shape.area() }
+//- /main.rs crate:main deps:dep
+pub struct Mine(pub u32);
+pub fn run() -> u32 { dep::through(&Mine(1)) }
+"#;
+
 /// A `#[track_caller]` method whose trait's declaration is not: through `&dyn Lines` it
 /// reports the location a `dyn` call gives it, never the call's.
 const TRACKED: &str = r#"
@@ -95,13 +110,19 @@ enum Made {
 fn world(db: &TestDB, text: &str, objects: &[(&str, &[&str], Made)]) -> Held {
     let fixture = Hasher::new(FIXTURE_DOMAIN).part(text.as_bytes()).finish();
     let content = |kind: &str, name: &str| {
-        Hasher::new(FIXTURE_DOMAIN).id(&fixture).part(kind.as_bytes()).part(name.as_bytes()).finish()
+        Hasher::new(FIXTURE_DOMAIN)
+            .id(&fixture)
+            .part(kind.as_bytes())
+            .part(name.as_bytes())
+            .finish()
     };
     let declared = declared(db);
     let trait_named = |name: &str| -> TraitId {
         (declared.iter())
             .find_map(|it| match it {
-                ModuleDefId::TraitId(id) if TraitSignature::of(db, *id).name.as_str() == name => Some(*id),
+                ModuleDefId::TraitId(id) if TraitSignature::of(db, *id).name.as_str() == name => {
+                    Some(*id)
+                }
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no trait `{name}`"))
@@ -109,7 +130,9 @@ fn world(db: &TestDB, text: &str, objects: &[(&str, &[&str], Made)]) -> Held {
     let struct_named = |name: &str| -> AdtId {
         (declared.iter())
             .find_map(|it| match it {
-                ModuleDefId::AdtId(AdtId::StructId(id)) if StructSignature::of(db, *id).name.as_str() == name => {
+                ModuleDefId::AdtId(AdtId::StructId(id))
+                    if StructSignature::of(db, *id).name.as_str() == name =>
+                {
                     Some(AdtId::StructId(*id))
                 }
                 _ => None,
@@ -118,7 +141,10 @@ fn world(db: &TestDB, text: &str, objects: &[(&str, &[&str], Made)]) -> Held {
     };
     let mut made: Vec<Object> = (objects.iter())
         .map(|&(name, tys, how)| {
-            let key = ObjectKey { trait_: trait_named(name), args: GenericArgs::new_from_slice(&[]).store() };
+            let key = ObjectKey {
+                trait_: trait_named(name),
+                args: GenericArgs::new_from_slice(&[]).store(),
+            };
             let targets: Box<[Target]> = (tys.iter())
                 .map(|ty| Target {
                     ty: db.ty(TyDefId::AdtId(struct_named(ty))).skip_binder().store(),
@@ -132,7 +158,13 @@ fn world(db: &TestDB, text: &str, objects: &[(&str, &[&str], Made)]) -> Held {
             };
             let trait_id = content("trait", name);
             let digest = devirt::object_digest(&trait_id, &ContentId([0; 32]), &targets, open);
-            Object { key, name: format!("dyn {name}").into(), targets, open: open.map(Into::into), digest }
+            Object {
+                key,
+                name: format!("dyn {name}").into(),
+                targets,
+                open: open.map(Into::into),
+                digest,
+            }
         })
         .collect();
     made.sort_unstable_by(|a, b| a.digest.cmp(&b.digest));
@@ -155,7 +187,9 @@ fn declared(db: &TestDB) -> Vec<ModuleDefId> {
 fn function(db: &TestDB, name: &str) -> FunctionId {
     let found: Vec<FunctionId> = (declared(db).into_iter())
         .filter_map(|it| match it {
-            ModuleDefId::FunctionId(id) if FunctionSignature::of(db, id).name.as_str() == name => Some(id),
+            ModuleDefId::FunctionId(id) if FunctionSignature::of(db, id).name.as_str() == name => {
+                Some(id)
+            }
             _ => None,
         })
         .collect();
@@ -215,9 +249,14 @@ fn devirtualized_in<T>(
 fn calls(body: &MirBody<'_>) -> Vec<bool> {
     (body.basic_blocks.iter())
         .filter_map(|(_, block)| match block.terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::Call { func, .. }) => Some(func.fn_def().is_some_and(|(_, args)| {
-                args.as_slice().first().and_then(|it| it.ty()).is_some_and(|it| matches!(it.kind(), TyKind::Dynamic(..)))
-            })),
+            Some(TerminatorKind::Call { func, .. }) => {
+                Some(func.fn_def().is_some_and(|(_, args)| {
+                    args.as_slice()
+                        .first()
+                        .and_then(|it| it.ty())
+                        .is_some_and(|it| matches!(it.kind(), TyKind::Dynamic(..)))
+                }))
+            }
             _ => None,
         })
         .collect()
@@ -228,7 +267,12 @@ fn one_type_closed_is_called_directly() {
     devirtualized("one", &[("Shape", &["Circle"], Made::Closed)], |_, body, object, events| {
         assert!(!calls(body).contains(&true), "a `dyn` call is left: {events:?}");
         assert_eq!(body.inlined.devirtualized, [object.digest.0], "{events:?}");
-        assert!(events.iter().any(|it| it.starts_with("devirtualize:") && it.contains("outcome=\"direct\"")), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|it| it.starts_with("devirtualize:") && it.contains("outcome=\"direct\"")),
+            "{events:?}"
+        );
     });
 }
 
@@ -240,17 +284,24 @@ fn three_types_closed_are_compared_with_the_dyn_call_last() {
         // through it stays behind the compares, and only that one.
         assert_eq!(calls(body).iter().filter(|it| **it).count(), 1, "{events:?}");
         assert!(body.inlined.devirtualized.iter().all(|it| *it == object.digest.0), "{events:?}");
-        assert!(events.iter().any(|it| it.contains("outcome=\"compared\"") && it.contains("targets=3")), "{events:?}");
+        assert!(
+            events.iter().any(|it| it.contains("outcome=\"compared\"") && it.contains("targets=3")),
+            "{events:?}"
+        );
     });
 }
 
 #[test]
 fn open_object_stays_virtual_saying_why() {
-    const WHY: &str = "the program is a cdylib: a program that loads it may make objects of its traits";
+    const WHY: &str =
+        "the program is a cdylib: a program that loads it may make objects of its traits";
     devirtualized("one", &[("Shape", &["Circle"], Made::Open(WHY))], |_, body, object, events| {
         assert_eq!(calls(body), [true]);
         assert_eq!(body.inlined.devirtualized, [object.digest.0]);
-        let kept = events.iter().find(|it| it.contains("outcome=\"kept\"")).expect("the kept call's event");
+        let kept = events
+            .iter()
+            .find(|it| it.contains("outcome=\"kept\""))
+            .expect("the kept call's event");
         assert!(kept.starts_with("devirtualize:") && kept.contains(WHY), "{kept}");
     });
 }
@@ -266,9 +317,11 @@ fn object_the_program_never_makes_is_read_as_absent() {
 #[test]
 fn devirtualized_body_is_the_same_bytes_twice() {
     let print = || {
-        devirtualized("three", &[("Named", &["Circle", "Square", "Line"], Made::Closed)], |db, body, _, _| {
-            print_mir_body(db, body, "three")
-        })
+        devirtualized(
+            "three",
+            &[("Named", &["Circle", "Square", "Line"], Made::Closed)],
+            |db, body, _, _| print_mir_body(db, body, "three"),
+        )
     };
     assert_eq!(print(), print());
 }
@@ -278,26 +331,78 @@ fn devirtualized_body_is_the_same_bytes_twice() {
 /// The site's digest is not the object's, as what `dep` sees follows from its dependencies.
 #[test]
 fn a_type_of_a_crate_the_body_does_not_depend_on_stays_virtual() {
-    devirtualized_in(ACROSS, "through", &[("Shape", &["Mine"], Made::Closed)], |_, body, object, events| {
-        assert_eq!(calls(body), [true], "{events:?}");
-        let kept = events.iter().find(|it| it.contains("outcome=\"kept\"")).expect("the kept call's event");
-        assert!(kept.contains("can't name the method") && kept.contains("finds no method"), "{kept}");
-        let unseen = devirt::site_digest(&object.digest, &[4]).0;
-        assert_eq!(body.inlined.devirtualized, [unseen], "{events:?}");
-        assert_ne!(unseen, object.digest.0);
-    });
+    devirtualized_in(
+        ACROSS,
+        "through",
+        &[("Shape", &["Mine"], Made::Closed)],
+        |_, body, object, events| {
+            assert_eq!(calls(body), [true], "{events:?}");
+            let kept = events
+                .iter()
+                .find(|it| it.contains("outcome=\"kept\""))
+                .expect("the kept call's event");
+            assert!(
+                kept.contains("can't name the method") && kept.contains("finds no method"),
+                "{kept}"
+            );
+            let unseen = devirt::site_digest(&object.digest, &[4]).0;
+            assert_eq!(body.inlined.devirtualized, [unseen], "{events:?}");
+            assert_ne!(unseen, object.digest.0);
+        },
+    );
+}
+
+/// A type of `main` stays virtual in `dep` though `dep`'s blanket impl gives its method: the
+/// direct callee would be resolved in `dep`, which does not load `main`.
+#[test]
+fn a_type_of_a_crate_the_body_does_not_load_stays_virtual_under_a_blanket_impl() {
+    devirtualized_in(
+        BLANKET,
+        "through",
+        &[("Shape", &["Mine"], Made::Closed)],
+        |_, body, object, events| {
+            assert_eq!(calls(body), [true], "{events:?}");
+            let kept = events
+                .iter()
+                .find(|it| it.contains("outcome=\"kept\""))
+                .expect("the kept call's event");
+            assert!(
+                kept.contains("names the crate main") && kept.contains("does not load"),
+                "{kept}"
+            );
+            assert_eq!(
+                body.inlined.devirtualized,
+                [devirt::site_digest(&object.digest, &[4]).0],
+                "{events:?}"
+            );
+        },
+    );
 }
 
 /// Of a type `dep` sees and one it does not, the seen one is compared and called directly and
 /// the other is left to the `dyn` call past it; the digest says which was which.
 #[test]
 fn a_seen_type_is_compared_and_an_unseen_one_left_to_the_dyn_call() {
-    devirtualized_in(ACROSS, "through", &[("Shape", &["Own", "Mine"], Made::Closed)], |_, body, object, events| {
-        assert_eq!(calls(body).iter().filter(|it| **it).count(), 1, "{events:?}");
-        assert!(events.iter().any(|it| it.contains("outcome=\"compared\"") && it.contains("targets=1")), "{events:?}");
-        // `Own` then `Mine`, in the object's order: seen, unseen.
-        assert_eq!(body.inlined.devirtualized, [devirt::site_digest(&object.digest, &[3, 4]).0], "{events:?}");
-    });
+    devirtualized_in(
+        ACROSS,
+        "through",
+        &[("Shape", &["Own", "Mine"], Made::Closed)],
+        |_, body, object, events| {
+            assert_eq!(calls(body).iter().filter(|it| **it).count(), 1, "{events:?}");
+            assert!(
+                events
+                    .iter()
+                    .any(|it| it.contains("outcome=\"compared\"") && it.contains("targets=1")),
+                "{events:?}"
+            );
+            // `Own` then `Mine`, in the object's order: seen, unseen.
+            assert_eq!(
+                body.inlined.devirtualized,
+                [devirt::site_digest(&object.digest, &[3, 4]).0],
+                "{events:?}"
+            );
+        },
+    );
 }
 
 /// A `#[track_caller]` method behind a declaration without it stays virtual: a direct call
@@ -305,11 +410,19 @@ fn a_seen_type_is_compared_and_an_unseen_one_left_to_the_dyn_call() {
 /// reason names the rule, and without it the call is made direct.
 #[test]
 fn a_track_caller_method_behind_a_plain_declaration_stays_virtual() {
-    devirtualized_in(TRACKED, "through", &[("Lines", &["Mine"], Made::Closed)], |_, body, _, events| {
-        assert_eq!(calls(body), [true], "{events:?}");
-        let kept = events.iter().find(|it| it.contains("outcome=\"kept\"")).expect("the kept call's event");
-        assert!(kept.contains("track_caller"), "{kept}");
-    });
+    devirtualized_in(
+        TRACKED,
+        "through",
+        &[("Lines", &["Mine"], Made::Closed)],
+        |_, body, _, events| {
+            assert_eq!(calls(body), [true], "{events:?}");
+            let kept = events
+                .iter()
+                .find(|it| it.contains("outcome=\"kept\""))
+                .expect("the kept call's event");
+            assert!(kept.contains("track_caller"), "{kept}");
+        },
+    );
 }
 
 /// Through a `dyn`, a `#[track_caller]` method whose trait's declaration is not reports the
@@ -323,12 +436,15 @@ fn a_dyn_call_of_a_track_caller_method_reports_its_definition() {
     blaze_query::db::attach(&db, || {
         let held = world(&db, TRACKED, &[("Lines", &["Mine"], Made::Closed)]);
         let run = function(&db, "run");
-        let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate: run.krate(&db) }.store();
+        let env =
+            ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate: run.krate(&db) }
+                .store();
         let plain = db
             .monomorphized_runtime_mir_body(run.into(), GenericArgs::empty().store(), env)
             .unwrap_or_else(|e| panic!("the runtime MIR of `run`: {e:?}"));
-        let optimized =
-            db.optimized_mir_body(run.into(), against(&held)).unwrap_or_else(|e| panic!("the MIR of `run`: {e:?}"));
+        let optimized = db
+            .optimized_mir_body(run.into(), against(&held))
+            .unwrap_or_else(|e| panic!("the MIR of `run`: {e:?}"));
         // The fixture's first line after the `minicore` header is line 1 of its one file.
         let defined = 1 + TRACKED
             .lines()

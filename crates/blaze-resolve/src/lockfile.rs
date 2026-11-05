@@ -7,13 +7,12 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use serde::{Deserialize, de};
+use std::alloc::Global;
 use url::Url;
 
 use crate::graph::Graph;
@@ -261,7 +260,11 @@ pub fn into_resolve(
     };
 
     // name -> version -> source -> id, to find the ids of edges written briefly.
-    let mut map: HashMap<&str, HashMap<String, HashMap<SourceId, PackageId, Global>, Global>, Global> = HashMap::new_in(Global);
+    let mut map: HashMap<
+        &str,
+        HashMap<String, HashMap<SourceId, PackageId, Global>, Global>,
+        Global,
+    > = HashMap::new_in(Global);
     for (id, _) in live_pkgs.values() {
         map.entry(id.name().as_str())
             .or_default()
@@ -608,61 +611,48 @@ pub fn serialize_resolve(resolve: &Resolve, orig: Option<&str>) -> String {
     out
 }
 
-/// `--locked` or `--frozen`: the lock file may not change.
-#[derive(Clone, Copy)]
-pub struct Locked<'a> {
-    /// The flag as the user wrote it, `--locked` or `--frozen`.
-    pub flag: &'a str,
-    /// Where the lock file is, for the error.
-    pub path: &'a Path,
-    /// The workspace's path packages, to read both lock files back.
-    pub path_deps: &'a PathDeps,
-}
-
-/// The same lock file: the same lines, or under [`Locked`] the same resolve read back from
-/// both, so a lock file differing only in its encoding or its spacing is left alone.
-pub fn are_equal_lockfiles(orig: &str, current: &str, locked: Option<Locked<'_>>) -> bool {
+/// The same lock file: the same lines, or with `path_deps` (the workspace's path packages, as
+/// `--locked` compares) the same resolve read back from both, so a lock file differing only in
+/// its encoding or its spacing is left alone.
+pub fn are_equal_lockfiles(orig: &str, current: &str, path_deps: Option<&PathDeps>) -> bool {
     if orig.lines().eq(current.lines()) {
         return true;
     }
-    let Some(locked) = locked else { return false };
+    let Some(path_deps) = path_deps else { return false };
     let same = || -> Result<bool> {
-        let old = into_resolve(parse(orig)?, orig, locked.path_deps)?;
-        let new = into_resolve(parse(current)?, current, locked.path_deps)?;
+        let old = into_resolve(parse(orig)?, orig, path_deps)?;
+        let new = into_resolve(parse(current)?, current, path_deps)?;
         Ok(old == new)
     };
     matches!(same(), Ok(true))
 }
 
-/// What cargo writes to `Cargo.lock` after a resolve: `None` when the lock file there
-/// (`orig`) is already the same, and otherwise the text, raised to the encoding a new lock
-/// file of the workspace would have (from its lowest `rust-version`) if it was older. A lock
-/// file left as it was keeps its encoding. Under [`Locked`] a change is an error.
-pub fn lockfile_to_write(
+/// What a resolve changes of `Cargo.lock` (`orig`, the lock file there): `None` when it is
+/// already the same, else the new text, raised to the encoding a new lock file of the
+/// workspace would have (from its lowest `rust-version`) if it was older. `same_resolve` (the
+/// workspace's path packages) compares the resolves read back from both texts, as `--locked`
+/// does, so a lock file differing only in its encoding or spacing is the same; without it the
+/// lines are compared, and such a file is written again. Never an error: whether the change
+/// may be made is the caller's policy (blaze-units' `lock`).
+pub fn lockfile_change(
     resolve: &mut Resolve,
     orig: Option<&str>,
     lowest_rust_version: Option<&RustVersion>,
-    locked: Option<Locked<'_>>,
-) -> Result<Option<String>> {
+    same_resolve: Option<&PathDeps>,
+) -> Option<String> {
     let mut out = serialize_resolve(resolve, orig);
     if let Some(orig) = orig
-        && are_equal_lockfiles(orig, &out, locked)
+        && are_equal_lockfiles(orig, &out, same_resolve)
     {
-        return Ok(None);
+        return None;
     }
-    if let Some(locked) = locked {
-        let action = if orig.is_some() { "update" } else { "create" };
-        let (path, flag) = (locked.path.display(), locked.flag);
-        bail!(
-            "cannot {action} the lock file {path} because {flag} was passed to prevent this\n\
-             help: to generate the lock file without accessing the network, \
-             remove the {flag} flag and use --offline instead."
-        );
+    if same_resolve.is_some() {
+        return Some(out);
     }
     let default_version = ResolveVersion::with_rust_version(lowest_rust_version);
     if resolve.version() < default_version {
         resolve.set_version(default_version);
         out = serialize_resolve(resolve, orig);
     }
-    Ok(Some(out))
+    Some(out)
 }

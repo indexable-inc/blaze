@@ -179,7 +179,11 @@ pub fn attrs(db: &Db, owner: AttrDefId) -> Option<FactRef> {
 
 /// The `CrateRoot` fact of `krate`.
 pub fn crate_root(db: &Db, krate: Crate) -> FactRef {
-    FactRef { kind: kinds::CRATE_ROOT, subject: key::crate_key(db, krate), object: FactObject::None }
+    FactRef {
+        kind: kinds::CRATE_ROOT,
+        subject: key::crate_key(db, krate),
+        object: FactObject::None,
+    }
 }
 
 /// The attribute owner a key resolved to, if attributes have one there.

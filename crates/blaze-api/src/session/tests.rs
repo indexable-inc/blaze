@@ -10,7 +10,7 @@ use blaze_mem::{
     tag::{Counters, Snapshot},
 };
 use blaze_query::{Database, QueryKey, QueryKind};
-use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
+use blaze_vfs::{Change, ChangeKind, Mode, Op, Vfs, View};
 
 use super::{Daemon, Session};
 
@@ -18,7 +18,12 @@ use super::{Daemon, Session};
 /// daemon's does.
 static BUILD: std::sync::LazyLock<crate::Build> = std::sync::LazyLock::new(|| crate::Build {
     id: ContentId([7; 32]),
-    exe: crate::Executable { path: "/opt/blaze/bin/blaze".to_owned(), len: 1 << 20, modified_ns: 5, inode: 6 },
+    exe: crate::Executable {
+        path: "/opt/blaze/bin/blaze".to_owned(),
+        len: 1 << 20,
+        modified_ns: 5,
+        inode: 6,
+    },
 });
 use crate::{
     ApiError, Arrived, Diagnostic, Edit, Edited, EditedItem, How, Level, Reach, Reply, Request,
@@ -66,7 +71,10 @@ impl World {
         World { vfs, db: Database::empty(), builder: Fake::default(), session: Session::new() }
     }
 
-    fn call(&mut self, f: impl FnOnce(&mut Session, &mut Daemon<'_>, &mut Vec<Reply>)) -> Vec<Reply> {
+    fn call(
+        &mut self,
+        f: impl FnOnce(&mut Session, &mut Daemon<'_>, &mut Vec<Reply>),
+    ) -> Vec<Reply> {
         let mut out = Vec::new();
         let mut cx = Daemon {
             vfs: &mut self.vfs,
@@ -74,8 +82,10 @@ impl World {
             builder: &mut self.builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
+            uptime_ms: 40,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -124,10 +134,7 @@ impl World {
     /// `main` with `files` written, made durable.
     fn commit(&mut self, files: &[(&str, &str)]) -> ContentId {
         let base = self.vfs.head("main").unwrap_or_else(|| self.vfs.empty());
-        let ops = files
-            .iter()
-            .map(|(path, bytes)| write(path, bytes))
-            .collect();
+        let ops = files.iter().map(|(path, bytes)| write(path, bytes)).collect();
         assert_eq!(self.request(9, 9, Request::Commit { head: "main".to_owned(), base, ops }), []);
         let replies = self.durable();
         assert!(matches!(replies[1].response, Response::Done { ok: true }), "{replies:?}");
@@ -221,7 +228,11 @@ fn a_check_forwards_its_reports_then_ends_and_closes_its_view() {
     let mut world = World::new();
     assert_eq!(world.request(1, 1, Request::Check { view: head("main"), targets: targets() }), []);
     let (job, view, work) = world.builder.started[0].clone();
-    assert_eq!(view.unwrap().view, View { root: world.vfs.empty() }, "a head never written is empty");
+    assert_eq!(
+        view.unwrap().view,
+        View { root: world.vfs.empty() },
+        "a head never written is empty"
+    );
     assert_eq!(work, Work::Check(targets()));
     assert_eq!(world.session.views(), 1);
 
@@ -252,9 +263,25 @@ fn test_run_and_verify_start_their_work() {
     world.request(
         1,
         1,
-        Request::Test { view: head("main"), targets: targets(), filter: filter.clone(), all: true, args: args.clone(), ub },
+        Request::Test {
+            view: head("main"),
+            targets: targets(),
+            filter: filter.clone(),
+            all: true,
+            args: args.clone(),
+            ub,
+        },
     );
-    world.request(1, 2, Request::Run { view: head("main"), targets: targets(), bin: None, args: vec!["-v".to_owned()] });
+    world.request(
+        1,
+        2,
+        Request::Run {
+            view: head("main"),
+            targets: targets(),
+            bin: None,
+            args: vec!["-v".to_owned()],
+        },
+    );
     world.request(1, 3, Request::Verify { view: head("main"), targets: targets() });
     let works: Vec<Work> = world.builder.started.iter().map(|it| it.2.clone()).collect();
     assert_eq!(
@@ -295,7 +322,8 @@ fn the_proofs_requests_start_their_work_on_the_view() {
 fn a_commit_is_answered_only_once_durable() {
     let mut world = World::new();
     let base = world.vfs.empty();
-    let commit = Request::Commit { head: "main".to_owned(), base, ops: vec![write("src/lib.rs", "")] };
+    let commit =
+        Request::Commit { head: "main".to_owned(), base, ops: vec![write("src/lib.rs", "")] };
     assert_eq!(world.request(1, 1, commit), []);
     let root = world.vfs.head("main").unwrap();
     assert_eq!(world.call(|session, cx, out| session.durable(cx, &[], out)), []);
@@ -310,7 +338,8 @@ fn a_commit_is_answered_only_once_durable() {
 fn a_commit_on_an_unknown_base_names_the_head() {
     let mut world = World::new();
     let base = ContentId([7; 32]);
-    let replies = world.request(1, 1, Request::Commit { head: "main".to_owned(), base, ops: Vec::new() });
+    let replies =
+        world.request(1, 1, Request::Commit { head: "main".to_owned(), base, ops: Vec::new() });
     assert_eq!(error_at(&replies), Some("main".to_owned()));
     assert_eq!(replies.last(), Some(&done(1, 1, false)));
 }
@@ -337,7 +366,10 @@ fn a_what_if_resolves_inside_out_and_names_a_path_that_fails() {
     assert_eq!(paths, ["a.rs", "b.rs"]);
     assert_eq!(world.vfs.head("main"), None, "a what-if moves no head");
 
-    let bad = ViewRef::WhatIf { base: Box::new(inner), ops: vec![Op::Delete { path: "c.rs".to_owned() }] };
+    let bad = ViewRef::WhatIf {
+        base: Box::new(inner),
+        ops: vec![Op::Delete { path: "c.rs".to_owned() }],
+    };
     let replies = world.request(1, 2, Request::Check { view: bad, targets: targets() });
     assert_eq!(error_at(&replies), Some("c.rs".to_owned()));
     assert_eq!(replies.last(), Some(&done(1, 2, false)));
@@ -356,10 +388,17 @@ fn an_unknown_root_is_an_error_naming_it() {
 fn opens_are_counted_and_each_needs_a_close() {
     let mut world = World::new();
     let root = world.vfs.empty();
-    assert_eq!(world.request(1, 1, Request::Open { view: head("main") }), [reply(1, 1, Response::Opened { root }), done(1, 1, true)]);
+    assert_eq!(
+        world.request(1, 1, Request::Open { view: head("main") }),
+        [reply(1, 1, Response::Opened { root }), done(1, 1, true)]
+    );
     world.request(1, 2, Request::Open { view: ViewRef::Root(View { root }) });
     assert_eq!(world.session.views(), 2);
-    assert_eq!(world.request(2, 1, Request::Close { root }).last(), Some(&done(2, 1, false)), "another connection's");
+    assert_eq!(
+        world.request(2, 1, Request::Close { root }).last(),
+        Some(&done(2, 1, false)),
+        "another connection's"
+    );
     assert_eq!(world.request(1, 3, Request::Close { root }), [done(1, 3, true)]);
     assert_eq!(world.request(1, 4, Request::Close { root }), [done(1, 4, true)]);
     let replies = world.request(1, 5, Request::Close { root });
@@ -464,9 +503,22 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(2, 8, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
-    let status =
-        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone(), bugs: Vec::new() };
-    assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
+    let status = Status {
+        pid: 30,
+        requests: vec![5, 8],
+        views: 3,
+        history: None,
+        memory_bytes: 10,
+        budget_bytes: 20,
+        uptime_ms: 40,
+        build: BUILD.clone(),
+        bugs: Vec::new(),
+        settings: Vec::new(),
+    };
+    assert_eq!(
+        world.request(3, 1, Request::Status),
+        [reply(3, 1, Response::Status(status)), done(3, 1, true)]
+    );
 }
 
 /// A warm Status, with one build under way, allocates only its reply's own: the one allocation
@@ -486,8 +538,10 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
+            uptime_ms: 40,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -496,9 +550,11 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
         };
         let from = to(2, id);
         let arrived = Arrived::Request { from, request: Request::Status };
-        blaze_alloc_count::assert_at_most(2, "a warm Status: its reply's list of requests and its executable's path", || {
-            session.arrive(&mut cx, arrived, &mut out)
-        });
+        blaze_alloc_count::assert_at_most(
+            2,
+            "a warm Status: its reply's list of requests and its executable's path",
+            || session.arrive(&mut cx, arrived, &mut out),
+        );
         let status = Status {
             pid: 30,
             requests: vec![1],
@@ -506,8 +562,10 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             history: None,
             memory_bytes: 10,
             budget_bytes: 20,
+            uptime_ms: 40,
             build: BUILD.clone(),
             bugs: Vec::new(),
+            settings: Vec::new(),
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
@@ -523,7 +581,10 @@ fn dumped(window: std::time::Duration) -> Vec<u8> {
 fn hotted(top: u32, since: crate::HotSince) -> Result<crate::Hot, ApiError> {
     use crate::{Hot, HotFunction, HotKey, HotSince, HotWait, HotWaitKind};
     if since == HotSince::LastBuild {
-        return Err(ApiError::new("no build has ended in this daemon", Some("blaze debug hot --last-build".to_owned())));
+        return Err(ApiError::new(
+            "no build has ended in this daemon",
+            Some("blaze debug hot --last-build".to_owned()),
+        ));
     }
     let ns = u64::from(top) * 1_000_000;
     Ok(Hot {
@@ -536,7 +597,14 @@ fn hotted(top: u32, since: crate::HotSince) -> Result<crate::Hot, ApiError> {
         torn: 0,
         since,
         spans: 1,
-        waits: vec![HotWait { kind: HotWaitKind::Key, count: 1, max_ns: 9, p50_ns: 9, p90_ns: 9, p99_ns: 9 }],
+        waits: vec![HotWait {
+            kind: HotWaitKind::Key,
+            count: 1,
+            max_ns: 9,
+            p50_ns: 9,
+            p90_ns: 9,
+            p99_ns: 9,
+        }],
         error_ns: 0,
         total_ns: ns,
     })
@@ -549,7 +617,10 @@ fn hot_is_the_daemons_sketches_and_their_refusal_is_its_error() {
     let mut world = World::new();
     let hot = world.request(1, 1, Request::Hot { top: 20, since: crate::HotSince::Start });
     let Some(Reply { response: Response::Hot(hot), .. }) = hot.first() else { panic!("{hot:?}") };
-    assert_eq!((hot.keys.len(), hot.keys[0].upper_ns, hot.since), (1, 20_000_000, crate::HotSince::Start));
+    assert_eq!(
+        (hot.keys.len(), hot.keys[0].upper_ns, hot.since),
+        (1, 20_000_000, crate::HotSince::Start)
+    );
     let refused = world.request(1, 2, Request::Hot { top: 20, since: crate::HotSince::LastBuild });
     assert_eq!(error_at(&refused).as_deref(), Some("blaze debug hot --last-build"), "{refused:?}");
     assert_eq!(refused.last(), Some(&done(1, 2, false)));
@@ -599,17 +670,20 @@ fn counters() -> Snapshot {
 }
 
 /// A profile request is answered with the daemon's dump of the seconds it asks for; the
-/// explorer, the live feed and live SQL are the daemon loop's, so one that reaches the session
+/// explorer, the live feed and the history's flush are the daemon loop's, so one that reaches the session
 /// fails naming its command.
 #[test]
 fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
     let mut world = World::new();
     let profiled = world.request(1, 1, Request::Profile { seconds: 60 });
-    assert_eq!(profiled, [reply(1, 1, Response::Profiled { trace: b"60".to_vec() }), done(1, 1, true)]);
+    assert_eq!(
+        profiled,
+        [reply(1, 1, Response::Profiled { trace: b"60".to_vec() }), done(1, 1, true)]
+    );
     for (id, request, named) in [
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
-        (4, Request::Sql { sql: "SELECT 1".to_owned(), last_s: 30 }, "blaze debug sql --live"),
+        (4, Request::Flush, "a read of the profile history"),
         (5, Request::Gc { dry_run: true }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);
@@ -657,7 +731,11 @@ fn memory_gives_each_subsystems_counters_and_rate() {
 fn a_reach_diffs_the_views_and_runs_on_the_later() {
     let mut world = World::new();
     let root = world.commit(&[("src/lib.rs", "")]);
-    world.request(1, 1, Request::Reach { from: head("empty"), to: head("main"), targets: targets() });
+    world.request(
+        1,
+        1,
+        Request::Reach { from: head("empty"), to: head("main"), targets: targets() },
+    );
     let (job, view, work) = world.builder.started[0].clone();
     assert_eq!(view.unwrap().view.root, root);
     let Work::Reach { from, changes, .. } = work else { panic!("{work:?}") };
@@ -702,7 +780,11 @@ fn a_cancel_cancels_the_jobs_and_the_request_still_ends_once() {
 fn a_commit_waiting_to_be_durable_cant_be_cancelled() {
     let mut world = World::new();
     let base = world.vfs.empty();
-    world.request(1, 1, Request::Commit { head: "main".to_owned(), base, ops: vec![write("a", "")] });
+    world.request(
+        1,
+        1,
+        Request::Commit { head: "main".to_owned(), base, ops: vec![write("a", "")] },
+    );
     let replies = world.request(1, 2, Request::Cancel { id: 1 });
     assert_eq!(error_at(&replies), Some("request 1".to_owned()));
     assert_eq!(replies.last(), Some(&done(1, 2, false)));
@@ -717,7 +799,11 @@ fn a_gone_connection_is_cancelled_closed_and_sent_nothing() {
     let job = world.last_job();
     world.request(1, 2, Request::Open { view: head("main") });
     let base = world.vfs.empty();
-    world.request(1, 3, Request::Commit { head: "main".to_owned(), base, ops: vec![write("a", "")] });
+    world.request(
+        1,
+        3,
+        Request::Commit { head: "main".to_owned(), base, ops: vec![write("a", "")] },
+    );
     world.request(2, 1, Request::Snapshot);
     let other = world.last_job();
     assert_eq!(world.session.views(), 2);
@@ -753,10 +839,14 @@ fn worked() -> Response {
         reran: 3,
         green: 9,
         served: Vec::new(),
+        build_id: Some(3),
         compiled: 1,
         found: 4,
         link: crate::LinkKind::Placed,
-        links: vec![crate::Linked { how: crate::LinkHow::First, path: "target/debug/app".to_owned() }],
+        links: vec![crate::Linked {
+            how: crate::LinkHow::First,
+            path: "target/debug/app".to_owned(),
+        }],
         critical_path_us: 70,
         steps_us: vec![(crate::NodeKind::Codegen, 70)],
         placed: crate::PlacedBytes::default(),
@@ -777,7 +867,14 @@ fn a_build_test_or_run_that_ends_without_its_work_fails_naming_the_job() {
     let mut world = World::new();
     let requests = [
         Request::Build { view: head("main"), targets: targets() },
-        Request::Test { view: head("main"), targets: targets(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
+        Request::Test {
+            view: head("main"),
+            targets: targets(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        },
         Request::Run { view: head("main"), targets: targets(), bin: None, args: Vec::new() },
     ];
     for (id, request) in (1..).zip(requests) {
@@ -858,7 +955,12 @@ fn intents_are_taken_over_in_start_order_after_slots_are_reused() {
     world.finish(snapshots[1], true, None);
 
     for conn in 1..=3 {
-        let will = Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms: 100 };
+        let will = Request::WillTest {
+            view: head("main"),
+            filter: Vec::new(),
+            targets: targets(),
+            wait_ms: 100,
+        };
         world.request(conn, 1, will);
     }
     let intents: Vec<JobId> = world.builder.speculated.iter().map(|it| it.0).collect();
@@ -895,8 +997,10 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             builder: &mut *builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
+            uptime_ms: 40,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -914,8 +1018,10 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             builder: &mut *builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
+            uptime_ms: 40,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -940,7 +1046,13 @@ fn best_of_ranks_with_ties_and_an_unappliable_candidate_last() {
         vec![write("b.rs", "b")],
         vec![write("c.rs", "c")],
     ];
-    let request = Request::BestOf { base: head("main"), candidates, targets: targets(), test: false, filter: Vec::new() };
+    let request = Request::BestOf {
+        base: head("main"),
+        candidates,
+        targets: targets(),
+        test: false,
+        filter: Vec::new(),
+    };
     let replies = world.request(1, 1, request);
     assert_eq!(replies.len(), 2);
     assert_eq!(of_error_at(&replies[0]), Some((1, Some("missing.rs".to_owned()))));
@@ -950,11 +1062,17 @@ fn best_of_ranks_with_ties_and_an_unappliable_candidate_last() {
     assert!(world.builder.started.iter().all(|it| it.2 == Work::Check(targets())));
     assert_eq!(world.session.views(), 3);
 
-    assert_eq!(world.report(jobs[0], diagnostic(Level::Error)), [reply(1, 1, of(0, diagnostic(Level::Error)))]);
+    assert_eq!(
+        world.report(jobs[0], diagnostic(Level::Error)),
+        [reply(1, 1, of(0, diagnostic(Level::Error)))]
+    );
     world.report(jobs[1], diagnostic(Level::Warning));
     world.report(jobs[2], diagnostic(Level::Warning));
     world.report(jobs[2], diagnostic(Level::Note));
-    assert_eq!(world.finish(jobs[0], false, None), [reply(1, 1, of(0, Response::Done { ok: false }))]);
+    assert_eq!(
+        world.finish(jobs[0], false, None),
+        [reply(1, 1, of(0, Response::Done { ok: false }))]
+    );
     world.finish(jobs[2], true, None);
     let replies = world.finish(jobs[1], true, None);
     assert_eq!(replies.len(), 3);
@@ -971,11 +1089,25 @@ fn best_of_ranks_with_ties_and_an_unappliable_candidate_last() {
 #[test]
 fn best_of_tests_rank_by_failed_then_passed() {
     let mut world = World::new();
-    let candidates = vec![vec![write("a.rs", "a")], vec![write("b.rs", "b")], vec![write("c.rs", "c")]];
+    let candidates =
+        vec![vec![write("a.rs", "a")], vec![write("b.rs", "b")], vec![write("c.rs", "c")]];
     let filter = vec!["it".to_owned()];
-    let request = Request::BestOf { base: head("main"), candidates, targets: targets(), test: true, filter: filter.clone() };
+    let request = Request::BestOf {
+        base: head("main"),
+        candidates,
+        targets: targets(),
+        test: true,
+        filter: filter.clone(),
+    };
     assert_eq!(world.request(1, 1, request), []);
-    assert!(world.builder.started.iter().all(|it| it.2 == Work::Test { targets: targets(), filter: filter.clone(), all: false, args: Vec::new(), ub: None }));
+    assert!(world.builder.started.iter().all(|it| it.2
+        == Work::Test {
+            targets: targets(),
+            filter: filter.clone(),
+            all: false,
+            args: Vec::new(),
+            ub: None
+        }));
     let jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
     world.report(jobs[0], test_result(TestOutcome::Passed));
     world.report(jobs[0], test_result(TestOutcome::Failed));
@@ -998,12 +1130,28 @@ fn best_of_tests_rank_by_failed_then_passed() {
 fn best_of_with_no_candidate_that_applies_ends_at_once() {
     let mut world = World::new();
     let candidates = vec![vec![Op::Delete { path: "x".to_owned() }]];
-    let request = Request::BestOf { base: head("main"), candidates, targets: targets(), test: false, filter: Vec::new() };
+    let request = Request::BestOf {
+        base: head("main"),
+        candidates,
+        targets: targets(),
+        test: false,
+        filter: Vec::new(),
+    };
     let replies = world.request(1, 1, request);
     assert!(matches!(replies[2].response, Response::Ranked(ref it) if it.len() == 1));
     assert_eq!(replies[3], done(1, 1, false));
     assert!(world.session.pending.is_empty());
-    let replies = world.request(1, 2, Request::BestOf { base: head("main"), candidates: Vec::new(), targets: targets(), test: false, filter: Vec::new() });
+    let replies = world.request(
+        1,
+        2,
+        Request::BestOf {
+            base: head("main"),
+            candidates: Vec::new(),
+            targets: targets(),
+            test: false,
+            filter: Vec::new(),
+        },
+    );
     assert_eq!(replies.last(), Some(&done(1, 2, false)));
     assert!(error_at(&replies).is_some());
 }
@@ -1012,7 +1160,17 @@ fn best_of_with_no_candidate_that_applies_ends_at_once() {
 fn a_best_of_cancel_cancels_every_running_candidate() {
     let mut world = World::new();
     let candidates = vec![vec![write("a.rs", "a")], vec![write("b.rs", "b")]];
-    world.request(1, 1, Request::BestOf { base: head("main"), candidates, targets: targets(), test: false, filter: Vec::new() });
+    world.request(
+        1,
+        1,
+        Request::BestOf {
+            base: head("main"),
+            candidates,
+            targets: targets(),
+            test: false,
+            filter: Vec::new(),
+        },
+    );
     let jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
     world.finish(jobs[0], true, None);
     world.request(1, 2, Request::Cancel { id: 1 });
@@ -1236,7 +1394,12 @@ fn an_intent_is_answered_at_once_and_a_request_on_its_root_takes_it_over() {
     let mut world = World::new();
     let root = world.commit(&[("src/lib.rs", "")]);
     let filter = vec!["parse".to_owned()];
-    let will = Request::WillTest { view: head("main"), filter: filter.clone(), targets: targets(), wait_ms: 100 };
+    let will = Request::WillTest {
+        view: head("main"),
+        filter: filter.clone(),
+        targets: targets(),
+        wait_ms: 100,
+    };
     assert_eq!(
         world.request(1, 1, will),
         [reply(1, 1, Response::Announced { root }), done(1, 1, true)]
@@ -1247,14 +1410,18 @@ fn an_intent_is_answered_at_once_and_a_request_on_its_root_takes_it_over() {
     assert_eq!(world.session.views(), 1);
     assert_eq!(world.report(job, diagnostic(Level::Error)), [], "an intent's reports are dropped");
 
-    world.request(2, 1, Request::Test {
-        view: head("main"),
-        targets: targets(),
-        filter: Vec::new(),
-        all: false,
-        args: Vec::new(),
-        ub: None,
-    });
+    world.request(
+        2,
+        1,
+        Request::Test {
+            view: head("main"),
+            targets: targets(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        },
+    );
     assert_eq!(world.builder.promoted, [job], "another connection's request takes it over");
     world.request(2, 2, Request::Check { view: head("main"), targets: targets() });
     assert_eq!(world.builder.promoted, [job], "once");
@@ -1269,11 +1436,20 @@ fn an_intent_is_answered_at_once_and_a_request_on_its_root_takes_it_over() {
 fn a_reach_verify_or_tables_takes_no_intent_over() {
     let mut world = World::new();
     world.commit(&[("src/lib.rs", "")]);
-    let will = Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms: 100 };
+    let will = Request::WillTest {
+        view: head("main"),
+        filter: Vec::new(),
+        targets: targets(),
+        wait_ms: 100,
+    };
     world.request(1, 1, will);
     world.request(1, 2, Request::Verify { view: head("main"), targets: targets() });
     world.request(1, 3, Request::Tables { view: head("main") });
-    world.request(1, 4, Request::Reach { from: head("main"), to: head("main"), targets: targets() });
+    world.request(
+        1,
+        4,
+        Request::Reach { from: head("main"), to: head("main"), targets: targets() },
+    );
     assert!(world.builder.promoted.is_empty());
 }
 
@@ -1296,7 +1472,13 @@ fn a_save_of_the_same_root_takes_it_over_and_one_of_another_cancels_it() {
     assert_eq!(opened.view, View { root });
     assert_eq!(
         work,
-        Work::Test { targets: targets(), filter: Vec::new(), all: false, args: Vec::new(), ub: None }
+        Work::Test {
+            targets: targets(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None
+        }
     );
     assert_eq!(world.vfs.head("main"), Some(base), "an intent moves no head");
 
@@ -1346,7 +1528,12 @@ fn a_save_of_the_same_root_takes_it_over_and_one_of_another_cancels_it() {
 fn an_intent_is_cancelled_by_a_newer_one_its_connections_end_or_its_wait() {
     let mut world = World::new();
     world.commit(&[("src/lib.rs", "")]);
-    let will = |wait_ms| Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms };
+    let will = |wait_ms| Request::WillTest {
+        view: head("main"),
+        filter: Vec::new(),
+        targets: targets(),
+        wait_ms,
+    };
     world.tick(1_000);
     world.request(1, 1, will(5));
     let first = world.last_speculated();
@@ -1392,7 +1579,8 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
         let texts = ["x", "y", "z"];
 
         for _ in 0..200 {
-            let (promoted, cancelled) = (world.builder.promoted.len(), world.builder.cancelled.len());
+            let (promoted, cancelled) =
+                (world.builder.promoted.len(), world.builder.cancelled.len());
             match rng.index(8) {
                 0..=2 if !conns.is_empty() => {
                     let conn = conns[rng.index(conns.len())];
@@ -1417,7 +1605,11 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                         },
                         2 => {
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
-                            Request::Commit { head: "main".to_owned(), base, ops: vec![write("a.rs", text)] }
+                            Request::Commit {
+                                head: "main".to_owned(),
+                                base,
+                                ops: vec![write("a.rs", text)],
+                            }
                         }
                         _ => Request::Check { view: head("main"), targets: targets() },
                     };
@@ -1431,7 +1623,8 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     assert!(world.session.deadline().is_none_or(|it| it > now), "seed {seed}");
                 }
                 4 | 5 => {
-                    let mut jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
+                    let mut jobs: Vec<JobId> =
+                        world.builder.started.iter().map(|it| it.0).collect();
                     jobs.extend(world.builder.speculated.iter().map(|it| it.0));
                     jobs.retain(|it| !finished.contains(it));
                     if !jobs.is_empty() {

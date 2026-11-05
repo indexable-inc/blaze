@@ -43,16 +43,15 @@ mod tests;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-
 use std::fmt;
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 
 pub use crate::build::{Builder, SectionWriter, TooLarge};
-pub use blaze_ids::crc32c::crc32c;
 pub use crate::image::{Image, Stable};
 pub use crate::raw::{bytes_of, cast};
+pub use blaze_ids::crc32c::crc32c;
 
 /// How a whole-image pass (CRCs at write, a section checked whole at restore) spreads its work:
 /// `jobs(n, job)` runs `job(0)` to `job(n - 1)` on as many workers as it has and returns when
@@ -253,7 +252,10 @@ impl fmt::Display for Corrupt {
                 write!(f, "{section} is read for {len} bytes at {at}, past its end (group {group})")
             }
             Cause::Misaligned { at, align } => {
-                write!(f, "{section} is read at {at} for a value aligned to {align} (group {group})")
+                write!(
+                    f,
+                    "{section} is read at {at} for a value aligned to {align} (group {group})"
+                )
             }
         }
     }

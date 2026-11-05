@@ -33,7 +33,9 @@ fn print(trees: &[Tree]) -> String {
 
 fn lex(text: &str) -> Stream {
     let mut emitted = Vec::new();
-    let stream = lex::stream(text, site(), Edition::Edition2021, false, &mut emitted, &mut Vec::new()).expect("lexes");
+    let stream =
+        lex::stream(text, site(), Edition::Edition2021, false, &mut emitted, &mut Vec::new())
+            .expect("lexes");
     assert!(emitted.is_empty(), "lexing {text:?} reported {emitted:?}");
     stream
 }
@@ -109,10 +111,20 @@ fn dollar_and_dollar_crate() {
     assert_eq!(quoted("$x"), "$x");
     let span = site();
     let dollar_crate = [
-        Tree::Ident { sym: Symbol::intern("$crate"), kind: IdentKind::Normal, span, spacing: Spacing::Alone },
+        Tree::Ident {
+            sym: Symbol::intern("$crate"),
+            kind: IdentKind::Normal,
+            span,
+            spacing: Spacing::Alone,
+        },
         Tree::Punct { ch: b':', spacing: Spacing::Joint, span },
         Tree::Punct { ch: b':', spacing: Spacing::Alone, span },
-        Tree::Ident { sym: Symbol::intern("x"), kind: IdentKind::Normal, span, spacing: Spacing::Alone },
+        Tree::Ident {
+            sym: Symbol::intern("x"),
+            kind: IdentKind::Normal,
+            span,
+            spacing: Spacing::Alone,
+        },
     ];
     // `convert_dollar_crate` is false for `ts_to_string`.
     assert_eq!(print(&dollar_crate), "$crate :: x");
@@ -123,7 +135,12 @@ fn raw_and_forced_keyword_idents() {
     assert_eq!(lexed("r#type"), "r#type");
     assert_eq!(quoted("r#type"), "r#type");
     let span = site();
-    let forced = [Tree::Ident { sym: Symbol::intern("fn"), kind: IdentKind::ForcedKeyword, span, spacing: Spacing::Alone }];
+    let forced = [Tree::Ident {
+        sym: Symbol::intern("fn"),
+        kind: IdentKind::ForcedKeyword,
+        span,
+        spacing: Spacing::Alone,
+    }];
     assert_eq!(print(&forced), "k#fn");
 }
 
@@ -166,9 +183,20 @@ fn every_literal_kind() {
     assert_eq!(quoted(text), text);
     let span = site();
     let negative = [
-        Tree::Ident { sym: Symbol::intern("x"), kind: IdentKind::Normal, span, spacing: Spacing::Alone },
+        Tree::Ident {
+            sym: Symbol::intern("x"),
+            kind: IdentKind::Normal,
+            span,
+            spacing: Spacing::Alone,
+        },
         Tree::Punct { ch: b'-', spacing: Spacing::Alone, span },
-        Tree::Literal { kind: LitKind::Integer, symbol: Symbol::intern("-1"), suffix: Some(Symbol::intern("i8")), span, spacing: Spacing::Alone },
+        Tree::Literal {
+            kind: LitKind::Integer,
+            symbol: Symbol::intern("-1"),
+            suffix: Some(Symbol::intern("i8")),
+            span,
+            spacing: Spacing::Alone,
+        },
     ];
     assert_eq!(print(&negative), "x - -1i8");
     assert_eq!(print(&given(&negative)), "x - -1i8");

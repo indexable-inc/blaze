@@ -15,6 +15,7 @@
 //! [`Built::puts`]: what the build compiled, its keys. A store entry that fails to read is an
 //! error naming the unit, never a reason to compile again.
 
+use std::alloc::Global;
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -23,14 +24,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use std::alloc::Global;
 
 use blaze_cas::{Key, Kind};
 use blaze_graph::par::{self, IntoSource};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
-
 
 use crate::{
     CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
@@ -48,7 +47,7 @@ use crate::{
     query::keys,
     settings::Spec,
     summary::{Imports, Summary},
-    template::{StaticTemplate, Template, TemplateError},
+    template::{OwnAnchors, StaticTemplate, Template, TemplateError, own_place},
 };
 
 /// The store as a build reads it.
@@ -122,7 +121,18 @@ impl Stats {
     /// `other`'s counts added to these: what one item of a loop on all cores counted, into its
     /// build's ([`Out::absorb`]).
     fn add(&mut self, other: Stats) {
-        let Stats { instances, statics, stored, memo, flown, compiled, folded, imported, profiles, verified } = other;
+        let Stats {
+            instances,
+            statics,
+            stored,
+            memo,
+            flown,
+            compiled,
+            folded,
+            imported,
+            profiles,
+            verified,
+        } = other;
         self.instances += instances;
         self.statics += statics;
         self.stored += stored;
@@ -228,6 +238,10 @@ pub struct Built {
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.
     pub cold: Vec<InstanceKey>,
+    /// Every instance the walk reached, sorted by key, each once, with how it was made: its
+    /// backend and the least origin that asked for it (`FnNode::least_origin`). The linker
+    /// sums an image's code by them; nothing is keyed by them.
+    pub made: Vec<(InstanceKey, crate::Made)>,
     /// Every dev template a whole build took from the store or made, sorted, each once (a lazy
     /// build's are not recorded yet): the kernel's entries, for the oracle.
     pub kernel: Vec<KernelEntry>,
@@ -247,9 +261,9 @@ impl Built {
     ///
     /// When `root` is no function of the build: the caller asks of one of [`Built::roots`].
     pub fn reached(&self, root: &InstanceKey) -> Vec<CodeHash> {
-        self.reach
-            .of(root)
-            .unwrap_or_else(|| panic!("{root:?} is no function of the build, so it reaches nothing"))
+        self.reach.of(root).unwrap_or_else(|| {
+            panic!("{root:?} is no function of the build, so it reaches nothing")
+        })
     }
 }
 
@@ -338,45 +352,64 @@ pub fn stored(key: InstanceKey, built_in: &[InstanceKey]) -> InstanceKey {
     InstanceKey(hasher.finish())
 }
 
-pub const PLACED_DOMAIN: &str = "blaze v2 placed 1";
+pub const PLACED_DOMAIN: &str = "blaze v2 placed 2";
 
-/// What a unit's code is kept under: [`stored`] and the kind of each of its references, by
-/// place. A template is made against the places of its references, and two bodies of one key
-/// can have other places (a fact of the arguments the key leaves out adds a call), so how many
-/// there are and what each is are keyed; which callee or symbol is at a place is not, as a
-/// template takes any.
-pub fn placed(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
+/// What a unit's code is kept under: [`stored`], the kind of each of its references, by
+/// place, and which place is the function itself (`own`, [`crate::template::own_place`] of
+/// the references its template is made against). A template is made against the places of its
+/// references, and two bodies of one key can have other places (a fact of the arguments the
+/// key leaves out adds a call), so how many there are and what each is are keyed; which callee
+/// or symbol is at a place is not, as a template takes any, but for the function itself, which
+/// its template holds as its own and never as a place (rule 20).
+pub fn placed(stored: InstanceKey, refs: &[Target], own: Option<u32>) -> InstanceKey {
     let mut hasher = Hasher::new(PLACED_DOMAIN);
     hasher.id(&stored.0).update(&(refs.len() as u64).to_le_bytes());
     for target in refs {
         hasher.update(&[place_kind(target)]);
     }
+    match own {
+        Some(at) => hasher.update(&[1]).update(&at.to_le_bytes()),
+        None => hasher.update(&[0]),
+    };
     InstanceKey(hasher.finish())
 }
 
-/// The store key of the dev template of `instance`, whose code builds in `built_in` (in the
-/// driver's order) and references `refs`, compiled by the codegen of `toolchain`
-/// (`Spec::toolchain.id`): `kernel::template(placed(stored(..), refs), ..)`. The one place the
+/// The store key of the dev template of `instance` (its template instance: its code is its
+/// template code), compiled as `own` (the instance key its function is compiled under), whose
+/// code builds in `built_in` (in the driver's order) and references `refs`, compiled by the
+/// codegen of `toolchain` (`Spec::toolchain.id`):
+/// `kernel::template(placed(stored(..), refs, own_place(own, refs)), ..)`. The one place the
 /// driver and `blaze_global`'s public dev function rule make it, so the two cannot differ.
 /// Every function compiled alone, with no imports, is kept under it, whatever its backend: a
 /// whole build's Cranelift and stencil code (all but [`crate::Backend::is_release`]'s), a lazy
 /// build's first compiles, and a lazy build's tier-up (`Later::tier_up`), LLVM's too. Code
 /// compiled with imports is under [`release_template_key`]: a whole build's LLVM code, and a
 /// whole live build's tier-up (`Build::tier_up`).
-pub fn dev_template_key(instance: &Instance, built_in: &[InstanceKey], refs: &[Target], toolchain: &ContentId) -> Key {
-    kernel::template(&placed(stored(instance.key(), built_in), refs), &instance.settings, toolchain)
+pub fn dev_template_key(
+    instance: &Instance,
+    own: InstanceKey,
+    built_in: &[InstanceKey],
+    refs: &[Target],
+    toolchain: &ContentId,
+) -> Key {
+    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, refs));
+    kernel::template(&placed, &instance.settings, toolchain)
 }
 
-/// The references and the store key of the release compile of `instance`, whose code builds
-/// in `built_in` (in the driver's order) and references `refs`, importing `imports` with
+/// The references and the store key of the release compile of `instance` (its template
+/// instance), compiled as `own` (the instance key its function is compiled under), whose code
+/// builds in `built_in` (in the driver's order) and references `refs`, importing `imports` with
 /// `imported_units`, `imported_refs` and `imported_built_in` (each imported function's
 /// instance key as its export is compiled, at its own settings, its references and the
 /// bodies its export builds in, in [`Imports::imported`]'s order):
-/// `keys::release(imports.blob_key(with_imported(laid_out(placed(stored(..), refs), places), ..)))`,
-/// the places of [`release_refs`]. The one place the driver and `blaze_global`'s public
-/// function rule make it, so the two cannot differ.
+/// `keys::release(imports.blob_key(with_imported(laid_out(placed(stored(..), refs, own_place(own, all)), places), ..)))`,
+/// `all` and `places` those of [`release_refs`]: its template is made against `all`, so the
+/// place of the function itself is among them, an import's call of it too. The one place the
+/// driver and `blaze_global`'s public function rule make it, so the two cannot differ.
+#[allow(clippy::too_many_arguments)]
 pub fn release_template_key(
     instance: &Instance,
+    own: InstanceKey,
     built_in: &[InstanceKey],
     refs: &[Target],
     imports: &Imports,
@@ -385,8 +418,14 @@ pub fn release_template_key(
     imported_built_in: &[&[InstanceKey]],
 ) -> (Vec<Target>, Key) {
     let (all, places) = release_refs(refs, imported_refs);
-    let laid = laid_out(placed(stored(instance.key(), built_in), refs), &places);
-    let key = keys::release(&imports.blob_key(with_imported(laid, imported_units, imported_refs, imported_built_in)));
+    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, &all));
+    let laid = laid_out(placed, &places);
+    let key = keys::release(&imports.blob_key(with_imported(
+        laid,
+        imported_units,
+        imported_refs,
+        imported_built_in,
+    )));
     (all, key)
 }
 
@@ -412,8 +451,9 @@ pub fn with_imported(
     for len in [imported_units.len(), imported_refs.len(), imported_built_in.len()] {
         hasher.update(&(len as u64).to_le_bytes());
     }
-    for ((unit, refs), built_in) in imported_units.iter().zip(imported_refs).zip(imported_built_in) {
-        hasher.id(&placed(stored(*unit, built_in), refs).0);
+    for ((unit, refs), built_in) in imported_units.iter().zip(imported_refs).zip(imported_built_in)
+    {
+        hasher.id(&placed(stored(*unit, built_in), refs, own_place(*unit, refs)).0);
     }
     InstanceKey(hasher.finish())
 }
@@ -457,6 +497,7 @@ pub fn subject(identity: ContentId, origin: Origin) -> ContentId {
     origin.hash_into(&mut hasher);
     hasher.finish()
 }
+pub const RELATIVE_FLIGHT_DOMAIN: &str = "blaze v2 relative flight 1";
 pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 
 /// What a folded group's merge flies under ([`crate::flight`]): its key, and each member with
@@ -476,12 +517,45 @@ fn group_flight(group: &Group) -> InstanceKey {
 impl<I, S> FnNode<I, S> {
     /// What its code is kept under.
     fn stored(&self) -> InstanceKey {
-        placed(stored(self.unit.instance.key(), &self.built_in), &self.refs)
+        let own = own_place(self.unit.instance.key(), &self.refs);
+        placed(stored(self.unit.instance.key(), &self.built_in), &self.refs, own)
     }
 
-    /// The store key of its dev template: the kernel's entry of its stored key.
+    /// What its dev compile flies under ([`crate::flight`]): [`Self::stored`] and whether its
+    /// template is relative to its own anchors ([`Described::anchors`]). One code is relative
+    /// for one requester and absolute for another (a report or profile names it for one
+    /// origin, or one origin's inliner builds bodies in), so two builds of the memo can compile
+    /// one stored key in the two forms. A landing hands its template to every build that flew
+    /// the key, which keeps it under its own template key: a relative build given an absolute
+    /// template would keep another function's positions under a key with no name or place in
+    /// it (rule 18), as [`Shape::relative`] keeps the two forms apart in the memo.
+    fn flight(&self) -> InstanceKey {
+        let stored = self.stored();
+        if self.described.anchors.is_none() {
+            return stored;
+        }
+        let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
+        hasher.id(&stored.0);
+        InstanceKey(hasher.finish())
+    }
+
+    /// The store key of its dev template: the kernel's entry of its stored key, of its
+    /// [`Self::template_instance`].
     fn template_key(&self) -> Key {
-        dev_template_key(&self.unit.instance, &self.built_in, &self.refs, &self.spec.toolchain.id)
+        dev_template_key(
+            &self.template_instance(),
+            self.unit.instance.key(),
+            &self.built_in,
+            &self.refs,
+            &self.spec.toolchain.id,
+        )
+    }
+
+    /// Its instance as its template is kept: its code is its template code
+    /// ([`Described::template_code`]), which holds no name and no place where its template
+    /// holds its own positions by table (`Described::anchors`).
+    fn template_instance(&self) -> Instance {
+        Instance { code: self.described.template_code, ..self.unit.instance }
     }
 
     /// What it is across edits of its body, telling apart instances side by side
@@ -492,18 +566,31 @@ impl<I, S> FnNode<I, S> {
 
     /// Why its dev template under `at` ([`Self::template_key`]) was not in the store, as its
     /// key's parts by name, for `blaze why` (`blaze_kernel::why`): each body it builds in by
-    /// path (with whose code it is where two share a path), so a callee whose code changed is
-    /// named. Made on a miss only, and only when asked ([`Build::explain_misses`]).
+    /// path (with whose code it is where two share a path, and its subject, which edits of its
+    /// body leave as it is, where two share both: two instances of one generic, `<[u8]>::as_ptr`
+    /// and `<[u16]>::as_ptr`, are one path of one origin), so a callee whose code changed is
+    /// named, and no two parts share a name (which `blaze_kernel::Miss::of_parts` refuses). Made
+    /// on a miss only, and only when asked ([`Build::explain_misses`]).
     fn missed(&self, at: Key, nodes: &Sorted<InstanceKey, FnNode<I, S>>) -> blaze_kernel::Miss {
         use blaze_kernel::Part;
-        let instance = &self.unit.instance;
+        let instance = self.template_instance();
         // alloc: once a miss, a part each part of its key
         let mut parts = vec![
             Part::new("the toolchain", Some(self.spec.toolchain.id)),
             Part::new("its code", Some(instance.code.0)),
             Part::new("its type arguments' facts", Some(instance.args)),
             Part::new("its codegen settings", Some(instance.settings.0)),
-            Part::new("the kinds of its references", Some(placed(InstanceKey(ContentId::default()), &self.refs).0)),
+            Part::new(
+                "the kinds of its references",
+                Some(
+                    placed(
+                        InstanceKey(ContentId::default()),
+                        &self.refs,
+                        own_place(self.unit.instance.key(), &self.refs),
+                    )
+                    .0,
+                ),
+            ),
         ];
         // alloc: once a miss
         let callees: Vec<(InstanceKey, Option<&Self>, Option<&str>)> = self
@@ -516,13 +603,37 @@ impl<I, S> FnNode<I, S> {
             .collect();
         for (key, node, path) in &callees {
             let shared = callees.iter().filter(|(_, _, other)| other == path).count() > 1;
-            let name = match (*node, shared) {
+            let origin = node.map(|it| it.described.origin);
+            let same_origin = shared
+                && callees
+                    .iter()
+                    .filter(|(_, other, it)| {
+                        it == path && other.map(|it| it.described.origin) == origin
+                    })
+                    .count()
+                    > 1;
+            let name = match (*node, shared, same_origin) {
                 // alloc: once a miss
-                (Some(node), false) => format!("the code of `{}`, built in", node.described.name),
+                (Some(node), false, _) => {
+                    format!("the code of `{}`, built in", node.described.name)
+                }
                 // alloc: once a miss
-                (Some(node), true) => format!("the code of `{}` as {:?}'s, built in", node.described.name, node.described.origin),
+                (Some(node), true, false) => format!(
+                    "the code of `{}` as {:?}'s, built in",
+                    node.described.name, node.described.origin
+                ),
                 // alloc: once a miss
-                (None, _) => "the code of a callee built in that its build did not walk".to_owned(),
+                (Some(node), true, true) => format!(
+                    "the code of `{}` as {:?}'s, instance {}, built in",
+                    node.described.name,
+                    node.described.origin,
+                    node.subject()
+                ),
+                // No subject without its node: told apart by its key.
+                // alloc: once a miss
+                (None, _, _) => {
+                    format!("the code of a callee built in that its build did not walk, {}", key.0)
+                }
             };
             let names = node.map(|it| it.described.name.clone()); // clone: once a miss
             parts.push(Part { name, hash: Some(key.0), names });
@@ -660,7 +771,9 @@ fn unkept_message<I, S>(
     kept: &[InstanceKey],
     under: &Key,
 ) -> String {
-    let name = |key: &InstanceKey| nodes.get(key).map_or("an instance of no node", |it| &it.described.name);
+    let name = |key: &InstanceKey| {
+        nodes.get(key).map_or("an instance of no node", |it| &it.described.name)
+    };
     let of_it: Vec<&str> = (nodes.iter())
         .filter(|(_, it_node)| it_node.described.held_codes().contains(&it))
         .map(|(_, it_node)| &*it_node.described.name)
@@ -669,7 +782,7 @@ fn unkept_message<I, S>(
     let held: Vec<&str> = kept.iter().map(name).collect(); // alloc: an error
     let of_it = match of_it.is_empty() {
         true => "no instance of the build".to_owned(), // alloc: an error
-        false => format!("`{}`", of_it.join("`, `")), // alloc: an error
+        false => format!("`{}`", of_it.join("`, `")),  // alloc: an error
     };
     // alloc: an error
     format!(
@@ -701,7 +814,8 @@ fn release_kept<B: Prepare>(
 
 impl<B: Prepare> Job<'_, B> {
     fn stored(&self) -> InstanceKey {
-        placed(stored(self.unit.instance.key(), &self.node.built_in), &self.node.refs)
+        let own = own_place(self.unit.instance.key(), &self.node.refs);
+        placed(stored(self.unit.instance.key(), &self.node.built_in), &self.node.refs, own)
     }
 
     /// What its summary is kept and flown under: [`Self::stored`] and its callees.
@@ -731,6 +845,21 @@ fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenEr
     CodegenError { unit, item, what: what.into(), front: None }
 }
 
+/// [`Prepare::prepare`] of `node` as `unit`, its shape [`Shape::relative`] when its template
+/// is relative to its own anchors ([`Described::anchors`]). Every prepare of a function goes
+/// through here, so the memo, its flights and a lazy build's recorded shapes all key one form.
+fn prepare_node<B: Prepare>(
+    backend: &B,
+    frontend: &B::Frontend,
+    unit: &Unit,
+    spec: &Spec,
+    node: &Node<B>,
+) -> Result<(Shape, B::Prepared), CodegenError> {
+    let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
+    let own = own_place(unit.instance.key(), &node.refs);
+    Ok((shape.relative(node.described.anchors.is_some()).own_place(own), made))
+}
+
 /// `why`, the refusal of the function called `name`, with its message naming it where it does
 /// not already (rule 16): a backend's error knows the unit's keys, not the function's path, so
 /// "LLVM has no code for it: opcode `swizzle`" alone says nothing of which function.
@@ -755,10 +884,20 @@ fn symbols_defined_twice<B: Prepare>(
     // The definer's unit and item, and its name for the message. A static's unit is its value's
     // key, as the owners' check has it.
     let functions = nodes.iter().filter_map(|(key, node)| {
-        Some((node.described.symbol.as_deref()?, node.described.name.as_str(), *key, node.unit.item))
+        Some((
+            node.described.symbol.as_deref()?,
+            node.described.name.as_str(),
+            *key,
+            node.unit.item,
+        ))
     });
     let statics = statics.iter().filter_map(|((item, _), node)| {
-        Some((node.described.symbol.as_deref()?, node.described.name.as_str(), InstanceKey(node.described.value), *item))
+        Some((
+            node.described.symbol.as_deref()?,
+            node.described.name.as_str(),
+            InstanceKey(node.described.value),
+            *item,
+        ))
     });
     // By symbol, then definer's name: the message lists them in order of name (rule 22).
     // alloc: per build, its symbols, a few hundred
@@ -770,13 +909,15 @@ fn symbols_defined_twice<B: Prepare>(
         let by: Vec<String> = one.iter().map(|it| format!("`{}`", it.1)).collect();
         let Some((last, rest)) = by.split_last() else { continue };
         let times = match one.len() {
-            2 => "twice".to_owned(), // alloc: the error's message
+            2 => "twice".to_owned(),   // alloc: the error's message
             n => format!("{n} times"), // alloc: the error's message
         };
         // alloc: the error's message
         let rest = rest.join(", by ");
         // alloc: the error's message
-        let what = format!("the symbol `{symbol}` is defined {times} in one program, by {rest} and by {last}");
+        let what = format!(
+            "the symbol `{symbol}` is defined {times} in one program, by {rest} and by {last}"
+        );
         errors.push(error(unit, item, what));
     }
 }
@@ -822,16 +963,21 @@ impl<B: Prepare> Exports<B> {
         let job = by_name[&name];
         let named = |it: &mut String| {
             use std::fmt::Write as _;
-            _ = write!(it, "codegen: the export of `{}` {name:?}, which another compile of this build makes", job.node.described.name);
+            _ = write!(
+                it,
+                "codegen: the export of `{}` {name:?}, which another compile of this build makes",
+                job.node.described.name
+            );
         };
         let ran = self.making.get_or_run_named(blaze_graph::Key(name.0.0), named, || {
             // Made by a run that ended since the look above.
             if self.made.pin().contains_key(&name) {
                 return Ok(());
             }
-            let made = (build.backend.prepare(build.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs))
+            let made = (prepare_node(build.backend, build.frontend, &job.unit, job.spec, job.node))
                 .and_then(|(_, mut made)| {
-                    let (_, export) = build.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
+                    let (_, export) =
+                        build.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
                     Ok((export, made))
                 });
             match made {
@@ -999,7 +1145,8 @@ impl Out {
                 applied: u64::from(profiled.applied()),
             });
         }
-        self.function_digests.push((function.key, digests::function_digest(code, &function.inlined)));
+        self.function_digests
+            .push((function.key, digests::function_digest(code, &function.inlined)));
         self.functions.push(function);
     }
 
@@ -1019,7 +1166,8 @@ impl Out {
                 *at = at.plus(counts);
             }
             other => {
-                let (key, item) = first.unwrap_or((InstanceKey(ContentId::default()), ItemKey(ContentId::default())));
+                let (key, item) = first
+                    .unwrap_or((InstanceKey(ContentId::default()), ItemKey(ContentId::default())));
                 // alloc: an error, once
                 let what = format!(
                     "{} functions were built with a profile (`Profiled::Used`) in a build whose policy \
@@ -1052,7 +1200,14 @@ impl Out {
     /// When the memo already keeps another template under `key`, compiled earlier, neither is
     /// instantiated: both are put, so [`Out::finish`] refuses the build naming both and their
     /// content IDs (rule 18). Two templates of equal bytes are one.
-    fn keyed<'m>(&mut self, memo: &'m Memo, by: By, unit: &Unit, key: Key, template: Template) -> Option<&'m Template> {
+    fn keyed<'m>(
+        &mut self,
+        memo: &'m Memo,
+        by: By,
+        unit: &Unit,
+        key: Key,
+        template: Template,
+    ) -> Option<&'m Template> {
         match memo.put_keyed(key, template) {
             Ok(kept) => {
                 self.template(by, key, kept);
@@ -1076,7 +1231,12 @@ impl Out {
     /// store hit records its entry where it is read (`hit: true`), so a cold and a warm build of
     /// one tree record the same entries.
     fn dev_template(&mut self, node: InstanceKey, unit: &Unit, key: Key, template: &Template) {
-        self.kernel.push(KernelEntry { instance: node, step: blaze_kernel::steps::DEV_TEMPLATE, key, hit: false });
+        self.kernel.push(KernelEntry {
+            instance: node,
+            step: blaze_kernel::steps::DEV_TEMPLATE,
+            key,
+            hit: false,
+        });
         self.template(By::node(node, unit), key, template);
     }
 
@@ -1085,7 +1245,11 @@ impl Out {
         match (emitted.side.take(), emitted.function.side) {
             (Some(bytes), Some(id)) => self.put(by, keys::side(&id), Kind::Debug, bytes),
             (None, None) => {}
-            _ => self.errors.push(error(by.unit, by.item, "the compile's side table and the function's record of it disagree")),
+            _ => self.errors.push(error(
+                by.unit,
+                by.item,
+                "the compile's side table and the function's record of it disagree",
+            )),
         }
     }
 
@@ -1102,14 +1266,22 @@ impl Out {
                 Ok(it) => Read::Hit(it),
                 Err(why) => {
                     // alloc: an error
-                    self.errors.push(error(unit.instance.key(), unit.item, format!("the store's {key:?}: {why}")));
+                    self.errors.push(error(
+                        unit.instance.key(),
+                        unit.item,
+                        format!("the store's {key:?}: {why}"),
+                    ));
                     Read::Failed
                 }
             },
             Ok(None) => Read::Miss,
             Err(why) => {
                 // alloc: an error
-                self.errors.push(error(unit.instance.key(), unit.item, format!("reading the store's {key:?}: {why}")));
+                self.errors.push(error(
+                    unit.instance.key(),
+                    unit.item,
+                    format!("reading the store's {key:?}: {why}"),
+                ));
                 Read::Failed
             }
         }
@@ -1125,13 +1297,19 @@ impl Out {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 // alloc: an error
-                let why = format!("{}: `{name}`'s template {at:?}, a hit of this build, is no longer in the store", blaze_store_check::VAR);
+                let why = format!(
+                    "{}: `{name}`'s template {at:?}, a hit of this build, is no longer in the store",
+                    blaze_store_check::VAR
+                );
                 self.errors.push(refused(why));
                 return;
             }
             Err(why) => {
                 // alloc: an error
-                self.errors.push(refused(format!("{}: reading `{name}`'s template {at:?} again: {why}", blaze_store_check::VAR)));
+                self.errors.push(refused(format!(
+                    "{}: reading `{name}`'s template {at:?} again: {why}",
+                    blaze_store_check::VAR
+                )));
                 return;
             }
         };
@@ -1141,8 +1319,8 @@ impl Out {
         }
     }
 
-    /// The function of `template`, from `whence`, for `key` (called `name`) with `refs`, into
-    /// the build's functions.
+    /// The function of `template`, from `whence`, for `key` (called `name`) with `refs` and its
+    /// own span tables anchored at `anchors`, into the build's functions.
     fn instantiate(
         &mut self,
         unit: &Unit,
@@ -1151,8 +1329,9 @@ impl Out {
         whence: Whence,
         template: &Template,
         refs: &[Target],
+        anchors: OwnAnchors<'_>,
     ) {
-        self.made(unit, name, key, whence, template.instantiate(key, refs));
+        self.made(unit, name, key, whence, template.instantiate_at(key, refs, anchors));
     }
 
     /// A function made for `key` (called `name`) of the template from `whence`, into the
@@ -1171,11 +1350,18 @@ impl Out {
         }
     }
 
-    /// A compile's template against `refs`, taking the compile's function over, or the error
-    /// naming why it has none.
-    fn template_of(&mut self, unit: &Unit, emitted: Emitted, refs: &[Target]) -> Option<Template> {
+    /// A compile's template against `refs`, its own positions by table where its instance's
+    /// span tables are anchored at `anchors` ([`crate::template::own_anchor`]), taking the
+    /// compile's function over, or the error naming why it has none.
+    fn template_of(
+        &mut self,
+        unit: &Unit,
+        emitted: Emitted,
+        refs: &[Target],
+        anchors: OwnAnchors<'_>,
+    ) -> Option<Template> {
         let key = emitted.function.key;
-        match Template::of_owned(emitted.function, refs, &emitted.extra) {
+        match Template::of_owned_at(emitted.function, refs, &emitted.extra, anchors) {
             Ok(it) => Some(it),
             Err(why) => {
                 // alloc: an error
@@ -1194,7 +1380,9 @@ impl Out {
         // By key, then putter, kind and bytes: which of one key's puts comes first is the
         // same whatever order the build pushed them in (rule 22).
         self.puts.sort_unstable_by(|a, b| {
-            (a.1.key, a.0, a.1.kind).cmp(&(b.1.key, b.0, b.1.kind)).then_with(|| a.1.bytes.cmp(&b.1.bytes))
+            (a.1.key, a.0, a.1.kind)
+                .cmp(&(b.1.key, b.0, b.1.kind))
+                .then_with(|| a.1.bytes.cmp(&b.1.bytes))
         });
         // alloc: per build, what it gives the caller to put, sized by its puts
         let mut puts: Vec<Put> = Vec::with_capacity(self.puts.len());
@@ -1209,7 +1397,8 @@ impl Out {
                             given: blaze_cas::content_of(&put.bytes),
                         };
                         let kinds = (kept.kind, put.kind);
-                        self.errors.push(put_twice(first, by, kinds, &mismatch, &name_of));
+                        let differ = template_difference(kinds, &kept.bytes, &put.bytes);
+                        self.errors.push(put_twice(first, by, kinds, &mismatch, &differ, &name_of));
                     }
                 }
                 _ => {
@@ -1263,6 +1452,7 @@ fn put_twice<'n>(
     then: By,
     (kept_kind, given_kind): (Kind, Kind),
     mismatch: &blaze_cas::Mismatch,
+    differ: &str,
     name_of: &impl Fn(Of) -> Option<&'n str>,
 ) -> CodegenError {
     let who = |by: By| {
@@ -1278,7 +1468,10 @@ fn put_twice<'n>(
             // alloc: an error
             Some(name) => format!("{what} `{name}` (instance {:?}, item {:?})", by.unit, by.item),
             // alloc: an error
-            None => format!("{what} of instance {:?} (item {:?}), which the walk has no name of", by.unit, by.item),
+            None => format!(
+                "{what} of instance {:?} (item {:?}), which the walk has no name of",
+                by.unit, by.item
+            ),
         }
     };
     let (key, kept, given) = (mismatch.key, mismatch.kept, mismatch.given);
@@ -1293,11 +1486,65 @@ fn put_twice<'n>(
     let refusal = if kept == given { String::new() } else { format!(" {mismatch:?}") };
     // alloc: an error
     let what = format!(
-        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 18: {why}{refusal})",
+        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 18: {why}{refusal}){differ}",
         who(first),
         who(then),
     );
     error(then.unit, then.item, what)
+}
+
+/// Where two templates put under one key differ, for [`put_twice`]'s error: the first field
+/// of [`Template`] whose values are not equal, with both values (each cut to its first
+/// differing entry for a list), so the error names the input the key misses. Empty when either
+/// is no template or the two are of other kinds.
+fn template_difference((kept_kind, given_kind): (Kind, Kind), kept: &[u8], given: &[u8]) -> String {
+    if kept_kind != Kind::Code || given_kind != Kind::Code {
+        return String::new();
+    }
+    let (Ok(kept), Ok(given)) = (blob::decode(kept), blob::decode(given)) else {
+        return String::new();
+    };
+    // The first index at which two lists differ, and the entry each has there.
+    fn first<T: std::fmt::Debug + PartialEq>(field: &str, a: &[T], b: &[T]) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let at = a.iter().zip(b).position(|(a, b)| a != b).unwrap_or(a.len().min(b.len()));
+        // alloc: an error
+        Some(format!(
+            "; they differ in `{field}` (lengths {} and {}) first at {at}: {:?} and {:?}",
+            a.len(),
+            b.len(),
+            a.get(at),
+            b.get(at)
+        ))
+    }
+    fn whole<T: std::fmt::Debug + PartialEq>(field: &str, a: &T, b: &T) -> Option<String> {
+        // alloc: an error
+        (a != b).then(|| format!("; they differ in `{field}`: {a:?} and {b:?}"))
+    }
+    let differ = [
+        whole("arch", &kept.arch, &given.arch),
+        whole("align", &kept.align, &given.align),
+        first("code", &kept.code, &given.code),
+        first("relocation rows", kept.relocs.rows(), given.relocs.rows()),
+        first("relocation targets", kept.relocs.targets(), given.relocs.targets()),
+        (kept.relocs.rows() == given.relocs.rows()
+            && kept.relocs.targets() == given.relocs.targets()
+            && kept.relocs != given.relocs)
+            .then(|| "; they differ in their relocations' wide addends".to_owned()), // alloc: an error
+        first("data", &kept.data, &given.data),
+        first("inlined", &kept.inlined, &given.inlined),
+        whole("side", &kept.side, &given.side),
+        whole("unwind", &kept.unwind, &given.unwind),
+        first("lines", &kept.lines, &given.lines),
+        whole("refs", &kept.refs, &given.refs),
+        first("externs", &kept.externs, &given.externs),
+        whole("coverage", &kept.coverage, &given.coverage),
+        whole("profile", &kept.profile, &given.profile),
+    ];
+    // alloc: an error
+    differ.into_iter().flatten().collect()
 }
 
 /// What a build collected, sorted and each once.
@@ -1325,10 +1572,18 @@ enum Whence {
 }
 
 /// Function `key` (`item`, called `name`) could not be made of the template from `whence`.
-fn unfit(key: InstanceKey, item: ItemKey, name: &str, whence: Whence, why: &TemplateError) -> CodegenError {
+fn unfit(
+    key: InstanceKey,
+    item: ItemKey,
+    name: &str,
+    whence: Whence,
+    why: &TemplateError,
+) -> CodegenError {
     let what = match whence {
         // alloc: an error
-        Whence::Folded(_) => format!("the body folded for the group of `{name}` ({key:?}, the group's key)"),
+        Whence::Folded(_) => {
+            format!("the body folded for the group of `{name}` ({key:?}, the group's key)")
+        }
         // alloc: an error
         Whence::Store(_) | Whence::Shape(_) => format!("`{name}` ({key:?})"),
     };
@@ -1343,11 +1598,12 @@ fn stored_function(
     bytes: &[u8],
     key: InstanceKey,
     refs: &[Target],
+    anchors: OwnAnchors<'_>,
 ) -> Result<Result<CompiledFunction, TemplateError>, String> {
     frame::task(Tag::Codegen, |frame| {
         // alloc: an error
         let view = blob::decode_view(bytes, frame).map_err(|e| e.to_string())?;
-        Ok(view.instantiate(key, refs))
+        Ok(view.instantiate_at(key, refs, anchors))
     })
 }
 
@@ -1380,7 +1636,12 @@ fn callee(target: &Target) -> Option<InstanceKey> {
 }
 
 impl<'a, B: Prepare> Build<'a, B> {
-    pub fn new(backend: &'a B, frontend: &'a B::Frontend, policy: &'a Policy, memo: &'a Memo) -> Self {
+    pub fn new(
+        backend: &'a B,
+        frontend: &'a B::Frontend,
+        policy: &'a Policy,
+        memo: &'a Memo,
+    ) -> Self {
         Build {
             backend,
             frontend,
@@ -1430,16 +1691,21 @@ impl<'a, B: Prepare> Build<'a, B> {
         requester: Origin,
         described: Described<FrontInstance<B>, FrontStatic<B>>,
     ) -> Result<Node<B>, CodegenError> {
-        let choice = self.policy.choose(&described.origin, described.overflow_checks).map_err(|why| {
-            let unit = Instance {
-                code: described.code,
-                args: described.args,
-                settings: crate::Settings(self.policy.id()),
-            };
-            // alloc: an error
-            error(unit.key(), described.item, why.to_string())
-        })?;
-        let instance_of = Instance { code: described.code, args: described.args, settings: choice.first.settings() };
+        let choice =
+            self.policy.choose(&described.origin, described.overflow_checks).map_err(|why| {
+                let unit = Instance {
+                    code: described.code,
+                    args: described.args,
+                    settings: crate::Settings(self.policy.id()),
+                };
+                // alloc: an error
+                error(unit.key(), described.item, why.to_string())
+            })?;
+        let instance_of = Instance {
+            code: described.code,
+            args: described.args,
+            settings: choice.first.settings(),
+        };
         let unit = Unit {
             instance: instance_of,
             backend: choice.first.backend,
@@ -1489,7 +1755,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         mut order: Option<&mut Vec<InstanceKey>>,
         errors: &mut Vec<CodegenError>,
     ) -> (Sorted<InstanceKey, Node<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
-        let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> = blaze_hash::HashMap::new_in(Global);
+        let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
+            blaze_hash::HashMap::new_in(Global);
         let mut statics: blaze_hash::HashMap<StaticId, StaticNode<B>, Global> =
             blaze_hash::HashMap::new_in(Global);
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
@@ -1573,7 +1840,11 @@ impl<'a, B: Prepare> Build<'a, B> {
                 self.frontend.describe_static(value).and_then(|it| self.static_node(value, it))
             });
             let current = std::mem::replace(&mut level, recursion::Level::new());
-            let functions = current.functions.into_iter().zip(current.function_items).zip(current.function_from);
+            let functions = current
+                .functions
+                .into_iter()
+                .zip(current.function_items)
+                .zip(current.function_from);
             for (((asked_for, item), at), node) in functions.zip(described) {
                 let node = match node {
                     Ok(node) => node,
@@ -1604,6 +1875,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                     blaze_hash::hash_map::Entry::Occupied(mut it) => {
                         let (kept, new) = (&it.get().described, &node.described);
                         if kept.code != new.code
+                            || kept.template_code != new.template_code
+                            || kept.anchors != new.anchors
                             || kept.built_in_code != new.built_in_code
                             || kept.built_in.len() != new.built_in.len()
                             || kept.refs.len() != new.refs.len()
@@ -1614,13 +1887,16 @@ impl<'a, B: Prepare> Build<'a, B> {
                                 // alloc: the error's message
                                 format!(
                                     "`{}` and `{}` have one instance key {key:?} but other code: \
-                                     code {:?} against {:?}, built in as {:?} against {:?}, {} \
+                                     code {:?} against {:?}, template code {:?} against {:?}, \
+                                     built in as {:?} against {:?}, {} \
                                      built-in callees against {}, {} references against {}; the \
                                      key misses an input their code reads",
                                     kept.name,
                                     new.name,
                                     kept.code,
                                     new.code,
+                                    kept.template_code,
+                                    new.template_code,
                                     kept.built_in_code,
                                     new.built_in_code,
                                     kept.built_in.len(),
@@ -1639,7 +1915,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                 }
             }
-            let statics_of = current.statics.into_iter().zip(current.static_items).zip(current.static_from);
+            let statics_of =
+                current.statics.into_iter().zip(current.static_items).zip(current.static_from);
             for (((value, item), at), node) in statics_of.zip(described_statics) {
                 let node = match node {
                     Ok(node) => node,
@@ -1661,21 +1938,29 @@ impl<'a, B: Prepare> Build<'a, B> {
         // each kept node's references as they resolve below, is built.
         if graph.checks_more() {
             // alloc: per build, what its own roots reach
-            let mut functions: blaze_hash::HashSet<InstanceKey, Global> = blaze_hash::HashSet::new_in(Global);
-            let mut values: blaze_hash::HashSet<StaticId, Global> = blaze_hash::HashSet::new_in(Global);
+            let mut functions: blaze_hash::HashSet<InstanceKey, Global> =
+                blaze_hash::HashSet::new_in(Global);
+            let mut values: blaze_hash::HashSet<StaticId, Global> =
+                blaze_hash::HashSet::new_in(Global);
             // alloc: per build, the walk's two queues, from the roots
-            let mut function_queue: Vec<InstanceKey> = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
+            let mut function_queue: Vec<InstanceKey> =
+                roots.iter().filter_map(|it| asked.get(it).copied()).collect();
             // alloc: as above
-            let mut value_queue: Vec<StaticId> = static_roots.iter().filter_map(|it| static_asked.get(it).copied()).collect();
+            let mut value_queue: Vec<StaticId> =
+                static_roots.iter().filter_map(|it| static_asked.get(it).copied()).collect();
             loop {
                 let (refs, requester) = if let Some(key) = function_queue.pop() {
                     match nodes.get(&key) {
-                        Some(node) if functions.insert(key) => (&node.described.refs, node.described.origin),
+                        Some(node) if functions.insert(key) => {
+                            (&node.described.refs, node.described.origin)
+                        }
                         _ => continue,
                     }
                 } else if let Some(id) = value_queue.pop() {
                     match statics.get(&id) {
-                        Some(node) if values.insert(id) => (&node.described.refs, node.described.origin),
+                        Some(node) if values.insert(id) => {
+                            (&node.described.refs, node.described.origin)
+                        }
                         _ => continue,
                     }
                 } else {
@@ -1687,7 +1972,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                             // clone: per build, the walk's key of a callee; who asks for it is a copy
                             function_queue.extend(asked.get(&(callee.clone(), requester)).copied());
                         }
-                        FrontRef::Static(value) => value_queue.extend(static_asked.get(value).copied()),
+                        FrontRef::Static(value) => {
+                            value_queue.extend(static_asked.get(value).copied())
+                        }
                         FrontRef::Extern(_) | FrontRef::Weak(_) => {}
                     }
                 }
@@ -1764,18 +2051,25 @@ impl<'a, B: Prepare> Build<'a, B> {
             // code, not its MIR: the copy built in stays right.
             for &at in &node.described.built_in {
                 match node.refs.get(at as usize).and_then(callee) {
-                    Some(it) if nodes.get(&it).is_some_and(|it| it.patchable) => errors.push(error(
-                        *key,
-                        node.unit.item,
-                        // alloc: an error
-                        format!("builds in {it:?}, which is patchable: an edit patches it alone"),
-                    )),
+                    Some(it) if nodes.get(&it).is_some_and(|it| it.patchable) => {
+                        errors.push(error(
+                            *key,
+                            node.unit.item,
+                            // alloc: an error
+                            format!(
+                                "builds in {it:?}, which is patchable: an edit patches it alone"
+                            ),
+                        ))
+                    }
                     Some(it) => callees.push(it),
                     None => errors.push(error(
                         *key,
                         node.unit.item,
                         // alloc: an error
-                        format!("builds in place {at}, which is not a function among its {} references", node.refs.len()),
+                        format!(
+                            "builds in place {at}, which is not a function among its {} references",
+                            node.refs.len()
+                        ),
                     )),
                 }
             }
@@ -1823,7 +2117,12 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// end says the build stopped ([`Frontend::stopped`], a relaxed load against a function's
     /// 50 to 200 µs): a stopped build gives each thread back within the one function it is in.
     /// Any left undone is one [`stopped`] error in `errors`.
-    fn until_stopped<I, R>(&self, items: I, errors: &mut Vec<CodegenError>, work: impl Fn(I::Item) -> R + Sync) -> Vec<R>
+    fn until_stopped<I, R>(
+        &self,
+        items: I,
+        errors: &mut Vec<CodegenError>,
+        work: impl Fn(I::Item) -> R + Sync,
+    ) -> Vec<R>
     where
         I: IntoSource,
         R: Send,
@@ -1865,7 +2164,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per batch of store misses, sized by it
         let mut slots: Vec<Option<(InstanceKey, T)>> = items.into_iter().map(Some).collect();
         // alloc: per batch of store misses, sized by it
-        let mut flown: Vec<Option<Flown<T, R>>> = std::iter::repeat_with(|| None).take(slots.len()).collect();
+        let mut flown: Vec<Option<Flown<T, R>>> =
+            std::iter::repeat_with(|| None).take(slots.len()).collect();
         'decide: loop {
             let decisions = plan.take_decisions();
             if decisions.is_empty() {
@@ -1880,7 +2180,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             let asked = self.until_stopped(asks, errors, |(at, (key, item))| {
                 let mut item = Some(item);
-                let asked = flights.ask(key, &owner, || run(item.take().expect("a run takes its item once")));
+                let asked = flights
+                    .ask(key, &owner, || run(item.take().expect("a run takes its item once")));
                 (at, key, item, asked)
             });
             for (at, key, item, asked) in asked {
@@ -1947,7 +2248,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
         self.until_stopped(keys, errors, |key| {
             let node = &nodes[key];
-            let made = self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs);
+            let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
             (*key, made)
         })
     }
@@ -2024,10 +2325,19 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: none for a whole build; a lazy one's, sized by its units
         let mut order = Vec::new();
         let (nodes, statics, root_keys) = {
-            let _span = tracing::info_span!(target: "blaze", "codegen walk", roots = roots.len()).entered();
-            self.walk(roots, static_roots, check, later.is_some().then_some(&mut order), &mut out.errors)
+            let _span =
+                tracing::info_span!(target: "blaze", "codegen walk", roots = roots.len()).entered();
+            self.walk(
+                roots,
+                static_roots,
+                check,
+                later.is_some().then_some(&mut order),
+                &mut out.errors,
+            )
         };
-        let owning = tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len()).entered();
+        let owning =
+            tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len())
+                .entered();
         // Over the columns, whose iterators clone: the owners are read before they are checked.
         let owned = owners::owners(
             &nodes.keys.iter().zip(&nodes.values).map(|(key, node)| owners::Function {
@@ -2050,13 +2360,19 @@ impl<'a, B: Prepare> Build<'a, B> {
             &mut out.errors,
         );
         // alloc: per build, the keys of its functions written in workspace crates
-        let editable: Vec<InstanceKey> =
-            nodes.keys.iter().zip(&nodes.values).filter(|(_, node)| node.described.editable).map(|(key, _)| *key).collect();
+        let editable: Vec<InstanceKey> = nodes
+            .keys
+            .iter()
+            .zip(&nodes.values)
+            .filter(|(_, node)| node.described.editable)
+            .map(|(key, _)| *key)
+            .collect();
         symbols_defined_twice(&nodes, &statics, &mut out.errors);
         drop(owning);
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
-        self.static_callees = statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
+        self.static_callees =
+            statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
         if !out.errors.is_empty() {
             let errors = out.finish(names_of(&nodes, Some(&statics))).errors;
             // A refused build is still the last run, as one whose compiles failed is: a lazy or
@@ -2081,7 +2397,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .iter()
                     .filter(|(_, node)| node.spec.backend.is_release())
                     // clone: per build, a release job's unit (plain IDs)
-                    .map(|(key, node)| Job { name: *key, unit: node.unit.clone(), spec: &node.spec, node })
+                    .map(|(key, node)| Job {
+                        name: *key,
+                        unit: node.unit.clone(),
+                        spec: &node.spec,
+                        node,
+                    })
                     // alloc: per build, sized by its units
                     .collect();
                 {
@@ -2097,11 +2418,15 @@ impl<'a, B: Prepare> Build<'a, B> {
             return Err(vec![stopped()]);
         }
         {
-            let _span = tracing::info_span!(target: "blaze", "codegen statics", statics = statics.len()).entered();
+            let _span =
+                tracing::info_span!(target: "blaze", "codegen statics", statics = statics.len())
+                    .entered();
             self.statics(&statics, store, &mut out);
         }
         out.profiled(self.policy.pgo);
-        let _finishing = tracing::info_span!(target: "blaze", "codegen finish", functions = nodes.len()).entered();
+        let _finishing =
+            tracing::info_span!(target: "blaze", "codegen finish", functions = nodes.len())
+                .entered();
 
         let mergeable = |key: &InstanceKey| match nodes.get(key) {
             Some(node) => !node.external(),
@@ -2114,7 +2439,11 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // static.
                 for at in renamed {
                     let value = &out.statics[at];
-                    debug_assert_eq!(out.static_digests[at].0, (value.item, value.instance), "pushed together");
+                    debug_assert_eq!(
+                        out.static_digests[at].0,
+                        (value.item, value.instance),
+                        "pushed together"
+                    );
                     out.static_digests[at].1 = digests::static_definition(value);
                 }
                 deduped
@@ -2145,7 +2474,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let static_symbols = statics
             .iter()
             // clone: per build, the symbols the build gives the linker
-            .filter_map(|((item, instance), node)| Some((*item, *instance, node.described.symbol.clone()?)))
+            .filter_map(|((item, instance), node)| {
+                Some((*item, *instance, node.described.symbol.clone()?))
+            })
             // alloc: per build, what it gives the linker
             .collect();
         // alloc: per build, what it gives the linker
@@ -2174,6 +2505,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         identities.append(&mut out.folded);
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
+        let made = nodes
+            .iter()
+            .map(|(key, node)| {
+                (*key, crate::Made { backend: node.spec.backend, origin: node.least_origin })
+            })
+            // alloc: per build, what it gives the linker
+            .collect();
         let reach = Reach::new(
             nodes.iter().map(|(key, node)| {
                 let marks = [node.unit.instance.code.0, node.unit.instance.args];
@@ -2192,7 +2530,16 @@ impl<'a, B: Prepare> Build<'a, B> {
             (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
         });
         out.used.extend(lazily.shapes.values().copied());
-        let Finished { functions, statics: compiled_statics, puts, stats, errors, used, kernel, misses } = out.finish(names_of(&nodes, Some(&statics)));
+        let Finished {
+            functions,
+            statics: compiled_statics,
+            puts,
+            stats,
+            errors,
+            used,
+            kernel,
+            misses,
+        } = out.finish(names_of(&nodes, Some(&statics)));
         self.last = Later { nodes, shapes: lazily.shapes };
         if !errors.is_empty() {
             return Err(errors);
@@ -2222,6 +2569,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             memo_used: used,
             identities,
             cold,
+            made,
             kernel,
             misses,
         })
@@ -2276,7 +2624,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         self.release(&self.last.nodes, &jobs, store, &mut out);
         out.profiled(self.policy.pgo);
-        let Finished { functions, puts, stats, errors, used, .. } = out.finish(names_of::<_, _, B>(&self.last.nodes, None));
+        let Finished { functions, puts, stats, errors, used, .. } =
+            out.finish(names_of::<_, _, B>(&self.last.nodes, None));
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -2306,7 +2655,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         // other data than the IR a group merges. Each form interned once in `self.masks`
         // (hashed only when new).
         // alloc: per build, sized by its units
-        let candidates_of: Vec<InstanceKey> = dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
+        let candidates_of: Vec<InstanceKey> =
+            dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
         // alloc: per build, sized by its units
         let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
         for (key, made) in self.prepare_all(nodes, &candidates_of, &mut out.errors) {
@@ -2344,7 +2694,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // What its code is kept under: the body of a group it is first in is its
                 // code rewritten, so that body's key covers it (`fold::Group::first`), and its thunk's
                 // key does (`fold::Group::stored`).
-                None => candidates.push((*key, node.stored(), node.unit.instance.settings, *it, node.refs.as_slice())),
+                None => candidates.push((
+                    *key,
+                    node.stored(),
+                    node.unit.instance.settings,
+                    *it,
+                    node.refs.as_slice(),
+                )),
             }
         }
         let groups = fold::groups(&candidates, &fold::Limits::default());
@@ -2361,12 +2717,17 @@ impl<'a, B: Prepare> Build<'a, B> {
             let node = &nodes[key];
             let at = node.template_key();
             let read = out.read(store, &at, &node.unit, |it| {
-                stored_function(it, *key, &node.refs)
+                stored_function(it, *key, &node.refs, node.described.anchors.as_ref())
             });
             match read {
                 Read::Hit(made) => {
                     out.stats.stored += 1;
-                    out.kernel.push(KernelEntry { instance: *key, step: blaze_kernel::steps::DEV_TEMPLATE, key: at, hit: true });
+                    out.kernel.push(KernelEntry {
+                        instance: *key,
+                        step: blaze_kernel::steps::DEV_TEMPLATE,
+                        key: at,
+                        hit: true,
+                    });
                     let ir = prepared.remove(key);
                     if self.verify.sampled(&at.0) {
                         sampled.push((*key, at, ir.map(|it| it.1)));
@@ -2391,16 +2752,23 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alone, once this build's own compiles ended.
         let items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> =
             // alloc: per build, sized by its store misses
-            missing.into_iter().map(|key| (nodes[&key].stored(), (key, prepared.remove(&key)))).collect();
+            missing.into_iter().map(|key| (nodes[&key].flight(), (key, prepared.remove(&key)))).collect();
         let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
             let node = &nodes[key];
             (*key, node.unit.item, node.described.name.as_str())
         };
-        let flown = self.fly(items, name, |(key, own)| self.compile_missing(nodes, key, own), &mut out.errors);
+        let flown = self.fly(
+            items,
+            name,
+            |(key, own)| self.compile_missing(nodes, key, own),
+            &mut out.errors,
+        );
         for it in flown {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
-                Flown::Landed((key, own), shape) => self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), out),
+                Flown::Landed((key, own), shape) => {
+                    self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), out)
+                }
             }
         }
         if self.frontend.stopped() {
@@ -2426,7 +2794,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             return;
         }
         // alloc: per build, the store hits the store check samples
-        let unprepared: Vec<InstanceKey> = sampled.iter().filter(|it| it.2.is_none()).map(|it| it.0).collect();
+        let unprepared: Vec<InstanceKey> =
+            sampled.iter().filter(|it| it.2.is_none()).map(|it| it.0).collect();
         let mut made: HashMap<InstanceKey, B::Prepared> = HashMap::new();
         for (key, it) in self.prepare_all(nodes, &unprepared, &mut out.errors) {
             match it {
@@ -2450,7 +2819,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             let emitted = match emitted {
                 Ok(it) if it.function.key == key => it,
                 Ok(it) => {
-                    let what = format!("{}: compiled again as {:?}", blaze_store_check::VAR, it.function.key); // alloc: an error
+                    let what = format!(
+                        "{}: compiled again as {:?}",
+                        blaze_store_check::VAR,
+                        it.function.key
+                    ); // alloc: an error
                     out.errors.push(error(key, node.unit.item, what));
                     continue;
                 }
@@ -2459,12 +2832,21 @@ impl<'a, B: Prepare> Build<'a, B> {
                     continue;
                 }
             };
-            if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
+            if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied())
+            {
                 // alloc: an error
-                out.errors.push(error(key, node.unit.item, unkept_message(nodes, node, it, &node.built_in, &at)));
+                out.errors.push(error(
+                    key,
+                    node.unit.item,
+                    unkept_message(nodes, node, it, &node.built_in, &at),
+                ));
                 continue;
             }
-            let Some(template) = out.template_of(&node.unit, emitted, &node.refs) else { continue };
+            let Some(template) =
+                out.template_of(&node.unit, emitted, &node.refs, node.described.anchors.as_ref())
+            else {
+                continue;
+            };
             out.verify(&node.unit, &node.described.name, store, at, &blob::encode(&template));
         }
     }
@@ -2485,13 +2867,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         if let Some(own) = own {
             let own = own.key();
             if own != shape {
-                let (name, stored) = (&node.described.name, node.stored());
+                let (name, stored) = (&node.described.name, node.flight());
                 out.errors.push(error(
                     key,
                     node.unit.item,
                     // alloc: an error
                     format!(
-                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same stored key {stored:?}, so the key misses an input of its IR (rule 18)"
+                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same flight key {stored:?}, so the key misses an input of its IR (rule 18)"
                     ),
                 ));
                 return;
@@ -2502,14 +2884,24 @@ impl<'a, B: Prepare> Build<'a, B> {
             Some(template) => {
                 out.stats.flown += 1;
                 out.dev_template(key, &node.unit, node.template_key(), template);
-                out.instantiate(&node.unit, &node.described.name, key, Whence::Shape(shape), template, &node.refs);
+                out.instantiate(
+                    &node.unit,
+                    &node.described.name,
+                    key,
+                    Whence::Shape(shape),
+                    template,
+                    &node.refs,
+                    node.described.anchors.as_ref(),
+                );
             }
             // A landing is dropped with its template ([`Memo::retain`]), between builds.
             None => out.errors.push(error(
                 key,
                 node.unit.item,
                 // alloc: an error
-                format!("its compile landed under shape {shape:?}, which the memo has no template of"),
+                format!(
+                    "its compile landed under shape {shape:?}, which the memo has no template of"
+                ),
             )),
         }
     }
@@ -2530,7 +2922,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let node = &nodes[&key];
         let (compiled, made) = match own {
             Some(it) => it,
-            None => match self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs) {
+            None => match prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node) {
                 Ok(it) => it,
                 Err(why) => {
                     out.errors.push(why);
@@ -2543,7 +2935,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         if self.memo.get(&shape).is_none() {
             let named = |it: &mut String| {
                 use std::fmt::Write as _;
-                _ = write!(it, "codegen: shape {shape:?} of `{}`, which another function of it compiles", node.described.name);
+                _ = write!(
+                    it,
+                    "codegen: shape {shape:?} of `{}`, which another function of it compiles",
+                    node.described.name
+                );
             };
             let mut here = false;
             self.memo.flights().shape(shape, named, || {
@@ -2551,30 +2947,53 @@ impl<'a, B: Prepare> Build<'a, B> {
                 if self.memo.get(&shape).is_some() {
                     return;
                 }
-                let mut emitted = match self.backend.emit(&node.unit, &node.spec, made, &node.refs, None) {
-                    Ok(it) if it.function.key == key => it,
-                    Ok(it) => {
-                        // alloc: an error
-                        out.errors.push(error(key, node.unit.item, format!("compiled as {:?}", it.function.key)));
-                        return;
-                    }
-                    Err(why) => {
-                        out.errors.push(naming(why, &node.described.name));
-                        return;
-                    }
-                };
-                if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
-                    let message = unkept_message(nodes, node, it, &node.built_in, &node.template_key());
+                let mut emitted =
+                    match self.backend.emit(&node.unit, &node.spec, made, &node.refs, None) {
+                        Ok(it) if it.function.key == key => it,
+                        Ok(it) => {
+                            // alloc: an error
+                            out.errors.push(error(
+                                key,
+                                node.unit.item,
+                                format!("compiled as {:?}", it.function.key),
+                            ));
+                            return;
+                        }
+                        Err(why) => {
+                            out.errors.push(naming(why, &node.described.name));
+                            return;
+                        }
+                    };
+                if let Some(it) =
+                    unkept_inline(nodes, &emitted.function, node.built_in.iter().copied())
+                {
+                    let message =
+                        unkept_message(nodes, node, it, &node.built_in, &node.template_key());
                     // alloc: an error
                     out.errors.push(error(key, node.unit.item, message));
                     return;
                 }
                 out.stats.compiled += 1;
                 out.side(By::node(key, &node.unit), &mut emitted);
-                let Some(template) = out.template_of(&node.unit, emitted, &node.refs) else { return };
+                let Some(template) = out.template_of(
+                    &node.unit,
+                    emitted,
+                    &node.refs,
+                    node.described.anchors.as_ref(),
+                ) else {
+                    return;
+                };
                 let kept = self.memo.put(compiled, template);
                 out.dev_template(key, &node.unit, node.template_key(), kept);
-                out.instantiate(&node.unit, &node.described.name, key, Whence::Shape(shape), kept, &node.refs);
+                out.instantiate(
+                    &node.unit,
+                    &node.described.name,
+                    key,
+                    Whence::Shape(shape),
+                    kept,
+                    &node.refs,
+                    node.described.anchors.as_ref(),
+                );
                 here = true;
             });
             if here {
@@ -2585,7 +3004,15 @@ impl<'a, B: Prepare> Build<'a, B> {
             Some(template) => {
                 out.stats.memo += 1;
                 out.dev_template(key, &node.unit, node.template_key(), template);
-                out.instantiate(&node.unit, &node.described.name, key, Whence::Shape(shape), template, &node.refs);
+                out.instantiate(
+                    &node.unit,
+                    &node.described.name,
+                    key,
+                    Whence::Shape(shape),
+                    template,
+                    &node.refs,
+                    node.described.anchors.as_ref(),
+                );
                 (Some(shape), out)
             }
             // This function's compile failed (its error is in `out`), or another function's
@@ -2612,12 +3039,14 @@ impl<'a, B: Prepare> Build<'a, B> {
         store: &impl Lookup,
         out: &mut Out,
     ) {
-        let thunk_refs = |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
+        let thunk_refs =
+            |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
         // alloc: per build, sized by its groups
         let mut merging = Vec::new();
         for group in groups {
             let key = group.key();
-            out.folded.push((key, folded_identity(group.members.iter().map(|it| nodes[it].subject()))));
+            out.folded
+                .push((key, folded_identity(group.members.iter().map(|it| nodes[it].subject()))));
             let first = &nodes[&group.members[0]];
             // alloc: an error
             let decode = |it: &[u8]| blob::decode(it).map_err(|e| e.to_string());
@@ -2637,12 +3066,30 @@ impl<'a, B: Prepare> Build<'a, B> {
                     out.stats.stored += 1 + thunks.len();
                     out.stats.folded += group.members.len();
                     let whence = Whence::Folded(keys::folded(&key));
-                    out.instantiate(&first.unit, &first.described.name, key, whence, &body, &first.refs);
-                    for ((member, stored), thunk) in group.members.iter().zip(&group.stored).zip(&thunks) {
+                    out.instantiate(
+                        &first.unit,
+                        &first.described.name,
+                        key,
+                        whence,
+                        &body,
+                        &first.refs,
+                        first.described.anchors.as_ref(),
+                    );
+                    for ((member, stored), thunk) in
+                        group.members.iter().zip(&group.stored).zip(&thunks)
+                    {
                         let node = &nodes[member];
                         let whence = Whence::Store(keys::thunk(&key, stored));
                         let refs = thunk_refs(group, member);
-                        out.instantiate(&node.unit, &node.described.name, *member, whence, thunk, &refs);
+                        out.instantiate(
+                            &node.unit,
+                            &node.described.name,
+                            *member,
+                            whence,
+                            thunk,
+                            &refs,
+                            node.described.anchors.as_ref(),
+                        );
                     }
                 }
                 _ => merging.push(group),
@@ -2654,14 +3101,24 @@ impl<'a, B: Prepare> Build<'a, B> {
         let items: Vec<(InstanceKey, (&Group, Vec<Option<(Shape, B::Prepared)>>))> = merging
             .into_iter()
             // alloc: per group the store missed, its members' IR
-            .map(|group| (group_flight(group), (group, group.members.iter().map(|it| prepared.remove(it)).collect())))
+            .map(|group| {
+                (
+                    group_flight(group),
+                    (group, group.members.iter().map(|it| prepared.remove(it)).collect()),
+                )
+            })
             // alloc: per build, sized by its groups
             .collect();
         let name = |(group, _): &(&Group, Vec<Option<(Shape, B::Prepared)>>)| {
             let first = &nodes[&group.members[0]];
             (group.key(), first.unit.item, first.described.name.as_str())
         };
-        let flown = self.fly(items, name, |(group, own)| self.merge_group(nodes, group, own), &mut out.errors);
+        let flown = self.fly(
+            items,
+            name,
+            |(group, own)| self.merge_group(nodes, group, own),
+            &mut out.errors,
+        );
         for it in flown {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
@@ -2684,13 +3141,20 @@ impl<'a, B: Prepare> Build<'a, B> {
         own: Vec<Option<(Shape, B::Prepared)>>,
     ) -> (Option<ContentId>, Out) {
         let mut out = Out::default();
-        let thunk_refs = |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
+        let thunk_refs =
+            |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
         let members: Vec<Option<_>> = (group.members.iter().zip(own))
             .map(|(member, own)| {
                 let node = &nodes[member];
                 let made = match own {
                     Some((_, made)) => made,
-                    None => match self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs) {
+                    None => match prepare_node(
+                        self.backend,
+                        self.frontend,
+                        &node.unit,
+                        &node.spec,
+                        node,
+                    ) {
                         Ok((_, made)) => made,
                         Err(why) => {
                             out.errors.push(why);
@@ -2703,7 +3167,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: per merge, the members the backend takes
             .collect();
         // A member that failed to prepare is an error of the build already.
-        let Some(members) = members.into_iter().collect::<Option<Vec<_>>>() else { return (None, out) };
+        let Some(members) = members.into_iter().collect::<Option<Vec<_>>>() else {
+            return (None, out);
+        };
         if self.frontend.stopped() {
             return (None, out);
         }
@@ -2725,21 +3191,36 @@ impl<'a, B: Prepare> Build<'a, B> {
         out.side(By::folded(group.members[0], &first.unit), &mut merged.body);
         let body_at = keys::folded(&key);
         let mut whole = true;
-        match out.template_of(&first.unit, merged.body, &first.refs) {
+        match out.template_of(
+            &first.unit,
+            merged.body,
+            &first.refs,
+            first.described.anchors.as_ref(),
+        ) {
             Some(body) => {
                 out.used(body_at.0);
                 let by = By::folded(group.members[0], &first.unit);
                 match out.keyed(self.memo, by, &first.unit, body_at, body) {
                     Some(kept) => {
                         let whence = Whence::Folded(body_at);
-                        out.instantiate(&first.unit, &first.described.name, key, whence, kept, &first.refs);
+                        out.instantiate(
+                            &first.unit,
+                            &first.described.name,
+                            key,
+                            whence,
+                            kept,
+                            &first.refs,
+                            first.described.anchors.as_ref(),
+                        );
                     }
                     None => whole = false,
                 }
             }
             None => whole = false,
         }
-        for ((member, stored), mut thunk) in group.members.iter().zip(&group.stored).zip(merged.thunks) {
+        for ((member, stored), mut thunk) in
+            group.members.iter().zip(&group.stored).zip(merged.thunks)
+        {
             let node = &nodes[member];
             if thunk.function.key != *member {
                 out.errors.push(error(*member, node.unit.item, "a thunk of another member"));
@@ -2749,12 +3230,26 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.side(By::node(*member, &node.unit), &mut thunk);
             let refs = thunk_refs(group, member);
             let at = keys::thunk(&key, stored);
-            match out.template_of(&node.unit, thunk, &refs) {
+            match out.template_of(&node.unit, thunk, &refs, node.described.anchors.as_ref()) {
                 Some(template) => {
                     out.used(at.0);
-                    match out.keyed(self.memo, By::node(*member, &node.unit), &node.unit, at, template) {
+                    match out.keyed(
+                        self.memo,
+                        By::node(*member, &node.unit),
+                        &node.unit,
+                        at,
+                        template,
+                    ) {
                         Some(kept) => {
-                            out.instantiate(&node.unit, &node.described.name, *member, Whence::Store(at), kept, &refs);
+                            out.instantiate(
+                                &node.unit,
+                                &node.described.name,
+                                *member,
+                                Whence::Store(at),
+                                kept,
+                                &refs,
+                                node.described.anchors.as_ref(),
+                            );
                         }
                         None => whole = false,
                     }
@@ -2798,13 +3293,29 @@ impl<'a, B: Prepare> Build<'a, B> {
         out.stats.folded += group.members.len();
         out.used(body_at.0);
         out.template(By::folded(group.members[0], &first.unit), body_at, body);
-        out.instantiate(&first.unit, &first.described.name, key, Whence::Folded(body_at), body, &first.refs);
+        out.instantiate(
+            &first.unit,
+            &first.described.name,
+            key,
+            Whence::Folded(body_at),
+            body,
+            &first.refs,
+            first.described.anchors.as_ref(),
+        );
         for (member, at, thunk) in thunks {
             let node = &nodes[member];
             out.used(at.0);
             out.template(By::node(*member, &node.unit), at, thunk);
             let refs = group.thunk_refs(&node.refs);
-            out.instantiate(&node.unit, &node.described.name, *member, Whence::Store(at), thunk, &refs);
+            out.instantiate(
+                &node.unit,
+                &node.described.name,
+                *member,
+                Whence::Store(at),
+                thunk,
+                &refs,
+                node.described.anchors.as_ref(),
+            );
         }
     }
 
@@ -2826,7 +3337,7 @@ impl<'a, B: Prepare> Build<'a, B> {
          -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
             self.until_stopped(names, errors, |name| {
                 let job = by_name[name];
-                let made = self.backend.prepare(self.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs);
+                let made = prepare_node(self.backend, self.frontend, &job.unit, job.spec, job.node);
                 (*name, made)
             })
         };
@@ -2841,17 +3352,20 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
         // alloc: per build, sized by its units
         let mut unsummarized = Vec::new();
-        for job in jobs {
-            let read = out.read(store, &keys::summary(&job.summarized()), &job.unit, |it| {
-                // alloc: an error
-                serde_json::from_slice::<Summary>(it).map_err(|e| e.to_string())
-            });
-            match read {
-                Read::Hit(summary) => {
-                    summaries.insert(job.name, summary);
+        {
+            let _span = tracing::info_span!(target: "blaze", "codegen summaries read", functions = jobs.len()).entered();
+            for job in jobs {
+                let read = out.read(store, &keys::summary(&job.summarized()), &job.unit, |it| {
+                    // alloc: an error
+                    Summary::decode(it).map_err(|e| e.to_string())
+                });
+                match read {
+                    Read::Hit(summary) => {
+                        summaries.insert(job.name, summary);
+                    }
+                    Read::Miss => unsummarized.push(job.name),
+                    Read::Failed => {}
                 }
-                Read::Miss => unsummarized.push(job.name),
-                Read::Failed => {}
             }
         }
         let summarize = |made: Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)>,
@@ -2859,18 +3373,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             self.until_stopped(made, errors, |(name, made)| {
                 let job = by_name[&name];
                 let summarized = made.and_then(|(_, mut made)| {
-                    let (summary, export) = self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
+                    let (summary, export) =
+                        self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
                     Ok((summary, export, made))
                 });
                 (name, summarized)
             })
         };
-        let summary_flight = |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].summarized()).0);
+        let summary_flight =
+            |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].summarized()).0);
         let flights = self.memo.flights();
         // Each summary the store missed is made by one build of the memo, by its flight key,
         // and landed the moment it is kept; else the other's, waited for alone.
         // alloc: per build, sized by its store misses
-        let items: Vec<(InstanceKey, InstanceKey)> = unsummarized.iter().map(|name| (summary_flight(name), *name)).collect();
+        let items: Vec<(InstanceKey, InstanceKey)> =
+            unsummarized.iter().map(|name| (summary_flight(name), *name)).collect();
         let name = |name: &InstanceKey| {
             let job = by_name[name];
             (job.name, job.unit.item, job.node.described.name.as_str())
@@ -2878,15 +3395,21 @@ impl<'a, B: Prepare> Build<'a, B> {
         let summarize_one = |name: InstanceKey| {
             let mut piece = Out::default();
             let job = by_name[&name];
-            let made = self.backend.prepare(self.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs);
+            let made = prepare_node(self.backend, self.frontend, &job.unit, job.spec, job.node);
             let summarized = made.and_then(|(_, mut made)| {
-                let (summary, export) = self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
+                let (summary, export) =
+                    self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
                 Ok((summary, export, made))
             });
             match summarized {
                 Ok((summary, export, made)) => {
-                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                    piece.put(By::node(job.name, &job.unit), keys::summary(&job.summarized()), Kind::Query, bytes);
+                    let bytes = summary.encode();
+                    piece.put(
+                        By::node(job.name, &job.unit),
+                        keys::summary(&job.summarized()),
+                        Kind::Query,
+                        bytes,
+                    );
                     let flight = summary_flight(&name);
                     piece.used(flight.0);
                     // clone: per summary made, the one the memo's other builds take
@@ -2953,7 +3476,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             Err(why) => {
                 let job = &jobs[0];
                 // alloc: an error
-                out.errors.push(error(job.name, job.unit.item, format!("deciding the imports: {why}")));
+                out.errors.push(error(
+                    job.name,
+                    job.unit.item,
+                    format!("deciding the imports: {why}"),
+                ));
                 return;
             }
         };
@@ -3008,7 +3535,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // alloc: per release unit, sized by its imports
                 imports.imported.iter().map(|it| by_name[it].unit.instance.key()).collect();
             let (refs, blob_key) = release_template_key(
-                &job.unit.instance,
+                &Instance { code: job.node.described.template_code, ..job.unit.instance },
+                job.unit.instance.key(),
                 &job.node.built_in,
                 &job.node.refs,
                 &imports,
@@ -3017,10 +3545,18 @@ impl<'a, B: Prepare> Build<'a, B> {
                 &imported_built_in,
             );
             let key = job.unit.instance.key();
-            match out.read(store, &blob_key, &job.unit, |it| stored_function(it, key, &refs)) {
+            match out.read(store, &blob_key, &job.unit, |it| {
+                stored_function(it, key, &refs, job.node.described.anchors.as_ref())
+            }) {
                 Read::Hit(made) => {
                     out.stats.stored += 1;
-                    out.made(&job.unit, &job.node.described.name, key, Whence::Store(blob_key), made);
+                    out.made(
+                        &job.unit,
+                        &job.node.described.name,
+                        key,
+                        Whence::Store(blob_key),
+                        made,
+                    );
                     if self.verify.sampled(&blob_key.0) {
                         sampled.push((job.name, imports, refs, blob_key));
                     }
@@ -3036,8 +3572,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         // the build that runs it prepares for it: its IR as the summaries left it, else made
         // here; an import's export as the summaries left it, else made once of this build's
         // runs ([`Exports`]), its IR then kept for that import's own compile.
-        let items: Vec<(InstanceKey, (InstanceKey, Imports, Vec<Target>, Key, Option<B::Prepared>))> = (missing.into_iter())
-            .map(|(name, imports, refs, blob_key)| (InstanceKey(blob_key.0), (name, imports, refs, blob_key, prepared.remove(&name))))
+        let items: Vec<(
+            InstanceKey,
+            (InstanceKey, Imports, Vec<Target>, Key, Option<B::Prepared>),
+        )> = (missing.into_iter())
+            .map(|(name, imports, refs, blob_key)| {
+                (InstanceKey(blob_key.0), (name, imports, refs, blob_key, prepared.remove(&name)))
+            })
             // alloc: per build, sized by its store misses
             .collect();
         let name = |it: &(InstanceKey, Imports, Vec<Target>, Key, Option<B::Prepared>)| {
@@ -3045,63 +3586,100 @@ impl<'a, B: Prepare> Build<'a, B> {
             (job.name, job.unit.item, job.node.described.name.as_str())
         };
         let made_here = Exports::<B>::default();
-        let compile = |(name, imports, refs, blob_key, made): (InstanceKey, Imports, Vec<Target>, Key, Option<B::Prepared>)| {
+        let compile = |(name, imports, refs, blob_key, made): (
+            InstanceKey,
+            Imports,
+            Vec<Target>,
+            Key,
+            Option<B::Prepared>,
+        )| {
             let mut out = Out::default();
             let job = by_name[&name];
             let key = job.unit.instance.key();
             let made = match made.or_else(|| made_here.spare.lock().remove(&name)) {
                 Some(made) => made,
-                None => match self.backend.prepare(self.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs) {
-                    Ok((_, made)) => made,
-                    Err(why) => {
-                        out.errors.push(why);
-                        return (None, out);
+                None => {
+                    match prepare_node(self.backend, self.frontend, &job.unit, job.spec, job.node) {
+                        Ok((_, made)) => made,
+                        Err(why) => {
+                            out.errors.push(why);
+                            return (None, out);
+                        }
                     }
-                },
+                }
             };
             // Each import's export: the summaries', else made here; one that failed is an
             // error of the build already, and this compile's that it was not made.
             let made_exports: Vec<(InstanceKey, Arc<B::Export>)> = (imports.imported.iter())
                 .filter(|it| !exports.contains_key(*it))
-                .filter_map(|it| Some((*it, made_here.export(self, &by_name, *it, &mut out.errors)?)))
+                .filter_map(|it| {
+                    Some((*it, made_here.export(self, &by_name, *it, &mut out.errors)?))
+                })
                 // alloc: per release compile, sized by its imports
                 .collect();
             let export_of = |it: &InstanceKey| {
-                exports.get(it).or_else(|| made_exports.iter().find(|made| made.0 == *it).map(|made| &*made.1))
+                exports
+                    .get(it)
+                    .or_else(|| made_exports.iter().find(|made| made.0 == *it).map(|made| &*made.1))
             };
-            let mut emitted = match self.emit_release(job, &by_name, export_of, &imports, &refs, made) {
-                Ok(it) if it.function.key == key => it,
-                Ok(it) => {
-                    // alloc: an error
-                    out.errors.push(error(key, job.unit.item, format!("compiled as {:?}", it.function.key)));
-                    return (None, out);
-                }
-                Err(why) => {
-                    out.errors.push(why);
-                    return (None, out);
-                }
-            };
+            let mut emitted =
+                match self.emit_release(job, &by_name, export_of, &imports, &refs, made) {
+                    Ok(it) if it.function.key == key => it,
+                    Ok(it) => {
+                        // alloc: an error
+                        out.errors.push(error(
+                            key,
+                            job.unit.item,
+                            format!("compiled as {:?}", it.function.key),
+                        ));
+                        return (None, out);
+                    }
+                    Err(why) => {
+                        out.errors.push(why);
+                        return (None, out);
+                    }
+                };
             let kept = release_kept(job, &by_name, &imports);
             if let Some(it) = unkept_inline(nodes, &emitted.function, kept.iter().copied()) {
                 // alloc: an error
-                out.errors.push(error(key, job.unit.item, unkept_message(nodes, job.node, it, &kept, &blob_key)));
+                out.errors.push(error(
+                    key,
+                    job.unit.item,
+                    unkept_message(nodes, job.node, it, &kept, &blob_key),
+                ));
                 return (None, out);
             }
             out.stats.compiled += 1;
             out.stats.imported += imports.imported.len();
             out.side(By::node(job.name, &job.unit), &mut emitted);
-            let Some(template) = out.template_of(&job.unit, emitted, &refs) else { return (None, out) };
-            out.used(blob_key.0);
-            let Some(kept) = out.keyed(self.memo, By::node(job.name, &job.unit), &job.unit, blob_key, template) else {
+            let Some(template) =
+                out.template_of(&job.unit, emitted, &refs, job.node.described.anchors.as_ref())
+            else {
                 return (None, out);
             };
-            out.instantiate(&job.unit, &job.node.described.name, key, Whence::Store(blob_key), kept, &refs);
+            out.used(blob_key.0);
+            let Some(kept) =
+                out.keyed(self.memo, By::node(job.name, &job.unit), &job.unit, blob_key, template)
+            else {
+                return (None, out);
+            };
+            out.instantiate(
+                &job.unit,
+                &job.node.described.name,
+                key,
+                Whence::Store(blob_key),
+                kept,
+                &refs,
+                job.node.described.anchors.as_ref(),
+            );
             (Some(blob_key.0), out)
         };
         for it in self.fly(items, name, compile, &mut out.errors) {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
-                Flown::Landed((name, _, refs, blob_key, _), _) => self.landed_release(&by_name, &name, &refs, blob_key, out),
+                Flown::Landed((name, _, refs, blob_key, _), _) => {
+                    self.landed_release(&by_name, &name, &refs, blob_key, out)
+                }
             }
         }
         if self.frontend.stopped() {
@@ -3139,14 +3717,27 @@ impl<'a, B: Prepare> Build<'a, B> {
             return;
         }
         let compiles: Vec<_> = (sampled.into_iter())
-            .filter_map(|(name, imports, refs, blob_key)| Some((name, imports, refs, blob_key, prepared.remove(&name)?)))
+            .filter_map(|(name, imports, refs, blob_key)| {
+                Some((name, imports, refs, blob_key, prepared.remove(&name)?))
+            })
             // alloc: per build, the store hits the store check samples
             .collect();
         let exports = &exports;
-        let emitted = self.until_stopped(compiles, &mut out.errors, |(name, imports, refs, blob_key, made)| {
-            let emitted = self.emit_release(by_name[&name], &by_name, |it| exports.get(it), &imports, &refs, made);
-            (name, imports, refs, blob_key, emitted)
-        });
+        let emitted = self.until_stopped(
+            compiles,
+            &mut out.errors,
+            |(name, imports, refs, blob_key, made)| {
+                let emitted = self.emit_release(
+                    by_name[&name],
+                    &by_name,
+                    |it| exports.get(it),
+                    &imports,
+                    &refs,
+                    made,
+                );
+                (name, imports, refs, blob_key, emitted)
+            },
+        );
         for (name, imports, refs, blob_key, emitted) in emitted {
             let job = by_name[&name];
             let key = job.unit.instance.key();
@@ -3156,15 +3747,31 @@ impl<'a, B: Prepare> Build<'a, B> {
                     if let Some(code) = unkept_inline(nodes, &it.function, kept.iter().copied()) {
                         let message = unkept_message(nodes, job.node, code, &kept, &blob_key);
                         // alloc: an error
-                        out.errors.push(error(key, job.unit.item, format!("{}: {message}", blaze_store_check::VAR)));
+                        out.errors.push(error(
+                            key,
+                            job.unit.item,
+                            format!("{}: {message}", blaze_store_check::VAR),
+                        ));
                         continue;
                     }
-                    if let Some(template) = out.template_of(&job.unit, it, &refs) {
-                        out.verify(&job.unit, &job.node.described.name, store, blob_key, &blob::encode(&template));
+                    if let Some(template) =
+                        out.template_of(&job.unit, it, &refs, job.node.described.anchors.as_ref())
+                    {
+                        out.verify(
+                            &job.unit,
+                            &job.node.described.name,
+                            store,
+                            blob_key,
+                            &blob::encode(&template),
+                        );
                     }
                 }
                 Ok(it) => {
-                    let what = format!("{}: compiled again as {:?}", blaze_store_check::VAR, it.function.key); // alloc: an error
+                    let what = format!(
+                        "{}: compiled again as {:?}",
+                        blaze_store_check::VAR,
+                        it.function.key
+                    ); // alloc: an error
                     out.errors.push(error(key, job.unit.item, what));
                 }
                 Err(why) => out.errors.push(why),
@@ -3189,7 +3796,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         let list: Result<Vec<Import<'_, B::Export>>, InstanceKey> = imports
             .imported
             .iter()
-            .map(|it| Ok(Import { key: *it, export: export_of(it).ok_or(*it)?, refs: &by_name[it].node.refs }))
+            .map(|it| {
+                Ok(Import {
+                    key: *it,
+                    export: export_of(it).ok_or(*it)?,
+                    refs: &by_name[it].node.refs,
+                })
+            })
             // alloc: per release compile, sized by its imports
             .collect();
         match list {
@@ -3198,7 +3811,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                 .emit(&job.unit, job.spec, made, refs, Some((imports, list.as_slice())))
                 .map_err(|why| naming(why, &job.node.described.name)),
             Err(import) => {
-                let named = by_name.get(&import).map_or("a function of no job", |it| &it.node.described.name);
+                let named = by_name
+                    .get(&import)
+                    .map_or("a function of no job", |it| &it.node.described.name);
                 // alloc: an error
                 let what = format!(
                     "the function `{}` imports `{named}` ({import:?}), whose export was not made",
@@ -3228,7 +3843,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                 out.used(blob_key.0);
                 out.stats.flown += 1;
                 out.template(By::node(job.name, &job.unit), blob_key, template);
-                out.instantiate(&job.unit, &job.node.described.name, key, Whence::Store(blob_key), template, refs);
+                out.instantiate(
+                    &job.unit,
+                    &job.node.described.name,
+                    key,
+                    Whence::Store(blob_key),
+                    template,
+                    refs,
+                    job.node.described.anchors.as_ref(),
+                );
             }
             // A landing is dropped with its template ([`Memo::retain`]), between builds.
             None => out.errors.push(error(
@@ -3254,11 +3877,17 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         // alloc: per batch of summaries another build made, sized by it
         let keys: Vec<InstanceKey> = flown.iter().map(|it| it.1).collect();
-        for ((name, flight), summary) in flown.into_iter().zip(self.memo.flights().summaries(&keys)) {
+        for ((name, flight), summary) in flown.into_iter().zip(self.memo.flights().summaries(&keys))
+        {
             match summary {
                 Some(summary) => {
-                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                    out.put(By::node(name, &by_name[&name].unit), keys::summary(&by_name[&name].summarized()), Kind::Query, bytes);
+                    let bytes = summary.encode();
+                    out.put(
+                        By::node(name, &by_name[&name].unit),
+                        keys::summary(&by_name[&name].summarized()),
+                        Kind::Query,
+                        bytes,
+                    );
                     out.used(flight.0);
                     summaries.insert(name, summary);
                 }
@@ -3275,7 +3904,12 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
     }
 
-    fn statics(&self, statics: &Sorted<StaticId, StaticNode<B>>, store: &impl Lookup, out: &mut Out) {
+    fn statics(
+        &self,
+        statics: &Sorted<StaticId, StaticNode<B>>,
+        store: &impl Lookup,
+        out: &mut Out,
+    ) {
         let unit_of = |node: &StaticNode<B>| Unit {
             instance: Instance {
                 code: blaze_items::CodeHash(node.described.value),
@@ -3289,10 +3923,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per build, sized by its statics
         let (mut hits, mut missing) = (Vec::new(), Vec::new());
         for (id, node) in statics.iter() {
-            let key = keys::static_value(&definition(&node.described, &node.refs), &node.spec.settings());
+            let key =
+                keys::static_value(&definition(&node.described, &node.refs), &node.spec.settings());
             let unit = unit_of(node);
             // alloc: an error
-            match out.read(store, &key, &unit, |it| blob::decode_static(it).map_err(|e| e.to_string())) {
+            match out
+                .read(store, &key, &unit, |it| blob::decode_static(it).map_err(|e| e.to_string()))
+            {
                 Read::Hit(template) => hits.push((id, node, template)),
                 Read::Miss => missing.push((id, node, key)),
                 Read::Failed => {}
@@ -3312,11 +3949,14 @@ impl<'a, B: Prepare> Build<'a, B> {
             match made {
                 Ok((value, digest)) => out.push_static(value, digest),
                 // alloc: an error
-                Err(why) => out.errors.push(error(unit_of(node).instance.key(), id.0, why.to_string())),
+                Err(why) => {
+                    out.errors.push(error(unit_of(node).instance.key(), id.0, why.to_string()))
+                }
             }
         }
         let compiled = self.until_stopped(missing, &mut out.errors, |(id, node, key)| {
-            let made = self.backend.compile_static(self.frontend, &node.spec, &node.value, &node.refs);
+            let made =
+                self.backend.compile_static(self.frontend, &node.spec, &node.value, &node.refs);
             let made = made.map(|value| {
                 let digest = digests::static_definition(&value);
                 (value, digest)
@@ -3351,7 +3991,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.stats.compiled += 1;
             match StaticTemplate::of(&value, &node.refs) {
                 Ok(template) => {
-                    out.put(By::static_(*id, &unit), key, Kind::Code, blob::encode_static(&template));
+                    out.put(
+                        By::static_(*id, &unit),
+                        key,
+                        Kind::Code,
+                        blob::encode_static(&template),
+                    );
                     out.push_static(value, digest);
                 }
                 // alloc: an error
@@ -3411,7 +4056,11 @@ fn folded_identity(members: impl Iterator<Item = ContentId>) -> ContentId {
 /// caller reports the check's errors or posts the job again, never this.
 fn stopped() -> CodegenError {
     let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
-    error(none.0, none.1, "stopped: a body the build compiles failed its check, or its job was cancelled or gave way")
+    error(
+        none.0,
+        none.1,
+        "stopped: a body the build compiles failed its check, or its job was cancelled or gave way",
+    )
 }
 
 mod masks;

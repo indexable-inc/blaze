@@ -96,7 +96,10 @@ pub(crate) enum Branch {
     Schedule(Schedule),
     /// The store a load reads: `pos` of `len` candidates, newest first. `len` 0: not yet known
     /// (a replayed choice).
-    Load { pos: u16, len: u16 },
+    Load {
+        pos: u16,
+        len: u16,
+    },
     /// Whether a timed wait times out.
     Spurious(bool),
 }
@@ -193,7 +196,9 @@ impl Path {
                     let pos = digits
                         .parse()
                         // alloc: a finding's or an error's text, made once, when the model stops
-                        .map_err(|_| format!("`{{{digits}}}` in a schedule is not a load choice"))?;
+                        .map_err(|_| {
+                            format!("`{{{digits}}}` in a schedule is not a load choice")
+                        })?;
                     Branch::Load { pos, len: 0 }
                 }
                 '+' => Branch::Spurious(true),
@@ -500,7 +505,9 @@ mod tests {
             let mut curr = at;
             loop {
                 match self.schedule(curr).prev {
-                    Some(prev) if self.schedule(curr).active() == self.schedule(prev).active() => curr = prev,
+                    Some(prev) if self.schedule(curr).active() == self.schedule(prev).active() => {
+                        curr = prev
+                    }
                     _ => return curr,
                 }
             }
@@ -509,7 +516,11 @@ mod tests {
         fn check_starts(&self) {
             for (at, branch) in self.branches.iter().enumerate() {
                 if let Branch::Schedule(schedule) = branch {
-                    assert_eq!(schedule.start, self.walk_start(at as u32), "the start of schedule {at}");
+                    assert_eq!(
+                        schedule.start,
+                        self.walk_start(at as u32),
+                        "the start of schedule {at}"
+                    );
                 }
             }
         }

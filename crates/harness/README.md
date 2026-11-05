@@ -8,7 +8,7 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 (blaze's root `Cargo.toml`): blaze's gate does not build or check it, and blaze's astlog rules,
 `harness/rustcsites.py` and `tools/docs.py` skip this directory. Build it with cargo, on the Mac:
 
-    cd crates/harness && cargo build --release    # target/release/harness, target/release/harness-native
+    cd crates/harness && cargo build --release    # target/release/harness, harness-native, harness-video
 
 ## Map
 
@@ -20,6 +20,9 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `harness-vt/` | terminal state through libghostty-vt (built by zig) |
 | `harness-ghostty-config/` | reads the user's Ghostty config |
 | `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
+| `harness-native-render/` | the renderer the app and harness-video share: Metal (Slang shaders), text, vector marks, the paint pass |
+| `harness-native-blaze/` | blaze's fire wordmark, live (drop in, catch, burn to embers), and its synthesised soundtrack (from indexable-inc/anim) |
+| `harness-video/` | videos from flecs scenes on the same stack, a timeline of `Cue`s as data (blaze's launch video: `scene/launch.flecs`) |
 | `harness-native-*` | the app's layers: model, flecs glue, ECS, UI layout/motion/draw/input/text and their `-api` crates, prims (`harness-native-ui-prims/scene/`), scroll physics |
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |

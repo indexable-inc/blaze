@@ -47,11 +47,7 @@ impl Parse for SettingsAttrArgs {
         let mut settings_args = Vec::new();
 
         if input.is_empty() {
-            return Ok(SettingsAttrArgs {
-                settings,
-                profile,
-                settings_args,
-            });
+            return Ok(SettingsAttrArgs { settings, profile, settings_args });
         }
 
         let is_named_arg = input.peek(Ident) && input.peek2(Token![=]);
@@ -86,11 +82,7 @@ impl Parse for SettingsAttrArgs {
             }
         }
 
-        Ok(SettingsAttrArgs {
-            settings,
-            profile,
-            settings_args,
-        })
+        Ok(SettingsAttrArgs { settings, profile, settings_args })
     }
 }
 
@@ -268,9 +260,7 @@ fn rewrite_draws_with_repeatability(
         rewriter.visit_stmt_mut(stmt);
     }
 
-    let mut target_rewriter = TargetRewriter {
-        test_case_ident: test_case_ident.to_string(),
-    };
+    let mut target_rewriter = TargetRewriter { test_case_ident: test_case_ident.to_string() };
     for stmt in &mut body.stmts {
         target_rewriter.visit_stmt_mut(stmt);
     }

@@ -20,9 +20,7 @@ use base_db::Db;
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
     expr_store::{Body, ExpressionStore, SpecClauseKind, path::Path, pretty::print_expr_hir},
-    hir::{
-        self as h, BindingAnnotation, BindingId, ExprId, LabelId, LoopSource, PatId, Statement,
-    },
+    hir::{self as h, BindingAnnotation, BindingId, ExprId, LabelId, LoopSource, PatId, Statement},
     resolver::{HasResolver as _, ResolveValueResult, Resolver, ValueNs},
     signatures::FunctionSignature,
 };
@@ -36,9 +34,9 @@ use rustc_type_ir::{IntTy, UintTy, inherent::IntoKind as _};
 use vir::{
     ast::{
         self as v, ArithOp, BodyVisibility, ByRef, Constant, CrateId, DeclProph, Div0Behavior,
-        Expr, ExprX, FunctionAttrsX, FunctionKind, FunctionX, HeaderExprX, InequalityOp,
-        IntRange, IntegerTypeBitwidth, ItemKind, KrateX, Label, Mode, ModuleX, Opaqueness,
-        OverflowBehavior, ParamX, PathX, PatternBinding, PatternX, PlaceX, ReadKind, Segment,
+        Expr, ExprX, FunctionAttrsX, FunctionKind, FunctionX, HeaderExprX, InequalityOp, IntRange,
+        IntegerTypeBitwidth, ItemKind, KrateX, Label, Mode, ModuleX, Opaqueness, OverflowBehavior,
+        ParamX, PathX, PatternBinding, PatternX, PlaceX, ReadKind, Segment,
         SignedDivEdgeCaseBehavior, StmtX, Typ, TypDecoration, TypX, UnaryOp, UnfinalizedReadKind,
         VarIdent, VarIdentDisambiguate, Visibility,
     },
@@ -224,7 +222,13 @@ pub(crate) fn lower_function(db: &Db, func: FunctionId) -> Result<Lowered, Refus
         let var = lower.var(id);
         params.push(Spanned::new(
             span.clone(),
-            ParamX { name: var.clone(), typ, mode: Mode::Exec, user_mut: false, unwrapped_info: None },
+            ParamX {
+                name: var.clone(),
+                typ,
+                mode: Mode::Exec,
+                user_mut: false,
+                unwrapped_info: None,
+            },
         ));
         lowered_params.push(LoweredParam { name: binding.name.as_str().to_owned(), var }); // alloc: a name
     }
@@ -238,7 +242,11 @@ pub(crate) fn lower_function(db: &Db, func: FunctionId) -> Result<Lowered, Refus
         {
             for &arg in args {
                 let h::Pat::Bind { id, subpat: None } = body.store.pat(arg) else {
-                    return Err(unsupported(&display, "a named return that is not a plain name", fn_text));
+                    return Err(unsupported(
+                        &display,
+                        "a named return that is not a plain name",
+                        fn_text,
+                    ));
                 };
                 lower.ret_bindings.push(id);
             }
@@ -250,7 +258,13 @@ pub(crate) fn lower_function(db: &Db, func: FunctionId) -> Result<Lowered, Refus
     };
     let ret = Spanned::new(
         span.clone(),
-        ParamX { name: ret_name, typ: ret_typ.clone(), mode: Mode::Exec, user_mut: false, unwrapped_info: None },
+        ParamX {
+            name: ret_name,
+            typ: ret_typ.clone(),
+            mode: Mode::Exec,
+            user_mut: false,
+            unwrapped_info: None,
+        },
     );
     lower.ret = Some(ret_typ);
 
@@ -293,20 +307,20 @@ pub(crate) fn lower_function(db: &Db, func: FunctionId) -> Result<Lowered, Refus
             attrs: Arc::new(FunctionAttrsX::default()),
             body: Some(vir_body),
             return_opaque_type_eqs: Arc::new(Vec::new()), // alloc: VIR
-            extra_dependencies: Vec::new(), // alloc: VIR
-            hidden: Arc::new(Vec::new()), // alloc: VIR
+            extra_dependencies: Vec::new(),               // alloc: VIR
+            hidden: Arc::new(Vec::new()),                 // alloc: VIR
         },
     );
     let krate = Arc::new(KrateX {
-        functions: vec![function], // alloc: VIR
-        reveal_groups: Vec::new(), // alloc: VIR
-        datatypes: Vec::new(), // alloc: VIR
-        traits: Vec::new(), // alloc: VIR
-        trait_impls: Vec::new(), // alloc: VIR
+        functions: vec![function],    // alloc: VIR
+        reveal_groups: Vec::new(),    // alloc: VIR
+        datatypes: Vec::new(),        // alloc: VIR
+        traits: Vec::new(),           // alloc: VIR
+        trait_impls: Vec::new(),      // alloc: VIR
         assoc_type_impls: Vec::new(), // alloc: VIR
         modules: vec![Spanned::new(span.clone(), ModuleX { path: module.clone(), reveals: None })], // alloc: VIR
-        external_fns: Vec::new(), // alloc: VIR
-        external_types: Vec::new(), // alloc: VIR
+        external_fns: Vec::new(),       // alloc: VIR
+        external_types: Vec::new(),     // alloc: VIR
         path_as_rust_names: Vec::new(), // alloc: VIR
         // Every target blaze builds for has 64-bit `usize`; this becomes the target's once
         // `blaze check --verify` passes the target in (docs/v2/plan/lanes/verus.md).
@@ -384,7 +398,10 @@ impl<'db> Lower<'db> {
             _ => binding,
         };
         let name = self.store[binding].name.as_str().to_owned(); // alloc: a name
-        VarIdent(Arc::new(name), VarIdentDisambiguate::RustcId(u32::from(binding.into_raw()) as usize))
+        VarIdent(
+            Arc::new(name),
+            VarIdentDisambiguate::RustcId(u32::from(binding.into_raw()) as usize),
+        )
     }
 
     /// `mid_ty_to_vir` for the types this slice takes.
@@ -467,7 +484,9 @@ impl<'db> Lower<'db> {
                 let found = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene);
                 self.resolver.reset_to_guard(guard);
                 match found {
-                    Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding))) => Some(binding),
+                    Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(binding))) => {
+                        Some(binding)
+                    }
                     _ => None,
                 }
             }
@@ -493,7 +512,12 @@ impl<'db> Lower<'db> {
 
     /// `binopkind_to_binaryop` for an arithmetic operator: spec code is over `int`, exec code
     /// checks overflow in the operands' range. The type is the result's.
-    fn arith(&self, op: h::ArithOp, operand: &Typ, expr: ExprId) -> Result<(v::BinaryOp, Typ, bool), Refused> {
+    fn arith(
+        &self,
+        op: h::ArithOp,
+        operand: &Typ,
+        expr: ExprId,
+    ) -> Result<(v::BinaryOp, Typ, bool), Refused> {
         let Some(range) = self.int_range(operand) else {
             return Err(self.unsupported(format!("`{op:?}` on a non-integer"), expr));
         };
@@ -515,17 +539,32 @@ impl<'db> Lower<'db> {
             h::ArithOp::Rem if spec => ArithOp::EuclideanMod(div0),
             h::ArithOp::Div => match signed_width {
                 None => ArithOp::EuclideanDiv(div0),
-                Some(width) => ArithOp::TruncatingDiv(div0, SignedDivEdgeCaseBehavior::Error(width)),
+                Some(width) => {
+                    ArithOp::TruncatingDiv(div0, SignedDivEdgeCaseBehavior::Error(width))
+                }
             },
             h::ArithOp::Rem => match signed_width {
                 None => ArithOp::EuclideanMod(div0),
-                Some(width) => ArithOp::TruncatingMod(div0, SignedDivEdgeCaseBehavior::Error(width)),
+                Some(width) => {
+                    ArithOp::TruncatingMod(div0, SignedDivEdgeCaseBehavior::Error(width))
+                }
             },
-            h::ArithOp::Shl | h::ArithOp::Shr | h::ArithOp::BitXor | h::ArithOp::BitOr | h::ArithOp::BitAnd => {
+            h::ArithOp::Shl
+            | h::ArithOp::Shr
+            | h::ArithOp::BitXor
+            | h::ArithOp::BitOr
+            | h::ArithOp::BitAnd => {
                 return Err(self.unsupported(format!("the bit operator `{op:?}`"), expr));
             }
         };
-        let clip = !spec && matches!(op, ArithOp::EuclideanDiv(_) | ArithOp::EuclideanMod(_) | ArithOp::TruncatingDiv(..) | ArithOp::TruncatingMod(..));
+        let clip = !spec
+            && matches!(
+                op,
+                ArithOp::EuclideanDiv(_)
+                    | ArithOp::EuclideanMod(_)
+                    | ArithOp::TruncatingDiv(..)
+                    | ArithOp::TruncatingMod(..)
+            );
         Ok((v::BinaryOp::Arith(op), result, clip))
     }
 
@@ -550,13 +589,20 @@ impl<'db> Lower<'db> {
                     h::Literal::Bool(b) => Constant::Bool(*b),
                     h::Literal::Int(value, _) => Constant::Int(BigInt::from(*value)),
                     h::Literal::Uint(value, _) => Constant::Int(BigInt::from(*value)),
-                    _ => return Err(self.unsupported("a literal that is not an integer or a `bool`", expr)),
+                    _ => {
+                        return Err(
+                            self.unsupported("a literal that is not an integer or a `bool`", expr)
+                        );
+                    }
                 };
                 Ok(self.mk(&span, &typ, ExprX::Const(constant)))
             }
             h::Expr::Path(path) => {
                 let Some(binding) = self.resolve_local(expr, path) else {
-                    return Err(self.unsupported("a path to an item (a constant, a static, a function)", expr));
+                    return Err(self.unsupported(
+                        "a path to an item (a constant, a static, a function)",
+                        expr,
+                    ));
                 };
                 let typ = self.typ(self.infer.binding_ty(binding), || self.text(expr))?;
                 let var = self.var(binding);
@@ -571,18 +617,27 @@ impl<'db> Lower<'db> {
                     h::UnaryOp::Neg => {
                         // `-e` is `0 - e`: in exec code it overflows exactly when `0 - e` does.
                         let (op, typ, _) = self.arith(h::ArithOp::Sub, &inner.typ, expr)?;
-                        let zero = self.mk(&span, &inner.typ, ExprX::Const(Constant::Int(BigInt::from(0))));
+                        let zero = self.mk(
+                            &span,
+                            &inner.typ,
+                            ExprX::Const(Constant::Int(BigInt::from(0))),
+                        );
                         Ok(self.mk(&span, &typ, ExprX::Binary(op, zero, inner)))
                     }
                     _ => Err(self.unsupported(format!("the unary operator `{op:?}` here"), expr)),
                 }
             }
             h::Expr::BinaryOp { lhs, rhs, op } => {
-                let Some(op) = op else { return Err(self.unsupported("a binary expression with no operator", expr)) };
+                let Some(op) = op else {
+                    return Err(self.unsupported("a binary expression with no operator", expr));
+                };
                 match op {
                     h::BinaryOp::Assignment { op } => {
                         let Some(binding) = self.place_local(lhs) else {
-                            return Err(self.unsupported("an assignment to something other than a local", expr));
+                            return Err(self.unsupported(
+                                "an assignment to something other than a local",
+                                expr,
+                            ));
                         };
                         self.assign(expr, &span, binding, rhs, op)
                     }
@@ -597,7 +652,10 @@ impl<'db> Lower<'db> {
                     h::BinaryOp::CmpOp(op) => {
                         let (l, r) = (self.expr(lhs)?, self.expr(rhs)?);
                         if !matches!(&*l.typ, TypX::Int(_) | TypX::Bool) {
-                            return Err(self.unsupported("a comparison of values that are not integers or `bool`s", expr));
+                            return Err(self.unsupported(
+                                "a comparison of values that are not integers or `bool`s",
+                                expr,
+                            ));
                         }
                         let mode = if self.in_spec() { Mode::Spec } else { Mode::Exec };
                         let op = match op {
@@ -627,13 +685,19 @@ impl<'db> Lower<'db> {
                         // The result of `/` and `%` is in range; the clip tells the solver
                         // (`mk_ty_clip`).
                         let range = self.int_range(&typ).unwrap_or(IntRange::Int);
-                        Ok(self.mk(&span, &typ, ExprX::Unary(UnaryOp::Clip { range, truncate: true }, e)))
+                        Ok(self.mk(
+                            &span,
+                            &typ,
+                            ExprX::Unary(UnaryOp::Clip { range, truncate: true }, e),
+                        ))
                     }
                 }
             }
             h::Expr::Assignment { target, value } => {
                 let Some(binding) = self.assigned_local(expr, target) else {
-                    return Err(self.unsupported("an assignment to something other than a local", expr));
+                    return Err(
+                        self.unsupported("an assignment to something other than a local", expr)
+                    );
                 };
                 self.assign(expr, &span, binding, value, None)
             }
@@ -658,7 +722,9 @@ impl<'db> Lower<'db> {
                 let mut stmts = Vec::new(); // alloc: VIR
                 for statement in statements.iter() {
                     match statement {
-                        Statement::Expr { expr: group, has_semi: _ } if store.spec_clause(group).is_some() => {
+                        Statement::Expr { expr: group, has_semi: _ }
+                            if store.spec_clause(group).is_some() =>
+                        {
                             let header = self.header(group)?;
                             stmts.push(Spanned::new(header.span.clone(), StmtX::Expr(header)));
                         }
@@ -692,7 +758,11 @@ impl<'db> Lower<'db> {
                             }
                             (Some(condition), then_branch)
                         }
-                        _ => return Err(self.unsupported("a `while` loop of an unexpected shape", expr)),
+                        _ => {
+                            return Err(
+                                self.unsupported("a `while` loop of an unexpected shape", expr)
+                            );
+                        }
                     },
                     LoopSource::ForLoop => return Err(self.unsupported("a `for` loop", expr)),
                 };
@@ -710,8 +780,9 @@ impl<'db> Lower<'db> {
                 let lowered = self.expr(body_expr);
                 self.loops.pop();
                 let mut body = lowered?;
-                let header = vir::headers::read_header(&mut body, &vir::headers::HeaderAllows::Loop)
-                    .map_err(|err| self.vir_error("vir", &err))?;
+                let header =
+                    vir::headers::read_header(&mut body, &vir::headers::HeaderAllows::Loop)
+                        .map_err(|err| self.vir_error("vir", &err))?;
                 Ok(self.mk(
                     &span,
                     &typ,
@@ -737,12 +808,20 @@ impl<'db> Lower<'db> {
                 }
                 let label = self.label_for(label, expr)?;
                 let typ = self.expr_typ(expr)?;
-                Ok(self.mk(&span, &typ, ExprX::BreakOrContinue { label, is_break: true, value: None }))
+                Ok(self.mk(
+                    &span,
+                    &typ,
+                    ExprX::BreakOrContinue { label, is_break: true, value: None },
+                ))
             }
             h::Expr::Continue { label } => {
                 let label = self.label_for(label, expr)?;
                 let typ = self.expr_typ(expr)?;
-                Ok(self.mk(&span, &typ, ExprX::BreakOrContinue { label, is_break: false, value: None }))
+                Ok(self.mk(
+                    &span,
+                    &typ,
+                    ExprX::BreakOrContinue { label, is_break: false, value: None },
+                ))
             }
             h::Expr::Return { expr: value } => {
                 let typ = self.expr_typ(expr)?;
@@ -755,7 +834,10 @@ impl<'db> Lower<'db> {
             h::Expr::Call { .. } | h::Expr::MethodCall { .. } => {
                 Err(self.unsupported("a call (callees' specifications are the next slice)", expr))
             }
-            other => Err(self.unsupported(format!("the expression kind `{}`", expr_kind_name(&other)), expr)),
+            other => {
+                Err(self
+                    .unsupported(format!("the expression kind `{}`", expr_kind_name(&other)), expr))
+            }
         }
     }
 
@@ -782,7 +864,12 @@ impl<'db> Lower<'db> {
     }
 
     /// `let x = init;` (`StmtX::Decl` with the initializer as a temporary place).
-    fn let_stmt(&mut self, block: ExprId, pat: PatId, initializer: Option<ExprId>) -> Result<v::Stmt, Refused> {
+    fn let_stmt(
+        &mut self,
+        block: ExprId,
+        pat: PatId,
+        initializer: Option<ExprId>,
+    ) -> Result<v::Stmt, Refused> {
         let h::Pat::Bind { id, subpat: None } = self.store.pat(pat) else {
             return Err(self.unsupported("a `let` with a pattern that is not a plain name", block));
         };
@@ -831,7 +918,8 @@ impl<'db> Lower<'db> {
         let Some(kind) = self.store.spec_clause(group) else {
             return Err(self.unsupported("a clause group lowering did not record", group));
         };
-        let index = self.groups.iter().position(|it| *it == group).unwrap_or(self.groups.len()) as u32;
+        let index =
+            self.groups.iter().position(|it| *it == group).unwrap_or(self.groups.len()) as u32;
         let (named, items_expr) = match self.store.expr(group) {
             h::Expr::Closure { args, body, .. } => (args.first().copied(), body),
             _ => (None, group),
@@ -841,11 +929,14 @@ impl<'db> Lower<'db> {
         };
         let mut items = Vec::new(); // alloc: VIR
         for (item, &e) in exprs.iter().enumerate() {
-            self.clause = Some(ClauseRef { kind, group: index, item: item as u32, text: self.text(e) });
+            self.clause =
+                Some(ClauseRef { kind, group: index, item: item as u32, text: self.text(e) });
             let lowered = self.expr(e);
             self.clause = None;
             let lowered = lowered?;
-            if !matches!(&*lowered.typ, TypX::Bool) && !matches!(kind, SpecClauseKind::Decreases | SpecClauseKind::LoopDecreases) {
+            if !matches!(&*lowered.typ, TypX::Bool)
+                && !matches!(kind, SpecClauseKind::Decreases | SpecClauseKind::LoopDecreases)
+            {
                 return Err(self.unsupported("a clause that is not a `bool`", e));
             }
             items.push(lowered);
@@ -858,15 +949,23 @@ impl<'db> Lower<'db> {
                 let named = match named {
                     Some(pat) => match self.store.pat(pat) {
                         h::Pat::Bind { id, subpat: None } => Some((self.var(id), self.ret.clone())),
-                        _ => return Err(self.unsupported("a named return that is not a plain name", group)),
+                        _ => {
+                            return Err(
+                                self.unsupported("a named return that is not a plain name", group)
+                            );
+                        }
                     },
                     None => None,
                 };
                 HeaderExprX::Ensures(named, (items, Arc::new(Vec::new()))) // alloc: VIR
             }
-            SpecClauseKind::Decreases | SpecClauseKind::LoopDecreases => HeaderExprX::Decreases(items),
+            SpecClauseKind::Decreases | SpecClauseKind::LoopDecreases => {
+                HeaderExprX::Decreases(items)
+            }
             SpecClauseKind::Invariant => HeaderExprX::Invariant(items),
-            SpecClauseKind::LoopEnsures => HeaderExprX::Ensures(None, (items, Arc::new(Vec::new()))), // alloc: VIR
+            SpecClauseKind::LoopEnsures => {
+                HeaderExprX::Ensures(None, (items, Arc::new(Vec::new())))
+            } // alloc: VIR
         };
         let span = self.span(
             Origin::Clause(ClauseRef { kind, group: index, item: 0, text: self.text(items_expr) }),

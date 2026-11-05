@@ -9,10 +9,10 @@ use blaze_codegen::{
 use blaze_core::sim::{Faults, Sim};
 use blaze_core::{Effect, FileName, run_until_idle};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Debug, DevRun, Format, Native, NativeKind, Output, OutputKind, Platform};
+use std::alloc::Global;
 
 use crate::PremapError;
 use crate::cache::{Images, Pick, Ready};
@@ -128,6 +128,7 @@ fn dev_output() -> Output {
         exec_log: false,
         sanitize: Sanitize::default(),
         rpaths: Vec::new(),
+        link: blaze_link::LinkArgs::default(),
     }
 }
 
@@ -149,8 +150,20 @@ impl Graph {
     fn new() -> Graph {
         Graph {
             units: vec![
-                ("serde 1.0.200 (registry)".to_owned(), "lib".to_owned(), vec!["std".to_owned()], Vec::new(), Vec::new()),
-                ("libc 0.2.150 (registry)".to_owned(), "lib".to_owned(), Vec::new(), vec!["freebsd11".to_owned()], Vec::new()),
+                (
+                    "serde 1.0.200 (registry)".to_owned(),
+                    "lib".to_owned(),
+                    vec!["std".to_owned()],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                (
+                    "libc 0.2.150 (registry)".to_owned(),
+                    "lib".to_owned(),
+                    Vec::new(),
+                    vec!["freebsd11".to_owned()],
+                    Vec::new(),
+                ),
             ],
             toolchain: toolchain(),
             settings: vec![Settings(id(9_100))],
@@ -158,7 +171,11 @@ impl Graph {
             output: dev_output(),
             base: BASE,
             tls_bias: TLS_BIAS,
-            natives: vec![NativeInput { id: id(9_300), kind: NativeKind::Shared { as_needed: true }, order: 1 }],
+            natives: vec![NativeInput {
+                id: id(9_300),
+                kind: NativeKind::Shared { as_needed: true },
+                order: 1,
+            }],
             spans: vec![(id(9_400), id(9_401))],
         }
     }
@@ -167,7 +184,13 @@ impl Graph {
         let units: Vec<DepUnit<'_>> = self
             .units
             .iter()
-            .map(|(package, target, features, cfg, rustflags)| DepUnit { package, target, features, cfg, rustflags })
+            .map(|(package, target, features, cfg, rustflags)| DepUnit {
+                package,
+                target,
+                features,
+                cfg,
+                rustflags,
+            })
             .collect();
         GraphKey::of(&GraphInputs {
             units: &units,
@@ -191,13 +214,33 @@ fn graph_key_changes_with_every_input() {
         ("a unit's target", Box::new(|it: &mut Graph| it.units[0].1 = "bin".to_owned())),
         ("a unit's features", Box::new(|it: &mut Graph| it.units[0].2.push("derive".to_owned()))),
         ("a unit's cfg", Box::new(|it: &mut Graph| it.units[1].3.clear())),
-        ("a unit's rustflags", Box::new(|it: &mut Graph| it.units[1].4.push("-Cdebug-assertions".to_owned()))),
-        ("a unit more", Box::new(|it: &mut Graph| it.units.push(("cc 1.0 (registry)".to_owned(), "lib".to_owned(), vec![], vec![], vec![])))),
+        (
+            "a unit's rustflags",
+            Box::new(|it: &mut Graph| it.units[1].4.push("-Cdebug-assertions".to_owned())),
+        ),
+        (
+            "a unit more",
+            Box::new(|it: &mut Graph| {
+                it.units.push((
+                    "cc 1.0 (registry)".to_owned(),
+                    "lib".to_owned(),
+                    vec![],
+                    vec![],
+                    vec![],
+                ))
+            }),
+        ),
         ("the toolchain's id", Box::new(|it: &mut Graph| it.toolchain.id = id(1))),
-        ("the target triple", Box::new(|it: &mut Graph| it.toolchain.target = "x86_64-unknown-linux-musl".to_owned())),
+        (
+            "the target triple",
+            Box::new(|it: &mut Graph| it.toolchain.target = "x86_64-unknown-linux-musl".to_owned()),
+        ),
         ("the toolchain's arch", Box::new(|it: &mut Graph| it.toolchain.arch = Arch::Aarch64)),
         ("the cpu", Box::new(|it: &mut Graph| it.toolchain.cpu = "znver4".to_owned())),
-        ("target features", Box::new(|it: &mut Graph| it.toolchain.features.push("+avx2".to_owned()))),
+        (
+            "target features",
+            Box::new(|it: &mut Graph| it.toolchain.features.push("+avx2".to_owned())),
+        ),
         ("cranelift", Box::new(|it: &mut Graph| it.toolchain.cranelift = "0.121".to_owned())),
         ("llvm", Box::new(|it: &mut Graph| it.toolchain.llvm = Some("20".to_owned()))),
         ("the stencils", Box::new(|it: &mut Graph| it.toolchain.stencils = Some("00".to_owned()))),
@@ -207,30 +250,74 @@ fn graph_key_changes_with_every_input() {
         ("the linker", Box::new(|it: &mut Graph| it.linker = id(3))),
         ("the format", Box::new(|it: &mut Graph| it.output.format = Format::MachO)),
         ("the output's arch", Box::new(|it: &mut Graph| it.output.arch = Arch::Aarch64)),
-        ("the output kind", Box::new(|it: &mut Graph| it.output.kind = OutputKind::Executable { entry: "main".to_owned() })),
+        (
+            "the output kind",
+            Box::new(|it: &mut Graph| {
+                it.output.kind = OutputKind::Executable { entry: "main".to_owned() }
+            }),
+        ),
         ("the interpreter", Box::new(|it: &mut Graph| it.output.interpreter = None)),
-        ("the platform", Box::new(|it: &mut Graph| it.output.platform = Some(Platform { platform: 1, minimum: 0x000e_0000, sdk: 0x000f_0000 }))),
+        (
+            "the platform",
+            Box::new(|it: &mut Graph| {
+                it.output.platform =
+                    Some(Platform { platform: 1, minimum: 0x000e_0000, sdk: 0x000f_0000 })
+            }),
+        ),
         ("incremental", Box::new(|it: &mut Graph| it.output.incremental = false)),
         ("debug info", Box::new(|it: &mut Graph| it.output.debug = Debug::None)),
         ("tags", Box::new(|it: &mut Graph| it.output.tags = 2 << 48)),
         ("the stack", Box::new(|it: &mut Graph| it.output.stack = Some(8 << 20))),
         ("the windows subsystem", Box::new(|it: &mut Graph| it.output.windows_subsystem = true)),
-        ("a dev run of no reservations", Box::new(|it: &mut Graph| it.output.dev_run = Some(DevRun { arena: 0, cells: 0, fixed: 0 }))),
-        ("a dev run's reservation", Box::new(|it: &mut Graph| it.output.dev_run = Some(DevRun { arena: 1 << 30, cells: 0, fixed: 0 }))),
-        ("the output's triple", Box::new(|it: &mut Graph| it.output.triple = "x86_64-unknown-linux-musl".to_owned())),
+        (
+            "a dev run of no reservations",
+            Box::new(|it: &mut Graph| {
+                it.output.dev_run = Some(DevRun { arena: 0, cells: 0, fixed: 0 })
+            }),
+        ),
+        (
+            "a dev run's reservation",
+            Box::new(|it: &mut Graph| {
+                it.output.dev_run = Some(DevRun { arena: 1 << 30, cells: 0, fixed: 0 })
+            }),
+        ),
+        (
+            "the output's triple",
+            Box::new(|it: &mut Graph| it.output.triple = "x86_64-unknown-linux-musl".to_owned()),
+        ),
         ("the execution log", Box::new(|it: &mut Graph| it.output.exec_log = true)),
-        ("a sanitizer", Box::new(|it: &mut Graph| it.output.sanitize.sanitizers = Sanitizers::ADDRESS)),
-        ("a recovering sanitizer", Box::new(|it: &mut Graph| it.output.sanitize.recover = Sanitizers::ADDRESS)),
+        (
+            "a sanitizer",
+            Box::new(|it: &mut Graph| it.output.sanitize.sanitizers = Sanitizers::ADDRESS),
+        ),
+        (
+            "a recovering sanitizer",
+            Box::new(|it: &mut Graph| it.output.sanitize.recover = Sanitizers::ADDRESS),
+        ),
         ("origin tracking", Box::new(|it: &mut Graph| it.output.sanitize.track_origins = 2)),
         ("the coverage level", Box::new(|it: &mut Graph| it.output.sanitize.coverage.level = 3)),
-        ("the coverage flags", Box::new(|it: &mut Graph| it.output.sanitize.coverage.flags = Coverage::TRACE_PC_GUARD)),
-        ("an rpath", Box::new(|it: &mut Graph| it.output.rpaths.push("/opt/blaze/runtime".to_owned()))),
+        (
+            "the coverage flags",
+            Box::new(|it: &mut Graph| it.output.sanitize.coverage.flags = Coverage::TRACE_PC_GUARD),
+        ),
+        (
+            "an rpath",
+            Box::new(|it: &mut Graph| it.output.rpaths.push("/opt/blaze/runtime".to_owned())),
+        ),
         ("the base", Box::new(|it: &mut Graph| it.base += 1 << 20)),
         ("the thread-local bias", Box::new(|it: &mut Graph| it.tls_bias -= 64)),
         ("a native's contents", Box::new(|it: &mut Graph| it.natives[0].id = id(4))),
-        ("a native's kind", Box::new(|it: &mut Graph| it.natives[0].kind = NativeKind::Shared { as_needed: false })),
+        (
+            "a native's kind",
+            Box::new(|it: &mut Graph| it.natives[0].kind = NativeKind::Shared { as_needed: false }),
+        ),
         ("a native's order", Box::new(|it: &mut Graph| it.natives[0].order = 2)),
-        ("a native more", Box::new(|it: &mut Graph| it.natives.push(NativeInput { id: id(5), kind: NativeKind::Object, order: 0 }))),
+        (
+            "a native more",
+            Box::new(|it: &mut Graph| {
+                it.natives.push(NativeInput { id: id(5), kind: NativeKind::Object, order: 0 })
+            }),
+        ),
         ("a span table", Box::new(|it: &mut Graph| it.spans[0].1 = id(6))),
         ("a span anchor", Box::new(|it: &mut Graph| it.spans[0].0 = id(7))),
     ];
@@ -263,10 +350,17 @@ fn image_key_changes_with_every_instance() {
     let graph = Graph::new().key();
     let functions = vec![KeyedFunction { key: ikey(1), code: CodeHash(id(11)), inlined: None }];
     let static_value = value(1, Init::Zeroed { size: 8 });
-    let statics = vec![KeyedStatic { item: item(1), instance: instance(1), definition: static_definition(&static_value) }];
+    let statics = vec![KeyedStatic {
+        item: item(1),
+        instance: instance(1),
+        definition: static_definition(&static_value),
+    }];
     let names = vec![("ffi_entry".to_owned(), Target::Function(ikey(1)))];
     let debug_names = vec![(ikey(1), "dep::f".to_owned())];
-    let key = |functions: &[KeyedFunction], statics: &[KeyedStatic], names: &[(String, Target)], debug: &[(InstanceKey, String)]| {
+    let key = |functions: &[KeyedFunction],
+               statics: &[KeyedStatic],
+               names: &[(String, Target)],
+               debug: &[(InstanceKey, String)]| {
         let names: Vec<&(String, Target)> = names.iter().collect();
         let debug: Vec<&(InstanceKey, String)> = debug.iter().collect();
         ImageKey::of(graph, &ImageInputs { functions, statics, names: &names, debug_names: &debug })
@@ -277,23 +371,98 @@ fn image_key_changes_with_every_instance() {
         assert!(!seen.contains(&it), "changing {what} left the image key as another one");
         seen.push(it);
     };
-    push("a function's key", key(&[KeyedFunction { key: ikey(2), ..functions[0] }], &statics, &names, &debug_names));
-    push("a function's code hash", key(&[KeyedFunction { code: CodeHash(id(12)), ..functions[0] }], &statics, &names, &debug_names));
-    push("a function more", key(&[functions[0], KeyedFunction { key: ikey(3), code: CodeHash(id(13)), inlined: None }], &statics, &names, &debug_names));
+    push(
+        "a function's key",
+        key(&[KeyedFunction { key: ikey(2), ..functions[0] }], &statics, &names, &debug_names),
+    );
+    push(
+        "a function's code hash",
+        key(
+            &[KeyedFunction { code: CodeHash(id(12)), ..functions[0] }],
+            &statics,
+            &names,
+            &debug_names,
+        ),
+    );
+    push(
+        "a function more",
+        key(
+            &[functions[0], KeyedFunction { key: ikey(3), code: CodeHash(id(13)), inlined: None }],
+            &statics,
+            &names,
+            &debug_names,
+        ),
+    );
     let inlined = crate::key::inlined_digest(&[CodeHash(id(14))]);
-    push("what a function inlined", key(&[KeyedFunction { inlined, ..functions[0] }], &statics, &names, &debug_names));
+    push(
+        "what a function inlined",
+        key(&[KeyedFunction { inlined, ..functions[0] }], &statics, &names, &debug_names),
+    );
     let changed = value(1, Init::Zeroed { size: 16 });
-    push("a static's value", key(&functions, &[KeyedStatic { definition: static_definition(&changed), ..statics[0] }], &names, &debug_names));
+    push(
+        "a static's value",
+        key(
+            &functions,
+            &[KeyedStatic { definition: static_definition(&changed), ..statics[0] }],
+            &names,
+            &debug_names,
+        ),
+    );
     let mutable = Static { mutable: true, ..value(1, Init::Zeroed { size: 8 }) };
-    push("a static's mutability", key(&functions, &[KeyedStatic { definition: static_definition(&mutable), ..statics[0] }], &names, &debug_names));
-    let section = Static { section: Some(".init_array".to_owned()), ..value(1, Init::Zeroed { size: 8 }) };
-    push("a static's section", key(&functions, &[KeyedStatic { definition: static_definition(&section), ..statics[0] }], &names, &debug_names));
-    push("a static's instance", key(&functions, &[KeyedStatic { instance: instance(2), ..statics[0] }], &names, &debug_names));
-    push("a name", key(&functions, &statics, &[("other".to_owned(), Target::Function(ikey(1)))], &debug_names));
-    push("what a name is", key(&functions, &statics, &[("ffi_entry".to_owned(), Target::Direct(ikey(1)))], &debug_names));
+    push(
+        "a static's mutability",
+        key(
+            &functions,
+            &[KeyedStatic { definition: static_definition(&mutable), ..statics[0] }],
+            &names,
+            &debug_names,
+        ),
+    );
+    let section =
+        Static { section: Some(".init_array".to_owned()), ..value(1, Init::Zeroed { size: 8 }) };
+    push(
+        "a static's section",
+        key(
+            &functions,
+            &[KeyedStatic { definition: static_definition(&section), ..statics[0] }],
+            &names,
+            &debug_names,
+        ),
+    );
+    push(
+        "a static's instance",
+        key(
+            &functions,
+            &[KeyedStatic { instance: instance(2), ..statics[0] }],
+            &names,
+            &debug_names,
+        ),
+    );
+    push(
+        "a name",
+        key(&functions, &statics, &[("other".to_owned(), Target::Function(ikey(1)))], &debug_names),
+    );
+    push(
+        "what a name is",
+        key(
+            &functions,
+            &statics,
+            &[("ffi_entry".to_owned(), Target::Direct(ikey(1)))],
+            &debug_names,
+        ),
+    );
     push("a debug name", key(&functions, &statics, &names, &[(ikey(1), "dep::g".to_owned())]));
-    let (names, debug_names): (Vec<_>, Vec<_>) = (names.iter().collect(), debug_names.iter().collect());
-    let other_graph = ImageKey::of(GraphKey(id(1)), &ImageInputs { functions: &functions, statics: &statics, names: &names, debug_names: &debug_names });
+    let (names, debug_names): (Vec<_>, Vec<_>) =
+        (names.iter().collect(), debug_names.iter().collect());
+    let other_graph = ImageKey::of(
+        GraphKey(id(1)),
+        &ImageInputs {
+            functions: &functions,
+            statics: &statics,
+            names: &names,
+            debug_names: &debug_names,
+        },
+    );
     push("the graph", other_graph);
 }
 
@@ -301,7 +470,13 @@ fn image_key_changes_with_every_instance() {
 fn table_finds_every_entry_and_refuses_corruption() {
     let entries: Vec<(SymbolId, Def)> = (0..100)
         .map(|n| {
-            let def = Def { value: BASE + n * 16, size: 16, kind: Kind::Function, strength: Strength::Strong, order: u32::MAX };
+            let def = Def {
+                value: BASE + n * 16,
+                size: 16,
+                kind: Kind::Function,
+                strength: Strength::Strong,
+                order: u32::MAX,
+            };
             (SymbolId::function(&ikey(n)), def)
         })
         .collect();
@@ -337,8 +512,15 @@ fn table_finds_every_entry_and_refuses_corruption() {
     let view = TableView::parse_with(&referring, 2, 1).unwrap();
     assert_eq!(view.entry(&entries[3].0).unwrap().refs, Refs { content: 2, debug: 0 });
     assert_eq!(view.entry(&entries[5].0).unwrap().refs, Refs { content: 0, debug: 1 });
-    assert_eq!(view.get(&entries[5].0), Some(entries[5].1), "a ref leaves the definition as it was");
-    assert!(table::set_content(&mut referring, &SymbolId::function(&ikey(100)), 1).is_err(), "a symbol it has not");
+    assert_eq!(
+        view.get(&entries[5].0),
+        Some(entries[5].1),
+        "a ref leaves the definition as it was"
+    );
+    assert!(
+        table::set_content(&mut referring, &SymbolId::function(&ikey(100)), 1).is_err(),
+        "a symbol it has not"
+    );
 }
 
 /// A small dependency graph: two dependency functions, a static pointing at one, a
@@ -358,7 +540,13 @@ const LIBRARIES: Libraries<'static> = &[("malloc", 0x7000_0000), ("puts", 0x7000
 
 impl Small {
     fn new() -> Small {
-        let d1 = function(1, vec![reloc(0, RelocKind::PcRel32, Target::Direct(ikey(2))), reloc(8, RelocKind::Abs64, of_static(1))]);
+        let d1 = function(
+            1,
+            vec![
+                reloc(0, RelocKind::PcRel32, Target::Direct(ikey(2))),
+                reloc(8, RelocKind::Abs64, of_static(1)),
+            ],
+        );
         let d2 = function(
             2,
             vec![
@@ -381,12 +569,23 @@ impl Small {
         let w2 = function(12, Vec::new());
         let s1 = value(1, pointer_to(Target::Function(ikey(2))));
         let t1 = Static { thread_local: true, align: 16, ..value(2, Init::Zeroed { size: 16 }) };
-        let i1 = Static { section: Some(".init_array".to_owned()), ..value(3, pointer_to(Target::Function(ikey(1)))) };
-        let i2 = Static { section: Some(".init_array".to_owned()), ..value(13, pointer_to(Target::Function(ikey(11)))) };
-        let t2 = Static { thread_local: true, align: 4, ..value(12, Init::Bytes { bytes: vec![1, 2, 3, 4], relocs: Vec::new().into() }) };
+        let i1 = Static {
+            section: Some(".init_array".to_owned()),
+            ..value(3, pointer_to(Target::Function(ikey(1))))
+        };
+        let i2 = Static {
+            section: Some(".init_array".to_owned()),
+            ..value(13, pointer_to(Target::Function(ikey(11))))
+        };
+        let t2 = Static {
+            thread_local: true,
+            align: 4,
+            ..value(12, Init::Bytes { bytes: vec![1, 2, 3, 4], relocs: Vec::new().into() })
+        };
         let mut owned_functions = vec![(ikey(1), CodeHash(id(101))), (ikey(2), CodeHash(id(102)))];
         owned_functions.sort();
-        let mut owned_statics = vec![(item(1), instance(1)), (item(2), instance(2)), (item(3), instance(3))];
+        let mut owned_statics =
+            vec![(item(1), instance(1)), (item(2), instance(2)), (item(3), instance(3))];
         owned_statics.sort();
         let mut statics = vec![s1, i2, t1, i1, t2];
         statics.sort_by_key(|it| (it.item, it.instance));
@@ -404,12 +603,30 @@ impl Small {
     /// are leaked so a test's `Built` borrows from `self` alone.
     fn built(&self) -> Built<'_> {
         let digests = Digests {
-            functions: self.functions.iter().map(|it| (it.key, function_digest(CodeHash(it.key.0), &it.inlined))).collect(),
-            statics: self.statics.iter().map(|it| ((it.item, it.instance), static_definition(it))).collect(),
-            debug_names: self.debug_names.iter().map(|(key, name)| (*key, debug_name_digest(name))).collect(),
+            functions: self
+                .functions
+                .iter()
+                .map(|it| (it.key, function_digest(CodeHash(it.key.0), &it.inlined)))
+                .collect(),
+            statics: self
+                .statics
+                .iter()
+                .map(|it| ((it.item, it.instance), static_definition(it)))
+                .collect(),
+            debug_names: self
+                .debug_names
+                .iter()
+                .map(|(key, name)| (*key, debug_name_digest(name)))
+                .collect(),
         };
         let digests: &'static Digests = Box::leak(Box::new(digests));
-        Built { functions: &self.functions, statics: &self.statics, names: &self.names, debug_names: &self.debug_names, digests }
+        Built {
+            functions: &self.functions,
+            statics: &self.statics,
+            names: &self.names,
+            debug_names: &self.debug_names,
+            digests,
+        }
     }
 
     fn owned(&self) -> Owned<'_> {
@@ -419,7 +636,13 @@ impl Small {
 
 fn natives() -> Vec<SidedNative<'static>> {
     vec![SidedNative {
-        native: Native { id: id(9_300), name: "libc.so.6", bytes: Box::leak(Box::new(std::sync::Arc::<[u8]>::from([]))), kind: NativeKind::Shared { as_needed: true }, order: 1 },
+        native: Native {
+            id: id(9_300),
+            name: "libc.so.6",
+            bytes: Box::leak(Box::new(std::sync::Arc::<[u8]>::from([]))),
+            kind: NativeKind::Shared { as_needed: true },
+            order: 1,
+        },
         dependency: true,
     }]
 }
@@ -461,20 +684,37 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
     let image = View::parse(&bytes, key).unwrap();
     assert_eq!(image.libraries().map(|it| it.name).collect::<Vec<_>>(), ["libc.so.6"]);
 
-    let workspace = part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
+    let workspace =
+        part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
     assert!(workspace.complete());
-    assert_eq!(workspace.functions.iter().map(|it| it.key).collect::<Vec<_>>(), [ikey(11), ikey(12)]);
-    assert!(workspace.natives.iter().all(|it| matches!(it.kind, NativeKind::Shared { .. })), "a shared library is in both");
+    assert_eq!(
+        workspace.functions.iter().map(|it| it.key).collect::<Vec<_>>(),
+        [ikey(11), ikey(12)]
+    );
+    assert!(
+        workspace.natives.iter().all(|it| matches!(it.kind, NativeKind::Shared { .. })),
+        "a shared library is in both"
+    );
 
     let layout = model::link_workspace(&workspace, &image).unwrap();
     let names = model::workspace_names(&layout, &workspace).unwrap();
     let start = model::start_of(&image, &names).unwrap();
-    assert_eq!(start.lookups.iter().map(|it| it.name).collect::<Vec<_>>(), ["malloc", "absent"], "only names no side defines are looked up");
+    assert_eq!(
+        start.lookups.iter().map(|it| it.name).collect::<Vec<_>>(),
+        ["malloc", "absent"],
+        "only names no side defines are looked up"
+    );
 
-    let whole_image: Vec<&CompiledFunction> =
-        small.functions.iter().filter(|it| small.owned_functions.iter().any(|o| o.0 == it.key)).collect();
-    let whole_statics: Vec<&Static> =
-        small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance))).collect();
+    let whole_image: Vec<&CompiledFunction> = small
+        .functions
+        .iter()
+        .filter(|it| small.owned_functions.iter().any(|o| o.0 == it.key))
+        .collect();
+    let whole_statics: Vec<&Static> = small
+        .statics
+        .iter()
+        .filter(|it| small.owned_statics.contains(&(it.item, it.instance)))
+        .collect();
     let whole = model::whole(
         (&whole_image, &whole_statics, &part.names),
         (&workspace.functions, &workspace.statics, &workspace.names),
@@ -484,14 +724,20 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
     .unwrap();
 
     let keys: Vec<InstanceKey> = small.functions.iter().map(|it| it.key).collect();
-    let statics: Vec<(ItemKey, ContentId)> = small.statics.iter().map(|it| (it.item, it.instance)).collect();
-    let split = model::split(&image, &layout, &names, &start, LIBRARIES, (&keys, &statics)).unwrap();
+    let statics: Vec<(ItemKey, ContentId)> =
+        small.statics.iter().map(|it| (it.item, it.instance)).collect();
+    let split =
+        model::split(&image, &layout, &names, &start, LIBRARIES, (&keys, &statics)).unwrap();
     assert_eq!(split.functions, whole.functions, "every function at the whole link's address");
     assert_eq!(split.statics, whole.statics, "every static at the whole link's address or offset");
     assert_eq!(split.init, whole.init, "init functions run in the whole link's order");
     let mut pieces = [(item(3), instance(3), ikey(1)), (item(13), instance(13), ikey(11))];
     pieces.sort_by_key(|(item, instance, _)| blaze_link::premap::InitEntry::tie_of(item, instance));
-    assert_eq!(split.init, pieces.map(|(_, _, function)| whole.functions[&function]), "unranked pieces run by their ties");
+    assert_eq!(
+        split.init,
+        pieces.map(|(_, _, function)| whole.functions[&function]),
+        "unranked pieces run by their ties"
+    );
     assert_eq!(split.tls, whole.tls, "the thread-local area as the whole link lays it out");
     assert_eq!(split.memory, whole.memory, "every byte the program starts with");
 }
@@ -513,16 +759,24 @@ fn an_image_serves_only_a_build_whose_pieces_it_holds_are_its_own() {
     let image = View::parse(&bytes, key).unwrap();
     assert_eq!((image.names(), image.debug_names()), (1, 1));
     let natives = natives();
-    let stale = |build: &Small| match workspace_part(&build.built(), &build.owned(), &image, &natives).unwrap() {
-        Fit::Part(_) => None,
-        Fit::Stale(it) => Some(it),
-    };
-    let workspace = part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
+    let stale =
+        |build: &Small| match workspace_part(&build.built(), &build.owned(), &image, &natives)
+            .unwrap()
+        {
+            Fit::Part(_) => None,
+            Fit::Stale(it) => Some(it),
+        };
+    let workspace =
+        part_of(workspace_part(&small.built(), &small.owned(), &image, &natives).unwrap());
     assert_eq!(workspace.names, [&small.names[0]], "the image's name is not linked again");
     assert_eq!(workspace.debug_names, [&small.debug_names[1]]);
 
     let changes: Vec<(&str, Box<dyn Fn(&mut Small)>, Option<Stale>)> = vec![
-        ("a workspace function's inlined callees", Box::new(|it: &mut Small| it.functions[1].inlined = vec![CodeHash(id(500))]), None),
+        (
+            "a workspace function's inlined callees",
+            Box::new(|it: &mut Small| it.functions[1].inlined = vec![CodeHash(id(500))]),
+            None,
+        ),
         (
             "a dependency function's inlined callees",
             Box::new(|it: &mut Small| it.functions[0].inlined = vec![CodeHash(id(500))]),
@@ -530,14 +784,36 @@ fn an_image_serves_only_a_build_whose_pieces_it_holds_are_its_own() {
         ),
         (
             "a dependency static's value",
-            Box::new(|it: &mut Small| it.statics[0] = value(1, pointer_to(Target::Function(ikey(1))))),
+            Box::new(|it: &mut Small| {
+                it.statics[0] = value(1, pointer_to(Target::Function(ikey(1))))
+            }),
             Some(Stale::Static(item(1), instance(1))),
         ),
-        ("what a name is", Box::new(|it: &mut Small| it.names[1].1 = Target::Function(ikey(1))), Some(Stale::Name(1))),
-        ("a name", Box::new(|it: &mut Small| it.names[1].0 = "dep_other".to_owned()), Some(Stale::Name(1))),
-        ("a name the image has, gone", Box::new(|it: &mut Small| drop(it.names.pop())), Some(Stale::Extra)),
-        ("a debug name", Box::new(|it: &mut Small| it.debug_names[0].1 = "dep::uno".to_owned()), Some(Stale::Function(ikey(1)))),
-        ("a debug name the image has, gone", Box::new(|it: &mut Small| drop(it.debug_names.remove(0))), Some(Stale::Extra)),
+        (
+            "what a name is",
+            Box::new(|it: &mut Small| it.names[1].1 = Target::Function(ikey(1))),
+            Some(Stale::Name(1)),
+        ),
+        (
+            "a name",
+            Box::new(|it: &mut Small| it.names[1].0 = "dep_other".to_owned()),
+            Some(Stale::Name(1)),
+        ),
+        (
+            "a name the image has, gone",
+            Box::new(|it: &mut Small| drop(it.names.pop())),
+            Some(Stale::Extra),
+        ),
+        (
+            "a debug name",
+            Box::new(|it: &mut Small| it.debug_names[0].1 = "dep::uno".to_owned()),
+            Some(Stale::Function(ikey(1))),
+        ),
+        (
+            "a debug name the image has, gone",
+            Box::new(|it: &mut Small| drop(it.debug_names.remove(0))),
+            Some(Stale::Extra),
+        ),
         (
             "an init static the image has, gone",
             Box::new(|it: &mut Small| {
@@ -567,12 +843,19 @@ fn a_build_the_newest_image_does_not_serve_makes_its_own() {
     let mut edited = Small::new();
     edited.functions[0].inlined = vec![CodeHash(id(500))];
     with_dev(&edited, &natives, |dev| {
-        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else { panic!("a stale image is never linked against") };
+        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else {
+            panic!("a stale image is never linked against")
+        };
         assert_ne!(job.key, first);
-        assert!(matches!(dev::plan(&mut images, dev).unwrap(), Plan::Wait), "a second build waits for it");
+        assert!(
+            matches!(dev::plan(&mut images, dev).unwrap(), Plan::Wait),
+            "a second build waits for it"
+        );
         let made = job.make(&Model, &mut shelf);
         images.finish(job.key, made).unwrap();
-        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else { panic!() };
+        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else {
+            panic!()
+        };
         assert_eq!(image.key, job.key);
         assert!(workspace.complete() && next.is_none());
     });
@@ -587,7 +870,13 @@ fn a_graph_key_allocates_nothing_of_the_heap() {
     let units: Vec<DepUnit<'_>> = graph
         .units
         .iter()
-        .map(|(package, target, features, cfg, rustflags)| DepUnit { package, target, features, cfg, rustflags })
+        .map(|(package, target, features, cfg, rustflags)| DepUnit {
+            package,
+            target,
+            features,
+            cfg,
+            rustflags,
+        })
         .collect();
     let inputs = GraphInputs {
         units: &units,
@@ -630,9 +919,13 @@ fn splitting_a_build_copies_no_name() {
     let natives = natives();
     let built = small.built();
     drop(image_part(&built, &small.owned(), &natives).unwrap());
-    let (part, used) = blaze_alloc_count::measure(|| image_part(&built, &small.owned(), &natives).unwrap());
+    let (part, used) =
+        blaze_alloc_count::measure(|| image_part(&built, &small.owned(), &natives).unwrap());
     assert_eq!(part.names.len(), 1);
-    assert!(part.names.iter().all(|it| built.names.iter().any(|b| std::ptr::eq(b, *it))), "the part's names are the build's");
+    assert!(
+        part.names.iter().all(|it| built.names.iter().any(|b| std::ptr::eq(b, *it))),
+        "the part's names are the build's"
+    );
     assert!(used.allocations <= 10, "the part's ten lists, no `String`: {used:?}");
 }
 
@@ -658,7 +951,10 @@ fn a_hit_allocates_its_lists_and_nothing_per_piece() {
         workspace.spilled_statics.is_empty(),
     ];
     let filled = lists.iter().filter(|it| !**it).count() as u64;
-    assert_eq!(used.allocations, filled, "one exact allocation per list the workspace link gets, none per piece");
+    assert_eq!(
+        used.allocations, filled,
+        "one exact allocation per list the workspace link gets, none per piece"
+    );
 }
 
 #[test]
@@ -674,15 +970,22 @@ fn image_refuses_a_dependency_that_reaches_into_the_workspace() {
 
     let mut small = Small::new();
     small.statics[0].section = Some("linkme_SLOTS".to_owned());
-    assert!(image_part(&small.built(), &small.owned(), &natives()).is_ok(), "a section only the image has");
-    small.statics.iter_mut().find(|it| it.item == item(13)).unwrap().section = Some("linkme_SLOTS".to_owned());
+    assert!(
+        image_part(&small.built(), &small.owned(), &natives()).is_ok(),
+        "a section only the image has"
+    );
+    small.statics.iter_mut().find(|it| it.item == item(13)).unwrap().section =
+        Some("linkme_SLOTS".to_owned());
     let error = image_part(&small.built(), &small.owned(), &natives()).err().unwrap();
     assert!(error.what.contains("linkme_SLOTS"), "{error}");
 
     let mut small = Small::new();
     small.owned_functions.push((ikey(99), CodeHash(id(199))));
     small.owned_functions.sort();
-    assert!(image_part(&small.built(), &small.owned(), &natives()).is_err(), "an owned instance with no code");
+    assert!(
+        image_part(&small.built(), &small.owned(), &natives()).is_err(),
+        "an owned instance with no code"
+    );
 }
 
 #[test]
@@ -698,14 +1001,19 @@ fn image_round_trips_and_refuses_damage() {
     assert_eq!(prelink::base(Format::Elf, Arch::X86_64).unwrap(), BASE);
     assert_eq!(image.meta().page, prelink::page(Format::Elf, Arch::X86_64));
     assert!(image.segments().all(|it| it.addr % PAGE == 0));
-    assert_eq!(image.segments().map(|it| it.prot).collect::<Vec<_>>(), [Prot::Code, Prot::ReadOnly, Prot::Data]);
+    assert_eq!(
+        image.segments().map(|it| it.prot).collect::<Vec<_>>(),
+        [Prot::Code, Prot::ReadOnly, Prot::Data]
+    );
     for (key, _) in &small.owned_functions {
         assert!(image.get(&SymbolId::function(key)).is_some());
     }
     assert!(image.get(&SymbolId::function(&ikey(11))).is_none());
     let names: Vec<&str> = image.binds().map(|it| it.name).collect();
     assert_eq!(names.len(), 3, "{names:?}");
-    assert!(names.contains(&"malloc") && names.contains(&"__rg_alloc") && names.contains(&"absent"));
+    assert!(
+        names.contains(&"malloc") && names.contains(&"__rg_alloc") && names.contains(&"absent")
+    );
     assert_eq!(image.tls().map(|it| it.size), Some(16));
     assert_eq!(image.init().count(), 1);
 
@@ -721,15 +1029,26 @@ fn image_round_trips_and_refuses_damage() {
     for (function, _) in &small.owned_functions {
         let entry = image.entry(&SymbolId::function(function)).unwrap();
         let inlined = &small.functions.iter().find(|it| it.key == *function).unwrap().inlined;
-        assert_eq!(image.content(entry.refs.content), Some(function_digest(CodeHash(function.0), inlined)), "codegen's digest");
+        assert_eq!(
+            image.content(entry.refs.content),
+            Some(function_digest(CodeHash(function.0), inlined)),
+            "codegen's digest"
+        );
     }
-    let dep_statics: Vec<&Static> =
-        small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance))).collect();
+    let dep_statics: Vec<&Static> = small
+        .statics
+        .iter()
+        .filter(|it| small.owned_statics.contains(&(it.item, it.instance)))
+        .collect();
     assert_eq!(image.statics(), dep_statics.len());
     for (at, value) in dep_statics.iter().enumerate() {
         let entry = image.entry(&SymbolId::of_static(&value.item, &value.instance)).unwrap();
         assert_eq!(image.content(entry.refs.content), Some(static_definition(value)));
-        assert_eq!(image.static_record(at), ((value.item, value.instance), static_definition(value)), "sorted");
+        assert_eq!(
+            image.static_record(at),
+            ((value.item, value.instance), static_definition(value)),
+            "sorted"
+        );
     }
     assert!(View::parse(&bytes, ImageKey(id(79))).is_err(), "an image under another key");
     assert!(View::parse(&bytes[..bytes.len() - 1], key).is_err(), "a cut image");
@@ -752,12 +1071,22 @@ fn an_image_is_the_outside_of_the_workspace_link_beside_it() {
     let bytes = prelink::build(&Model, &prelink_request(&output, &part), key).unwrap();
     let image = View::parse(&bytes, key).unwrap();
     for (key, _) in &small.owned_functions {
-        assert_eq!(Outside::function(&image, key), image.get(&SymbolId::function(key)).map(|it| it.value));
+        assert_eq!(
+            Outside::function(&image, key),
+            image.get(&SymbolId::function(key)).map(|it| it.value)
+        );
     }
-    assert_eq!(Outside::function(&image, &ikey(11)), None, "a workspace function is not the image's");
-    for it in small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance))) {
+    assert_eq!(
+        Outside::function(&image, &ikey(11)),
+        None,
+        "a workspace function is not the image's"
+    );
+    for it in
+        small.statics.iter().filter(|it| small.owned_statics.contains(&(it.item, it.instance)))
+    {
         let value = image.get(&SymbolId::of_static(&it.item, &it.instance)).unwrap().value;
-        let want = if it.thread_local { StaticAt::ThreadLocal(value) } else { StaticAt::Addr(value) };
+        let want =
+            if it.thread_local { StaticAt::ThreadLocal(value) } else { StaticAt::Addr(value) };
         assert_eq!(Outside::static_at(&image, &it.item, &it.instance), Some(want));
     }
     assert_eq!(Outside::tls_end(&image), 16);
@@ -784,11 +1113,17 @@ fn prelink_refuses_what_it_was_not_asked() {
 
     let mut missing = good.clone();
     missing.functions.pop();
-    assert!(prelink::build(&Fixed(missing), &request, ImageKey(id(1))).is_err(), "a function not placed");
+    assert!(
+        prelink::build(&Fixed(missing), &request, ImageKey(id(1))).is_err(),
+        "a function not placed"
+    );
 
     let mut unaligned = good.clone();
     unaligned.segments[1].addr += 8;
-    assert!(prelink::build(&Fixed(unaligned), &request, ImageKey(id(1))).is_err(), "a segment off its page");
+    assert!(
+        prelink::build(&Fixed(unaligned), &request, ImageKey(id(1))).is_err(),
+        "a segment off its page"
+    );
 
     let mut bind = good.clone();
     bind.binds[0].place = BASE;
@@ -801,10 +1136,16 @@ fn prelink_refuses_what_it_was_not_asked() {
 
     let mut below = prelink_request(&output, &part);
     below.link.base = BASE - PAGE;
-    assert!(prelink::build(&Model, &below, ImageKey(id(1))).is_err(), "a base below the executable's reservation");
+    assert!(
+        prelink::build(&Model, &below, ImageKey(id(1))).is_err(),
+        "a base below the executable's reservation"
+    );
     let mut past = prelink_request(&output, &part);
     past.link.base = prelink::END;
-    assert!(prelink::build(&Model, &past, ImageKey(id(1))).is_err(), "a base past the smallest address space");
+    assert!(
+        prelink::build(&Model, &past, ImageKey(id(1))).is_err(),
+        "a base past the smallest address space"
+    );
 }
 
 #[test]
@@ -834,7 +1175,8 @@ fn a_prelink_that_writes_its_own_segments_makes_the_same_image() {
 
         fn prelink(&self, request: &Request<'_>) -> Result<Placing, PremapError> {
             let mut linked = Model.prelink(request)?;
-            let bytes = linked.segments.iter_mut().map(|it| std::mem::take(&mut it.bytes)).collect();
+            let bytes =
+                linked.segments.iter_mut().map(|it| std::mem::take(&mut it.bytes)).collect();
             Ok(Placing { linked, bytes })
         }
     }
@@ -860,7 +1202,11 @@ fn a_prelink_refuses_a_segment_written_outside_the_image() {
 }
 
 /// An image of hand-made binds and names, for the start's rules, or the prelink's refusal.
-fn try_image_of(binds: Vec<Bind>, names: Vec<PlacedName>, reached_directly: Vec<String>) -> Result<(Vec<u8>, ImageKey), PremapError> {
+fn try_image_of(
+    binds: Vec<Bind>,
+    names: Vec<PlacedName>,
+    reached_directly: Vec<String>,
+) -> Result<(Vec<u8>, ImageKey), PremapError> {
     struct Fixed(Prelinked);
     impl Prelink for Fixed {
         type Placed = Prelinked;
@@ -917,8 +1263,14 @@ fn def(value: u64, kind: Kind, strength: Strength, order: u32) -> Def {
 #[test]
 fn start_binds_as_a_whole_link_resolves() {
     let image_names = vec![
-        PlacedName { name: "hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Weak, 5) },
-        PlacedName { name: "both_weak".to_owned(), def: def(BASE + 32, Kind::Function, Strength::Weak, 5) },
+        PlacedName {
+            name: "hook".to_owned(),
+            def: def(BASE + 16, Kind::Function, Strength::Weak, 5),
+        },
+        PlacedName {
+            name: "both_weak".to_owned(),
+            def: def(BASE + 32, Kind::Function, Strength::Weak, 5),
+        },
     ];
     let binds = vec![
         bind(0, "hook", BindKind::Addr, false),
@@ -936,17 +1288,24 @@ fn start_binds_as_a_whole_link_resolves() {
     ];
     names.sort_by(|a, b| a.0.cmp(&b.0));
     let start = start::plan(&image, &names).unwrap();
-    let writes: HashMap<u64, u64, Global> = start.writes.iter().map(|it| (it.place, it.value)).collect();
+    let writes: HashMap<u64, u64, Global> =
+        start.writes.iter().map(|it| (it.place, it.value)).collect();
     assert_eq!(writes[&(BASE + PAGE)], 0x9000, "a strong definition beats a weak one");
     assert_eq!(writes[&(BASE + PAGE + 8)], 0x9100, "of two weak ones the first on the line");
     assert_eq!(writes[&(BASE + PAGE + 16)], 0x9200);
     assert!(start.writes.iter().all(|it| it.address), "an address moves with the run's slide");
-    assert_eq!(start.lookups.iter().map(|it| (it.name, it.weak)).collect::<Vec<_>>(), [("write", false), ("maybe", true)]);
+    assert_eq!(
+        start.lookups.iter().map(|it| (it.name, it.weak)).collect::<Vec<_>>(),
+        [("write", false), ("maybe", true)]
+    );
 
     let strong = vec![("hook".to_owned(), def(0x9000, Kind::Function, Strength::Strong, u32::MAX))];
     let (bytes, key) = image_of(
         vec![bind(0, "hook", BindKind::Addr, false)],
-        vec![PlacedName { name: "hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Strong, 5) }],
+        vec![PlacedName {
+            name: "hook".to_owned(),
+            def: def(BASE + 16, Kind::Function, Strength::Strong, 5),
+        }],
     );
     let image = View::parse(&bytes, key).unwrap();
     assert!(start::plan(&image, &strong).is_err(), "two strong definitions");
@@ -954,9 +1313,14 @@ fn start_binds_as_a_whole_link_resolves() {
     let (bytes, key) = image_of(vec![bind(0, "errno_tls", BindKind::TpOff, false)], Vec::new());
     let image = View::parse(&bytes, key).unwrap();
     assert!(start::plan(&image, &[]).is_err(), "a fixed offset into a library's thread-locals");
-    let tls = vec![("errno_tls".to_owned(), def(16, Kind::ThreadLocal, Strength::Strong, u32::MAX))];
+    let tls =
+        vec![("errno_tls".to_owned(), def(16, Kind::ThreadLocal, Strength::Strong, u32::MAX))];
     let start = start::plan(&image, &tls).unwrap();
-    assert_eq!(start.writes, [Write { place: BASE + PAGE, value: 16, address: false }], "an offset from the thread pointer never slides");
+    assert_eq!(
+        start.writes,
+        [Write { place: BASE + PAGE, value: 16, address: false }],
+        "an offset from the thread pointer never slides"
+    );
     let data = vec![("errno_tls".to_owned(), def(0x9000, Kind::Data, Strength::Strong, u32::MAX))];
     assert!(start::plan(&image, &data).is_err(), "a thread-local bound to an address");
 }
@@ -978,18 +1342,34 @@ fn start_refuses_workspace_names_out_of_order() {
 fn an_image_marks_the_weak_names_its_code_reaches_directly() {
     use blaze_link::Outside;
     let names = vec![
-        PlacedName { name: "weak_hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Weak, 5) },
-        PlacedName { name: "other_weak".to_owned(), def: def(BASE + 32, Kind::Function, Strength::Weak, 5) },
-        PlacedName { name: "strong".to_owned(), def: def(BASE + 48, Kind::Function, Strength::Strong, 5) },
+        PlacedName {
+            name: "weak_hook".to_owned(),
+            def: def(BASE + 16, Kind::Function, Strength::Weak, 5),
+        },
+        PlacedName {
+            name: "other_weak".to_owned(),
+            def: def(BASE + 32, Kind::Function, Strength::Weak, 5),
+        },
+        PlacedName {
+            name: "strong".to_owned(),
+            def: def(BASE + 48, Kind::Function, Strength::Strong, 5),
+        },
     ];
-    let (bytes, key) = try_image_of(Vec::new(), names.clone(), vec!["weak_hook".to_owned()]).unwrap();
+    let (bytes, key) =
+        try_image_of(Vec::new(), names.clone(), vec!["weak_hook".to_owned()]).unwrap();
     let image = View::parse(&bytes, key).unwrap();
     assert!(Outside::reached_directly(&image, "weak_hook"));
     assert!(!Outside::reached_directly(&image, "other_weak"));
     assert!(!Outside::reached_directly(&image, "strong"));
     assert!(!Outside::reached_directly(&image, "absent"));
-    assert!(try_image_of(Vec::new(), names.clone(), vec!["strong".to_owned()]).is_err(), "a strong name");
-    assert!(try_image_of(Vec::new(), names, vec!["absent".to_owned()]).is_err(), "a name with no slot");
+    assert!(
+        try_image_of(Vec::new(), names.clone(), vec!["strong".to_owned()]).is_err(),
+        "a strong name"
+    );
+    assert!(
+        try_image_of(Vec::new(), names, vec!["absent".to_owned()]).is_err(),
+        "a name with no slot"
+    );
 
     let table_at = |bytes: &[u8]| {
         let at = |n: usize| u64::from_le_bytes(bytes[n..n + 8].try_into().unwrap()) as usize;
@@ -998,7 +1378,9 @@ fn an_image_marks_the_weak_names_its_code_reaches_directly() {
     let slot_of = |bytes: &[u8], name: &str| {
         let (offset, len) = table_at(bytes);
         let id = SymbolId::name(name).0.0;
-        offset + bytes[offset..offset + len].chunks(table::SLOT).position(|it| it[..32] == id).unwrap() * table::SLOT
+        offset
+            + bytes[offset..offset + len].chunks(table::SLOT).position(|it| it[..32] == id).unwrap()
+                * table::SLOT
     };
     let mut damaged = bytes.clone();
     damaged[slot_of(&bytes[..], "weak_hook") + 54] = 2;
@@ -1010,15 +1392,20 @@ fn an_image_marks_the_weak_names_its_code_reaches_directly() {
 
 #[test]
 fn a_bind_carries_the_slot_of_the_images_own_definition() {
-    let names = vec![PlacedName { name: "hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Weak, 5) }];
-    let binds = vec![bind(0, "hook", BindKind::Addr, true), bind(8, "absent", BindKind::Addr, true)];
+    let names = vec![PlacedName {
+        name: "hook".to_owned(),
+        def: def(BASE + 16, Kind::Function, Strength::Weak, 5),
+    }];
+    let binds =
+        vec![bind(0, "hook", BindKind::Addr, true), bind(8, "absent", BindKind::Addr, true)];
     let (bytes, key) = image_of(binds, names);
     let image = View::parse(&bytes, key).unwrap();
     let own: Vec<_> = image.binds().map(|it| (it.name, it.own)).collect();
     assert_eq!(own, [("hook", image.get(&SymbolId::name("hook"))), ("absent", None)]);
     assert!(own[0].1.is_some());
 
-    let binds_at = u64::from_le_bytes(bytes[80 + 2 * 16..80 + 2 * 16 + 8].try_into().unwrap()) as usize;
+    let binds_at =
+        u64::from_le_bytes(bytes[80 + 2 * 16..80 + 2 * 16 + 8].try_into().unwrap()) as usize;
     for (record, slot) in [(0, 0u32), (1, 1), (0, u32::MAX)] {
         let mut damaged = bytes.clone();
         let at = binds_at + record * 32 + 28;
@@ -1057,7 +1444,11 @@ fn store_round_trip() {
     let mut store = open_store(&mut sim);
     assert_eq!(store.get_image(&key).unwrap(), None);
     store.put_image(&key, bytes.clone()).unwrap();
-    assert_eq!(store.get_image(&key).unwrap().as_deref(), Some(&bytes[..]), "read back before it is durable");
+    assert_eq!(
+        store.get_image(&key).unwrap().as_deref(),
+        Some(&bytes[..]),
+        "read back before it is durable"
+    );
     let mut effects = Vec::new();
     store.flush(&mut effects);
     drive(&mut sim, &mut store, &mut effects);
@@ -1091,7 +1482,13 @@ fn with_dev<R>(small: &Small, natives: &[SidedNative<'_>], f: impl FnOnce(&Dev<'
     let units: Vec<DepUnit<'_>> = graph
         .units
         .iter()
-        .map(|(package, target, features, cfg, rustflags)| DepUnit { package, target, features, cfg, rustflags })
+        .map(|(package, target, features, cfg, rustflags)| DepUnit {
+            package,
+            target,
+            features,
+            cfg,
+            rustflags,
+        })
         .collect();
     let dev = Dev {
         graph: GraphInputs {
@@ -1120,11 +1517,18 @@ fn an_image_is_made_once_per_key_and_again_only_when_a_build_needs_more() {
     let natives = natives();
     let small = Small::new();
     let first = with_dev(&small, &natives, |dev| {
-        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else { panic!("a graph with no image makes one") };
-        assert!(matches!(dev::plan(&mut images, dev).unwrap(), Plan::Wait), "a second build waits for it");
+        let Plan::Make(job) = dev::plan(&mut images, dev).unwrap() else {
+            panic!("a graph with no image makes one")
+        };
+        assert!(
+            matches!(dev::plan(&mut images, dev).unwrap(), Plan::Wait),
+            "a second build waits for it"
+        );
         let made = job.make(&Model, &mut shelf);
         let ready = images.finish(job.key, made).unwrap();
-        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else { panic!("links once made") };
+        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else {
+            panic!("links once made")
+        };
         assert!(workspace.complete() && next.is_none());
         assert_eq!(image.key, ready.key);
         ready.key
@@ -1137,9 +1541,15 @@ fn an_image_is_made_once_per_key_and_again_only_when_a_build_needs_more() {
     more.owned_functions.push((ikey(4), CodeHash(id(104))));
     more.owned_functions.sort();
     with_dev(&more, &natives, |dev| {
-        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else { panic!("links the graph's image") };
+        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else {
+            panic!("links the graph's image")
+        };
         assert_eq!(image.key, first, "the graph's newest image, while the next is made");
-        assert_eq!(workspace.spilled, [ikey(4)], "the instance the image lacks is linked with the workspace");
+        assert_eq!(
+            workspace.spilled,
+            [ikey(4)],
+            "the instance the image lacks is linked with the workspace"
+        );
         let job = next.expect("the image of the build's key is made next");
         assert_ne!(job.key, first);
         let Plan::Link { next, .. } = dev::plan(&mut images, dev).unwrap() else { panic!() };
@@ -1147,7 +1557,9 @@ fn an_image_is_made_once_per_key_and_again_only_when_a_build_needs_more() {
         let made = job.make(&Model, &mut shelf);
         images.finish(job.key, made).unwrap();
         assert!(images.get(&first).is_none(), "the image it replaces is closed");
-        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else { panic!() };
+        let Plan::Link { image, workspace, next } = dev::plan(&mut images, dev).unwrap() else {
+            panic!()
+        };
         assert_eq!(image.key, job.key);
         assert!(workspace.complete() && next.is_none());
     });
@@ -1169,7 +1581,8 @@ fn a_failed_image_fails_again_and_never_falls_back() {
     let key = ImageKey(id(2));
     assert!(images.newest(graph).is_none());
     assert!(matches!(images.want(key), Pick::Make));
-    let error = PremapError::new("the prelink of the dependency image placed no function".to_owned());
+    let error =
+        PremapError::new("the prelink of the dependency image placed no function".to_owned());
     assert!(images.finish(key, Err::<Ready, _>(error.clone())).is_err());
     assert!(matches!(images.want(key), Pick::Failed(it) if it == error));
     assert!(images.newest(graph).is_none(), "a failed image is no graph's newest");

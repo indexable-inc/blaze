@@ -16,20 +16,15 @@
 pub mod library;
 pub mod own;
 
-pub use own::home;
-
 use std::path::{Path, PathBuf};
 
 use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp};
-
-/// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
-pub const OURS: &str = include_str!("../../../harness/toolchain");
 
 /// blaze's toolchain as blaze names it in what it prints: `blaze-2026-10-25`, after the date of
 /// the Rust nightly it is (`harness/toolchain`), so it moves with every bump. rustup knows the
 /// toolchain by the nightly's name, not this one.
 pub fn name() -> String {
-    let ours = OURS.trim();
+    let ours = blaze_units::lock::toolchain();
     format!("blaze-{}", ours.strip_prefix("nightly-").unwrap_or(ours))
 }
 
@@ -54,6 +49,43 @@ pub fn host() -> Option<&'static str> {
     own::host()
 }
 
+/// `blaze toolchain --json`'s object: blaze's toolchain as blaze and rustup name it, the rustc
+/// it is, the host's tuple and where its files are. What a harness asks instead of running
+/// `rustc -vV` (docs/toolchain.md).
+#[derive(serde::Serialize)]
+struct ToolchainJson<'a> {
+    /// `blaze-2026-10-27` ([`name`]).
+    name: String,
+    /// `nightly-2026-10-27` ([`blaze_units::lock::toolchain`]).
+    nightly: &'a str,
+    /// `1.101.0-nightly (12433c307 2026-10-24)` ([`ours_says`]).
+    rustc: &'a str,
+    /// `1.101.0-nightly` ([`ours_release`]).
+    release: &'a str,
+    commit: &'a str,
+    /// The host's tuple ([`host`]): `null` on a host blaze ships no toolchain for.
+    host: Option<&'a str>,
+    sysroot: &'a Path,
+}
+
+/// [`ToolchainJson`] of `chosen`, one line, newline ended.
+pub fn json(chosen: &Chosen) -> Result<String, String> {
+    let json = ToolchainJson {
+        name: name(),
+        nightly: blaze_units::lock::toolchain(),
+        rustc: ours_says(),
+        release: ours_release(),
+        commit: ours_commit(),
+        host: host(),
+        sysroot: chosen.dir(),
+    };
+    // alloc: the CLI's answer, once
+    let mut line = serde_json::to_string(&json)
+        .map_err(|error| format!("`blaze toolchain --json`'s answer as JSON: {error}"))?;
+    line.push('\n');
+    Ok(line)
+}
+
 /// Where the files of blaze's release are: blaze's own copy, never rustup's.
 pub struct Chosen(PathBuf);
 
@@ -66,7 +98,7 @@ impl Chosen {
 
 impl std::fmt::Display for Chosen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (name, ours) = (name(), OURS.trim());
+        let (name, ours) = (name(), blaze_units::lock::toolchain());
         write!(f, "{name}, blaze's toolchain (Rust {ours}), at {}", self.0.display())
     }
 }
@@ -92,7 +124,7 @@ pub fn ensure() -> Result<Chosen, String> {
     if let Some(chosen) = found() {
         return Ok(chosen);
     }
-    let ours = OURS.trim();
+    let ours = blaze_units::lock::toolchain();
     let Some(release) = own::Release::ours() else {
         return Err(format!(
             "blaze builds with Rust {ours}, and the Rust project publishes no copy of it for this machine that blaze knows"
@@ -100,8 +132,9 @@ pub fn ensure() -> Result<Chosen, String> {
     };
     let Some(dir) = release.dir() else {
         return Err(format!(
-            "blaze builds with Rust {ours} and keeps it in .blaze in your home directory, and there is no home \
-             directory: `BLAZE_HOME` names where to keep it"
+            "blaze builds with Rust {ours} and keeps it in .blaze/toolchains in your home \
+             directory, for every BLAZE_HOME, and no home directory is set (HOME, or \
+             USERPROFILE on Windows)"
         ));
     };
     own::fetch(&release, &dir)?;
@@ -135,7 +168,12 @@ pub fn sysroot() -> Option<&'static Path> {
 /// `file` under `base` (an address ending in `/`) from byte `offset` on, through blaze-registry's
 /// HTTP client; `None` when the server has no such file. A server that ignores the range sends
 /// the whole file, of which what is had is left out.
-async fn read_from(http: &HyperHttp, base: &url::Url, file: &str, offset: u64) -> anyhow::Result<Option<Vec<u8>>> {
+async fn read_from(
+    http: &HyperHttp,
+    base: &url::Url,
+    file: &str,
+    offset: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let url = base.join(file)?;
     let range = format!("bytes={offset}-");
     let headers: &[(&str, &str)] = if offset == 0 { &[] } else { &[("range", &range)] };
@@ -176,7 +214,11 @@ struct NotUtf8Var(&'static str);
 
 impl std::fmt::Display for NotUtf8Var {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`{}` is not UTF-8, and blaze reads the address or directory it names as text", self.0)
+        write!(
+            f,
+            "`{}` is not UTF-8, and blaze reads the address or directory it names as text",
+            self.0
+        )
     }
 }
 
@@ -208,7 +250,12 @@ pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
 /// nothing about the build depends on it.
 pub fn say_toolchain_file(dir: &Path, verbose: bool) {
     if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
-        eprintln!("blaze: {} is ignored: blaze builds with its own Rust, {} ({})", file.display(), ours_release(), name());
+        eprintln!(
+            "blaze: {} is ignored: blaze builds with its own Rust, {} ({})",
+            file.display(),
+            ours_release(),
+            name()
+        );
     }
 }
 
@@ -222,7 +269,11 @@ mod tests {
         let inner = root.path().join("a/b");
         std::fs::create_dir_all(&inner).unwrap();
         assert_eq!(toolchain_file(&inner).filter(|it| it.starts_with(root.path())), None);
-        std::fs::write(root.path().join("a/rust-toolchain.toml"), "[toolchain]\nchannel = \"1.70\"\n").unwrap();
+        std::fs::write(
+            root.path().join("a/rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.70\"\n",
+        )
+        .unwrap();
         assert_eq!(toolchain_file(&inner), Some(root.path().join("a/rust-toolchain.toml")));
         std::fs::write(root.path().join("a/b/rust-toolchain"), "1.70\n").unwrap();
         assert_eq!(toolchain_file(&inner), Some(inner.join("rust-toolchain")), "the nearest");
@@ -230,7 +281,9 @@ mod tests {
 
     #[test]
     fn blazes_toolchain_is_named_after_its_nightly_and_its_rustc_says_its_release() {
-        let date = OURS.trim().strip_prefix("nightly-").expect("harness/toolchain names a nightly");
+        let date = blaze_units::lock::toolchain()
+            .strip_prefix("nightly-")
+            .expect("harness/toolchain names a nightly");
         assert_eq!(name(), format!("blaze-{date}"));
         assert!(ours_says().starts_with(ours_release()), "{}", ours_says());
         semver::Version::parse(ours_release()).expect("a release is a version");
@@ -238,8 +291,12 @@ mod tests {
 
     #[test]
     fn a_download_that_gave_up_says_how_often_it_tried_and_why() {
-        let error = anyhow::anyhow!("connection reset").context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
-        assert_eq!(format!("{error:#}"), "library-ab.tar.xz: the download gave up after 4 tries: connection reset");
+        let error = anyhow::anyhow!("connection reset")
+            .context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
+        assert_eq!(
+            format!("{error:#}"),
+            "library-ab.tar.xz: the download gave up after 4 tries: connection reset"
+        );
         assert!(error.downcast_ref::<GaveUp>().is_some_and(|it| it.tries == 4));
         assert_eq!(
             NotUtf8Var("BLAZE_RUST_DIST").to_string(),

@@ -393,7 +393,15 @@ fn main() {}
 "#;
     assert_reports(
         &ui_lint("unused-doc-comments-edge-cases.rs", source, "unused_doc_comments"),
-        &[error(6, &[]), error(23, &[]), error(33, &[]), error(45, &[]), error(55, &[]), error(59, &[]), error(66, &[])],
+        &[
+            error(6, &[]),
+            error(23, &[]),
+            error(33, &[]),
+            error(45, &[]),
+            error(55, &[]),
+            error(59, &[]),
+            error(66, &[]),
+        ],
     );
 }
 

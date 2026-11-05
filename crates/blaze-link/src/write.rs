@@ -21,8 +21,8 @@ use std::sync::Arc;
 use blaze_codegen::Arch;
 use blaze_graph::par;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
+use std::alloc::Global;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
@@ -36,7 +36,7 @@ use crate::stage::{Content, Stage, error, function_of, named_in};
 use crate::state::{self, Def, PieceId, PieceRef, Space, State, What};
 use crate::symbols::{IdNo, SymKey, Symbols};
 use crate::thunk;
-use crate::{Debug, Format, LinkError, OutputKind};
+use crate::{Debug, Format, LinkError, OutputKind, Refusal};
 
 /// What a symbol is worth to a fixup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,7 +125,9 @@ impl Resolver<'_> {
     pub(crate) fn value(&self, mut sym: Sym) -> Result<Value, Why> {
         for _ in 0..64 {
             return Ok(match self.state.def(sym) {
-                Def::Piece { piece, offset } => Value::Image(self.state.piece(piece).ok_or(Why::Removed)?.addr + offset),
+                Def::Piece { piece, offset } => {
+                    Value::Image(self.state.piece(piece).ok_or(Why::Removed)?.addr + offset)
+                }
                 Def::Import(at) => Value::Import(at),
                 Def::Absolute(value) => Value::Absolute(value),
                 Def::TlsOffset(value) => Value::Tls(value),
@@ -159,8 +161,12 @@ impl Resolver<'_> {
     fn special(&self, sym: Sym, special: &Special) -> Result<Value, Why> {
         Ok(match special {
             Special::ImageBase => Value::Image(self.base),
-            Special::Start(class) => Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.0),
-            Special::Stop(class) => Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.1),
+            Special::Start(class) => {
+                Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.0)
+            }
+            Special::Stop(class) => {
+                Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.1)
+            }
             Special::Section { name, end } => {
                 let (start, stop) = self.bounds(
                     |it| matches!(it, Class::Named { name: n, .. } if n == name),
@@ -178,10 +184,16 @@ impl Resolver<'_> {
                 self.value(sym)?
             }
             Special::Got { .. } => {
-                let name = self.symbols.name_of(sym).and_then(|it| special.got_target(it)).ok_or_else(|| {
-                    // alloc: error path
-                    Why::Special(format!("{} names no GOT cell's target", self.symbols.describe(sym)))
-                })?;
+                let name =
+                    self.symbols.name_of(sym).and_then(|it| special.got_target(it)).ok_or_else(
+                        || {
+                            // alloc: error path
+                            Why::Special(format!(
+                                "{} names no GOT cell's target",
+                                self.symbols.describe(sym)
+                            ))
+                        },
+                    )?;
                 let target = self
                     .symbols
                     .find_sym_name(name)
@@ -419,7 +431,8 @@ fn split(fixups: &[Fixup]) -> impl Iterator<Item = (u64, u32)> + '_ {
     let whole = fixups.len() <= SPLIT
         || fixups.last().is_some_and(|it| matches!(it.apply, Apply::Native(_)))
         || fixups.windows(2).any(|pair| {
-            matches!(pair[0].apply, Apply::Native(_)) || pair[0].at + reloc::width(pair[0].apply) as u64 > pair[1].at
+            matches!(pair[0].apply, Apply::Native(_))
+                || pair[0].at + reloc::width(pair[0].apply) as u64 > pair[1].at
         });
     let rest = if whole { 0..0 } else { SPLIT..fixups.len() };
     std::iter::once((0, 0)).chain(rest.step_by(SPLIT).map(|at| (fixups[at].at, at as u32)))
@@ -466,7 +479,13 @@ impl Reloc<'_> {
             }
             return;
         }
-        out.records.push((index, rebase as u32, out.rebase.len() as u32, binds as u32, out.binds.len() as u32));
+        out.records.push((
+            index,
+            rebase as u32,
+            out.rebase.len() as u32,
+            binds as u32,
+            out.binds.len() as u32,
+        ));
     }
 
     fn job(&self, job: &mut Job<'_, '_>, out: &mut Loader) -> Result<(), LinkError> {
@@ -477,7 +496,11 @@ impl Reloc<'_> {
             error(
                 function_of(piece),
                 // alloc: error path
-                format!("{} has {len} bytes for a piece of {}", symbols.describe(piece.sym), piece.size),
+                format!(
+                    "{} has {len} bytes for a piece of {}",
+                    symbols.describe(piece.sym),
+                    piece.size
+                ),
             )
         };
         match job.source {
@@ -527,9 +550,17 @@ impl Reloc<'_> {
                 format!("{:?} at {:#x} in {}: {what}", fixup.apply, fixup.at, describe(piece.sym)),
             )
         };
+        // A value its field can't hold, or a branch no thunk reaches: a reach, whose message
+        // the stage gives the image's regions ([`crate::shape::explained`]).
+        let past = |fixup: &Fixup, what: String| LinkError {
+            refusal: Some(Refusal::FieldRange),
+            ..fail(fixup, what)
+        };
         for fixup in fixups {
             let p = piece.addr + fixup.at;
-            let Some(place) = fixup.at.checked_sub(job.lo).and_then(|at| field.get_mut(at as usize..)) else {
+            let Some(place) =
+                fixup.at.checked_sub(job.lo).and_then(|at| field.get_mut(at as usize..))
+            else {
                 return Err(fail(fixup, "past the piece's end".into()));
             };
             let value = match self.column.value(fixup.target) {
@@ -561,8 +592,12 @@ impl Reloc<'_> {
                     ));
                 }
                 (Value::Image(_) | Value::Tls(_), Some(at)) if tls_kind => {
-                    let Some(offset) = s.checked_sub(tls_base).filter(|_| self.tls.is_some()) else {
-                        return Err(fail(fixup, "a thread-local relocation to what is not thread-local".into()));
+                    let Some(offset) = s.checked_sub(tls_base).filter(|_| self.tls.is_some())
+                    else {
+                        return Err(fail(
+                            fixup,
+                            "a thread-local relocation to what is not thread-local".into(),
+                        ));
                     };
                     Some(at + offset as i64)
                 }
@@ -572,8 +607,15 @@ impl Reloc<'_> {
                 Some(minus) => match self.column.value(minus) {
                     Ok(Value::Image(m) | Value::Absolute(m)) => m,
                     Ok(Value::Tls(offset)) => tls_base + offset,
-                    Ok(Value::TpOff(_)) => return Err(fail(fixup, "the difference of another image's thread-local".into())),
-                    Ok(Value::Import(_)) => return Err(fail(fixup, "the difference of an import".into())),
+                    Ok(Value::TpOff(_)) => {
+                        return Err(fail(
+                            fixup,
+                            "the difference of another image's thread-local".into(),
+                        ));
+                    }
+                    Ok(Value::Import(_)) => {
+                        return Err(fail(fixup, "the difference of an import".into()));
+                    }
                     Err(at) => return Err(fail(fixup, self.column.why(&describe, minus, at))),
                 },
                 None => 0,
@@ -632,7 +674,11 @@ impl Reloc<'_> {
                                     }
                                     // The same call rewritten by the link before, whose bytes
                                     // a relink starts from (`Source::Bytes`).
-                                    Some(UNREACHABLE) if field.get(at..at + 5) == Some(&[NOP; 5][..]) => continue,
+                                    Some(UNREACHABLE)
+                                        if field.get(at..at + 5) == Some(&[NOP; 5][..]) =>
+                                    {
+                                        continue;
+                                    }
                                     _ => {
                                         return Err(fail(
                                             fixup,
@@ -663,7 +709,9 @@ impl Reloc<'_> {
                     }
                     _ => s,
                 };
-                self.writer.apply(r_type, place, p, s, fixup.addend).map_err(|it| fail(fixup, it))?;
+                self.writer
+                    .apply(r_type, place, p, s, fixup.addend)
+                    .map_err(|it| fail(fixup, it))?;
                 continue;
             }
             let kind = reloc::got_kind(fixup.apply);
@@ -672,7 +720,12 @@ impl Reloc<'_> {
                     let target = got_target(symbols, fixup);
                     match self.column.cells(target).got[kind as usize] {
                         // alloc: error path
-                        NONE => return Err(fail(fixup, format!("no GOT cell of {}", symbols.describe(target)))),
+                        NONE => {
+                            return Err(fail(
+                                fixup,
+                                format!("no GOT cell of {}", symbols.describe(target)),
+                            ));
+                        }
                         at => at,
                     }
                 }
@@ -681,12 +734,19 @@ impl Reloc<'_> {
             let mut slid = matches!(value, Value::Image(_));
             let mut plt = false;
             let s = match value {
-                Value::Import(at) if through_plt(fixup.apply, self.got_by_library, self.imports, at) => {
+                Value::Import(at)
+                    if through_plt(fixup.apply, self.got_by_library, self.imports, at) =>
+                {
                     slid = true;
                     plt = true;
                     match self.column.cells(fixup.target).plt {
                         // alloc: error path
-                        NONE => return Err(fail(fixup, format!("no PLT stub of {}", symbols.describe(fixup.target)))),
+                        NONE => {
+                            return Err(fail(
+                                fixup,
+                                format!("no PLT stub of {}", symbols.describe(fixup.target)),
+                            ));
+                        }
                         at => at,
                     }
                 }
@@ -704,7 +764,10 @@ impl Reloc<'_> {
                 Value::Import(at) if fixup.apply == Apply::Abs64 => {
                     let Some(place) = place.get_mut(..8) else {
                         // alloc: error path
-                        return Err(fail(fixup, Bad::PastEnd { apply: fixup.apply, need: 8 }.to_string()));
+                        return Err(fail(
+                            fixup,
+                            Bad::PastEnd { apply: fixup.apply, need: 8 }.to_string(),
+                        ));
                     };
                     place.fill(0);
                     out.binds.push((fixup.at, at, fixup.addend));
@@ -727,14 +790,32 @@ impl Reloc<'_> {
             if fixup.apply == Apply::Abs64 && slid {
                 out.rebase.push(fixup.at);
             }
-            let (s, a) = if slid && thunk::extends(fixup.apply) && !thunk::reaches(p, s.wrapping_add(fixup.addend as u64), thunk::REACH) {
-                self.thunk(fixup, plt, p, s).map_err(|it| fail(fixup, it))?
+            let (s, a) = if slid
+                && thunk::extends(fixup.apply)
+                && !thunk::reaches(p, s.wrapping_add(fixup.addend as u64), thunk::REACH)
+            {
+                self.thunk(fixup, plt, p, s).map_err(|it| past(fixup, it))?
             } else {
                 (s, fixup.addend)
             };
-            let ctx = Ctx { arch: self.arch, format: self.format, s, a, p, g, m, base: self.base, tls: self.tls, tp };
-            // alloc: error path
-            reloc::apply(fixup.apply, &ctx, place).map_err(|it| fail(fixup, it.to_string()))?;
+            let ctx = Ctx {
+                arch: self.arch,
+                format: self.format,
+                s,
+                a,
+                p,
+                g,
+                m,
+                base: self.base,
+                tls: self.tls,
+                tp,
+            };
+            reloc::apply(fixup.apply, &ctx, place).map_err(|it| match it.reach() {
+                // alloc: error path
+                true => past(fixup, it.to_string()),
+                // alloc: error path
+                false => fail(fixup, it.to_string()),
+            })?;
         }
         Ok(())
     }
@@ -743,8 +824,11 @@ impl Reloc<'_> {
     /// instead: the nearest thunk of it in reach ([`thunk::through`]), with no addend. An error
     /// naming the target when there is none.
     fn thunk(&self, fixup: &Fixup, plt: bool, p: u64, s: u64) -> Result<(u64, i64), String> {
-        let target = if plt { self.symbols.find(SymKey::Plt(fixup.target)) } else { Some(fixup.target) };
-        if let Some(at) = target.and_then(|it| thunk::through(self.symbols, self.state, it, fixup.addend, p)) {
+        let target =
+            if plt { self.symbols.find(SymKey::Plt(fixup.target)) } else { Some(fixup.target) };
+        if let Some(at) =
+            target.and_then(|it| thunk::through(self.symbols, self.state, it, fixup.addend, p))
+        {
             return Ok((at, 0));
         }
         let to = s.wrapping_add(fixup.addend as u64);
@@ -760,7 +844,12 @@ impl Reloc<'_> {
     }
 
     /// The jump table's cells in a full link: each filled slot's body's address, rebased.
-    fn cells(&self, piece: PieceRef<'_>, field: &mut [u8], out: &mut Loader) -> Result<(), LinkError> {
+    fn cells(
+        &self,
+        piece: PieceRef<'_>,
+        field: &mut [u8],
+        out: &mut Loader,
+    ) -> Result<(), LinkError> {
         out.rebase.reserve(field.len() / 8);
         for (slot, body) in self.state.filled_cells() {
             let at = slot as usize * 8;
@@ -768,7 +857,9 @@ impl Reloc<'_> {
                 .state
                 .addr_of(body)
                 // alloc: error path
-                .ok_or_else(|| error(None, format!("{} is not defined", self.symbols.describe(body))))?;
+                .ok_or_else(|| {
+                    error(None, format!("{} is not defined", self.symbols.describe(body)))
+                })?;
             let cell = field.get_mut(at..at + 8).ok_or_else(|| {
                 // alloc: error path
                 error(None, format!("slot {slot} is past the jump table's {} bytes", piece.size))
@@ -792,13 +883,22 @@ const MAX_REGIONS: usize = 1 << 31;
 /// the input's.
 fn write_order(region: u32, addr: u64, filled: bool, id: PieceId) -> u128 {
     debug_assert!((region as usize) < MAX_REGIONS);
-    (u128::from(region) << 97) | (u128::from(addr) << 33) | (u128::from(filled) << 32) | u128::from(id)
+    (u128::from(region) << 97)
+        | (u128::from(addr) << 33)
+        | (u128::from(filled) << 32)
+        | u128::from(id)
 }
 
 /// A full link's piece that starts before the end of the one written before it in its
 /// region: both named, with their sizes, alignments and offsets in the region.
 #[cold]
-fn overlap(symbols: &Symbols, state: &State, space: &Space, piece: PieceRef<'_>, last: Option<PieceId>) -> LinkError {
+fn overlap(
+    symbols: &Symbols,
+    state: &State,
+    space: &Space,
+    piece: PieceRef<'_>,
+    last: Option<PieceId>,
+) -> LinkError {
     let class = &space.region.class;
     let at = |it: PieceRef<'_>| {
         let start = it.addr - space.region.addr;
@@ -816,7 +916,10 @@ fn overlap(symbols: &Symbols, state: &State, space: &Space, piece: PieceRef<'_>,
         // alloc: error path
         Some(it) => format!("{} overlaps the piece before it, {}", at(piece), at(it)),
         // alloc: error path
-        None => format!("{} overlaps the piece before it, though nothing was written before it", at(piece)),
+        None => format!(
+            "{} overlaps the piece before it, though nothing was written before it",
+            at(piece)
+        ),
     };
     error(function_of(piece).or_else(|| before.and_then(function_of)), what)
 }
@@ -837,7 +940,10 @@ impl<'a> Stage<'a> {
                 .filter(|it| regions.get(it.region as usize).is_some_and(|r| r.prot.exec))
                 .map(|it| it.addr)
                 .chain(
-                    regions.iter().filter(|it| it.prot.exec && matches!(it.class, Class::Synthetic(_))).map(|it| it.addr),
+                    regions
+                        .iter()
+                        .filter(|it| it.prot.exec && matches!(it.class, Class::Synthetic(_)))
+                        .map(|it| it.addr),
                 ),
             self.arena,
         );
@@ -866,26 +972,42 @@ impl<'a> Stage<'a> {
     /// Copies and relocates every piece to write, in parallel.
     pub fn relocate_all(&mut self) -> Result<(), LinkError> {
         let full = self.full;
-        let short = |space: &Space| has_bytes(space) && (space.bytes.len() as u64) < space.region.size;
+        let short =
+            |space: &Space| has_bytes(space) && (space.bytes.len() as u64) < space.region.size;
         if !full && self.new.spaces.iter().any(short) {
             for space in Arc::make_mut(&mut self.new.spaces).iter_mut().filter(|it| short(&**it)) {
                 space.bytes.resize(space.region.size as usize);
             }
         }
         let arena = self.arena;
-        let mut ids: FrameVec<'a, (u32, u64, bool, PieceId)> = Vec::with_capacity_in(self.write.len(), arena);
-        ids.extend(self.write.iter().filter_map(|id| self.new.piece(id).map(|it| (it.region, it.addr, it.size != 0, id))));
+        let mut ids: FrameVec<'a, (u32, u64, bool, PieceId)> =
+            Vec::with_capacity_in(self.write.len(), arena);
+        ids.extend(
+            self.write.iter().filter_map(|id| {
+                self.new.piece(id).map(|it| (it.region, it.addr, it.size != 0, id))
+            }),
+        );
         if self.new.spaces.len() > MAX_REGIONS {
             // alloc: error path
-            return Err(error(None, format!("{} regions, past the writer's {MAX_REGIONS}", self.new.spaces.len())));
+            return Err(error(
+                None,
+                format!("{} regions, past the writer's {MAX_REGIONS}", self.new.spaces.len()),
+            ));
         }
-        radix::sort_copy_by_key(&mut ids, |&(region, addr, filled, id)| write_order(region, addr, filled, id));
+        radix::sort_copy_by_key(&mut ids, |&(region, addr, filled, id)| {
+            write_order(region, addr, filled, id)
+        });
         let regions = self.new.regions();
-        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(if full { self.new.spaces.len() } else { 0 });
+        let mut buffers: Vec<Vec<u8>> =
+            Vec::with_capacity(if full { self.new.spaces.len() } else { 0 });
         if full {
             for space in self.new.spaces.iter() {
                 // alloc: a full link's regions, one zeroed buffer each, kept as the image's bytes
-                buffers.push(if has_bytes(space) { vec![0; space.region.size as usize] } else { Vec::new() });
+                buffers.push(if has_bytes(space) {
+                    vec![0; space.region.size as usize]
+                } else {
+                    Vec::new()
+                });
             }
         }
         let mut scratch: &'a mut [u8] = &mut [];
@@ -919,7 +1041,11 @@ impl<'a> Stage<'a> {
                             wants.got.push((kind, target));
                         }
                         if reloc::is_branch(fixup.apply)
-                            || (got_by_library && matches!(fixup.apply, Apply::Abs64 | Apply::ImageRel32 | Apply::Rel32))
+                            || (got_by_library
+                                && matches!(
+                                    fixup.apply,
+                                    Apply::Abs64 | Apply::ImageRel32 | Apply::Rel32
+                                ))
                         {
                             wants.plt.push(fixup.target);
                         }
@@ -930,7 +1056,8 @@ impl<'a> Stage<'a> {
             .into_iter()
             .fold(Wants::default(), Wants::join);
             let column = Column::build(&resolver, wants);
-            let wasm: &[u64] = if self.output.format == Format::Wasm { self.wasm_code(&regions) } else { &[] };
+            let wasm: &[u64] =
+                if self.output.format == Format::Wasm { self.wasm_code(&regions) } else { &[] };
             if !full {
                 let len: u64 = ids
                     .iter()
@@ -953,7 +1080,10 @@ impl<'a> Stage<'a> {
                 let piece = state.piece(id).expect("live");
                 let Some(space) = state.spaces.get(region as usize) else {
                     // alloc: error path
-                    return Err(error(function_of(piece), format!("{} is in no region", symbols.describe(piece.sym))));
+                    return Err(error(
+                        function_of(piece),
+                        format!("{} is in no region", symbols.describe(piece.sym)),
+                    ));
                 };
                 if !has_bytes(space) {
                     if piece.fixups().is_empty() {
@@ -962,7 +1092,10 @@ impl<'a> Stage<'a> {
                     return Err(error(
                         function_of(piece),
                         // alloc: error path
-                        format!("{} has relocations in a zeroed region", symbols.describe(piece.sym)),
+                        format!(
+                            "{} has relocations in a zeroed region",
+                            symbols.describe(piece.sym)
+                        ),
                     ));
                 }
                 if !full && piece.what() == What::Cells {
@@ -972,7 +1105,13 @@ impl<'a> Stage<'a> {
                 let offset = piece.addr - space.region.addr;
                 let field: &mut [u8] = if full {
                     let Some(skip) = offset.checked_sub(taken[region as usize]) else {
-                        return Err(overlap(symbols, state, space, piece, written[region as usize]));
+                        return Err(overlap(
+                            symbols,
+                            state,
+                            space,
+                            piece,
+                            written[region as usize],
+                        ));
                     };
                     written[region as usize] = Some(id);
                     let buffer = std::mem::take(&mut rest[region as usize]);
@@ -993,7 +1132,8 @@ impl<'a> Stage<'a> {
                 let mut cuts = split(fixups).peekable();
                 let mut field = field;
                 while let Some((lo, first)) = cuts.next() {
-                    let (hi, last) = cuts.peek().map_or((piece.size, fixups.len() as u32), |it| (it.0, it.1));
+                    let (hi, last) =
+                        cuts.peek().map_or((piece.size, fixups.len() as u32), |it| (it.0, it.1));
                     let (mine, after) = std::mem::take(&mut field).split_at_mut((hi - lo) as usize);
                     field = after;
                     owners.push(id);
@@ -1015,17 +1155,20 @@ impl<'a> Stage<'a> {
                 wasm,
             };
             let grain = jobs.len().div_ceil(par::threads() * 8).max(1);
-            let loaders: Vec<Loader> = par::map(par::enumerate(par::chunks_mut(&mut jobs, grain)), |(batch, jobs)| {
-                let mut out = Loader::default();
-                for (at, job) in jobs.iter_mut().enumerate() {
-                    reloc.run((batch * grain + at) as u32, job, &mut out);
-                }
-                out
-            }); // alloc: one loader per pool batch of jobs, a few per thread, never one per job
+            let loaders: Vec<Loader> =
+                par::map(par::enumerate(par::chunks_mut(&mut jobs, grain)), |(batch, jobs)| {
+                    let mut out = Loader::default();
+                    for (at, job) in jobs.iter_mut().enumerate() {
+                        reloc.run((batch * grain + at) as u32, job, &mut out);
+                    }
+                    out
+                }); // alloc: one loader per pool batch of jobs, a few per thread, never one per job
             loaders
         };
         let mut loaders = loaders;
-        if let Some((_, it)) = loaders.iter_mut().filter_map(|it| it.error.take()).min_by_key(|it| it.0) {
+        if let Some((_, it)) =
+            loaders.iter_mut().filter_map(|it| it.error.take()).min_by_key(|it| it.0)
+        {
             return Err(it);
         }
         if full {
@@ -1043,7 +1186,8 @@ impl<'a> Stage<'a> {
         let mut records: FrameVec<'a, (u32, u32, u32, u32, u32, u32)> =
             Vec::with_capacity_in(loaders.iter().map(|it| it.records.len()).sum(), arena);
         for (at, loader) in loaders.iter().enumerate() {
-            records.extend(loader.records.iter().map(|it| (it.0, at as u32, it.1, it.2, it.3, it.4)));
+            records
+                .extend(loader.records.iter().map(|it| (it.0, at as u32, it.1, it.2, it.3, it.4)));
         }
         radix::sort_copy_by_key(&mut records, |it| it.0);
         let mut rebase: FrameVec<'a, u64> = Vec::new_in(arena);
@@ -1051,10 +1195,14 @@ impl<'a> Stage<'a> {
         let mut at = 0;
         while at < records.len() {
             let piece = owners[records[at].0 as usize];
-            let end = at + records[at..].iter().take_while(|it| owners[it.0 as usize] == piece).count();
+            let end =
+                at + records[at..].iter().take_while(|it| owners[it.0 as usize] == piece).count();
             let lists = |it: &(u32, u32, u32, u32, u32, u32)| {
                 let loader = &loaders[it.1 as usize];
-                (&loader.rebase[it.2 as usize..it.3 as usize], &loader.binds[it.4 as usize..it.5 as usize])
+                (
+                    &loader.rebase[it.2 as usize..it.3 as usize],
+                    &loader.binds[it.4 as usize..it.5 as usize],
+                )
             };
             if end - at == 1 {
                 let (r, b) = lists(&records[at]);
@@ -1082,17 +1230,23 @@ impl<'a> Stage<'a> {
         let piece = self.new.piece(id).expect("live");
         let region = piece.region as usize;
         let start = (piece.addr - self.new.spaces[region].region.addr) as usize;
-        let mut writes: FrameVec<'a, (usize, [u8; 8])> = Vec::with_capacity_in(self.dirty_cells.len(), self.arena);
+        let mut writes: FrameVec<'a, (usize, [u8; 8])> =
+            Vec::with_capacity_in(self.dirty_cells.len(), self.arena);
         for slot in self.dirty_cells.iter() {
             let Some(body) = self.new.cell(slot) else { continue };
             let addr = self
                 .new
                 .addr_of(body)
                 // alloc: error path
-                .ok_or_else(|| error(None, format!("{} is not defined", self.symbols.describe(body))))?;
+                .ok_or_else(|| {
+                    error(None, format!("{} is not defined", self.symbols.describe(body)))
+                })?;
             if u64::from(slot) * 8 + 8 > piece.size {
                 // alloc: error path
-                return Err(error(None, format!("slot {slot} is past the jump table's {} bytes", piece.size)));
+                return Err(error(
+                    None,
+                    format!("slot {slot} is past the jump table's {} bytes", piece.size),
+                ));
             }
             writes.push((start + slot as usize * 8, addr.to_le_bytes()));
         }
@@ -1103,7 +1257,10 @@ impl<'a> Stage<'a> {
             }
         }
         if self.filled_slots_changed(id) {
-            let rebase = collect_in(self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8), self.arena);
+            let rebase = collect_in(
+                self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8),
+                self.arena,
+            );
             self.new.set_loader(id, &rebase, &[]);
         }
         Ok(())
@@ -1182,7 +1339,12 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
     /// runs are copied in parallel. A one-function edit so costs a copy of the list at memory
     /// bandwidth, where a serial walk cost about 5 ns an entry. Same lists and runs as
     /// [`Owned::splice_serial`], the reference the tests hold it to.
-    fn splice(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>, runs: &mut FrameVec<'_, Splice>) -> Owned<T>
+    fn splice(
+        &self,
+        drop: &IdSet,
+        mut entries: Vec<(PieceId, T)>,
+        runs: &mut FrameVec<'_, Splice>,
+    ) -> Owned<T>
     where
         T: PartialEq,
     {
@@ -1196,7 +1358,9 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         let dropped: Vec<u32> = if drop.is_empty() {
             Vec::new() // alloc: empty, which allocates nothing
         } else {
-            par::filter_map(par::enumerate(old_owners), |(at, owner)| drop.contains(*owner).then_some(at as u32)) // alloc: as above
+            par::filter_map(par::enumerate(old_owners), |(at, owner)| {
+                drop.contains(*owner).then_some(at as u32)
+            }) // alloc: as above
         };
         let gaps = gaps(old, old_owners, &dropped, &entries);
         let len = old.len() - dropped.len() + entries.len();
@@ -1225,7 +1389,12 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
 
     /// [`Owned::splice`] as one serial pass: the reference its tests hold it to.
     #[cfg(test)]
-    fn splice_serial(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>, runs: &mut FrameVec<'_, Splice>) -> Owned<T>
+    fn splice_serial(
+        &self,
+        drop: &IdSet,
+        mut entries: Vec<(PieceId, T)>,
+        runs: &mut FrameVec<'_, Splice>,
+    ) -> Owned<T>
     where
         T: PartialEq,
     {
@@ -1244,7 +1413,9 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
                 open.get_or_insert((at, items.len()));
                 continue;
             }
-            while let Some((id, it)) = new.next_if(|(id, it)| (it.addr(), *id) < (item.addr(), *owner)) {
+            while let Some((id, it)) =
+                new.next_if(|(id, it)| (it.addr(), *id) < (item.addr(), *owner))
+            {
                 open.get_or_insert((at, items.len()));
                 items.push(it);
                 owners.push(id);
@@ -1277,7 +1448,10 @@ const DEBUG_CHUNK: usize = 1024;
 
 /// `rows` cut before every [`DEBUG_CHUNK`]th function's first row, `starts` being where each
 /// function's rows start and, last, where they end.
-fn debug_chunks<'r>(mut rows: &'r mut [crate::dwarf::Row], starts: &[usize]) -> Vec<&'r mut [crate::dwarf::Row]> {
+fn debug_chunks<'r>(
+    mut rows: &'r mut [crate::dwarf::Row],
+    starts: &[usize],
+) -> Vec<&'r mut [crate::dwarf::Row]> {
     let functions = starts.len() - 1;
     // alloc: once per stage that makes debug info, a slice per task
     let mut out = Vec::with_capacity(functions.div_ceil(DEBUG_CHUNK));
@@ -1312,7 +1486,12 @@ struct Gap {
 /// the new entries whose (address, piece) falls between those two. `dropped` is sorted, and
 /// `entries` sorted by (address, piece); a new entry never ties a kept one, whose piece is
 /// not dropped. Costs the dropped entries plus a binary search per new one.
-fn gaps<T: Addr>(old: &[T], owners: &[PieceId], dropped: &[u32], entries: &[(PieceId, T)]) -> Vec<Gap> {
+fn gaps<T: Addr>(
+    old: &[T],
+    owners: &[PieceId],
+    dropped: &[u32],
+    entries: &[(PieceId, T)],
+) -> Vec<Gap> {
     // The dropped entries as blocks of consecutive indexes; each block ends at a kept entry
     // or the list's end.
     // alloc: once per list a stage changes, O(dropped)
@@ -1370,7 +1549,13 @@ fn gaps<T: Addr>(old: &[T], owners: &[PieceId], dropped: &[u32], entries: &[(Pie
 
 /// Pushes the run of `old` (from `old_at` in the last list) replaced by `new` (from `new_at`),
 /// unless they are the same entries.
-fn run<T: PartialEq>(old: &[T], new: &[T], old_at: usize, new_at: usize, runs: &mut FrameVec<'_, Splice>) {
+fn run<T: PartialEq>(
+    old: &[T],
+    new: &[T],
+    old_at: usize,
+    new_at: usize,
+    runs: &mut FrameVec<'_, Splice>,
+) {
     if old == new {
         return;
     }
@@ -1458,42 +1643,63 @@ impl Entries<'_> {
         let regions = self.resolver.regions;
         if want.loader {
             out.rebase.extend(piece.rebase().iter().map(|at| (piece.id, piece.addr + at)));
-            out.binds.extend(
-                piece
-                    .binds()
-                    .iter()
-                    .map(|(at, import, addend)| (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend })),
-            );
+            out.binds.extend(piece.binds().iter().map(|(at, import, addend)| {
+                (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend })
+            }));
         }
         match piece.what() {
             What::Got { kind, target } if want.got => {
-                out.got.push((piece.id, GotEntry { addr: piece.addr, holds: self.holds(kind, target)? }));
+                out.got.push((
+                    piece.id,
+                    GotEntry { addr: piece.addr, holds: self.holds(kind, target)? },
+                ));
             }
             What::Function(function) if want.functions => {
                 let info = state.function(function);
-                let fde = info.fde.and_then(|it| state.home(it)).and_then(|(p, _)| state.piece(p)).map(|p| p.addr);
+                let fde = info
+                    .fde
+                    .and_then(|it| state.home(it))
+                    .and_then(|(p, _)| state.piece(p))
+                    .map(|p| p.addr);
                 let windows = match info.windows {
                     Some((unwind, handler, lsda)) => {
                         let at = |sym: Sym| -> Result<u64, LinkError> {
-                            match self.resolver.value(sym).map_err(|it| error(Some(info.key), it.say(symbols)))? {
+                            match self
+                                .resolver
+                                .value(sym)
+                                .map_err(|it| error(Some(info.key), it.say(symbols)))?
+                            {
                                 Value::Image(s) => Ok(s),
-                                _ => Err(error(Some(info.key), "an unwind handler not in the image")),
+                                _ => {
+                                    Err(error(Some(info.key), "an unwind handler not in the image"))
+                                }
                             }
                         };
-                        Some(WindowsUnwind { info: at(unwind)?, handler: handler.map(at).transpose()?, lsda: lsda.map(at).transpose()? })
+                        Some(WindowsUnwind {
+                            info: at(unwind)?,
+                            handler: handler.map(at).transpose()?,
+                            lsda: lsda.map(at).transpose()?,
+                        })
                     }
                     None => None,
                 };
                 let name = state.debug_name(info.id).map(|it| symbols.str(it).into());
-                out.functions.push((piece.id, Function { addr: piece.addr, size: piece.size, fde, windows, name }));
+                out.functions.push((
+                    piece.id,
+                    Function { addr: piece.addr, size: piece.size, fde, windows, name },
+                ));
             }
             What::Native { unwind: false, .. }
                 if want.functions
                     && self.indexed_code
                     && regions.get(piece.region as usize).is_some_and(|it| it.prot.exec) =>
             {
-                let name = piece.defines().iter().find_map(|sym| symbols.name_of(*sym)).map(Into::into);
-                out.functions.push((piece.id, Function { addr: piece.addr, size: piece.size, fde: None, windows: None, name }));
+                let name =
+                    piece.defines().iter().find_map(|sym| symbols.name_of(*sym)).map(Into::into);
+                out.functions.push((
+                    piece.id,
+                    Function { addr: piece.addr, size: piece.size, fde: None, windows: None, name },
+                ));
             }
             _ => {}
         }
@@ -1501,7 +1707,8 @@ impl Entries<'_> {
     }
 
     fn holds(&self, kind: GotKind, target: Sym) -> Result<Holds, LinkError> {
-        let value = self.resolver.value(target).map_err(|it| error(None, it.say(self.resolver.symbols)))?;
+        let value =
+            self.resolver.value(target).map_err(|it| error(None, it.say(self.resolver.symbols)))?;
         let tls = self.tls;
         Ok(match (kind, value) {
             (GotKind::TlsGd | GotKind::TlsDesc, _) if self.tls_at.is_some() => {
@@ -1522,19 +1729,22 @@ impl Entries<'_> {
                 return Err(error(None, "an address GOT cell of another image's thread-local"));
             }
             (kind, value) => {
-                let tls = tls.ok_or_else(|| error(None, "a thread-local GOT cell in an image with no TLS"))?;
+                let tls = tls.ok_or_else(|| {
+                    error(None, "a thread-local GOT cell in an image with no TLS")
+                })?;
                 let at = match value {
                     Value::Tls(offset) => offset,
-                    Value::Image(s) => {
-                        s.checked_sub(tls.addr).ok_or_else(|| error(None, "a TLS cell of what isn't thread-local"))?
-                    }
+                    Value::Image(s) => s
+                        .checked_sub(tls.addr)
+                        .ok_or_else(|| error(None, "a TLS cell of what isn't thread-local"))?,
                     _ => return Err(error(None, "a TLS cell of an absolute symbol")),
                 };
                 match kind {
                     GotKind::TpOff => Holds::TpOff(match self.tls_at {
                         Some(tls_at) => tls_at + at as i64,
                         // alloc: error path
-                        None => reloc::tp_offset(self.arch, tls, tls.addr + at).map_err(|it| error(None, it.to_string()))?,
+                        None => reloc::tp_offset(self.arch, tls, tls.addr + at)
+                            .map_err(|it| error(None, it.to_string()))?,
                     }),
                     GotKind::TlsGd => Holds::TlsGd { import: None, offset: at },
                     GotKind::TlsDesc => Holds::TlsDesc { import: None, offset: at },
@@ -1545,7 +1755,11 @@ impl Entries<'_> {
     }
 
     /// The entries of `ids`' live pieces, in parallel.
-    fn collect(&self, ids: impl IntoIterator<Item = PieceId>, want: Want) -> Result<Batch, LinkError> {
+    fn collect(
+        &self,
+        ids: impl IntoIterator<Item = PieceId>,
+        want: Want,
+    ) -> Result<Batch, LinkError> {
         let state = self.resolver.state;
         // alloc: once per collection, the piece ids split into ordered batches
         let ids: Vec<PieceId> = ids.into_iter().collect();
@@ -1581,7 +1795,12 @@ impl<'a> Stage<'a> {
         let totals = self.totals();
         let regions = self.new.regions();
         let entries = Entries {
-            resolver: Resolver { symbols: self.symbols, state: &self.new, regions: &regions, base: self.plan.base },
+            resolver: Resolver {
+                symbols: self.symbols,
+                state: &self.new,
+                regions: &regions,
+                base: self.plan.base,
+            },
             arch: self.output.arch,
             tls: self.new.tls,
             tls_at: self.new.tls_at,
@@ -1618,17 +1837,29 @@ impl<'a> Stage<'a> {
                 || !Arc::ptr_eq(&old_resolved.libraries, &new_resolved.libraries)
                 || self.old.tls != self.new.tls
                 || self.old.tls_at != self.new.tls_at;
-            let batch = entries.collect(ids.iter().copied(), Want { loader: true, got: !imports, functions: true })?;
+            let batch = entries.collect(
+                ids.iter().copied(),
+                Want { loader: true, got: !imports, functions: true },
+            )?;
             let (binds, got) = if imports {
                 let count = self.new.piece_count();
-                let more = entries.collect(0..count, Want { loader: false, got: true, functions: false })?;
+                let more = entries
+                    .collect(0..count, Want { loader: false, got: true, functions: false })?;
                 let state = &self.new;
                 let binds: Vec<(PieceId, Bind)> = par::map(0..count as usize, |id| {
-                    state.piece(id as PieceId)
+                    state
+                        .piece(id as PieceId)
                         .into_iter()
                         .flat_map(|piece| {
                             piece.binds().iter().map(move |(at, import, addend)| {
-                                (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend })
+                                (
+                                    piece.id,
+                                    Bind {
+                                        addr: piece.addr + at,
+                                        import: *import,
+                                        addend: *addend,
+                                    },
+                                )
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1663,9 +1894,9 @@ impl<'a> Stage<'a> {
                         return None;
                     }
                     let info = state.piece(*owner).and_then(PieceRef::function)?;
-                    let windows = info
-                        .windows
-                        .is_some_and(|(unwind, handler, lsda)| is(unwind) || handler.is_some_and(is) || lsda.is_some_and(is));
+                    let windows = info.windows.is_some_and(|(unwind, handler, lsda)| {
+                        is(unwind) || handler.is_some_and(is) || lsda.is_some_and(is)
+                    });
                     (windows || info.fde.is_some_and(is)).then_some(*owner)
                 }); // alloc: once per stage, the stale functions found in parallel
                 stale.extend(found);
@@ -1674,12 +1905,19 @@ impl<'a> Stage<'a> {
             if !stale.is_empty() {
                 let ids = collect_in(stale.iter(), arena);
                 functions.extend(
-                    entries.collect(ids.iter().copied(), Want { loader: false, got: false, functions: true })?.functions,
+                    entries
+                        .collect(
+                            ids.iter().copied(),
+                            Want { loader: false, got: false, functions: true },
+                        )?
+                        .functions,
                 );
                 affected.extend(ids);
             }
             let touched = affected.iter().any(|id| {
-                let function = |state: &State| state.any(id).is_some_and(|it| matches!(it.what(), What::Function(_)));
+                let function = |state: &State| {
+                    state.any(id).is_some_and(|it| matches!(it.what(), What::Function(_)))
+                };
                 function(self.old) || function(&self.new)
             });
             let lists = Lists {
@@ -1696,7 +1934,9 @@ impl<'a> Stage<'a> {
         drop(entries);
         lists.debug = match self.output.debug {
             Debug::None => Arc::default(),
-            Debug::Lines if functions_changed || self.spans_changed || self.full => Arc::from(self.debug(&lists)?),
+            Debug::Lines if functions_changed || self.spans_changed || self.full => {
+                Arc::from(self.debug(&lists)?)
+            }
             Debug::Lines => lists.debug,
         };
         // alloc: once per stage; the state shares the lists
@@ -1707,7 +1947,12 @@ impl<'a> Stage<'a> {
     /// The image as the writer reads it, besides [`State::lists`].
     pub fn parts(&self) -> Result<Parts, LinkError> {
         let regions = self.new.regions();
-        let resolver = Resolver { symbols: self.symbols, state: &self.new, regions: &regions, base: self.plan.base };
+        let resolver = Resolver {
+            symbols: self.symbols,
+            state: &self.new,
+            regions: &regions,
+            base: self.plan.base,
+        };
         let exports = self.exports();
         let mut out = Vec::with_capacity(exports.len());
         for (name, symbol, data) in exports {
@@ -1718,23 +1963,29 @@ impl<'a> Stage<'a> {
             let value = resolver
                 .value(sym)
                 // alloc: error path
-                .map_err(|it| error(None, format!("the export `{name}`: {}", it.say(self.symbols))))?;
+                .map_err(|it| {
+                    error(None, format!("the export `{name}`: {}", it.say(self.symbols)))
+                })?;
             let Value::Image(addr) = value else {
                 // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not in the image")));
             };
-            let (kind, size) = match self.new.home(sym).and_then(|(p, o)| Some((self.new.piece(p)?, o))) {
-                Some((piece, offset)) => {
-                    let class = &regions[piece.region as usize].class;
-                    let kind = match (piece.what(), class) {
-                        (_, Class::Tdata | Class::Tbss) => SymbolKind::Tls,
-                        (What::Function(_), _) | (_, Class::Text | Class::Patch | Class::Stubs) => SymbolKind::Function,
-                        _ => SymbolKind::Data,
-                    };
-                    (kind, if offset == 0 { piece.size } else { 0 })
-                }
-                None => (SymbolKind::Other, 0),
-            };
+            let (kind, size) =
+                match self.new.home(sym).and_then(|(p, o)| Some((self.new.piece(p)?, o))) {
+                    Some((piece, offset)) => {
+                        let class = &regions[piece.region as usize].class;
+                        let kind = match (piece.what(), class) {
+                            (_, Class::Tdata | Class::Tbss) => SymbolKind::Tls,
+                            (What::Function(_), _)
+                            | (_, Class::Text | Class::Patch | Class::Stubs) => {
+                                SymbolKind::Function
+                            }
+                            _ => SymbolKind::Data,
+                        };
+                        (kind, if offset == 0 { piece.size } else { 0 })
+                    }
+                    None => (SymbolKind::Other, 0),
+                };
             let kind = if data { SymbolKind::Data } else { kind };
             // alloc: the writer's export table owns its names (model.rs `Export`), one per export
             out.push(Export { name: name.to_owned(), addr, size, kind });
@@ -1752,7 +2003,9 @@ impl<'a> Stage<'a> {
         let entry = match entry {
             Some(entry) => {
                 // alloc: error path
-                Some(image(entry).ok_or_else(|| error(None, format!("the entry point `{entry}` is not in the image")))?)
+                Some(image(entry).ok_or_else(|| {
+                    error(None, format!("the entry point `{entry}` is not in the image"))
+                })?)
             }
             None => None,
         };
@@ -1773,9 +2026,10 @@ impl<'a> Stage<'a> {
         let state = &self.new;
         let symbols: &Symbols = self.symbols;
         // alloc: once per stage that makes debug info: the Rust functions in list order
-        let functions: Vec<_> = par::filter_map(par::zip(&lists.functions.owners[..], &lists.functions.items[..]), |(owner, function)| {
-            Some((state.piece(*owner).and_then(PieceRef::function)?, function))
-        }); // alloc: as above
+        let functions: Vec<_> = par::filter_map(
+            par::zip(&lists.functions.owners[..], &lists.functions.items[..]),
+            |(owner, function)| Some((state.piece(*owner).and_then(PieceRef::function)?, function)),
+        ); // alloc: as above
         // alloc: as above, each function's line count, then where its rows start
         let counts: Vec<usize> = par::map(&functions, |(info, _)| state.lines(info).len()); // alloc: as above
         let mut starts: Vec<usize> = Vec::with_capacity(functions.len() + 1);
@@ -1787,18 +2041,22 @@ impl<'a> Stage<'a> {
         }
         // alloc: as above, a view per function
         let views: Vec<crate::dwarf::DebugFunction<'_>> =
-            par::map(par::enumerate(&functions), |(at, (info, function))| crate::dwarf::DebugFunction {
-                addr: function.addr,
-                size: function.size,
-                name: state.debug_name(info.id).map(|it| symbols.str(it)),
-                lines: starts[at] as u32..starts[at + 1] as u32,
+            par::map(par::enumerate(&functions), |(at, (info, function))| {
+                crate::dwarf::DebugFunction {
+                    addr: function.addr,
+                    size: function.size,
+                    name: state.debug_name(info.id).map(|it| symbols.str(it)),
+                    lines: starts[at] as u32..starts[at + 1] as u32,
+                }
             }); // alloc: as above
-        let rows: &mut [crate::dwarf::Row] =
-            self.arena.alloc_slice_fill_with(total, |_| crate::dwarf::Row { at: 0, file: 0, line: 0, column: 0 });
+        let rows: &mut [crate::dwarf::Row] = self.arena.alloc_slice_fill_with(total, |_| {
+            crate::dwarf::Row { at: 0, file: 0, line: 0, column: 0 }
+        });
         // Each task's files, (anchor, file in its table) and name, in the order it met them.
         type Met<'s> = Vec<((IdNo, u32), &'s str)>;
-        let met: Vec<Result<Met<'_>, LinkError>> =
-            par::map(par::enumerate(debug_chunks(&mut *rows, &starts)), |(chunk, out)| {
+        let met: Vec<Result<Met<'_>, LinkError>> = par::map(
+            par::enumerate(debug_chunks(&mut *rows, &starts)),
+            |(chunk, out)| {
                 let from = chunk * DEBUG_CHUNK;
                 // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
                 let mut met: Met<'_> = Vec::new();
@@ -1811,7 +2069,9 @@ impl<'a> Stage<'a> {
                         let (anchor_id, table) = match last {
                             Some((it, id, table)) if it == anchor => (id, table),
                             _ => {
-                                let found = symbols.find_id(anchor).and_then(|id| Some((id, state.span_table(id)?)));
+                                let found = symbols
+                                    .find_id(anchor)
+                                    .and_then(|id| Some((id, state.span_table(id)?)));
                                 let (id, table) = found.ok_or_else(|| {
                                     // alloc: error path
                                     error(Some(info.key), format!("a line in {anchor:?}, whose span table the link was not given"))
@@ -1822,19 +2082,28 @@ impl<'a> Stage<'a> {
                         };
                         let span = table.span(line.span.index).ok_or_else(|| {
                             // alloc: error path
-                            error(Some(info.key), format!("span {} of {anchor:?}, past its table", line.span.index))
+                            error(
+                                Some(info.key),
+                                format!("span {} of {anchor:?}, past its table", line.span.index),
+                            )
                         })?;
                         let next = met.len() as u32;
                         let file = *file_of.entry((anchor_id, span.file)).or_insert(next);
                         if file == next {
                             met.push(((anchor_id, span.file), table.file(span.file)));
                         }
-                        out[at] = crate::dwarf::Row { at: line.at, file, line: span.line, column: span.column };
+                        out[at] = crate::dwarf::Row {
+                            at: line.at,
+                            file,
+                            line: span.line,
+                            column: span.column,
+                        };
                         at += 1;
                     }
                 }
                 Ok(met)
-            }); // alloc: once per stage that makes debug info, a result per task
+            },
+        ); // alloc: once per stage that makes debug info, a result per task
         // alloc: once per stage that makes debug info, the files and each task's numbers for its own
         let mut files: Vec<&str> = Vec::new();
         let mut file_of: HashMap<(IdNo, u32), u32, Global> = HashMap::new_in(Global);
@@ -1864,7 +2133,8 @@ impl<'a> Stage<'a> {
             Arch::X86_64 | Arch::Aarch64 => 8,
         };
         // alloc: error path
-        crate::dwarf::sections(&views, rows, &files, size).map_err(|it| error(None, format!("debug info: {it}")))
+        crate::dwarf::sections(&views, rows, &files, size)
+            .map_err(|it| error(None, format!("debug info: {it}")))
     }
 
     /// What finds the address of a name the image defines, among `regions`: [`Placed::symbol`].
@@ -1944,8 +2214,12 @@ mod tests {
         let few: Vec<Fixup> = (0..10).map(|it| fixup(it * 8, Apply::Abs64)).collect();
         let cuts = |fixups: &[Fixup]| split(fixups).collect::<Vec<_>>();
         assert_eq!(cuts(&few), [(0, 0)]);
-        let many: Vec<Fixup> = (0..SPLIT as u64 * 2 + 5).map(|it| fixup(it * 8, Apply::Abs64)).collect();
-        assert_eq!(cuts(&many), [(0, 0), (SPLIT as u64 * 8, SPLIT as u32), (SPLIT as u64 * 16, 2 * SPLIT as u32)]);
+        let many: Vec<Fixup> =
+            (0..SPLIT as u64 * 2 + 5).map(|it| fixup(it * 8, Apply::Abs64)).collect();
+        assert_eq!(
+            cuts(&many),
+            [(0, 0), (SPLIT as u64 * 8, SPLIT as u32), (SPLIT as u64 * 16, 2 * SPLIT as u32)]
+        );
         let mut overlapping = many.clone();
         overlapping[100].at = overlapping[99].at + 4;
         assert_eq!(cuts(&overlapping), [(0, 0)]);
@@ -1960,16 +2234,22 @@ mod tests {
     /// A splice against rebuilding the list from what is left and what is new.
     #[test]
     fn a_spliced_list_is_the_list_built_again() {
-        let old: Vec<(PieceId, u64)> = (0..200u32).map(|id| (id, u64::from(id % 50) * 64 + u64::from(id / 50))).collect();
+        let old: Vec<(PieceId, u64)> =
+            (0..200u32).map(|id| (id, u64::from(id % 50) * 64 + u64::from(id / 50))).collect();
         let list = Owned::build(old.clone());
         assert!(list.items.windows(2).all(|it| it[0] <= it[1]));
         let mut drop = IdSet::default();
         drop.extend((0..200).filter(|it| it % 7 == 0));
-        let new: Vec<(PieceId, u64)> = (0..200u32).filter(|it| it % 7 == 0).map(|id| (id, u64::from(id) * 13 % 3000)).chain([(500, 0), (501, 9999)]).collect();
+        let new: Vec<(PieceId, u64)> = (0..200u32)
+            .filter(|it| it % 7 == 0)
+            .map(|id| (id, u64::from(id) * 13 % 3000))
+            .chain([(500, 0), (501, 9999)])
+            .collect();
         let frame = crate::arena::stage_frame().unwrap();
         let mut runs = Vec::new_in(&frame);
         let spliced = list.splice(&drop, new.clone(), &mut runs);
-        let mut want: Vec<(PieceId, u64)> = old.into_iter().filter(|it| !drop.contains(it.0)).chain(new).collect();
+        let mut want: Vec<(PieceId, u64)> =
+            old.into_iter().filter(|it| !drop.contains(it.0)).chain(new).collect();
         want.sort_by_key(|(id, at)| (*at, *id));
         assert_eq!(*spliced.items, want.iter().map(|it| it.1).collect::<Vec<_>>());
         assert_eq!(*spliced.owners, want.iter().map(|it| it.0).collect::<Vec<_>>());
@@ -1989,7 +2269,9 @@ mod tests {
         let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let mut next = move |below: u64| rng.below(below);
         let frame = crate::arena::stage_frame().unwrap();
-        for (round, pieces) in [0u32, 1, 3, 40, 500, 9_000, 30_000].into_iter().cycle().take(42).enumerate() {
+        for (round, pieces) in
+            [0u32, 1, 3, 40, 500, 9_000, 30_000].into_iter().cycle().take(42).enumerate()
+        {
             let mut old: Vec<(PieceId, u64)> = Vec::new();
             for id in 0..pieces {
                 let base = next(u64::from(pieces) * 64);
@@ -2004,7 +2286,10 @@ mod tests {
             let mut new: Vec<(PieceId, u64)> = Vec::new();
             for (id, at) in &old {
                 if drop.contains(*id) && next(3) > 0 {
-                    new.push((*id, if next(2) == 0 { *at } else { next(u64::from(pieces) * 64 + 64) }));
+                    new.push((
+                        *id,
+                        if next(2) == 0 { *at } else { next(u64::from(pieces) * 64 + 64) },
+                    ));
                 }
             }
             for id in pieces..pieces + next(4) as u32 {
@@ -2042,7 +2327,10 @@ mod tests {
         assert_eq!(column.value(syms[5]), Err(u32::MAX));
         assert_eq!(column.value(Symbols::join(40, 1 << 20)), Err(u32::MAX));
         assert!(column.removed(0), "an unwind record's target in a removed piece is zeroed");
-        assert!(!column.removed(u32::MAX), "any other unresolved target of an unwind record is an error");
+        assert!(
+            !column.removed(u32::MAX),
+            "any other unresolved target of an unwind record is an error"
+        );
         assert_eq!(column.cells(syms[2]).plt, 0x2000);
         assert_eq!(column.cells(syms[2]).got, [NONE; 4]);
         assert_eq!(column.cells(syms[0]).got, [NONE, 0x3000, NONE, NONE]);

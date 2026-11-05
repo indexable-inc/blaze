@@ -29,7 +29,7 @@ use syntax::{
 use super::{expr_span, from_expansion};
 use crate::{
     lints::bodies::{
-        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, lint_set,
+        BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, lint_set,
         types::util::{Solver, method_fn, path_value},
     },
     lower::{Found, Phase},
@@ -76,7 +76,9 @@ impl LatePass for StaticMutRefs {
                 let Some(self_ty) = inputs.first() else { return };
                 let TyKind::Ref(_, _, mutability) = self_ty.kind() else { return };
                 let mutable = mutability == rustc_type_ir::Mutability::Mut;
-                let (Some(at), Some(outer)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
+                let (Some(at), Some(outer)) = (b.expr_node(expr), expr_span(b, expr)) else {
+                    return;
+                };
                 let span = match from_expansion(&outer) {
                     true => match expr_span(b, receiver) {
                         Some(it) => it,
@@ -90,9 +92,18 @@ impl LatePass for StaticMutRefs {
         }
     }
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         let Expr::Block { statements, .. } = b.store().expr(block) else { return };
-        let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index) else { return };
+        let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index)
+        else {
+            return;
+        };
         let Pat::Bind { id, .. } = b.store().pat(pat) else { return };
         let mutable = match b.store()[id].mode {
             BindingAnnotation::Ref => false,
@@ -112,7 +123,11 @@ fn static_mut(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> Option<StaticId> {
     }
     let Expr::Path(_) = b.store().expr(expr) else { return None };
     match path_value(b, expr)? {
-        ValueNs::StaticId(it) if StaticSignature::of(b.db(), it).flags.contains(StaticFlags::MUTABLE) => Some(it),
+        ValueNs::StaticId(it)
+            if StaticSignature::of(b.db(), it).flags.contains(StaticFlags::MUTABLE) =>
+        {
+            Some(it)
+        }
         _ => None,
     }
 }
@@ -188,7 +203,12 @@ fn emit(
 /// rustc's `interior_mutability_suggestion`: whether to say to use a type with interior
 /// mutability, and where the `mut` of the static is when its type already has it and the
 /// reference is shared.
-fn interior_mutability(b: &BodyCx<'_, '_, '_>, def: StaticId, mutable: bool, suggest_addr_of: bool) -> (bool, Option<Span>) {
+fn interior_mutability(
+    b: &BodyCx<'_, '_, '_>,
+    def: StaticId,
+    mutable: bool,
+    suggest_addr_of: bool,
+) -> (bool, Option<Span>) {
     let ty = b.db().type_for_static(def).skip_binder();
     if Solver::of(b).is_freeze(ty) {
         return (!suggest_addr_of, None);
@@ -213,7 +233,9 @@ fn mutability_span(b: &BodyCx<'_, '_, '_>, def: StaticId) -> Option<Span> {
     let source = def.lookup(db).source_view(db);
     let file = source.file_id.file_id()?.file_id(db);
     let node = source.value.syntax();
-    let first = node.children_with_tokens().find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR)?;
+    let first = node
+        .children_with_tokens()
+        .find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR)?;
     let lo = match first.kind() {
         SyntaxKind::VISIBILITY => first.text_range().end(),
         _ => first.text_range().start(),
@@ -223,7 +245,8 @@ fn mutability_span(b: &BodyCx<'_, '_, '_>, def: StaticId) -> Option<Span> {
     let (_, static_end) = find_word(snippet, "static", 0)?;
     let (mut_start, mut_end) = find_word(snippet, "mut", static_end)?;
     let mut_end = extend_trailing_space(snippet, mut_end);
-    let range = TextRange::new(lo + TextSize::from(mut_start as u32), lo + TextSize::from(mut_end as u32));
+    let range =
+        TextRange::new(lo + TextSize::from(mut_start as u32), lo + TextSize::from(mut_end as u32));
     Some(b.cx.span_in_file(file, range))
 }
 

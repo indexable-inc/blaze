@@ -75,6 +75,16 @@ pub struct Toolchain {
     pub relocation: Relocation,
 }
 
+impl Toolchain {
+    /// A feature of the target's baseline CPU that this toolchain's CPU and features lack (its
+    /// `-name`), or `None` when it has them all. The stencils are the baseline CPU's code: a
+    /// toolchain that lacks one of its features can't run them, and its code is LLVM's
+    /// (`plan::Policy::choose`).
+    pub fn lacks_baseline(&self) -> Option<&str> {
+        self.features.iter().find_map(|it| it.strip_prefix('-'))
+    }
+}
+
 /// rustc's `-Zsanitizer` (address, thread, memory), `-Zsanitizer-recover`,
 /// `-Zsanitizer-memory-track-origins`, and SanitizerCoverage as rustc gets it
 /// (`-Cpasses=sancov-module` with `-Cllvm-args=-sanitizer-coverage-*`): one for the whole

@@ -115,7 +115,14 @@ already knows its units.
 The daemon keeps the ledger: `granted`, the sum of the predictions of the units running, and
 `held`, what its tree holds now. A unit is admitted when `max(granted, held) + prediction <=
 budget`. Units that wait start largest first among those that fit, and no more CPU-bound
-units than cores run at once. A unit whose prediction is the whole budget runs alone. Workers
+units than cores run at once. A unit whose prediction fits the budget at all starts, alone,
+once no unit granted memory runs, whatever the process holds besides: waiting could never make
+room for it, so it is never refused for that. While a unit waits for memory the process holds
+besides its grants (`Plane::short`), the daemon lets go of the kept front ends of other
+checkouts and asks each build's front end for a release, before the unit starts. A unit's phase
+with no record of its own is predicted from its size, its source's bytes times what its kind
+held per byte lately, never the largest peak of its kind (memadmit: one crate's 15.78 GB
+codegen was every codegen's prediction). Workers
 ask for a grant on the socket they already have with the daemon (one CBOR message each way,
 rule no-mcp) before a program's build, a link or a test program starts, and give it back when
 it ends with the peak they measured.

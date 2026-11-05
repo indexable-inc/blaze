@@ -155,9 +155,7 @@ fn old_sort<'t>(
             (Branch::Int(value), true)
         }
         (Ask::Int(_), &Ask::Range(lo, hi)) => {
-            let named = |it: &(Branch, Vec<Candidate<'t>, &'t Frame>)| {
-                matches!(it.0, Branch::Int(value) if lo <= value && value <= hi)
-            };
+            let named = |it: &(Branch, Vec<Candidate<'t>, &'t Frame>)| matches!(it.0, Branch::Int(value) if lo <= value && value <= hi);
             if branches.iter().any(named) {
                 return None;
             }
@@ -275,7 +273,9 @@ impl<'t> Gen<'t> {
                 }
             }
             Kind::Bool => Ask::Bool(rng.chance(0.5)),
-            Kind::Equal => Ask::Equal(&self.literals[rng.below(self.literals.len() as u64) as usize], false),
+            Kind::Equal => {
+                Ask::Equal(&self.literals[rng.below(self.literals.len() as u64) as usize], false)
+            }
             Kind::Slice => {
                 let len = rng.below(3);
                 let mut inside = Vec::new_in(self.frame);
@@ -313,14 +313,22 @@ fn both<'t>(frame: &'t Frame, arms: Vec<Candidate<'t>, &'t Frame>) -> (Vec<bool>
     let count = arms.len();
     let mut old_arms = Vec::with_capacity_in(count, frame);
     old_arms.extend(arms.iter().cloned());
-    let mut old =
-        OldTree { frame, thens: Vec::new_in(frame), reached: framed::bits_in(count, frame), escaped: false };
+    let mut old = OldTree {
+        frame,
+        thens: Vec::new_in(frame),
+        reached: framed::bits_in(count, frame),
+        escaped: false,
+    };
     let old_fell = old.run(true, old_arms);
 
     let mut new_arms = arms;
     new_arms.reverse();
-    let mut new =
-        Tree { frame, thens: Vec::new_in(frame), reached: framed::bits_in(count, frame), escaped: false };
+    let mut new = Tree {
+        frame,
+        thens: Vec::new_in(frame),
+        reached: framed::bits_in(count, frame),
+        escaped: false,
+    };
     let new_fell = new.run(true, new_arms);
 
     let (old_reached, new_reached) = (reached(&old.reached, count), reached(&new.reached, count));
@@ -371,7 +379,12 @@ fn many_values_and_ranges_go_through_the_index() {
             pairs.push(Pair { place, ask, inside: Vec::new_in(frame) });
             arms.push(Candidate { arm: arms.len(), pairs, guarded: value % 7 == 0, then: None });
         }
-        arms.push(Candidate { arm: arms.len(), pairs: Vec::new_in(frame), guarded: false, then: None });
+        arms.push(Candidate {
+            arm: arms.len(),
+            pairs: Vec::new_in(frame),
+            guarded: false,
+            then: None,
+        });
         let (reached, _) = both(frame, arms);
         assert!(reached[0]);
     });
@@ -388,7 +401,11 @@ fn constants_one_test_each() {
             let mut pairs = Vec::with_capacity_in(1, frame);
             let mut place = Vec::with_capacity_in(1, frame);
             place.push(Step::Field(0));
-            pairs.push(Pair { place, ask: Ask::Equal(&literals[arm % 3], false), inside: Vec::new_in(frame) });
+            pairs.push(Pair {
+                place,
+                ask: Ask::Equal(&literals[arm % 3], false),
+                inside: Vec::new_in(frame),
+            });
             arms.push(Candidate { arm, pairs, guarded: false, then: None });
         }
         arms.push(Candidate { arm: 2000, pairs: Vec::new_in(frame), guarded: false, then: None });
@@ -405,7 +422,9 @@ fn failed_ranges_merge() {
             branches.fail_range(lo, hi);
         }
         assert_eq!(branches.failed[..], [(0, 1), (10, 40), (50, 50)]);
-        for (value, covered) in [(0, true), (2, false), (10, true), (40, true), (41, false), (50, true), (51, false)] {
+        for (value, covered) in
+            [(0, true), (2, false), (10, true), (40, true), (41, false), (50, true), (51, false)]
+        {
             assert_eq!(branches.failed_covers(value), covered, "{value}");
         }
     });

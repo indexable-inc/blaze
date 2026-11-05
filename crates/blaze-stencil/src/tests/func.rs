@@ -42,11 +42,11 @@ mod traps;
 mod unwind;
 
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod world;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod fuel;
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod long;
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod world;
 
 /// The user-name namespaces of `exec`'s linker: units, data objects, host functions.
 pub const FUNCS: u32 = 0;
@@ -91,7 +91,12 @@ impl Mk {
         self.sig_in(self.cc(), params, rets)
     }
 
-    pub fn sig_in(&self, cc: CallConv, params: &[ir::AbiParam], rets: &[ir::AbiParam]) -> ir::Signature {
+    pub fn sig_in(
+        &self,
+        cc: CallConv,
+        params: &[ir::AbiParam],
+        rets: &[ir::AbiParam],
+    ) -> ir::Signature {
         let mut sig = ir::Signature::new(cc);
         sig.params.extend_from_slice(params);
         sig.returns.extend_from_slice(rets);
@@ -195,7 +200,11 @@ pub fn widen(b: &mut FunctionBuilder<'_>, x: ir::Value, signed: bool) -> ir::Val
 
 /// A stack slot of `size` bytes aligned to `1 << align_shift`.
 pub fn slot(b: &mut FunctionBuilder<'_>, size: u32, align_shift: u8) -> ir::StackSlot {
-    b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size, align_shift))
+    b.create_sized_stack_slot(ir::StackSlotData::new(
+        ir::StackSlotKind::ExplicitSlot,
+        size,
+        align_shift,
+    ))
 }
 
 /// Functions compiled and called together: `funcs[i]` is `u0:i`, `funcs[0]` is called.

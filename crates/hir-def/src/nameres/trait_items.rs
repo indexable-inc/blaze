@@ -28,7 +28,10 @@ use crate::{
     visibility::Visibility,
 };
 
-#[expect(clippy::disallowed_types, reason = "the process's one trait item import feature symbol: the constant is interned once")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one trait item import feature symbol: the constant is interned once"
+)]
 static FEATURE: std::sync::LazyLock<Symbol> =
     std::sync::LazyLock::new(|| Symbol::intern("import_trait_associated_functions"));
 
@@ -74,7 +77,10 @@ impl DefMap {
                 AttrsOrCfg::Enabled { attrs } => attrs,
                 AttrsOrCfg::CfgDisabled(_) => continue,
             };
-            if attrs.as_ref().iter().any(|(_, attr)| !self.is_builtin_or_registered_attr(&attr.path))
+            if attrs
+                .as_ref()
+                .iter()
+                .any(|(_, attr)| !self.is_builtin_or_registered_attr(&attr.path))
             {
                 return Err(ItemsFromMacros);
             }

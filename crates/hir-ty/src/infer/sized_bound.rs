@@ -16,8 +16,8 @@ use crate::{
     db::HirDatabase,
     infer::InferenceContext,
     method_resolution::{
-        CandidateId, CandidateSource, MethodError, MethodResolutionContext, Mode, Pick,
-        TraitSet, TraitsInScope, in_crate_trait_value_items, loaded_crates,
+        CandidateId, CandidateSource, MethodError, MethodResolutionContext, Mode, Pick, TraitSet,
+        TraitsInScope, in_crate_trait_value_items, loaded_crates,
     },
     next_solver::{AnyImplId, Ty, TyKind},
 };

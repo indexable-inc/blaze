@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut compiler = Compiler::default();
             let pack: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
             let start = std::time::Instant::now();
-            compiler.set_pack(pack, blaze_wasm::macros::expand)?;
+            compiler.set_pack(pack)?;
             eprintln!("load: {:.1?}", start.elapsed());
             let (crates, resolve, infer) = compiler.analyze();
             eprintln!("{crates} crates: names {resolve:.1?}, types of the program {infer:.1?}");

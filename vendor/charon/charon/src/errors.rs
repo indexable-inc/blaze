@@ -55,8 +55,7 @@ macro_rules! error_assert {
 pub use error_assert;
 
 /// Common error used during the translation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
     pub span: Span,
     pub msg: String,
@@ -67,10 +66,7 @@ impl Error {
         Self { span, msg }
     }
     pub fn dummy() -> Self {
-        Self {
-            span: Span::dummy(),
-            msg: String::new(),
-        }
+        Self { span: Span::dummy(), msg: String::new() }
     }
 
     pub fn render(&self, krate: &TranslatedCrate, level: Level) -> String {
@@ -113,10 +109,7 @@ impl<T, E: ToString> ErrorContext<T> for Result<T, E> {
 
 impl<T: ToString> From<T> for Error {
     fn from(err: T) -> Self {
-        Self {
-            span: Span::dummy(),
-            msg: err.to_string(),
-        }
+        Self { span: Span::dummy(), msg: err.to_string() }
     }
 }
 
@@ -124,9 +117,7 @@ impl<T: ToString> From<T> for Error {
 pub fn display_unspanned_error(level: Level, msg: &str) {
     use annotate_snippets::*;
     let title = level.primary_title(msg);
-    let message = Renderer::styled()
-        .render(&[Group::with_title(title)])
-        .to_string();
+    let message = Renderer::styled().render(&[Group::with_title(title)]).to_string();
     anstream::eprintln!("{message}\n");
 }
 
@@ -140,11 +131,9 @@ pub fn display_spanned_error(krate: &TranslatedCrate, span: Span, title: &str, l
     if let Some(file) = krate.files.get(span.file_id) {
         origin = file.name.to_string();
         if let Some(source) = &file.contents {
-            let snippet = Snippet::source(source).path(&origin).annotation(
-                AnnotationKind::Primary
-                    .span(span.to_byte_range(source))
-                    .label(label),
-            );
+            let snippet = Snippet::source(source)
+                .path(&origin)
+                .annotation(AnnotationKind::Primary.span(span.to_byte_range(source)).label(label));
             group = group.element(snippet);
         } else {
             let origin = Origin::path(origin)
@@ -185,9 +174,7 @@ struct DepGraph {
 
 impl DepGraph {
     fn new() -> Self {
-        DepGraph {
-            edges: Default::default(),
-        }
+        DepGraph { edges: Default::default() }
     }
 
     fn insert_edge(&mut self, from: DepNode, to: DepNode) {
@@ -268,11 +255,8 @@ impl ErrorCtx {
         msg: &str,
         level: Level,
     ) -> Error {
-        let level = if level == Level::WARNING && self.error_on_warnings {
-            Level::ERROR
-        } else {
-            level
-        };
+        let level =
+            if level == Level::WARNING && self.error_on_warnings { Level::ERROR } else { level };
         let err = self.display_error(krate, span, level, msg.to_string());
         self.error_count += 1;
         if let Some(id) = self.def_id
@@ -346,15 +330,13 @@ impl ErrorCtx {
         by_file.sort_by_key(|(file_id, ..)| *file_id);
 
         let level = Level::NOTE;
-        let snippets =
-            by_file.iter().map(|(_, origin, source, spans)| {
-                Snippet::source(*source)
-                    .path(origin)
-                    .fold(true)
-                    .annotations(spans.iter().map(|span| {
-                        AnnotationKind::Context.span(span.data().to_byte_range(source))
-                    }))
-            });
+        let snippets = by_file.iter().map(|(_, origin, source, spans)| {
+            Snippet::source(*source).path(origin).fold(true).annotations(
+                spans
+                    .iter()
+                    .map(|span| AnnotationKind::Context.span(span.data().to_byte_range(source))),
+            )
+        });
 
         let msg = format!(
             "the error occurred when translating `{}`, \

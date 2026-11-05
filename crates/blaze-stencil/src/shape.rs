@@ -723,7 +723,13 @@ impl Op {
         match isa {
             Isa::X86_64 => !matches!(
                 self,
-                Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma | Op::Swizzle | Op::Shuffle
+                Op::Ceil
+                    | Op::Floor
+                    | Op::Trunc
+                    | Op::Nearest
+                    | Op::Fma
+                    | Op::Swizzle
+                    | Op::Shuffle
             ),
             Isa::Aarch64 => !matches!(self, Op::X86Cvtt2dq),
         }
@@ -980,8 +986,13 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     unary(Op::UwidenLow, "uwiden_low", WIDENED),
     unary(Op::UwidenHigh, "uwiden_high", WIDENED),
     binary(Op::IaddPairwise, "iadd_pairwise", NARROWED),
-    conversion(Op::ScalarToVector, "scalar_to_vector", TySet::VECTORS, TySet::INTS.union(TySet::FLOATS))
-        .imm(0b1),
+    conversion(
+        Op::ScalarToVector,
+        "scalar_to_vector",
+        TySet::VECTORS,
+        TySet::INTS.union(TySet::FLOATS),
+    )
+    .imm(0b1),
     unary(Op::Splat, "splat", TySet::VECTORS).imm(0b1),
     binary(Op::Swizzle, "swizzle", ty(Ty::I8x16)).acc(0),
     binary(Op::Shuffle, "shuffle", ty(Ty::I8x16)).acc(0),
@@ -1139,7 +1150,10 @@ impl Shape {
             }
             Op::StoreConfined if n > 0 => Ty::I64,
             Op::AtomicRmw | Op::AtomicCas if n == 0 => Ty::I64,
-            Op::UaddOverflowCin | Op::SaddOverflowCin | Op::UsubOverflowBin | Op::SsubOverflowBin
+            Op::UaddOverflowCin
+            | Op::SaddOverflowCin
+            | Op::UsubOverflowBin
+            | Op::SsubOverflowBin
                 if n == 2 =>
             {
                 Ty::I8
@@ -1247,9 +1261,10 @@ impl Shape {
         let (ty, x64) = (self.ty, isa == Isa::X86_64);
         match self.op {
             // New in 0.137; neither backend has a rule yet.
-            Op::UaddOverflowCin | Op::SaddOverflowCin | Op::UsubOverflowBin | Op::SsubOverflowBin => {
-                false
-            }
+            Op::UaddOverflowCin
+            | Op::SaddOverflowCin
+            | Op::UsubOverflowBin
+            | Op::SsubOverflowBin => false,
             // x64 has `pavgb`/`pavgw` and the saturating byte and word adds and subtracts only.
             Op::AvgRound | Op::UaddSat | Op::SaddSat | Op::UsubSat | Op::SsubSat => {
                 !x64 || matches!(ty, Ty::I8x16 | Ty::I16x8)
@@ -1262,7 +1277,9 @@ impl Shape {
             Op::Uunarrow => !x64,
             // x64 converts a float to 32 or 64 bits only, and a vector to `i32x4` only.
             Op::FcvtToUint | Op::FcvtToSint => !(x64 && matches!(ty, Ty::I8 | Ty::I16)),
-            Op::FcvtToUintSat | Op::FcvtToSintSat => !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2)),
+            Op::FcvtToUintSat | Op::FcvtToSintSat => {
+                !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2))
+            }
             // Of vectors, x64 has no `one` or `ueq`, and AArch64 neither those nor the
             // unordered orderings.
             Op::Fcmp if ty.is_vector() => match FloatCc::from_u8(self.aux) {
@@ -1289,7 +1306,11 @@ impl Shape {
     /// types, at most one source is an accumulator, and it is not pruned.
     pub fn exists_on(self, isa: Isa) -> bool {
         let info = self.op.info();
-        if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() || !self.lowered_on(isa) {
+        if !self.op.on(isa)
+            || !info.tys.contains(self.ty)
+            || !self.aux_ok()
+            || !self.lowered_on(isa)
+        {
             return false;
         }
         if let Some((_, disp)) = self.confined()
@@ -1478,7 +1499,9 @@ mod tests {
                 assert!(shape.exists_on(isa), "{shape}");
                 listed.insert(shape.key());
             });
-            walk(|shape| assert_eq!(shape.exists_on(isa), listed.contains(&shape.key()), "{shape}"));
+            walk(|shape| {
+                assert_eq!(shape.exists_on(isa), listed.contains(&shape.key()), "{shape}")
+            });
         }
     }
 
@@ -1523,7 +1546,13 @@ mod tests {
         each_on(Isa::X86_64, |shape| {
             assert!(!matches!(
                 shape.op,
-                Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma | Op::Swizzle | Op::Shuffle
+                Op::Ceil
+                    | Op::Floor
+                    | Op::Trunc
+                    | Op::Nearest
+                    | Op::Fma
+                    | Op::Swizzle
+                    | Op::Shuffle
             ));
         });
         each_on(Isa::Aarch64, |shape| assert!(!shape.op.info().name.starts_with("x86_")));

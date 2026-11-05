@@ -3,8 +3,9 @@
 //! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
 //! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
-//! as rustup lays out a toolchain, its records and channel manifest included, so that what
-//! reads a sysroot reads this one unchanged.
+//! (the machine's, whatever `BLAZE_HOME` says: [`toolchains`]) as rustup lays out a toolchain,
+//! its records and channel manifest included, so that what reads a sysroot reads this one
+//! unchanged.
 //!
 //! It is a stopgap: blaze still runs cargo and rustc for the first build and the proc macros
 //! (docs/no-rustc.md). This gives them a home that no project's pin and no `PATH` changes; it
@@ -18,7 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_sha256::Sha256;
 use tokio::sync::mpsc;
 
 use blaze_registry::http::HyperHttp;
@@ -128,9 +128,10 @@ impl Release {
         self.components.iter().map(|it| it.pin.bytes).sum::<u64>() + self.manifest.bytes
     }
 
-    /// Where blaze keeps this release.
+    /// Where blaze keeps this release: under this machine's [`toolchains`], whatever
+    /// `BLAZE_HOME` says.
     pub fn dir(&self) -> Option<PathBuf> {
-        Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
+        Some(toolchains()?.join(format!("{}-{}", self.version, self.host)))
     }
 }
 
@@ -164,13 +165,14 @@ pub fn host() -> Option<&'static str> {
     })
 }
 
-/// blaze's own directory: `BLAZE_HOME`, else `.blaze` in the user's home.
-pub fn home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(PathBuf::from(home).join(".blaze"))
+/// Where this machine keeps blaze's toolchains: `.blaze/toolchains` in the user's home, for
+/// every `BLAZE_HOME`. A release is its pinned bytes, each file checked against its sha256 as
+/// it is downloaded, so every home of the machine reads the one copy: `BLAZE_HOME` moves a
+/// daemon's settings and state, never what it builds with. A home of its own (a harness's, a
+/// CI job's, a second daemon's) neither downloads the release again nor fails for not having
+/// it. [`fetch`]'s lock keeps two processes from laying it out at once.
+pub fn toolchains() -> Option<PathBuf> {
+    Some(blaze_manifest::user_config::user_home()?.join(".blaze").join("toolchains"))
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one
@@ -234,9 +236,7 @@ fn fetch_from(
         release.megabytes()
     );
     let start = Instant::now();
-    // The client has no flight recorder: the download is its own step in the client's part of
-    // a `BLAZE_PROFILE` profile and the table it prints, and a span wherever spans are recorded.
-    let step = format!("toolchain download {} ({} bytes)", release.version, release.bytes()); // alloc: once per download
+    // A span in the client's flight recorder, which the client's rows take to the history.
     let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));
     let staging = parent.join(format!(".{name}.unpacking"));
@@ -252,7 +252,6 @@ fn fetch_from(
         remove_dir(&downloads)?;
         anyhow::Ok(())
     })();
-    blaze_profile::note(&step, blaze_profile::CLIENT, start);
     if let Err(e) = fetched {
         _ = remove_dir(&staging);
         return Err(match e.downcast_ref::<NotPublished>() {
@@ -353,7 +352,8 @@ impl Source {
         let missing = || anyhow::anyhow!("{file} is not there");
         match self {
             Source::Web { http, base } => {
-                let bytes = super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
+                let bytes =
+                    super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
                 Ok(Body::Web { bytes, at: 0 })
             }
             Source::Dir(dir) => {
@@ -372,7 +372,10 @@ impl Source {
 /// What is read of a file, given on in pieces of [`PIECE`] bytes.
 enum Body {
     /// The bytes the server sent, of which the first `at` are given.
-    Web { bytes: Vec<u8>, at: usize },
+    Web {
+        bytes: Vec<u8>,
+        at: usize,
+    },
     File(File),
 }
 
@@ -484,8 +487,12 @@ async fn download(
         Some(to) => to.send(piece).await.map_err(|_| anyhow::Error::new(Unpacking)),
         None => Ok(()),
     };
+    // alloc: once a file
+    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256))
+        .map_err(anyhow::Error::new)?;
     let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
-    let mut hasher = Sha256::new();
+    // The pin's algorithm and BLAKE3 in one pass, as blaze-fetch checks every download.
+    let mut hasher = blaze_fetch::Hashing::new(pinned.algo());
     let mut have = written.metadata()?.len();
     if have > pin.bytes {
         written.set_len(0)?;
@@ -524,16 +531,18 @@ async fn download(
             Ok(()) if tries + 1 == TRIES => {
                 // alloc: error path, the last failure, as below.
                 let gave_up = super::GaveUp { file: file.to_owned(), tries: TRIES };
-                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes).context(gave_up));
+                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes)
+                    .context(gave_up));
             }
             // alloc: error path, the last failure.
-            Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
+            Err(e) if tries + 1 == TRIES => {
+                return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
+            }
             _ => tries += 1,
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;
     }
-    let got = crate::content::hex(&hasher.finish());
-    if got != pin.sha256 {
+    if hasher.finish().digest != pinned {
         drop(written);
         _ = std::fs::remove_file(part);
         return Err(NotPublished { file: file.to_owned(), version: "" }.into());
@@ -758,7 +767,7 @@ mod tests {
         let ours = Release::read(PINS, "x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(
             ours.version,
-            super::super::OURS.trim(),
+            blaze_units::lock::toolchain(),
             "toolchain_pins.py '{{\"write\": true}}'"
         );
         assert_eq!(ours.channel, "nightly");

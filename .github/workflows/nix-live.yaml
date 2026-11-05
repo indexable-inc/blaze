@@ -45,16 +45,14 @@ env:
 jobs:
   unit-graphs:
     name: nix unit graphs are current
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - uses: ./.github/actions/nix
         with:
-          use-flakehub: false
-          use-gha-cache: true
+          cache: true
       - run: python3 tools/nix/unit_graph.py
       - name: tools/nix/units is what unit_graph.py writes
         run: |
@@ -62,17 +60,17 @@ jobs:
           git diff --exit-code -- tools/nix/units || { echo "::error::tools/nix/units is stale: run tools/nix/unit_graph.py and commit the result"; exit 1; }
 
   nix:
-    name: nix build (x86_64-linux)
+    # aarch64-linux, on ix: TODO(x86-64) the x86_64-linux build comes back once ix has x86-64
+    # capacity (docs/harness.md "ix runners").
+    name: nix build (aarch64-linux)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - uses: ./.github/actions/nix
         with:
-          use-flakehub: false
-          use-gha-cache: true
+          cache: true
       - name: flake evaluates
         run: nix flake check --print-build-logs
       # The daemon as a package, the demo as a package, and the per-unit builds both are made of.
@@ -112,7 +110,7 @@ jobs:
   demo:
     name: demo/life and blaze-live (linux)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live-demo]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -139,12 +137,16 @@ jobs:
           # timeout's own 124: the window was still up when it was stopped.
           test "$status" = 124 || { echo "::error::the window exited ($status) before it was stopped"; exit 1; }
           ! grep -E -i "panicked|Err\(" life.log
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   live-edits:
     name: live edits (macOS arm64)
     if: github.event_name != 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 60
+    # blaze-engine's build by blaze, from the tests job's store: longer than an hour when cold.
+    timeout-minutes: 240
     # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,
     # which has been the least steady thing in the repository. Whatever it says is still shown.
     continue-on-error: true
@@ -159,12 +161,13 @@ jobs:
           job: tests
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: nix develop --command blaze test --release -p blaze-live --locked
-      # The blaze that edits the program: cargo's, with no cache, since the blaze that blaze
-      # builds runs about ten times slower until it inlines one function into another
-      # (https://github.com/indexable-inc/blaze/issues/899).
-      - run: cargo build --release -p blaze-engine
+      # The blaze that edits the program: blaze's build of it (AGENTS.md rule
+      # blaze-builds-blaze), the one users get; then the stage 0's daemon ends before it starts.
+      - run: nix develop --command blaze build --release -p blaze-engine --locked
+      - run: blaze stop
       - name: edit a running program
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
+        run: |
+          python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\"}"
       - name: crash reports
         if: failure()
         run: |
@@ -175,3 +178,6 @@ jobs:
       - name: the demo builds on macOS
         run: cargo build --locked
         working-directory: demo/life
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log

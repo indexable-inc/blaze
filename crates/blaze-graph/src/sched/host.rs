@@ -34,11 +34,14 @@ use std::{
 
 use super::{
     CounterId, Cycle, JobId, Suspend, Wait,
-    domain::{Domain, Guard, Scheduler, counter_cell, key_cell, live_job_cell, lock, lock_joined, roots, wait_cell},
+    domain::{
+        Domain, Guard, Scheduler, counter_cell, key_cell, live_job_cell, lock, lock_joined, roots,
+        wait_cell,
+    },
     fiber::{
-        Answer, Given, HERE, Here, IdleReason, OwnIo, Panic, SwitchEvent, Taken, UNREGISTERED, carry_stack_limit,
-        check_no_wait, clear, come_on, dispatch, go_off, go_off_ended, idled, observing, switched, switched_known,
-        switched_unregistered,
+        Answer, Given, HERE, Here, IdleReason, OwnIo, Panic, SwitchEvent, Taken, UNREGISTERED,
+        carry_stack_limit, check_no_wait, clear, come_on, dispatch, go_off, go_off_ended, idled,
+        observing, switched, switched_known, switched_unregistered,
     },
     ids,
     stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
@@ -163,10 +166,13 @@ impl Driven {
     ///
     /// Where no fiber's stack can be had, naming its size.
     pub(crate) fn new(work: impl FnOnce(&Turns<'_>) + 'static) -> Driven {
-        let stack = Stack::new(FIBER_STACK)
-            .unwrap_or_else(|why| panic!("a driven pool worker's fiber stack of {FIBER_STACK} bytes: {why}"));
+        let stack = Stack::new(FIBER_STACK).unwrap_or_else(|why| {
+            panic!("a driven pool worker's fiber stack of {FIBER_STACK} bytes: {why}")
+        });
         let number = super::fiber::next_fiber();
-        let fiber = Stackful::new(stack, number, move |yielder: &Yielder<(), Turn>, ()| work(&Turns(yielder)));
+        let fiber = Stackful::new(stack, number, move |yielder: &Yielder<(), Turn>, ()| {
+            work(&Turns(yielder))
+        });
         Driven { fiber, number, ended: false }
     }
 
@@ -176,7 +182,11 @@ impl Driven {
     ///
     /// For a worker whose loop returned, naming its fiber.
     pub(crate) fn turn(&mut self) -> Turn {
-        assert!(!self.ended, "driven worker on fiber {} was given a turn after its loop returned", self.number);
+        assert!(
+            !self.ended,
+            "driven worker on fiber {} was given a turn after its loop returned",
+            self.number
+        );
         match self.fiber.resume(()) {
             Resumed::Yield(turn) => turn,
             Resumed::Return => {
@@ -196,7 +206,12 @@ impl Driven {
 /// `wake` is called under the scheduler's lock: it must not call into the scheduler.
 /// `idle(ctx)` says, under the scheduler's lock, whether every worker of the pool sleeps
 /// with nothing queued ([`check_stall`]).
-pub(crate) fn join_pool(sched: &Scheduler, wake: fn(usize, usize), idle: fn(usize) -> bool, ctx: usize) -> u32 {
+pub(crate) fn join_pool(
+    sched: &Scheduler,
+    wake: fn(usize, usize),
+    idle: fn(usize) -> bool,
+    ctx: usize,
+) -> u32 {
     carry_stack_limit();
     let mut g = sched.lock();
     let member = g.world.join_own(false);
@@ -268,7 +283,12 @@ pub(crate) fn stop_pool(sched: &Scheduler, member: u32, reason: super::StopReaso
 /// a wait that leads to the dropper leads on to the pool's jobs, so one that would close a
 /// cycle through the stop is refused, and a stall sees the dropper as waiting rather than as a
 /// thread that may end what it claimed. `false`, linking nothing, for a job of the pool itself.
-pub(crate) fn stop_begins(sched: &Scheduler, member: u32, dropper: JobId, theirs: &Scheduler) -> bool {
+pub(crate) fn stop_begins(
+    sched: &Scheduler,
+    member: u32,
+    dropper: JobId,
+    theirs: &Scheduler,
+) -> bool {
     let mut g = lock_joined(sched.cell(), || Some(Arc::clone(theirs.cell()))); // clone: a reference count
     if g.world.home(dropper).0 == member {
         return false;
@@ -295,9 +315,12 @@ pub(crate) fn waits_of(sched: &Scheduler, member: u32) -> super::Waits {
 #[allow(unsafe_code)]
 pub(crate) fn job_in_graph() -> Option<(JobId, Scheduler)> {
     match HERE.get() {
-        // SAFETY: `here` was stored by the fiber running this code, on this thread, and its
-        // scheduler outlives the job's run.
-        Some(here) => (here.job != UNREGISTERED).then(|| (here.job, unsafe { &*here.sched }.clone())), // clone: a reference count
+        Some(here) => (here.job != UNREGISTERED).then(|| {
+            // SAFETY: `here` was stored by the fiber running this code, on this thread, and its
+            // scheduler outlives the job's run.
+            let sched = unsafe { &*here.sched };
+            (here.job, sched.clone()) // clone: a reference count
+        }),
         // A thread whose locals are going (a pool dropped as its thread ends) is in the graph
         // no more: its client left it as it went.
         None => CLIENT
@@ -381,7 +404,10 @@ pub(crate) fn leave_pool(sched: &Scheduler, member: u32) {
     g.world.leave_own(member);
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one origin of the pool jobs' clock, which every pool's timed waits share")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one origin of the pool jobs' clock, which every pool's timed waits share"
+)]
 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// The clock a pool job's [`Wait::Until`] counts in: nanoseconds since the process first read
@@ -480,7 +506,10 @@ pub(crate) struct Host<'a> {
     sched: &'a Scheduler,
     member: u32,
     idle: Vec<Fiber>,
-    #[allow(clippy::vec_box, reason = "each record is given to the scheduler as a token by `Box::into_raw`")]
+    #[allow(
+        clippy::vec_box,
+        reason = "each record is given to the scheduler as a token by `Box::into_raw`"
+    )]
     spare: Vec<Box<Parked>>,
     /// The pool's jobs parked now, which it waits for before it stops.
     parked: &'a crate::sync::atomic::AtomicUsize,
@@ -504,7 +533,15 @@ impl<'a> Host<'a> {
     ) -> Host<'a> {
         CORE.set(core);
         // alloc: the worker's own, once
-        Host { sched, member, idle: Vec::with_capacity(IDLE), spare: Vec::with_capacity(SPARE), parked, ended, inside }
+        Host {
+            sched,
+            member,
+            idle: Vec::with_capacity(IDLE),
+            spare: Vec::with_capacity(SPARE),
+            parked,
+            ended,
+            inside,
+        }
     }
 
     /// Runs `job` (one the pool was given, or a parked one given back) on a fiber until it ends
@@ -548,7 +585,13 @@ impl<'a> Host<'a> {
 
     /// Runs `fiber` from `input` until its job parks or ends, then gives the thread `worker`'s
     /// carried thread-locals back; `stray`, a panic of the worker's own as the job came on.
-    fn drive(&mut self, mut fiber: Fiber, mut input: In, worker: &mut Taken, stray: Option<Panic>) -> Option<Panic> {
+    fn drive(
+        &mut self,
+        mut fiber: Fiber,
+        mut input: In,
+        worker: &mut Taken,
+        stray: Option<Panic>,
+    ) -> Option<Panic> {
         loop {
             self.inside.store(true, crate::sync::atomic::Ordering::Relaxed);
             let resumed = fiber.0.resume(input);
@@ -638,16 +681,29 @@ fn exit(mut fiber: Fiber) {
 }
 
 fn new_fiber(sched: &Scheduler, member: u32) -> Fiber {
-    let stack = Stack::new(FIBER_STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
+    let stack = Stack::new(FIBER_STACK)
+        .unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
     let limit = stack.limit();
     let number = super::fiber::next_fiber();
     let sched = sched.clone(); // clone: a reference count, held by the fiber for its life
-    Fiber(Stackful::new(stack, number, move |yielder, first| body(&sched, member, number, limit, yielder, first)), number)
+    Fiber(
+        Stackful::new(stack, number, move |yielder, first| {
+            body(&sched, member, number, limit, yielder, first)
+        }),
+        number,
+    )
 }
 
 /// A fiber's life: run each job it is started with, end it in the graph if it joined, report
 /// its end, and wait for the next. `limit` is the lowest usable address of its stack.
-fn body(sched: &Scheduler, member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first: In) {
+fn body(
+    sched: &Scheduler,
+    member: u32,
+    fiber: u32,
+    limit: usize,
+    yielder: &Yielder<In, Out>,
+    first: In,
+) {
     let mut next = first;
     loop {
         let job = match next {
@@ -655,7 +711,14 @@ fn body(sched: &Scheduler, member: u32, fiber: u32, limit: usize, yielder: &Yiel
             In::Exit => return,
             In::Go(_) => unreachable!("an idle fiber is only started or ended"),
         };
-        let cx = HostCx { yielder, sched, member, fiber, job: Cell::new(UNREGISTERED), counter: Cell::new(None) };
+        let cx = HostCx {
+            yielder,
+            sched,
+            member,
+            fiber,
+            job: Cell::new(UNREGISTERED),
+            counter: Cell::new(None),
+        };
         enter(&cx);
         stdx::set_fiber_stack_limit(limit);
         // Each job is a reclamation boundary: a value a shared table retires is freed once
@@ -755,7 +818,10 @@ unsafe fn register_thunk(cx: *const ()) -> JobId {
 unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), Cycle> {
     // SAFETY: as in `register_thunk`.
     let cx = unsafe { host_cx(cx) };
-    assert!(!matches!(on, Wait::Job(_)), "a pool's job waits for a job: wait for a key or a counter");
+    assert!(
+        !matches!(on, Wait::Job(_)),
+        "a pool's job waits for a job: wait for a key or a counter"
+    );
     let job = cx.register();
     check_no_wait(job);
     clear();
@@ -794,7 +860,8 @@ unsafe fn key_done_thunk(_: *const (), key: Key) {
 ///
 /// Where no scheduler has a flight of `key`.
 fn end_flight(key: Key) {
-    let cell = key_cell(key).unwrap_or_else(|| panic!("key {key:?} done with no flight in any scheduler"));
+    let cell =
+        key_cell(key).unwrap_or_else(|| panic!("key {key:?} done with no flight in any scheduler"));
     let mut g = lock(&cell);
     g.world.key_done(key);
     dispatch(&mut g, None);
@@ -807,7 +874,9 @@ unsafe fn count_thunk(cx: *const (), counter: CounterId) {
     match cx.job.get() {
         UNREGISTERED => cx.counter.set(Some(counter)),
         // The scope may be another scheduler's: they join first.
-        job => lock_joined(cx.sched.cell(), || Some(counter_cell(counter))).world.count_towards(job, counter),
+        job => lock_joined(cx.sched.cell(), || Some(counter_cell(counter)))
+            .world
+            .count_towards(job, counter),
     }
 }
 
@@ -891,7 +960,10 @@ fn client_job() -> JobId {
 
 #[inline(never)]
 fn client_wait(on: Wait) -> Result<(), Cycle> {
-    assert!(!matches!(on, Wait::Job(_) | Wait::Until(_)), "a thread on no fiber waits for a key or a counter");
+    assert!(
+        !matches!(on, Wait::Job(_) | Wait::Until(_)),
+        "a thread on no fiber waits for a key or a counter"
+    );
     CLIENT.with(|client| {
         let job = {
             // What it waits for may be another scheduler's: they join first.
@@ -971,9 +1043,14 @@ pub(crate) fn before_claim() -> Result<(), super::NoProgress> {
     }
     let job = job_here();
     // alloc: a retry after a give-way, rare: the record, kept across the wait unlocked
-    let Some(gave_way) = lock(&live_job_cell(job)).world.give_way_of(job).cloned() else { return Ok(()) };
-    let waiting =
-        crate::pump::Waiting::begin(crate::wait::WaitKind::Key, &mut |it| gave_way.name_wait(it), || Some(gave_way.owner));
+    let Some(gave_way) = lock(&live_job_cell(job)).world.give_way_of(job).cloned() else {
+        return Ok(());
+    };
+    let waiting = crate::pump::Waiting::begin(
+        crate::wait::WaitKind::Key,
+        &mut |it| gave_way.name_wait(it),
+        || Some(gave_way.owner),
+    );
     let waited = wait(Wait::Key(gave_way.flight));
     drop(waiting);
     let cell = live_job_cell(job);
@@ -1050,7 +1127,9 @@ impl Event {
     #[expect(clippy::new_without_default, reason = "each one claims a key in the graph")]
     pub fn new() -> Event {
         let mut key = [0u8; 32];
-        key[..8].copy_from_slice(&EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        key[..8].copy_from_slice(
+            &EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes(),
+        );
         key[8..].copy_from_slice(b"an event, of sched::host");
         let key = Key(key);
         let sched = Scheduler::new(1);

@@ -35,11 +35,15 @@ use std::{cell::RefCell, ops::ControlFlow};
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::HirDisplay as _;
 use hir_def::{AdtId, HasModule as _, hir::Expr};
-use hir_ty::next_solver::{DbInterner, Ty, TyKind};
-use rustc_type_ir::{TypeSuperVisitable as _, TypeVisitable as _, TypeVisitor, inherent::IntoKind as _};
+use hir_ty::next_solver::{
+    AliasTyKind, DbInterner, OpaqueTyIdWrapper, Ty, TyKind, ensure_sufficient_stack,
+};
+use rustc_type_ir::{
+    TypeSuperVisitable as _, TypeVisitable as _, TypeVisitor, inherent::IntoKind as _,
+};
+use std::alloc::Global;
 use syntax::{SyntaxKind as K, TextRange, WalkEvent, view as ast};
 
 use ast::{AstNode as _, HasName as _};
@@ -94,7 +98,8 @@ impl Allocators {
             allocator: cx
                 .std_trait(&["core", "alloc", "Allocator"])
                 .or_else(|| cx.std_trait(&["std", "alloc", "Allocator"])),
-            string: adt(&["alloc", "string", "String"]).or_else(|| adt(&["std", "string", "String"])),
+            string: adt(&["alloc", "string", "String"])
+                .or_else(|| adt(&["std", "string", "String"])),
             path_buf: adt(&["std", "path", "PathBuf"]),
             os_string: adt(&["std", "ffi", "OsString"]),
             map: adt(&["std", "collections", "HashMap"]),
@@ -125,14 +130,18 @@ impl Allocators {
             return known.clone(); // clone: an interned name
         }
         let params = hir::GenericDef::from(hir::Adt::from(adt)).type_or_const_params(db);
-        let found = params.into_iter().filter_map(|it| it.as_type_param(db)).enumerate().find_map(|(at, param)| {
-            let to_global = param
-                .default(db)
-                .and_then(|it| it.as_adt())
-                .is_some_and(|it| Some(AdtId::from(it)) == self.global);
-            let bounded = self.allocator.is_some_and(|allocator| param.trait_bounds(db).contains(&allocator));
-            (to_global || bounded).then(|| (at, param.name(db)))
-        });
+        let found = params.into_iter().filter_map(|it| it.as_type_param(db)).enumerate().find_map(
+            |(at, param)| {
+                let to_global = param
+                    .default(db)
+                    .and_then(|it| it.as_adt())
+                    .is_some_and(|it| Some(AdtId::from(it)) == self.global);
+                let bounded = self
+                    .allocator
+                    .is_some_and(|allocator| param.trait_bounds(db).contains(&allocator));
+                (to_global || bounded).then(|| (at, param.name(db)))
+            },
+        );
         self.params.borrow_mut().insert(adt, found.clone()); // clone: an interned name
         found
     }
@@ -165,15 +174,49 @@ struct Collect<'a, 'db> {
     db: &'db Db,
     allocators: &'a Allocators,
     walk: Walk,
-    /// Opaque types walked, so a bound that names its own opaque type ends.
-    opaque: Vec<Ty<'db>>,
+    /// The types whose `impl Trait` bounds were walked, each walked once: a bound names the
+    /// type it bounds (`impl Iterator`'s `Self: Iterator`), so without this a walk of the
+    /// bounds walks them again, forever, as rustc's opaque-type walks keep a set of the
+    /// opaque types they have seen.
+    expanded: Vec<Expanded<'db>>,
     found: Vec<(Ty<'db>, Implicit)>,
+}
+
+/// What a walk of `impl Trait` bounds is keyed by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Expanded<'db> {
+    /// An opaque type (`-> impl Trait`, an RPITIT), by its definition, not its arguments: its
+    /// bounds can name it again with other arguments (a recursive `impl Trait` through an
+    /// associated type), and its arguments are walked as the type's own parts anyway.
+    Opaque(OpaqueTyIdWrapper<'db>),
+    /// An argument-position `impl Trait` parameter, or a coroutine: by the type itself.
+    Ty(Ty<'db>),
+}
+
+impl<'db> Expanded<'db> {
+    fn of(ty: Ty<'db>) -> Expanded<'db> {
+        match ty.kind() {
+            TyKind::Alias(_, alias) => match alias.kind {
+                AliasTyKind::Opaque { def_id } => Expanded::Opaque(def_id),
+                _ => Expanded::Ty(ty),
+            },
+            _ => Expanded::Ty(ty),
+        }
+    }
 }
 
 impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, 'db> {
     type Result = ();
 
     fn visit_ty(&mut self, ty: Ty<'db>) {
+        // A walk goes as deep as the type is nested: on a fiber's stack, grow it rather than
+        // run into its guard page, which takes the whole daemon down, not one job.
+        ensure_sufficient_stack(|| self.visit_ty_here(ty));
+    }
+}
+
+impl<'db> Collect<'_, 'db> {
+    fn visit_ty_here(&mut self, ty: Ty<'db>) {
         if let Some(it) = self.allocators.implicit(self.db, ty) {
             self.found.push((ty, it));
         }
@@ -194,13 +237,11 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, 'db> {
             Walk::Owned if behind => {}
             Walk::Owned => ty.super_visit_with(self),
             Walk::Written => {
-                if matches!(ty.kind(), TyKind::Alias(..)) {
-                    if self.opaque.contains(&ty) {
-                        return;
-                    }
-                    self.opaque.push(ty);
-                }
-                if let Some(bounds) = ty.impl_trait_bounds(self.db) {
+                let key = Expanded::of(ty);
+                if !self.expanded.contains(&key)
+                    && let Some(bounds) = ty.impl_trait_bounds(self.db)
+                {
+                    self.expanded.push(key);
                     bounds.visit_with(self);
                 }
                 ty.super_visit_with(self);
@@ -210,9 +251,14 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, 'db> {
 }
 
 /// The implicit types in `ty`, outermost first.
-fn collect<'db>(db: &'db Db, allocators: &Allocators, ty: Ty<'db>, walk: Walk) -> Vec<(Ty<'db>, Implicit)> {
+fn collect<'db>(
+    db: &'db Db,
+    allocators: &Allocators,
+    ty: Ty<'db>,
+    walk: Walk,
+) -> Vec<(Ty<'db>, Implicit)> {
     // alloc: a lint's walk of one type, dropped when it returns
-    let mut it = Collect { db, allocators, walk, opaque: Vec::new(), found: Vec::new() };
+    let mut it = Collect { db, allocators, walk, expanded: Vec::new(), found: Vec::new() };
     ty.visit_with(&mut it);
     it.found
 }
@@ -236,7 +282,11 @@ fn holds<'db>(ty: Ty<'db>, part: Ty<'db>) -> bool {
 /// The finding of the written type `ty`, reported where it is written.
 pub(super) fn check_type<'t>(cx: &mut Cx<'_, 't>, ty: ast::Type<'t>) {
     let node = ty.syntax();
-    if cx.expansion().is_some() || !cx.is_written(node) || is_trait_path(node) || cx.source_of(node) == "Self" {
+    if cx.expansion().is_some()
+        || !cx.is_written(node)
+        || is_trait_path(node)
+        || cx.source_of(node) == "Self"
+    {
         return;
     }
     let Some(at) = place(node) else { return };
@@ -280,10 +330,13 @@ pub(super) fn check_body<'db, 't>(
             Expr::Call { args, .. } => (None, args),
             _ => continue,
         };
-        let Some((callee, callee_args)) = super::alloc::written_callee(infer, body, id) else { continue };
+        let Some((callee, callee_args)) = super::alloc::written_callee(infer, body, id) else {
+            continue;
+        };
         let function = hir::Function::from(callee);
         if callee.krate(db).data(db).origin.is_local()
-            && !collect(db, allocators, function.ret_type(db).to_next_solver(), Walk::Written).is_empty()
+            && !collect(db, allocators, function.ret_type(db).to_next_solver(), Walk::Written)
+                .is_empty()
         {
             continue;
         }
@@ -292,7 +345,8 @@ pub(super) fn check_body<'db, 't>(
             made.extend(collect(db, allocators, arg, Walk::Owned));
         }
         let inputs = receiver.into_iter().chain(args.iter().copied()).map(|it| infer.expr_ty(it));
-        let Some((ty, what)) = made.into_iter().find(|(ty, _)| !inputs.clone().any(|input| holds(input, *ty)))
+        let Some((ty, what)) =
+            made.into_iter().find(|(ty, _)| !inputs.clone().any(|input| holds(input, *ty)))
         else {
             continue;
         };
@@ -357,7 +411,9 @@ fn is_trait_path(node: ast::Node<'_>) -> bool {
     let Some(parent) = node.parent() else { return false };
     match parent.kind() {
         K::TYPE_BOUND => true,
-        K::IMPL => ast::Impl::cast(parent).and_then(|it| it.trait_()).is_some_and(|it| it.syntax() == node),
+        K::IMPL => {
+            ast::Impl::cast(parent).and_then(|it| it.trait_()).is_some_and(|it| it.syntax() == node)
+        }
         _ => false,
     }
 }
@@ -394,7 +450,9 @@ fn place(node: ast::Node<'_>) -> Option<Place<'_>> {
             | K::PARENTHESIZED_ARG_LIST
             | K::PARAM_LIST => {}
             K::LET_STMT => return None,
-            _ if ast::Expr::can_cast(kind) => return (!in_args).then_some(Place { holder: parent, via }),
+            _ if ast::Expr::can_cast(kind) => {
+                return (!in_args).then_some(Place { holder: parent, via });
+            }
             _ => return Some(Place { holder: parent, via }),
         }
         at = parent.parent();
@@ -418,7 +476,10 @@ fn describe<'t>(cx: &Cx<'_, 't>, place: Place<'t>) -> String {
         K::RECORD_FIELD => format!("the field `{owner}`"),
         K::TUPLE_FIELD => {
             let index = holder.parent().map_or(0, |list| {
-                list.children().take_while(|it| *it != holder).filter(|it| it.kind() == K::TUPLE_FIELD).count()
+                list.children()
+                    .take_while(|it| *it != holder)
+                    .filter(|it| it.kind() == K::TUPLE_FIELD)
+                    .count()
             });
             format!("the field `{owner}::{index}`")
         }

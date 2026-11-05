@@ -105,7 +105,11 @@ impl Prepare for Folding {
 fn a_group_has_the_data_its_members_ir_gives_in_its_build() {
     let (policy, program) = (folding_policy(), program());
     let (machine, memo, masks) = (Folding::default(), Memo::new(), Masks::new());
-    let run = |store: &Store| Build::new(&machine, &program, &policy, &memo).with_masks(&masks).run(&[(1, member())], store);
+    let run = |store: &Store| {
+        Build::new(&machine, &program, &policy, &memo)
+            .with_masks(&masks)
+            .run(&[(1, member())], store)
+    };
 
     let store = Store::default();
     let first = run(&store).expect_err("its group is refused");
@@ -116,7 +120,11 @@ fn a_group_has_the_data_its_members_ir_gives_in_its_build() {
     machine.data.store(1, Ordering::Relaxed);
     run(&store).expect_err("its group is refused");
     assert!(machine.merged.load(Ordering::Relaxed) > merged, "the second build folds too");
-    assert_eq!(machine.stale.load(Ordering::Relaxed), 0, "a group was made of masked IR from another build");
+    assert_eq!(
+        machine.stale.load(Ordering::Relaxed),
+        0,
+        "a group was made of masked IR from another build"
+    );
 }
 
 /// Nothing masked goes to the store, and a second build makes each mask again from its IR,
@@ -126,7 +134,12 @@ fn masked_ir_is_neither_put_nor_kept_and_forms_are_interned_once() {
     let (policy, program) = (folding_policy(), program());
     let machine = Folding { apart: true, ..Folding::default() };
     let (memo, masks) = (Memo::new(), Masks::new());
-    let run = |store: &Store| Build::new(&machine, &program, &policy, &memo).with_masks(&masks).run(&[(1, member())], store).unwrap();
+    let run = |store: &Store| {
+        Build::new(&machine, &program, &policy, &memo)
+            .with_masks(&masks)
+            .run(&[(1, member())], store)
+            .unwrap()
+    };
 
     let mut store = Store::default();
     let cold = run(&store);

@@ -9,8 +9,8 @@ use crate::{
     test_db::{TestDB, TestDBExt},
 };
 use expect_test::{Expect, expect};
-use la_arena::RawIdx;
 use hir_expand::fixture;
+use la_arena::RawIdx;
 
 use super::super::*;
 
@@ -39,7 +39,8 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
 /// which are the source map's.
 fn round_trip(db: &TestDB, def: DefWithBodyId) {
     let (body, source_map) = Body::with_source_map(db, def);
-    let in_store: blaze_hash::HashSet<_, std::alloc::Global> = body.store.macro_calls().iter().copied().collect();
+    let in_store: blaze_hash::HashSet<_, std::alloc::Global> =
+        body.store.macro_calls().iter().copied().collect();
     let in_map: blaze_hash::HashSet<_, std::alloc::Global> =
         source_map.store.macro_calls().map(|(_, call)| call).collect();
     assert_eq!(in_store, in_map, "{def:?}: the store's macro calls are the source map's");
@@ -410,7 +411,10 @@ fn every_variant_is_lowered() {
         }
     }
     let missing: Vec<_> = (0..STATEMENT_VARIANTS).filter(|&it| !statements[it]).collect();
-    assert!(missing.is_empty(), "statement variants not lowered, by `statement_variants`: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "statement variants not lowered, by `statement_variants`: {missing:?}"
+    );
     assert!(expression_without_semi, "no expression statement without `;`");
 }
 
@@ -467,7 +471,11 @@ fn every_variant_fits_the_column_budget() {
     let statements = columns.stmt_kind.len();
     assert_eq!(columns.stmt_data.len(), statements, "one data word per statement");
     let statement_bytes = columns.stmt_kind.len() + 4 * columns.stmt_data.len();
-    assert_eq!(statement_bytes, 5 * statements, "{statement_bytes} bytes for {statements} statements");
+    assert_eq!(
+        statement_bytes,
+        5 * statements,
+        "{statement_bytes} bytes for {statements} statements"
+    );
 
     let per = |n: usize, of: usize| n as f64 / of as f64;
     println!(
@@ -1197,7 +1205,9 @@ mod generic_arg_views {
         view::{self as ast, AstNode},
     };
 
-    use crate::expr_store::lower::{hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast_view};
+    use crate::expr_store::lower::{
+        hir_assoc_type_binding_to_ast_view, hir_generic_arg_to_ast_view,
+    };
 
     /// Generic argument lists with every kind of argument: lifetimes (named and elided), types,
     /// consts (literal and block), bindings, bounds and return type notation.
@@ -1240,13 +1250,15 @@ fn f() {
     #[test]
     fn hir_indices_map_to_their_syntax() {
         let parse = SourceFile::parse(CODE, Edition::CURRENT);
-        let lists: Vec<_> = parse.root().descendants().filter_map(ast::GenericArgList::cast).collect();
+        let lists: Vec<_> =
+            parse.root().descendants().filter_map(ast::GenericArgList::cast).collect();
         let texts: Vec<_> = lists.iter().map(|it| it.syntax().text()).collect();
         assert_eq!(texts, WANT.iter().map(|&(text, ..)| text).collect::<Vec<_>>());
         for (&list, &(text, args, bindings)) in lists.iter().zip(WANT) {
             let len = list.generic_args().count() as u32;
             for idx in 0..=len {
-                let arg = hir_generic_arg_to_ast_view(list, idx, false).map(|it| it.syntax().text());
+                let arg =
+                    hir_generic_arg_to_ast_view(list, idx, false).map(|it| it.syntax().text());
                 assert_eq!(arg, args.get(idx as usize).copied(), "argument {idx} of `{text}`");
                 if idx > 0 {
                     let arg =
@@ -1256,7 +1268,11 @@ fn f() {
                 }
                 let binding =
                     hir_assoc_type_binding_to_ast_view(list, idx).map(|it| it.syntax().text());
-                assert_eq!(binding, bindings.get(idx as usize).copied(), "binding {idx} of `{text}`");
+                assert_eq!(
+                    binding,
+                    bindings.get(idx as usize).copied(),
+                    "binding {idx} of `{text}`"
+                );
             }
         }
     }
@@ -1546,7 +1562,11 @@ fn f(x: u32) -> Option<u32> {{
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|decl| match decl {
-                ModuleDefId::FunctionId(it) if crate::signatures::FunctionSignature::of(&db, it).name.as_str() == "f" => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if crate::signatures::FunctionSignature::of(&db, it).name.as_str() == "f" =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .expect("`f`");
@@ -1556,8 +1576,10 @@ fn f(x: u32) -> Option<u32> {{
     for (cfg, checked) in [("", "false"), ("cfg:contract_checks", "true")] {
         let printed = body(cfg);
         let count = |it: &str| printed.matches(it).count();
+        // A lang path prints the name of the item it names (`print_path`), not its lang item:
+        // `contract_build_check_ensures` is the fixture's `build_check_ensures`, as in core.
         assert_eq!(count("builtin#lang(contract_check_requires)"), 1, "{printed}");
-        assert_eq!(count("builtin#lang(contract_build_check_ensures)"), 1, "{printed}");
+        assert_eq!(count("builtin#lang(build_check_ensures)"), 1, "{printed}");
         // The tail, `return None` and the `?`; not the closure's `return 1u32`.
         assert_eq!(count("builtin#lang(contract_check_ensures)"), 3, "{printed}");
         assert_eq!(count(&format!("if {checked}")), 4, "{printed}");
@@ -1617,7 +1639,12 @@ fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
     function("f");
     let test = function("f_contract");
     let printed = Body::of(&db, test.into()).pretty_print(&db, test.into(), Edition::CURRENT);
-    assert!(printed.contains("assume(x < 10)"), "the requires is assumed: {printed}");
+    // A call prints each argument on a line of its own: `.assume(\n    x < 10,\n)`.
+    let assumed = printed.split_once(".assume(").map(|(_, rest)| rest.trim_start());
+    assert!(
+        assumed.is_some_and(|it| it.starts_with("x < 10,")),
+        "the requires is assumed: {printed}"
+    );
     assert!(printed.contains("r > x"), "the ensures is checked: {printed}");
     assert!(printed.contains("f("), "`f` is called: {printed}");
 }
@@ -1656,7 +1683,10 @@ trait Registry {
         let body = Body::of(&db, func.into());
         body.exprs()
             .filter(|(_, expr)| {
-                matches!(expr, Expr::Closure { closure_kind: crate::hir::ClosureKind::Coroutine { .. }, .. })
+                matches!(
+                    expr,
+                    Expr::Closure { closure_kind: crate::hir::ClosureKind::Coroutine { .. }, .. }
+                )
             })
             .count()
     };

@@ -10,30 +10,34 @@ it is not there, and copied; the clone is never written to. In the copy, with bl
 of the same source from nothing (`Scratch`: a home, store and target directory of its own for
 every command) as the reference:
   cold      `blaze build` from nothing, with no daemon; the program is run
-  warm      once the daemon has loaded the workspace, `blaze build` again; the program,
-            which is now the one the daemon linked, is run
+  warm      `blaze build` again, by the daemon the cold build started; the program is run
   test      `blaze test`, cold and again warm
   edit      the source is edited; `blaze build`, the program is run, `blaze test`
   broken    a type error is added; both have to fail with the same status
 After every step the program's output and exit status and the result of every test have to be
 what the build from nothing gives for the same source, every build but `broken` has to
 succeed, and every test run has to pass by its own tests. A build cargo did in place of the
-daemon passes (that is the contract) and is in the table with the reason.
+daemon passes (that is the contract) and is in the table with the reason. Every build runs
+with `--message-format=json-render-diagnostics` (`machine_format`): who built it is its
+`build-finished` line on stdout (`how_built`), the program's and the tests' output is what
+comes after that line, and rustc's diagnostics stay rendered on stderr.
 
-Then a second checkout of the repository is built, edited and built again, and the
-functions the daemon compiled itself are counted.
+Then a second checkout of the repository is built, edited and built again.
 
 Flags. A small workspace made here is built and run with each flag `blaze` passes
 through, cold and after an edit, and held to the build from nothing the same way; before the
 edit, each exit status has to be the one the workspace's source says.
 
 Daemon. Started on demand, reused, shared by a git worktree, alive after its client is
-killed, replaced when the client is another build of blaze, gone when idle, and its workers
-gone with it. A project whose rust-toolchain file names an older stable or a nightly is built
-and edited by the daemon, under the toolchain blaze compiles; a `#![feature]` of the nightly
-builds, and an error in it fails, with nothing said of the project's toolchain but one line
-under `-v`. With no rustup and no Rust on
-the path, `blaze run` builds with blaze's own copy of its release and the edit is the daemon's.
+killed, replaced when the client is another build of blaze, and gone when idle. The daemon is
+found by its lock (`storelib.daemon_pid`), which names it whether or not the daemon answers.
+v1's checks of its workers (one per workspace, reused, gone with the daemon), of its write in
+place after a link (`BLAZE_LAYOUT_PAUSE_MS`) and of the waits until a workspace was `ready` are
+gone with them: v2's daemon has no workers, and its first build of a workspace is its own.
+A project whose rust-toolchain file names an older stable or a nightly is built and edited by
+the daemon, under the toolchain blaze compiles; a `#![feature]` of the nightly builds, and an
+error in it fails, with nothing said of the project's toolchain but one line under `-v`. With
+no rustup and no Rust on the path, `blaze run` builds with blaze's own copy of its release and the edit is the daemon's.
 
 Upgraded. A project whose rust-toolchain file names another release: that is not said, and the
 build is not cargo's. `--only-upgraded` runs
@@ -42,10 +46,12 @@ this part alone.
 Writes BLAZE-CLI.md and blaze_cli.json next to this file. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, contextlib, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, urllib.request
+import collections, contextlib, functools, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import storelib
+from storelib import daemon_pid
 # The cargo this compares with is the pinned nightly's.
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 # Set, not unset: cargo's `[env]` fills in only what is not already set, so an unset
@@ -56,14 +62,15 @@ WINDOWS = os.name == "nt"
 EXE = ".exe" if WINDOWS else ""
 
 
-def host():
-    return subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
-
-
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine" + EXE)
+
+
+@functools.cache
+def host():
+    """The host's tuple, as blaze's toolchain names it (`blaze toolchain --json`): no rustc runs."""
+    return storelib.blaze_toolchain(BLAZE, dict(os.environ)).host
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/blaze-projects")
-WARMUP_SECS = 1800
 
 PROJECTS = {
     "ripgrep": dict(
@@ -185,7 +192,8 @@ def write(at, path, text):
 
 
 def base_env(home):
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never")
+    # BLAZE_LOCK: the workspaces are clones and generated ones, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never", BLAZE_LOCK="write")
     # Every side's cargo lays out a build as stable cargo does, as a user's does and as blaze
     # places a test: in nightly's second layout a test is in its unit's directory, from where
     # fd's, ripgrep's and just's tests find no program beside them.
@@ -264,7 +272,7 @@ class Side:
         self.env = env if blaze else dict(env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref"))
 
     def argv(self, command, *args):
-        return [*(["blaze"] if self.blaze else ["cargo"]), command, *args]
+        return [*(["blaze"] if self.blaze else ["cargo"]), command, *(machine_format(command, args) if self.blaze else []), *args]
 
     @contextlib.contextmanager
     def session(self):
@@ -272,32 +280,23 @@ class Side:
         yield self.env
 
     def cargo(self, command, *args, env=None, timeout=7200):
-        """Runs it. Of `blaze test`, what ran also has `kept`: the tests blaze did not run for
-        having passed as they are now, from its `tests.ndjson`."""
+        """Runs it. What ran has `finished`, its `build-finished` line read (None for a command
+        that builds nothing, or refused before it built), and `blaze_stdout`, all it printed;
+        when this added `--message-format` (`machine_format`) its `stdout` is only what came after that
+        line: the program's (`blaze run`) or the tests' (`blaze test`) own output. Of
+        `blaze test`, what ran also has `kept`: the tests blaze did not run for having passed as
+        they are now, from its `tests.ndjson`."""
         with self.session() as own:
             env = dict(own, **(env or {}))
             report = self.blaze and command == "test" and os.path.join(env.get("CARGO_TARGET_DIR") or os.path.join(self.ws, "target"), "blaze", "tests.ndjson")
             if report and os.path.exists(report):
                 os.remove(report)
             took, ran = timed(self.argv(command, *args), self.ws, env, timeout)
+            read_build(ran, cut=self.blaze and bool(machine_format(command, args)))
             if report:
                 ran.kept = kept_passes(report)
             return took, ran
 
-    def how_built(self, stderr):
-        """Whether the daemon built what the last command asked for, or why cargo did."""
-        return how_built(stderr)
-
-    def share(self):
-        """The functions of the largest load the daemon compiled itself, of all it has."""
-        loads = []
-        workers = os.path.join(self.env["BLAZE_HOME"], "workers")
-        for worker in os.listdir(workers) if os.path.isdir(workers) else []:
-            path = os.path.join(workers, worker, "log")
-            # A worker that began as a spare keeps its log where it began.
-            log = open(path, errors="replace").read() if os.path.exists(path) else ""
-            loads += [(int(of), int(done)) for done, of in re.findall(r"^cold: compiled (\d+) of (\d+) fns", log, re.M)]
-        return max(loads, default=(0, 0))[::-1]
 
 
 class Scratch(Side):
@@ -327,16 +326,54 @@ class Scratch(Side):
             shutil.rmtree(home, ignore_errors=True)
 
 
-def how_built(stderr):
-    """How a build of blaze's ended: "daemon" when it finished, else "failed: " and its first
-    error. v2 builds only through its daemon (`blaze` hands every command to `blaze_cargo::cli`,
-    which runs no cargo and no rustc), and prints cargo's own lines, `Finished` and `Compiling`
-    too, so its output can't tell a build of cargo's from its own; that no rustc runs is
-    norustc.py's, through a toolchain that logs every run."""
-    if re.search(r"^\s*Finished `[^`]+` profile \[", stderr, re.M):
+# The commands that build, and print a `build-finished` line under `--message-format=json`.
+BUILDS = ("build", "check", "run", "test", "bench")
+# The machine format a harness reads a build by: blaze's JSON lines on stdout, before the
+# program's or the tests' own output, and rustc's diagnostics rendered on stderr as the human
+# format has them.
+MACHINE = "--message-format=json-render-diagnostics"
+
+
+def machine_format(command, args):
+    """What `blaze COMMAND ARGS` needs added for its build to say how it ended: `MACHINE`, for
+    a command that builds and whose arguments (before a `--`) ask for no format of their own."""
+    args = list(args)
+    asked = args[:args.index("--")] if "--" in args else args
+    if command not in BUILDS or any(arg.startswith("--message-format") for arg in asked):
+        return []
+    return [MACHINE]
+
+
+def read_build(ran, cut=True):
+    """Reads a finished blaze command's `build-finished` line (storelib.split_build_output)
+    into `ran.finished` (None when it printed none), keeps all it printed as `ran.blaze_stdout`,
+    and with `cut`, when there is the line, leaves in `ran.stdout` only what came after it: the
+    program's or the tests' own output. The result is `ran`."""
+    ran.blaze_stdout = ran.stdout
+    ran.finished, rest = storelib.split_build_output(ran.stdout)
+    if cut and ran.finished is not None:
+        ran.stdout = rest
+    return ran
+
+
+def how_built(ran):
+    """How the build of a finished blaze command `ran` (with `stdout` and `stderr`, run with
+    `MACHINE`) ended, by its `build-finished` line: "daemon" when the daemon built it and it
+    succeeded, else "failed: " and its first error, or what is missing. `ran.finished` is read
+    when it is there (`Side.cargo`, `read_build`), else `ran.stdout` is. v2 builds only through
+    its daemon (`blaze` hands every command to `blaze_cargo::cli`, which runs no cargo and no
+    rustc); that no rustc runs is norustc.py's, through a toolchain that logs every run."""
+    finished = ran.finished if hasattr(ran, "finished") else storelib.build_finished(ran.stdout)
+    if finished is not None and finished.daemon:
         return "daemon"
-    error = re.search(r"^error(?:\[\w+\])?: (.*)$", stderr, re.M)
-    return "failed: " + (error[1] if error else "no `Finished` line")
+    if finished is not None and finished.success:
+        return f"served {finished.served}, not by the daemon"
+    error = re.search(r"^error(?:\[\w+\])?: (.*)$", ran.stderr, re.M)
+    if error:
+        return "failed: " + error[1]
+    if finished is not None:
+        return "failed: its `build-finished` line says it failed, and no `error` line says why"
+    return "failed: no `build-finished` line"
 
 
 def program_output(ran):
@@ -471,61 +508,14 @@ def serve(side, command, ask, env):
                 break
 
 
-def checking(root):
-    """Whether a `cargo check` runs below `root`: the one `blaze` starts after cargo
-    built, for the dependencies to be checked by the time the daemon builds."""
-    if not os.path.isdir("/proc/self"):
-        # No /proc on macOS: `ps` has the commands and `lsof` where each one runs.
-        listed = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
-        checks = [l.split()[0] for l in listed.splitlines() if l.split()[2:3] == ["check"]]
-        cwd = lambda pid: subprocess.run(["lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"], capture_output=True, text=True).stdout
-        return any(os.path.realpath(l[1:]).startswith(root) for pid in checks for l in cwd(pid).splitlines() if l.startswith("n"))
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-            if b"check" in words[1:2] and os.readlink(f"/proc/{pid}/cwd").startswith(root):
-                return True
-        except OSError:
-            pass
-    return False
-
-
-def linked_for_loads(ws):
-    """The build scripts and proc macros linked into blaze's own target directory
-    (`target/rust-analyzer`) of the checkout `ws`, with when each was written: a load of
-    `blaze` links them there, and reads them there again after."""
-    top = os.path.join(ws, "target", "rust-analyzer")
-    linked = {}
-    for at, _, files in os.walk(top):
-        for name in files:
-            path = os.path.join(at, name)
-            try:
-                info = os.stat(path, follow_symlinks=False)
-            except OSError:
-                continue
-            library = name.endswith((".so", ".dylib", ".dll"))
-            if library or (stat.S_ISREG(info.st_mode) and info.st_mode & 0o111):
-                linked[os.path.relpath(path, top)] = info.st_mtime_ns
-    return linked
-
-
 def wait_warm(side, root):
-    """Waits until the daemon has every build of `root` loaded or has given up on one. The
-    result is the seconds it took and how each ended."""
-    # The daemon names a checkout by its real path: on macOS /tmp and /var are links.
-    root = os.path.realpath(root)
-    began = time.time()
-    while time.time() - began < WARMUP_SECS:
-        _, status = side.cargo("status")
-        states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
-        if states and not any(s.startswith("loading") for s in states) and not checking(root):
-            return time.time() - began, states
-        # No daemon loads what every build so far was left to cargo for.
-        left = re.search(r"^daemon: not running$(?s:.*)^  every build is cargo's: (.*)$", status.stdout, re.M)
-        if left:
-            return time.time() - began, ["left to cargo: " + left[1]]
-        time.sleep(0.25)
-    return time.time() - began, ["not loaded in time"]
+    """v1 waited here, reading `blaze status`, until a worker had `root` loaded. v2 has no
+    loading to wait out: the first build of a workspace is the daemon's own, so there is nothing
+    to wait for. The result is as v1's was, for the harnesses that still ask: no seconds, and
+    `["ready"]` while a daemon runs on the side's home (its lock, `storelib.daemon_pid`), else
+    `["no daemon"]`."""
+    del root
+    return 0.0, ["ready"] if daemon_pid(side.env["BLAZE_HOME"]) else ["no daemon"]
 
 
 def rewrite(path, old, new):
@@ -567,12 +557,12 @@ def project(name, spec, work, mode):
         `compare` reads from each."""
         (took, mine), (fresh_s, fresh) = ours.cargo(command, *args), scratch.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(fresh_s, 2))
-        row["built"][label] = ours.how_built(mine.stderr)
+        row["built"][label] = how_built(mine)
         wrong = difference(compare(mine), compare(fresh))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
-            open(os.path.join(work, f"{name}-{label}.blaze.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
-            open(os.path.join(work, f"{name}-{label}.scratch.txt"), "w", encoding="utf-8").write(fresh.stdout + fresh.stderr)
+            open(os.path.join(work, f"{name}-{label}.blaze.txt"), "w", encoding="utf-8").write(mine.blaze_stdout + mine.stderr)
+            open(os.path.join(work, f"{name}-{label}.scratch.txt"), "w", encoding="utf-8").write(fresh.blaze_stdout + fresh.stderr)
         print(f"  {label:12} blaze {took:7.2f}s  from nothing {fresh_s:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
         # What the tests that failed here alone said.
         said = wrong and re.search(r"^failures:\n(.*?)^failures:", mine.stdout, re.M | re.S)
@@ -602,12 +592,6 @@ def project(name, spec, work, mode):
         else:
             step(label, "run", [*build, "--", *run], program_output)
 
-    def warm(label):
-        took, states = wait_warm(ours, ws)
-        row["times"][label] = (round(took, 2), None)
-        row["built"][label] = "; ".join(states)
-        print(f"  {label:12} {took:7.2f}s  {'; '.join(states)[:150]}", flush=True)
-
     status = lambda ran: ran.returncode
     step("cold build", "build", build, status)
     ask = fetched(spec["serves"]) if "serves" in spec else None
@@ -620,19 +604,9 @@ def project(name, spec, work, mode):
         shutil.copy2(os.path.join(ws, "target", "debug", spec["client"] + EXE), client)
         ask = asked_by(client)
     runs("cold run")
-    linked = linked_for_loads(ws)
-    warm("warm-up")
-    # The daemon loads the workspace with the build scripts and proc macros the cold build
-    # had: cargo's, or those its load linked into blaze's own target directory. It links
-    # none of them again.
-    again = sorted(path for path, written in linked_for_loads(ws).items() if linked.get(path) != written)
-    if again:
-        row["wrong"].append(f"warm-up: the daemon built the build scripts and proc macros again: {', '.join(again[:3])}")
-        print(f"  warm-up      the daemon built the build scripts and proc macros again: {', '.join(again[:3])}", flush=True)
     step("warm build", "build", build, status)
     runs("warm run")
     step("cold test", "test", test, test_results)
-    warm("test warm-up")
     step("warm test", "test", test, test_results)
     for file, old, new in spec["edits"]:
         rewrite(os.path.join(ws, file), old, new)
@@ -648,10 +622,6 @@ def project(name, spec, work, mode):
     step("mended", "build", build, status)
     runs("mended run")
     worktree(ours, row, build, [*build, "--", *run] if not ask else None, spec["edits"], work)
-    row["share"] = ours.share()
-    print(f"  functions    {row['share'][0]} of {row['share'][1]} compiled by blaze", flush=True)
-    _, counted = ours.cargo("status")
-    row["status"] = counted.stdout
     ours.cargo("stop")
     return row
 
@@ -692,45 +662,47 @@ EDITED_IN = """fn edited_in(n: usize) -> (u64, (i8, u64), usize) {
 
 """
 
-# Each: the subcommand, its arguments, the variables it runs with.
-FLAG_CASES = [
-    ("run", [], {}),
-    ("run", ["--", "fail"], {}),
-    ("run", ["--release"], {}),
-    ("run", ["--release", "--", "fail"], {}),
-    ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
-    # A processor of x86-64 is one only there.
-    *([("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"})] if host().startswith("x86_64") else []),
-    ("run", ["--no-default-features", "-p", "app"], {}),
-    # The host named: what is built for is the same, where it is put is not.
-    ("run", ["--target", host()], {}),
-    ("run", ["-p", "app"], {}),
-    ("run", ["--features", "loud", "-p", "app"], {}),
-    ("run", ["--bin", "other"], {}),
-    ("run", ["--example", "demo"], {}),
-    ("run", ["--manifest-path", "app/Cargo.toml"], {}),
-    ("run", ["--profile", "quick"], {}),
-    ("run", ["-q", "name"], {}),
-    ("run", [], {"RUSTFLAGS": "--cfg extra"}),
-    ("build", ["--workspace"], {}),
-    ("build", ["--all-features"], {}),
-    ("check", [], {}),
-    ("test", [], {}),
-    ("test", ["--test", "it"], {}),
-    ("test", ["-p", "util", "--lib"], {}),
-    ("test", ["greets"], {}),
-    ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
-    ("test", [], {"FLAGS_FAIL": "1"}),
-    ("test", ["--no-run"], {}),
-    ("test", ["--doc"], {}),
-    ("test", ["--doc", "--features", "loud", "-p", "util"], {}),
-    ("test", ["--doc", "--workspace", "--features", "app/loud"], {}),
-    # Flags of how the results are shown are the harness's: blaze runs the doctests all the
-    # same, and shows them as libtest does.
-    ("test", ["--doc", "-q"], {}),
-    ("test", ["--doc", "--", "--format=terse", "--color", "never"], {}),
-    ("test", [], {"CARGO_INCREMENTAL": "0"}),
-]
+# Each: the subcommand, its arguments, the variables it runs with. A function, so that importing
+# this asks blaze nothing: the host's tuple is blaze's answer.
+def flag_cases():
+    return [
+        ("run", [], {}),
+        ("run", ["--", "fail"], {}),
+        ("run", ["--release"], {}),
+        ("run", ["--release", "--", "fail"], {}),
+        ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
+        # A processor of x86-64 is one only there.
+        *([("run", ["--release"], {"RUSTFLAGS": "-C target-cpu=x86-64-v3"})] if host().startswith("x86_64") else []),
+        ("run", ["--no-default-features", "-p", "app"], {}),
+        # The host named: what is built for is the same, where it is put is not.
+        ("run", ["--target", host()], {}),
+        ("run", ["-p", "app"], {}),
+        ("run", ["--features", "loud", "-p", "app"], {}),
+        ("run", ["--bin", "other"], {}),
+        ("run", ["--example", "demo"], {}),
+        ("run", ["--manifest-path", "app/Cargo.toml"], {}),
+        ("run", ["--profile", "quick"], {}),
+        ("run", ["-q", "name"], {}),
+        ("run", [], {"RUSTFLAGS": "--cfg extra"}),
+        ("build", ["--workspace"], {}),
+        ("build", ["--all-features"], {}),
+        ("check", [], {}),
+        ("test", [], {}),
+        ("test", ["--test", "it"], {}),
+        ("test", ["-p", "util", "--lib"], {}),
+        ("test", ["greets"], {}),
+        ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
+        ("test", [], {"FLAGS_FAIL": "1"}),
+        ("test", ["--no-run"], {}),
+        ("test", ["--doc"], {}),
+        ("test", ["--doc", "--features", "loud", "-p", "util"], {}),
+        ("test", ["--doc", "--workspace", "--features", "app/loud"], {}),
+        # Flags of how the results are shown are the harness's: blaze runs the doctests all the
+        # same, and shows them as libtest does.
+        ("test", ["--doc", "-q"], {}),
+        ("test", ["--doc", "--", "--format=terse", "--color", "never"], {}),
+        ("test", [], {"CARGO_INCREMENTAL": "0"}),
+    ]
 
 
 # What blaze fails and cargo builds, known and not mended: an edit to a crate whose profile
@@ -750,7 +722,7 @@ def flags(work):
     rows, wrong = [], []
 
     def round_of(label):
-        for command, args, extra in FLAG_CASES:
+        for command, args, extra in flag_cases():
             (_, mine), (_, other) = ours.cargo(command, *args, env=extra), scratch.cargo(command, *args, env=extra)
             read = test_results if command == "test" else program_output
             differs = difference(read(mine), read(other))
@@ -769,15 +741,14 @@ def flags(work):
             if differs and mine.returncode != other.returncode:
                 differs += f"; {mine.stderr.strip()[-600:]!r}"
             shown = " ".join([*(f"{k}={v}" for k, v in extra.items()), "blaze", command, *args])
-            rows.append((label, shown, how_built(mine.stderr), mine.returncode, differs or "same"))
+            rows.append((label, shown, how_built(mine), mine.returncode, differs or "same"))
             if differs and (label, shown) in FLAGS_OPEN:
                 differs = "open: " + differs
             elif differs:
                 wrong.append(f"{label}: {shown}: {differs}")
-            print(f"  {label:6} {shown:50} exit {mine.returncode:3}  {how_built(mine.stderr):8.60}  {differs or 'same'}", flush=True)
+            print(f"  {label:6} {shown:50} exit {mine.returncode:3}  {how_built(mine):8.60}  {differs or 'same'}", flush=True)
 
     round_of("cold")
-    wait_warm(ours, ws)
     round_of("warm")
     rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("hello {name}")', 'format!("hello {name}!")')
     # rustc's program of an example has the constant in it: the one of the warm round is stale.
@@ -787,9 +758,8 @@ def flags(work):
     rewrite(os.path.join(ws, "app/src/main.rs"), "#[cfg(test)]", EDITED_IN + "#[cfg(test)]")
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
-    _, counted = ours.cargo("status")
     ours.cargo("stop")
-    return rows, wrong, counted.stdout
+    return rows, wrong
 
 
 def daemon(work):
@@ -816,21 +786,19 @@ def daemon(work):
         checks.append((name, bool(held), detail))
         print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
 
-    def status(side=None):
-        text = (side or here).cargo("status")[1].stdout
-        pid = re.search(r"^daemon: pid (\d+)", text, re.M)
-        return (int(pid[1]) if pid else None), [int(p) for p in re.findall(r"worker: pid (\d+)", text)], text
+    def status():
+        """The pid of the daemon on `home`, from its lock; None when none runs."""
+        return daemon_pid(home)
 
     edit = lambda root, text: open(os.path.join(root, "app/src/main.rs"), "a").write(f"\n// {text}\n")
 
-    check("no daemon before the first build", status()[0] is None)
+    check("no daemon before the first build", status() is None)
     _, first = here.cargo("build")
-    pid, workers, _ = status()
+    pid = status()
     check("the first build starts one", first.returncode == 0 and pid is not None, f"pid {pid}")
     # No cargo builds first: the build is the daemon's from the start, with nothing to wait
     # for after cargo.
-    check("and the first build's program is the daemon's", how_built(first.stderr) == "daemon", how_built(first.stderr))
-    wait_warm(here, ws)
+    check("and the first build's program is the daemon's", how_built(first) == "daemon", how_built(first))
     # A program that runs plain `cargo build` on its own checkout, as a test suite may, after
     # the daemon built it: cargo's own artifacts are behind the sources, so cargo builds
     # them again and its executable takes the place of the daemon's. Both are right.
@@ -839,19 +807,17 @@ def daemon(work):
     _, nested = here.cargo("run", "--bin", "nested")
     _, after = here.cargo("run", "--bin", "app")
     _, reference = Scratch(ws, env).cargo("run", "--bin", "app")
-    check("a program that runs cargo on its checkout builds, and the next run is right", how_built(installed.stderr) == "daemon" and nested.returncode == 0 and after.returncode == reference.returncode and after.stdout == reference.stdout, f"{how_built(installed.stderr)}, nested {nested.returncode}, then {how_built(after.stderr)}")
+    check("a program that runs cargo on its checkout builds, and the next run is right", how_built(installed) == "daemon" and nested.returncode == 0 and after.returncode == reference.returncode and after.stdout == reference.stdout, f"{how_built(installed)}, nested {nested.returncode}, then {how_built(after)}")
     edit(ws, "one")
     _, second = here.cargo("build")
-    check("a later build is the daemon's, by the same daemon", how_built(second.stderr) == "daemon" and status()[0] == pid, how_built(second.stderr))
+    check("a later build is the daemon's, by the same daemon", how_built(second) == "daemon" and status() == pid, how_built(second))
 
-    there.cargo("build")
-    wait_warm(there, tree)
-    _, workers_now, text = status()
-    shared = re.search(rf"worker: pid \d+,[^\n]*\n(    [^\n]*\n)*    {re.escape(tree)}: ready", text)
-    check("a worktree is loaded by the same daemon and the same worker", status()[0] == pid and len(workers_now) == 1 and shared, f"workers {workers_now}")
+    # v1 also checked that the worktree was loaded by the same worker; v2 has no workers.
+    _, in_there = there.cargo("build")
+    check("a worktree is built by the same daemon", in_there.returncode == 0 and status() == pid, f"pid {pid} then {status()}")
     edit(tree, "two")
     _, in_tree = there.cargo("run")
-    check("a build in the worktree is the daemon's", how_built(in_tree.stderr) == "daemon" and in_tree.returncode == 0, how_built(in_tree.stderr))
+    check("a build in the worktree is the daemon's", how_built(in_tree) == "daemon" and in_tree.returncode == 0, how_built(in_tree))
 
     edit(ws, "three")
     client = subprocess.Popen(["blaze", "build"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **OWN_GROUP)
@@ -860,45 +826,39 @@ def daemon(work):
     client.wait()
     edit(ws, "four")
     _, after_kill = here.cargo("run")
-    check("the daemon outlives a client that is killed", status()[0] == pid and after_kill.returncode == 0 and "hello world" in after_kill.stdout, how_built(after_kill.stderr))
+    check("the daemon outlives a client that is killed", status() == pid and after_kill.returncode == 0 and "hello world" in after_kill.stdout, how_built(after_kill))
 
     other = another_build(os.path.join(work, "other-build"))
     newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     edit(ws, "five")
     _, by_newer = newer.cargo("run")
-    replaced = status(newer)[0]
+    replaced = status()
     ran = by_newer.returncode == 0 and "hello world" in by_newer.stdout
     check("a client of another build replaces the daemon", ran and replaced not in (None, pid) and not alive(pid), f"pid {pid} then {replaced}")
-    check("the workers of the daemon it replaced are gone", not any(alive(p) for p in workers_now), f"{workers_now}")
     newer.cargo("stop")
 
     quick = Side(ws, dict(env, BLAZE_IDLE_SECS="3"), True)
     quick.cargo("build")
-    pid, _, _ = status()
-    wait_warm(quick, ws)
-    _, workers, _ = status()
+    pid = status()
     time.sleep(6)
-    gone = not alive(pid) and not any(alive(p) for p in workers)
-    check("idle for BLAZE_IDLE_SECS, the daemon and its workers exit", pid is not None and workers and gone, f"daemon {pid}, workers {workers}")
+    check("idle for BLAZE_IDLE_SECS, the daemon exits", pid is not None and not alive(pid), f"daemon {pid}")
 
+    # v1 also checked that its workers exited with a killed daemon; v2 has no workers.
     here.cargo("build")
-    wait_warm(here, ws)
-    pid, workers, _ = status()
+    pid = status()
     kill(pid)
     time.sleep(1)
-    check("workers exit when the daemon is killed", workers and not any(alive(p) for p in workers), f"workers {workers}")
     edit(ws, "six")
     _, again = here.cargo("run")
-    check("the build after that starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status()[0] not in (None, pid))
+    check("the build after a killed daemon starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status() not in (None, pid))
 
     # An example has the dev-dependencies, as cargo builds it: its edit is one the daemon
     # builds, not one rust-analyzer finds names missing from.
     demo = os.path.join(ws, "app/examples/demo.rs")
     here.cargo("run", "--example", "demo")
-    wait_warm(here, ws)
     open(demo, "a").write("\n// edited\n")
     _, example = here.cargo("run", "--example", "demo")
-    check("an edited example with a dev-dependency is the daemon's", how_built(example.stderr) == "daemon" and example.returncode == 0 and " DEMO" in example.stdout, f"{how_built(example.stderr)}: {example.stdout.strip()[-80:]}")
+    check("an edited example with a dev-dependency is the daemon's", how_built(example) == "daemon" and example.returncode == 0 and " DEMO" in example.stdout, f"{how_built(example)}: {example.stdout.strip()[-80:]}")
     # An error is blaze's, written as rustc and cargo write it, and no rustc runs to say it.
     main = os.path.join(ws, "app/src/main.rs")
     kept = open(main).read()
@@ -925,27 +885,24 @@ def daemon(work):
     unset = "names a variable that is not set" in cold.stderr
     check("a first build that is an integration test naming a program builds it", not unset and re.search(r"^test greets_it \.\.\. ok$", cold.stdout, re.M), f"exit {cold.returncode}, {cold.stderr.strip()[-300:]!r}")
     # A lint the source denies fails the build as rustc's would, unless the flags cap lints.
-    wait_warm(here, ws)
     open(main, "a").write("\n#[deny(non_snake_case)]\npub fn Denied() {}\n")
     _, denied = here.cargo("build")
     said = re.search(r'^error: .*`Denied`.*\n +--> app/src/main\.rs:\d+:8\n', denied.stderr, re.M)
     check("an edit with a lint its source denies fails the build with blaze's error", denied.returncode == 101 and said, f"exit {denied.returncode}, {denied.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
-    wait_warm(here, ws)
     open(main, "a").write("\n#[deny(elided_lifetimes_in_paths)]\npub fn hidden(_: std::fmt::Arguments) {}\n")
     _, denied = here.cargo("build")
     said = re.search(r'^error: hidden lifetime parameters in types are deprecated\n +--> app/src/main\.rs:\d+:28\n', denied.stderr, re.M)
     check("and so does one with a lint of a type's hidden lifetime it denies", denied.returncode == 101 and said, f"exit {denied.returncode}, {denied.stderr.strip()[-300:]}")
     capped = {"RUSTFLAGS": "--cap-lints warn"}
     here.cargo("build", env=capped)
-    wait_warm(here, ws)
     open(main, "a").write("\n// edited\n")
     _, allowed = here.cargo("run", env=capped)
-    check("with `--cap-lints` among the flags the build of that edit is the daemon's", allowed.returncode == 0 and how_built(allowed.stderr) == "daemon" and "hello world" in allowed.stdout, f"exit {allowed.returncode}, {how_built(allowed.stderr)}: {allowed.stderr.strip()[-300:]}")
+    check("with `--cap-lints` among the flags the build of that edit is the daemon's", allowed.returncode == 0 and how_built(allowed) == "daemon" and "hello world" in allowed.stdout, f"exit {allowed.returncode}, {how_built(allowed)}: {allowed.stderr.strip()[-300:]}")
     open(main, "w").write(kept)
     # `blaze check` is what the daemon's build says.
     _, checked = here.cargo("check")
-    check("`blaze check` of a loaded build is the daemon's", checked.returncode == 0 and how_built(checked.stderr) == "daemon", f"exit {checked.returncode}, {checked.stderr.strip()[-300:]}")
+    check("`blaze check` of a loaded build is the daemon's", checked.returncode == 0 and how_built(checked) == "daemon", f"exit {checked.returncode}, {checked.stderr.strip()[-300:]}")
     open(main, "a").write("\nfn broken() -> u32 { \"text\" }\n")
     _, failed = here.cargo("check")
     said = re.search(r'^error\[E0308\]: .*\n +--> app/src/main\.rs:\d+:22\n', failed.stderr, re.M)
@@ -954,7 +911,7 @@ def daemon(work):
     # With no build of its flags loaded.
     here.cargo("stop")
     _, unloaded = here.cargo("check")
-    check("`blaze check` with no build loaded is the daemon's", unloaded.returncode == 0 and how_built(unloaded.stderr) == "daemon", f"exit {unloaded.returncode}, {unloaded.stderr.strip()[-300:]}")
+    check("`blaze check` with no build loaded is the daemon's", unloaded.returncode == 0 and how_built(unloaded) == "daemon", f"exit {unloaded.returncode}, {unloaded.stderr.strip()[-300:]}")
     open(main, "a").write("\nfn broken() -> u32 { \"text\" }\n")
     _, failed = here.cargo("check")
     said = re.search(r'^error\[E0308\]: .*\n +--> app/src/main\.rs:\d+:22\n', failed.stderr, re.M)
@@ -975,11 +932,10 @@ def daemon(work):
     open(main, "w").write(kept)
     os.remove(added)
     _, other = here.cargo("check", "--release")
-    check("`blaze check` of flags no build had is the daemon's", other.returncode == 0 and "`release` profile [" in other.stderr, f"exit {other.returncode}, {other.stderr.strip()[-300:]}")
+    check("`blaze check` of flags no build had is the daemon's", other.returncode == 0 and how_built(other) == "daemon" and other.finished.profile == "release", f"exit {other.returncode}, {how_built(other)}, {other.stderr.strip()[-300:]}")
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
-    in_place(work, check)
     cleaned(work, check)
     through_link(work, check)
     script_links_proc_macro(work, check)
@@ -1027,17 +983,16 @@ def pinned(work, check):
         side = project(name, version, plain)
         _, cold = side.cargo("run")
         check(f"a project pinned to {label} ({version}) builds with blaze's release", cold.returncode == 0 and "pinned 42" in cold.stdout, f"exit {cold.returncode}, {cold.stderr.strip()[-300:]!r}")
-        wait_warm(side, side.ws)
         rewrite(os.path.join(side.ws, "src/main.rs"), "6 * 7", "6 * 8")
         _, edited = side.cargo("run")
-        how = how_built(edited.stderr)
+        how = how_built(edited)
         check("and its edit is the daemon's", edited.returncode == 0 and how == "daemon" and "pinned 48" in edited.stdout, f"{how[:90]}; {edited.stderr.strip()[-300:]!r}")
     # blaze's toolchain is a nightly (docs/toolchain.md): a nightly's `#![feature]` builds.
     # The project's rust-toolchain file is not read, and said only under `-v` (#837).
     side = project("featured", "1.101.0-nightly", "#![feature(never_type)]\nfn main() {\n    let _: Option<!> = None;\n}\n")
     named = lambda stderr: "0000000 2026-01-01" in stderr or "rust-toolchain" in stderr
     _, featured = side.cargo("build")
-    check("a nightly's `#![feature]` builds with blaze's own, nothing said of the project's toolchain", featured.returncode == 0 and how_built(featured.stderr) == "daemon" and not named(featured.stderr), f"exit {featured.returncode}, {featured.stderr.strip()[-400:]!r}")
+    check("a nightly's `#![feature]` builds with blaze's own, nothing said of the project's toolchain", featured.returncode == 0 and how_built(featured) == "daemon" and not named(featured.stderr), f"exit {featured.returncode}, {featured.stderr.strip()[-400:]!r}")
     _, verbose = side.cargo("build", "-v")
     ignored = verbose.stderr.count("rust-toolchain.toml is ignored: blaze builds with its own Rust")
     check("and under `-v` one line says its rust-toolchain file is ignored", verbose.returncode == 0 and ignored == 1, f"exit {verbose.returncode}, {ignored} lines, {verbose.stderr.strip()[-400:]!r}")
@@ -1051,13 +1006,14 @@ class Bare(Side):
     """`blaze` itself, where there is no cargo to run `blaze`: the same commands."""
 
     def argv(self, command, *args):
-        return [os.path.join(os.path.dirname(BLAZE), "blaze" + EXE), command, *args]
+        return [os.path.join(os.path.dirname(BLAZE), "blaze" + EXE), command, *machine_format(command, args), *args]
 
 
 def own_toolchain(work, check):
     """A machine with no rustup and no Rust on the path (docs/self-contained.md): blaze builds
-    with its own copy of its release, laid out in `BLAZE_HOME` as rustup lays one out (here a
-    copy of rustup's, so nothing is downloaded), runs cargo and rustc from it, and the edit
+    with its own copy of its release, laid out in the machine's `~/.blaze/toolchains` (every
+    BLAZE_HOME reads that one) as rustup lays one out (here a copy of rustup's in a user's home
+    of the harness's, so nothing is downloaded), runs cargo and rustc from it, and the edit
     after the first build is the daemon's."""
     sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip() if shutil.which("rustup") else ""
     if WINDOWS or not os.path.exists(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
@@ -1068,8 +1024,10 @@ def own_toolchain(work, check):
         subprocess.run(["rustup", "target", "add", "--toolchain", TOOLCHAIN, "wasm32-wasip1"], capture_output=True)
     home = os.path.join(work, "home-own")
     os.makedirs(home, mode=0o700)
+    # The user's home of this machine: where blaze keeps its toolchains, whatever BLAZE_HOME says.
+    user = os.path.join(work, "user-own")
     host = subprocess.run([os.path.join(sysroot, "bin", "rustc"), "-vV"], capture_output=True, text=True).stdout.split("host: ")[1].split()[0]
-    own = os.path.join(home, "toolchains", f"{TOOLCHAIN}-{host}")
+    own = os.path.join(user, ".blaze", "toolchains", f"{TOOLCHAIN}-{host}")
 
     def link(source, target):
         try:
@@ -1080,8 +1038,11 @@ def own_toolchain(work, check):
     env = base_env(home)
     for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"):
         env.pop(name, None)
-    # BLAZE_HOME is the daemon's directory too.
+    # BLAZE_HOME is the daemon's directory; HOME holds the toolchain. The standard library's
+    # shared directory stays the machine's (`~/.cache/blaze`), so std is not built again.
     env["BLAZE_HOME"] = home
+    env["XDG_CACHE_HOME"] = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    env["HOME"] = user
     env["RUSTUP_HOME"] = os.path.join(work, "no-rustup")
     # A directory with Rust's programs in it is replaced by one with the rest of them: the C
     # compiler can be a script of the shell beside them (Nix).
@@ -1115,10 +1076,9 @@ def own_toolchain(work, check):
     if cold.returncode:
         side.cargo("stop")
         return
-    wait_warm(side, ws)
     rewrite(os.path.join(ws, "src/main.rs"), "6 * 7", "6 * 8")
     _, edited = side.cargo("run")
-    how = how_built(edited.stderr)
+    how = how_built(edited)
     check("and its edit is the daemon's", edited.returncode == 0 and how == "daemon" and "own 48" in edited.stdout,
           f"{how[:90]}; {edited.stderr.strip()[-300:]!r}")
     side.cargo("stop")
@@ -1148,16 +1108,13 @@ def through_link(work, check):
     env = base_env(os.path.join(work, "home-through-link"))
     ours, scratch = Side(work, env, True), Scratch(work, env)
     ours.cargo("build", *manifest)
-    began = time.time()
-    while ": ready" not in ours.cargo("status", *manifest)[1].stdout and time.time() - began < WARMUP_SECS:
-        time.sleep(0.25)
     rewrite(os.path.join(real, "ws/src/main.rs"), 'println!("{:?}"', 'println!("edited {:?}"')
     (_, mine), (_, other) = ours.cargo("run", *manifest), scratch.cargo("run", *manifest)
     wrong = difference(program_output(mine), program_output(other))
     # `bump` counts from 0, and the edit prints its tuple after `edited`.
     if not wrong and program_output(mine)[1].strip() != "edited (0, (1, 2), 3)":
         wrong = f"printed {program_output(mine)[1].strip()[-120:]!r}, and the source says `edited (0, (1, 2), 3)`"
-    how = how_built(mine.stderr)
+    how = how_built(mine)
     check("an edit of a workspace named through a link, with a path dependency outside it, is the daemon's and right",
           mine.returncode == 0 and how == "daemon" and not wrong, f"{how[:90]}; {wrong or 'same as from nothing'}; {mine.stderr.strip()[-300:]!r}")
     ours.cargo("stop", *manifest)
@@ -1189,73 +1146,10 @@ def script_links_proc_macro(work, check):
     _, mine = ours.cargo("run")
     printed = program_output(mine)[1].strip()
     wrong = None if printed == "proc_macro available: false" else f"printed {printed[-120:]!r}"
-    how = how_built(mine.stderr)
+    how = how_built(mine)
     check("a build script whose build dependency links `proc_macro` is the daemon's, and the program is right",
           mine.returncode == 0 and how == "daemon" and not wrong, f"{how[:90]}; {wrong or 'as the source says'}; {mine.stderr.strip()[-300:]!r}")
     ours.cargo("stop")
-
-
-def in_place(work, check):
-    """On Linux the daemon writes a program it linked in full in place after it answered: the
-    debug info, to where the splices write it. A program started while its file is open for
-    writing is refused ("text file busy"), so whatever is given the program waits for the
-    write. The daemon holds each write here for BLAZE_LAYOUT_PAUSE_MS (and says "laid out:
-    paused", then "written") while a client is given the program each way a user is."""
-    if not sys.platform.startswith("linux"):
-        return
-    env = dict(base_env(os.path.join(work, "home-in-place")), BLAZE_LAYOUT_PAUSE_MS="3000")
-
-    def writes():
-        """How many writes in place began and how many are over, in every worker's log."""
-        logs = glob.glob(os.path.join(env["BLAZE_HOME"], "*", "*", "log"))
-        said = "".join(open(log, errors="replace").read() for log in logs)
-        return said.count("laid out: paused"), said.count("laid out: written")
-
-    def still():
-        """Waits until no write is under way: what the daemon does after a client has the program."""
-        began = time.time()
-        while writes()[0] != writes()[1] and time.time() - began < 60:
-            time.sleep(0.1)
-
-    def started(name, side, ran):
-        """Has the daemon link the program of a checkout it has loaded in full, for an edit
-        that adds a thread local, which a splice leaves to the linker, and `ran` be given it.
-        The result is how the program ran, who built it, and the writes under way when the
-        client had it."""
-        for file, text in FLAG_WORKSPACE.items():
-            os.makedirs(os.path.dirname(os.path.join(side.ws, file)), exist_ok=True)
-            open(os.path.join(side.ws, file), "w").write(text)
-        side.cargo("build")
-        wait_warm(side, side.ws)
-        still()
-        side.how_built("")
-        before = writes()[0]
-        main = os.path.join(side.ws, "app/src/main.rs")
-        rewrite(main, 'println!("{:?}", sum.ok());', 'println!("{:?} {}", sum.ok(), IN_PLACE.with(|it| it.get()));')
-        open(main, "a").write("\nthread_local! {\n    static IN_PLACE: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };\n}\n")
-        out, how, under_way = ran(side)
-        written = writes()[0] - before
-        still()
-        held = out.returncode == 0 and how == "daemon" and written > 0 and not under_way
-        check(f"{name}, while the daemon writes it in place, starts", held,
-              f"{how[:90]}; {written} written in place, {under_way} under way when the client had it; exit {out.returncode}; {out.stderr.strip()[-300:]!r}")
-
-    def by_path(side):
-        _, built = side.cargo("build")
-        paused, written = writes()
-        try:
-            ran = subprocess.run([os.path.join(side.ws, "target/debug/app" + EXE), "in-place"], capture_output=True, text=True, timeout=60)
-        except OSError as refused:
-            ran = subprocess.CompletedProcess([], 126, "", f"could not start it: {refused}")
-        return (ran if built.returncode == 0 else built), side.how_built(built.stderr), paused - written
-
-    def by_run(side):
-        _, ran = side.cargo("run", "in-place")
-        return ran, side.how_built(ran.stderr), 0
-
-    started("the program by its path after `blaze build`", Side(os.path.join(work, "in-place-build"), env, True), by_path)
-    started("`blaze run`", Side(os.path.join(work, "in-place-run"), env, True), by_run)
-    subprocess.run([BLAZE, "stop"], env=env, capture_output=True)
 
 
 # A program with a build script whose output it includes: a clean takes that away too.
@@ -1268,20 +1162,19 @@ CLEANED = {
 
 def cleaned(work, check):
     """A clean while the daemon runs (#721): `blaze clean`, `cargo clean` and `rm -rf
-    target` take away what its worker wrote under the target directory, the standard
-    library's unit among them, and tell it nothing. The next build is the same worker's,
-    which writes again what is gone, and so is an edit after it."""
+    target` take away what it wrote under the target directory, the standard library's unit
+    among them, and tell it nothing. The next build is the same daemon's (v1's check was of the
+    same worker), which writes again what is gone, and so is an edit after it."""
     ws = os.path.realpath(os.path.join(work, "cleaned"))
     for file, text in CLEANED.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
     env = base_env(os.path.join(work, "home-cleaned"))
     here = Side(ws, env, True)
-    workers = lambda: re.findall(r"worker: pid (\d+)", here.cargo("status")[1].stdout)
+    pid = lambda: daemon_pid(env["BLAZE_HOME"])
     _, first = here.cargo("run")
-    wait_warm(here, ws)
-    before = workers()
-    check("a program with a build script's output is the daemon's", first.returncode == 0 and how_built(first.stderr) == "daemon" and "hello from the script" in first.stdout, f"exit {first.returncode}, {first.stderr.strip()[-300:]!r}")
+    before = pid()
+    check("a program with a build script's output is the daemon's", first.returncode == 0 and how_built(first) == "daemon" and "hello from the script" in first.stdout, f"exit {first.returncode}, {first.stderr.strip()[-300:]!r}")
     cleans = [
         ("`blaze clean`", lambda: here.cargo("clean")),
         ("`cargo clean`", lambda: timed(["cargo", "clean"], ws, env)),
@@ -1290,11 +1183,11 @@ def cleaned(work, check):
     for at, (name, clean) in enumerate(cleans):
         clean()
         _, again = here.cargo("run")
-        held = again.returncode == 0 and how_built(again.stderr) == "daemon" and "hello from the script" in again.stdout and workers() == before
-        check(f"a build after {name} while the daemon runs is the same worker's, and runs", held, f"exit {again.returncode}, workers {before} then {workers()}, {again.stderr.strip()[-300:]!r}")
+        held = again.returncode == 0 and how_built(again) == "daemon" and "hello from the script" in again.stdout and before is not None and pid() == before
+        check(f"a build after {name} while the daemon runs is the same daemon's, and runs", held, f"exit {again.returncode}, daemon {before} then {pid()}, {again.stderr.strip()[-300:]!r}")
         rewrite(os.path.join(ws, "src/main.rs"), "hello", f"edit {at}")
         _, edited = here.cargo("run")
-        held = edited.returncode == 0 and how_built(edited.stderr) == "daemon" and f"edit {at} from the script" in edited.stdout
+        held = edited.returncode == 0 and how_built(edited) == "daemon" and f"edit {at} from the script" in edited.stdout
         check("and an edit after it", held, f"exit {edited.returncode}, {edited.stderr.strip()[-300:]!r}")
         rewrite(os.path.join(ws, "src/main.rs"), f"edit {at}", "hello")
     here.cargo("stop")
@@ -1315,7 +1208,6 @@ def manners(work, ws, env, here, check, edit):
         check(f"`{' '.join(argv)}` lists the commands and exits 0", ran.returncode == 0 and listed, f"exit {ran.returncode}")
 
     here.cargo("build")
-    wait_warm(here, ws)
     for argv in ([BLAZE, "status"], [BLAZE, "tables", "--format=json"], [BLAZE, "--help"], ["blaze", "status"], ["blaze", "--help"]):
         shown = subprocess.Popen(argv, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         shown.stdout.close()
@@ -1331,7 +1223,6 @@ def manners(work, ws, env, here, check, edit):
         edit(ws, f"stopped {turn}")
         _, after = here.cargo("run")
         left.append(after.returncode == 0 and "hello world" in after.stdout and "answer" not in after.stderr and "EOF" not in after.stderr)
-        wait_warm(here, ws)
     check("a build straight after `stop` starts a daemon and is not a fallback over the one leaving", all(left), f"{sum(left)} of 5")
     here.cargo("stop")
 
@@ -1340,17 +1231,16 @@ def manners(work, ws, env, here, check, edit):
     for file, name in ((main, "the program's crate"), (lib, "a library of the workspace")):
         kept = open(file).read()
         here.cargo("build")
-        wait_warm(here, ws)
         open(file, "a").write(USE_AFTER_MOVE)
         _, wrong = here.cargo("run")
         # The daemon refuses an edit its borrow checker finds wrong, as one with a type error,
         # and says what is.
-        check(f"a use after a move in {name} is the daemon's error on a warm `blaze run`", wrong.returncode == 101 and "error[E0382]" in wrong.stderr, f"exit {wrong.returncode}, {how_built(wrong.stderr)}")
+        check(f"a use after a move in {name} is the daemon's error on a warm `blaze run`", wrong.returncode == 101 and "error[E0382]" in wrong.stderr, f"exit {wrong.returncode}, {how_built(wrong)}")
         _, checked = here.cargo("check")
         check("and `blaze check` of it", checked.returncode == 101 and "E0382" in checked.stderr, f"exit {checked.returncode}")
         open(file, "w").write(kept)
         _, mended = here.cargo("run")
-        check("and the build once it is mended is right", mended.returncode == 0 and "hello world" in mended.stdout, how_built(mended.stderr))
+        check("and the build once it is mended is right", mended.returncode == 0 and "hello world" in mended.stdout, how_built(mended))
     here.cargo("stop")
 
 
@@ -1384,10 +1274,9 @@ def abuse(work, ws, tree, env, check, status, alive):
     sides = [Side(root, env, True) for root in trees]
     for side in sides:
         side.cargo("build")
-    for side in sides:
-        wait_warm(side, side.ws)
-    pid, workers, _ = status()
-    spawn = lambda root, *args: subprocess.Popen(["blaze", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
+    pid = status()
+    # A client as a user starts one, with the format its build is read by (`machine_format`).
+    spawn = lambda root, *args: subprocess.Popen(["blaze", *args[:1], *machine_format(args[0], args[1:]), *args[1:]], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
     # Round after round, as a client's program is started while the others put theirs in
     # place, which on macOS lost one program in a few hundred. `app` is its package's
     # `default-run`: the program is blaze's to start, not cargo's.
@@ -1398,15 +1287,19 @@ def abuse(work, ws, tree, env, check, status, alive):
         for n, root in enumerate(trees):
             rewrite(os.path.join(root, "util/src/lib.rs"), f'format!("{greeting(n, r - 1)} {{name}}")', f'format!("{greeting(n, r)} {{name}}")')
         clients = [(n, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees)]
-        ended = [(n, i // 4, *finished(client, 300)) for i, (n, client) in enumerate(clients)]
-        served += sum(how_built(err) == "daemon" for _, _, (_, err), _ in ended)
-        wrong += [f"; round {r} tree{n} c{i}: exit {code}, {out[-80:]!r} {err[-200 if code is not None else -2000:]!r}" for n, i, (out, err), code in ended if code != 0 or not greets(out, f"{greeting(n, r)} c{i}")]
-    check(f"16 clients at once on 4 worktrees each run their own tree's program, {rounds} times over", not wrong and served == 16 * rounds and status()[0] == pid and status()[1] == workers, f"{16 * rounds - len(wrong)} of {16 * rounds} right, {served} by the daemon alone, {len(workers)} worker" + "".join(wrong))
+        ended = []
+        for i, (n, client) in enumerate(clients):
+            (out, err), code = finished(client, 300)
+            ended.append((n, i // 4, read_build(subprocess.CompletedProcess(client.args, code, out, err)), code))
+        served += sum(how_built(ran) == "daemon" for _, _, ran, _ in ended)
+        wrong += [f"; round {r} tree{n} c{i}: exit {code}, {ran.stdout[-80:]!r} {ran.stderr[-200 if code is not None else -2000:]!r}" for n, i, ran, code in ended if code != 0 or not greets(ran.stdout, f"{greeting(n, r)} c{i}")]
+    check(f"16 clients at once on 4 worktrees each run their own tree's program, {rounds} times over", not wrong and served == 16 * rounds and status() == pid, f"{16 * rounds - len(wrong)} of {16 * rounds} right, {served} by the daemon alone" + "".join(wrong))
 
-    # A worker that is stopped holds the build a client asks for until it is continued.
+    # A daemon that is stopped holds the build a client asks for until it is continued (v1
+    # stopped its workers; v2's daemon does the work itself).
     edit = lambda text: open(os.path.join(ws, "app/src/main.rs"), "a").write(f"\n// {text}\n")
-    held = lambda: [os.kill(p, signal.SIGSTOP) for p in workers]
-    freed = lambda: [os.kill(p, signal.SIGCONT) for p in workers if alive(p)]
+    held = lambda: os.kill(pid, signal.SIGSTOP)
+    freed = lambda: alive(pid) and os.kill(pid, signal.SIGCONT)
     edit("held one")
     held()
     client = spawn(ws, "build")
@@ -1416,7 +1309,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     client.wait()
     freed()
     _, after = here.cargo("run", "again")
-    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and greets(after.stdout, "tree0 again") and status()[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and greets(after.stdout, "tree0 again") and status() == pid and how_built(after) == "daemon", how_built(after))
 
     edit("held two")
     held()
@@ -1426,32 +1319,31 @@ def abuse(work, ws, tree, env, check, status, alive):
     os.kill(pid, signal.SIGKILL)
     freed()
     out, err = client.communicate(timeout=600)
-    said = how_built(err)
-    check("the build whose daemon is killed is right, by a daemon started in its place", waits and client.returncode == 0 and greets(out, "tree0 killed") and said == "daemon" and status()[0] not in (None, pid), f"exit {client.returncode}, {said}, {err.strip()[-200:]}")
-    time.sleep(1)
-    check("the workers of the killed daemon are gone", not any(alive(p) for p in workers), f"{workers}")
-    wait_warm(here, ws)
+    killed = read_build(subprocess.CompletedProcess(client.args, client.returncode, out, err))
+    said = how_built(killed)
+    check("the build whose daemon is killed is right, by a daemon started in its place", waits and client.returncode == 0 and greets(killed.stdout, "tree0 killed") and said == "daemon" and status() not in (None, pid), f"exit {client.returncode}, {said}, {err.strip()[-200:]}")
     edit("after")
     _, after = here.cargo("run", "after")
-    check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status()[0] not in (None, pid) and how_built(after.stderr) == "daemon", how_built(after.stderr))
+    check("the build after that is a new daemon's", after.returncode == 0 and greets(after.stdout, "tree0 after") and status() not in (None, pid) and how_built(after) == "daemon", how_built(after))
 
     other = os.path.join(work, "other-build")
     older = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
-    pid = status()[0]
-    seen = next((line for line in older.cargo("status")[1].stdout.splitlines() if line.startswith("daemon:")), "")
-    check("status by another build says the daemon is another build, and leaves it", "another build of blaze" in seen and status()[0] == pid, seen)
+    pid = status()
+    # v1 also read `blaze status`'s `daemon:` line, which said the daemon was another build;
+    # v2's `blaze status --json` names only the daemon's build hash, so only that it is left is
+    # checked.
+    asked = older.cargo("status")[1]
+    check("status by another build leaves the daemon", asked.returncode == 0 and status() == pid, f"exit {asked.returncode}, pid {pid} then {status()}")
     # With no cargo to build in its place (docs/no-rustc.md), the build replaces the daemon
     # and is the new one's.
     edit("skew")
     _, skewed = older.cargo("run", "skew")
-    said, newer = how_built(skewed.stderr), status(older)[0]
+    said, newer = how_built(skewed), status()
     check("a build by another build of blaze replaces the daemon and is the new one's", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and said == "daemon" and newer not in (None, pid) and not alive(pid), f"{said}, pid {pid} then {newer}")
-    wait_warm(older, ws)
     edit("back")
     _, back = here.cargo("run", "back")
-    said, again = how_built(back.stderr), status()[0]
+    said, again = how_built(back), status()
     check("and the first build of blaze replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and said == "daemon" and again not in (None, newer) and not alive(newer), f"{said}, pid {newer} then {again}")
-    wait_warm(here, ws)
 
     stranger(env["BLAZE_HOME"], check)
     here.cargo("stop")
@@ -1483,12 +1375,13 @@ def cbor(value):
     raise TypeError(value)
 
 
-# The daemon answers a message of another schema as one of another version (`Restart`).
-SCHEMA = int(re.search(r"^pub const SCHEMA: u32 = (\d+);", open(os.path.join(ROOT, "crates/blaze-protocol/src/lib.rs")).read(), re.M)[1])
+# The schema of the agent API's bodies, which an envelope names (blaze_api::SCHEMA).
+SCHEMA = int(re.search(r"^pub const SCHEMA: u32 = (\d+);", open(os.path.join(ROOT, "crates/blaze-api/src/lib.rs")).read(), re.M)[1])
 
 
 def framed(body):
-    """A request as the daemon reads one: a frame of a `blaze_protocol::Message`."""
+    """A request as the daemon reads one: a frame of a `blaze_api::Envelope`, its length and
+    its deterministic CBOR (crates/blaze-api/src/frames.rs, `encode_into`)."""
     item = cbor({"schema": SCHEMA, "id": 1, "body": body})
     return (len(item).to_bytes(4, "big") + item).hex()
 
@@ -1510,9 +1403,10 @@ def stranger(home, check):
     else:
         sudo("userdel", name)
         made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
-    sock = os.path.join(home, "daemon.sock")
-    version = re.search(r"version (\S+),", subprocess.run(["blaze", "status"], env=dict(os.environ, BLAZE_HOME=home, PATH=os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
-    request = framed({"version": version, "replaces": False, "request": "Status"})
+    # The daemon's socket (blaze_api::client::socket). v1's request named the daemon's version,
+    # read from `blaze status`; v2's carries its schema alone.
+    sock = os.path.join(home, "v2.sock")
+    request = framed("Status")
     def knock(user):
         run = subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/")
         # What went wrong before the request was made, where nothing was printed.
@@ -1536,8 +1430,8 @@ def stranger(home, check):
             os.chmod(sock, 0o600)
             for at, mode in opened:
                 os.chmod(at, mode)
-        log = open(os.path.join(home, "daemon.log")).read()
-        check("with the modes opened, the daemon turns the second user away by its uid", refused.startswith("answer:") and "Status" not in refused and "the peer is user" in log, f"{refused!r}")
+        # v1 also read its log for the refusal; v2's daemon says it in no machine format.
+        check("with the modes opened, the daemon turns the second user away", refused.startswith("answer:") and "Status" not in refused, f"{refused!r}")
         mine = knock(None)
         check("and still answers its own user", "Status" in mine, mine[:60])
         # The other way round: the second user listens where BLAZE_HOME points the user's
@@ -1596,7 +1490,7 @@ def upgraded(work):
         _, ran = side.cargo("run", "--release")
         # The pin is not read, and not said but under `-v` (#837).
         notes = len(re.findall(r"^.*(own toolchain|rust-toolchain|0000000 2026-01-01).*$", ran.stderr, re.M))
-        check(f"a project pinned to rustc 1.98.1, {round} `blaze run --release`: blaze's release, no warning", ran.returncode == 0 and "anim 42" in ran.stdout and not said(ran) and how_built(ran.stderr) == "daemon" and notes == 0, f"exit {ran.returncode}, {notes} notes, {said(ran) or ran.stderr.strip()[-200:]!r}")
+        check(f"a project pinned to rustc 1.98.1, {round} `blaze run --release`: blaze's release, no warning", ran.returncode == 0 and "anim 42" in ran.stdout and not said(ran) and how_built(ran) == "daemon" and notes == 0, f"exit {ran.returncode}, {notes} notes, {said(ran) or ran.stderr.strip()[-200:]!r}")
     side.cargo("stop")
     return checks
 
@@ -1618,22 +1512,18 @@ def worktree(ours, row, build, run, edits, work):
     def step(label, command, args):
         took, ran = there.cargo(command, *args)
         row["times"][label] = (round(took, 2), None)
-        row["built"][label] = there.how_built(ran.stderr)
+        row["built"][label] = how_built(ran)
         print(f"  {label:12} blaze {took:7.2f}s  {row['built'][label]:8.80}  exit {ran.returncode}", flush=True)
         return ran
 
     if step("tree build", "build", build).returncode != 0:
         row["wrong"].append("tree build: failed")
-    took, states = wait_warm(there, tree)
-    row["times"]["tree warm-up"], row["built"]["tree warm-up"] = (round(took, 2), None), "; ".join(states)
-    print(f"  tree warm-up {took:7.2f}s  {'; '.join(states)[:150]}", flush=True)
     for file, old, new in edits:
         rewrite(os.path.join(tree, file), old, new)
     if step("tree edit", "build", build).returncode != 0:
         row["wrong"].append("tree edit: failed")
     if run:
         _, first = ours.cargo("run", *run)
-        ours.how_built(first.stderr)
         second = step("tree run", "run", run)
         wrong = difference(program_output(second), program_output(first))
         if wrong:
@@ -1644,20 +1534,16 @@ def worktree(ours, row, build, run, edits, work):
 
 def table(rows):
     """The table of the report: for every step the seconds of `blaze` and of its build from nothing."""
-    steps = ["cold build", "warm-up", "warm build", "cold test", "test warm-up", "warm test", "edit build", "edit test", "broken", "mended", "tree build", "tree warm-up", "tree edit"]
-    out = ["| Project | " + " | ".join(steps) + " | Functions by blaze | Differences |", "|---|" + "---:|" * (len(steps) + 1) + "---|"]
+    steps = ["cold build", "warm build", "cold test", "warm test", "edit build", "edit test", "broken", "mended", "tree build", "tree edit"]
+    out = ["| Project | " + " | ".join(steps) + " | Differences |", "|---|" + "---:|" * len(steps) + "---|"]
     for row in rows:
         cells = []
         for step in steps:
             ours, fresh = row["times"].get(step, (None, None))
             who = row["built"].get(step, "")
-            mark = " (x)" if who.startswith("failed") and "warm-up" not in step else ""
-            if "warm-up" in step:
-                mark = "" if who and all(s == "ready" for s in who.split("; ")) else " (f)"
+            mark = " (x)" if who.startswith("failed") else ""
             cells.append("-" if ours is None else f"{ours:.2f}{mark}" if fresh is None else f"{'**' if who == 'daemon' else ''}{ours:.2f}{'**' if who == 'daemon' else ''}{mark} / {fresh:.2f}")
-        done, of = row.get("share", (0, 0))
-        share = f"{done} of {of} ({100 * done // of}%)" if of else "-"
-        out.append(f"| {row['project']} {row['tag']} | " + " | ".join(cells) + f" | {share} | {len(row['wrong'])} |")
+        out.append(f"| {row['project']} {row['tag']} | " + " | ".join(cells) + f" | {len(row['wrong'])} |")
     return "\n".join(out)
 
 
@@ -1682,8 +1568,8 @@ def main():
                     shutil.rmtree(os.path.join(work, name), ignore_errors=True)
     if "--only-projects" not in argv and not alone:
         print("flags:", flush=True)
-        rows, wrong, counted = flags(work)
-        result["flags"], result["flags_status"] = rows, counted
+        rows, wrong = flags(work)
+        result["flags"] = rows
         result["wrong"] += wrong
         print("daemon:", flush=True)
         result["daemon"] = daemon(work)
@@ -1698,12 +1584,12 @@ def main():
     rows = {(row["project"], row.get("mode", "blaze")): row for row in before.get("projects", []) + result["projects"]}
     result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
     if "--only-projects" in argv or alone:
-        kept = ("flags", "flags_status", "daemon") + (() if alone else ("upgraded",))
+        kept = ("flags", "daemon") + (() if alone else ("upgraded",))
         result.update({part: before.get(part, []) for part in kept})
     json.dump(result, open(stored, "w"), indent=1)
     with open(os.path.join(HERE, "BLAZE-CLI.md"), "w") as md:
         md.write("# blaze and its daemon\n\nGenerated by `harness/blaze_cli.py`. Seconds, blaze / blaze from nothing for the same step; the steps in the second checkout (`tree`) are blaze's only. "
-                 "Bold is a build that finished; `(x)` one that failed, with its error below; `(f)` a warm-up that failed. "
+                 "Bold is a build that finished; `(x)` one that failed, with its error below. "
                  "The profile picks the backend: dev is Cranelift's, release LLVM's. "
                  "Differences counts the steps whose program output, exit status or test results were not those of the build from nothing, "
                  "or that failed on their own.\n\n")
@@ -1720,7 +1606,7 @@ def main():
             md.write("\n## Daemon\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["daemon"]))
         if result.get("upgraded"):
             md.write("\n## After an upgrade, and a project pinned to another release\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["upgraded"]))
-    # A failed run keeps its workers' logs for CI's upload (blaze-platform.yaml's blaze-cli-logs).
+    # A failed run keeps its work directory, the daemons' logs in it, for CI's upload (blaze-platform.yaml's blaze-cli-logs).
     if "--keep" not in argv and not result["wrong"]:
         shutil.rmtree(work, ignore_errors=True)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))

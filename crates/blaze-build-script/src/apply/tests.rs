@@ -130,7 +130,10 @@ fn link_args_reach_their_targets() {
     };
     let linked = [Linked { own: true, output: &own }, Linked { own: false, output: &dep }];
     let pkg = package(vec![]);
-    let args = |target: &Target, test| Compile::of(&pkg, target, test, &linked, &[]).link_args;
+    let args = |target: &Target, test| {
+        let compile = Compile::of(&pkg, target, test, &linked, &[]);
+        compile.link_args.into_iter().map(|it| it.arg).collect::<Vec<_>>()
+    };
     assert_eq!(args(&target("one", "bin", "bin"), false), ["all", "bins", "one"]);
     assert_eq!(args(&target("two", "bin", "bin"), false), ["all", "bins"]);
     assert_eq!(args(&target("t", "test", "bin"), true), ["all", "tests"]);
@@ -139,6 +142,9 @@ fn link_args_reach_their_targets() {
     assert_eq!(args(&target("e", "example", "cdylib"), false), ["all"]);
     assert_eq!(args(&target("c", "cdylib", "cdylib"), false), ["all", "cdylib", "dep-cdylib"]);
     assert_eq!(args(&target("c", "cdylib", "cdylib"), true), ["all"]);
+    // Each names the script that printed it, by its place among those linked.
+    let from = Compile::of(&pkg, &target("c", "cdylib", "cdylib"), false, &linked, &[]).link_args;
+    assert_eq!(from.iter().map(|it| it.from).collect::<Vec<_>>(), [0, 0, 1]);
 }
 
 /// `build_map`: a unit is linked with its package's script and those of the libraries it

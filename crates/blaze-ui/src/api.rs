@@ -9,8 +9,9 @@
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, Hot, HotFunction, HotSince, HotWaitKind, How, Level, LinkHow, LinkKind, Linked, NodeKind,
-    Ranked, Response, ServedCrate, TestOutcome, TestResult, Traced, Unchecked, Verb, Worked,
+    Diagnostic, FetchVerb, Hot, HotFunction, HotSince, HotWaitKind, How, Level, LinkHow, LinkKind,
+    Linked, NodeKind, Ranked, Response, ServedCrate, TestOutcome, TestResult, Traced, Unchecked,
+    Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -44,7 +45,8 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         Response::Diagnostic(diagnostic) => diagnostic_lines(out, diagnostic, 0, color),
         Response::Built { artifacts, profile, .. } => {
             for it in artifacts {
-                let (package, kind, path, content) = (&it.package, it.kind.name(), &it.path, &it.content);
+                let (package, kind, path, content) =
+                    (&it.package, it.kind.name(), &it.path, &it.content);
                 put!(out, "{} {package} {kind} at {path} ({content})\n", status("Built"));
             }
             put!(out, "{} {profile}\n", status("Finished"));
@@ -125,7 +127,8 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             put!(
                 out,
                 "committed: {} bytes, {} at most\n",
-                memory.committed, memory.committed_high_water
+                memory.committed,
+                memory.committed_high_water
             );
         }
         Response::Edited(edited) => {
@@ -137,10 +140,17 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
         Response::Packed { pack } => put!(out, "{} {} bytes\n", status("Packed"), pack.len()),
-        Response::DocPage { path, page } => put!(out, "{} {path}, {} bytes\n", status("Page"), page.len()),
+        Response::DocPage { path, page } => {
+            put!(out, "{} {path}, {} bytes\n", status("Page"), page.len())
+        }
         Response::Documented(documented) => {
             let (dir, crates) = (&documented.dir, documented.crates.len());
-            put!(out, "{} {crates} crates, {} pages in {dir}\n", status("Documented"), documented.pages);
+            put!(
+                out,
+                "{} {crates} crates, {} pages in {dir}\n",
+                status("Documented"),
+                documented.pages
+            );
         }
         Response::TestResult(result) => test_lines(out, result, color),
         Response::Ran { code, stdout, stderr } => {
@@ -192,13 +202,8 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         }
         Response::Done { ok: true } => {}
         Response::Done { ok: false } => put!(out, "{}\n", paint(RED, "failed")),
-        Response::Error(error) => {
-            put!(out, "{}: {}", paint(RED, "error"), error.what);
-            if let Some(at) = &error.at {
-                put!(out, " (at {at})");
-            }
-            out.push('\n');
-        }
+        Response::Error(error) => report_into(out, error.report(), color),
+        Response::Report { report, .. } => report_into(out, report, color),
         Response::Opened { root } => put!(out, "{} {root}\n", paint(GREEN, "opened")),
         Response::Reached(reach) => {
             put!(
@@ -257,7 +262,9 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
         }
         Response::Explored { link } => put!(out, "{link}\n"),
-        Response::Profiled { trace } => put!(out, "{} {} bytes of Chrome trace\n", status("Profiled"), trace.len()),
+        Response::Profiled { trace } => {
+            put!(out, "{} {} bytes of Chrome trace\n", status("Profiled"), trace.len())
+        }
         Response::Live(frame) => {
             let tables = frame.spans.len() + frame.counters.len() + frame.open.len();
             put!(out, "{} {tables} bytes of Arrow IPC", status("Live"));
@@ -266,14 +273,20 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
             out.push('\n');
         }
-        Response::Queried { rows, ipc } => put!(out, "{} {rows} rows, {} bytes of Arrow IPC\n", status("Queried"), ipc.len()),
+        Response::Flushed { seq } => put!(out, "{} flush {seq}\n", status("Flushed")),
         Response::Hot(hot) => hot_lines(out, hot),
         Response::Collected { report } => out.push_str(report),
         Response::UnitBegan(unit) => {
             put!(out, "{} {} ({})\n", status("Began"), unit.target.name, unit.package_id);
         }
         Response::TestReady(it) => {
-            put!(out, "{} {} at {}\n", status("Linked"), it.target.name, it.executable.as_deref().unwrap_or(&it.path));
+            put!(
+                out,
+                "{} {} at {}\n",
+                status("Linked"),
+                it.target.name,
+                it.executable.as_deref().unwrap_or(&it.path)
+            );
         }
         Response::Rebuilt(rebuilt) => crate::why::lines(out, rebuilt),
         Response::Launched { live, env } => {
@@ -285,7 +298,21 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             out.push('\n');
         }
         Response::Stopping { doing } => put!(out, "{} {doing}\n", status("Stopping")),
+        Response::Stored { path: Some(path), blake3 } => {
+            put!(out, "{} blake3:{blake3} at {path}\n", status("Stored"))
+        }
+        Response::Stored { path: None, blake3 } => {
+            put!(out, "{} blake3:{blake3} in the store\n", status("Stored"))
+        }
     }
+}
+
+/// A report as the one renderer writes it ([`blaze_report::render_into`]): no links, no
+/// wrapping, paths as the report has them; a client with a terminal and a workspace renders
+/// it with those itself.
+fn report_into(out: &mut String, report: &blaze_api::Report, color: bool) {
+    let caps = blaze_report::Caps { color, links: false, width: None };
+    blaze_report::render_into(out, report, caps, &blaze_report::Roots::NONE);
 }
 
 /// `blaze debug hot`'s table: the keys that took most, each with the bracket the sketches
@@ -315,9 +342,17 @@ pub fn hot_lines(out: &mut String, hot: &Hot) {
         };
     }
     if hot.torn > 0 {
-        _ = writeln!(out, "{} entries were read as a thread replaced them: left out of `at least`", hot.torn);
+        _ = writeln!(
+            out,
+            "{} entries were read as a thread replaced them: left out of `at least`",
+            hot.torn
+        );
     }
-    _ = writeln!(out, "{:<8} {:>9} {:>12} {:>12} {:>12} {:>12}", "wait", "count", "p50 ms", "p90 ms", "p99 ms", "max ms");
+    _ = writeln!(
+        out,
+        "{:<8} {:>9} {:>12} {:>12} {:>12} {:>12}",
+        "wait", "count", "p50 ms", "p90 ms", "p99 ms", "max ms"
+    );
     for wait in &hot.waits {
         let kind = match wait.kind {
             HotWaitKind::Key => "key",
@@ -524,10 +559,21 @@ pub fn unchecked_lines(out: &mut String, unchecked: &Unchecked, color: bool) {
                 "{note}: {skipped} unit{} not checked: the build stopped at its first failure (--fail-fast; without it what does not depend on it is checked)\n",
                 plural(skipped)
             ),
-            false => put!(out, "{note}: {skipped} unit{} not checked, behind what failed:\n", plural(skipped)),
+            false => put!(
+                out,
+                "{note}: {skipped} unit{} not checked, behind what failed:\n",
+                plural(skipped)
+            ),
         }
         for it in &unchecked.behind {
-            put!(out, "  behind {} ({}): {} unit{}\n", it.unit, it.why, it.units.len(), plural(it.units.len()));
+            put!(
+                out,
+                "  behind {} ({}): {} unit{}\n",
+                it.unit,
+                it.why,
+                it.units.len(),
+                plural(it.units.len())
+            );
             named(out, &it.units);
         }
     }
@@ -537,7 +583,11 @@ pub fn unchecked_lines(out: &mut String, unchecked: &Unchecked, color: bool) {
             1 => (1, "unit that depends on it was"),
             n => (n, "units that depend on it were"),
         };
-        put!(out, "{note}: {} failed only in its bodies or lints: {count} {them} checked against its items\n", it.unit);
+        put!(
+            out,
+            "{note}: {} failed only in its bodies or lints: {count} {them} checked against its items\n",
+            it.unit
+        );
         named(out, &it.checked);
     }
 }
@@ -800,6 +850,7 @@ mod tests {
             reran: 12,
             green: 300,
             served: Vec::new(),
+            build_id: None,
             compiled: 2,
             found: 40,
             link: LinkKind::Patched,
@@ -850,6 +901,7 @@ mod tests {
             reran: 0,
             green: 0,
             served: Vec::new(),
+            build_id: None,
             compiled: 0,
             found: 0,
             link: LinkKind::Placed,
@@ -894,7 +946,8 @@ mod tests {
             )
         );
         assert!(text.ends_with('\n'));
-        let lines: Vec<serde_json::Value> = text.lines().map(|it| serde_json::from_str(it).unwrap()).collect();
+        let lines: Vec<serde_json::Value> =
+            text.lines().map(|it| serde_json::from_str(it).unwrap()).collect();
         assert_eq!(lines.len(), 2);
         for (line, it) in lines.iter().zip(&served) {
             assert_eq!(line["reason"], "blaze-served");
@@ -997,18 +1050,21 @@ mod tests {
             outcome: TestOutcome::Unreached,
             ..result
         };
-        assert_eq!(lines(&Response::TestResult(kept), false), "test parses ... ok (cached, 9 ms)\n");
+        assert_eq!(
+            lines(&Response::TestResult(kept), false),
+            "test parses ... ok (cached, 9 ms)\n"
+        );
     }
 
     #[test]
     fn a_candidates_lines_are_marked_with_it() {
         let inner = Response::Error(ApiError::new("no such file", Some("src/a.rs".to_owned())));
         let of = Response::Of { candidate: 2, response: Box::new(inner) };
-        assert_eq!(lines(&of, false), "[2] error: no such file (at src/a.rs)\n");
+        assert_eq!(lines(&of, false), "[2] error: no such file\n[2]   ─ src/a.rs\n");
         // After what `out` had, which stays as it was.
         let mut out = "before\n".to_owned();
         lines_into(&mut out, &of, false);
-        assert_eq!(out, "before\n[2] error: no such file (at src/a.rs)\n");
+        assert_eq!(out, "before\n[2] error: no such file\n[2]   ─ src/a.rs\n");
     }
 
     #[test]

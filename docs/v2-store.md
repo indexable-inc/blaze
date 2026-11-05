@@ -94,10 +94,15 @@ another format and nothing is skipped.
 
 Query results, compiled code, outputs and the image are **hot**: kept raw and read in place. Debug
 info and build-script runs are **cold**: read rarely, kept zstd (level 6) with a dictionary of
-their kind. A cold kind's first values are kept raw; once 256 of them (2 MiB) are there, a
-64 KiB dictionary is trained on them, written as a record and listed in the head, and the kind's
-values from then on are compressed with it. A training that fails is in `Store::problems` and is
-tried again on twice the samples. A cold value of 8 MiB or more gets no dictionary but zstd's
+their kind. A cold kind's first values are kept raw; once 256 of them (2 MiB) are there, or the
+4096 samples kept are full (a kind of short values, as debug info is, never reaches 2 MiB in
+4096), a 64 KiB dictionary is trained on them, written as a record and listed in the head, and
+the kind's values from then on are compressed with it. Samples are distinct values, each kept
+once however often it is put or a settle meets it, and held in memory only: a store opened again
+samples its puts anew, and its settles sample the kind's raw records. A training that fails is
+in `Store::problems` and is tried again on twice the samples; samples full that did not train
+(fewer than 256 distinct values, or a failed training) give it up until the store is opened
+again, with a problem naming the kind. A cold value of 8 MiB or more gets no dictionary but zstd's
 long-distance matching over a 128 MiB window, on 4 threads: a fixed count, so the bytes are the
 same on every machine. zstd refusing a value stops the store; it is never kept another way. A
 compressed value is decompressed on read and held until the store is next changed. Each
@@ -196,7 +201,7 @@ has is durable at once. A layer that is not there stops the store.
 ## A shared store
 
 `Store::open_shared` opens a store several daemons on one machine write at once: one build's
-std under `<user cache>/blaze/std/<blaze build id>/store`, shared by every BLAZE_HOME. No lock
+std under `<user cache>/blaze/std/<makers>/store` (`<makers>`: blaze-cargo's `serve::RecordMakers`), shared by every BLAZE_HOME. No lock
 is taken. Each daemon is a writer (`SharedConfig::writer`, one per BLAZE_HOME) with a store
 directory of its own in the shared one, `w-<writer>`, written as any store is, so two daemons'
 commits never touch one file. Every other writer's directory is read as a layer behind its own,
@@ -250,8 +255,10 @@ and NUMA-local mappings) is in docs/v2/requests/store.md; threads and pinning ar
 `Store::settle` is called by the daemon when it is idle. Each call is a period: what was read
 and what was made in it and in the one before is known from four bit columns (`flags.rs`). It
 moves records between tiers by how recently they were read, copying each into a new record and
-leaving the old one dead. A record of 4 KiB or more moves a tier colder once it was neither read
-nor made in the last two periods:
+leaving the old one dead. A record of 4 KiB or more, or a shorter one of a cold kind once that
+kind has a dictionary, moves a tier colder once it was neither read nor made in the last two
+periods (a short record counts as 4 KiB toward a settle's bound, short records take at most a
+quarter of it, and a short record never comes back hot):
 
 - a value of a schema the store was given `BufferColumns` for (`Store::encode_columns`) goes from hot
   to warm columns, or straight to cold where warm saves less than an eighth, and from warm to

@@ -67,11 +67,11 @@ trait B: A {}
 
 fn test<'a>(
     _: &(dyn A<Assoc = ()> + Send),
-  //^ &(dyn A<Assoc = ()> + Send + 'static)
+  //^ &(dyn A<Assoc = ()> + Send)
     _: &'a (dyn Send + A<Assoc = ()>),
-  //^ &(dyn A<Assoc = ()> + Send + 'static)
+  //^ &(dyn A<Assoc = ()> + Send)
     _: &dyn B<Assoc = ()>,
-  //^ &(dyn B<Assoc = ()> + 'static)
+  //^ &dyn B<Assoc = ()>
 ) {}
         "#,
     );
@@ -85,7 +85,7 @@ fn render_dyn_for_ty() {
 trait Foo<'a> {}
 
 fn foo(foo: &dyn for<'a> Foo<'a>) {}
-    // ^^^ &(dyn Foo<'?0.0> + 'static)
+    // ^^^ &dyn Foo<'?0.0>
 "#,
     );
 }
@@ -97,7 +97,7 @@ fn render_dyn_ty_under_enclosing_binder() {
 //- minicore: fn
 fn test(f: impl for<'b> Fn(&dyn Fn() -> &'b u8)) {
     f;
-  //^ impl Fn(&(dyn Fn() -> &u8 + 'static))
+  //^ impl Fn(&dyn Fn() -> &u8)
 }
 "#,
     );

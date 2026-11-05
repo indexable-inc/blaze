@@ -22,8 +22,25 @@ pub fn tree_digest(workspace: &Path) -> io::Result<String> {
 
 /// The BLAKE3 hash of the executable running now, as 64 hex digits.
 pub fn binary() -> io::Result<String> {
+    Ok(hex(&binary_hash()?))
+}
+
+/// The BLAKE3 hash of the executable running now, read once a process: the executable is not
+/// written in place while it runs (see ix-prof's `map`), so the first hash is every later one.
+/// A read that fails is not kept, and the next call tries again.
+pub fn binary_hash() -> io::Result<[u8; 32]> {
+    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if let Some(hash) = HASH.get() {
+        return Ok(*hash);
+    }
     let exe = std::env::current_exe()?;
-    Ok(hex(&tree::hash_file(&exe)?.1))
+    let hash = tree::hash_file(&exe)?.1;
+    Ok(*HASH.get_or_init(|| hash))
+}
+
+/// `hash` as 64 hex digits.
+pub fn hex_of(hash: &[u8; 32]) -> String {
+    hex(hash)
 }
 
 fn hex(hash: &[u8; 32]) -> String {
@@ -41,7 +58,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-identity-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-identity-{name}-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         dir

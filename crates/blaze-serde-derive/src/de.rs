@@ -14,7 +14,8 @@ const DE: &str = "::blaze_serde::serde::de";
 const OK: &str = "::core::result::Result::Ok";
 const SOME: &str = "::core::option::Option::Some";
 const NONE: &str = "::core::option::Option::None";
-const MARKERS: &str = "{ __marker: ::core::marker::PhantomData, __lifetime: ::core::marker::PhantomData }";
+const MARKERS: &str =
+    "{ __marker: ::core::marker::PhantomData, __lifetime: ::core::marker::PhantomData }";
 
 pub(crate) fn derive(item: &Item) -> Result<TokenStream, Error> {
     check(item)?;
@@ -48,7 +49,9 @@ fn check(item: &Item) -> Result<(), Error> {
         let span = item.ident.span();
         Err(Error::new(span, format!("`{}` ({}): {what}", item.name(), at(span))))
     };
-    let newtype_skip = |fields: &Fields| fields.style == Style::Tuple && fields.list.len() == 1 && fields.list[0].attrs.skip;
+    let newtype_skip = |fields: &Fields| {
+        fields.style == Style::Tuple && fields.list.len() == 1 && fields.list[0].attrs.skip
+    };
     match &item.data {
         Data::Struct(fields) => {
             if newtype_skip(fields) && !item.attrs.transparent {
@@ -57,7 +60,9 @@ fn check(item: &Item) -> Result<(), Error> {
         }
         Data::Enum(variants) => {
             if variants.is_empty() {
-                return refuse("blaze-serde-derive derives `Deserialize` for an enum with variants only");
+                return refuse(
+                    "blaze-serde-derive derives `Deserialize` for an enum with variants only",
+                );
             }
             if item.attrs.tag.is_none() && variants.iter().any(|it| it.attrs.other) {
                 return refuse("`#[serde(other)]` is read in an internally tagged enum only");
@@ -120,10 +125,15 @@ fn bounds(item: &Item) -> Vec<TokenStream> {
     for param in item.generics.type_params() {
         let ty: TokenStream = TokenStream::from(proc_macro::TokenTree::Ident(param.clone()));
         let named = |it: &&&Field| generics::mentions(&it.ty, param);
-        if fields.iter().filter(named).any(|it| !it.attrs.skip && it.attrs.deserialize_with.is_none() && it.attrs.borrow_cow.is_none()) {
+        if fields.iter().filter(named).any(|it| {
+            !it.attrs.skip && it.attrs.deserialize_with.is_none() && it.attrs.borrow_cow.is_none()
+        }) {
             out.push(predicate(&ty, ": ::blaze_serde::Deserialize<'de>"));
         }
-        if fields.iter().filter(named).any(|it| matches!(it.attrs.default, Some(DefaultOf::Trait)) || (it.attrs.skip && it.attrs.default.is_none())) {
+        if fields.iter().filter(named).any(|it| {
+            matches!(it.attrs.default, Some(DefaultOf::Trait))
+                || (it.attrs.skip && it.attrs.default.is_none())
+        }) {
             out.push(predicate(&ty, ": ::core::default::Default"));
         }
     }
@@ -175,9 +185,14 @@ impl<'i> Gen<'i> {
     /// Through `from` or `try_from`: the other type read, then converted.
     fn convert(from: &TokenStream, fallible: bool) -> TokenStream {
         let mut out = Out::default();
-        out.s("let __value = <").tokens(from).s("as ::blaze_serde::Deserialize<'de>>::deserialize(__deserializer)?;");
+        out.s("let __value = <")
+            .tokens(from)
+            .s("as ::blaze_serde::Deserialize<'de>>::deserialize(__deserializer)?;");
         match fallible {
-            false => out.s(&format!("{OK}(<Self as ::core::convert::From<")).tokens(from).s(">>::from(__value))"),
+            false => out
+                .s(&format!("{OK}(<Self as ::core::convert::From<"))
+                .tokens(from)
+                .s(">>::from(__value))"),
             true => out
                 .s("<Self as ::core::convert::TryFrom<")
                 .tokens(from)
@@ -196,7 +211,9 @@ impl<'i> Gen<'i> {
                     default_of(&mut out, field, None);
                 }
                 false => {
-                    out.s("<").tokens(&store.ty).s("as ::blaze_serde::Deserialize<'de>>::deserialize(__deserializer)?");
+                    out.s("<")
+                        .tokens(&store.ty)
+                        .s("as ::blaze_serde::Deserialize<'de>>::deserialize(__deserializer)?");
                     if store.wrapped {
                         out.s(".value");
                     }
@@ -204,7 +221,9 @@ impl<'i> Gen<'i> {
             }
             out.s(";");
         }
-        out.s(OK).paren(|out| construct(out, self.item, &Ctor { variant: None, fields, expecting: String::new() }));
+        out.s(OK).paren(|out| {
+            construct(out, self.item, &Ctor { variant: None, fields, expecting: String::new() })
+        });
         out.finish()
     }
 
@@ -224,18 +243,27 @@ impl<'i> Gen<'i> {
         let call = "::blaze_serde::serde::Deserializer::deserialize_";
         let instance = format!("__Visitor{number} {MARKERS}");
         match fields.style {
-            Style::Unit => out.s(&format!("{call}unit_struct(__deserializer,")).str(&name).s(&format!(", {instance})")),
-            Style::Tuple if fields.list.len() == 1 => {
-                out.s(&format!("{call}newtype_struct(__deserializer,")).str(&name).s(&format!(", {instance})"))
-            }
+            Style::Unit => out
+                .s(&format!("{call}unit_struct(__deserializer,"))
+                .str(&name)
+                .s(&format!(", {instance})")),
+            Style::Tuple if fields.list.len() == 1 => out
+                .s(&format!("{call}newtype_struct(__deserializer,"))
+                .str(&name)
+                .s(&format!(", {instance})")),
             Style::Tuple => out
                 .s(&format!("{call}tuple_struct(__deserializer,"))
                 .str(&name)
                 .s(",")
                 .usize(fields.list.iter().filter(|it| !it.attrs.skip).count())
                 .s(&format!(", {instance})")),
-            Style::Named if has_flatten(fields) => out.s(&format!("{call}map(__deserializer, {instance})")),
-            Style::Named => out.s(&format!("{call}struct(__deserializer,")).str(&name).s(&format!(", __FIELDS{number}, {instance})")),
+            Style::Named if has_flatten(fields) => {
+                out.s(&format!("{call}map(__deserializer, {instance})"))
+            }
+            Style::Named => out
+                .s(&format!("{call}struct(__deserializer,"))
+                .str(&name)
+                .s(&format!(", __FIELDS{number}, {instance})")),
         };
         out.finish()
     }
@@ -266,16 +294,30 @@ impl<'i> Gen<'i> {
             match variant.fields.style {
                 Style::Unit => {
                     arms.brace(|arms| {
-                        arms.s(&format!("{access}::unit_variant(__variant)?; {OK}(")).ident(&item.ident).s("::").ident(&variant.ident).s(")");
+                        arms.s(&format!("{access}::unit_variant(__variant)?; {OK}("))
+                            .ident(&item.ident)
+                            .s("::")
+                            .ident(&variant.ident)
+                            .s(")");
                     });
                 }
                 Style::Tuple if variant.fields.list.len() == 1 => {
                     let store = self.store(&variant.fields.list[0]);
-                    arms.s(&format!("{access}::newtype_variant::<")).tokens(&store.ty).s(">(__variant).map(|__v|");
-                    arms.ident(&item.ident).s("::").ident(&variant.ident).s(if store.wrapped { "(__v.value))," } else { "(__v)),"});
+                    arms.s(&format!("{access}::newtype_variant::<"))
+                        .tokens(&store.ty)
+                        .s(">(__variant).map(|__v|");
+                    arms.ident(&item.ident).s("::").ident(&variant.ident).s(if store.wrapped {
+                        "(__v.value)),"
+                    } else {
+                        "(__v)),"
+                    });
                 }
                 Style::Tuple | Style::Named => {
-                    let ctor = Ctor { variant: Some(variant), fields: &variant.fields, expecting: variant_expecting(&name, variant) };
+                    let ctor = Ctor {
+                        variant: Some(variant),
+                        fields: &variant.fields,
+                        expecting: variant_expecting(&name, variant),
+                    };
                     let (visitor, number) = self.visitor(&ctor, deny, None);
                     out.tokens(&visitor);
                     let instance = format!("__Visitor{number} {MARKERS}");
@@ -284,7 +326,9 @@ impl<'i> Gen<'i> {
                             .s(&format!("{access}::tuple_variant(__variant,"))
                             .usize(variant.fields.list.iter().filter(|it| !it.attrs.skip).count())
                             .s(&format!(", {instance}),")),
-                        _ => arms.s(&format!("{access}::struct_variant(__variant, __FIELDS{number}, {instance}),")),
+                        _ => arms.s(&format!(
+                            "{access}::struct_variant(__variant, __FIELDS{number}, {instance}),"
+                        )),
                     };
                 }
             }
@@ -303,7 +347,9 @@ impl<'i> Gen<'i> {
                 });
             });
         });
-        out.s("::blaze_serde::serde::Deserializer::deserialize_enum(__deserializer,").str(&name).s(&format!(", __VARIANTS, __Visitor {MARKERS})"));
+        out.s("::blaze_serde::serde::Deserializer::deserialize_enum(__deserializer,")
+            .str(&name)
+            .s(&format!(", __VARIANTS, __Visitor {MARKERS})"));
         out.finish()
     }
 
@@ -326,17 +372,31 @@ impl<'i> Gen<'i> {
             match variant.fields.style {
                 Style::Unit => {
                     arms.brace(|arms| {
-                        arms.s("::blaze_serde::__private::tagged_unit(__inner,").str(&name).s(",").str(&variant.key).s(&format!(")?; {OK}("));
+                        arms.s("::blaze_serde::__private::tagged_unit(__inner,")
+                            .str(&name)
+                            .s(",")
+                            .str(&variant.key)
+                            .s(&format!(")?; {OK}("));
                         arms.ident(&item.ident).s("::").ident(&variant.ident).s(")");
                     });
                 }
                 Style::Tuple => {
                     let store = self.store(&variant.fields.list[0]);
-                    arms.s("<").tokens(&store.ty).s("as ::blaze_serde::Deserialize<'de>>::deserialize(__inner).map(|__v|");
-                    arms.ident(&item.ident).s("::").ident(&variant.ident).s(if store.wrapped { "(__v.value))," } else { "(__v)),"});
+                    arms.s("<")
+                        .tokens(&store.ty)
+                        .s("as ::blaze_serde::Deserialize<'de>>::deserialize(__inner).map(|__v|");
+                    arms.ident(&item.ident).s("::").ident(&variant.ident).s(if store.wrapped {
+                        "(__v.value)),"
+                    } else {
+                        "(__v)),"
+                    });
                 }
                 Style::Named => {
-                    let ctor = Ctor { variant: Some(variant), fields: &variant.fields, expecting: variant_expecting(&name, variant) };
+                    let ctor = Ctor {
+                        variant: Some(variant),
+                        fields: &variant.fields,
+                        expecting: variant_expecting(&name, variant),
+                    };
                     let (visitor, number) = self.visitor(&ctor, deny, None);
                     out.tokens(&visitor);
                     arms.s(&format!("::blaze_serde::serde::Deserializer::deserialize_any(__inner, __Visitor{number} {MARKERS}),"));
@@ -347,8 +407,14 @@ impl<'i> Gen<'i> {
             Some(index) => format!("{SOME}({index})"),
             None => NONE.to_owned(),
         };
-        out.s("let __human = ::blaze_serde::serde::Deserializer::is_human_readable(&__deserializer);");
-        out.s("let (__index, __content) = ::blaze_serde::__private::tagged(__deserializer,").str(&name).s(",").str(tag).s(&format!(", __VARIANTS, {other})?;"));
+        out.s(
+            "let __human = ::blaze_serde::serde::Deserializer::is_human_readable(&__deserializer);",
+        );
+        out.s("let (__index, __content) = ::blaze_serde::__private::tagged(__deserializer,")
+            .str(&name)
+            .s(",")
+            .str(tag)
+            .s(&format!(", __VARIANTS, {other})?;"));
         out.s("let __inner = ::blaze_serde::__private::ContentRefDeserializer::<__D::Error>::new(&__content, __human);");
         out.s("match __index").brace(|out| {
             out.tokens(&arms.finish());
@@ -365,37 +431,65 @@ impl<'i> Gen<'i> {
         for variant in variants {
             match variant.fields.style {
                 Style::Unit => {
-                    tries.s(&format!("if let {OK}(()) = ::blaze_serde::__private::untagged_unit({inner})")).brace(|out| {
-                        out.s(&format!("return {OK}(")).ident(&item.ident).s("::").ident(&variant.ident).s(");");
-                    });
+                    tries
+                        .s(&format!(
+                            "if let {OK}(()) = ::blaze_serde::__private::untagged_unit({inner})"
+                        ))
+                        .brace(|out| {
+                            out.s(&format!("return {OK}("))
+                                .ident(&item.ident)
+                                .s("::")
+                                .ident(&variant.ident)
+                                .s(");");
+                        });
                 }
                 Style::Tuple if variant.fields.list.len() == 1 => {
                     let store = self.store(&variant.fields.list[0]);
-                    tries.s(&format!("if let {OK}(__v) = <")).tokens(&store.ty).s(&format!("as ::blaze_serde::Deserialize<'de>>::deserialize({inner})"));
+                    tries
+                        .s(&format!("if let {OK}(__v) = <"))
+                        .tokens(&store.ty)
+                        .s(&format!("as ::blaze_serde::Deserialize<'de>>::deserialize({inner})"));
                     tries.brace(|out| {
-                        out.s(&format!("return {OK}(")).ident(&item.ident).s("::").ident(&variant.ident).s(if store.wrapped { "(__v.value));" } else { "(__v));" });
+                        out.s(&format!("return {OK}("))
+                            .ident(&item.ident)
+                            .s("::")
+                            .ident(&variant.ident)
+                            .s(if store.wrapped { "(__v.value));" } else { "(__v));" });
                     });
                 }
                 Style::Tuple | Style::Named => {
-                    let ctor = Ctor { variant: Some(variant), fields: &variant.fields, expecting: variant_expecting(&name, variant) };
+                    let ctor = Ctor {
+                        variant: Some(variant),
+                        fields: &variant.fields,
+                        expecting: variant_expecting(&name, variant),
+                    };
                     let (visitor, number) = self.visitor(&ctor, false, None);
                     out.tokens(&visitor);
                     let instance = format!("__Visitor{number} {MARKERS}");
                     let call = match variant.fields.style {
                         Style::Tuple => {
-                            let len = variant.fields.list.iter().filter(|it| !it.attrs.skip).count();
-                            format!("::blaze_serde::serde::Deserializer::deserialize_tuple({inner}, {len}, {instance})")
+                            let len =
+                                variant.fields.list.iter().filter(|it| !it.attrs.skip).count();
+                            format!(
+                                "::blaze_serde::serde::Deserializer::deserialize_tuple({inner}, {len}, {instance})"
+                            )
                         }
-                        _ => format!("::blaze_serde::serde::Deserializer::deserialize_any({inner}, {instance})"),
+                        _ => format!(
+                            "::blaze_serde::serde::Deserializer::deserialize_any({inner}, {instance})"
+                        ),
                     };
                     tries.s(&format!("if let {OK}(__v) = {call} {{ return {OK}(__v); }}"));
                 }
             }
         }
-        out.s("let __human = ::blaze_serde::serde::Deserializer::is_human_readable(&__deserializer);");
+        out.s(
+            "let __human = ::blaze_serde::serde::Deserializer::is_human_readable(&__deserializer);",
+        );
         out.s("let __content = <::blaze_serde::__private::Content<'de> as ::blaze_serde::Deserialize<'de>>::deserialize(__deserializer)?;");
         out.tokens(&tries.finish());
-        out.s("::core::result::Result::Err(::blaze_serde::__private::no_variant::<__D::Error>(").str(&name).s("))");
+        out.s("::core::result::Result::Err(::blaze_serde::__private::no_variant::<__D::Error>(")
+            .str(&name)
+            .s("))");
         out.finish()
     }
 
@@ -431,7 +525,10 @@ impl<'i> Gen<'i> {
             item.generics.write_impl(out, &["'de"]);
             item.generics.write_where(out, &[]);
             out.brace(|out| {
-                out.s("value:").tokens(ty).s(", __marker: ::core::marker::PhantomData<fn() ->").ident(&item.ident);
+                out.s("value:")
+                    .tokens(ty)
+                    .s(", __marker: ::core::marker::PhantomData<fn() ->")
+                    .ident(&item.ident);
                 item.generics.write_args(out);
                 out.s(">, __lifetime: ::core::marker::PhantomData<&'de ()>,");
             });
@@ -483,13 +580,22 @@ impl<'i> Gen<'i> {
     }
 
     /// The visitor of `ctor`'s fields (`__FIELDS{n}` with it, for named fields), and its number.
-    fn visitor(&mut self, ctor: &Ctor<'_>, deny: bool, container_default: Option<&DefaultOf>) -> (TokenStream, usize) {
+    fn visitor(
+        &mut self,
+        ctor: &Ctor<'_>,
+        deny: bool,
+        container_default: Option<&DefaultOf>,
+    ) -> (TokenStream, usize) {
         let number = self.visitors;
         self.visitors += 1;
         let stores = self.stores(ctor.fields);
         let fields = ctor.fields;
-        let read: Vec<(&Field, &Store)> =
-            fields.list.iter().zip(&stores).filter(|(it, _)| !it.attrs.skip && !it.attrs.flatten).collect();
+        let read: Vec<(&Field, &Store)> = fields
+            .list
+            .iter()
+            .zip(&stores)
+            .filter(|(it, _)| !it.attrs.skip && !it.attrs.flatten)
+            .collect();
         let mut out = Out::default();
         if fields.style == Style::Named {
             out.s(&format!("const __FIELDS{number}: &[&str] = &"));
@@ -620,9 +726,19 @@ fn construct(out: &mut Out, item: &Item, ctor: &Ctor<'_>) {
     }
 }
 
-fn visit_seq(out: &mut Out, item: &Item, ctor: &Ctor<'_>, stores: &[Store], container_default: Option<&DefaultOf>) {
+fn visit_seq(
+    out: &mut Out,
+    item: &Item,
+    ctor: &Ctor<'_>,
+    stores: &[Store],
+    container_default: Option<&DefaultOf>,
+) {
     let fields = ctor.fields;
-    let expected = format!("{} with {} elements", ctor.expecting, fields.list.iter().filter(|it| !it.attrs.skip).count());
+    let expected = format!(
+        "{} with {} elements",
+        ctor.expecting,
+        fields.list.iter().filter(|it| !it.attrs.skip).count()
+    );
     out.s(&format!("fn visit_seq<__A>(self, mut __seq: __A) -> ::core::result::Result<Self::Value, __A::Error> where __A: {DE}::SeqAccess<'de>"));
     out.brace(|out| {
         container_default_let(out, container_default);
@@ -634,7 +750,9 @@ fn visit_seq(out: &mut Out, item: &Item, ctor: &Ctor<'_>, stores: &[Store], cont
                 out.s(";");
                 continue;
             }
-            out.s(&format!("match {DE}::SeqAccess::next_element::<")).tokens(&store.ty).s(">(&mut __seq)?");
+            out.s(&format!("match {DE}::SeqAccess::next_element::<"))
+                .tokens(&store.ty)
+                .s(">(&mut __seq)?");
             out.brace(|out| {
                 out.s(&format!("{SOME}(__v) => __v"));
                 if store.wrapped {
@@ -644,7 +762,13 @@ fn visit_seq(out: &mut Out, item: &Item, ctor: &Ctor<'_>, stores: &[Store], cont
                 match defaults(field, container_default) {
                     true => default_of(out, field, container_default),
                     false => {
-                        out.s(&format!("return ::core::result::Result::Err({DE}::Error::invalid_length(")).usize(read).s(", &").str(&expected).s("))");
+                        out.s(&format!(
+                            "return ::core::result::Result::Err({DE}::Error::invalid_length("
+                        ))
+                        .usize(read)
+                        .s(", &")
+                        .str(&expected)
+                        .s("))");
                     }
                 }
                 out.s(",");

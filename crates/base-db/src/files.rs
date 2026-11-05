@@ -21,15 +21,15 @@ use std::{
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
+use crate::{AbsPath, AbsPathBuf, FileId, FileSet, VfsPath};
 use blaze_format::cursor::Put;
+use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame, scratch};
-use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use smallvec::SmallVec;
+use std::alloc::Global;
 use triomphe::Arc;
-use crate::{AbsPath, AbsPathBuf, FileId, FileSet, VfsPath};
 
 use crate::{
     Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, ReadError, SourceRoot,
@@ -64,9 +64,15 @@ pub enum AliasError {
 impl fmt::Display for AliasError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AliasError::NotInASourceRoot(file) => write!(f, "{file:?} is in no source root, so it has no path to alias"),
-            AliasError::OfAnAlias(file) => write!(f, "{file:?} is an alias; alias the file it is of"),
-            AliasError::CrateAttr(file) => write!(f, "{file:?} is a crate attribute's file, which has no path"),
+            AliasError::NotInASourceRoot(file) => {
+                write!(f, "{file:?} is in no source root, so it has no path to alias")
+            }
+            AliasError::OfAnAlias(file) => {
+                write!(f, "{file:?} is an alias; alias the file it is of")
+            }
+            AliasError::CrateAttr(file) => {
+                write!(f, "{file:?} is a crate attribute's file, which has no path")
+            }
             AliasError::NotAnAlias(file) => write!(f, "{file:?} is not an alias"),
             AliasError::NoFileId => f.write_str("no file ID is left for an alias"),
         }
@@ -152,7 +158,9 @@ struct IncludedSource {
 /// text's bytes, and its [`FileText::content`]: an empty text with [`FileText::no_text`]'s
 /// content for a file that could not be read or is not UTF-8, which `include!` refuses before
 /// it parses it.
-fn source_text(read: &Result<std::sync::Arc<[u8]>, ReadError>) -> (syntax::Text, ContentId, ContentId) {
+fn source_text(
+    read: &Result<std::sync::Arc<[u8]>, ReadError>,
+) -> (syntax::Text, ContentId, ContentId) {
     let text = read.as_ref().ok().and_then(|bytes| {
         // clone: a count, the text shares the bytes
         let text = blaze_vfs::text_of(blaze_vfs::Bytes::from(std::sync::Arc::clone(bytes))).ok()?;
@@ -160,13 +168,20 @@ fn source_text(read: &Result<std::sync::Arc<[u8]>, ReadError>) -> (syntax::Text,
     });
     match text {
         Some((text, file)) => (text, file, FileText::content_of_file(file, None)),
-        None => (syntax::Text::from_static(""), ContentId::of(blaze_vfs::FILE_DOMAIN, b""), no_text()),
+        None => {
+            (syntax::Text::from_static(""), ContentId::of(blaze_vfs::FILE_DOMAIN, b""), no_text())
+        }
     }
 }
 
 /// The content ID of a source root that has only `file`, at `path`, with the content ID
 /// `content`: by the one rule every source root's is ([`RootContent`]).
-fn one_file_root_content(is_library: bool, file: FileId, path: &VfsPath, id: ContentId) -> ContentId {
+fn one_file_root_content(
+    is_library: bool,
+    file: FileId,
+    path: &VfsPath,
+    id: ContentId,
+) -> ContentId {
     frame::task(Tag::Parse, |frame| {
         let mut files = Vec::with_capacity_in(1, frame);
         files.push((file, content::path_key(path), id));
@@ -228,7 +243,9 @@ pub(crate) struct Writer {
 impl Writer {
     pub(crate) fn spare_root(&mut self) -> Arc<SourceRoot> {
         // alloc: once per database.
-        let spare = self.spare_root.get_or_insert_with(|| Arc::new(SourceRoot::new_local(FileSet::default())));
+        let spare = self
+            .spare_root
+            .get_or_insert_with(|| Arc::new(SourceRoot::new_local(FileSet::default())));
         Arc::clone(spare)
     }
 
@@ -312,7 +329,10 @@ impl<T> ByFile<T> {
 
     /// Each file with a value, by file ID.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (FileId, &T)> + '_ {
-        self.0.iter().enumerate().filter_map(|(at, it)| Some((FileId::from_raw(at as u32), it.as_ref()?)))
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(at, it)| Some((FileId::from_raw(at as u32), it.as_ref()?)))
     }
 }
 
@@ -357,7 +377,8 @@ impl Files {
     /// nor bytes) is a bug of the caller, which panics naming the file's path and why it has
     /// none: a reader of every file of a source root reads [`Files::file_content`] instead.
     pub fn file_text(&self, file_id: FileId) -> FileText {
-        match self.text.get(file_id.index()).or_else(|| Some(self.source_of(file_id.index())?.text)) {
+        match self.text.get(file_id.index()).or_else(|| Some(self.source_of(file_id.index())?.text))
+        {
             Some(text) => text,
             None => self.no_text(file_id),
         }
@@ -369,7 +390,9 @@ impl Files {
     #[inline(never)]
     fn no_text(&self, file_id: FileId) -> ! {
         let why = match self.raw.get(file_id.index()) {
-            Some(_) => "its bytes are not UTF-8, so it has no text (read its content with `file_content`, its bytes with `raw_file`)",
+            Some(_) => {
+                "its bytes are not UTF-8, so it has no text (read its content with `file_content`, its bytes with `raw_file`)"
+            }
             None => "it has neither text nor bytes: it was never set, or its text was taken away",
         };
         // A setter may hold the writer while it reads a text (`set_appended_root_module`): then
@@ -379,8 +402,12 @@ impl Files {
             writer.by_path.iter().find(|(_, it)| **it == file_id).map(|(path, _)| path.to_string())
         });
         match path {
-            Some(path) => panic!("no text for the file `{path}` ({file_id:?}): {why}; this is a bug of the reader"),
-            None => panic!("no text for {file_id:?}, a file no source root named: {why}; this is a bug of the reader"),
+            Some(path) => panic!(
+                "no text for the file `{path}` ({file_id:?}): {why}; this is a bug of the reader"
+            ),
+            None => panic!(
+                "no text for {file_id:?}, a file no source root named: {why}; this is a bug of the reader"
+            ),
         }
     }
 
@@ -438,7 +465,9 @@ impl Files {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             if let Some(of) = writer.alias_of.get(file_id) {
-                panic!("{file_id:?} is an alias of {of:?}: its module is set with `Db::set_alias_appended`");
+                panic!(
+                    "{file_id:?} is an alias of {of:?}: its module is set with `Db::set_alias_appended`"
+                );
             }
             let input = self.file_text(file_id);
             if input.appended_root_module(&*db) == module {
@@ -454,13 +483,7 @@ impl Files {
     }
 
     /// Sets a file's text from outside a view: what it was set from by a view is forgotten.
-    fn set_text(
-        &self,
-        db: &mut Db,
-        file_id: FileId,
-        text: &str,
-        durability: Option<Durability>,
-    ) {
+    fn set_text(&self, db: &mut Db, file_id: FileId, text: &str, durability: Option<Durability>) {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             self.refuse_crate_attr(&writer, file_id);
@@ -544,7 +567,9 @@ impl Files {
         appended: Option<(&'static str, &str)>,
     ) -> Result<(), AliasError> {
         let mut writer = self.lock();
-        let Some(&of) = writer.alias_of.get(alias) else { return Err(AliasError::NotAnAlias(alias)) };
+        let Some(&of) = writer.alias_of.get(alias) else {
+            return Err(AliasError::NotAnAlias(alias));
+        };
         let now = writer.suffixes.get(alias).map(|(module, text)| (*module, &**text));
         if now == appended {
             return Ok(());
@@ -554,7 +579,7 @@ impl Files {
             Some((module, text)) => writer.suffixes.insert(alias, (module, text.into())),
             None => _ = writer.suffixes.remove(alias),
         }
-        let durability = alias_durability(&writer, of);
+        let durability = file_durability(&writer, of);
         let text = self.text_input(of).map(|input| {
             // clone: a count of the bytes
             (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
@@ -593,7 +618,7 @@ impl Files {
         }
         let file_root = file_root.source_root_id(&*db);
         self.set_file_source_root_in(&mut writer, db, alias, file_root, Durability::MEDIUM);
-        let durability = alias_durability(&writer, of);
+        let durability = file_durability(&writer, of);
         let text = self.text_input(of).map(|input| {
             // clone: a count of the bytes, which the alias shares
             (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
@@ -702,12 +727,10 @@ impl Files {
             }
             None => {
                 let reparse = Reparse::new(&text, file);
-                let builder = FileText::builder(text, file_id, InputId(content), reparse);
-                let builder = match durability {
-                    Some(durability) => builder.durability(durability),
-                    None => builder,
-                };
-                self.text.set(raw, Some(builder.new(&*db)));
+                let durability = durability.unwrap_or_else(|| file_durability(writer, file_id));
+                let input =
+                    FileText::new(&*db, durability, text, file_id, InputId(content), reparse);
+                self.text.set(raw, Some(input));
             }
         }
         content
@@ -724,7 +747,10 @@ impl Files {
         bytes: &blaze_vfs::Bytes,
         durability: Option<Durability>,
     ) -> ContentId {
-        debug_assert!(std::str::from_utf8(&bytes[..]).is_err(), "{file_id:?}: bytes that are text are its text");
+        debug_assert!(
+            std::str::from_utf8(&bytes[..]).is_err(),
+            "{file_id:?}: bytes that are text are its text"
+        );
         self.park_text(writer, db, file_id, durability);
         let content = IncludedFile::content_of(Ok(&bytes[..]));
         let existing = match self.raw.get(file_id.index()) {
@@ -746,12 +772,8 @@ impl Files {
                 input
             }
             None => {
-                let builder = IncludedFile::builder(read(), InputId(content));
-                let builder = match durability {
-                    Some(durability) => builder.durability(durability),
-                    None => builder,
-                };
-                builder.new(&*db)
+                let durability = durability.unwrap_or_else(|| file_durability(writer, file_id));
+                IncludedFile::new(&*db, durability, read(), InputId(content))
             }
         };
         self.raw.set(file_id.index(), Some(input));
@@ -759,7 +781,13 @@ impl Files {
     }
 
     /// Takes `file_id`'s text away, keeping its input in [`Writer::parked`].
-    fn park_text(&self, writer: &mut Writer, db: &mut Db, file_id: FileId, durability: Option<Durability>) {
+    fn park_text(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        file_id: FileId,
+        durability: Option<Durability>,
+    ) {
         let raw = file_id.index();
         if let Some(input) = self.text.get(raw) {
             // Nothing reads the text left behind: `file_text` no longer has the file.
@@ -776,18 +804,27 @@ impl Files {
     /// Takes `file_id`'s bytes away (it has text now, or neither), keeping their input in
     /// [`Writer::raw_parked`]. The input is set to no bytes, which a file without text never
     /// has (no bytes are UTF-8), so what read them reruns and finds the file as it is now.
-    fn park_raw(&self, writer: &mut Writer, db: &mut Db, file_id: FileId, durability: Option<Durability>) {
+    fn park_raw(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        file_id: FileId,
+        durability: Option<Durability>,
+    ) {
         let raw = file_id.index();
         if let Some(input) = self.raw.get(raw) {
             self.raw.set(raw, None);
             let none: &[u8] = &[];
             let empty = std::sync::Arc::from(none); // alloc: none to speak of, once per file that gets text back
             set(input.set_read_field(db), durability, Ok(empty));
-            set(input.set_content_field(db), durability, InputId(IncludedFile::content_of(Ok(none))));
+            set(
+                input.set_content_field(db),
+                durability,
+                InputId(IncludedFile::content_of(Ok(none))),
+            );
             writer.raw_parked.insert(file_id, input);
         }
     }
-
 
     /// Brings the content IDs of `roots` up to date and writes those that changed.
     pub(crate) fn write_root_contents(
@@ -933,7 +970,7 @@ impl Files {
             None => {
                 let read = self.read_included(path);
                 let content = InputId(IncludedFile::content_of(read.as_deref()));
-                let file = IncludedFile::builder(read, content).durability(durability).new(db);
+                let file = IncludedFile::new(db, durability, read, content);
                 let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
                 self.included.insert(hash, |it| it.path.as_path() == path, make).0
             }
@@ -974,7 +1011,7 @@ impl Files {
         }
         let (text, vfs, content) = source_text(included.file.read(db));
         let reparse = Reparse::new(&text, vfs);
-        let text = FileText::builder(text, id, InputId(content), reparse).durability(durability).new(db);
+        let text = FileText::new(db, durability, text, id, InputId(content), reparse);
         let vfs_path = VfsPath::from(path.to_path_buf());
         let root_content = one_file_root_content(is_library, id, &vfs_path, content);
         let mut files = FileSet::default();
@@ -983,13 +1020,13 @@ impl Files {
             true => SourceRoot::new_library(files),
             false => SourceRoot::new_local(files),
         };
-        let root = SourceRootInput::builder(Arc::new(root), InputId(root_content))
-            .durability(durability)
+        let root = SourceRootInput::builder(durability, Arc::new(root), InputId(root_content))
             .content_durability(root_content_durability(is_library))
             .new(db);
-        let file_root = FileSourceRootInput::builder(SourceRootId(raw)).durability(durability).new(db);
+        let file_root = FileSourceRootInput::new(db, durability, SourceRootId(raw));
         // A reader that made it first at once keeps its own; this one's inputs are left unread.
-        let source = included.source.get_or_init(|| IncludedSource { file: id, text, file_root, root });
+        let source =
+            included.source.get_or_init(|| IncludedSource { file: id, text, file_root, root });
         (included.file, Ok(source.file))
     }
 
@@ -1028,7 +1065,7 @@ impl Files {
         Some(self.included.get(at).file)
     }
 
-    /// Notes a file a module declaration names that the VFS has not: whoever
+    /// Notes a file a frozen def map names that the VFS has not: whoever
     /// owns the VFS puts it in the source root, see [`Files::included_sources`].
     pub fn include_source(&self, path: &AbsPath, root: SourceRootId, krate: Crate) {
         let (at, _) = self.included_sources.insert(
@@ -1140,7 +1177,8 @@ impl Files {
     /// ([`IncludedSource`]), once one has, changes with it: its edit found for its next parse
     /// as a file of the view's is ([`Reparse::after`]), and its source root's content.
     pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath) -> bool {
-        let Some(at) = self.included.find(self.included.hash(path), |it| it.path.as_path() == path) else {
+        let Some(at) = self.included.find(self.included.hash(path), |it| it.path.as_path() == path)
+        else {
             return false;
         };
         let included = self.included.get(at);
@@ -1159,8 +1197,10 @@ impl Files {
             if input.content(&*db) != content {
                 input.set_content_field(db).to(InputId(content));
                 let root = source.root.source_root_ref(&*db);
-                let path = root.path_for_file(&source.file).expect("an included source's root has it");
-                let root_content = one_file_root_content(root.is_library, source.file, path, content);
+                let path =
+                    root.path_for_file(&source.file).expect("an included source's root has it");
+                let root_content =
+                    one_file_root_content(root.is_library, source.file, path, content);
                 source.root.set_content_field(db).to(InputId(root_content));
             }
         }
@@ -1188,7 +1228,11 @@ impl Files {
 
     /// Source root of the file.
     pub fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        match self.source_roots.get(source_root_id.0).or_else(|| Some(self.source_of(source_root_id.0)?.root)) {
+        match self
+            .source_roots
+            .get(source_root_id.0)
+            .or_else(|| Some(self.source_of(source_root_id.0)?.root))
+        {
             Some(source_root) => source_root,
             None => panic!(
                 "Unable to fetch `SourceRootInput` with `SourceRootId` ({source_root_id:?}); this is a bug"
@@ -1227,22 +1271,31 @@ impl Files {
                     }
                 }
                 None => {
-                    let input = SourceRootInput::builder(source_root, content)
-                        .durability(durability)
+                    let input = SourceRootInput::builder(durability, source_root, content)
                         .content_durability(content_durability)
                         .new(&*db);
                     self.source_roots.set(source_root_id.0, Some(input));
                 }
             }
             let mut orphans: SmallVec<[FileId; 4]> = SmallVec::new();
-            orphans.extend(writer.aliases.iter().map(|(of, _)| of).filter(|&of| writer.roots_of(of).is_empty()));
+            orphans.extend(
+                writer
+                    .aliases
+                    .iter()
+                    .map(|(of, _)| of)
+                    .filter(|&of| writer.roots_of(of).is_empty()),
+            );
             self.drop_orphan_aliases(&mut writer, db, orphans, |_| {});
             writer.named.publish(db, frame);
         })
     }
 
     pub fn file_source_root(&self, db: &Db, id: FileId) -> FileSourceRootInput {
-        match self.file_source_roots.get(id.index()).or_else(|| Some(self.source_of(id.index())?.file_root)) {
+        match self
+            .file_source_roots
+            .get(id.index())
+            .or_else(|| Some(self.source_of(id.index())?.file_root))
+        {
             Some(file_source_root) => file_source_root,
             None => panic!(
                 "Unable to get `FileSourceRootInput` with `FileId` ({id:?}, path: {}); this is a bug",
@@ -1254,9 +1307,9 @@ impl Files {
     }
 
     fn path_for_file(&self, db: &Db, id: FileId) -> Option<VfsPath> {
-        self.source_roots
-            .iter()
-            .find_map(|(_, source_root)| source_root.source_root_ref(db).path_for_file(&id).cloned())
+        self.source_roots.iter().find_map(|(_, source_root)| {
+            source_root.source_root_ref(db).path_for_file(&id).cloned()
+        })
     }
 
     pub fn set_file_source_root_with_durability(
@@ -1285,8 +1338,7 @@ impl Files {
                 input.set_source_root_id(db).with_durability(durability).to(source_root_id);
             }
             None => {
-                let input =
-                    FileSourceRootInput::builder(source_root_id).durability(durability).new(&*db);
+                let input = FileSourceRootInput::new(&*db, durability, source_root_id);
                 self.file_source_roots.set(id.index(), Some(input));
             }
         }
@@ -1332,10 +1384,13 @@ impl Files {
     }
 }
 
-/// What an alias of `of` is written with: as durable as a file of `of`'s source root.
-fn alias_durability(writer: &Writer, of: FileId) -> Durability {
-    let root = writer.roots_of(of).first();
-    let is_library = root.and_then(|root| writer.root_contents.get(root)).is_some_and(|it| it.is_library);
+/// The kind of `file`'s inputs, by its source root: `HIGH` in a library root, else `LOW` (a
+/// workspace file, or one in no root yet). What an alias of `file` is written with, and what a
+/// file's new input is made with where its writer gave no kind ([`Files::set_file_text`]).
+fn file_durability(writer: &Writer, file: FileId) -> Durability {
+    let root = writer.roots_of(file).first();
+    let is_library =
+        root.and_then(|root| writer.root_contents.get(root)).is_some_and(|it| it.is_library);
     if is_library { Durability::HIGH } else { Durability::LOW }
 }
 
@@ -1375,9 +1430,11 @@ pub enum ExpansionRead {
 }
 
 fn note_env(table: &Table<(Crate, Box<str>)>, krate: Crate, key: &str) {
-    table.insert(table.hash((krate, key)), |(by, known)| *by == krate && **known == *key, || {
-        (krate, key.into())
-    });
+    table.insert(
+        table.hash((krate, key)),
+        |(by, known)| *by == krate && **known == *key,
+        || (krate, key.into()),
+    );
 }
 
 fn env_list(table: &Table<(Crate, Box<str>)>) -> Vec<(Crate, String)> {
@@ -1602,7 +1659,13 @@ impl RootContent {
 
     /// Puts `file` in the root at `key` (whose [`SourceRoot::PATH_DOMAIN`] hash is `path`) with
     /// `content`: a file another file's key had is taken from it.
-    pub(crate) fn insert(&mut self, file: FileId, key: Box<[u8]>, path: ContentId, content: ContentId) {
+    pub(crate) fn insert(
+        &mut self,
+        file: FileId,
+        key: Box<[u8]>,
+        path: ContentId,
+        content: ContentId,
+    ) {
         self.remove(file);
         if let Some(other) = self.find(&key, &path) {
             self.remove(self.entries[other as usize].file);
@@ -1628,7 +1691,11 @@ impl RootContent {
         loop {
             let this = &self.nodes[node as usize];
             if this.leaf {
-                return this.entries.iter().copied().find(|&at| *self.entries[at as usize].key == *key);
+                return this
+                    .entries
+                    .iter()
+                    .copied()
+                    .find(|&at| *self.entries[at as usize].key == *key);
             }
             node = this.children[digit(path, depth)];
             if node == NO_NODE {
@@ -1758,7 +1825,10 @@ impl RootContent {
     /// Makes the inner node `node` a leaf of every entry under it, the nodes below freed.
     fn collapse(&mut self, node: u32) {
         let mut entries = SmallVec::new();
-        let children = std::mem::replace(&mut self.nodes[node as usize].children, [NO_NODE; SourceRoot::FANOUT]);
+        let children = std::mem::replace(
+            &mut self.nodes[node as usize].children,
+            [NO_NODE; SourceRoot::FANOUT],
+        );
         for child in children {
             if child != NO_NODE {
                 self.gather(child, &mut entries);
@@ -1808,7 +1878,9 @@ impl RootContent {
     fn leaf_bytes(&self, node: u32, sorted: &mut Vec<u32, &Frame>, out: &mut Vec<u8>) {
         sorted.clear();
         sorted.extend_from_slice(&self.nodes[node as usize].entries);
-        sorted.sort_unstable_by(|&a, &b| self.entries[a as usize].key.cmp(&self.entries[b as usize].key));
+        sorted.sort_unstable_by(|&a, &b| {
+            self.entries[a as usize].key.cmp(&self.entries[b as usize].key)
+        });
         out.put_u64(sorted.len() as u64);
         for &at in sorted.iter() {
             let entry = &self.entries[at as usize];
@@ -1883,7 +1955,10 @@ impl RootContent {
         if refreshed.is_empty() {
             return;
         }
-        fn of(contents: &HashMap<SourceRootId, RootContent, Global>, root: SourceRootId) -> &RootContent {
+        fn of(
+            contents: &HashMap<SourceRootId, RootContent, Global>,
+            root: SourceRootId,
+        ) -> &RootContent {
             contents.get(&root).expect("a root out of date has its content")
         }
         let mut bytes = scratch::lend_bytes();

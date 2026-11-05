@@ -1,0 +1,28 @@
+{
+  "info": {
+    "argv": [
+      "claude",
+      "-p"
+    ],
+    "attached": 1,
+    "busy": true,
+    "cols": 120,
+    "created_ms": 1762300000000,
+    "cwd": "/tmp",
+    "ended_ms": null,
+    "exit": null,
+    "id": 7,
+    "kind": "claude",
+    "mode": "chat",
+    "model": "opus",
+    "name": null,
+    "object": "s7",
+    "parent": 3,
+    "past": false,
+    "rows": 40,
+    "status": "running",
+    "title": "count the files"
+  },
+  "reply": "attached",
+  "t": "reply"
+}

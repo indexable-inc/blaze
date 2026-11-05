@@ -11,13 +11,13 @@ use std::alloc::Allocator;
 
 use crate::mem::{self, FMap, FVec};
 use blaze_mem::frame::Frame;
-use smallvec::SmallVec;
 use rustc_type_ir::{
     ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFlags,
     TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt as _, TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
+use smallvec::SmallVec;
 
 use hir_ty::{
     GenericPredicates,
@@ -139,6 +139,42 @@ pub(crate) fn outlived_as<'db>(db: &'db Db, ty: Ty<'db>) -> Ty<'db> {
         }
     }
     ty.fold_with(&mut Fold { db, depth: 0 })
+}
+
+/// `ty` with every alias in it marked not rigid. Whether the solver has found an alias rigid
+/// (it could not normalize it further) says nothing of which type it is, and the bounds a type
+/// is checked against come from both sides: `&Self::Output` of
+/// `impl<I: SliceIndex<[Value]>> Index<I> for Array` normalizes, for its implied bound, to a
+/// rigid `<I as SliceIndex<[Value]>>::Output`, while the callee's signature it is tested
+/// against names the same projection as lowered, not rigid (sonic-rs's `Array::index`, E0311);
+/// `type Data = T::Data` of wasmtime's `impl<T: AsContext> AsContext for &T`, normalized to
+/// prove the trait's `type Data: 'static`, is rigid where the where clauses and the trait's
+/// bounds name it as lowered. Types compared as types, to find what bounds them, are compared
+/// in this form, as rustc compares `AliasTy`s, which carry no rigidity.
+pub fn unrigid<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
+    struct Unrigid<'db>(DbInterner<'db>);
+    impl<'db> TypeFolder<DbInterner<'db>> for Unrigid<'db> {
+        fn cx(&self) -> DbInterner<'db> {
+            self.0
+        }
+
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            if !ty.has_aliases() {
+                return ty;
+            }
+            let ty = ty.super_fold_with(self);
+            match ty.kind() {
+                TyKind::Alias(rustc_type_ir::IsRigid::Yes, alias) => {
+                    Ty::new_alias(self.0, rustc_type_ir::IsRigid::No, alias)
+                }
+                _ => ty,
+            }
+        }
+    }
+    if !ty.has_rigid_aliases() {
+        return ty;
+    }
+    ty.fold_with(&mut Unrigid(interner))
 }
 
 /// A region of a function body, which only the borrow checker reasons about: inference
@@ -298,15 +334,14 @@ fn wf_into<'db, A: Allocator>(
     if depth > 32 || !ty.has_type_flags(MAY_NEED) {
         return;
     }
-    let args = |inferred: &mut Inferred<'db>,
-                args: GenericArgs<'db>,
-                out: &mut Vec<Needs<'db>, A>| {
-        for arg in args.iter() {
-            if let GenericArgKind::Type(ty) = arg.kind() {
-                wf_into(db, inferred, ty, out, depth + 1);
+    let args =
+        |inferred: &mut Inferred<'db>, args: GenericArgs<'db>, out: &mut Vec<Needs<'db>, A>| {
+            for arg in args.iter() {
+                if let GenericArgKind::Type(ty) = arg.kind() {
+                    wf_into(db, inferred, ty, out, depth + 1);
+                }
             }
-        }
-    };
+        };
     match ty.kind() {
         TyKind::Ref(region, inner, _) => {
             out.push(Needs::Type(inner, region));
@@ -520,7 +555,11 @@ impl<'f, 'db> Wfcx<'f, 'db> {
         );
         let constraints: FVec<'_, Constraint<'db>> = mem::collect(
             self.frame,
-            inner.unwrap_region_constraints().region_constraint_data().constraints.iter_from(mark.1),
+            inner
+                .unwrap_region_constraints()
+                .region_constraint_data()
+                .constraints
+                .iter_from(mark.1),
         );
         drop(inner);
         // The impl's lifetimes are inference variables the solver equates with the item's.
@@ -724,8 +763,7 @@ impl<'db> Inferred<'db> {
         &self,
         db: &'db Db,
         adt: AdtId,
-    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db>
-    {
+    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db> {
         inferred_outlives(db, adt).0.iter().map(|it| {
             let arg: GenericArg<'db> = match &it.arg {
                 InferredArg::Type(ty) => ty.as_ref().into(),
@@ -972,7 +1010,8 @@ impl<'f, 'db> Known<'f, 'db> {
 
     /// The associated types in `ty` not known to outlive `region`, as rustc's
     /// `alias_bound`s: one does when the where clauses say so, when the trait declares it
-    /// does (`type Error: 'static`), or when each of its arguments does.
+    /// does (`type Error: 'static`), or when each of its arguments does. Whether the solver
+    /// found one rigid does not matter ([`unrigid`]).
     pub(crate) fn failing_aliases(
         &self,
         db: &'db Db,
@@ -997,38 +1036,27 @@ impl<'f, 'db> Known<'f, 'db> {
         failing
     }
 
-    fn alias_outlives(
-        &self,
-        db: &'db Db,
-        ty: Ty<'db>,
-        region: Region<'db>,
-        depth: usize,
-    ) -> bool {
+    fn alias_outlives(&self, db: &'db Db, ty: Ty<'db>, region: Region<'db>, depth: usize) -> bool {
         let TyKind::Alias(_, alias) = ty.kind() else { return true };
-        let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind else { return true };
-        if depth > 8
-            || ty.has_non_region_infer()
-            || ty.references_error()
-            || self
-                .types
-                .iter()
-                .any(|&(known, bound)| known == ty && self.region_outlives(bound, region))
-        {
+        let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind else { return true };
+        if depth > 8 || ty.has_non_region_infer() || ty.references_error() {
             return true;
         }
         let interner = DbInterner::new_no_crate(db);
+        // The alias as lowered: one the solver normalized to, rigid, is the one the where
+        // clauses and the trait's bounds name (rustc's `alias_bound` compares `AliasTy`s).
+        let ty = unrigid(interner, ty);
+        let TyKind::Alias(_, alias) = ty.kind() else { return true };
+        if self.types.iter().any(|&(known, bound)| {
+            unrigid(interner, known) == ty && self.region_outlives(bound, region)
+        }) {
+            return true;
+        }
+        // rustc's `declared_bounds_from_definition`: the outlives bounds the trait declares of
+        // the associated type itself (`item_self_bounds`), with the alias's arguments.
         let declared = mem::collect(
             *self.regions.allocator(),
-            rustc_type_ir::Interner::item_bounds(interner, def_id.into())
-                .iter_instantiated(interner, alias.args.as_slice())
-                .filter_map(|clause| match clause.kind().skip_binder() {
-                    ClauseKind::TypeOutlives(OutlivesClause(bounded, bound))
-                        if bounded == ty && !bound.has_escaping_bound_vars() =>
-                    {
-                        Some(bound)
-                    }
-                    _ => None,
-                }),
+            rustc_type_ir::outlives::declared_bounds_from_definition(interner, alias),
         );
         if declared.iter().any(|&bound| self.region_outlives(bound, region)) {
             return true;
@@ -1043,7 +1071,10 @@ impl<'f, 'db> Known<'f, 'db> {
         };
         let verified = ty.has_infer_regions()
             && (!declared.is_empty()
-                || self.types.iter().any(|&(known, _)| erased(known) == erased(ty)));
+                || self
+                    .types
+                    .iter()
+                    .any(|&(known, _)| erased(unrigid(interner, known)) == erased(ty)));
         let outlives = |longer: Region<'db>| {
             !(verified && matches!(longer.kind(), RegionKind::ReVar(_)))
                 && self.region_outlives(longer, region)

@@ -12,9 +12,10 @@ function or another of the library, one in a private module named as a public fu
 it, one that downcasts a `dyn Any` of what one returns (a
 `TypeId`, which code generation takes from rustc), one that keeps it in a `HashMap` (seeded at
 random), one that prints a backtrace (which reads the environment and the working directory),
-one that reads a file, one that calls nothing. It is tested until the daemon serves the build,
-then edited a step at a time, and after each the tests that ran have to be the ones the step
-names: those whose code or what it calls changed, those added or given other attributes, the
+one that reads a file, one that calls nothing. It is tested once (every build is the daemon's,
+and each says so in its `blaze-work` line under `--message-format=json`; a run without one is
+not served), then edited a step at a time, and after each the tests that ran have to be the
+ones the step names: those whose code or what it calls changed, those added or given other attributes, the
 one that reads a file every time, the one that failed until it passes (and not the others that
 ran and passed beside it; once fixed back to code that passed, it is not run again), one added
 to a program with an `ignore` with a list, one added to a library with a bench (in a package of
@@ -45,9 +46,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
+
+import storelib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 LIB = """pub fn helper(x: u32) -> u32 {
@@ -196,8 +201,8 @@ OUTSIDE = os.path.join(os.path.expanduser("~"), ".cache", f"blaze-testselect-{os
 # The test that reads a file, in a step that did not change the file: where it runs sandboxed,
 # it is skipped like any other unchanged test.
 F = set() if SANDBOXED else {FILE}
-# (what the step is, [(file, old, new)], BLAZE_TESTS, the tests that run (`None`: cargo's build
-# of an edited manifest, which runs them all), whether they pass)
+# (what the step is, [(file, old, new)], BLAZE_TESTS, the tests that run (`None`: not checked,
+# the build of an edited manifest, which runs them all), whether they pass)
 STEPS = [
     ("nothing edited", [], "affected", F, True),
     ("a function one test calls", [("src/lib.rs", "x + 1", "x + 2 - 1")], "affected",
@@ -357,18 +362,15 @@ def benched(root, env):
     for path, text in BENCHED.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    deadline = time.monotonic() + 300
-    while "[blaze]" not in test(ws, env, "all")[1]:
-        if time.monotonic() > deadline:
-            return "NEVER SERVED BY THE DAEMON"
-        time.sleep(0.5)
+    if not worked(test(ws, env, "all")[1]):
+        return "NOT SERVED BY THE DAEMON (no `blaze-work` line)"
     path, old, new = BENCHED_ADDED
     text = open(os.path.join(ws, path)).read()
     open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
     code, said = test(ws, env, "all")
     ran = {name for name, _ in RAN.findall(said)}
-    if "[blaze]" not in said:
-        return "NOT SERVED BY THE DAEMON"
+    if not worked(said):
+        return "NOT SERVED BY THE DAEMON (no `blaze-work` line)"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
     # It has not opted into sandboxed tests: its hermetic tests are kept all the same, once they
@@ -415,15 +417,13 @@ def beside(root, env):
     for path, text in BESIDE.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], env=env, capture_output=True, text=True).stdout, re.M)[1]
+    # blaze's own answer for the host's tuple, never rustc's.
+    host = storelib.blaze_toolchain(shutil.which("blaze", path=env["PATH"]) or "blaze", env).host
     try:
         for args in ("", "--release", f"--target {host}"):
-            deadline = time.monotonic() + 300
-            while "[blaze]" not in (said := test(ws, env, f"all {args}"))[1]:
-                if time.monotonic() > deadline:
-                    return f"`{args}`: NEVER SERVED BY THE DAEMON"
-                time.sleep(0.5)
-            code, said = said
+            code, said = test(ws, env, f"all {args}")
+            if not worked(said):
+                return f"`{args}`: NOT SERVED BY THE DAEMON (no `blaze-work` line)"
             ran = {name for name, end in RAN.findall(said) if end == "ok"}
             if ran != {"tests::in_deps", "finds_the_program"} or code != 0:
                 return f"`{args}`: ENDED {code} HAVING PASSED {', '.join(sorted(ran)) or 'nothing'}"
@@ -434,7 +434,8 @@ def beside(root, env):
 
 def test(ws, env, mode):
     """`mode` is BLAZE_TESTS's value, then `blaze test`'s arguments and NAME=VALUE for the
-    environment."""
+    environment. It runs with `--message-format=json`, so what it says has the daemon's
+    `blaze-work` line beside libtest's `test ... ok` lines."""
     if mode == "fresh":
         subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
         shutil.rmtree(os.path.join(ws, "target"))
@@ -442,7 +443,7 @@ def test(ws, env, mode):
     mode, *args = mode.split()
     more = dict(it.split("=", 1) for it in args if "=" in it)
     args = [it for it in args if "=" not in it]
-    ran = subprocess.run(["blaze", "test", *args], cwd=ws, env=dict(env, BLAZE_TESTS=mode, **more),
+    ran = subprocess.run(["blaze", "test", "--message-format=json", *args], cwd=ws, env=dict(env, BLAZE_TESTS=mode, **more),
                          capture_output=True, text=True, timeout=TIMEOUT)
     return ran.returncode, ran.stdout + ran.stderr
 
@@ -472,16 +473,12 @@ def main():
     wrong = 0
 
     def served(when):
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            code, said = test(ws, env, "affected")
-            if code != 0:
-                raise SystemExit(f"the tests failed {when}:\n{said[-3000:]}")
-            if "[blaze]" in said:
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[blaze]` {when}; the daemon's log is in {home}")
+        # The first `blaze test` starts the daemon and is served by it: there is nothing to wait for.
+        code, said = test(ws, env, "affected")
+        if code != 0:
+            raise SystemExit(f"the tests failed {when}:\n{said[-3000:]}")
+        if not worked(said):
+            raise SystemExit(f"no `blaze-work` line {when}: not served by the daemon; its log is in {home}")
         # The daemon's first build of the tests: each is new to it, and runs.
         test(ws, env, "affected")
 
@@ -496,10 +493,10 @@ def main():
             ran = {name for name, _ in RAN.findall(said)}
             failed = {name for name, end in RAN.findall(said) if end == "FAILED"}
             verdict = "ok"
-            # An edit of the manifest is cargo's to build, and the daemon's again after it.
+            # After an edit of the manifest the tests run twice more, as before the first step.
             manifest = any(path == "Cargo.toml" for path, _, _ in edits)
-            if "[blaze]" not in said and not manifest:
-                verdict = "NOT SERVED BY THE DAEMON"
+            if not worked(said):
+                verdict = "NOT SERVED BY THE DAEMON (no `blaze-work` line)"
             elif expected is not None and ran != expected:
                 extra, missing = sorted(ran - expected), sorted(expected - ran)
                 verdict = f"RAN {', '.join(extra) or 'nothing more'}; DID NOT RUN {', '.join(missing) or '-'}"

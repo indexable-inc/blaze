@@ -35,11 +35,14 @@ concurrency:
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
   BLAZE_CORES: all
+  # The projects built here are new and throwaway, with no committed lock: their builds may
+  # write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+  BLAZE_LOCK: write
 
 jobs:
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -47,12 +50,16 @@ jobs:
 
   install:
     name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    # A clean machine, as a user's: Linux AArch64 on a cold ix runner, booted from the base image
+    # and never snapshotted (ix-mode-cold), so nothing an earlier job left is there. macOS stays on
+    # a hosted Mac: install.sh's macOS path (the darwin archive, its quarantine and signature) runs
+    # only on macOS. TODO(x86-64): Linux x86-64 again once ix has x86-64 capacity.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04-arm' && fromJSON('["ix", "arm64", "ix-mode-cold"]') || matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-15]
     env:
       BLAZE_REPO: ${{ github.repository }}
       # A release the workflow was started for, or the one just published.
@@ -126,17 +133,31 @@ jobs:
   # as release.yaml builds it: with a profile older than the crates the build sat silent past
   # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
   # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
+  # TODO(sysroot): hosted Ubuntu 22.04 only for its glibc (2.35, near RHEL 9's 2.34). Move to an
+  # ix runner once blaze can link against an older glibc sysroot (docs/v2/plan/toolchain-c.md,
+  # "sysroot"); blaze has no --sysroot today (docs/harness.md "ix runners").
   archive:
     name: this commit's build
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
-      # dist profile), and the recipe is what it checks.
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo
-        timeout-minutes: 40
+      # The release's own recipe, and the recipe is what it checks: the stage 0
+      # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
+      # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
+      - uses: ./.github/actions/blaze
+        with:
+          job: install-archive
+          llvm: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - run: |
+          uv run --frozen --no-dev python .github/scripts/build_release.py \
+            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+        timeout-minutes: 300
       - name: archive
         run: |
           name=blaze-commit-x86_64-unknown-linux-gnu
@@ -148,6 +169,9 @@ jobs:
         with:
           name: archive
           path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # A machine with no Rust: blaze brings its own, and the first `blaze run` prints the program's
   # output. The time is from the start of install.sh to that output. On the oldest systems a
@@ -155,6 +179,7 @@ jobs:
   no-rust:
     name: no Rust installed, ${{ matrix.system }}
     needs: archive
+    # Hosted, as the archive it installs is x86-64 and built there (TODO(sysroot) above).
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:

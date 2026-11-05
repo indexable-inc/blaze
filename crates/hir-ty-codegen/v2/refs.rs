@@ -18,8 +18,7 @@ use std::{borrow::Cow, hash::BuildHasher};
 use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
-use blaze_ids::bits::BitSet;
+use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_query::db::AsId;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
@@ -36,9 +35,10 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    AssertKind, BasicBlockId, devirt::DevirtWorld, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
-    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind, dispatch,
-    interpret_mir, is_by_move_coroutine,
+    AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
+    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    devirt::DevirtWorld,
+    dispatch, interpret_mir, is_by_move_coroutine,
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
 };
@@ -46,6 +46,7 @@ use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use smallvec::{SmallVec, smallvec};
+use std::alloc::Global;
 
 use super::{
     HirInstance, Kind,
@@ -54,9 +55,9 @@ use super::{
     places::{self, Ref},
 };
 use crate::{
-    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm,
-    fn_trait_methods, fncache,
-    fragment::{DataRequest, FuncTarget, Recorder},
+    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm, fn_trait_methods,
+    fncache,
+    fragment::{Asked, DataRequest, FuncTarget, Recorder},
     is_integer, is_thread_local,
 };
 
@@ -67,6 +68,14 @@ mod tests;
 
 /// The types of a call's operands: inline up to eight, as nearly every call has.
 pub(super) type Tys<'db> = SmallVec<[Ty<'db>; 8]>;
+
+/// The domain of [`placement`]: how many requests the walk of an instance made, what they were
+/// given ([`PLACED_DOMAIN`]), how many references it lists, and the places of the callees it
+/// builds in.
+const PLACEMENT_DOMAIN: &str = "blaze v2 reference placement 1";
+/// The domain of what each request of a walk was given, in order: a place of the list, or a
+/// data object of the function's own by its place among the recorder's requests.
+const PLACED_DOMAIN: &str = "blaze v2 reference placed 1";
 
 /// What the references of an instance are walked for: whether a unit of it MIR-inlines bodies
 /// of crates other than the library's (`Spec::mir_inline`), whose code then asks for what they
@@ -83,15 +92,30 @@ impl Walking {
     pub(crate) fn plain(inlined: bool) -> Self {
         Walking { inlined, world: None }
     }
+
+    /// The settings the walk builds the instance's code under, a pass each, the one list of
+    /// them ([`code_refs`], [`start_walk`], and the error of a request no pass listed):
+    /// [`Build::WALK`], and where a unit of the instance MIR-inlines, each of
+    /// [`Build::WALKS_INLINED`] against the program's world. It is the same list for every kind
+    /// of instance and every crate: a unit builds each under its own settings, and even where
+    /// the instance's own MIR is the same under all of them (a body of the library's, inlined
+    /// in every unit; a shim, which has none) the `#[inline(always)]` callees of other crates
+    /// it builds in are built under them (`always_inlinable_callee`), their bodies MIR-inlined
+    /// where the unit inlines: core's `<&A as PartialEq<&B>>::eq` builds in smol_str's
+    /// `<SmolStr as PartialEq<str>>::eq`, whose code inlined asks for `Repr::as_str` and
+    /// `memcmp`, where at level 1 it calls `SmolStr::as_str` and `<str as PartialEq>::eq`.
+    pub(crate) fn builds(self) -> SmallVec<[Build; 3]> {
+        let mut builds: SmallVec<[Build; 3]> = smallvec![Build::WALK];
+        if self.inlined {
+            builds.extend(Build::WALKS_INLINED.map(|it| Build { world: self.world, ..it }));
+        }
+        builds
+    }
 }
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
 /// owned.
-pub(crate) fn walk(
-    db: &Db,
-    instance: &HirInstance,
-    walking: Walking,
-) -> Result<Vec<Ref>, String> {
+pub(crate) fn walk(db: &Db, instance: &HirInstance, walking: Walking) -> Result<Vec<Ref>, String> {
     listed(db, instance, walking).map(Cow::into_owned)
 }
 
@@ -134,6 +158,29 @@ pub(crate) fn built_in<'db>(
     }
 }
 
+/// Which place of [`walked`] each request of the walk of `instance` is given, in the walk's
+/// order, a request listed already included, and the places of [`built_in`]: the one thing the
+/// list's references alone do not say. The list holds each reference once, so two requests of
+/// one callee are one place (`size_of::<S>` and `size_of::<D>` in `needs_realloc::<S, D>`, one
+/// place where `S` is `D`), and the IR names a reference by its place. Two instances whose
+/// compile identities are equal call callees of equal identities, which may be one instance in
+/// one of them and two in the other: their code differs only here, so a generic shared under
+/// its compile identity is keyed by this too ([`super::frontend`]'s `generic_args`, rule 18).
+/// The default for an instance that names nothing.
+pub(crate) fn placement(
+    db: &Db,
+    instance: &HirInstance,
+    walking: Walking,
+) -> Result<ContentId, String> {
+    match &instance.0 {
+        // Its references are listed per entry ([`super::allocator::walk`]), never shared.
+        Kind::Allocator(_) => Ok(ContentId::default()),
+        _ => {
+            memo(db, instance, walking).map(|it| it.map_or(ContentId::default(), |it| it.placement))
+        }
+    }
+}
+
 /// What the IR of `instance` does with trait objects ([`super::devirt`]); `None` for one that
 /// names nothing.
 pub(crate) fn facts<'db>(
@@ -168,6 +215,8 @@ pub(crate) struct Walked {
     built_in: Vec<u32>,
     facts: Facts,
     read: Vec<[u8; 32]>,
+    /// [`placement`].
+    placement: ContentId,
 }
 
 /// The walk of `instance`; `None` for one that names nothing.
@@ -180,20 +229,15 @@ fn memo<'db>(
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
         // assembly function with a relocation.
         Kind::Asm(..) => return Ok(None),
-        // `lang_start` is the library's, and its bodies are inlined in every unit.
-        Kind::Start(main) => start_walk(db, *main),
+        Kind::Start(main) => start_walk(db, *main, inlined),
         Kind::Allocator(forward) => {
             // alloc: the error's message
             return Err(format!("{forward:?}: an allocator entry, whose references are listed"));
         }
         Kind::Code(code, env) => {
-            // One walk where the inliner changes nothing: a shim's, a coroutine's, and a body
-            // of the library's, which is inlined in every unit.
-            let inlined = inlined
-                && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
-                && super::frontend::crate_of(db, &instance.0)
-                    .is_some_and(|it| !it.data(db).origin.is_lang());
-            // Only a body built with the inliner is built against the world.
+            // Walked under each setting a unit of it builds it with ([`Walking::builds`]),
+            // whatever its kind or crate. Only a body built with the inliner is built against
+            // the world.
             let world = world.filter(|_| inlined);
             // clone: the query's keys by value, each a few `Copy` ids in a `Clone`-only type
             code_walk(db, code.clone(), env.clone(), inlined, world)
@@ -202,7 +246,9 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(blaze_query::db::attach(db, || format!("the references of {}: {what}", super::Named(db, instance)))),
+        Err(what) => Err(blaze_query::db::attach(db, || {
+            format!("the references of {}: {what}", super::Named(db, instance))
+        })),
     }
 }
 
@@ -219,14 +265,18 @@ fn code_walk<'db>(
     code_refs(db, &instance, &env, inlined, world)
 }
 
+/// `lang_start`'s walk: the library's body, whose `#[inline(always)]` callees of other crates
+/// (`main`'s return type's `Termination::report`) a unit builds in under its own settings, so
+/// it is walked under each of them as any instance is ([`Walking::builds`]).
 #[blaze_query::tracked(returns(ref))]
-fn start_walk(db: &Db, main: FunctionId) -> Result<Walked, String> {
+fn start_walk(db: &Db, main: FunctionId, inlined: bool) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
-    scratch(db, env, None, false, |walk| walk.start_shim(main))
+    scratch(db, env, &Walking::plain(inlined).builds(), |walk| walk.start_shim(main))
 }
 
-/// The walk of a function, closure, `async` body or shim, as `instance_code` builds each;
-/// `world` is what the body with the inliner on is devirtualized against.
+/// The walk of a function, closure, `async` body or shim, as `instance_code` builds each,
+/// under each of [`Walking::builds`]; `world` is what the body with the inliner on is
+/// devirtualized against.
 fn code_refs(
     db: &Db,
     instance: &Instance,
@@ -234,33 +284,45 @@ fn code_refs(
     inlined: bool,
     world: Option<DevirtWorld>,
 ) -> Result<Walked, String> {
+    let builds = Walking { inlined, world }.builds();
     let ty = || instance.args.as_ref().type_at(0);
     let shim_env = env.as_ref(db);
     match instance.def {
         InstanceDef::DropGlue => {
-            return scratch(db, shim_env, None, false, |walk| walk.drop_glue(ty()));
+            return scratch(db, shim_env, &builds, |walk| walk.drop_glue(ty()));
         }
         InstanceDef::CallOnceShim => {
-            return scratch(db, shim_env, None, false, |walk| walk.call_once_shim(ty()));
+            return scratch(db, shim_env, &builds, |walk| walk.call_once_shim(ty()));
         }
         InstanceDef::VtableShim(func) => {
             let args = instance.args.as_ref();
-            return scratch(db, shim_env, None, false, |walk| walk.vtable_shim(func, args));
+            return scratch(db, shim_env, &builds, |walk| walk.vtable_shim(func, args));
         }
         InstanceDef::FnPointerShim => {
-            return scratch(db, shim_env, None, false, |walk| walk.fn_pointer_shim(ty()));
+            return scratch(db, shim_env, &builds, |walk| walk.fn_pointer_shim(ty()));
         }
         InstanceDef::ReifyShim { receiver } => {
-            return scratch(db, shim_env, None, false, |walk| walk.reify_shim(ty(), receiver));
+            return scratch(db, shim_env, &builds, |walk| walk.reify_shim(ty(), receiver));
         }
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)
         | InstanceDef::Coroutine(_)
         | InstanceDef::CoroutineByMove(_) => (),
     }
-    // clone: `instance_body` takes the env by value; two `Copy` ids in a `Clone`-only type
-    let body = crate::instance_body(db, instance, env.clone(), Some(Build::WALK)).map_err(told)?;
-    let body = &*body;
+    // The body each pass walks, as a unit under its settings reads it: under `WALK` first, so
+    // the list starts with what a unit that inlines nothing asks for. A body of the library's
+    // or a coroutine is the same MIR under each (the library's is inlined in every unit, a
+    // coroutine has nothing inlined into it), and is walked under each all the same: the
+    // callees it builds in are built under the pass's settings ([`Walking::builds`]).
+    // alloc: inline, one body a pass
+    let mut bodies: SmallVec<[(Build, _); 3]> = SmallVec::new();
+    for &build in &builds {
+        // clone: `instance_body` takes the env by value; two `Copy` ids in a `Clone`-only type
+        bodies.push((
+            build,
+            crate::instance_body(db, instance, env.clone(), Some(build)).map_err(told)?,
+        ));
+    }
     let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);
@@ -268,62 +330,47 @@ fn code_refs(
         }
         _ => (false, ExternAbi::Rust, false),
     };
-    // A body of the library's is inlined under `WALK` already, as in every unit; a coroutine
-    // has nothing inlined into it (`hir-ty-mir` `inline.rs`). A body with nothing inlined is
-    // walked again too: the callees it builds in are built under the unit's settings, where
-    // their own bodies are inlined. It is walked under each of [`Build::WALKS_INLINED`]: what
-    // the inliner takes is not monotone in debug assertions, so neither walk lists all a
-    // unit's code may ask for.
-    let written = body.owner.module(db).krate(db);
-    let inlines = inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none();
-    // alloc: inline, one body a walk of `WALKS_INLINED`
-    let mut inlined: SmallVec<[(Build, _); 2]> = SmallVec::new();
-    for build in Build::WALKS_INLINED.into_iter().filter(|_| inlines) {
-        let build = Build { world, ..build };
-        // clone: as above, two `Copy` ids in a `Clone`-only type
-        inlined.push((build, crate::instance_body(db, instance, env.clone(), Some(build)).map_err(told)?));
-    }
     // clone: `Found` owns the env the requests hold; two `Copy` ids in a `Clone`-only type
-    let mut found = Found::new(env.clone(), Some(body));
+    let mut found = Found::new(env.clone(), Some(&*bodies[0].1));
     let env = env.as_ref(db);
-    pass(db, env, Some(body), tracked, (Build::WALK, &mut found), |walk| {
-        walk.fx.abi = abi;
-        walk.fx.variadic = variadic;
-        walk.fx.args = Some(instance.args);
-        walk.outside()?;
-        walk.edge(body, abi)?;
-        walk.body(body)
-    })?;
-    for (build, inlined) in &inlined {
-        let inlined = &**inlined;
-        found.read.extend_from_slice(&inlined.inlined.devirtualized);
+    for (at, (build, body)) in bodies.iter().enumerate() {
+        let body = &**body;
+        found.read.extend_from_slice(&body.inlined.devirtualized);
         found.read.sort_unstable();
         found.read.dedup();
-        pass(db, env, Some(inlined), tracked, (*build, &mut found), |walk| {
+        pass(db, env, Some(body), tracked, (*build, &mut found), |walk| {
             walk.fx.abi = abi;
             walk.fx.variadic = variadic;
             walk.fx.args = Some(instance.args);
-            walk.body(inlined)
+            if at == 0 {
+                walk.outside()?;
+                walk.edge(body, abi)?;
+            }
+            walk.body(body)
         })?;
     }
     Ok(found.walked())
 }
 
-/// Runs `work` on a [`FunctionCx`] for `body` in `env` whose function is never built, with
+/// Runs `work` on a [`FunctionCx`] in `env` with no body (a shim's, `lang_start`'s), whose
+/// function is never built, once under each of `builds` ([`Walking::builds`]), the first with
 /// what any function names ([`Walk::outside`]): what its resolvers ask for is all that is kept
 /// of it.
 fn scratch<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
-    body: Option<&'db MirBody<'db>>,
-    tracked: bool,
-    work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
+    builds: &[Build],
+    work: impl for<'w, 'cx> Fn(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
 ) -> Result<Walked, String> {
-    let mut found = Found::new(env.store(), body);
-    pass(db, env, body, tracked, (Build::WALK, &mut found), |walk| {
-        walk.outside()?;
-        work(walk)
-    })?;
+    let mut found = Found::new(env.store(), None);
+    for (at, &build) in builds.iter().enumerate() {
+        pass(db, env, None, false, (build, &mut found), |walk| {
+            if at == 0 {
+                walk.outside()?;
+            }
+            work(walk)
+        })?;
+    }
     Ok(found.walked())
 }
 
@@ -340,6 +387,8 @@ fn pass<'db>(
     let isa = &**crate::isa_for(target).map_err(told)?;
     // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
     let mut cg = Recorder::new(db, isa, target, true, Some(build));
+    // Every ask, one asked for before included, which `Walk::drain` places ([`placement`]).
+    cg.wants.asks = Some(Vec::new()); // alloc: one pass's log of asks, freed with the pass
     let mut done = None;
     crate::build(&mut cg, env, body, tracked, |fx| {
         // The union of what the settings of a unit compile.
@@ -347,7 +396,15 @@ fn pass<'db>(
         fx.debug_assertions = true;
         fx.ub_checks = true;
         // alloc: one pass's few built-in places, freed with the pass
-        let mut walk = Walk { fx, found: &mut *found, drained: (0, 0), built_here: Vec::new() };
+        let mut walk = Walk {
+            fx,
+            found: &mut *found,
+            drained: 0,
+            built_here: Vec::new(),
+            // alloc: one pass's places of its recorder's requests, freed with the pass
+            func_places: Vec::new(),
+            data_places: Vec::new(), // alloc: as above
+        };
         done = Some(work(&mut walk).and_then(|()| walk.drain()));
         Ok(())
     })
@@ -355,7 +412,10 @@ fn pass<'db>(
     done.expect("the walk ran")
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of the walk's every step, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of the walk's every step, which hands it the error by value"
+)]
 fn told(error: CodegenError) -> String {
     // alloc: the error's message
     error.to_string()
@@ -365,8 +425,14 @@ fn told(error: CodegenError) -> String {
 pub(super) struct Walk<'w, 'cx, 'db> {
     fx: &'w mut FunctionCx<'cx, 'db>,
     found: &'w mut Found<'db>,
-    /// How many of the function and data requests of `fx.cg` are in `found.listed`.
-    drained: (usize, usize),
+    /// How many of the asks of `fx.cg` ([`crate::fragment::Wants::asks`]) are placed.
+    drained: usize,
+    /// The place in `found.listed` of each function request of `fx.cg`, by its place among
+    /// the requests: what an ask of it again is given. The pass's own, as its recorder is.
+    func_places: Vec<u32>,
+    /// The same of each data request: a static's place, or `None` for a data object of the
+    /// function's own, which no reference is.
+    data_places: Vec<Option<u32>>,
     /// The places of the callees this pass has built in. Each pass builds its body under its
     /// own settings, so a callee the `WALK` pass built in is built in again by the
     /// `WALK_INLINED` pass, whose copy of the callee's body is MIR-inlined and may call what
@@ -406,9 +472,17 @@ impl<'db> Found<'db> {
     }
 
     fn walked(self) -> Walked {
-        let mut refs = self.listed.refs;
+        let Listed { mut refs, given, requests, .. } = self.listed;
         refs.shrink_to_fit();
-        Walked { refs, built_in: self.built_in, facts: self.facts, read: self.read }
+        let mut placement = Hasher::new(PLACEMENT_DOMAIN);
+        placement.update(&requests.to_le_bytes()).id(&given.finish());
+        placement.update(&(refs.len() as u64).to_le_bytes());
+        placement.update(&(self.built_in.len() as u64).to_le_bytes());
+        for at in &self.built_in {
+            placement.update(&at.to_le_bytes());
+        }
+        let placement = placement.finish();
+        Walked { refs, built_in: self.built_in, facts: self.facts, read: self.read, placement }
     }
 }
 
@@ -423,7 +497,13 @@ struct Listed {
     at: HashTable<Slot>,
     /// The places in `refs` of the symbols ([`FrontRef::Extern`]), by the hash of the name.
     symbols: HashTable<Slot>,
-    libcalls: SmallVec<[ir::LibCall; 8]>,
+    /// Each routine listed, with its place.
+    libcalls: SmallVec<[(ir::LibCall, u32); 8]>,
+    /// The place each request is given, in the order asked, one already listed included:
+    /// What each request was given, in the order asked, one already listed included
+    /// ([`PLACED_DOMAIN`]), and how many there were: [`placement`].
+    given: Hasher,
+    requests: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -441,7 +521,23 @@ impl Listed {
             at: HashTable::with_capacity(capacity),
             symbols: HashTable::with_capacity(8),
             libcalls: SmallVec::new(),
+            given: Hasher::new(PLACED_DOMAIN),
+            requests: 0,
         }
+    }
+
+    /// Records that a request is given `at`, giving it back.
+    fn placed(&mut self, at: u32) -> u32 {
+        self.given.update(&[0]).update(&at.to_le_bytes());
+        self.requests += 1;
+        at
+    }
+
+    /// Records that a request is given a data object of the function's own, the `at`th of
+    /// its recorder's requests: which earlier ones it is one with is in the code too.
+    fn own_data(&mut self, at: u32) {
+        self.given.update(&[1]).update(&at.to_le_bytes());
+        self.requests += 1;
     }
 
     fn next(&self) -> u32 {
@@ -457,14 +553,15 @@ impl Listed {
         let hash = FixedState.hash_one(&it);
         let at = self.next();
         let refs = &self.refs;
-        match self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash) {
+        let at = match self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash) {
             Entry::Occupied(found) => found.get().at,
             Entry::Vacant(vacant) => {
                 vacant.insert(Slot { hash, at });
                 self.refs.push(it);
                 at
             }
-        }
+        };
+        self.placed(at)
     }
 
     fn symbol(&mut self, name: Cow<'_, str>) -> u32 {
@@ -473,20 +570,27 @@ impl Listed {
         let refs = &self.refs;
         let same =
             |slot: &Slot| matches!(&refs[slot.at as usize], FrontRef::Extern(it) if **it == *name);
-        match self.symbols.entry(hash, same, |slot| slot.hash) {
+        let at = match self.symbols.entry(hash, same, |slot| slot.hash) {
             Entry::Occupied(found) => found.get().at,
             Entry::Vacant(vacant) => {
                 vacant.insert(Slot { hash, at });
                 self.refs.push(FrontRef::Extern(name.into_owned()));
                 at
             }
-        }
+        };
+        self.placed(at)
     }
 
     fn libcall(&mut self, libcall: ir::LibCall) {
-        if !self.libcalls.contains(&libcall) {
-            self.libcalls.push(libcall);
-            self.symbol(Cow::Owned(places::libcall_symbol(libcall)));
+        let listed = self.libcalls.iter().find(|(it, _)| *it == libcall).map(|&(_, at)| at);
+        match listed {
+            Some(at) => {
+                self.placed(at);
+            }
+            None => {
+                let at = self.symbol(Cow::Owned(places::libcall_symbol(libcall)));
+                self.libcalls.push((libcall, at));
+            }
         }
     }
 }
@@ -518,34 +622,100 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// builder's requests are placed: a function by its target, a static as itself or its
     /// symbol, with what Cranelift calls to reach a thread-local one.
     fn drain(&mut self) -> Result<(), String> {
-        let Walk { fx, found, drained, .. } = self;
+        let Walk { fx, found, drained, func_places, data_places, .. } = self;
         let Found { listed, facts, .. } = &mut **found;
         let db = fx.cg.db;
         let requests = &fx.cg.wants.requests;
-        for request in &requests.funcs[drained.0..] {
-            match &request.target {
-                FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol.as_str())),
-                target => listed.add(places::func_ref(db, target)?),
-            };
-        }
-        for request in &requests.datas[drained.1..] {
-            if let DataRequest::Vtable { ty, trait_ref: Some((trait_, args)), .. } = request {
-                facts.vtable(ty, *trait_, args);
-            }
-            if let DataRequest::Static(id) = request {
-                listed.add(places::static_ref(db, *id)?);
-                // A static of an `extern` block is at the program's edge, as a foreign
-                // function's signature is: code outside the program made what it holds.
-                let flags = hir_def::signatures::StaticSignature::of(db, *id).flags;
-                if flags.contains(hir_def::signatures::StaticFlags::EXTERN) {
-                    facts.foreign(&fx.infcx, fx.env.param_env, fx.static_ty(*id));
+        let Some(asks) = fx.cg.wants.asks.as_deref() else {
+            // alloc: the error's message
+            return Err(
+                "the walk's recorder logs no asks (`Wants::asks`), which its places are read from"
+                    .to_owned(),
+            );
+        };
+        // Each ask in order, one asked for before included: a request's first ask is listed,
+        // and every later one given the place the first was ([`placement`]).
+        for &ask in &asks[*drained..] {
+            match ask {
+                Asked::Func(at) => {
+                    let known = func_places.len();
+                    match (at as usize).cmp(&known) {
+                        std::cmp::Ordering::Less => {
+                            listed.placed(func_places[at as usize]);
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let place = match &requests.funcs[at as usize].target {
+                                FuncTarget::Symbol(symbol) => {
+                                    listed.symbol(Cow::Borrowed(symbol.as_str()))
+                                }
+                                target => listed.add(places::func_ref(db, target)?),
+                            };
+                            func_places.push(place);
+                        }
+                        // alloc: the error's message
+                        std::cmp::Ordering::Greater => {
+                            return Err(format!(
+                                "the walk's recorder gave function request {at} before request {known} \
+                             was asked for: an ask that `Wants::asks` did not log"
+                            ));
+                        }
+                    }
                 }
-                if is_thread_local(db, *id) {
-                    listed.libcall(ir::LibCall::ElfTlsGetAddr);
+                Asked::Data(at) => {
+                    let known = data_places.len();
+                    match (at as usize).cmp(&known) {
+                        std::cmp::Ordering::Less => match data_places[at as usize] {
+                            Some(place) => {
+                                listed.placed(place);
+                            }
+                            None => listed.own_data(at),
+                        },
+                        std::cmp::Ordering::Equal => {
+                            let request = &requests.datas[at as usize];
+                            if let DataRequest::Vtable {
+                                ty, trait_ref: Some((trait_, args)), ..
+                            } = request
+                            {
+                                facts.vtable(ty, *trait_, args);
+                            }
+                            let place = match request {
+                                DataRequest::Static(id) => {
+                                    let place = listed.add(places::static_ref(db, *id)?);
+                                    // A static of an `extern` block is at the program's edge, as a foreign
+                                    // function's signature is: code outside the program made what it holds.
+                                    let flags =
+                                        hir_def::signatures::StaticSignature::of(db, *id).flags;
+                                    if flags.contains(hir_def::signatures::StaticFlags::EXTERN) {
+                                        facts.foreign(
+                                            &fx.infcx,
+                                            fx.env.param_env,
+                                            fx.static_ty(*id),
+                                        );
+                                    }
+                                    if is_thread_local(db, *id) {
+                                        listed.libcall(ir::LibCall::ElfTlsGetAddr);
+                                    }
+                                    Some(place)
+                                }
+                                _ => {
+                                    listed.own_data(at);
+                                    None
+                                }
+                            };
+                            data_places.push(place);
+                        }
+                        // alloc: the error's message
+                        std::cmp::Ordering::Greater => {
+                            return Err(format!(
+                                "the walk's recorder gave data request {at} before request {known} \
+                             was asked for: an ask that `Wants::asks` did not log"
+                            ));
+                        }
+                    }
                 }
             }
         }
-        *drained = (requests.funcs.len(), requests.datas.len());
+        *drained = asks.len();
         Ok(())
     }
 
@@ -579,7 +749,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
         }
         for (_, block) in body.basic_blocks.iter() {
-            let Some(TerminatorKind::Call { func, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+            let Some(TerminatorKind::Call { func, .. }) =
+                block.terminator.as_ref().map(|it| &it.kind)
             else {
                 continue;
             };
@@ -607,7 +778,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         args: GenericArgs<'db>,
     ) -> Result<Option<u32>, String> {
         self.drain()?;
-        if self.found.called.contains_key(&(def, args)) {
+        if let Some(&at) = self.found.called.get(&(def, args)) {
+            self.found.listed.placed(at);
             return Ok(None);
         }
         self.call_place(def, args).map(Some)
@@ -618,8 +790,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let db = self.fx.cg.db;
         let wasm = self.fx.cg.target.is_wasm();
         let Found { env, listed, called, .. } = &mut *self.found;
+        // A callee listed already is given its place again: which earlier request a call
+        // shares its place with is what [`placement`] holds.
         if let Some(&at) = called.get(&(def, args)) {
-            return Ok(at);
+            return Ok(listed.placed(at));
         }
         // A unit of a proc macro's wasm module calls the bridge's import in place of what
         // `wasm::bridged` names (`Recorder::callee`), any other unit the function: the walk
@@ -898,7 +1072,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 match ty.closure_upvars_ty().map(|it| it.kind()) {
                     Some(TyKind::Tuple(fields)) => Some(fields),
                     // alloc: the error's message
-                    _ => return Err("builtin `Clone` of a closure without tupled upvars".to_owned()),
+                    _ => {
+                        return Err("builtin `Clone` of a closure without tupled upvars".to_owned());
+                    }
                 }
             }
             _ => None,
@@ -1130,9 +1306,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let Some(args) = promoted.args(body, self.fx.args.as_ref()) else { continue };
             // A promoted constant whose MIR does not build is the IR builder's error too
             // (`promoted_constant`), never left out of the walk.
-            let constant =
-                monomorphized_promoted_mir_body_query(db, promoted.owner, promoted.expr, args, env.store())
-                    .map_err(|error| crate::no_promoted_mir(db, promoted, error).to_string())?;
+            let constant = monomorphized_promoted_mir_body_query(
+                db,
+                promoted.owner,
+                promoted.expr,
+                args,
+                env.store(),
+            )
+            .map_err(|error| crate::no_promoted_mir(db, promoted, error).to_string())?;
             let allocation = interpret_mir(db, constant, Some(env)).ok().and_then(|it| it.0.ok());
             if let Some(allocation) = allocation {
                 // A constant whose data can't be made is not promoted, and leaves what it
@@ -1355,7 +1536,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         // A check of an arbitrary width panics through core's `panic`, naming it
         // (`FunctionCx::panic_if`).
         if let AssertKind::Overflow(
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr,
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::Shl
+            | BinOp::Shr,
             of,
             _,
         )

@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cargo_platform::Platform;
 use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
 use cargo_util_schemas::manifest::{
@@ -17,6 +16,7 @@ use cargo_util_schemas::manifest::{
     StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints,
     TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
 };
+use std::alloc::Global;
 use url::Url;
 
 use crate::config::Config;
@@ -471,7 +471,10 @@ fn to_workspace_config(
 /// What `[workspace]` gives a member: read from its workspace root the first time a field
 /// inherits, so a manifest that inherits nothing never reads the root.
 struct Inherit<'a, F: Files> {
-    #[expect(clippy::disallowed_types, reason = "the workspace root's fields, read the first time one is inherited: per manifest read, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the workspace root's fields, read the first time one is inherited: per manifest read, not global"
+    )]
     fields: std::cell::OnceCell<InheritableFields>,
     ctx: &'a Context<F>,
     manifest_file: &'a Path,
@@ -724,10 +727,9 @@ fn normalize_patch<F: Files>(
         for (pkg, dep) in packages {
             let dep = if let TomlDependency::Detailed(dep) = dep {
                 let mut dep = dep.clone();
-                normalize_path_dependency(config, &mut dep, inherit, features)
-                    .with_context(|| {
-                        format!("resolving path for patch of ({pkg}) for source ({name})")
-                    })?;
+                normalize_path_dependency(config, &mut dep, inherit, features).with_context(
+                    || format!("resolving path for patch of ({pkg}) for source ({name})"),
+                )?;
                 TomlDependency::Detailed(dep)
             } else {
                 dep.clone()
@@ -800,7 +802,9 @@ fn normalize_package_toml<F: Files>(
             .readme
             .clone()
             .map(|value| {
-                field_inherit_with(value, "readme", || inherit.fields()?.readme(files, package_root))
+                field_inherit_with(value, "readme", || {
+                    inherit.fields()?.readme(files, package_root)
+                })
             })
             .transpose()?
             .as_ref(),

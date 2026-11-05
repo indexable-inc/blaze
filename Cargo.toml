@@ -46,12 +46,21 @@ exclude = [
     # is its wasm implementation, built only there (vendor/libzstd-rs-sys/SOURCE.md).
     "vendor/zstd-sys",
     "vendor/libzstd-rs-sys",
+    # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
+    "vendor/corosensei",
+    # Patched below, without `tracing` (docs/v2/plan/observe/no-tracing.md, 6.2); each is its own
+    # workspace for its tests, whose dev-dependencies stay out of blaze's lock (vendor/*/PATCHES.md).
+    "vendor/quinn-proto",
+    "vendor/ra-ap-rustc_pattern_analysis",
 ]
 resolver = "2"
 
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
-version = "0.20261030.1"
+version = "0.20261105.0"
+# A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
+# saying what moved (docs/cargo.md, "Lock files").
+lock = "required"
 
 # blaze-lints' own lints (AGENTS.md rules 3, 9, 11, 13-15, 20, 22). Each is `warn` until its
 # count in crates/blaze-lints/baselines/ reaches zero, then `deny`. The other `hot_*` lints are
@@ -157,10 +166,19 @@ dyn_fn_param = "warn"
 box_large_new = "warn"
 # Zero findings since every span outside a `blaze*` crate named `target: "blaze"`.
 unrecorded_span = "deny"
+# `lenient_deserialize` (a serde `Deserialize` derive without `#[serde(deny_unknown_fields)]`,
+# which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
+# `warn`; other workspaces opt in.
 
-# llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
-[workspace.metadata.blaze.sandbox]
-build-script-env = ["LLVM_SYS_231_PREFIX"]
+# The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
+# crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
+# under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the
+# shell has. llvm-sys's (vendor/llvm-sys/pin.rs) links it; blaze-stencil's makes its stencils with
+# it when `llvm-stencils` is on (the wasm seed builds it without, and asks for no LLVM).
+[workspace.metadata.blaze.native.llvm]
+pin = "crates/hir-ty-codegen/llvm.json"
+env = "LLVM_SYS_231_PREFIX"
+packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 
 [workspace.package]
 version = "0.0.0"
@@ -201,6 +219,14 @@ debug = 0
 # after every edit, so its rebuild time is the edit loop ("make release mode at least incremental",
 # Andrew, 2026-11-03; a release rebuild took 5-12 min). The shipped binary is `dist`, built from
 # scratch with incremental off.
+incremental = true
+
+# bootstrap: stage 0 refuses build-override and release twins of one crate (crossbeam-channel) as
+# one key twice (fixed by crateclash); matching the profiles makes them one unit. Drop at the next stage.
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16
+debug = 0
 incremental = true
 
 # As in `profile.dev.package`: build dependencies are built at opt-level 0 otherwise.
@@ -247,6 +273,15 @@ wasmtime = { path = "vendor/wasmtime" }
 # rsasm's master after 0.1.3, which has aarch64's exclusive and LSE atomics that compiler_builtins'
 # outline atomics are written in (vendor/rsasm/SOURCE.md).
 rsasm = { path = "vendor/rsasm" }
+# For one release: its trampolines assembled from .S by cc, not `global_asm!`, which stage 0 drops
+# (#1659); removed when stage 0 is a release built after 8498b0dfc1 (vendor/corosensei/SOURCE.md).
+corosensei = { path = "vendor/corosensei" }
+# Upstream with every `tracing` site deleted, as patch series tools/vendor/sync.py replays on each
+# bump (docs/v2/plan/observe/no-tracing.md, 6.2; vendor/<crate>/PATCHES.md). quinn, quinn-udp and
+# wtransport are out of the graph: blaze-http's h3 core drives quinn-proto itself
+# (docs/v2/plan/observe/http3-sans-io.md).
+quinn-proto = { path = "vendor/quinn-proto" }
+ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
 
 [workspace.dependencies]
 # local crates
@@ -288,6 +323,7 @@ blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
+blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
@@ -297,6 +333,7 @@ ix-prof = { path = "crates/ix-prof", default-features = false }
 blaze-explore = { path = "crates/blaze-explore" }
 blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
+blaze-report = { path = "crates/blaze-report" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }
@@ -313,8 +350,11 @@ blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
+# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
@@ -424,15 +464,19 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-# The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a
-# self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;
-# no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).
-wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+# QUIC under blaze-http's h3 core (the explorer's WebTransport on 127.0.0.1): quinn-proto's
+# sans-IO endpoint, on rustls with ring, the crypto rustls already uses here; no `log`, no
+# `bloom` (no 0-RTT or Retry tokens to remember).
+quinn-proto = { version = "0.11.19", default-features = false, features = ["rustls-ring"] }
+# quinn-proto's buffer types, as h3 hands it datagrams.
+bytes = "1.11.1"
 # The explorer's ECDSA P-256 certificate, made at start and rotated before it expires.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 # blaze's own profiler (crates/blaze-profile): the schema's Arrow types, the live feed's IPC
 # batches and the Parquet history. Pure Rust; DuckDB stays outside blaze (`blaze debug sql`).
 arrow-array = { version = "60.1.0", default-features = false }
+# The live feed's client feeds its long-lived IPC streams to `StreamDecoder` as `Buffer`s.
+arrow-buffer = { version = "60.1.0", default-features = false }
 arrow-ipc = { version = "60.1.0", default-features = false, features = ["zstd"] }
 arrow-schema = { version = "60.1.0", default-features = false }
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "simdutf8"] }
@@ -483,7 +527,7 @@ text-size = "1.1.1"
 toml = "1.1.8"
 # Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
 # recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
-tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_info"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_debug"] }
 tracing-tree = "0.4.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "registry",
@@ -551,12 +595,10 @@ foldhash = "0.2.0"
 fst = { version = "0.4.7", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 glob = "0.3.4"
-http-body-util = "0.1.5"
-# A request's method, status and header names, hyper's own (blaze-registry, with or without `net`).
+# A request's method, status and header names (blaze-http, and blaze-registry with or without `net`).
 http = "1.5.0"
-hyper = { version = "1.12.0", default-features = false }
-hyper-rustls = { version = "0.27.10", default-features = false }
-hyper-util = { version = "0.1.21", default-features = false }
+# blaze-http's parsing of an answer's head.
+httparse = "1.10.1"
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }
@@ -565,6 +607,8 @@ rsasm = { version = "=0.1.3", default-features = false, features = ["x86", "aarc
 lzma-rust2 = { version = "0.24.0", default-features = false }
 # blaze's map shared between threads (`blaze_hash::SharedMap`): lock-free reads, no guard held across calls.
 papaya = "0.2.5"
+# SHA-512 for blaze-fetch's pins; SHA-256 is blaze-sha256's.
+sha2 = "0.11"
 # blaze's locks and condition variables: `std::sync`'s are disallowed (`.clippy.toml`).
 parking_lot = "0.12.5"
 pathdiff = "0.2.3"

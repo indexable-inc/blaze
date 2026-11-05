@@ -5,13 +5,17 @@
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
-use arrow_array::{Array, RecordBatch, cast::AsArray, types::{Int64Type, UInt32Type, UInt64Type}};
+use arrow_array::{
+    Array, RecordBatch,
+    cast::AsArray,
+    types::{Int64Type, UInt32Type, UInt64Type},
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
+    history::{HistoryError, Pin},
     schema,
     slow::{DiedSpan, DiedThread},
 };
@@ -31,21 +35,49 @@ pub struct Reading {
 
 #[derive(Debug)]
 pub enum ReadingError {
-    Io { path: PathBuf, doing: &'static str, error: std::io::Error },
-    Parquet { path: PathBuf, error: parquet::errors::ParquetError },
-    Arrow { path: PathBuf, error: arrow_schema::ArrowError },
+    Io {
+        path: PathBuf,
+        doing: &'static str,
+        error: std::io::Error,
+    },
+    Parquet {
+        path: PathBuf,
+        error: parquet::errors::ParquetError,
+    },
+    Arrow {
+        path: PathBuf,
+        error: arrow_schema::ArrowError,
+    },
     /// A column of an `open` file is missing or of another type.
-    Column { path: PathBuf, column: &'static str },
+    Column {
+        path: PathBuf,
+        column: &'static str,
+    },
+    /// The history could not be pinned and its manifest read ([`Pin`]).
+    History(HistoryError),
 }
 
 impl fmt::Display for ReadingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReadingError::Io { path, doing, error } => write!(f, "the profile history: {doing} {}: {error}", path.display()),
-            ReadingError::Parquet { path, error } => write!(f, "the profile history: reading {}: {error}", path.display()),
-            ReadingError::Arrow { path, error } => write!(f, "the profile history: reading the rows of {}: {error}", path.display()),
+            ReadingError::Io { path, doing, error } => {
+                write!(f, "the profile history: {doing} {}: {error}", path.display())
+            }
+            ReadingError::Parquet { path, error } => {
+                write!(f, "the profile history: reading {}: {error}", path.display())
+            }
+            ReadingError::Arrow { path, error } => {
+                write!(f, "the profile history: reading the rows of {}: {error}", path.display())
+            }
             ReadingError::Column { path, column } => {
-                write!(f, "the profile history: {} has no column `{column}` of the type the open table has", path.display())
+                write!(
+                    f,
+                    "the profile history: {} has no column `{column}` of the type the open table has",
+                    path.display()
+                )
+            }
+            ReadingError::History(error) => {
+                write!(f, "pinning the history to read its last open spans: {error}")
             }
         }
     }
@@ -53,28 +85,25 @@ impl fmt::Display for ReadingError {
 
 impl std::error::Error for ReadingError {}
 
-/// The last reading of the open spans of the process `pid` in the history `dir`, among its
-/// newest [`FILES`] `open` files; `None` where they hold none of it.
+/// The last reading of the open spans of the process `pid` in the history `dir`, among the
+/// newest [`FILES`] `open` files its manifest lists (by their latest instant, then name);
+/// `None` where they hold none of it.
 pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let suffix = format!(".{}.parquet", schema::OPEN.name); // alloc: once a reading
-    let schema_file = format!("schema{suffix}"); // alloc: once a reading
-    let io = |doing| move |error| ReadingError::Io { path: dir.to_owned(), doing, error }; // alloc: an error
+    // Held to the end: a merge or the cap retires `open` files, and none the manifest it read
+    // lists is deleted meanwhile.
+    let pin = Pin::take(dir).map_err(ReadingError::History)?;
+    let manifest = pin.manifest();
     // alloc: the history's open files, once a reading
-    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io("listing"))? {
-        let entry = entry.map_err(io("listing"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(&suffix) || name == schema_file || name.starts_with('.') {
-            continue;
-        }
-        let modified = entry.metadata().and_then(|it| it.modified()).map_err(io("reading a file's time in"))?;
-        files.push((modified, entry.path()));
-    }
-    // Newest first; the name (build, then flush) breaks a tie in time.
+    let mut files: Vec<(i64, &str)> = manifest
+        .entries(schema::OPEN.name)
+        .filter(|(_, entry)| entry.pid.is_none_or(|it| it == pid))
+        .map(|(name, entry)| (entry.t_ns.map_or(i64::MIN, |it| it[1]), name))
+        .collect();
     files.sort_unstable_by(|a, b| b.cmp(a));
+    // alloc: the files' paths, once a reading
+    let files: Vec<PathBuf> = files.iter().take(FILES).map(|(_, name)| dir.join(name)).collect();
     let mut best: Option<Reading> = None;
-    for (_, path) in files.iter().take(FILES) {
+    for path in &files {
         if let Some(reading) = of_file(path, pid)?
             && best.as_ref().is_none_or(|it| reading.read_ns > it.read_ns)
         {
@@ -86,9 +115,16 @@ pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
 
 /// The last reading of `pid` in the `open` file `path`.
 fn of_file(path: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let file = fs::File::open(path).map_err(|error| ReadingError::Io { path: path.to_owned(), doing: "opening", error })?;
+    let file = fs::File::open(path).map_err(|error| ReadingError::Io {
+        path: path.to_owned(),
+        doing: "opening",
+        error,
+    })?;
     let parquet = |error| ReadingError::Parquet { path: path.to_owned(), error };
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file).map_err(parquet)?.build().map_err(parquet)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(parquet)?
+        .build()
+        .map_err(parquet)?;
     let mut out: Option<Reading> = None;
     for batch in reader {
         let batch = batch.map_err(|error| ReadingError::Arrow { path: path.to_owned(), error })?;
@@ -97,15 +133,27 @@ fn of_file(path: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
     Ok(out)
 }
 
-fn rows(batch: &RecordBatch, path: &Path, pid: u32, out: &mut Option<Reading>) -> Result<(), ReadingError> {
-    let column = |column: &'static str| batch.column_by_name(column).ok_or(ReadingError::Column { path: path.to_owned(), column });
+fn rows(
+    batch: &RecordBatch,
+    path: &Path,
+    pid: u32,
+    out: &mut Option<Reading>,
+) -> Result<(), ReadingError> {
+    let column = |column: &'static str| {
+        batch.column_by_name(column).ok_or(ReadingError::Column { path: path.to_owned(), column })
+    };
     let typed = |column: &'static str| ReadingError::Column { path: path.to_owned(), column };
-    let process = column("process")?.as_primitive_opt::<UInt32Type>().ok_or_else(|| typed("process"))?;
-    let thread = column("thread")?.as_primitive_opt::<UInt32Type>().ok_or_else(|| typed("thread"))?;
-    let read = column("read_ns")?.as_primitive_opt::<Int64Type>().ok_or_else(|| typed("read_ns"))?;
-    let start = column("start_ns")?.as_primitive_opt::<Int64Type>().ok_or_else(|| typed("start_ns"))?;
+    let process =
+        column("process")?.as_primitive_opt::<UInt32Type>().ok_or_else(|| typed("process"))?;
+    let thread =
+        column("thread")?.as_primitive_opt::<UInt32Type>().ok_or_else(|| typed("thread"))?;
+    let read =
+        column("read_ns")?.as_primitive_opt::<Int64Type>().ok_or_else(|| typed("read_ns"))?;
+    let start =
+        column("start_ns")?.as_primitive_opt::<Int64Type>().ok_or_else(|| typed("start_ns"))?;
     let owner = column("owner")?.as_primitive_opt::<UInt64Type>().ok_or_else(|| typed("owner"))?;
-    let (thread_name, name, function, awaits) = (column("thread_name")?, column("name")?, column("function")?, column("awaits")?);
+    let (thread_name, name, function, awaits) =
+        (column("thread_name")?, column("name")?, column("function")?, column("awaits")?);
     for row in 0..batch.num_rows() {
         if process.is_null(row) || process.value(row) != pid || read.is_null(row) {
             continue;
@@ -120,7 +168,11 @@ fn rows(batch: &RecordBatch, path: &Path, pid: u32, out: &mut Option<Reading>) -
         let tid = thread.value(row);
         if reading.threads.last().is_none_or(|it| it.thread != tid) {
             // alloc: once a thread a reading
-            reading.threads.push(DiedThread { thread: tid, name: text(thread_name.as_ref(), row), spans: Vec::new() });
+            reading.threads.push(DiedThread {
+                thread: tid,
+                name: text(thread_name.as_ref(), row),
+                spans: Vec::new(),
+            });
         }
         let span = DiedSpan {
             name: text(name.as_ref(), row).unwrap_or_default(),

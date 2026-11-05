@@ -132,12 +132,7 @@ pub mod __bench {
     }
 
     pub fn biased_float_sample(fc: &FloatChoice, rng: &mut EngineRng) -> f64 {
-        biased_float_sample_with(
-            fc,
-            FloatWidth::F64,
-            rng,
-            FloatGenerationParameters::default(),
-        )
+        biased_float_sample_with(fc, FloatWidth::F64, rng, FloatGenerationParameters::default())
     }
 
     /// [`biased_float_sample`] for a draw of the given width, under an explicit
@@ -162,21 +157,12 @@ pub mod __bench {
         Fresh { budget: usize },
         /// One sequence positionally, bare when `extend == 0`, else with up
         /// to `extend` random draws past it (`Rescue::Pun`).
-        Sequence {
-            choices: &'a [ChoiceValue],
-            extend: usize,
-        },
+        Sequence { choices: &'a [ChoiceValue], extend: usize },
         /// A counterexample under the live set, with up to
         /// `extend` random draws past its longest timeline.
-        Set {
-            timelines: &'a [Vec<ChoiceValue>],
-            extend: usize,
-        },
+        Set { timelines: &'a [Vec<ChoiceValue>], extend: usize },
         /// Every draw decided by the resolver.
-        External {
-            resolver: alloc::boxed::Box<dyn ExternalReplay>,
-            budget: usize,
-        },
+        External { resolver: alloc::boxed::Box<dyn ExternalReplay>, budget: usize },
     }
 
     pub struct ReplayOutcome {
@@ -205,11 +191,7 @@ pub mod __bench {
                 NativeTestCase::for_probe(choices, rng, flattened_values_len(choices) + extend)
             }
             ReplayKind::Set { timelines, extend } => {
-                let longest = timelines
-                    .iter()
-                    .map(|t| flattened_values_len(t))
-                    .max()
-                    .unwrap_or(0);
+                let longest = timelines.iter().map(|t| flattened_values_len(t)).max().unwrap_or(0);
                 NativeTestCase::for_counterexample(timelines, rng, longest + extend)
             }
             ReplayKind::External { resolver, budget } => {
@@ -602,10 +584,7 @@ pub struct hegel_string_t {
 
 impl Default for hegel_string_t {
     fn default() -> Self {
-        Self {
-            data: ptr::null(),
-            len: 0,
-        }
+        Self { data: ptr::null(), len: 0 }
     }
 }
 
@@ -614,10 +593,7 @@ impl From<&str> for hegel_string_t {
         if value.is_empty() {
             Self::default()
         } else {
-            Self {
-                data: value.as_ptr().cast(),
-                len: value.len(),
-            }
+            Self { data: value.as_ptr().cast(), len: value.len() }
         }
     }
 }
@@ -659,10 +635,7 @@ impl From<String> for StoredString {
     fn from(mut value: String) -> Self {
         let len = value.len();
         value.push('\0');
-        let string = hegel_string_t {
-            data: value.as_ptr().cast(),
-            len,
-        };
+        let string = hegel_string_t { data: value.as_ptr().cast(), len };
         Self { value, string }
     }
 }
@@ -717,11 +690,7 @@ impl OutputTarget {
 /// `callback`, in which case `user_data` is ignored).
 fn output_from_callback(callback: hegel_output_callback_t, user_data: *mut c_void) -> Output {
     match callback {
-        Some(callback) => OutputTarget {
-            callback,
-            user_data,
-        }
-        .as_output(),
+        Some(callback) => OutputTarget { callback, user_data }.as_output(),
         None => Output::stderr(),
     }
 }
@@ -730,9 +699,7 @@ fn output_from_callback(callback: hegel_output_callback_t, user_data: *mut c_voi
 /// Never returns NULL. Must be freed with `hegel_context_free`.
 #[unsafe(no_mangle)]
 pub extern "C" fn hegel_context_new() -> *mut HegelContext {
-    Box::into_raw(Box::new(HegelContext {
-        last_error: String::new().into(),
-    }))
+    Box::into_raw(Box::new(HegelContext { last_error: String::new().into() }))
 }
 
 /// Parameters:
@@ -758,10 +725,7 @@ pub unsafe extern "C" fn hegel_context_free(ctx: *mut HegelContext) -> hegel_res
 pub unsafe extern "C" fn hegel_context_last_error(ctx: *const HegelContext) -> hegel_string_t {
     match unsafe { ctx.as_ref() } {
         Some(c) => c.last_error.string,
-        None => hegel_string_t {
-            data: c"".as_ptr(),
-            len: 0,
-        },
+        None => hegel_string_t { data: c"".as_ptr(), len: 0 },
     }
 }
 
@@ -817,20 +781,13 @@ impl HegelSettings {
             Database::Disabled => Some(String::new().into()),
             Database::Path(path) => Some(path.clone().into()),
         };
-        HegelSettings {
-            inner,
-            database_key: None,
-            database_c,
-            test_location: None,
-        }
+        HegelSettings { inner, database_key: None, database_c, test_location: None }
     }
 
     /// The reporter for a run or blob replay under these settings, writing
     /// to `output`: `None` when no test location was set.
     fn reporter(&self, output: &Output) -> Option<Reporter> {
-        self.test_location
-            .clone()
-            .map(|location| Reporter::new(location, output.clone()))
+        self.test_location.clone().map(|location| Reporter::new(location, output.clone()))
     }
 }
 
@@ -888,10 +845,7 @@ impl FamilyShared {
     /// tearing down an in-flight case — is a no-op. This is the single home
     /// of the exactly-once completion protocol.
     fn complete(&self, outcome: &TestCaseResult) {
-        if self
-            .completed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        if self.completed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
         {
             self.ds.mark_complete(outcome);
             if let Some(reporter) = &self.reporter {
@@ -960,9 +914,7 @@ impl Attribution {
         if worker == NO_WORKER {
             return None;
         }
-        let elapsed = self
-            .started
-            .map_or(core::time::Duration::ZERO, |started| started.elapsed());
+        let elapsed = self.started.map_or(core::time::Duration::ZERO, |started| started.elapsed());
         let ms = elapsed.as_secs_f64() * 1000.0;
         Some(format!("[worker {worker} +{ms:.3}ms] "))
     }
@@ -1070,11 +1022,7 @@ impl From<&RunError> for HegelRunError {
             RunError::UsageError(_) => (HEGEL_RUN_ERROR_USAGE, 0),
             RunError::Internal(_) => (HEGEL_RUN_ERROR_INTERNAL, 0),
         };
-        HegelRunError {
-            kind,
-            health_check,
-            message: e.to_string().into(),
-        }
+        HegelRunError { kind, health_check, message: e.to_string().into() }
     }
 }
 
@@ -1127,10 +1075,7 @@ impl HegelRunResult {
     /// exposed via `hegel_run_result_error_kind` and the message via
     /// `hegel_run_result_error`.
     fn from_error(e: &RunError) -> Self {
-        HegelRunResult {
-            failures: Vec::new(),
-            error: Some(HegelRunError::from(e)),
-        }
+        HegelRunResult { failures: Vec::new(), error: Some(HegelRunError::from(e)) }
     }
 
     fn status(&self) -> hegel_run_status_t {
@@ -1149,10 +1094,7 @@ impl HegelRunResult {
 /// contain NULs, but defending against that here means the caller never
 /// sees a `CString` construction fail.
 fn cstring_lossy(s: &str) -> CString {
-    let sanitized: String = s
-        .chars()
-        .map(|c| if c == '\0' { '\u{FFFD}' } else { c })
-        .collect();
+    let sanitized: String = s.chars().map(|c| if c == '\0' { '\u{FFFD}' } else { c }).collect();
     let mut bytes = sanitized.into_bytes();
     bytes.push(0);
     // SAFETY: `sanitized` contains no U+0000, and no other char's UTF-8
@@ -1247,19 +1189,11 @@ pub unsafe extern "C" fn hegel_settings_new_for_profile(
 ) -> hegel_result_t {
     clear_last_error(ctx);
     let Ok(name) = (unsafe { name.as_str() }) else {
-        set_last_error(
-            ctx,
-            "hegel_settings_new_for_profile: name is not valid UTF-8",
-        );
+        set_last_error(ctx, "hegel_settings_new_for_profile: name is not valid UTF-8");
         return HEGEL_E_INVALID_ARG;
     };
     unsafe {
-        settings_new_for_profile(
-            ctx,
-            Some(name),
-            out_settings,
-            "hegel_settings_new_for_profile",
-        )
+        settings_new_for_profile(ctx, Some(name), out_settings, "hegel_settings_new_for_profile")
     }
 }
 
@@ -1362,10 +1296,7 @@ pub unsafe extern "C" fn hegel_settings_set_backend(
             handle.inner = handle.inner.clone().backend(Backend::Urandom);
         }
         _ => {
-            set_last_error(
-                ctx,
-                &format!("hegel_settings_set_backend: unknown backend {backend}"),
-            );
+            set_last_error(ctx, &format!("hegel_settings_set_backend: unknown backend {backend}"));
             return HEGEL_E_INVALID_ARG;
         }
     }
@@ -1414,10 +1345,7 @@ pub unsafe extern "C" fn hegel_settings_set_verbosity(
         x if x == hegel_verbosity_t::HEGEL_VERBOSITY_VERBOSE as u32 => Verbosity::Verbose,
         x if x == hegel_verbosity_t::HEGEL_VERBOSITY_DEBUG as u32 => Verbosity::Debug,
         _ => {
-            set_last_error(
-                ctx,
-                &format!("hegel_settings_set_verbosity: unknown verbosity {v}"),
-            );
+            set_last_error(ctx, &format!("hegel_settings_set_verbosity: unknown verbosity {v}"));
             return HEGEL_E_INVALID_ARG;
         }
     };
@@ -1479,10 +1407,7 @@ pub unsafe extern "C" fn hegel_settings_set_seed(
         Ok(h) => h,
         Err(rc) => return rc,
     };
-    handle.inner = handle
-        .inner
-        .clone()
-        .seed(if has_seed { Some(seed) } else { None });
+    handle.inner = handle.inner.clone().seed(if has_seed { Some(seed) } else { None });
     HEGEL_OK
 }
 
@@ -1679,10 +1604,7 @@ pub unsafe extern "C" fn hegel_settings_set_database_key(
             HEGEL_OK
         }
         Err(_) => {
-            set_last_error(
-                ctx,
-                "hegel_settings_set_database_key: key is not valid UTF-8",
-            );
+            set_last_error(ctx, "hegel_settings_set_database_key: key is not valid UTF-8");
             HEGEL_E_INVALID_ARG
         }
     }
@@ -1725,20 +1647,12 @@ pub unsafe extern "C" fn hegel_settings_set_test_location(
     };
     const FN: &str = "hegel_settings_set_test_location";
     let read = |name: &str, p: hegel_string_t| unsafe { required_utf8_arg(ctx, FN, name, p) };
-    let (file, class, function) = match (
-        read("file", file),
-        read("class_name", class_name),
-        read("function", function),
-    ) {
-        (Ok(file), Ok(class), Ok(function)) => (file, class, function),
-        (Err(rc), _, _) | (_, Err(rc), _) | (_, _, Err(rc)) => return rc,
-    };
-    hs.test_location = Some(TestLocation {
-        function,
-        class,
-        file,
-        begin_line,
-    });
+    let (file, class, function) =
+        match (read("file", file), read("class_name", class_name), read("function", function)) {
+            (Ok(file), Ok(class), Ok(function)) => (file, class, function),
+            (Err(rc), _, _) | (_, Err(rc), _) | (_, _, Err(rc)) => return rc,
+        };
+    hs.test_location = Some(TestLocation { function, class, file, begin_line });
     HEGEL_OK
 }
 
@@ -1860,10 +1774,7 @@ pub unsafe extern "C" fn hegel_settings_register_profile(
 ) -> hegel_result_t {
     clear_last_error(ctx);
     let Ok(name) = (unsafe { name.as_str() }) else {
-        set_last_error(
-            ctx,
-            "hegel_settings_register_profile: name is not valid UTF-8",
-        );
+        set_last_error(ctx, "hegel_settings_register_profile: name is not valid UTF-8");
         return HEGEL_E_INVALID_ARG;
     };
     let handle = match unsafe { settings_ref(ctx, settings, "hegel_settings_register_profile") } {
@@ -2158,10 +2069,7 @@ pub unsafe extern "C" fn hegel_settings_get_suppress_health_check(
         Err(rc) => return rc,
     };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_suppress_health_check: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_suppress_health_check: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out = health_check_bits(&handle.inner.suppress_health_check) };
@@ -2198,10 +2106,7 @@ pub unsafe extern "C" fn hegel_settings_get_report_multiple_failures(
             Err(rc) => return rc,
         };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_report_multiple_failures: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_report_multiple_failures: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out = handle.inner.report_multiple_failures };
@@ -2224,10 +2129,7 @@ pub unsafe extern "C" fn hegel_settings_get_stop_on_first_failure(
         Err(rc) => return rc,
     };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_stop_on_first_failure: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_stop_on_first_failure: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out = handle.inner.stop_on_first_failure };
@@ -2250,10 +2152,7 @@ pub unsafe extern "C" fn hegel_settings_get_show_statistics(
         Err(rc) => return rc,
     };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_show_statistics: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_show_statistics: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out = handle.inner.show_statistics };
@@ -2277,10 +2176,7 @@ pub unsafe extern "C" fn hegel_settings_get_unbounded_choices(
         Err(rc) => return rc,
     };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_unbounded_choices: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_unbounded_choices: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out = handle.inner.unbounded_choices };
@@ -2355,10 +2251,7 @@ pub unsafe extern "C" fn hegel_settings_get_nondeterminism_strictness(
             Err(rc) => return rc,
         };
     if out.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_settings_get_nondeterminism_strictness: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_settings_get_nondeterminism_strictness: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     use hegel_nondeterminism_strictness_t as c;
@@ -2398,15 +2291,7 @@ pub unsafe extern "C" fn hegel_run_start(
     out_run: *mut *mut HegelRun,
 ) -> hegel_result_t {
     unsafe {
-        start_exploring_run(
-            ctx,
-            "hegel_run_start",
-            false,
-            settings,
-            callback,
-            user_data,
-            out_run,
-        )
+        start_exploring_run(ctx, "hegel_run_start", false, settings, callback, user_data, out_run)
     }
 }
 
@@ -2477,10 +2362,7 @@ unsafe fn start_exploring_run(
         set_last_error(ctx, &format!("{name}: settings pointer is null"));
         return HEGEL_E_INVALID_HANDLE;
     };
-    let settings = handle
-        .inner
-        .clone()
-        .output(output_from_callback(callback, user_data));
+    let settings = handle.inner.clone().output(output_from_callback(callback, user_data));
     let database_key = handle.database_key.clone();
     let reporter = handle.reporter(&settings.output);
 
@@ -2568,10 +2450,7 @@ pub unsafe extern "C" fn hegel_run_start_blob(
         );
         return HEGEL_E_INVALID_ARG;
     };
-    let settings = handle
-        .inner
-        .clone()
-        .output(output_from_callback(callback, user_data));
+    let settings = handle.inner.clone().output(output_from_callback(callback, user_data));
     let reporter = handle.reporter(&settings.output);
 
     let exchange = Arc::new(CaseExchange::new());
@@ -2732,10 +2611,7 @@ pub unsafe extern "C" fn hegel_run_propose(
         }
     };
     let Some(prefix) = crate::native::database::deserialize_choices_exact(prefix) else {
-        set_last_error(
-            ctx,
-            "hegel_run_propose: prefix is not a valid encoded choice sequence",
-        );
+        set_last_error(ctx, "hegel_run_propose: prefix is not a valid encoded choice sequence");
         return HEGEL_E_INVALID_ARG;
     };
     let proposal = crate::native::external::Proposal { id, prefix, tail };
@@ -2768,10 +2644,7 @@ unsafe fn provide_next(
     next: Next,
 ) -> hegel_result_t {
     if run.exchange.provide(next).is_err() {
-        set_last_error(
-            ctx,
-            &format!("{name}: the run is not waiting for a proposal"),
-        );
+        set_last_error(ctx, &format!("{name}: the run is not waiting for a proposal"));
         return HEGEL_E_INVALID_ARG;
     }
     HEGEL_OK
@@ -2843,9 +2716,7 @@ pub unsafe extern "C" fn hegel_run_case_report(
 /// run finishes (`Ready`). The engine only suspends at its case exchange and
 /// is only resumed here, so a no-op waker suffices — no executor is involved.
 fn poll_engine(engine: &mut EngineFuture) -> Poll<Result<TestRunResult, RunError>> {
-    engine
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
+    engine.as_mut().poll(&mut Context::from_waker(Waker::noop()))
 }
 
 /// Parameters:
@@ -2991,10 +2862,7 @@ pub unsafe extern "C" fn hegel_test_case_from_blob(
         set_last_error(ctx, "hegel_test_case_from_blob: blob is not valid UTF-8");
         return HEGEL_E_INVALID_ARG;
     };
-    let settings = handle
-        .inner
-        .clone()
-        .output(output_from_callback(callback, user_data));
+    let settings = handle.inner.clone().output(output_from_callback(callback, user_data));
     let Some(ds) = data_source_for_blob(&settings, blob) else {
         set_last_error(
             ctx,
@@ -3163,12 +3031,7 @@ pub unsafe extern "C" fn hegel_test_case_block(
         set_last_error(ctx, "hegel_test_case_block: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
-    let print_target = match src
-        .family
-        .printer
-        .lock()
-        .block(src.print_target, size_arg(indent))
-    {
+    let print_target = match src.family.printer.lock().block(src.print_target, size_arg(indent)) {
         Ok(slot) => PrinterTarget::Slot(slot),
         Err(_) => src.print_target,
     };
@@ -3233,9 +3096,7 @@ fn new_family(
     Arc::new(FamilyShared {
         ds: Arc::from(ds),
         completed: AtomicBool::new(false),
-        printer: Arc::new(Mutex::new(Printer::new(size_arg(
-            DEFAULT_PRINTER_MAX_WIDTH,
-        )))),
+        printer: Arc::new(Mutex::new(Printer::new(size_arg(DEFAULT_PRINTER_MAX_WIDTH)))),
         printer_width_configured: AtomicBool::new(false),
         started: crate::sys::Instant::now(),
         reporter,
@@ -3294,10 +3155,7 @@ unsafe fn tc_guard<'a>(
         return Err(HEGEL_E_ALREADY_COMPLETE);
     }
     let Some(guard) = tc.local.try_lock() else {
-        set_last_error(
-            ctx,
-            &format!("{fn_name}: test case handle is in use on another thread"),
-        );
+        set_last_error(ctx, &format!("{fn_name}: test case handle is in use on another thread"));
         return Err(HEGEL_E_CONCURRENT_USE);
     };
     Ok((tc, guard))
@@ -3505,11 +3363,7 @@ pub unsafe extern "C" fn hegel_label_combine(
         set_last_error(ctx, "hegel_label_combine: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
-    let labels = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(labels, len) }
-    };
+    let labels = if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(labels, len) } };
     unsafe { *out_label = crate::native::labels::combine_labels(labels) };
     HEGEL_OK
 }
@@ -3598,11 +3452,7 @@ pub unsafe extern "C" fn hegel_new_collection(
         return HEGEL_E_INVALID_ARG;
     }
     unsafe { *out_collection = ptr::null_mut() };
-    let max = if max_size == u64::MAX {
-        None
-    } else {
-        Some(max_size)
-    };
+    let max = if max_size == u64::MAX { None } else { Some(max_size) };
     if let Some(max) = max {
         if min_size > max {
             set_last_error(
@@ -3618,9 +3468,7 @@ pub unsafe extern "C" fn hegel_new_collection(
     match tc.stream.new_collection(min_size, max) {
         Ok(state) => {
             unsafe {
-                *out_collection = into_raw_send_sync(HegelCollection {
-                    state: Mutex::new(state),
-                });
+                *out_collection = into_raw_send_sync(HegelCollection { state: Mutex::new(state) });
             }
             HEGEL_OK
         }
@@ -3825,9 +3673,7 @@ pub unsafe extern "C" fn hegel_new_recursion(
     match tc.stream.new_recursion(max_depth, max_leaves) {
         Ok(state) => {
             unsafe {
-                *out_recursion = into_raw_send_sync(HegelRecursion {
-                    state: Mutex::new(state),
-                });
+                *out_recursion = into_raw_send_sync(HegelRecursion { state: Mutex::new(state) });
             }
             HEGEL_OK
         }
@@ -4068,9 +3914,7 @@ pub unsafe extern "C" fn hegel_new_pool(
     match tc.stream.new_pool() {
         Ok(variables) => {
             unsafe {
-                *out_pool = into_raw_send_sync(HegelPool {
-                    variables: Mutex::new(variables),
-                });
+                *out_pool = into_raw_send_sync(HegelPool { variables: Mutex::new(variables) });
             }
             HEGEL_OK
         }
@@ -4232,17 +4076,10 @@ unsafe fn names_from_c_array(
     if (names.is_null() && len > 0)
         || len > isize::MAX as usize / core::mem::size_of::<hegel_string_t>()
     {
-        set_last_error(
-            ctx,
-            &format!("{func}: {what} pointer is null or length is invalid"),
-        );
+        set_last_error(ctx, &format!("{func}: {what} pointer is null or length is invalid"));
         return Err(HEGEL_E_INVALID_ARG);
     }
-    let strings = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(names, len) }
-    };
+    let strings = if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(names, len) } };
     let mut out = Vec::with_capacity(len);
     for (i, &value) in strings.iter().enumerate() {
         out.push(unsafe { required_utf8_arg(ctx, func, &format!("{what}[{i}]"), value) }?);
@@ -4380,13 +4217,7 @@ pub unsafe extern "C" fn hegel_new_state_machine(
     }
     unsafe { *out_state_machine = ptr::null_mut() };
     let rules = match unsafe {
-        names_from_c_array(
-            ctx,
-            "hegel_new_state_machine",
-            "rule_names",
-            rule_names,
-            num_rules,
-        )
+        names_from_c_array(ctx, "hegel_new_state_machine", "rule_names", rule_names, num_rules)
     } {
         Ok(v) => v,
         Err(rc) => return rc,
@@ -4400,10 +4231,7 @@ pub unsafe extern "C" fn hegel_new_state_machine(
     } else {
         unsafe { core::slice::from_raw_parts(rule_groups, num_rules) }.to_vec()
     };
-    if let Some(rule) = rule_groups
-        .iter()
-        .position(|&id| id == HEGEL_STATE_MACHINE_DONE)
-    {
+    if let Some(rule) = rule_groups.iter().position(|&id| id == HEGEL_STATE_MACHINE_DONE) {
         set_last_error(
             ctx,
             &format!(
@@ -4450,9 +4278,8 @@ pub unsafe extern "C" fn hegel_new_state_machine(
         Ok(machine) => {
             let concurrency = machine.concurrency();
             unsafe {
-                *out_state_machine = into_raw_send_sync(HegelStateMachine {
-                    machine: Mutex::new(machine),
-                });
+                *out_state_machine =
+                    into_raw_send_sync(HegelStateMachine { machine: Mutex::new(machine) });
                 *out_concurrency = concurrency;
             }
             HEGEL_OK
@@ -4582,10 +4409,7 @@ pub unsafe extern "C" fn hegel_state_machine_next_rule(
         return HEGEL_E_INVALID_ARG;
     }
     let mut machine = state_machine.machine.lock();
-    match tc
-        .stream
-        .state_machine_next_rule(&mut machine, worker_index)
-    {
+    match tc.stream.state_machine_next_rule(&mut machine, worker_index) {
         Ok(Some(index)) => {
             unsafe { *out_rule_index = index };
             HEGEL_OK
@@ -4633,10 +4457,7 @@ pub unsafe extern "C" fn hegel_state_machine_rule_rejected(
             Err(rc) => return rc,
         };
     let mut machine = state_machine.machine.lock();
-    match tc
-        .stream
-        .state_machine_rule_rejected(&mut machine, worker_index)
-    {
+    match tc.stream.state_machine_rule_rejected(&mut machine, worker_index) {
         Ok(()) => HEGEL_OK,
         Err(e) => translate_ds_error(ctx, e),
     }
@@ -4679,27 +4500,17 @@ pub unsafe extern "C" fn hegel_state_machine_should_check_invariant(
             Err(rc) => return rc,
         };
     let state_machine = match unsafe {
-        state_machine_ref(
-            ctx,
-            "hegel_state_machine_should_check_invariant",
-            state_machine,
-        )
+        state_machine_ref(ctx, "hegel_state_machine_should_check_invariant", state_machine)
     } {
         Ok(m) => m,
         Err(rc) => return rc,
     };
     if out_should_check.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_state_machine_should_check_invariant: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_state_machine_should_check_invariant: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     let mut machine = state_machine.machine.lock();
-    match tc
-        .stream
-        .state_machine_should_check_invariant(&mut machine, invariant_index)
-    {
+    match tc.stream.state_machine_should_check_invariant(&mut machine, invariant_index) {
         Ok(should_check) => {
             unsafe { *out_should_check = should_check };
             HEGEL_OK
@@ -4830,10 +4641,7 @@ pub unsafe extern "C" fn hegel_generate_integer_big(
         return HEGEL_E_INVALID_ARG;
     }
     if min_value_len == 0 || max_value_len == 0 {
-        set_last_error(
-            ctx,
-            "hegel_generate_integer_big: bound encodings must not be empty",
-        );
+        set_last_error(ctx, "hegel_generate_integer_big: bound encodings must not be empty");
         return HEGEL_E_INVALID_ARG;
     }
     if out_value.is_null() || out_value_len.is_null() {
@@ -4859,11 +4667,7 @@ pub unsafe extern "C" fn hegel_generate_integer_big(
                 );
                 return HEGEL_E_INVALID_ARG;
             }
-            let fill = if bytes.last().unwrap() & 0x80 != 0 {
-                0xFF
-            } else {
-                0x00
-            };
+            let fill = if bytes.last().unwrap() & 0x80 != 0 { 0xFF } else { 0x00 };
             unsafe {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_value, bytes.len());
                 core::ptr::write_bytes(
@@ -4966,10 +4770,7 @@ pub unsafe extern "C" fn hegel_generate_bytes(
             tc,
             "hegel_generate_bytes",
             out_result.is_null(),
-            |tc| {
-                tc.stream
-                    .generate_bytes(size_arg(min_size), size_arg(max_size))
-            },
+            |tc| tc.stream.generate_bytes(size_arg(min_size), size_arg(max_size)),
             |v| {
                 let boxed = v.into_boxed_slice();
                 let len = boxed.len();
@@ -5093,9 +4894,7 @@ unsafe fn write_string_generator(
     out_generator: *mut *mut HegelStringGenerator,
     spec: crate::native::draws::StringSpec,
 ) -> hegel_result_t {
-    let handle = into_raw_send_sync(HegelStringGenerator {
-        spec: Arc::new(spec),
-    });
+    let handle = into_raw_send_sync(HegelStringGenerator { spec: Arc::new(spec) });
     unsafe { *out_generator = handle };
     HEGEL_OK
 }
@@ -5483,10 +5282,7 @@ pub unsafe extern "C" fn hegel_grammar_builder_new(
     };
     match crate::native::lark::builder::GrammarFiles::new(text) {
         Ok(files) => {
-            let mut builder = HegelGrammarBuilder {
-                files,
-                paths: Vec::new(),
-            };
+            let mut builder = HegelGrammarBuilder { files, paths: Vec::new() };
             builder.sync_paths();
             unsafe { *out_builder = into_raw_send_sync(builder) };
             HEGEL_OK
@@ -5694,16 +5490,8 @@ pub unsafe extern "C" fn hegel_grammar_new(
         start,
         explicit,
         alphabet: unsafe { alphabet.as_ref() }.map(|g| Arc::clone(&g.spec)),
-        max_size: if max_size == 0 {
-            defaults.max_size
-        } else {
-            max_size
-        },
-        max_depth: if max_depth == 0 {
-            defaults.max_depth
-        } else {
-            max_depth
-        },
+        max_size: if max_size == 0 { defaults.max_size } else { max_size },
+        max_depth: if max_depth == 0 { defaults.max_depth } else { max_depth },
     };
     match from_files(&builder.files, options) {
         Ok(spec) => {
@@ -5844,10 +5632,7 @@ pub unsafe extern "C" fn hegel_generate_grammar(
         set_last_error(ctx, "hegel_generate_grammar: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
-    match tc
-        .stream
-        .generate_grammar(&grammar.spec, (max_size != 0).then_some(max_size))
-    {
+    match tc.stream.generate_grammar(&grammar.spec, (max_size != 0).then_some(max_size)) {
         Ok(s) => unsafe { write_string_result(out_result, s) },
         Err(e) => translate_ds_error(ctx, e),
     }
@@ -5888,11 +5673,7 @@ pub struct hegel_datetime_t {
 }
 
 fn rust_date(d: &hegel_date_t) -> crate::native::draws::special::Date {
-    crate::native::draws::special::Date {
-        year: d.year,
-        month: d.month,
-        day: d.day,
-    }
+    crate::native::draws::special::Date { year: d.year, month: d.month, day: d.day }
 }
 
 fn rust_time(t: &hegel_time_t) -> crate::native::draws::special::Time {
@@ -5905,27 +5686,15 @@ fn rust_time(t: &hegel_time_t) -> crate::native::draws::special::Time {
 }
 
 fn rust_datetime(dt: &hegel_datetime_t) -> crate::native::draws::special::DateTime {
-    crate::native::draws::special::DateTime {
-        date: rust_date(&dt.date),
-        time: rust_time(&dt.time),
-    }
+    crate::native::draws::special::DateTime { date: rust_date(&dt.date), time: rust_time(&dt.time) }
 }
 
 fn c_date(d: crate::native::draws::special::Date) -> hegel_date_t {
-    hegel_date_t {
-        year: d.year,
-        month: d.month,
-        day: d.day,
-    }
+    hegel_date_t { year: d.year, month: d.month, day: d.day }
 }
 
 fn c_time(t: crate::native::draws::special::Time) -> hegel_time_t {
-    hegel_time_t {
-        hour: t.hour,
-        minute: t.minute,
-        second: t.second,
-        nanosecond: t.nanosecond,
-    }
+    hegel_time_t { hour: t.hour, minute: t.minute, second: t.second, nanosecond: t.nanosecond }
 }
 
 /// Parameters:
@@ -5951,10 +5720,7 @@ pub unsafe extern "C" fn hegel_generate_date(
             tc,
             "hegel_generate_date",
             out_value.is_null(),
-            |tc| {
-                tc.stream
-                    .generate_date(rust_date(&min_value), rust_date(&max_value))
-            },
+            |tc| tc.stream.generate_date(rust_date(&min_value), rust_date(&max_value)),
             |d| *out_value = c_date(d),
         )
     }
@@ -5981,10 +5747,7 @@ pub unsafe extern "C" fn hegel_generate_time(
             tc,
             "hegel_generate_time",
             out_value.is_null(),
-            |tc| {
-                tc.stream
-                    .generate_time(rust_time(&min_value), rust_time(&max_value))
-            },
+            |tc| tc.stream.generate_time(rust_time(&min_value), rust_time(&max_value)),
             |t| *out_value = c_time(t),
         )
     }
@@ -6012,16 +5775,8 @@ pub unsafe extern "C" fn hegel_generate_datetime(
             tc,
             "hegel_generate_datetime",
             out_value.is_null(),
-            |tc| {
-                tc.stream
-                    .generate_datetime(rust_datetime(&min_value), rust_datetime(&max_value))
-            },
-            |dt| {
-                *out_value = hegel_datetime_t {
-                    date: c_date(dt.date),
-                    time: c_time(dt.time),
-                }
-            },
+            |tc| tc.stream.generate_datetime(rust_datetime(&min_value), rust_datetime(&max_value)),
+            |dt| *out_value = hegel_datetime_t { date: c_date(dt.date), time: c_time(dt.time) },
         )
     }
 }
@@ -6312,9 +6067,7 @@ impl HegelPrinterOptions {
     /// default. `options` is the (possibly NULL-derived) reference a
     /// construction call received.
     fn resolve_max_width(options: Option<&HegelPrinterOptions>) -> u64 {
-        options
-            .and_then(|o| o.max_width)
-            .unwrap_or(DEFAULT_PRINTER_MAX_WIDTH)
+        options.and_then(|o| o.max_width).unwrap_or(DEFAULT_PRINTER_MAX_WIDTH)
     }
 }
 
@@ -6418,15 +6171,8 @@ unsafe fn printer_guard<'a>(
     printer: *const HegelPrinter,
 ) -> Result<(&'a HegelPrinter, PrinterBusyGuard<'a>), hegel_result_t> {
     let handle = unsafe { printer_arg(ctx, fn_name, printer) }?;
-    if handle
-        .busy
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        set_last_error(
-            ctx,
-            &format!("{fn_name}: printer handle is in use by another thread"),
-        );
+    if handle.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        set_last_error(ctx, &format!("{fn_name}: printer handle is in use by another thread"));
         return Err(HEGEL_E_CONCURRENT_USE);
     }
     Ok((handle, PrinterBusyGuard(&handle.busy)))
@@ -6462,10 +6208,7 @@ unsafe fn printer_text_arg(
 ) -> Result<String, hegel_result_t> {
     let text = unsafe { required_utf8_arg(ctx, fn_name, arg_name, value) }?;
     if text.contains('\n') {
-        set_last_error(
-            ctx,
-            &format!("{fn_name}: {arg_name} must not contain newlines"),
-        );
+        set_last_error(ctx, &format!("{fn_name}: {arg_name} must not contain newlines"));
         return Err(HEGEL_E_INVALID_ARG);
     }
     Ok(text)
@@ -6777,9 +6520,7 @@ pub unsafe extern "C" fn hegel_reflow_options_new(
         set_last_error(ctx, "hegel_reflow_options_new: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
-    let options = Box::into_raw(Box::new(HegelReflowOptions {
-        inner: ReflowOptions::default(),
-    }));
+    let options = Box::into_raw(Box::new(HegelReflowOptions { inner: ReflowOptions::default() }));
     unsafe { *out_options = options };
     HEGEL_OK
 }
@@ -7165,9 +6906,7 @@ pub unsafe extern "C" fn hegel_test_case_printer(
         let mut printer = inner.lock();
         if !tc.family.printer_width_configured.load(Ordering::Acquire) {
             printer.set_max_width(size_arg(requested));
-            tc.family
-                .printer_width_configured
-                .store(true, Ordering::Release);
+            tc.family.printer_width_configured.store(true, Ordering::Release);
         } else if printer.max_width() != size_arg(requested) {
             let actual = printer.max_width();
             set_last_error(
@@ -7229,17 +6968,9 @@ pub unsafe extern "C" fn hegel_note(
         Ok(text) => text,
         Err(rc) => return rc,
     };
-    let attribution = Attribution {
-        worker: Arc::clone(&tc.worker),
-        started: tc.family.started,
-    };
+    let attribution = Attribution { worker: Arc::clone(&tc.worker), started: tc.family.started };
     let prefix = attribution.line_prefix();
-    match tc
-        .family
-        .printer
-        .lock()
-        .note(tc.print_target, &text, prefix.as_deref())
-    {
+    match tc.family.printer.lock().note(tc.print_target, &text, prefix.as_deref()) {
         Ok(()) => HEGEL_OK,
         Err(e) => translate_printer_error(ctx, FN, e),
     }
@@ -7308,10 +7039,7 @@ pub unsafe extern "C" fn hegel_mark_complete(
             })
         }
         _ => {
-            set_last_error(
-                ctx,
-                &format!("hegel_mark_complete: unknown status {status}"),
-            );
+            set_last_error(ctx, &format!("hegel_mark_complete: unknown status {status}"));
             return HEGEL_E_INVALID_ARG;
         }
     };
@@ -7436,10 +7164,7 @@ pub unsafe extern "C" fn hegel_run_result_error_kind(
         Err(rc) => return rc,
     };
     if out_kind.is_null() && out_health_check.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_run_result_error_kind: both out parameters are null",
-        );
+        set_last_error(ctx, "hegel_run_result_error_kind: both out parameters are null");
         return HEGEL_E_INVALID_ARG;
     }
     let (kind, health_check) = match &r.error {
@@ -7587,10 +7312,7 @@ pub unsafe extern "C" fn hegel_failure_reproduction_blob(
         Err(rc) => return rc,
     };
     if out_blob.is_null() {
-        set_last_error(
-            ctx,
-            "hegel_failure_reproduction_blob: out parameter is null",
-        );
+        set_last_error(ctx, "hegel_failure_reproduction_blob: out parameter is null");
         return HEGEL_E_INVALID_ARG;
     }
     unsafe {
@@ -7651,10 +7373,7 @@ pub unsafe extern "C" fn hegel_version(
     }
     const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     unsafe {
-        *out_version = hegel_string_t {
-            data: VERSION.as_ptr().cast(),
-            len: VERSION.len() - 1,
-        }
+        *out_version = hegel_string_t { data: VERSION.as_ptr().cast(), len: VERSION.len() - 1 }
     };
     HEGEL_OK
 }

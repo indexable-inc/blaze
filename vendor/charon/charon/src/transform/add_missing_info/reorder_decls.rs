@@ -63,9 +63,8 @@ impl<Id: Copy> GDeclarationGroup<Id> {
 impl DeclarationGroup {
     fn make_group(is_rec: bool, ids: Vec<ItemId>) -> Self {
         let id0 = ids[0];
-        let all_same_kind = ids
-            .iter()
-            .all(|id| std::mem::discriminant(&id0) == std::mem::discriminant(id));
+        let all_same_kind =
+            ids.iter().all(|id| std::mem::discriminant(&id0) == std::mem::discriminant(id));
         match id0 {
             _ if !all_same_kind => {
                 DeclarationGroup::Mixed(GDeclarationGroup::make_group(is_rec, ids))
@@ -114,11 +113,7 @@ impl<Id: Display> Display for GDeclarationGroup<Id> {
         match self {
             GDeclarationGroup::NonRec(id) => write!(f, "non-rec: {id}"),
             GDeclarationGroup::Rec(ids) => {
-                write!(
-                    f,
-                    "rec: {}",
-                    pretty_display_list(|id| format!("    {id}"), ids)
-                )
+                write!(f, "rec: {}", pretty_display_list(|id| format!("    {id}"), ids))
             }
         }
     }
@@ -220,31 +215,19 @@ impl Deps {
 
         // Add the id of the impl/trait this item belongs to, if necessary
         match item {
-            ItemRef::Fun(FunDecl {
-                src: FunSource::TraitDefault { trait_ref, .. },
-                ..
-            })
+            ItemRef::Fun(FunDecl { src: FunSource::TraitDefault { trait_ref, .. }, .. })
             | ItemRef::Global(GlobalDecl {
                 src: GlobalSource::TraitDefault { trait_ref, .. },
                 ..
             }) => for_item.parent_trait_decl = Some(trait_ref.id),
-            ItemRef::Fun(FunDecl {
-                src: FunSource::TraitImpl { impl_ref, .. },
-                ..
-            })
+            ItemRef::Fun(FunDecl { src: FunSource::TraitImpl { impl_ref, .. }, .. })
             | ItemRef::Global(GlobalDecl {
-                src: GlobalSource::TraitImpl { impl_ref, .. },
-                ..
+                src: GlobalSource::TraitImpl { impl_ref, .. }, ..
             }) => for_item.parent_trait_impl = Some(impl_ref.id),
             // An associated const's initializer belongs to the same impl as the const.
-            ItemRef::Fun(FunDecl {
-                src: FunSource::GlobalInitializer(global_ref),
-                ..
-            }) => {
-                if let Some(GlobalDecl {
-                    src: GlobalSource::TraitImpl { impl_ref, .. },
-                    ..
-                }) = ctx.translated.global_decls.get(global_ref.id)
+            ItemRef::Fun(FunDecl { src: FunSource::GlobalInitializer(global_ref), .. }) => {
+                if let Some(GlobalDecl { src: GlobalSource::TraitImpl { impl_ref, .. }, .. }) =
+                    ctx.translated.global_decls.get(global_ref.id)
                 {
                     for_item.parent_trait_impl = Some(impl_ref.id);
                 }
@@ -316,12 +299,7 @@ impl VisitAst for DepsForItem<'_> {
         &mut self,
         assoc_const: &TraitAssocConst,
     ) -> ControlFlow<Self::Break> {
-        let TraitAssocConst {
-            name: _,
-            attr_info: _,
-            ty,
-            default,
-        } = assoc_const;
+        let TraitAssocConst { name: _, attr_info: _, ty, default } = assoc_const;
         ty.drive(self)?;
         // We consider that a trait decl only contains the method/constant signatures.
         // Therefore we don't explore the default method/const ids.
@@ -333,12 +311,7 @@ impl VisitAst for DepsForItem<'_> {
     }
 
     fn visit_trait_method(&mut self, method: &TraitMethod) -> ControlFlow<Self::Break> {
-        let TraitMethod {
-            name: _,
-            item_meta: _,
-            signature,
-            default,
-        } = method;
+        let TraitMethod { name: _, item_meta: _, signature, default } = method;
         // We consider that a trait decl only contains the method/constant signatures.
         // Therefore we don't explore the default method/const ids.
         signature.drive(self)?;

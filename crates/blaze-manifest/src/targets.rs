@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cargo_util_schemas::manifest::{
     PathValue, StringOrVec, TomlManifest, TomlPackageBuild, TomlTarget,
 };
 use serde::Serialize;
+use std::alloc::Global;
 
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features};
@@ -503,7 +503,8 @@ pub(crate) fn normalize_lib<F: Files>(
             } else {
                 let name = name_or_panic(&lib);
                 let legacy_path = Path::new("src").join(format!("{name}.rs"));
-                if edition == Edition::Edition2015 && files.exists(&package_root.join(&legacy_path)) {
+                if edition == Edition::Edition2015 && files.exists(&package_root.join(&legacy_path))
+                {
                     warnings.push(format!(
                         "path `{}` was erroneously implicitly accepted for library `{name}`,\n\
                          please rename the file to `src/lib.rs` or set lib.path in Cargo.toml",
@@ -808,7 +809,9 @@ pub(crate) fn normalize_benches<F: Files>(
 enum Legacy {
     None,
     /// `src/<name>.rs` (with no library), `src/main.rs` or `src/bin/main.rs`.
-    Bin { has_lib: bool },
+    Bin {
+        has_lib: bool,
+    },
     /// `src/bench.rs`, for a benchmark named `bench`.
     Bench,
 }

@@ -37,15 +37,15 @@ use rustc_type_ir::{ClausePolarity, ClosureKind, inherent::IntoKind, reflect::Re
 
 use crate::{
     Span,
+    comptime::ReflectedMember,
     consteval::CreateConstError,
     db::{AnonConstId, InternedOpaqueTyId},
     infer::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments,
         CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ComptimeLoop,
-        ExplicitDropMethodUseKind,
-        InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
-        PatAdjustment, PointerCast, ReturnKind, StructPathDef, StructPathFound, Unreachable,
-        UnreachableAt, UpvarCapture,
+        ExplicitDropMethodUseKind, InferenceDiagnostic, InferenceResult, MinCaptures,
+        OverloadedDeref, PatAdjust, PatAdjustment, PointerCast, ReturnKind, StructPathDef,
+        StructPathFound, Unreachable, UnreachableAt, UpvarCapture,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
             BorrowKind,
@@ -74,7 +74,6 @@ use crate::{
         Ambiguity, AmbiguityCandidate, AmbiguityNote, NamedTerm, StoredGoal, TypeAnnotationNeeded,
         UnreportedSolverError,
     },
-    comptime::ReflectedMember,
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
 };
 
@@ -864,7 +863,12 @@ impl InferenceRecord {
         );
 
         let ExprOrPatColumn { exprs, pats } = variant_resolutions;
-        record.put_variants(exprs, C64::VariantExprPresent, C8::VariantExprKinds, C64::VariantExprIds);
+        record.put_variants(
+            exprs,
+            C64::VariantExprPresent,
+            C8::VariantExprKinds,
+            C64::VariantExprIds,
+        );
         record.put_variants(pats, C64::VariantPatPresent, C8::VariantPatKinds, C64::VariantPatIds);
         let ExprOrPatColumn { exprs, pats } = assoc_resolutions;
         let expr_columns = [C64::AssocExprPresent, C64::AssocExprIds];
@@ -872,7 +876,8 @@ impl InferenceRecord {
         let pat_columns = [C64::AssocPatPresent, C64::AssocPatIds];
         record.put_assocs(tys, pats, pat_columns, C32::AssocPatArgs, C8::AssocPatKinds);
 
-        let tuple_len = |it: &StoredTys| u32::try_from(it.as_ref().len()).expect("a tuple of 2^32 types");
+        let tuple_len =
+            |it: &StoredTys| u32::try_from(it.as_ref().len()).expect("a tuple of 2^32 types");
         record.put32(C32::TupleLens, tuple_field_access_types.iter().map(tuple_len));
         record.put32(
             C32::TupleItems,
@@ -897,9 +902,21 @@ impl InferenceRecord {
         );
 
         let expr_columns = [C32::ExprAdjustEnds, C32::ExprAdjustTargets];
-        record.put_adjustments(tys, expr_adjustments, C64::ExprAdjustPresent, expr_columns, C8::ExprAdjustKinds);
+        record.put_adjustments(
+            tys,
+            expr_adjustments,
+            C64::ExprAdjustPresent,
+            expr_columns,
+            C8::ExprAdjustKinds,
+        );
         let coercion_columns = [C32::CoercionEnds, C32::CoercionTargets];
-        record.put_adjustments(tys, assignment_coercions, C64::CoercionPresent, coercion_columns, C8::CoercionKinds);
+        record.put_adjustments(
+            tys,
+            assignment_coercions,
+            C64::CoercionPresent,
+            coercion_columns,
+            C8::CoercionKinds,
+        );
         record.put_lists(pat_adjustments, C64::PatAdjustPresent, C32::PatAdjustEnds);
         record.put8(
             C8::PatAdjustKinds,
@@ -921,8 +938,14 @@ impl InferenceRecord {
                 .flat_map(|(&(asm, operand), ty)| [local(asm), operand, tys.ty(ty.as_ref())]),
         );
         record.put32(C32::Unreachables, unreachable.iter().flat_map(unreachable_words));
-        record.put32(C32::TraitsUsedNodes, traits_in_scope_used.iter().flat_map(|&(node, _)| node_words(node)));
-        record.put64(C64::TraitsUsedIds, traits_in_scope_used.iter().map(|&(_, trait_)| id_bits(trait_)));
+        record.put32(
+            C32::TraitsUsedNodes,
+            traits_in_scope_used.iter().flat_map(|&(node, _)| node_words(node)),
+        );
+        record.put64(
+            C64::TraitsUsedIds,
+            traits_in_scope_used.iter().map(|&(_, trait_)| id_bits(trait_)),
+        );
         record.put32(
             C32::CoroutineStalled,
             coroutine_stalled_predicates.iter().flat_map(|&(span, predicate)| {
@@ -1046,7 +1069,10 @@ impl Persist for InferenceRecord {
         let root = open_as::<InferRoot>(buffer, Self::SCHEMA)?;
         let at = (root as *const InferRoot as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
         if root.reserved != 0 {
-            return Err(FormatError::Invalid { at, what: "an inference record with a reserved word set" });
+            return Err(FormatError::Invalid {
+                at,
+                what: "an inference record with a reserved word set",
+            });
         }
         let record = InferenceRecordRef {
             at,
@@ -1120,7 +1146,12 @@ impl<'a> InferenceRecordRef<'a> {
         let bound = bound.min(PACKED_NODES);
         match index < bound {
             true => Ok(pack(node)),
-            false => Err(FormatError::Bound { at: self.at, what, found: index.into(), bound: bound.into() }),
+            false => Err(FormatError::Bound {
+                at: self.at,
+                what,
+                found: index.into(),
+                bound: bound.into(),
+            }),
         }
     }
 
@@ -1164,20 +1195,29 @@ impl<'a> InferenceRecordRef<'a> {
         self.ensure(lens.windows(2).all(|it| it[0] == it[1]), what)
     }
 
-    fn index_column<K: DenseKey, V>(&self, present: C64, rows: Box<[V]>) -> Result<IndexColumn<K, V>, FormatError> {
+    fn index_column<K: DenseKey, V>(
+        &self,
+        present: C64,
+        rows: Box<[V]>,
+    ) -> Result<IndexColumn<K, V>, FormatError> {
         // alloc: the memo's column, exact size, once per record read
-        IndexColumn::from_parts(self.u64s(present).to_vec(), rows).map_err(|what| self.invalid(what))
+        IndexColumn::from_parts(self.u64s(present).to_vec(), rows)
+            .map_err(|what| self.invalid(what))
     }
 
-    fn variants<K: DenseKey>(&self, at: C64, kinds: C8, ids: C64) -> Result<IndexColumn<K, VariantId>, FormatError> {
+    fn variants<K: DenseKey>(
+        &self,
+        at: C64,
+        kinds: C8,
+        ids: C64,
+    ) -> Result<IndexColumn<K, VariantId>, FormatError> {
         let (kinds, ids) = (self.u8s(kinds), self.u64s(ids));
         self.same_len(&[kinds.len(), ids.len()], "variant columns of different lengths")?;
         let rows = exact(
             kinds.len(),
-            kinds
-                .iter()
-                .zip(ids)
-                .map(|(&kind, &bits)| variant_of(kind, bits).ok_or(self.invalid("a variant of no kind or id 0"))),
+            kinds.iter().zip(ids).map(|(&kind, &bits)| {
+                variant_of(kind, bits).ok_or(self.invalid("a variant of no kind or id 0"))
+            }),
         )?
         .into_boxed_slice();
         self.index_column(at, rows)
@@ -1195,7 +1235,8 @@ impl<'a> InferenceRecordRef<'a> {
         let rows = exact(
             kinds.len(),
             kinds.iter().zip(ids).zip(args).map(|((&kind, &bits), &args)| {
-                let candidate = candidate_of(kind, bits).ok_or(self.invalid("an item of no kind or id 0"))?;
+                let candidate =
+                    candidate_of(kind, bits).ok_or(self.invalid("an item of no kind or id 0"))?;
                 Ok((candidate, tys.args(args)?))
             }),
         )?
@@ -1208,8 +1249,13 @@ impl<'a> InferenceRecordRef<'a> {
         Ok(exact(column.len(), column.iter().map(|&it| tys.ty(it)))?.into_boxed_slice())
     }
 
-    fn ty_column<K: DenseKey>(&self, tys: &impl TyDecode, [at, dictionary]: [C32; 2]) -> Result<TyColumn<K>, FormatError> {
-        TyColumn::from_parts(self.u32s(at).into(), self.tys(tys, dictionary)?).map_err(|what| self.invalid(what))
+    fn ty_column<K: DenseKey>(
+        &self,
+        tys: &impl TyDecode,
+        [at, dictionary]: [C32; 2],
+    ) -> Result<TyColumn<K>, FormatError> {
+        TyColumn::from_parts(self.u32s(at).into(), self.tys(tys, dictionary)?)
+            .map_err(|what| self.invalid(what))
     }
 
     fn idx_set<K: DenseKey>(&self, column: C64) -> Result<IdxSet<K>, FormatError> {
@@ -1217,9 +1263,15 @@ impl<'a> InferenceRecordRef<'a> {
         IdxSet::from_words(self.u64s(column).to_vec()).map_err(|what| self.invalid(what))
     }
 
-    fn lists<K: DenseKey, T>(&self, present: C64, ends: C32, items: Box<[T]>) -> Result<Csr<K, T>, FormatError> {
+    fn lists<K: DenseKey, T>(
+        &self,
+        present: C64,
+        ends: C32,
+        items: Box<[T]>,
+    ) -> Result<Csr<K, T>, FormatError> {
         // alloc: the memo's column, exact size, once per record read
-        Csr::from_parts(self.u64s(present).to_vec(), self.u32s(ends).into(), items).map_err(|what| self.invalid(what))
+        Csr::from_parts(self.u64s(present).to_vec(), self.u32s(ends).into(), items)
+            .map_err(|what| self.invalid(what))
     }
 
     fn adjustments<K: DenseKey>(
@@ -1234,7 +1286,10 @@ impl<'a> InferenceRecordRef<'a> {
         let items = exact(
             kinds.len(),
             kinds.iter().zip(targets).map(|(&kind, &target)| {
-                let kind = ADJUSTS.get(kind as usize).cloned().ok_or(self.invalid("an adjustment of no kind"))?;
+                let kind = ADJUSTS
+                    .get(kind as usize)
+                    .cloned()
+                    .ok_or(self.invalid("an adjustment of no kind"))?;
                 Ok(Adjustment { kind, target: tys.ty(target)? })
             }),
         )?
@@ -1262,7 +1317,11 @@ impl<'a> InferenceRecordRef<'a> {
     }
 
     /// [`Self::decode_in`] in a task of its own: decoding runs outside any query (R1).
-    fn decode<'db>(&self, tys: &impl TyDecode, nodes: Nodes) -> Result<InferenceResult<'db>, FormatError> {
+    fn decode<'db>(
+        &self,
+        tys: &impl TyDecode,
+        nodes: Nodes,
+    ) -> Result<InferenceResult<'db>, FormatError> {
         blaze_mem::frame::task(crate::db::INFER_TAG, |frame| self.decode_in(tys, nodes, frame))
     }
 
@@ -1277,7 +1336,9 @@ impl<'a> InferenceRecordRef<'a> {
         self.same_len(&[fns.len(), args.len()], "method columns of different lengths")?;
         let rows = exact(
             fns.len(),
-            fns.iter().zip(args).map(|(&bits, &args)| Ok((self.id::<FunctionId>(bits)?, tys.args(args)?))),
+            fns.iter()
+                .zip(args)
+                .map(|(&bits, &args)| Ok((self.id::<FunctionId>(bits)?, tys.args(args)?))),
         )?
         .into_boxed_slice();
         let method_resolutions = self.index_column(C64::MethodPresent, rows)?;
@@ -1285,7 +1346,10 @@ impl<'a> InferenceRecordRef<'a> {
         let tuple_field_access_types = {
             let (lens, items) = (self.u32s(C32::TupleLens), self.tys(tys, C32::TupleItems)?);
             let total = lens.iter().try_fold(0usize, |sum, &len| sum.checked_add(len as usize));
-            self.ensure(total == Some(items.len()), "tuple lengths that do not add up to their types")?;
+            self.ensure(
+                total == Some(items.len()),
+                "tuple lengths that do not add up to their types",
+            )?;
             let mut start = 0;
             let mut buffer = Vec::new_in(frame);
             lens.iter()
@@ -1299,13 +1363,20 @@ impl<'a> InferenceRecordRef<'a> {
         };
 
         let field_resolutions = {
-            let (kinds, variants, locals) =
-                (self.u8s(C8::FieldKinds), self.u64s(C64::FieldVariants), self.u32s(C32::FieldLocals));
-            self.same_len(&[kinds.len(), variants.len(), locals.len()], "field columns of different lengths")?;
+            let (kinds, variants, locals) = (
+                self.u8s(C8::FieldKinds),
+                self.u64s(C64::FieldVariants),
+                self.u32s(C32::FieldLocals),
+            );
+            self.same_len(
+                &[kinds.len(), variants.len(), locals.len()],
+                "field columns of different lengths",
+            )?;
             let fields = exact(
                 kinds.len(),
                 kinds.iter().zip(variants).zip(locals).map(|((&kind, &bits), &local)| {
-                    let parent = variant_of(kind, bits).ok_or(self.invalid("a field of a variant of no kind"))?;
+                    let parent = variant_of(kind, bits)
+                        .ok_or(self.invalid("a field of a variant of no kind"))?;
                     Ok(FieldId { parent, local_id: local_of(local) })
                 }),
             )?
@@ -1330,12 +1401,26 @@ impl<'a> InferenceRecordRef<'a> {
         };
 
         let variant_resolutions = ExprOrPatColumn {
-            exprs: self.variants(C64::VariantExprPresent, C8::VariantExprKinds, C64::VariantExprIds)?,
+            exprs: self.variants(
+                C64::VariantExprPresent,
+                C8::VariantExprKinds,
+                C64::VariantExprIds,
+            )?,
             pats: self.variants(C64::VariantPatPresent, C8::VariantPatKinds, C64::VariantPatIds)?,
         };
         let assoc_resolutions = ExprOrPatColumn {
-            exprs: self.assocs(tys, [C64::AssocExprPresent, C64::AssocExprIds], C32::AssocExprArgs, C8::AssocExprKinds)?,
-            pats: self.assocs(tys, [C64::AssocPatPresent, C64::AssocPatIds], C32::AssocPatArgs, C8::AssocPatKinds)?,
+            exprs: self.assocs(
+                tys,
+                [C64::AssocExprPresent, C64::AssocExprIds],
+                C32::AssocExprArgs,
+                C8::AssocExprKinds,
+            )?,
+            pats: self.assocs(
+                tys,
+                [C64::AssocPatPresent, C64::AssocPatIds],
+                C32::AssocPatArgs,
+                C8::AssocPatKinds,
+            )?,
         };
 
         let type_of_opaque = {
@@ -1343,9 +1428,9 @@ impl<'a> InferenceRecordRef<'a> {
             self.same_len(&[ids.len(), opaque_tys.len()], "opaque columns of different lengths")?;
             let mut entries = exact(
                 ids.len(),
-                ids.iter()
-                    .zip(opaque_tys)
-                    .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))),
+                ids.iter().zip(opaque_tys).map(|(&bits, &ty)| {
+                    Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))
+                }),
             )?;
             if crate::check_cache::in_scope() {
                 entries.sort_unstable_by_key(|&(id, _)| id);
@@ -1355,7 +1440,10 @@ impl<'a> InferenceRecordRef<'a> {
 
         let pat_adjustments = {
             let (kinds, sources) = (self.u8s(C8::PatAdjustKinds), self.u32s(C32::PatAdjustSources));
-            self.same_len(&[kinds.len(), sources.len()], "pattern adjustment columns of different lengths")?;
+            self.same_len(
+                &[kinds.len(), sources.len()],
+                "pattern adjustment columns of different lengths",
+            )?;
             let items = exact(
                 kinds.len(),
                 kinds.iter().zip(sources).map(|(&kind, &source)| {
@@ -1383,12 +1471,15 @@ impl<'a> InferenceRecordRef<'a> {
 
         let unreachable = {
             let words = self.u32s(C32::Unreachables);
-            self.ensure(words.len() % UNREACHABLE_WORDS == 0, "an unreachable column of a partial entry")?;
+            self.ensure(
+                words.len() % UNREACHABLE_WORDS == 0,
+                "an unreachable column of a partial entry",
+            )?;
             exact(
                 words.len() / UNREACHABLE_WORDS,
-                words
-                    .chunks_exact(UNREACHABLE_WORDS)
-                    .map(|it| unreachable_of(it).ok_or(self.invalid("an unreachable entry of no kind"))),
+                words.chunks_exact(UNREACHABLE_WORDS).map(|it| {
+                    unreachable_of(it).ok_or(self.invalid("an unreachable entry of no kind"))
+                }),
             )?
             .into_boxed_slice()
         };
@@ -1399,7 +1490,8 @@ impl<'a> InferenceRecordRef<'a> {
             exact(
                 words.len() / 3,
                 words.chunks_exact(3).map(|it| {
-                    let span = span_of(&it[..2]).ok_or(self.invalid("a stalled goal at a span of no kind"))?;
+                    let span = span_of(&it[..2])
+                        .ok_or(self.invalid("a stalled goal at a span of no kind"))?;
                     Ok((span, tys.predicate(it[2])?))
                 }),
             )?
@@ -1412,7 +1504,8 @@ impl<'a> InferenceRecordRef<'a> {
             exact(
                 ids.len(),
                 nodes.chunks_exact(2).zip(ids).map(|(node, &bits)| {
-                    let node = node_of(node).ok_or(self.invalid("a trait use at a node of no kind"))?;
+                    let node =
+                        node_of(node).ok_or(self.invalid("a trait use at a node of no kind"))?;
                     Ok((node, self.id::<TraitId>(bits)?))
                 }),
             )?
@@ -1420,14 +1513,18 @@ impl<'a> InferenceRecordRef<'a> {
         };
 
         let side = self.u32s(C32::Words);
-        let mut words = Source { words: side, next: 0, text: self.u8s(C8::Text), at: self.at, frame };
+        let mut words =
+            Source { words: side, next: 0, text: self.u8s(C8::Text), at: self.at, frame };
         let count = self.diagnostics as usize;
         self.ensure(count <= side.len(), "more diagnostics than side table words")?;
-        let diagnostics = exact(count, (0..count).map(|_| words.diagnostic(tys)))?.into_boxed_slice();
+        let diagnostics =
+            exact(count, (0..count).map(|_| words.diagnostic(tys)))?.into_boxed_slice();
         let closures_data = {
             let exprs = self.u32s(C32::ClosureExprs);
-            let entries =
-                exact(exprs.len(), exprs.iter().map(|&expr| Ok((local_of(expr), words.closure(tys, frame)?))))?;
+            let entries = exact(
+                exprs.len(),
+                exprs.iter().map(|&expr| Ok((local_of(expr), words.closure(tys, frame)?))),
+            )?;
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
         let value_resolutions = {
@@ -1439,7 +1536,10 @@ impl<'a> InferenceRecordRef<'a> {
             for _ in 0..words.len()? {
                 let node = self.node_below(words.expr_or_pat()?, nodes, WHAT)?;
                 let value = words.value_ns()?;
-                self.ensure(map.insert(node, value).is_none(), "a node with two value path resolutions")?;
+                self.ensure(
+                    map.insert(node, value).is_none(),
+                    "a node with two value path resolutions",
+                )?;
             }
             map.freeze()
         };
@@ -1452,7 +1552,10 @@ impl<'a> InferenceRecordRef<'a> {
             for _ in 0..words.len()? {
                 let node = self.node_below(words.expr_or_pat()?, nodes, WHAT)?;
                 let qualifier = (words.type_ns()?, words.word()?);
-                self.ensure(map.insert(node, qualifier).is_none(), "a node with two qualifier resolutions")?;
+                self.ensure(
+                    map.insert(node, qualifier).is_none(),
+                    "a node with two qualifier resolutions",
+                )?;
             }
             map.freeze()
         };
@@ -1467,8 +1570,12 @@ impl<'a> InferenceRecordRef<'a> {
                 let len = words.len()?;
                 self.ensure(len != 0, "a node that passed over no unstable items")?;
                 let candidates =
-                    exact(len, (0..len).map(|_| Ok((words.candidate()?, words.symbol()?))))?.into_boxed_slice();
-                self.ensure(map.insert(node, candidates).is_none(), "a node with two unstable item lists")?;
+                    exact(len, (0..len).map(|_| Ok((words.candidate()?, words.symbol()?))))?
+                        .into_boxed_slice();
+                self.ensure(
+                    map.insert(node, candidates).is_none(),
+                    "a node with two unstable item lists",
+                )?;
             }
             map.freeze()
         };
@@ -1480,7 +1587,10 @@ impl<'a> InferenceRecordRef<'a> {
                     Ok((local_of(words.word()?), words.named_term(tys)?))
                 }),
             )?;
-            self.ensure(entries.is_sorted_by(|a, b| a.0 < b.0), "named pattern types out of order")?;
+            self.ensure(
+                entries.is_sorted_by(|a, b| a.0 < b.0),
+                "named pattern types out of order",
+            )?;
             entries.into_boxed_slice()
         };
         let comptime_loops = {
@@ -1520,9 +1630,11 @@ impl<'a> InferenceRecordRef<'a> {
         self.ensure(words.is_done(), "words after the last `for const` loop")?;
 
         let anon_consts = self.u64s(C64::AnonConsts);
-        let defined_anon_consts =
-            exact(anon_consts.len(), anon_consts.iter().map(|&bits| self.id::<AnonConstId<'db>>(bits)))?
-                .into_boxed_slice();
+        let defined_anon_consts = exact(
+            anon_consts.len(),
+            anon_consts.iter().map(|&bits| self.id::<AnonConstId<'db>>(bits)),
+        )?
+        .into_boxed_slice();
         self.ensure(self.flags <= 1, "an inference record with unknown flags")?;
 
         Ok(InferenceResult {
@@ -1537,7 +1649,8 @@ impl<'a> InferenceRecordRef<'a> {
             type_of_expr: self.ty_column(tys, [C32::ExprTyAt, C32::ExprTys])?,
             type_of_pat: self.ty_column(tys, [C32::PatTyAt, C32::PatTys])?,
             type_of_binding: self.ty_column(tys, [C32::BindingTyAt, C32::BindingTys])?,
-            type_of_type_placeholder: self.ty_column(tys, [C32::PlaceholderTyAt, C32::PlaceholderTys])?,
+            type_of_type_placeholder: self
+                .ty_column(tys, [C32::PlaceholderTyAt, C32::PlaceholderTys])?,
             type_of_opaque,
             has_errors: self.flags & 1 != 0,
             diagnostics,
@@ -1822,7 +1935,11 @@ impl Sink {
         });
     }
 
-    fn trait_predicate<'db>(&mut self, tys: &mut impl TyEncode<'db>, predicate: &StoredTraitPredicate) {
+    fn trait_predicate<'db>(
+        &mut self,
+        tys: &mut impl TyEncode<'db>,
+        predicate: &StoredTraitPredicate,
+    ) {
         let StoredTraitPredicate { trait_ref, polarity } = predicate;
         let words = tys.trait_ref(trait_ref);
         self.words.extend(words);
@@ -2081,7 +2198,8 @@ impl Sink {
         let at = self.words.len();
         self.word(0);
         put(&mut self.words);
-        self.words[at] = u32::try_from(self.words.len() - at - 1).expect("a diagnostic of 2^32 words");
+        self.words[at] =
+            u32::try_from(self.words.len() - at - 1).expect("a diagnostic of 2^32 words");
     }
 
     /// A diagnostic: its kind's place in [`InferenceDiagnostic`]'s declaration, then its fields
@@ -2305,7 +2423,13 @@ impl Sink {
                 self.node(*node);
                 self.lowering_words(|words| put_path_diagnostic(words, diag));
             }
-            D::MethodCallIncorrectGenericsLen { expr, provided_count, expected_count, kind, def } => {
+            D::MethodCallIncorrectGenericsLen {
+                expr,
+                provided_count,
+                expected_count,
+                kind,
+                def,
+            } => {
                 self.words.extend([32, local(*expr), *provided_count, *expected_count]);
                 self.generics_len_kind(*kind);
                 self.generic_def(*def);
@@ -2434,7 +2558,9 @@ impl Sink {
             D::ExplicitDropMethodUse { kind } => {
                 self.word(40);
                 match kind {
-                    ExplicitDropMethodUseKind::MethodCall(expr) => self.words.extend([0, local(*expr)]),
+                    ExplicitDropMethodUseKind::MethodCall(expr) => {
+                        self.words.extend([0, local(*expr)])
+                    }
                     ExplicitDropMethodUseKind::Path(node) => {
                         self.word(1);
                         self.node(*node);
@@ -2750,8 +2876,13 @@ impl Source<'_> {
 
     fn symbol(&mut self) -> Result<Symbol, FormatError> {
         let (start, len) = (self.word()? as usize, self.word()? as usize);
-        let bytes = self.text.get(start..).and_then(|it| it.get(..len)).ok_or(self.invalid("a name past the text"))?;
-        let text = std::str::from_utf8(bytes).map_err(|_| self.invalid("a name that is not UTF-8"))?;
+        let bytes = self
+            .text
+            .get(start..)
+            .and_then(|it| it.get(..len))
+            .ok_or(self.invalid("a name past the text"))?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| self.invalid("a name that is not UTF-8"))?;
         Ok(Symbol::intern(text))
     }
 
@@ -2863,7 +2994,10 @@ impl Source<'_> {
             7 => {
                 let parent = self.generic_def()?;
                 let local_id = self.local()?;
-                ValueNs::GenericParam(ConstParamId::from_unchecked(TypeOrConstParamId { parent, local_id }))
+                ValueNs::GenericParam(ConstParamId::from_unchecked(TypeOrConstParamId {
+                    parent,
+                    local_id,
+                }))
             }
             _ => return Err(self.invalid("a value path resolution of no kind")),
         })
@@ -2882,7 +3016,10 @@ impl Source<'_> {
             1 => {
                 let parent = self.generic_def()?;
                 let local_id = self.local()?;
-                TypeNs::GenericParam(TypeParamId::from_unchecked(TypeOrConstParamId { parent, local_id }))
+                TypeNs::GenericParam(TypeParamId::from_unchecked(TypeOrConstParamId {
+                    parent,
+                    local_id,
+                }))
             }
             2 => TypeNs::AdtId(self.adt()?),
             3 => TypeNs::AdtSelfType(self.adt()?),
@@ -2890,7 +3027,9 @@ impl Source<'_> {
             5 => TypeNs::TypeAliasId(self.id()?),
             6 => {
                 let word = self.word()?;
-                TypeNs::BuiltinType(builtin_of(word).ok_or(self.invalid("a builtin type of no kind"))?)
+                TypeNs::BuiltinType(
+                    builtin_of(word).ok_or(self.invalid("a builtin type of no kind"))?,
+                )
             }
             7 => TypeNs::TraitId(self.id()?),
             _ => return Err(self.invalid("a qualifier resolution of no kind")),
@@ -2925,7 +3064,10 @@ impl Source<'_> {
         })
     }
 
-    fn trait_predicate(&mut self, tys: &impl TyDecode) -> Result<StoredTraitPredicate, FormatError> {
+    fn trait_predicate(
+        &mut self,
+        tys: &impl TyDecode,
+    ) -> Result<StoredTraitPredicate, FormatError> {
         let words = [self.word()?, self.word()?, self.word()?];
         let trait_ref = tys.trait_ref(words)?;
         let polarity = match self.word()? {
@@ -3002,7 +3144,8 @@ impl Source<'_> {
             0 => {
                 let trait_predicate = self.trait_predicate(tys)?;
                 let len = self.len()?;
-                let parent_trait_predicates = exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
+                let parent_trait_predicates =
+                    exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
                 let parent_impls = exact(
                     len,
                     (0..len).map(|_| match self.optional_impl()? {
@@ -3035,7 +3178,9 @@ impl Source<'_> {
                 normalized: if self.bool()? { Some(self.generic_arg(tys)?) } else { None },
                 impl_: self.optional_impl()?,
             },
-            5 => SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? },
+            5 => {
+                SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? }
+            }
             6 => SolverDiagnosticKind::ConstArgHasWrongType {
                 ct: self.generic_arg(tys)?,
                 ct_ty: self.ty(tys)?,
@@ -3056,7 +3201,10 @@ impl Source<'_> {
             9 => SolverDiagnosticKind::ReflectedMemberUnmet {
                 container: self.ty(tys)?,
                 member: match self.word()? {
-                    0 => ReflectedMember::Field(FieldId { parent: self.variant()?, local_id: self.local()? }),
+                    0 => ReflectedMember::Field(FieldId {
+                        parent: self.variant()?,
+                        local_id: self.local()?,
+                    }),
                     1 => ReflectedMember::TupleField(self.word()?),
                     2 => ReflectedMember::Variant(self.id()?),
                     _ => return Err(self.invalid("a reflected member of no kind")),
@@ -3071,10 +3219,24 @@ impl Source<'_> {
 
     fn goal(&mut self, tys: &impl TyDecode) -> Result<StoredGoal, FormatError> {
         Ok(match self.word()? {
-            0 => StoredGoal::Trait { trait_: self.id()?, args: self.args(tys)?, polarity: self.polarity()? },
-            1 => StoredGoal::HostEffect { trait_: self.id()?, args: self.args(tys)?, maybe_const: self.bool()? },
-            2 => StoredGoal::Projection { alias: self.generic_arg(tys)?, term: self.generic_arg(tys)? },
-            3 => StoredGoal::NormalizesTo { alias: self.generic_arg(tys)?, term: self.generic_arg(tys)? },
+            0 => StoredGoal::Trait {
+                trait_: self.id()?,
+                args: self.args(tys)?,
+                polarity: self.polarity()?,
+            },
+            1 => StoredGoal::HostEffect {
+                trait_: self.id()?,
+                args: self.args(tys)?,
+                maybe_const: self.bool()?,
+            },
+            2 => StoredGoal::Projection {
+                alias: self.generic_arg(tys)?,
+                term: self.generic_arg(tys)?,
+            },
+            3 => StoredGoal::NormalizesTo {
+                alias: self.generic_arg(tys)?,
+                term: self.generic_arg(tys)?,
+            },
             4 => StoredGoal::WellFormed { term: self.generic_arg(tys)? },
             5 => StoredGoal::Subtype { a: self.ty(tys)?, b: self.ty(tys)? },
             6 => StoredGoal::Coerce { a: self.ty(tys)?, b: self.ty(tys)? },
@@ -3200,11 +3362,9 @@ impl Source<'_> {
                     _ => return Err(self.invalid("an optional function of no kind")),
                 },
             },
-            10 => D::UnresolvedAssocItem {
-                id: self.node()?,
-                ty: self.ty(tys)?,
-                name: self.name()?,
-            },
+            10 => {
+                D::UnresolvedAssocItem { id: self.node()?, ty: self.ty(tys)?, name: self.name()? }
+            }
             11 => D::UnresolvedIdent { id: self.node()? },
             70 => D::UnresolvedPath { id: self.node()?, segment: self.word()? },
             12 => D::BreakOutsideOfLoop {
@@ -3235,10 +3395,9 @@ impl Source<'_> {
                 is_fn_trait_call: self.bool()?,
                 args: self.call_arguments(tys)?,
             },
-            52 => D::IncorrectArguments {
-                call_expr: self.local()?,
-                args: self.call_arguments(tys)?,
-            },
+            52 => {
+                D::IncorrectArguments { call_expr: self.local()?, args: self.call_arguments(tys)? }
+            }
             19 => D::MismatchedTupleStructPatArgCount {
                 pat: self.local()?,
                 expected: self.usize()?,
@@ -3300,7 +3459,10 @@ impl Source<'_> {
                 expr: self.local()?,
                 error: {
                     let code = self.word()?;
-                    CAST_ERRORS.get(code as usize).cloned().ok_or(self.invalid("a cast error of no kind"))?
+                    CAST_ERRORS
+                        .get(code as usize)
+                        .cloned()
+                        .ok_or(self.invalid("a cast error of no kind"))?
                 },
                 expr_ty: self.ty(tys)?,
                 cast_ty: self.ty(tys)?,
@@ -3371,10 +3533,9 @@ impl Source<'_> {
                 arg_idx: self.word()?,
                 has_self_arg: self.bool()?,
             },
-            60 => D::MethodCallLateBoundLifetimeArgs {
-                expr: self.local()?,
-                def: self.generic_def()?,
-            },
+            60 => {
+                D::MethodCallLateBoundLifetimeArgs { expr: self.local()?, def: self.generic_def()? }
+            }
             35 => D::InvalidLhsOfAssignment {
                 lhs: self.local()?,
                 assign: self.local()?,
@@ -3414,7 +3575,11 @@ impl Source<'_> {
                     }
                     _ => return Err(self.invalid("an optional ambiguity of no kind")),
                 },
-                origin: if self.bool()? { Some((self.span()?, self.generic_param()?)) } else { None },
+                origin: if self.bool()? {
+                    Some((self.span()?, self.generic_param()?))
+                } else {
+                    None
+                },
                 named: match self.word()? {
                     0 => None,
                     // alloc: error path, a persisted diagnostic's named term
@@ -3637,7 +3802,8 @@ impl Source<'_> {
             roots.push((binding, end));
         }
         // alloc: the decoded captures, once at their number (a drain is `TrustedLen`)
-        let min_captures = MinCaptures::from_parts(roots.into_boxed_slice(), captures.drain(..).collect());
+        let min_captures =
+            MinCaptures::from_parts(roots.into_boxed_slice(), captures.drain(..).collect());
         let len = self.len()?;
         // alloc: the decoded fake reads, once at their number
         let mut fake_reads = Vec::with_capacity(len);
@@ -3742,11 +3908,17 @@ mod tests {
 
     impl TyDecode for Model {
         fn ty(&self, at: u32) -> Result<StoredTy, FormatError> {
-            self.tys.get(at as usize).cloned().ok_or(FormatError::Invalid { at: 0, what: "no such type" })
+            self.tys
+                .get(at as usize)
+                .cloned()
+                .ok_or(FormatError::Invalid { at: 0, what: "no such type" })
         }
 
         fn args(&self, at: u32) -> Result<StoredGenericArgs, FormatError> {
-            self.args.get(at as usize).cloned().ok_or(FormatError::Invalid { at: 0, what: "no such arguments" })
+            self.args
+                .get(at as usize)
+                .cloned()
+                .ok_or(FormatError::Invalid { at: 0, what: "no such arguments" })
         }
 
         fn trait_ref(&self, _: [u32; 3]) -> Result<StoredTraitRef, FormatError> {
@@ -3754,7 +3926,10 @@ mod tests {
         }
 
         fn predicate(&self, at: u32) -> Result<StoredPredicate, FormatError> {
-            self.predicates.get(at as usize).copied().ok_or(FormatError::Invalid { at: 0, what: "no such predicate" })
+            self.predicates
+                .get(at as usize)
+                .copied()
+                .ok_or(FormatError::Invalid { at: 0, what: "no such predicate" })
         }
     }
 
@@ -3780,7 +3955,10 @@ mod tests {
             base_ty: types.i32.store(),
             base,
             projections: Box::new([
-                Projection { ty: types.u8.store(), kind: ProjectionKind::Field { field_idx: 1, variant_idx: 0 } },
+                Projection {
+                    ty: types.u8.store(),
+                    kind: ProjectionKind::Field { field_idx: 1, variant_idx: 0 },
+                },
                 Projection { ty: types.bool.store(), kind: ProjectionKind::Deref },
             ]),
         }
@@ -3790,7 +3968,10 @@ mod tests {
         lens.iter()
             .map(|&len| {
                 let ids: Vec<ExprOrPatIdPacked> = std::iter::once(expr(1).into())
-                    .chain((1..len).map(|it| if it % 2 == 0 { expr(it).into() } else { pat(it).into() }))
+                    .chain(
+                        (1..len)
+                            .map(|it| if it % 2 == 0 { expr(it).into() } else { pat(it).into() }),
+                    )
                     .collect();
                 CaptureSourceStack::from_slice(&ids)
             })
@@ -3811,7 +3992,11 @@ mod tests {
         let segment = PathGenericsSource::Segment(1);
         let assoc = PathGenericsSource::AssocType { segment: 2, assoc_type: 3 };
         let trait_ = TraitId::from_id(id(11));
-        let args = GenericArgs::new_from_slice(&[GenericArg::from(types.u8), GenericArg::from(types.bool)]).store();
+        let args = GenericArgs::new_from_slice(&[
+            GenericArg::from(types.u8),
+            GenericArg::from(types.bool),
+        ])
+        .store();
         let goals = [
             StoredGoal::Trait { trait_, args: args.clone(), polarity: ClausePolarity::Negative },
             StoredGoal::HostEffect { trait_, args: args.clone(), maybe_const: true },
@@ -3839,12 +4024,26 @@ mod tests {
             D::InvalidRangePatType {
                 pat: pat(4),
                 lhs: Some((ty(types.str), true)),
-                rhs: Some((Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(), false)),
+                rhs: Some((
+                    Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(),
+                    false,
+                )),
             },
             D::DuplicateField { field: pat(5).into(), variant },
-            D::PrivateField { expr: expr(2), field: FieldId { parent: enum_variant, local_id: local_of(7) }, at: None },
-            D::PrivateField { expr: expr(3), field: FieldId { parent: enum_variant, local_id: local_of(7) }, at: Some(2) },
-            D::PrivateAssocItem { id: expr(3).into(), item: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(6))) },
+            D::PrivateField {
+                expr: expr(2),
+                field: FieldId { parent: enum_variant, local_id: local_of(7) },
+                at: None,
+            },
+            D::PrivateField {
+                expr: expr(3),
+                field: FieldId { parent: enum_variant, local_id: local_of(7) },
+                at: Some(2),
+            },
+            D::PrivateAssocItem {
+                id: expr(3).into(),
+                item: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(6))),
+            },
             D::UnresolvedField {
                 expr: expr(4),
                 receiver: ty(types.bool),
@@ -3944,7 +4143,13 @@ mod tests {
                     compatible: Box::default(),
                 }),
             },
-            D::MismatchedTupleStructPatArgCount { pat: pat(10), expected: 1, found: 0, variant, had_err: false },
+            D::MismatchedTupleStructPatArgCount {
+                pat: pat(10),
+                expected: 1,
+                found: 0,
+                variant,
+                had_err: false,
+            },
             D::MismatchedTupleStructPatArgCount {
                 pat: pat(10),
                 expected: 2,
@@ -3957,7 +4162,9 @@ mod tests {
             D::CannotBeDereferenced {
                 expr: expr(13),
                 found: ty(types.i32),
-                at_error: Some(Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store()),
+                at_error: Some(
+                    Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(),
+                ),
             },
             D::MutRefInImmRefPat { pat: pat(11) },
             D::CannotImplicitlyDerefTraitObject { pat: pat(12), found: ty(types.bool) },
@@ -3965,7 +4172,9 @@ mod tests {
             D::CannotIndexInto {
                 expr: expr(14),
                 found: ty(types.f64),
-                at_error: Some(Ty::new_without_interner(TyKind::Infer(InferTy::FreshFloatTy(0))).store()),
+                at_error: Some(
+                    Ty::new_without_interner(TyKind::Infer(InferTy::FreshFloatTy(0))).store(),
+                ),
             },
             D::TypedHole { expr: expr(15), expected: ty(types.unit) },
             D::CastToUnsized { expr: expr(16), cast_ty: ty(types.u8) },
@@ -3981,7 +4190,9 @@ mod tests {
                 },
             },
             D::TyDiagnostic {
-                diag: TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::Dummy]) },
+                diag: TyLoweringDiagnostic::InferVarsNotAllowed {
+                    sources: Box::new([Span::Dummy]),
+                },
             },
             D::MethodCallIncorrectGenericsLen {
                 expr: expr(17),
@@ -4065,8 +4276,10 @@ mod tests {
                 ambiguity: None,
                 origin: Some((Span::ExprId(expr(31)), TypeParamId::from_unchecked(param).into())),
                 named: Some(Box::new(NamedTerm {
-                    term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(InferTy::FreshTy(1))))
-                        .store(),
+                    term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(
+                        InferTy::FreshTy(1),
+                    )))
+                    .store(),
                     params: vec![
                         (Span::Dummy, ConstParamId::from_unchecked(param).into()),
                         (Span::ExprId(expr(31)), TypeParamId::from_unchecked(param).into()),
@@ -4147,7 +4360,10 @@ mod tests {
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::Dummy,
                 cause: causes[2],
-                kind: SolverDiagnosticKind::Overflow { goal: goals[3].clone(), suggest_increasing_limit: true },
+                kind: SolverDiagnosticKind::Overflow {
+                    goal: goals[3].clone(),
+                    suggest_increasing_limit: true,
+                },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(31)),
@@ -4170,7 +4386,10 @@ mod tests {
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::PatId(pat(17)),
                 cause: causes[4],
-                kind: SolverDiagnosticKind::TypesDiffer { expected: ty(types.u8), found: ty(types.i32) },
+                kind: SolverDiagnosticKind::TypesDiffer {
+                    expected: ty(types.u8),
+                    found: ty(types.i32),
+                },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(32)),
@@ -4228,7 +4447,10 @@ mod tests {
             expr: expr(26),
             op,
             found: ty(types.u8),
-            at_error: (n == 1).then(|| Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store()),
+            at_error:
+                (n == 1).then(|| {
+                    Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store()
+                }),
             unmet: goals.iter().take(n).cloned().collect(),
         }));
         all.extend(goals.iter().enumerate().map(|(n, goal)| {
@@ -4272,7 +4494,11 @@ mod tests {
             unmet: if code % 2 == 0 { Vec::new() } else { goals.to_vec() },
             output: (code % 3 == 0).then(|| ty(types.bool)),
         }));
-        all.extend(ArithOp::ALL.map(|op| D::InvalidLhsOfAssignment { lhs: expr(20), assign: expr(22), op: Some(op) }));
+        all.extend(ArithOp::ALL.map(|op| D::InvalidLhsOfAssignment {
+            lhs: expr(20),
+            assign: expr(22),
+            op: Some(op),
+        }));
         all.extend(CAST_ERRORS.iter().map(|error| D::InvalidCast {
             expr: expr(28),
             error: error.clone(),
@@ -4319,9 +4545,22 @@ mod tests {
                 arg_idx: 2,
                 has_self_arg: false,
             },
-            PathLoweringDiagnostic::ElidedLifetimesInPath { generics_source: assoc, def, expected_count: 2, hard_error: true },
-            PathLoweringDiagnostic::ElisionFailure { generics_source: segment, def, expected_count: 1 },
-            PathLoweringDiagnostic::MissingLifetime { generics_source: assoc, def, expected_count: 3 },
+            PathLoweringDiagnostic::ElidedLifetimesInPath {
+                generics_source: assoc,
+                def,
+                expected_count: 2,
+                hard_error: true,
+            },
+            PathLoweringDiagnostic::ElisionFailure {
+                generics_source: segment,
+                def,
+                expected_count: 1,
+            },
+            PathLoweringDiagnostic::MissingLifetime {
+                generics_source: assoc,
+                def,
+                expected_count: 3,
+            },
             PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment: 0 },
         ];
         all.extend(paths.into_iter().map(|diag| D::PathDiagnostic { node: expr(29).into(), diag }));
@@ -4339,12 +4578,18 @@ mod tests {
             Box::new([
                 CapturedPlace {
                     place: place(PlaceBase::Upvar { closure: expr(3), var_id: binding(4) }),
-                    info: CaptureInfo { sources: sources(&[1, 2, 5]), capture_kind: UpvarCapture::ByRef(BorrowKind::UniqueImmutable) },
+                    info: CaptureInfo {
+                        sources: sources(&[1, 2, 5]),
+                        capture_kind: UpvarCapture::ByRef(BorrowKind::UniqueImmutable),
+                    },
                     mutability: Mutability::Mut,
                 },
                 CapturedPlace {
                     place: place(PlaceBase::Local(binding(4))),
-                    info: CaptureInfo { sources: sources(&[3]), capture_kind: UpvarCapture::ByValue },
+                    info: CaptureInfo {
+                        sources: sources(&[3]),
+                        capture_kind: UpvarCapture::ByValue,
+                    },
                     mutability: Mutability::Not,
                 },
             ]),
@@ -4352,7 +4597,11 @@ mod tests {
         ClosureData {
             min_captures,
             fake_reads: Box::new([
-                (place(PlaceBase::Rvalue), FakeReadCause::ForMatchedPlace(Some(expr(2))), sources(&[1])),
+                (
+                    place(PlaceBase::Rvalue),
+                    FakeReadCause::ForMatchedPlace(Some(expr(2))),
+                    sources(&[1]),
+                ),
                 (place(PlaceBase::StaticItem), FakeReadCause::ForLet(None), sources(&[])),
                 (place(PlaceBase::Local(binding(0))), FakeReadCause::ForIndex, sources(&[4, 1])),
             ]),
@@ -4361,7 +4610,10 @@ mod tests {
                 fn_sig_kind: FnSigKind::new(ExternAbi::RustCall, Safety::Safe, false, Some(1), 2)
                     .expect("two inputs, so index 1 is in bounds"),
             }),
-            kind_origin: Some((pat(6).into(), place(PlaceBase::Upvar { closure: expr(3), var_id: binding(4) }))),
+            kind_origin: Some((
+                pat(6).into(),
+                place(PlaceBase::Upvar { closure: expr(3), var_id: binding(4) }),
+            )),
         }
     }
 
@@ -4382,13 +4634,23 @@ mod tests {
             type_of_expr.insert(expr(at), ty.store());
         }
         let mut expr_adjustments = CsrBuilder::new_in(frame);
-        expr_adjustments.insert(expr(1), ADJUSTS.iter().map(|kind| Adjustment { kind: kind.clone(), target: types.u8.store() }));
+        expr_adjustments.insert(
+            expr(1),
+            ADJUSTS.iter().map(|kind| Adjustment { kind: kind.clone(), target: types.u8.store() }),
+        );
         expr_adjustments.ensure(expr(4));
         let mut assignment_coercions = CsrBuilder::new_in(frame);
-        assignment_coercions.insert(expr(6), [Adjustment { kind: Adjust::NeverToAny, target: types.unit.store() }]);
+        assignment_coercions
+            .insert(expr(6), [Adjustment { kind: Adjust::NeverToAny, target: types.unit.store() }]);
         let mut pat_adjustments = CsrBuilder::new_in(frame);
-        pat_adjustments.push(pat(2), PatAdjustment { kind: PatAdjust::OverloadedDeref, source: types.i32.store() });
-        pat_adjustments.push(pat(2), PatAdjustment { kind: PatAdjust::BuiltinDeref, source: types.u8.store() });
+        pat_adjustments.push(
+            pat(2),
+            PatAdjustment { kind: PatAdjust::OverloadedDeref, source: types.i32.store() },
+        );
+        pat_adjustments.push(
+            pat(2),
+            PatAdjustment { kind: PatAdjust::BuiltinDeref, source: types.u8.store() },
+        );
         let mut mismatches = ExprOrPatSet::default();
         mismatches.insert(expr(70).into());
         mismatches.insert(pat(3).into());
@@ -4398,7 +4660,13 @@ mod tests {
                 (expr(9), (FunctionId::from_id(id(21)), args(&[]))),
             ]),
             field_resolutions: FieldColumn::from_entries([
-                (expr(2), Either::Left(FieldId { parent: StructId::from_id(id(22)).into(), local_id: local_of(1) })),
+                (
+                    expr(2),
+                    Either::Left(FieldId {
+                        parent: StructId::from_id(id(22)).into(),
+                        local_id: local_of(1),
+                    }),
+                ),
                 (expr(5), Either::Right(TupleFieldId { tuple: TupleId(1), index: 1 })),
                 (expr(8), Either::Right(TupleFieldId { tuple: TupleId(0), index: 0 })),
             ]),
@@ -4407,7 +4675,10 @@ mod tests {
                 pats: IndexColumn::from_entries([(pat(1), EnumVariantId::from_id(id(24)).into())]),
             },
             value_resolutions: {
-                let param = TypeOrConstParamId { parent: FunctionId::from_id(id(33)).into(), local_id: local_of(1) };
+                let param = TypeOrConstParamId {
+                    parent: FunctionId::from_id(id(33)).into(),
+                    local_id: local_of(1),
+                };
                 let mut values = ExprOrPatMap::new_in(frame);
                 values.insert(expr(12).into(), ValueNs::ImplSelf(ImplId::from_id(id(34))));
                 values.insert(expr(13).into(), ValueNs::LocalBinding(binding(2)));
@@ -4415,40 +4686,72 @@ mod tests {
                 values.insert(expr(15).into(), ValueNs::ConstId(ConstId::from_id(id(36))));
                 values.insert(expr(16).into(), ValueNs::StaticId(StaticId::from_id(id(37))));
                 values.insert(pat(5).into(), ValueNs::StructId(StructId::from_id(id(38))));
-                values.insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_id(id(39))));
-                values.insert(expr(17).into(), ValueNs::GenericParam(ConstParamId::from_unchecked(param)));
+                values
+                    .insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_id(id(39))));
+                values.insert(
+                    expr(17).into(),
+                    ValueNs::GenericParam(ConstParamId::from_unchecked(param)),
+                );
                 values.freeze()
             },
             qualifier_resolutions: {
-                let param = TypeOrConstParamId { parent: FunctionId::from_id(id(33)).into(), local_id: local_of(0) };
+                let param = TypeOrConstParamId {
+                    parent: FunctionId::from_id(id(33)).into(),
+                    local_id: local_of(0),
+                };
                 let enum_ = AdtId::EnumId(hir_def::EnumId::from_id(id(49)));
                 let mut qualifiers = ExprOrPatMap::new_in(frame);
-                qualifiers.insert(expr(14).into(), (TypeNs::AdtId(StructId::from_id(id(38)).into()), 1));
-                qualifiers.insert(expr(15).into(), (TypeNs::GenericParam(TypeParamId::from_unchecked(param)), 1));
+                qualifiers
+                    .insert(expr(14).into(), (TypeNs::AdtId(StructId::from_id(id(38)).into()), 1));
+                qualifiers.insert(
+                    expr(15).into(),
+                    (TypeNs::GenericParam(TypeParamId::from_unchecked(param)), 1),
+                );
                 qualifiers.insert(expr(16).into(), (TypeNs::SelfType(ImplId::from_id(id(34))), 1));
                 qualifiers.insert(expr(17).into(), (TypeNs::AdtSelfType(enum_), 1));
                 qualifiers.insert(expr(18).into(), (TypeNs::TraitId(TraitId::from_id(id(41))), 2));
-                qualifiers.insert(expr(19).into(), (TypeNs::TypeAliasId(TypeAliasId::from_id(id(6))), 3));
-                qualifiers.insert(expr(20).into(), (TypeNs::BuiltinType(BuiltinType::Uint(BuiltinUint::U128)), 1));
+                qualifiers
+                    .insert(expr(19).into(), (TypeNs::TypeAliasId(TypeAliasId::from_id(id(6))), 3));
+                qualifiers.insert(
+                    expr(20).into(),
+                    (TypeNs::BuiltinType(BuiltinType::Uint(BuiltinUint::U128)), 1),
+                );
                 qualifiers.insert(expr(21).into(), (TypeNs::BuiltinType(BuiltinType::Char), 1));
-                qualifiers.insert(pat(6).into(), (TypeNs::EnumVariantId(EnumVariantId::from_id(id(39))), 0));
+                qualifiers.insert(
+                    pat(6).into(),
+                    (TypeNs::EnumVariantId(EnumVariantId::from_id(id(39))), 0),
+                );
                 qualifiers.freeze()
             },
             unstable_candidates: {
                 let mut candidates = ExprOrPatMap::new_in(frame);
                 let call: Box<[(CandidateId, Symbol)]> = Box::new([
-                    (CandidateId::FunctionId(FunctionId::from_id(id(44))), Symbol::intern("iter_flatten")),
-                    (CandidateId::ConstId(ConstId::from_id(id(45))), Symbol::intern("int_roundings")),
+                    (
+                        CandidateId::FunctionId(FunctionId::from_id(id(44))),
+                        Symbol::intern("iter_flatten"),
+                    ),
+                    (
+                        CandidateId::ConstId(ConstId::from_id(id(45))),
+                        Symbol::intern("int_roundings"),
+                    ),
                 ]);
-                let path: Box<[(CandidateId, Symbol)]> =
-                    Box::new([(CandidateId::ConstId(ConstId::from_id(id(46))), Symbol::intern("f16"))]);
+                let path: Box<[(CandidateId, Symbol)]> = Box::new([(
+                    CandidateId::ConstId(ConstId::from_id(id(46))),
+                    Symbol::intern("f16"),
+                )]);
                 candidates.insert(expr(12).into(), call);
                 candidates.insert(pat(6).into(), path);
                 candidates.freeze()
             },
             assoc_resolutions: ExprOrPatColumn {
-                exprs: IndexColumn::from_entries([(expr(6), (ConstId::from_id(id(25)).into(), args(&[types.u8])))]),
-                pats: IndexColumn::from_entries([(pat(0), (FunctionId::from_id(id(26)).into(), args(&[])))]),
+                exprs: IndexColumn::from_entries([(
+                    expr(6),
+                    (ConstId::from_id(id(25)).into(), args(&[types.u8])),
+                )]),
+                pats: IndexColumn::from_entries([(
+                    pat(0),
+                    (FunctionId::from_id(id(26)).into(), args(&[])),
+                )]),
             },
             tuple_field_access_types: Box::new([
                 Tys::new_from_slice(&[types.i32]).store(),
@@ -4456,7 +4759,10 @@ mod tests {
                 Tys::new_from_slice(&[]).store(),
             ]),
             type_of_expr: TyColumn::from_entries(type_of_expr),
-            type_of_pat: TyColumn::from_entries([(pat(1), types.bool.store()), (pat(3), types.bool.store())]),
+            type_of_pat: TyColumn::from_entries([
+                (pat(1), types.bool.store()),
+                (pat(3), types.bool.store()),
+            ]),
             type_of_binding: TyColumn::from_entries([(binding(0), types.unit.store())]),
             type_of_type_placeholder: TyColumn::from_entries([(local_of(2), types.never.store())]),
             type_of_opaque: SortedMap::from_entries([
@@ -4477,8 +4783,10 @@ mod tests {
                 (
                     pat(3),
                     NamedTerm {
-                        term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(InferTy::FreshTy(0))))
-                            .store(),
+                        term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(
+                            InferTy::FreshTy(0),
+                        )))
+                        .store(),
                         params: vec![(
                             Span::PatId(pat(3)),
                             TypeParamId::from_unchecked(TypeOrConstParamId {
@@ -4503,29 +4811,49 @@ mod tests {
             skipped_ref_pats: [pat(130)].into_iter().collect(),
             coercion_casts: [expr(1), expr(64)].into_iter().collect(),
             closures_without_expectation: [expr(3)].into_iter().collect(),
-            asm_sym_tys: SortedMap::from_entries([((expr(9), 2), types.i32.store()), ((expr(9), 0), types.u8.store())]),
-            comptime_loops: SortedMap::from_entries([(expr(18), ComptimeLoop {
-                binder: Ty::new_without_interner(TyKind::Placeholder(PlaceholderType::new_anon(
-                    UniverseIndex::from_u32(3),
-                    BoundVar::ZERO,
-                )))
-                .store(),
-                domain: types.u8.store(),
-                kind: ReflectedDomain::Variants,
-                container: types.i32.store(),
-                assumptions: Clauses::empty().store(),
-            })]),
-            closures_data: SortedMap::from_entries([(expr(3), closure()), (expr(11), ClosureData {
-                min_captures: Default::default(),
-                fake_reads: Box::new([]),
-                liberated_sig: StoredFnSig::new(FnSig {
-                    inputs_and_output: Tys::new_from_slice(&[types.unit]),
-                    fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: true }, Safety::Unsafe, true, None, 0)
-                        .expect("no splatted argument is always valid"),
-                }),
-                kind_origin: None,
-            })]),
-            defined_anon_consts: Box::new([AnonConstId::from_id(id(31)), AnonConstId::from_id(id(32))]),
+            asm_sym_tys: SortedMap::from_entries([
+                ((expr(9), 2), types.i32.store()),
+                ((expr(9), 0), types.u8.store()),
+            ]),
+            comptime_loops: SortedMap::from_entries([(
+                expr(18),
+                ComptimeLoop {
+                    binder: Ty::new_without_interner(TyKind::Placeholder(
+                        PlaceholderType::new_anon(UniverseIndex::from_u32(3), BoundVar::ZERO),
+                    ))
+                    .store(),
+                    domain: types.u8.store(),
+                    kind: ReflectedDomain::Variants,
+                    container: types.i32.store(),
+                    assumptions: Clauses::empty().store(),
+                },
+            )]),
+            closures_data: SortedMap::from_entries([
+                (expr(3), closure()),
+                (
+                    expr(11),
+                    ClosureData {
+                        min_captures: Default::default(),
+                        fake_reads: Box::new([]),
+                        liberated_sig: StoredFnSig::new(FnSig {
+                            inputs_and_output: Tys::new_from_slice(&[types.unit]),
+                            fn_sig_kind: FnSigKind::new(
+                                ExternAbi::C { unwind: true },
+                                Safety::Unsafe,
+                                true,
+                                None,
+                                0,
+                            )
+                            .expect("no splatted argument is always valid"),
+                        }),
+                        kind_origin: None,
+                    },
+                ),
+            ]),
+            defined_anon_consts: Box::new([
+                AnonConstId::from_id(id(31)),
+                AnonConstId::from_id(id(32)),
+            ]),
         }
     }
 
@@ -4593,7 +4921,11 @@ mod tests {
         .into_iter()
         .map(|what| Unreachable { what, after, note: None })
         .chain([
-            Unreachable { what: UnreachableAt::Expr(expr(8)), after: ExprOrPatId::PatId(pat(2)), note: None },
+            Unreachable {
+                what: UnreachableAt::Expr(expr(8)),
+                after: ExprOrPatId::PatId(pat(2)),
+                note: None,
+            },
             Unreachable { what: UnreachableAt::Stmt { block: expr(3), index: 0 }, after, note },
         ])
         .collect()
@@ -4639,11 +4971,16 @@ mod tests {
         record.table = table_words(&table);
         let buffer = blaze_format::Aligned::copy_from(&to_bytes(&record));
         let read = InferenceRecord::read(&buffer).unwrap();
-        let TableView::InPlace(view) = read.table else { panic!("a read record's table is a view") };
+        let TableView::InPlace(view) = read.table else {
+            panic!("a read record's table is a view")
+        };
         assert_eq!(view, &table_bytes(&record.table)[..]);
         assert_eq!(view.as_ptr().align_offset(ALIGN), 0);
         let inside = buffer.as_ptr() as usize..buffer.as_ptr() as usize + buffer.len();
-        assert!(inside.contains(&(view.as_ptr() as usize)), "the view is into the buffer, not a copy");
+        assert!(
+            inside.contains(&(view.as_ptr() as usize)),
+            "the view is into the buffer, not a copy"
+        );
 
         record.table = Vec::new();
         let buffer = blaze_format::Aligned::copy_from(&to_bytes(&record));
@@ -4680,8 +5017,10 @@ mod tests {
         impls.iter().for_each(|&it| sink.optional_impl(it));
         blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
             let mut source = Source { words: &sink.words, next: 0, text: &sink.text, at: 0, frame };
-            let read_causes = causes.iter().map(|_| source.cause_code().unwrap()).collect::<Vec<_>>();
-            let read_impls = impls.iter().map(|_| source.optional_impl().unwrap()).collect::<Vec<_>>();
+            let read_causes =
+                causes.iter().map(|_| source.cause_code().unwrap()).collect::<Vec<_>>();
+            let read_impls =
+                impls.iter().map(|_| source.optional_impl().unwrap()).collect::<Vec<_>>();
             assert_eq!(read_causes, causes);
             assert_eq!(read_impls, impls);
             assert!(source.is_done());
@@ -4805,10 +5144,22 @@ mod tests {
         let record = InferenceRecord::of(&result(), &mut model);
         let cases = [
             // The value resolutions' last expression is 17, their last pattern 6.
-            (Nodes { exprs: 17, ..NODES }, "a value path resolution's expression, below the store's expression count", 17),
-            (Nodes { pats: 6, ..NODES }, "a value path resolution's pattern, below the store's pattern count", 6),
+            (
+                Nodes { exprs: 17, ..NODES },
+                "a value path resolution's expression, below the store's expression count",
+                17,
+            ),
+            (
+                Nodes { pats: 6, ..NODES },
+                "a value path resolution's pattern, below the store's pattern count",
+                6,
+            ),
             // The qualifier resolutions have the expressions 14 to 21.
-            (Nodes { exprs: 18, ..NODES }, "a qualifier resolution's expression, below the store's expression count", 18),
+            (
+                Nodes { exprs: 18, ..NODES },
+                "a qualifier resolution's expression, below the store's expression count",
+                18,
+            ),
         ];
         for (nodes, wanted, node) in cases {
             let read: Result<InferenceResult<'static>, _> = record.as_ref().decode(&model, nodes);
@@ -4829,12 +5180,17 @@ mod tests {
         let found: Vec<usize> = (0..words.len().saturating_sub(2))
             .filter(|&at| words[at..at + 3] == [8, 0, 12])
             .collect(); // alloc: a test's list
-        let [at] = found[..] else { panic!("the value resolutions start in {} places, not one", found.len()) };
+        let [at] = found[..] else {
+            panic!("the value resolutions start in {} places, not one", found.len())
+        };
         words[at + 2] = 0x8000_0003;
         let read: Result<InferenceResult<'static>, _> = damaged.as_ref().decode(&model, NODES);
         match read {
             Err(FormatError::Bound { what, found, bound, .. }) => {
-                assert_eq!(what, "a value path resolution's expression, below the store's expression count");
+                assert_eq!(
+                    what,
+                    "a value path resolution's expression, below the store's expression count"
+                );
                 assert_eq!((found, bound), (0x8000_0003, NODES.exprs.into()));
             }
             other => panic!("expression 0x8000_0003 read as {other:?}"),

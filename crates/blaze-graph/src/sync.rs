@@ -7,7 +7,10 @@
 #[allow(clippy::disallowed_types, reason = "named only by `pump::Lock`, which allows it")]
 pub(crate) use parking_lot::{Condvar, Mutex, MutexGuard};
 #[cfg(not(blaze_check))]
-#[allow(clippy::disallowed_types, reason = "named only by the crate's process-wide singletons, each of which expects it")]
+#[allow(
+    clippy::disallowed_types,
+    reason = "named only by the crate's process-wide singletons, each of which expects it"
+)]
 pub(crate) use std::sync::OnceLock;
 #[cfg(not(blaze_check))]
 pub(crate) use std::{hint, sync::atomic, thread, thread_local};

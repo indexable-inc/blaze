@@ -33,7 +33,7 @@ env:
 jobs:
   notes:
     name: version and notes
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       version: ${{ steps.notes.outputs.version }}
@@ -67,8 +67,16 @@ jobs:
   build:
     name: ${{ matrix.target }}
     needs: notes
+    # On GitHub's hosted runners, Linux too: the binaries are built on the oldest hosted Ubuntu so
+    # that they ask for an old glibc (build_release.py refuses one newer than RHEL 9's), and the
+    # ix runner image is Ubuntu 24.04, whose glibc 2.39 headers bind C code to newer symbols
+    # (docs/harness.md "ix runners"). TODO(sysroot): build Linux on ix against an older glibc
+    # sysroot (docs/v2/plan/toolchain-c.md) once blaze can target one; it has no --sysroot today.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # A store blaze's release has not compiled into, which a release's always is: about 97
+    # minutes on hosted Linux x86-64 and longer on macOS's 7 GB runner (blaze-platform.yaml's
+    # build), under the hosted runner's 6-hour cap.
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +91,20 @@ jobs:
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names, with its own Rust, and the pinned LLVM (LLVM_SYS_231_PREFIX), as blaze-platform.yaml's
+      # build job has them; no rustup, no cargo, no Nix. The store's project is this job's own and
+      # nothing pushes it, so it pulls nothing: a release's binaries come from a clean build.
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: release
+          llvm: true
+      # build_release.py runs in the repository's Python workspace (typed_input).
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
       # `blaze --version` names the commit and its date (UTC), as rustc does:
       # `blaze 0.20261028.9 (fb82b09 2026-10-28)` (crates/blaze-engine/build.rs).
       - run: |
@@ -94,14 +115,15 @@ jobs:
       # library from the release's assets (the step `Standard library` below; shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # No build cache: release binaries come from a clean build. With LLVM, as every native
-      # blaze has (blaze-engine's default `native`), so every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
-      # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile tools/pgo/profiles.json pins; a
-      # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
-      # since the pgo workflow last ran).
-      # PGO is off for now (pgo.yaml runs by hand only): releases ship the plain `dist` build, so a
-      # fix reaches users minutes after release-cut. To turn it back on, `--strict` instead of `--no-pgo`.
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --no-pgo
+      # The `dist` profile, with LLVM, as every native blaze has (blaze-engine's default
+      # `native`): build_release.py refuses a binary that loads libLLVM or a C++ runtime, or on
+      # Linux asks for a glibc newer than RHEL 9's. PGO is off: blaze applies only a profile
+      # trained on its own build (tools/pgo/pgo.py), which it cannot make while it refuses
+      # `-C profile-generate`; `"pgo": "pinned"` stops with that error (build_release.py).
+      - name: blaze build -p blaze-engine --profile dist
+        run: |
+          uv run --frozen --no-dev python .github/scripts/build_release.py \
+            '{"target": "${{ matrix.target }}", "out": "shipped", "pgo": "off"}'
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - name: Archive
@@ -119,6 +141,9 @@ jobs:
           name: ${{ env.NAME }}
           path: ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # blaze's crate and the forks it depends on (`blaze-hir`, `blaze-rustc_abi`, ...) on crates.io, as
   # its own job so it can be rerun alone: versions already published are skipped. Each crate is
@@ -129,10 +154,17 @@ jobs:
     # Off: it would publish 60 permanent `blaze-*` names and `blaze`, both retired (#270);
     # whether and under which names blaze goes to crates.io is decided after the rename.
     if: false
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
+      # cargo here is crates.io's client alone (`cargo package --no-verify`, `cargo publish
+      # --no-verify`); what the crates build to is checked by the stage 0's `blaze build`
+      # (publish_crates.py, `verify`).
+      - uses: ./.github/actions/blaze
+        with:
+          job: crates
+          llvm: true
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # crates.io needs the manifests to say the release's version: written into this job's
       # checkout only, never committed (main's stays `0.0.0`).
@@ -141,12 +173,15 @@ jobs:
       - run: python3 -I .github/scripts/publish_crates.py --publish --max-hours 5
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   publish:
     name: GitHub release
     needs: [notes, build]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
     permissions:
       contents: write
@@ -180,13 +215,53 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
             out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
-      # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
-      # promote.yaml tests the archives just published and makes this same release stable when
-      # they pass (docs/release.md). By dispatch, since a release this token publishes starts no
-      # `release:` workflow.
+      # A canary: promote.yaml tests the archives just published and makes this same release
+      # stable when they pass (docs/release.md). By dispatch, since a release this token
+      # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.
       - name: Promotion
         env:
           GH_TOKEN: ${{ github.token }}
+        run: gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"
+
+  # The canary pointer (what a workspace pinned to canary reads) and latest.json (what every blaze
+  # daemon reads every few minutes, docs/release.md, "latest.json") name this release.
+  metadata:
+    name: pointers and latest.json
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: [ix, arm64, ix-mode-cold]
+    timeout-minutes: 10
+    # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
+    # latest.json from the releases as they are when it runs, so the last one to run is right. A
+    # run the group cancels while it waits behind a newer one loses nothing.
+    concurrency:
+      group: release-metadata
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # Only GH_TOKEN: the Cloudflare token reaches no script, only wrangler-action below.
+      - name: pointers and latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
         run: |
-          python3 -I .github/scripts/promote.py pointer "{\"channel\": \"canary\", \"tag\": \"$GITHUB_REF_NAME\"}"
-          gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"
+          python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
+      # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
+      # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
+      # missing secret fails the run without holding a release back.
+      - name: the R2 token is set
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::latest.json is not published: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
+            exit 1
+          fi
+      - name: Publish latest.json
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote

@@ -26,7 +26,9 @@ pub(crate) fn connect() -> anyhow::Result<Client> {
     let Some(conn) = running.daemon.connect_local() else {
         let failed = running.daemon.failed().map(|why| format!(": {why}")).unwrap_or_default();
         running.end()?;
-        anyhow::bail!("the build engine started in this process took no connection of its own{failed}");
+        anyhow::bail!(
+            "the build engine started in this process took no connection of its own{failed}"
+        );
     };
     // alloc: once a command, the client's link
     Ok(Client::local(Box::new(Once { running: Some(running), conn, told: false })))
@@ -77,8 +79,12 @@ impl Local for Once {
             }
             if !running.daemon.turn() {
                 break Err(match running.daemon.failed() {
-                    Some(why) => io::Error::other(format!("the build engine in this process failed: {why}")),
-                    None => io::Error::other("the build engine in this process stopped before it replied"),
+                    Some(why) => {
+                        io::Error::other(format!("the build engine in this process failed: {why}"))
+                    }
+                    None => io::Error::other(
+                        "the build engine in this process stopped before it replied",
+                    ),
                 });
             }
         };
@@ -92,12 +98,17 @@ impl Local for Once {
         };
         running.daemon.stop();
         while running.daemon.turn() {}
-        let failed = running.daemon.failed().map(|why| format!("the build engine in this process failed as it stopped: {why}"));
+        let failed = running
+            .daemon
+            .failed()
+            .map(|why| format!("the build engine in this process failed as it stopped: {why}"));
         let marked = match failed {
             None => running.stopped().map_err(|why| io::Error::other(format!("{why:#}"))),
             Some(_) => Ok(()),
         };
-        let ended = running.end().map_err(|why| io::Error::other(format!("ending the build engine in this process: {why:#}")));
+        let ended = running.end().map_err(|why| {
+            io::Error::other(format!("ending the build engine in this process: {why:#}"))
+        });
         match failed {
             Some(why) => Err(io::Error::other(why)),
             None => ended.and(marked),

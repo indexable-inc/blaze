@@ -88,10 +88,13 @@ fn foreign_read_is_noop_after_foreign_write() {
             }
             for rel_pos in AccessRelatedness::exhaustive() {
                 precondition!(rel_pos.is_foreign());
-                if let Some(new) = transition::perform_access(old_access, rel_pos, old, old_protected) {
+                if let Some(new) =
+                    transition::perform_access(old_access, rel_pos, old, old_protected)
+                {
                     assert_eq!(
                         new,
-                        transition::perform_access(new_access, rel_pos, new, new_protected).unwrap()
+                        transition::perform_access(new_access, rel_pos, new, new_protected)
+                            .unwrap()
                     );
                 }
             }
@@ -176,7 +179,10 @@ fn permissionpriv_partialord_is_reachability() {
     for [p1, p2] in <[PermissionPriv; 2]>::exhaustive() {
         let le12 = p1 <= p2;
         let reach12 = reach.contains(&(p1, p2));
-        assert!(le12 == reach12, "`{p1} reach {p2}` ({reach12}) does not match `{p1} <= {p2}` ({le12})");
+        assert!(
+            le12 == reach12,
+            "`{p1} reach {p2}` ({reach12}) does not match `{p1} <= {p2}` ({le12})"
+        );
     }
 }
 

@@ -4,8 +4,8 @@
 use base_db::{Db, FileId};
 use blaze_diagnostics::emit::{Sources, Style};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use crate::{
     check::{Setup, check},
@@ -72,7 +72,8 @@ macro_rules! vec {
 /// it after these. `clippy::all` is clippy's five default groups only, while blaze also warns of
 /// pedantic, nursery and cargo by default (`registry::Group::default_level`), so those three are
 /// named too; restriction is off by default.
-pub(crate) const CLIPPY_OFF: &str = "-A clippy::all -A clippy::pedantic -A clippy::nursery -A clippy::cargo";
+pub(crate) const CLIPPY_OFF: &str =
+    "-A clippy::all -A clippy::pedantic -A clippy::nursery -A clippy::cargo";
 
 /// The diagnostics clippy's lints have in the crate `fixture` writes at `/src/lib.rs` (named
 /// `main`, or the name a lint keys on, `blaze_vfs`), rustc's flags `flags` given, each as rustc
@@ -92,7 +93,12 @@ pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
 
 /// [`lint_with`], `given` done to each database's fixture first (a proc-macro crate given its
 /// macros, [`fixture::Fixture::set_proc_macros`]).
-pub(crate) fn lint_given(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+pub(crate) fn lint_given(
+    fixture: &str,
+    flags: &str,
+    conf: Conf,
+    given: fn(&mut fixture::Fixture),
+) -> String {
     let by_kind = lint_once(fixture, flags, conf.clone(), given);
     crate::lints::BY_CASTS.set(true);
     let by_casts = lint_once(fixture, flags, conf, given);
@@ -138,7 +144,8 @@ pub(crate) fn try_lint_once(
         }
         let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs`");
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
-        let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
+        let setup =
+            Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();
         let found = check(&db, krate, &setup, &name_of)?;
         let mut sources = Sources::of(texts);

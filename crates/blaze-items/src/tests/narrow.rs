@@ -11,6 +11,7 @@ use hir_def::{
     nameres::{DefMap, crate_def_map},
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate, check_orphan_rules,
@@ -25,7 +26,6 @@ use hir_ty::{
     traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
 };
 use rustc_type_ir::inherent::GenericArgs as _;
-use hir_expand::fixture;
 
 use super::db::TestDB;
 
@@ -212,7 +212,9 @@ impl Tr for S {}
 ";
 
 fn impls_of_trait(db: &TestDB, trait_: TraitId) -> usize {
-    blaze_query::db::attach(db, || TraitImpls::in_crate_and_deps_for_trait(db, krate(db), trait_).len())
+    blaze_query::db::attach(db, || {
+        TraitImpls::in_crate_and_deps_for_trait(db, krate(db), trait_).len()
+    })
 }
 
 #[test]
@@ -382,10 +384,8 @@ fn warm_layouts_destructors_coherence_and_hidden_types_allocate_nothing() {
         let interner = DbInterner::new_no_crate(db);
         let args = GenericArgs::identity_for_item(interner, adt.into());
         let ty = Ty::new_adt(interner, adt, args);
-        let own = ParamEnvAndCrate {
-            param_env: db.trait_environment(GenericDefId::AdtId(adt)),
-            krate,
-        };
+        let own =
+            ParamEnvAndCrate { param_env: db.trait_environment(GenericDefId::AdtId(adt)), krate };
         let under_g = ParamEnvAndCrate {
             param_env: db.trait_environment(GenericDefId::FunctionId(g)),
             krate,
@@ -763,7 +763,8 @@ fn a_local_body_is_lowered_for_impls_only_when_it_may_hold_one() {
             _ => None,
         })
         .expect("trait `Tr`");
-    let found = blaze_query::db::attach(&db, || TraitImpls::in_crate_for_trait(&db, main, tr).len());
+    let found =
+        blaze_query::db::attach(&db, || TraitImpls::in_crate_for_trait(&db, main, tr).len());
     // `A`, `B` (through `writes!`), `E` and `F`.
     assert_eq!(found, 4);
 }
@@ -844,9 +845,7 @@ const TRAIT_DEF: &str =
     "pub struct A;\npub trait Tr {\n    fn m(&self);\n}\nimpl Tr for A {\n    fn m(&self) {}\n}\n";
 
 fn trait_method_db() -> (TestDB, FileId, FunctionId) {
-    let fx = fixture::db(&format!(
-        "//- /main.rs crate:main\n{TRAIT_CALLER}//- /a.rs\n{TRAIT_DEF}"
-    ));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{TRAIT_CALLER}//- /a.rs\n{TRAIT_DEF}"));
     let files = fx.files().to_vec();
     let db = fx.into_db();
     let trait_file = files[1].file_id(&db);

@@ -72,7 +72,11 @@ impl Bytes {
     /// their count: bytes kept past any request that die on their own, as a fetched source's
     /// files do with the VFS tree that holds them. `write`'s error is returned, and the block
     /// freed, when it fails.
-    pub fn kept<E>(tag: Tag, len: usize, write: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Bytes, E> {
+    pub fn kept<E>(
+        tag: Tag,
+        len: usize,
+        write: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<Bytes, E> {
         let mut made = Arc::<[u8], Kept>::new_zeroed_slice_in(len, Kept(tag));
         let place = Arc::get_mut(&mut made).expect("a new `Arc` is its only count");
         // SAFETY: the slice was made zeroed, and zero is a `u8`; no other count can read it

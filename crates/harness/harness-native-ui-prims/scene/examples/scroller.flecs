@@ -1,0 +1,37 @@
+// ui.Scroller, the overlay scroller every ui.Scroll carries: a list scrolled partway down (the knob over its trailing
+// edge, as long as the view is of the content) and a row that scrolls sideways (its knob along the foot). Each flashes
+// as it appears, stays `scroller_hold` seconds and fades, so shoot it early (HARNESS_NATIVE_SHOT_SECS=0.5). Point near
+// an edge and the knob widens over its track; drag it, or press the track to page.
+
+@tree ChildOf
+ex {
+  prefab ScrollerDemo : ex.Card {
+    label : ui.Label { Text: {s: "OVERLAY SCROLLER"} }
+    list : ui.Scroll {
+      ScrollState: {x: 0, y: 60}
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 96, min: 0, max: 0}}
+      a : ui.Line { Text: {s: "Inbox"} }
+      b : ui.Line { Text: {s: "Drafts"} }
+      c : ui.Line { Text: {s: "Sent"} }
+      d : ui.Line { Text: {s: "Archive"} }
+      e : ui.Line { Text: {s: "Junk"} }
+      f : ui.Line { Text: {s: "Trash"} }
+      g : ui.Line { Text: {s: "Receipts"} }
+      h : ui.Line { Text: {s: "Travel"} }
+      i : ui.Line { Text: {s: "Family"} }
+      j : ui.Line { Text: {s: "Work"} }
+    }
+    wide : ui.Scroll {
+      ScrollState: {x: 80, y: 0}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 40, min: 0, max: 0}}
+      a : ui.Button { label : ui.Line { Text: {s: "Monday"} } }
+      b : ui.Button { label : ui.Line { Text: {s: "Tuesday"} } }
+      c : ui.Button { label : ui.Line { Text: {s: "Wednesday"} } }
+      d : ui.Button { label : ui.Line { Text: {s: "Thursday"} } }
+      e : ui.Button { label : ui.Line { Text: {s: "Friday"} } }
+      f : ui.Button { label : ui.Line { Text: {s: "Saturday"} } }
+    }
+  }
+}

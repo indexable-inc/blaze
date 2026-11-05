@@ -48,9 +48,15 @@ pub(crate) struct Sources {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Located {
     /// The package's `Cargo.toml`, absolute, under a mount.
-    Here { manifest: String },
+    Here {
+        manifest: String,
+    },
     Needs(Fetch),
     Failed(LoadError),
+    /// A package of a sparse registry or a git source that blaze's sources don't hold, which
+    /// this offline build may not fetch: cargo's error, as a download's ([`unfetched`]). One
+    /// run that may fetch has it, unlike every [`Located::Failed`].
+    Unfetched(LoadError),
 }
 
 /// A registry's index file, as read.
@@ -68,7 +74,11 @@ impl Sources {
     /// `kept` is where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]).
     /// `offline` is `Some("--offline")` or `Some("--frozen")` when the command line or
     /// `net.offline` makes the build offline.
-    pub(crate) fn new<F: Files>(config: &Config<F>, kept: &str, offline: Option<&'static str>) -> anyhow::Result<Sources> {
+    pub(crate) fn new<F: Files>(
+        config: &Config<F>,
+        kept: &str,
+        offline: Option<&'static str>,
+    ) -> anyhow::Result<Sources> {
         let kept = normal(std::path::Path::new(kept)).ok_or_else(|| {
             anyhow!("the daemon names `{kept}`, no absolute directory, for where it keeps the packages it fetches")
         })?;
@@ -111,13 +121,15 @@ impl Sources {
                 };
                 match tree::vendored_package(cx, &root, &from.to_string(), id, checksum)? {
                     Ok(manifest) => Located::Here { manifest },
-                    Err(error) if from != source => {
-                        failed(error.context(format!("failed to download replaced source {source}")))
-                    }
+                    Err(error) if from != source => failed(
+                        error.context(format!("failed to download replaced source {source}")),
+                    ),
                     Err(error) => failed(error),
                 }
             }
-            SourceKind::Path => failed(anyhow!("{source} is replaced with the path {from}, which is not a source")),
+            SourceKind::Path => {
+                failed(anyhow!("{source} is replaced with the path {from}, which is not a source"))
+            }
         })
     }
 
@@ -148,7 +160,7 @@ impl Sources {
         if let Some(flag) = self.offline
             && from.kind() != &SourceKind::LocalRegistry
         {
-            return Ok(Err(anyhow!("attempting to make an HTTP request, but {flag} was specified")));
+            return Ok(Ok(unfetched(id, flag)));
         }
         let sha256 = match checksum.filter(|it| !it.is_empty()) {
             Some(it) => it.to_owned(),
@@ -256,13 +268,12 @@ impl Sources {
         }
         let at = format!("{}/git/checkouts/{}/{commit}", self.kept, from.git_ident());
         if let Found::Here(_) = read_dir(cx, &at)? {
-            return Ok(tree::checkout_package(cx, &at, id)?.map(|manifest| Located::Here { manifest }));
+            return Ok(
+                tree::checkout_package(cx, &at, id)?.map(|manifest| Located::Here { manifest })
+            );
         }
         if let Some(flag) = self.offline {
-            return Ok(Err(download_error(
-                id,
-                anyhow!("attempting to make an HTTP request, but {flag} was specified"),
-            )));
+            return Ok(Ok(unfetched(id, flag)));
         }
         Ok(Ok(Located::Needs(Fetch {
             what: format!("git repository `{}`", from.url()),
@@ -302,7 +313,9 @@ impl Sources {
             }
             SourceKind::LocalRegistry => {
                 let Some(root) = local_path(from) else {
-                    return Ok(IndexFile::Failed(anyhow!("{from} is not a directory blaze can name")));
+                    return Ok(IndexFile::Failed(anyhow!(
+                        "{from} is not a directory blaze can name"
+                    )));
                 };
                 match read_dir(cx, &root)? {
                     Found::Here(_) => {}
@@ -350,6 +363,12 @@ impl Sources {
         self.offline
     }
 
+    /// Where fetched packages are kept ([`crate::query::BuildConfig::sources`]), as errors say
+    /// where blaze looked.
+    pub(crate) fn kept(&self) -> &str {
+        &self.kept
+    }
+
     /// The registry `id`'s packages come from, when `id` is a registry and what replaces it is
     /// one too.
     pub(crate) fn registry_of(&self, id: SourceId) -> anyhow::Result<Option<SourceId>> {
@@ -382,6 +401,14 @@ fn download_error(id: PackageId, error: anyhow::Error) -> anyhow::Error {
     error.context(format!("failed to download `{} v{}`", id.name(), id.version()))
 }
 
+/// `id`, which blaze's sources don't hold and an offline build (`flag`) may not fetch, as
+/// cargo says it: a download refused.
+fn unfetched(id: PackageId, flag: &str) -> Located {
+    let error =
+        download_error(id, anyhow!("attempting to make an HTTP request, but {flag} was specified"));
+    Located::Unfetched(load_error(&error, Some(format!("{} v{}", id.name(), id.version()))))
+}
+
 fn git_index(from: SourceId) -> anyhow::Error {
     anyhow!(
         "blaze reads sparse registry indexes only, and {from} has a git index (`{}`): read it \
@@ -392,7 +419,9 @@ fn git_index(from: SourceId) -> anyhow::Error {
 }
 
 fn unmounted_local(root: &str) -> anyhow::Error {
-    anyhow!("blaze reads the local registry `{root}` in place, and it is under no mount of the view")
+    anyhow!(
+        "blaze reads the local registry `{root}` in place, and it is under no mount of the view"
+    )
 }
 
 /// A sparse index's URL without `sparse+`, ending in `/`, as cargo's `HttpRegistry::new` takes

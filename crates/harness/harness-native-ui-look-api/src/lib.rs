@@ -93,7 +93,8 @@ pub struct TextStyle {
     /// The line height of code blocks in markdown text (0: the text's own `line`).
     pub code_line: f32,
     /// Which surface the style was written for (0 transcript, 1 composer, 2 title, 3 rail names, 4 permission, 5
-    /// palette, 6 chips and digits, 7 the Settings page). Nothing reads it: the scene keeps it as a note, and the text is the same whatever it says.
+    /// palette, 6 chips and digits, 7 the Settings page), a note the text ignores, but for two that pick its face: 9 is
+    /// code (the monospace face), 10 tabular figures (the text face, every digit as wide: a column of numbers).
     pub role: i32,
     pub bold: i32,
     /// The weight the sidebar's labels set their text in: 0 as `bold` says, 500 medium (the open row's label).
@@ -119,6 +120,15 @@ pub struct Ribbon {
     pub min: f32,
 }
 
+/// The appearance a subtree is drawn in, whatever the window's (SwiftUI's `.environment(\.colorScheme, ...)`): every
+/// Fill, Edge and look in it takes its `dark` half when `dark`, else its `light` half; the nearest ancestor's wins. A view
+/// on a ground of its own says which half reads on it (the chat pane sits on the terminal's ground, which is dark in both
+/// appearances unless the Ghostty theme says otherwise).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scheme {
+    pub dark: bool,
+}
+
 /// `(RibbonFrom, node)` and `(RibbonTo, node)` on a [`Ribbon`]: the nodes its ends span. Exclusive; deleting either node
 /// deletes the ribbon (it joins nothing then).
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -140,6 +150,7 @@ hyperion_api_layouts::api_layouts! {
     "OnLook" => alias OnLook,
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
+    "Scheme" => alias Scheme,
 }
 
 /// Register the appearance vocabulary before scenes or systems resolve it.
@@ -157,6 +168,7 @@ pub fn register(world: &World) {
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();
     world.component::<Ribbon>().writable();
+    world.component::<Scheme>().writable();
     world.component::<RibbonFrom>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
     world.component::<RibbonTo>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
 }

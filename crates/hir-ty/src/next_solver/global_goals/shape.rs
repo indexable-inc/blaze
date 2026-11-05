@@ -96,8 +96,7 @@ pub(crate) fn holds_within<'db>(
     goal: Goal<'db, Predicate<'db>>,
     available: usize,
 ) -> Option<usize> {
-    let PredicateKind::Clause(ClauseKind::Trait(pred)) = goal.predicate.kind().skip_binder()
-    else {
+    let PredicateKind::Clause(ClauseKind::Trait(pred)) = goal.predicate.kind().skip_binder() else {
         return None;
     };
     if pred.polarity != ClausePolarity::Positive {
@@ -130,8 +129,7 @@ pub(crate) fn copy_clone_holds<'db>(
     }
     let TyKind::Adt(def, args) = self_ty.kind() else { return false };
     let interner = cx.0.interner;
-    args.is_empty()
-        && copy_clone_impl(interner.db, def.def_id(), trait_.0, interner.expect_crate())
+    args.is_empty() && copy_clone_impl(interner.db, def.def_id(), trait_.0, interner.expect_crate())
 }
 
 /// The depth below the goal `self_ty: trait_` its proof by shape costs, when that is at most
@@ -319,9 +317,7 @@ impl<'db> Walk<'db> {
             | TyKind::Slice(elem)
             | TyKind::Pat(elem, _) => self.holds(trait_, elem),
             TyKind::Tuple(tys) => tys.iter().all(|elem| self.holds(trait_, elem)),
-            TyKind::Adt(def, args) if def.is_phantom_data() => {
-                self.holds(trait_, args.type_at(0))
-            }
+            TyKind::Adt(def, args) if def.is_phantom_data() => self.holds(trait_, args.type_at(0)),
             TyKind::Adt(def, args) => def
                 .all_field_tys(interner)
                 .iter_instantiated(interner, args.as_slice())

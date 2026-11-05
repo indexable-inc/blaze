@@ -142,7 +142,11 @@ fn main() {
         let layout = Layout::from_size_align(size, 8).expect("a valid layout");
         case(format!("pair {size:>5} B, outside any task"), &|| one(None, layout));
         case(format!("pair {size:>5} B, in a task       "), &|| one(Some(Tag::Infer), layout));
-        case(format!("pair {size:>5} B, {THREADS} threads in tasks"), &|| shared(Some(Tag::Infer), layout));
-        case(format!("made in a task, freed on another thread, {size:>5} B (a block)"), &|| across(Some(Tag::Infer), layout));
+        case(format!("pair {size:>5} B, {THREADS} threads in tasks"), &|| {
+            shared(Some(Tag::Infer), layout)
+        });
+        case(format!("made in a task, freed on another thread, {size:>5} B (a block)"), &|| {
+            across(Some(Tag::Infer), layout)
+        });
     }
 }

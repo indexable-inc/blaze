@@ -232,9 +232,10 @@ pub(crate) fn contains_comment(node: ast::Node<'_>, range: TextRange) -> bool {
             return is_comment(it.kind()) && range.contains_range(it.text_range());
         }
     };
-    within.descendants_with_tokens().filter_map(|it| it.into_token()).any(|it| {
-        is_comment(it.kind()) && range.contains_range(it.text_range())
-    })
+    within
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .any(|it| is_comment(it.kind()) && range.contains_range(it.text_range()))
 }
 
 /// Calls `f` on each path expression of `root` that starts at or after `after`, and of what
@@ -301,7 +302,10 @@ pub(crate) enum Owner {
 pub(crate) fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<Owner> {
     let db = cx.db();
     let def = cx.def(node)?;
-    if !matches!(def, hir::ModuleDef::Function(_) | hir::ModuleDef::Const(_) | hir::ModuleDef::TypeAlias(_)) {
+    if !matches!(
+        def,
+        hir::ModuleDef::Function(_) | hir::ModuleDef::Const(_) | hir::ModuleDef::TypeAlias(_)
+    ) {
         return None;
     }
     Some(match def.as_assoc_item(db).map(|it| it.container(db)) {

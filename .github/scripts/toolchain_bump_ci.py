@@ -35,12 +35,14 @@ BASE = "toolchain/base"
 PIN = os.path.join(ROOT, "harness/toolchain")
 PINS = os.path.join(ROOT, "crates/blaze-cargo/src/toolchain/pins.txt")
 ANSWERS = os.path.join(ROOT, "crates/blaze-units/src/stdlib/rustc.json")
+# The CPU table tools/cpus.py writes from ANSWERS (the workflow runs it after `answers`).
+CPUS = os.path.join(ROOT, "crates/target-features/src/cpus/table.rs")
 # The issue is one for as long as the bump is blocked, retitled to the nightly it is on.
 TITLE = "Toolchain bump to {date} is blocked"
 TITLED = re.compile(r"^Toolchain bump to (\d{4}-\d{2}-\d{2}) is blocked$")
 # train.yaml's jobs that gather the others, and those that do not block it (train_issue.py).
 GATHERERS = {"train", "train issue", "release"}
-NOT_BLOCKING = ("nix / ", "linux x64 / bench")
+NOT_BLOCKING = ("nix / ", "linux arm64 / bench")
 FAILED = {"failure", "cancelled", "timed_out"}
 # Attempts of the bump's train before red that main does not have blocks it.
 ATTEMPTS = 2
@@ -211,8 +213,8 @@ def answers(files):
 def pr():
     name = pin()
     rustc, commit = pins()
-    run("git", "add", ANSWERS)
-    if run("git", "status", "--porcelain", ANSWERS).strip():
+    run("git", "add", ANSWERS, CPUS)
+    if run("git", "status", "--porcelain", ANSWERS, CPUS).strip():
         run("git", "commit", "-q", "-m", f"toolchain: answers of {name} (answers.py --write on each CI host)")
     existing = open_pr()
     if not existing and run("git", "rev-parse", "HEAD").strip() == run("git", "rev-parse", f"origin/{BRANCH}").strip():

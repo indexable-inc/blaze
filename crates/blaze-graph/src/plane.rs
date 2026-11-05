@@ -58,6 +58,7 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_hash::hash_map::Entry;
 use std::{
     borrow::Cow,
     cmp::Reverse,
@@ -65,13 +66,12 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
 };
-use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{ByHash, HashMap};
-use std::alloc::Global;
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
+use std::alloc::Global;
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +140,30 @@ impl Memo for NoMemo {
 pub struct Budget {
     pub bytes: u64,
     pub from: String,
+    /// What the least limit loses before it is the budget: what others use and the margin
+    /// ([`crate::arena::machine_budget`]). The limit that fits a task is its need and this.
+    #[serde(default)]
+    pub kept_back: u64,
+}
+
+impl Budget {
+    /// The memory limit, in whole GiB, under which a task predicted to hold `need` bytes
+    /// fits: its need and what the limit loses to others and the margin ([`Budget::kept_back`]).
+    pub fn to_fit(&self, need: u64) -> u64 {
+        need.saturating_add(self.kept_back).div_ceil(1 << 30)
+    }
+
+    /// What to tell blaze so a task predicted to hold `need` bytes fits, for the error that
+    /// refuses it: the exact `BLAZE_DAEMON_MEMORY_GB`.
+    pub fn advice(&self, need: u64) -> String {
+        let fit = self.to_fit(need);
+        // alloc: the message of a task refused for memory, once
+        format!(
+            "to fit it, run with BLAZE_DAEMON_MEMORY_GB={fit} (or `--memory-gb {fit}`) on a \
+             machine with that much memory, which every other limit above must allow too; a \
+             command with another value than the daemon's restarts it when idle"
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -406,7 +430,9 @@ impl TryFrom<Columns> for Nodes {
             if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
                 let offsets = at.len();
                 // alloc: a refused trace's message, once
-                return Err(format!("{column} of {offsets} offsets for {len} nodes and {end} entries"));
+                return Err(format!(
+                    "{column} of {offsets} offsets for {len} nodes and {end} entries"
+                ));
             }
             match at.windows(2).position(|pair| pair[0] > pair[1]) {
                 // alloc: a refused trace's message, once
@@ -528,6 +554,17 @@ pub struct Counts {
 /// weight up to 16, so for those the shares are exact.
 const SHARE: u128 = 720_720 << 32;
 
+/// What memory admission did with a task as it started ([`Plane::admitted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admitted {
+    /// The memory the plane granted it: its predicted peak.
+    pub granted: u64,
+    /// The times another task with memory started while it did not fit.
+    pub passed: u32,
+    /// The pool it runs on: what a wait that memory did not hold back waited for a thread of.
+    pub pool: Pool,
+}
+
 /// What one request did, for its proof of work ([`Plane::stats`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequestStats {
@@ -616,7 +653,10 @@ impl<M: Default> Slots<M> {
 
     #[track_caller]
     pub(crate) fn give(&mut self, handle: Handle<M>) {
-        assert!(self.slab.remove(handle).is_some(), "slot {handle:?} given back, but it is not live");
+        assert!(
+            self.slab.remove(handle).is_some(),
+            "slot {handle:?} given back, but it is not live"
+        );
     }
 
     /// Slots made so far, live or free: the rows each column has.
@@ -959,6 +999,11 @@ pub struct Plane<M = NoMemo> {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// What the process holds besides the tasks granted memory that kept the best task held
+    /// back for memory in the last dispatch from starting: the bytes of it to let go for that
+    /// task to start now; 0 when none was held back, or only granted tasks held it back
+    /// ([`Plane::short`]).
+    short: u64,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests, which share it among themselves alone.
@@ -1043,6 +1088,7 @@ impl<M: Memo> Plane<M> {
             running: [0; 2],
             granted: 0,
             held: 0,
+            short: 0,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             // Each `Vec` here is empty scratch the plane keeps: it grows to the most a step needs
@@ -1050,7 +1096,7 @@ impl<M: Memo> Plane<M> {
             idle_running: Vec::new(), // alloc: kept scratch
             yielding: [0; 2],
             yielding_memory: 0,
-            yields: Vec::new(), // alloc: kept scratch
+            yields: Vec::new(),               // alloc: kept scratch
             active: [Vec::new(), Vec::new()], // alloc: kept scratch
             hold: None,
             passes: 0,
@@ -1058,12 +1104,12 @@ impl<M: Memo> Plane<M> {
             last_ns: 0,
             counts: Counts::default(),
             batch: Batch::default(),
-            touched: Vec::new(), // alloc: kept scratch
-            added: Vec::new(), // alloc: kept scratch
-            rising: Vec::new(), // alloc: kept scratch
+            touched: Vec::new(),  // alloc: kept scratch
+            added: Vec::new(),    // alloc: kept scratch
+            rising: Vec::new(),   // alloc: kept scratch
             skipping: Vec::new(), // alloc: kept scratch
-            order: Vec::new(), // alloc: kept scratch
-            passed: Vec::new(), // alloc: kept scratch
+            order: Vec::new(),    // alloc: kept scratch
+            passed: Vec::new(),   // alloc: kept scratch
             scan: BinaryHeap::new(),
             sorting: Vec::new(), // alloc: kept scratch
         })
@@ -1082,6 +1128,16 @@ impl<M: Memo> Plane<M> {
         self.granted
     }
 
+    /// The bytes of what the process holds besides its granted tasks (a front end kept, values
+    /// its caches keep: [`PlaneInput::Held`] less the grants) that held back a task for memory
+    /// in the last dispatch: letting go of that much would have let the best such task start
+    /// then. 0 when no task was held back, or only granted tasks did (they end, and give it
+    /// back). The driver lets go of what it can when this is not 0 (`blaze-cargo`'s release of
+    /// a front end), which waiting alone never would.
+    pub fn short(&self) -> u64 {
+        self.short
+    }
+
     /// The state of `id`, if it was added.
     pub fn state(&self, id: NodeId) -> Option<&NodeState> {
         let node = *self.index.get(&id)?;
@@ -1089,9 +1145,26 @@ impl<M: Memo> Plane<M> {
         Some(&self.states[node.index() as usize])
     }
 
+    /// What memory admission did with the task node `id` runs, read as it starts (after its
+    /// [`PlaneOutput::Run`]): the bytes the plane granted it (its predicted peak) and the times
+    /// it was passed over for memory before it started. `None` for a node with no live task.
+    /// The driver writes it into the task's profile span (`blaze_profile::span::Task`), so a
+    /// forecast that held tasks back shows against what each task then held.
+    pub fn admitted(&self, id: NodeId) -> Option<Admitted> {
+        let node = *self.index.get(&id)?;
+        let task = self.rows[node.index() as usize].task;
+        if task == NO_TASK || !self.task_slots.live(task) {
+            return None;
+        }
+        let row = &self.tasks[row_of(task)];
+        Some(Admitted { granted: row.memory, passed: row.passed, pool: row.pool })
+    }
+
     /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.
     pub fn is_open(&self, request: RequestId) -> bool {
-        self.request_index.get(&request).is_some_and(|r| !self.requests[r.index() as usize].finished)
+        self.request_index
+            .get(&request)
+            .is_some_and(|r| !self.requests[r.index() as usize].finished)
     }
 
     /// What `request` did so far, if it is known: open, or finished and not released.
@@ -1155,7 +1228,13 @@ impl<M: Memo> Plane<M> {
                     .iter()
                     .find(|edge| !self.states[edge.dep as usize].settled())
                     .map(|edge| self.rows[edge.dep as usize].id);
-                each(Unsettled { request: request.id, id: self.rows[m].id, name: request.name(cold), state, on });
+                each(Unsettled {
+                    request: request.id,
+                    id: self.rows[m].id,
+                    name: request.name(cold),
+                    state,
+                    on,
+                });
             }
         }
     }
@@ -1197,7 +1276,8 @@ impl<M: Memo> Plane<M> {
         for &me in &request.nodes {
             let m = me as usize;
             debug_assert!(self.states[m].settled() && self.rows[m].task == NO_TASK);
-            let node = self.index.remove(&self.rows[m].id).expect("a node of a request in the index");
+            let node =
+                self.index.remove(&self.rows[m].id).expect("a node of a request in the index");
             debug_assert_eq!(node.index(), me);
             self.node_slots.give(node);
             self.states[m] = NodeState::Waiting;
@@ -1230,7 +1310,11 @@ impl<M: Memo> Plane<M> {
     /// [`Plane::step`], with its outputs appended to `out`: a caller that keeps one buffer and
     /// drains it gets them with no allocation of its own per step. An input refused appends
     /// nothing and changes nothing.
-    pub fn step_into(&mut self, input: PlaneInput, out: &mut Vec<PlaneOutput>) -> Result<(), Error> {
+    pub fn step_into(
+        &mut self,
+        input: PlaneInput,
+        out: &mut Vec<PlaneOutput>,
+    ) -> Result<(), Error> {
         // A time before the last is the last: completions race the clock that stamps them.
         let at = input.at_ns().max(self.last_ns);
         let mut touched = std::mem::take(&mut self.touched);
@@ -1277,7 +1361,8 @@ impl<M: Memo> Plane<M> {
                     it.idle = false;
                     it.vtime = self.vclock;
                     let (rows, tasks) = (&self.rows, &self.tasks);
-                    self.idle_running.retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
+                    self.idle_running
+                        .retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
                 }
             }
             PlaneInput::Yielded { id, .. } => {
@@ -1306,11 +1391,11 @@ impl<M: Memo> Plane<M> {
                     // Empty, so allocating nothing: the place the record takes below.
                     let kept = Event::Nodes {
                         first: 0,
-                        kinds: Vec::new(), // alloc: none, empty
+                        kinds: Vec::new(),    // alloc: none, empty
                         names: String::new(), // alloc: none, empty
-                        name_at: Vec::new(), // alloc: none, empty
-                        deps: Vec::new(), // alloc: none, empty
-                        deps_at: Vec::new(), // alloc: none, empty
+                        name_at: Vec::new(),  // alloc: none, empty
+                        deps: Vec::new(),     // alloc: none, empty
+                        deps_at: Vec::new(),  // alloc: none, empty
                     };
                     out.push(said(request, at, kept));
                     self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
@@ -1430,7 +1515,7 @@ impl<M: Memo> Plane<M> {
     fn after(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
         self.settle_deferred(at, out, touched);
         self.last_ns = at;
-        self.dispatch(at, out, touched);
+        self.dispatch(at, out);
         let requests = &self.requests;
         radix::sort_copy_by_key_in(
             touched,
@@ -1504,7 +1589,10 @@ impl<M: Memo> Plane<M> {
                         batch.deps.push(NEW | place);
                     }
                     Some((it, None)) if self.rows[it.index() as usize].request == r => {
-                        debug_assert!(self.node_slots.live(it), "the index holds a stale handle of {dep}");
+                        debug_assert!(
+                            self.node_slots.live(it),
+                            "the index holds a stale handle of {dep}"
+                        );
                         batch.deps.push(it.index());
                     }
                     _ => {
@@ -1661,15 +1749,19 @@ impl<M: Memo> Plane<M> {
             match &self.states[dep as usize] {
                 NodeState::Built | NodeState::Cached { .. } => {
                     if blocker == NONE
-                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                        || later(&self.rows, &self.cold, dep)
+                            > later(&self.rows, &self.cold, blocker)
                     {
                         blocker = dep;
                     }
                 }
                 // A failure that leaves what waits for it to run, under keep-going: as done.
-                NodeState::Failed { .. } if request.keep_going && self.cold[dep as usize].flags & OPEN != 0 => {
+                NodeState::Failed { .. }
+                    if request.keep_going && self.cold[dep as usize].flags & OPEN != 0 =>
+                {
                     if blocker == NONE
-                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                        || later(&self.rows, &self.cold, dep)
+                            > later(&self.rows, &self.cold, blocker)
                     {
                         blocker = dep;
                     }
@@ -1872,7 +1964,10 @@ impl<M: Memo> Plane<M> {
             let vacant = match self.flight.entry(key) {
                 Entry::Occupied(it) => {
                     let task = *it.get();
-                    debug_assert!(self.task_slots.live(task), "a key in flight names a task that ended");
+                    debug_assert!(
+                        self.task_slots.live(task),
+                        "a key in flight names a task that ended"
+                    );
                     self.join(at, me, task, out);
                     return;
                 }
@@ -1973,7 +2068,9 @@ impl<M: Memo> Plane<M> {
                 edge = it.next;
                 let dependent = &mut self.rows[it.owner as usize];
                 dependent.waiting -= 1;
-                if dependent.waiting == 0 && matches!(self.states[it.owner as usize], NodeState::Waiting) {
+                if dependent.waiting == 0
+                    && matches!(self.states[it.owner as usize], NodeState::Waiting)
+                {
                     self.cold[it.owner as usize].blocker = me;
                     self.became_ready(at, it.owner, out);
                 }
@@ -2020,7 +2117,11 @@ impl<M: Memo> Plane<M> {
         if task == NO_TASK {
             return None;
         }
-        debug_assert!(self.task_slots.live(task), "node {} names a task that ended", self.rows[m].id);
+        debug_assert!(
+            self.task_slots.live(task),
+            "node {} names a task that ended",
+            self.rows[m].id
+        );
         self.rows[m].task = NO_TASK;
         let t = self.tasks[row_of(task)];
         let next = self.rows[m].next_member;
@@ -2191,7 +2292,8 @@ impl<M: Memo> Plane<M> {
         (request.idle, request.vtime[p], Reverse(request.weight), request.seq)
     }
 
-    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
+    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
+        self.short = 0;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             if self.config.budget.is_none() {
@@ -2240,13 +2342,6 @@ impl<M: Memo> Plane<M> {
                         }
                         self.passed = passed;
                         self.start(at, me, out);
-                    }
-                    Pick::Fail(me, why) => {
-                        self.passed = passed;
-                        self.leave_task(me);
-                        touched.push(self.rows[me as usize].request);
-                        self.deferred.push((me, NodeState::Failed { why }));
-                        self.settle_deferred(at, out, touched);
                     }
                     Pick::None => {
                         self.passed = passed;
@@ -2375,13 +2470,20 @@ impl<M: Memo> Plane<M> {
 
     /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
     /// of it that did not fit, before that one, are added to `passed`. Only with a budget.
+    ///
+    /// A task that fits the budget at all (one over it was refused as it was added,
+    /// [`too_big`]) never waits for good: once no task granted memory runs it starts, alone,
+    /// whatever the process holds besides. Its grant then holds every other task with memory
+    /// back until it ends. Refusing it there (as this did until memadmit: ten test targets of
+    /// blaze's own refused behind a prediction of 15.78 GB with 31 GB held and none of it
+    /// granted) would fail a unit that waiting could never help, since nothing granted is left
+    /// to end and give memory back; what the process holds besides is the driver's to let go
+    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 15: the wait ends,
+    /// in a start).
     fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<TaskHandle>) -> Pick {
         let free = self.memory_free().expect("a budget");
-        // A task predicted the whole budget runs alone: once nothing granted memory runs,
-        // whatever the process holds besides, and while it runs nothing granted memory fits.
         let whole = self.config.budget.as_ref().expect("a budget").bytes;
         let alone = self.granted == 0;
-        let nothing_runs = self.running == [0, 0];
         let hold = self.hold();
         // An idle request's task passed over holds back no other.
         let counts = !self.requests[r as usize].idle;
@@ -2408,7 +2510,7 @@ impl<M: Memo> Plane<M> {
                         break;
                     }
                 }
-                _ if memory <= free || (memory == whole && alone) => {
+                _ if memory <= free || (memory <= whole && alone) => {
                     picked = me;
                     break;
                 }
@@ -2431,24 +2533,17 @@ impl<M: Memo> Plane<M> {
         if picked != NONE {
             return Pick::Start(picked);
         }
-        if unfit == NONE || !nothing_runs {
-            return Pick::None;
+        if unfit != NONE && self.short == 0 {
+            // The first task held back, of the request whose turn it is: what the process
+            // holds besides the grants kept it out by this much.
+            let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
+            let held_besides = self.held.saturating_sub(self.granted);
+            let by_grants = whole.saturating_sub(self.granted);
+            if memory <= by_grants {
+                self.short = memory.saturating_sub(free).min(held_besides);
+            }
         }
-        let budget = self.config.budget.as_ref().expect("a budget");
-        let cold = &self.cold[unfit as usize];
-        let request = &self.requests[r as usize];
-        Pick::Fail(
-            unfit, // alloc: below, the message of a node that fails for memory, once
-            format!(
-                "{} needs {} of memory as predicted, and with nothing of blaze's running \
-                 the process holds {} of the {} it may use ({})",
-                request.name(cold),
-                gb(cold.memory),
-                gb(self.held),
-                gb(budget.bytes),
-                budget.from
-            ),
-        )
+        Pick::None
     }
 
     fn start(&mut self, at: u64, me: u32, out: &mut Vec<PlaneOutput>) {
@@ -2497,11 +2592,12 @@ impl<M: Memo> Plane<M> {
             .iter()
             .copied()
             .filter(|&it| self.cold[it as usize].flags & DONE != 0)
-            .max_by_key(|&it| (self.cold[it as usize].done_at, Reverse(self.rows[it as usize].seq)));
+            .max_by_key(|&it| {
+                (self.cold[it as usize].done_at, Reverse(self.rows[it as usize].seq))
+            });
         let blocker = |it: &u32| Some(self.cold[*it as usize].blocker).filter(|&it| it != NONE);
-        let mut path: Vec<u32> = std::iter::successors(last, blocker)
-            .map(|it| self.rows[it as usize].id.0)
-            .collect(); // alloc: the payload of the request's one `Event::Critical`
+        let mut path: Vec<u32> =
+            std::iter::successors(last, blocker).map(|it| self.rows[it as usize].id.0).collect(); // alloc: the payload of the request's one `Event::Critical`
         path.reverse();
         path
     }
@@ -2509,15 +2605,17 @@ impl<M: Memo> Plane<M> {
 
 /// Whether an entry of a request's running nodes is still what it says: the same node (a slot
 /// reused has another `seq`), running, at that priority.
-fn running_live(rows: &[NodeRow], states: &[NodeState], (priority, seq, node): (u64, u64, u32)) -> bool {
+fn running_live(
+    rows: &[NodeRow],
+    states: &[NodeState],
+    (priority, seq, node): (u64, u64, u32),
+) -> bool {
     let row = &rows[node as usize];
     row.seq == seq && row.priority == priority && states[node as usize] == NodeState::Running
 }
 
 enum Pick {
     Start(u32),
-    /// It cannot fit even with nothing running.
-    Fail(u32, String),
     None,
 }
 
@@ -2532,11 +2630,12 @@ fn too_big(config: &PlaneConfig, request: &Request, cold: &NodeCold) -> Option<S
     (cold.memory > budget.bytes).then(|| {
         // alloc: the message of a node refused for memory, once
         format!(
-            "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
+            "{} needs {} of memory as predicted, more than blaze may use here: {} ({}); {}",
             request.name(cold),
             gb(cold.memory),
             gb(budget.bytes),
-            budget.from
+            budget.from,
+            budget.advice(cold.memory)
         )
     })
 }
@@ -2576,7 +2675,12 @@ fn new_task(
 }
 
 /// Takes the ids of the first `len` nodes of a batch refused back out of the index.
-fn unindex(index: &mut HashMap<NodeId, NodeHandle, Global>, nodes: &(impl Given + ?Sized), len: usize) { // alloc: the plane's index, for the daemon's life
+fn unindex(
+    index: &mut HashMap<NodeId, NodeHandle, Global>,
+    nodes: &(impl Given + ?Sized),
+    len: usize,
+) {
+    // alloc: the plane's index, for the daemon's life
     for at in 0..len {
         index.remove(&nodes.id(at));
     }

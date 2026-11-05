@@ -9,14 +9,23 @@ use super::*;
 use crate::{Status, http::RequestParser};
 
 fn status() -> Status {
-    Status { pid: 4, requests: vec![7], views: 1, history: None, memory_bytes: 2, budget_bytes: 3, build: crate::Build::default(), bugs: Vec::new() }
+    Status {
+        pid: 4,
+        requests: vec![7],
+        views: 1,
+        history: None,
+        memory_bytes: 2,
+        budget_bytes: 3,
+        uptime_ms: 40,
+        build: crate::Build::default(),
+        bugs: Vec::new(),
+        settings: Vec::new(),
+    }
 }
 
 /// A client over one end of a socket pair, and a thread on the other that reads one request
 /// and answers with `answers` (each envelope's id 0 is the request's).
-fn unix_daemon(
-    answers: Vec<Envelope<Response>>,
-) -> (Client, JoinHandle<Envelope<Request>>) {
+fn unix_daemon(answers: Vec<Envelope<Response>>) -> (Client, JoinHandle<Envelope<Request>>) {
     let (ours, mut theirs) = UnixStream::pair().unwrap();
     let daemon = thread::spawn(move || {
         let item = blaze_protocol::read_frame(&mut theirs).unwrap().unwrap();
@@ -52,7 +61,8 @@ fn a_call_hands_over_its_responses_and_keeps_the_others() {
 #[test]
 fn a_call_in_place_hands_over_its_responses_and_keeps_the_others() {
     let error = ApiError::new("no such head", Some("main".to_owned()));
-    let fetched = Response::Fetched { verb: crate::FetchVerb::Updating, what: "crates.io index".to_owned() };
+    let fetched =
+        Response::Fetched { verb: crate::FetchVerb::Updating, what: "crates.io index".to_owned() };
     // Every answer is in the socket before the first read, so one read takes them all.
     let (ours, mut theirs) = UnixStream::pair().unwrap();
     for answer in [
@@ -65,13 +75,14 @@ fn a_call_in_place_hands_over_its_responses_and_keeps_the_others() {
     }
     let mut client = Client::over(Link::Unix(ours));
     let mut seen = Vec::new();
-    let ok = client.call_ref(Request::Status, |it, buffered| seen.push((it.into_owned(), buffered))).unwrap();
+    let ok = client
+        .call_ref(Request::Status, |it, buffered| seen.push((it.into_owned(), buffered)))
+        .unwrap();
     assert!(ok);
-    assert_eq!(seen, [
-        (Response::Status(status()), true),
-        (fetched, true),
-        (Response::Done { ok: true }, false),
-    ]);
+    assert_eq!(
+        seen,
+        [(Response::Status(status()), true), (fetched, true), (Response::Done { ok: true }, false),]
+    );
     assert!(client.buffered(), "the other request's response is kept");
     assert_eq!(client.receive().unwrap(), Envelope::new(99, Response::Error(error)));
     assert!(!client.buffered());
@@ -184,12 +195,15 @@ fn over_http_a_second_send_keeps_the_first_ones_rest_on_one_connection() {
     assert_eq!(client.send(Request::Status).unwrap(), 2);
     assert_eq!(client.send(Request::Cancel { id: 2 }).unwrap(), 3);
     let got: Vec<Envelope<Response>> = (0..4).map(|_| client.receive().unwrap()).collect();
-    assert_eq!(got, [
-        Envelope::new(2, Response::Status(status())),
-        Envelope::new(2, Response::Done { ok: true }),
-        Envelope::new(3, Response::Status(status())),
-        Envelope::new(3, Response::Done { ok: true }),
-    ]);
+    assert_eq!(
+        got,
+        [
+            Envelope::new(2, Response::Status(status())),
+            Envelope::new(2, Response::Done { ok: true }),
+            Envelope::new(3, Response::Status(status())),
+            Envelope::new(3, Response::Done { ok: true }),
+        ]
+    );
     assert!(client.receive().is_err(), "nothing is outstanding");
     assert_eq!(daemon.join().unwrap().len(), 3);
 }
@@ -226,7 +240,9 @@ fn the_token_is_not_in_debug() {
 fn until_hung_up_waits_for_the_end_and_keeps_what_came_first() {
     let (ours, mut theirs) = UnixStream::pair().unwrap();
     let daemon = thread::spawn(move || {
-        theirs.write_all(&frames::encode(&Envelope::new(3, Response::Done { ok: true })).unwrap()).unwrap();
+        theirs
+            .write_all(&frames::encode(&Envelope::new(3, Response::Done { ok: true })).unwrap())
+            .unwrap();
     });
     let mut client = Client::over(Link::Unix(ours));
     client.until_hung_up(std::time::Duration::from_secs(10)).unwrap();
@@ -242,9 +258,15 @@ fn until_hung_up_waits_per_step_said_and_names_the_step_it_outlasted() {
     let patience = std::time::Duration::from_millis(300);
     let (ours, mut theirs) = UnixStream::pair().unwrap();
     let daemon = thread::spawn(move || {
-        let say = |theirs: &mut UnixStream, response| theirs.write_all(&frames::encode(&Envelope::new(3, response)).unwrap()).unwrap();
+        let say = |theirs: &mut UnixStream, response| {
+            theirs.write_all(&frames::encode(&Envelope::new(3, response)).unwrap()).unwrap()
+        };
         say(&mut theirs, Response::Done { ok: true });
-        for step in ["making the daemon image", "writing the daemon image /v2/image (679 MiB)", "mapping the daemon image"] {
+        for step in [
+            "making the daemon image",
+            "writing the daemon image /v2/image (679 MiB)",
+            "mapping the daemon image",
+        ] {
             thread::sleep(patience / 2);
             say(&mut theirs, Response::Stopping { doing: step.to_owned() });
         }
@@ -253,16 +275,24 @@ fn until_hung_up_waits_per_step_said_and_names_the_step_it_outlasted() {
     let mut client = Client::over(Link::Unix(ours));
     let began = std::time::Instant::now();
     client.until_hung_up(patience).unwrap();
-    assert!(began.elapsed() > patience, "the stop took {:?}, no longer than the patience", began.elapsed());
+    assert!(
+        began.elapsed() > patience,
+        "the stop took {:?}, no longer than the patience",
+        began.elapsed()
+    );
     daemon.join().unwrap();
     assert_eq!(client.receive().unwrap(), Envelope::new(3, Response::Done { ok: true }));
 
     let (ours, mut theirs) = UnixStream::pair().unwrap();
-    let step = Response::Stopping { doing: "writing the daemon image /v2/image (679 MiB)".to_owned() };
+    let step =
+        Response::Stopping { doing: "writing the daemon image /v2/image (679 MiB)".to_owned() };
     theirs.write_all(&frames::encode(&Envelope::new(3, step)).unwrap()).unwrap();
     let mut client = Client::over(Link::Unix(ours));
     let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
-    assert!(error.to_string().contains("said it was writing the daemon image /v2/image (679 MiB)"), "{error}");
+    assert!(
+        error.to_string().contains("said it was writing the daemon image /v2/image (679 MiB)"),
+        "{error}"
+    );
     drop(theirs);
 }
 
@@ -271,8 +301,14 @@ fn until_hung_up_gives_up_after_its_patience() {
     let (ours, _theirs) = UnixStream::pair().unwrap();
     let mut client = Client::over(Link::Unix(ours));
     let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
-    assert!(error.to_string().contains("still holds the connection after 20 ms, saying nothing"), "{error}");
+    assert!(
+        error.to_string().contains("still holds the connection after 20 ms, saying nothing"),
+        "{error}"
+    );
     let (at, _daemon) = http_daemon(0, None);
     let mut client = Client::http(at, "tok").unwrap();
-    assert!(matches!(client.until_hung_up(std::time::Duration::from_millis(20)), Err(ClientError::Refused(_))));
+    assert!(matches!(
+        client.until_hung_up(std::time::Duration::from_millis(20)),
+        Err(ClientError::Refused(_))
+    ));
 }

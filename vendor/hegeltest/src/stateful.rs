@@ -188,11 +188,7 @@ impl<M> Rule<M> {
     /// Create a new rule with a name, a selection weight (1.0 for the
     /// default), and an apply function.
     pub fn new(name: &str, weight: f64, apply: fn(&mut M, TestCase)) -> Self {
-        Rule {
-            name: name.to_string(),
-            weight,
-            apply,
-        }
+        Rule { name: name.to_string(), weight, apply }
     }
 }
 
@@ -208,19 +204,12 @@ pub struct Invariant<M: ?Sized> {
 impl<M> Invariant<M> {
     /// Create a sampled invariant with a name and an apply function.
     pub fn new(name: &str, apply: fn(&mut M, TestCase)) -> Self {
-        Invariant {
-            name: name.to_string(),
-            always_run: false,
-            apply,
-        }
+        Invariant { name: name.to_string(), always_run: false, apply }
     }
 
     /// Create an invariant that runs after every rule.
     pub fn new_always_run(name: &str, apply: fn(&mut M, TestCase)) -> Self {
-        Invariant {
-            always_run: true,
-            ..Invariant::new(name, apply)
-        }
+        Invariant { always_run: true, ..Invariant::new(name, apply) }
     }
 }
 
@@ -345,10 +334,7 @@ impl<T> Pool<T> {
     /// removing it. Drawing rejects the current test case (as if by
     /// `assume(false)`) when the pool is empty.
     pub fn values_reusable(&self) -> ValuesReusable<'_, T> {
-        ValuesReusable {
-            pool: &self.pool,
-            values: &self.values,
-        }
+        ValuesReusable { pool: &self.pool, values: &self.values }
     }
 
     /// A generator that consumes values from the pool.
@@ -366,10 +352,7 @@ impl<T> Pool<T> {
     /// such as a [`map`](Generator::map) or a tuple, that a filter around
     /// the combinator rejects.
     pub fn values_consumed(&mut self) -> ValuesConsumed<'_, T> {
-        ValuesConsumed {
-            pool: &self.pool,
-            values: RefCell::new(&mut self.values),
-        }
+        ValuesConsumed { pool: &self.pool, values: RefCell::new(&mut self.values) }
     }
 }
 
@@ -474,11 +457,7 @@ pub fn pool<T>(tc: &TestCase) -> Pool<T> {
         Ok(handle) => handle,
         Err(rc) => raise_for_rc(rc), // nocov
     };
-    Pool {
-        pool,
-        tc: tc.clone(),
-        values: HashMap::new(),
-    }
+    Pool { pool, tc: tc.clone(), values: HashMap::new() }
 }
 
 /// A pool of previously generated values that [`Machine::run_concurrent`]'s worker
@@ -674,10 +653,7 @@ pub fn concurrent_pool<T>(tc: &TestCase) -> ConcurrentPool<T> {
         Ok(handle) => handle,
         Err(rc) => raise_for_rc(rc),
     };
-    ConcurrentPool {
-        handle,
-        values: Mutex::new(HashMap::new()),
-    }
+    ConcurrentPool { handle, values: Mutex::new(HashMap::new()) }
 }
 
 /// Trait for defining a stateful test.
@@ -725,11 +701,7 @@ fn check_invariants<M: StateMachine>(
         }
         let inv_tc = tc.child(2); // nocov
         if let Err(e) = catch_unwind(AssertUnwindSafe(|| (invariant.apply)(m, inv_tc))) {
-            note_panic_trailer(
-                tc,
-                e.as_ref(),
-                &format!("Invariant {} failed:", invariant.name),
-            );
+            note_panic_trailer(tc, e.as_ref(), &format!("Invariant {} failed:", invariant.name));
             resume_unwind(e);
         }
     }
@@ -846,12 +818,7 @@ impl<M> Machine<M> {
     /// Wrap `model` with the defaults: [`DEFAULT_STEP_COUNT`] steps and a
     /// minimum and maximum concurrency of 1.
     pub fn new(model: M) -> Self {
-        Machine {
-            model,
-            step_count: DEFAULT_STEP_COUNT,
-            min_concurrency: 1,
-            max_concurrency: 1,
-        }
+        Machine { model, step_count: DEFAULT_STEP_COUNT, min_concurrency: 1, max_concurrency: 1 }
     }
 
     /// Set the target number of steps per test case: every case runs at
@@ -1056,8 +1023,7 @@ fn run_sequential<M: StateMachine>(mut m: M, tc: TestCase, step_count: i64) {
                 Err(e) if e.downcast_ref::<AssumeFailed>().is_some() => {
                     machine_rule_rejected(&tc, &machine, 0);
                     round_rejected = true;
-                    tc.child(2)
-                        .note("Rule stopped early due to violated assumption.");
+                    tc.child(2).note("Rule stopped early due to violated assumption.");
                     tc.note("}");
                 }
                 // Everything else — including StopTest, so an out-of-data
@@ -1106,12 +1072,7 @@ impl<M> ConcurrentRule<M> {
     /// weight, and an apply function. Pass [`ANONYMOUS_GROUP`] as the
     /// group for a rule without a group annotation.
     pub fn new(name: &str, group: &str, weight: f64, apply: fn(&M, TestCase)) -> Self {
-        ConcurrentRule {
-            name: name.to_string(),
-            group: group.to_string(),
-            weight,
-            apply,
-        }
+        ConcurrentRule { name: name.to_string(), group: group.to_string(), weight, apply }
     }
 }
 
@@ -1128,19 +1089,12 @@ pub struct ConcurrentInvariant<M: ?Sized> {
 impl<M> ConcurrentInvariant<M> {
     /// Create a sampled invariant with a name and an apply function.
     pub fn new(name: &str, apply: fn(&M, TestCase)) -> Self {
-        ConcurrentInvariant {
-            name: name.to_string(),
-            always_run: false,
-            apply,
-        }
+        ConcurrentInvariant { name: name.to_string(), always_run: false, apply }
     }
 
     /// Create an invariant that runs at every join point.
     pub fn new_always_run(name: &str, apply: fn(&M, TestCase)) -> Self {
-        ConcurrentInvariant {
-            always_run: true,
-            ..ConcurrentInvariant::new(name, apply)
-        }
+        ConcurrentInvariant { always_run: true, ..ConcurrentInvariant::new(name, apply) }
     }
 }
 
@@ -1197,11 +1151,7 @@ fn check_concurrent_invariants<M: ConcurrentStateMachine + ?Sized>(
         }
         let inv_tc = tc.child(2);
         if let Err(e) = catch_unwind(AssertUnwindSafe(|| (invariant.apply)(m, inv_tc))) {
-            note_panic_trailer(
-                tc,
-                e.as_ref(),
-                &format!("Invariant {} failed:", invariant.name),
-            );
+            note_panic_trailer(tc, e.as_ref(), &format!("Invariant {} failed:", invariant.name));
             resume_unwind(e);
         }
     }
@@ -1226,10 +1176,7 @@ enum WorkerEvent {
     ControlPayload(Box<dyn std::any::Any + Send>),
     /// A real panic, with the worker-side capture to re-install on the main
     /// thread.
-    Panicked {
-        payload: Box<dyn std::any::Any + Send>,
-        info: Option<PanicInfo>,
-    },
+    Panicked { payload: Box<dyn std::any::Any + Send>, info: Option<PanicInfo> },
     /// Synthesized by the main thread when a worker exited without
     /// reporting: never constructed by workers.
     Died,
@@ -1250,10 +1197,7 @@ fn classify_worker_unwind(e: Box<dyn std::any::Any + Send>) -> WorkerEvent {
     {
         return WorkerEvent::ControlPayload(e);
     }
-    WorkerEvent::Panicked {
-        payload: e,
-        info: run_lifecycle::take_panic_info(),
-    }
+    WorkerEvent::Panicked { payload: e, info: run_lifecycle::take_panic_info() }
 }
 
 /// One worker's round: pull rules for `worker` until the engine signals the
@@ -1301,8 +1245,7 @@ fn run_worker_round<M: ConcurrentStateMachine + ?Sized>(
                         tc.note("}");
                         return classify_worker_unwind(e);
                     }
-                    tc.child(2)
-                        .note("Rule stopped early due to violated assumption.");
+                    tc.child(2).note("Rule stopped early due to violated assumption.");
                     tc.note("}");
                 }
                 event => {
@@ -1373,13 +1316,10 @@ fn run_concurrent_machine<M: ConcurrentStateMachine + Sync>(
     let mut group_names: Vec<&str> = Vec::new();
     let mut rule_groups: Vec<i64> = Vec::with_capacity(rules.len());
     for rule in &rules {
-        let index = group_names
-            .iter()
-            .position(|name| *name == rule.group)
-            .unwrap_or_else(|| {
-                group_names.push(rule.group.as_str());
-                group_names.len() - 1
-            });
+        let index = group_names.iter().position(|name| *name == rule.group).unwrap_or_else(|| {
+            group_names.push(rule.group.as_str());
+            group_names.len() - 1
+        });
         rule_groups.push(index as i64);
     }
     let rule_weights: Vec<f64> = rules.iter().map(|r| r.weight).collect();
@@ -1421,15 +1361,7 @@ fn run_concurrent_machine<M: ConcurrentStateMachine + Sync>(
             round_txs.push(round_tx);
             event_rxs.push(event_rx);
             scope.spawn(move || {
-                worker_loop(
-                    worker,
-                    m,
-                    rules,
-                    machine,
-                    capture_backtraces,
-                    round_rx,
-                    event_tx,
-                );
+                worker_loop(worker, m, rules, machine, capture_backtraces, round_rx, event_tx);
             });
         }
 
@@ -1450,10 +1382,8 @@ fn run_concurrent_machine<M: ConcurrentStateMachine + Sync>(
                 worker_tc.with_ctc(|ctc| ctc.set_worker(worker as i64));
                 let _ = tx.send(worker_tc);
             }
-            let events: Vec<WorkerEvent> = event_rxs
-                .iter()
-                .map(|rx| rx.recv().unwrap_or(WorkerEvent::Died))
-                .collect();
+            let events: Vec<WorkerEvent> =
+                event_rxs.iter().map(|rx| rx.recv().unwrap_or(WorkerEvent::Died)).collect();
 
             resolve_round(events, &tc);
 
@@ -1501,11 +1431,9 @@ fn resolve_round(events: Vec<WorkerEvent>, tc: &TestCase) {
                     control = Some(payload);
                 }
             }
-            WorkerEvent::Panicked { payload, info } => panics.push(WorkerPanic {
-                worker,
-                payload,
-                info,
-            }),
+            WorkerEvent::Panicked { payload, info } => {
+                panics.push(WorkerPanic { worker, payload, info })
+            }
             WorkerEvent::Died => {
                 if control.is_none() {
                     control = Some(Box::new(InternalError(format!(
@@ -1520,10 +1448,8 @@ fn resolve_round(events: Vec<WorkerEvent>, tc: &TestCase) {
 
     let note_dropped = |dropped: &[WorkerPanic]| {
         for p in dropped {
-            let location = p
-                .info
-                .as_ref()
-                .map_or("<unknown>", |(_, _, location, _)| location.as_str());
+            let location =
+                p.info.as_ref().map_or("<unknown>", |(_, _, location, _)| location.as_str());
             tc.note(&format!(
                 "Dropped concurrent panic from worker {} at {}: {}",
                 p.worker,

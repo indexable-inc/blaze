@@ -19,7 +19,10 @@ use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
 use object::write::{Object as Builder, Relocation, Symbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, pe};
+use object::{
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
+    SymbolScope, pe,
+};
 
 const TARGET: Target = Target {
     name: "link_coff_import",
@@ -64,8 +67,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Pe, Arch::X86_64, SHARED, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Pe, Arch::X86_64, SHARED, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -116,9 +120,15 @@ fn named() -> Vec<(&'static str, Vec<u8>)> {
     ];
     let long = [("foo.dll", descriptor("foo")), ("foo.dll", long_import("foo", "f", 0, 0))];
     vec![
-        ("short imports of two DLLs, indexed", ar(&short, &[("__imp_f", 0), ("f", 0), ("__imp__v", 1), ("__imp_g", 2), ("g", 2)])),
+        (
+            "short imports of two DLLs, indexed",
+            ar(&short, &[("__imp_f", 0), ("f", 0), ("__imp__v", 1), ("__imp_g", 2), ("g", 2)]),
+        ),
         ("short imports without an index", ar(&short, &[])),
-        ("a descriptor and a long import", ar(&long, &[("__IMPORT_DESCRIPTOR_foo", 0), ("__imp_f", 1), ("f", 1)])),
+        (
+            "a descriptor and a long import",
+            ar(&long, &[("__IMPORT_DESCRIPTOR_foo", 0), ("__imp_f", 1), ("f", 1)]),
+        ),
     ]
 }
 
@@ -145,7 +155,13 @@ fn short_import(types: u16, hint: u16, strings: &[&str]) -> Vec<u8> {
     out
 }
 
-fn define(b: &mut Builder<'_>, name: &str, section: object::write::SectionId, value: u64, scope: SymbolScope) -> object::write::SymbolId {
+fn define(
+    b: &mut Builder<'_>,
+    name: &str,
+    section: object::write::SectionId,
+    value: u64,
+    scope: SymbolScope,
+) -> object::write::SymbolId {
     b.add_symbol(Symbol {
         name: name.into(),
         value,
@@ -194,12 +210,15 @@ fn long_import(dll: &str, symbol: &str, thunk: u64, value: u64) -> Vec<u8> {
     });
     let name = define(&mut b, "hint_name", names, value, SymbolScope::Compilation);
     let flags = RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR32NB };
-    b.add_relocation(thunks, Relocation { offset: 0, symbol: name, addend: 0, flags }).expect("a COFF relocation");
+    b.add_relocation(thunks, Relocation { offset: 0, symbol: name, addend: 0, flags })
+        .expect("a COFF relocation");
     b.write().expect("a COFF object")
 }
 
 fn header(out: &mut Vec<u8>, name: &str, size: usize) {
-    out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
+    out.extend_from_slice(
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes(),
+    );
 }
 
 /// `members` (names of at most 15 bytes) after a GNU `/` index naming `symbols` (name,
@@ -264,7 +283,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Pe, Arch::X86_64, SHARED, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Pe, Arch::X86_64, SHARED, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

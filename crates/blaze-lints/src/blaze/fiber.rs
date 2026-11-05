@@ -35,9 +35,13 @@ enum Named {
 impl Named {
     fn message(self) -> String {
         match self {
-            Named::Fiber => "`blaze_graph::sched::fiber` is named outside `blaze_graph::sched`".to_owned(),
+            Named::Fiber => {
+                "`blaze_graph::sched::fiber` is named outside `blaze_graph::sched`".to_owned()
+            }
             Named::Corosensei => "`corosensei` is named outside `blaze_graph::sched`".to_owned(),
-            Named::Driver(name) => format!("the fiber driver `{name}` is named outside `blaze_graph::sched`"),
+            Named::Driver(name) => {
+                format!("the fiber driver `{name}` is named outside `blaze_graph::sched`")
+            }
         }
     }
 }
@@ -129,5 +133,10 @@ fn is_fiber(db: &Db, module: hir::Module) -> bool {
 }
 
 fn is_crate(db: &Db, krate: hir::Crate, name: &str) -> bool {
-    krate.base().extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name)
+    krate
+        .base()
+        .extra_data(db)
+        .display_name
+        .as_ref()
+        .is_some_and(|it| it.crate_name().as_str() == name)
 }

@@ -57,7 +57,9 @@ pub(crate) const SAMPLE_BYTES_MOST: u64 = 32 << 20;
 pub(crate) fn train(samples: &[&[u8]]) -> Result<Vec<u8>, String> {
     zstd::dict::from_samples(samples, DICTIONARY_SIZE)
         // alloc: the error's message
-        .map_err(|error| format!("training a dictionary on {} values failed: {error}", samples.len()))
+        .map_err(|error| {
+            format!("training a dictionary on {} values failed: {error}", samples.len())
+        })
 }
 
 /// A kind's dictionary, digested once for both directions. Loading 64 KiB of dictionary into a
@@ -110,7 +112,8 @@ fn with_contexts<R>(f: impl FnOnce(&mut Contexts) -> Result<R, String>) -> Resul
         let mut cell = cell.borrow_mut();
         if cell.is_none() {
             let compress = CCtx::try_create().ok_or("starting zstd failed: it made no context")?;
-            let mut decompress = DCtx::try_create().ok_or("starting zstd failed: it made no context")?;
+            let mut decompress =
+                DCtx::try_create().ok_or("starting zstd failed: it made no context")?;
             decompress
                 .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
                 .map_err(|code| failed("starting zstd failed", code))?;
@@ -149,7 +152,9 @@ pub(crate) struct Batch<'d>(zstd::bulk::Compressor<'d>);
 impl<'d> Batch<'d> {
     pub(crate) fn new(dictionary: Option<&'d Prepared>) -> Result<Batch<'d>, String> {
         match dictionary {
-            Some(dictionary) => zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder),
+            Some(dictionary) => {
+                zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder)
+            }
             None => zstd::bulk::Compressor::new(LEVEL),
         }
         .map(Batch)
@@ -159,7 +164,9 @@ impl<'d> Batch<'d> {
 
     pub(crate) fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>, String> {
         // alloc: the error's message
-        self.0.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
+        self.0
+            .compress(raw)
+            .map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
     }
 }
 
@@ -178,7 +185,9 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
             .map_err(|error| format!("zstd refused {parameter:?}: {error}"))?;
     }
     // alloc: the error's message
-    compressor.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
+    compressor
+        .compress(raw)
+        .map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
 }
 
 /// The length a zstd frame of `stored` bytes may decode to, checked before anything of that
@@ -203,7 +212,9 @@ fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
     match zstd::zstd_safe::get_frame_content_size(stored) {
         Ok(Some(said)) if said == raw => {}
         // alloc: the error's message
-        Ok(Some(said)) => return Err(format!("its frame holds {said} bytes, not the {raw} recorded")),
+        Ok(Some(said)) => {
+            return Err(format!("its frame holds {said} bytes, not the {raw} recorded"));
+        }
         Ok(None) => return Err("its frame does not say how long it is".into()),
         Err(_) => return Err("it is not a zstd frame".into()),
     }
@@ -218,7 +229,11 @@ fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
 }
 
 /// Exactly `raw` bytes, or why not.
-pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn decompress(
+    dictionary: &Prepared,
+    stored: &[u8],
+    raw: u64,
+) -> Result<Vec<u8>, String> {
     let raw = zstd_length(stored, raw)?;
     with_contexts(|contexts| {
         // alloc: the value made whole, kept in `Owned` and read in place after
@@ -237,7 +252,10 @@ pub(crate) fn decompress_long(stored: &[u8], raw: u64) -> Result<Vec<u8>, String
     with_contexts(|contexts| {
         // alloc: the value made whole, kept in `Owned` and read in place after
         let mut bytes = Vec::with_capacity(raw);
-        contexts.decompress.decompress(&mut bytes, stored).map_err(|code| failed("it does not decompress", code))?;
+        contexts
+            .decompress
+            .decompress(&mut bytes, stored)
+            .map_err(|code| failed("it does not decompress", code))?;
         whole(bytes, raw)
     })
 }
@@ -260,7 +278,8 @@ pub(crate) fn lz4(raw: &[u8]) -> Option<Vec<u8>> {
 pub(crate) fn lz4_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
     out.clear();
     out.resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
-    let len = lz4_flex::block::compress_into(raw, out).expect("the most LZ4 can grow a block by fits");
+    let len =
+        lz4_flex::block::compress_into(raw, out).expect("the most LZ4 can grow a block by fits");
     out.truncate(len);
     len + raw.len() / 8 <= raw.len()
 }
@@ -412,11 +431,17 @@ mod tests {
 
     /// The reference for the thread's contexts: a context made for the one value and dropped.
     fn compress_fresh(dictionary: &Prepared, raw: &[u8]) -> Vec<u8> {
-        zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder).unwrap().compress(raw).unwrap()
+        zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder)
+            .unwrap()
+            .compress(raw)
+            .unwrap()
     }
 
     fn decompress_fresh(dictionary: &Prepared, stored: &[u8], raw: usize) -> Vec<u8> {
-        zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder).unwrap().decompress(stored, raw).unwrap()
+        zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder)
+            .unwrap()
+            .decompress(stored, raw)
+            .unwrap()
     }
 
     fn two_dictionaries() -> (Prepared, Prepared) {
@@ -448,7 +473,10 @@ mod tests {
                 assert_eq!(decompress_long(&stored, long.len() as u64).unwrap(), long);
             }
             let other = if std::ptr::eq(dictionary, &first) { &second } else { &first };
-            assert!(decompress(other, &stored, value.len() as u64).is_err(), "step {step}: the wrong dictionary");
+            assert!(
+                decompress(other, &stored, value.len() as u64).is_err(),
+                "step {step}: the wrong dictionary"
+            );
         }
     }
 
@@ -458,17 +486,25 @@ mod tests {
     fn every_threads_contexts_make_the_same_bytes() {
         let (first, second) = two_dictionaries();
         let values: Vec<Vec<u8>> = (0..40).map(|n| sample(n * 101).repeat(1 + n % 4)).collect();
-        let want: Vec<Vec<u8>> =
-            values.iter().enumerate().map(|(n, value)| compress_fresh([&first, &second][n % 2], value)).collect();
+        let want: Vec<Vec<u8>> = values
+            .iter()
+            .enumerate()
+            .map(|(n, value)| compress_fresh([&first, &second][n % 2], value))
+            .collect();
         std::thread::scope(|scope| {
             for t in 0..4 {
                 let (first, second, values, want) = (&first, &second, &values, &want);
                 scope.spawn(move || {
-                    for (n, value) in values.iter().enumerate().cycle().skip(t * 7).take(values.len() * 2) {
+                    for (n, value) in
+                        values.iter().enumerate().cycle().skip(t * 7).take(values.len() * 2)
+                    {
                         let dictionary = [first, second][n % 2];
                         let stored = compress(dictionary, value).unwrap();
                         assert_eq!(stored, want[n], "thread {t}, value {n}");
-                        assert_eq!(&decompress(dictionary, &stored, value.len() as u64).unwrap(), value);
+                        assert_eq!(
+                            &decompress(dictionary, &stored, value.len() as u64).unwrap(),
+                            value
+                        );
                     }
                 });
             }
@@ -493,7 +529,9 @@ mod tests {
         let mut rng = blaze_ids::rng::SplitMix64::new(7);
         let noise: Vec<u8> = (0..64 << 10).map(|_| rng.next_u64() as u8).collect();
         let mut out = vec![0xAA; 3];
-        for value in [sample(1).repeat(64), noise, sample(2).repeat(3), Vec::new(), sample(3).repeat(500)] {
+        for value in
+            [sample(1).repeat(64), noise, sample(2).repeat(3), Vec::new(), sample(3).repeat(500)]
+        {
             let kept = lz4_into(&value, &mut out);
             assert_eq!(lz4(&value), kept.then(|| out.clone()), "{} bytes", value.len());
         }
@@ -562,7 +600,11 @@ mod tests {
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
         assert_eq!(train(&refs).unwrap(), OLD_DICTIONARY, "the trained dictionary");
         let dictionary = Prepared::new(OLD_DICTIONARY.to_vec()).unwrap();
-        assert_eq!(compress(&dictionary, &fixture_sample(12_345)).unwrap(), OLD_FRAME, "a dictionary frame");
+        assert_eq!(
+            compress(&dictionary, &fixture_sample(12_345)).unwrap(),
+            OLD_FRAME,
+            "a dictionary frame"
+        );
         let long = fixture_long();
         assert_eq!(compress_long(&long).unwrap(), OLD_LONG_FRAME, "a long frame on 4 workers");
         // The fixture stands for the threaded path only while zstd cuts it into jobs: on one

@@ -66,9 +66,9 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
+use std::alloc::Global;
 
 use self::ops::{Cold, Hot, Id, Kind};
 use crate::{
@@ -398,7 +398,9 @@ impl Statx {
         if self.mask & STATX_STAMP != STATX_STAMP {
             return Stamp::UNKNOWN;
         }
-        let ns = |t: &StatxTime| (t.sec as u64).wrapping_mul(1_000_000_000).wrapping_add(u64::from(t.nsec));
+        let ns = |t: &StatxTime| {
+            (t.sec as u64).wrapping_mul(1_000_000_000).wrapping_add(u64::from(t.nsec))
+        };
         Stamp {
             ino: self.ino,
             size: self.size,
@@ -420,7 +422,14 @@ fn stamp_of_error(res: i32) -> Stamp {
 
 /// `io_uring_register(2)` of `opcode` with `arg`, or an error naming what was asked and the
 /// kernel that has it, where this one refuses it as unknown.
-fn register<T>(ring: RawFd, opcode: libc::c_uint, arg: *const T, nr: libc::c_uint, what: &str, since: &str) -> io::Result<i64> {
+fn register<T>(
+    ring: RawFd,
+    opcode: libc::c_uint,
+    arg: *const T,
+    nr: libc::c_uint,
+    what: &str,
+    since: &str,
+) -> io::Result<i64> {
     // SAFETY: `arg` points at what `opcode` reads (and the memory it names), alive for the call.
     let got = unsafe { libc::syscall(libc::SYS_io_uring_register, ring, opcode, arg, nr) };
     if got >= 0 {
@@ -431,7 +440,10 @@ fn register<T>(ring: RawFd, opcode: libc::c_uint, arg: *const T, nr: libc::c_uin
         Some(libc::EINVAL | libc::EOPNOTSUPP) => io::Error::new(
             io::ErrorKind::Unsupported,
             // alloc: the error of a setup that failed.
-            format!("io_uring {what}: {error}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
+            format!(
+                "io_uring {what}: {error}: Linux {since} or later has it, and this is Linux {}",
+                crate::cgroup::kernel()
+            ),
         ),
         // alloc: the error of a setup that failed.
         _ => io::Error::new(error.kind(), format!("io_uring {what}: {error}")),
@@ -482,28 +494,65 @@ impl Table {
         let size = u32::try_from(limit.rlim_cur).unwrap_or(u32::MAX).min(TABLE) & !1;
         if size < 2 {
             // alloc: the error of a setup that failed.
-            return Err(io::Error::other(format!("RLIMIT_NOFILE is {}: no table of files fits", limit.rlim_cur)));
+            return Err(io::Error::other(format!(
+                "RLIMIT_NOFILE is {}: no table of files fits",
+                limit.rlim_cur
+            )));
         }
         let fd = ring.as_raw_fd();
-        let sparse = RsrcRegister { nr: size, flags: RSRC_REGISTER_SPARSE, resv2: 0, data: 0, tags: 0 };
+        let sparse =
+            RsrcRegister { nr: size, flags: RSRC_REGISTER_SPARSE, resv2: 0, data: 0, tags: 0 };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
-        register(fd, REGISTER_FILES2, &raw const sparse, nr, "a sparse table of registered files", "5.19")?;
+        register(
+            fd,
+            REGISTER_FILES2,
+            &raw const sparse,
+            nr,
+            "a sparse table of registered files",
+            "5.19",
+        )?;
         let ours = size / 2;
         let range = FileIndexRange { off: ours, len: size - ours, resv: 0 };
-        register(fd, REGISTER_FILE_ALLOC_RANGE, &raw const range, 0, "a range of the file table for direct accepts", "6.0")?;
+        register(
+            fd,
+            REGISTER_FILE_ALLOC_RANGE,
+            &raw const range,
+            0,
+            "a range of the file table for direct accepts",
+            "6.0",
+        )?;
         // alloc: setup, once per driver: room for every slot, so a drop never grows it.
         let closing = RefCell::new(Vec::with_capacity(size as usize));
         // alloc: clone: setup, once per driver; `ring` is a reference count.
-        Ok(Rc::new(Table { ring: ring.clone(), free: RefCell::new((0..ours).rev().collect()), closing, ours }))
+        Ok(Rc::new(Table {
+            ring: ring.clone(),
+            free: RefCell::new((0..ours).rev().collect()),
+            closing,
+            ours,
+        }))
     }
 
     /// Slot `slot` made `fd`'s file, or emptied with -1.
     fn set(&self, slot: u32, fd: RawFd) -> io::Result<()> {
         let fds = [fd];
-        let update = RsrcUpdate2 { offset: slot, resv: 0, data: fds.as_ptr() as u64, tags: 0, nr: 1, resv2: 0 };
+        let update = RsrcUpdate2 {
+            offset: slot,
+            resv: 0,
+            data: fds.as_ptr() as u64,
+            tags: 0,
+            nr: 1,
+            resv2: 0,
+        };
         let nr = size_of::<RsrcUpdate2>() as libc::c_uint;
-        register(self.ring.as_raw_fd(), REGISTER_FILES_UPDATE2, &raw const update, nr, "updating the file table", "5.13")
-            .map(|_| ())
+        register(
+            self.ring.as_raw_fd(),
+            REGISTER_FILES_UPDATE2,
+            &raw const update,
+            nr,
+            "updating the file table",
+            "5.13",
+        )
+        .map(|_| ())
     }
 
     /// `fd` put in a slot of the driver's half, if one is free.
@@ -584,9 +633,18 @@ impl Registered {
     fn new(ring: RawFd) -> io::Result<Registered> {
         let map = anonymous(DIRECT_BUFFERS as usize * DIRECT_PIECE)?;
         let iovecs: Vec<libc::iovec> = (0..DIRECT_BUFFERS as usize)
-            .map(|n| libc::iovec { iov_base: map.at.wrapping_add(n * DIRECT_PIECE).cast(), iov_len: DIRECT_PIECE })
+            .map(|n| libc::iovec {
+                iov_base: map.at.wrapping_add(n * DIRECT_PIECE).cast(),
+                iov_len: DIRECT_PIECE,
+            })
             .collect(); // alloc: setup, once per driver.
-        let buffers = RsrcRegister { nr: DIRECT_BUFFERS.into(), flags: 0, resv2: 0, data: iovecs.as_ptr() as u64, tags: 0 };
+        let buffers = RsrcRegister {
+            nr: DIRECT_BUFFERS.into(),
+            flags: 0,
+            resv2: 0,
+            data: iovecs.as_ptr() as u64,
+            tags: 0,
+        };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
         register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
             match error.raw_os_error() {
@@ -648,7 +706,10 @@ impl Provided {
     /// it is checked against the group in every build (one compare per 16 KiB received): a
     /// larger id would hand out memory past `buffers`.
     fn buffer(&self, bid: u16) -> *mut u8 {
-        assert!(bid < RECV_BUFFERS, "the kernel named provided buffer {bid} of a group of {RECV_BUFFERS}");
+        assert!(
+            bid < RECV_BUFFERS,
+            "the kernel named provided buffer {bid} of a group of {RECV_BUFFERS}"
+        );
         self.buffers.at.wrapping_add(bid as usize * RECV_BUFFER)
     }
 
@@ -667,7 +728,8 @@ impl Provided {
     /// past the tail the kernel was shown, which it does not read until then.
     fn give(&mut self, bid: u16) {
         let mask = RECV_BUFFERS - 1;
-        let entry: *mut ProvidedBuf = self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
+        let entry: *mut ProvidedBuf =
+            self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
         let addr = self.buffer(bid) as u64;
         // SAFETY: `entry` is slot `tail & mask` of the ring `new` mapped for `RECV_BUFFERS`
         // entries; the kernel does not read it until `publish` stores a tail past it (at most
@@ -720,7 +782,14 @@ fn direct_alignment(fd: RawFd) -> io::Result<(u64, u32)> {
     // SAFETY: an open descriptor, an empty path with `AT_EMPTY_PATH`, and a buffer of the
     // size of `struct statx` to write.
     let got = unsafe {
-        libc::syscall(libc::SYS_statx, fd, c"".as_ptr(), libc::AT_EMPTY_PATH, STATX_DIOALIGN, statx.0.as_mut_ptr())
+        libc::syscall(
+            libc::SYS_statx,
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            STATX_DIOALIGN,
+            statx.0.as_mut_ptr(),
+        )
     };
     if got != 0 {
         return Err(io::Error::last_os_error());
@@ -854,7 +923,10 @@ impl Ring {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 // alloc: the error of a setup that failed.
-                format!("io_uring without {name}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
+                format!(
+                    "io_uring without {name}: Linux {since} or later has it, and this is Linux {}",
+                    crate::cgroup::kernel()
+                ),
             ));
         }
         let sq_len = params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
@@ -995,6 +1067,13 @@ impl Ring {
             }
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
+                // A signal ended a timed wait early: back to the caller, whose deadline says
+                // how much of it is left. Entering again with the same relative timeout would
+                // never end under a signal that comes sooner than it: the profile's sampler
+                // signals this thread every 20 ms, so a 50 ms wait never timed out and the
+                // daemon's first turn never ended (0.20261105.0 on Linux, `blaze serve` stuck
+                // before it listened).
+                Some(libc::EINTR) if wait.is_some() => return Ok(()),
                 Some(libc::EINTR) => continue,
                 // The wait ended with nothing done.
                 Some(libc::ETIME) => return Ok(()),
@@ -1351,10 +1430,15 @@ impl Job {
         while let Some(chunk) = self.claims.claim() {
             let from = (chunk * STAMP_CHUNK).min(self.names.len());
             let to = (from + STAMP_CHUNK).min(self.names.len());
-            let dir = self.dir.get_or_init(|| open_dir(&self.root).map_err(|it| it.raw_os_error().unwrap_or(libc::EIO)));
+            let dir = self.dir.get_or_init(|| {
+                open_dir(&self.root).map_err(|it| it.raw_os_error().unwrap_or(libc::EIO))
+            });
             if let Ok(dir) = dir {
                 stamp_names(dir.as_raw_fd(), &self.names, from..to, parent, |at, stamp| {
-                    assert!((from..to).contains(&at), "stamp {at} outside the chunk {from}..{to} claimed");
+                    assert!(
+                        (from..to).contains(&at),
+                        "stamp {at} outside the chunk {from}..{to} claimed"
+                    );
                     let slot = self.base.wrapping_add(at);
                     // SAFETY: `at` is in `from..to` (checked above), below `names.len()`, the
                     // length of `out`'s buffer, and in the chunk this thread alone claimed, so
@@ -1430,8 +1514,10 @@ impl List {
 impl Stampers {
     fn new() -> io::Result<Stampers> {
         let count = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let (senders, receivers): (Vec<crossbeam_channel::Sender<ToStamp>>, Vec<crossbeam_channel::Receiver<ToStamp>>) =
-            (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
+        let (senders, receivers): (
+            Vec<crossbeam_channel::Sender<ToStamp>>,
+            Vec<crossbeam_channel::Receiver<ToStamp>>,
+        ) = (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
         let stampers = Stampers { inboxes: senders.into(), next: std::cell::Cell::new(0) };
         for (me, inbox) in receivers.into_iter().enumerate() {
             let inboxes = Arc::clone(&stampers.inboxes);
@@ -1461,7 +1547,11 @@ impl Drop for Stampers {
     }
 }
 
-fn stamper(me: usize, inbox: &crossbeam_channel::Receiver<ToStamp>, inboxes: &[crossbeam_channel::Sender<ToStamp>]) {
+fn stamper(
+    me: usize,
+    inbox: &crossbeam_channel::Receiver<ToStamp>,
+    inboxes: &[crossbeam_channel::Sender<ToStamp>],
+) {
     // alloc: one buffer per stamper, reused for every directory of every job.
     let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
     while let Ok(work) = inbox.recv() {
@@ -1538,7 +1628,9 @@ fn open_path(dir: RawFd, name: &[u8]) -> Result<OwnedFd, i32> {
     debug_assert_eq!(name.last(), Some(&0));
     // SAFETY: an open directory and a NUL-terminated name; the result is a descriptor of its
     // own or -1.
-    let fd = unsafe { libc::openat(dir, name.as_ptr().cast(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::openat(dir, name.as_ptr().cast(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+    };
     if fd < 0 {
         return Err(errno());
     }
@@ -1646,6 +1738,8 @@ pub struct Uring {
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
 }
 
@@ -1705,6 +1799,7 @@ impl Uring {
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
             stampers: None,
             offload: Offload::new()?,
+            locks: crate::locks::Locks::new(),
             in_flight: 0,
         })
     }
@@ -1776,7 +1871,9 @@ impl Uring {
             return Done::Synced;
         }
         // clone: an error path, the name it is about.
-        let Some(name) = self.names.iter().find(|(_, it)| **it == file).map(|(name, _)| name.clone()) else {
+        let Some(name) =
+            self.names.iter().find(|(_, it)| **it == file).map(|(name, _)| name.clone())
+        else {
             return Done::Synced;
         };
         let path = under(&self.root, &name, |path| path.display().to_string());
@@ -2029,7 +2126,11 @@ fn unflushed(ready: &mut Vec<Completion>, flushes: &mut Vec<Tag>) {
 
 /// Forgets the descriptor kept for `name`: the name now is another file. It is closed once no
 /// request in flight holds it.
-fn forget(names: &mut HashMap<FileName, Handle<Kept>, Global>, kept: &mut Slab<Kept>, name: &FileName) {
+fn forget(
+    names: &mut HashMap<FileName, Handle<Kept>, Global>,
+    kept: &mut Slab<Kept>,
+    name: &FileName,
+) {
     let Some(file) = names.remove(name) else { return };
     let it = kept.get_mut(file).expect("named files are kept");
     it.named = false;
@@ -2178,30 +2279,49 @@ impl Driver for Uring {
             self.in_flight += 1;
             let started = match effect {
                 Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
-                Effect::Clone { from, to, .. } => self.copy(tag, Kind::Clone, &from, &to).map(|()| None),
-                Effect::Link { from, to, .. } => self.copy(tag, Kind::Link, &from, &to).map(|()| None),
+                Effect::Clone { from, to, .. } => {
+                    self.copy(tag, Kind::Clone, &from, &to).map(|()| None)
+                }
+                Effect::Link { from, to, .. } => {
+                    self.copy(tag, Kind::Link, &from, &to).map(|()| None)
+                }
                 Effect::Stat { file, .. } => self.look(tag, Kind::Stat, true, &file).map(|()| None),
-                Effect::Lstat { file, .. } => self.look(tag, Kind::Stat, false, &file).map(|()| None),
+                Effect::Lstat { file, .. } => {
+                    self.look(tag, Kind::Stat, false, &file).map(|()| None)
+                }
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
-                Effect::WriteAt { file, at, bytes, .. } => self.write_at(tag, &file, at, bytes).map(|()| None),
+                Effect::WriteAt { file, at, bytes, .. } => {
+                    self.write_at(tag, &file, at, bytes).map(|()| None)
+                }
                 Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
                 Effect::Mode { file, mode, .. } => {
-                    under(&self.root, &file, |path| crate::fs::set_mode(path, mode)).map(|()| Some(Done::Moded))
+                    under(&self.root, &file, |path| crate::fs::set_mode(path, mode))
+                        .map(|()| Some(Done::Moded))
                 }
                 // An open, an `fstat` and an `fchmod`, here as a mode is set.
                 Effect::Seal { file, mode, .. } => {
-                    under(&self.root, &file, |path| crate::fs::seal(path, mode)).map(|()| Some(Done::Moded))
+                    under(&self.root, &file, |path| crate::fs::seal(path, mode))
+                        .map(|()| Some(Done::Moded))
                 }
                 // No io_uring op sets a file's times: one `utimensat` here on the driver's
                 // thread, as a mode is set, its path in the thread's scratch buffers. A thread
                 // of its own (`off_ring`) would cost a spawn per file for a call of microseconds.
                 Effect::Times { file, modified_ns, .. } => {
-                    under(&self.root, &file, |path| crate::fs::set_times(path, modified_ns)).map(|()| Some(Done::Timed))
+                    under(&self.root, &file, |path| crate::fs::set_times(path, modified_ns))
+                        .map(|()| Some(Done::Timed))
                 }
                 // No io_uring op reads a link: one `readlink` here, as a file's times are set.
-                Effect::ReadLink { file, .. } => crate::threads::read_link(&self.root, &file).map(Some),
+                Effect::ReadLink { file, .. } => {
+                    crate::threads::read_link(&self.root, &file).map(Some)
+                }
                 Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
+                // No io_uring op takes a lock, and `flock` without waiting is one call: here on
+                // the driver's thread, as a mode is set.
+                Effect::Lock { file, mode, .. } => {
+                    self.locks.lock(&self.root, &file, mode, tag).map(Some)
+                }
+                Effect::Unlock { lock, .. } => self.locks.unlock(lock).map(Some),
                 Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
                 // cursor is lost, and the watch is live from its start.
@@ -2250,7 +2370,11 @@ impl Driver for Uring {
                 }),
                 Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
                     let file = self.hold(file);
-                    self.start(Hot::new(tag, Kind::Sync, file.to_bits()), ops::NO_BYTES, Cold::EMPTY);
+                    self.start(
+                        Hot::new(tag, Kind::Sync, file.to_bits()),
+                        ops::NO_BYTES,
+                        Cold::EMPTY,
+                    );
                     None
                 }),
                 // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
@@ -2261,30 +2385,43 @@ impl Driver for Uring {
                 // under the name is let go, so the next request on it opens what the name is now.
                 Effect::Truncate { file, len, .. } => {
                     self.forget(&file);
-                    under(&self.root, &file, |path| crate::fs::truncate(path, len)).map(|()| Some(Done::Truncated))
+                    under(&self.root, &file, |path| crate::fs::truncate(path, len))
+                        .map(|()| Some(Done::Truncated))
                 }
                 Effect::Timer { after, .. } => {
-                    let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                    let due =
+                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
                     self.timers.insert(due, tag);
                     Ok(None)
                 }
                 Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
-                Effect::Listen { at: address, .. } => {
-                    crate::net::listen(&self.root, &address).and_then(|listener| {
+                Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
+                    .and_then(|listener| {
                         no_delay(&listener)?;
                         let listener = self.listeners.insert(listener);
-                        let id = self.start(Hot::new(tag, Kind::Accept, listener.to_bits()), ops::NO_BYTES, Cold::EMPTY);
+                        let id = self.start(
+                            Hot::new(tag, Kind::Accept, listener.to_bits()),
+                            ops::NO_BYTES,
+                            Cold::EMPTY,
+                        );
                         self.listens.insert(tag, id);
                         Ok(None)
-                    })
-                }
+                    }),
                 Effect::Connect { at: address, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
                         let socket = connect_socket(&self.table, address.domain)?;
                         let tcp = address.domain != libc::AF_UNIX;
-                        let connecting = self.connectings.insert(Connecting { socket: Some(socket), at: address, tcp });
-                        self.start(Hot::new(tag, Kind::Connect, connecting.to_bits()), ops::NO_BYTES, Cold::EMPTY);
+                        let connecting = self.connectings.insert(Connecting {
+                            socket: Some(socket),
+                            at: address,
+                            tcp,
+                        });
+                        self.start(
+                            Hot::new(tag, Kind::Connect, connecting.to_bits()),
+                            ops::NO_BYTES,
+                            Cold::EMPTY,
+                        );
                         Ok(None)
                     }),
                 Effect::Recv { conn, most, into, .. } => {
@@ -2332,9 +2469,13 @@ impl Driver for Uring {
             while out.len() == before {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let now = wheel::ticks(self.start.elapsed());
-                let until_timer =
-                    self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
-                if let Err(error) = self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left)))) {
+                let until_timer = self
+                    .timers
+                    .next_deadline()
+                    .map(|due| Duration::from_nanos(due.saturating_sub(now)));
+                if let Err(error) =
+                    self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left))))
+                {
                     self.fail_unsubmitted(&error);
                     out.append(&mut self.ready);
                     break;
@@ -2350,7 +2491,12 @@ impl Driver for Uring {
         // A watch or a journal goes on after a change, and a listen after an accept.
         let ended = out[before..]
             .iter()
-            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }))
+            .filter(|it| {
+                !matches!(
+                    it.done,
+                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                )
+            })
             .count();
         self.in_flight -= ended;
         out.len() - before
@@ -2467,11 +2613,17 @@ mod tests {
                 if round == 1 {
                     std::fs::remove_dir_all(root.join("build")).unwrap();
                 }
-                let mut effects = vec![Effect::Truncate { file: file.clone(), len: 0, tag: Tag(10 * round + 1) }];
+                let mut effects =
+                    vec![Effect::Truncate { file: file.clone(), len: 0, tag: Tag(10 * round + 1) }];
                 run_until_idle(driver, &mut effects, |done, effects| {
                     if done.tag.0 % 10 == 1 {
                         let bytes = format!("round {round}").into_bytes();
-                        effects.push(Effect::WriteAt { file: file.clone(), at: 0, bytes, tag: Tag(done.tag.0 + 1) });
+                        effects.push(Effect::WriteAt {
+                            file: file.clone(),
+                            at: 0,
+                            bytes,
+                            tag: Tag(done.tag.0 + 1),
+                        });
                     }
                     seen.push(done.done);
                 });
@@ -2499,13 +2651,18 @@ mod tests {
         let file = FileName::new("state/journal").unwrap();
         let mut driver = Uring::new(&root).unwrap();
         let mut seen = BTreeMap::new();
-        let mut effects = vec![Effect::Append { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+        let mut effects =
+            vec![Effect::Append { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
         run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
         std::fs::remove_dir_all(root.join("state")).unwrap();
         let mut effects = vec![Effect::Sync { file: file.clone(), tag: Tag(2) }];
         run_until_idle(&mut driver, &mut effects, |done, effects| {
             if done.tag == Tag(2) {
-                effects.push(Effect::Append { file: file.clone(), bytes: b"two".to_vec(), tag: Tag(3) });
+                effects.push(Effect::Append {
+                    file: file.clone(),
+                    bytes: b"two".to_vec(),
+                    tag: Tag(3),
+                });
             }
             _ = seen.insert(done.tag.0, done.done);
         });
@@ -2615,9 +2772,18 @@ mod tests {
     /// Processes with input, output, an exit code and a signal; one killed; one in a sandbox
     /// no driver was given the means to make; one whose program is not there.
     fn processes(driver: &mut impl Driver) -> BTreeMap<u64, Done> {
-        let unconfined = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
+        let unconfined = Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        };
         let mut effects = vec![
-            Effect::Spawn { command: sh("tr a-z A-Z; echo oops >&2; exit 3", b"hello\n"), tag: Tag(1) },
+            Effect::Spawn {
+                command: sh("tr a-z A-Z; echo oops >&2; exit 3", b"hello\n"),
+                tag: Tag(1),
+            },
             Effect::Spawn { command: sh("kill -TERM $$", b""), tag: Tag(2) },
             Effect::Spawn { command: sh("exec sleep 60", b""), tag: Tag(3) },
             Effect::Spawn {
@@ -2625,7 +2791,10 @@ mod tests {
                 tag: Tag(4),
             },
             Effect::Spawn {
-                command: Box::new(Command { sandbox: unconfined, ..command("/bin/true", &[], b"") }),
+                command: Box::new(Command {
+                    sandbox: unconfined,
+                    ..command("/bin/true", &[], b"")
+                }),
                 tag: Tag(5),
             },
             Effect::Spawn {
@@ -2663,7 +2832,11 @@ mod tests {
         assert_eq!(four.code, Some(0));
         assert!(four.stdout.starts_with(b"300000\n"), "{:?}", four.stdout.get(..10));
         assert_eq!(four.stdout.len(), 7 + 200_000);
-        assert!(matches!(&ring[&5], Done::Failed(why) if why.0.contains("no Confine")), "{:?}", ring[&5]);
+        assert!(
+            matches!(&ring[&5], Done::Failed(why) if why.0.contains("no Confine")),
+            "{:?}",
+            ring[&5]
+        );
         assert!(
             matches!(&ring[&6], Done::Failed(why) if why.0.contains("/nonexistent/blaze-test")),
             "{:?}",
@@ -2711,8 +2884,13 @@ mod tests {
     fn a_confined_spawn_is_traced() {
         let root = dir("uring-confined");
         let mut driver = Uring::new(&root).unwrap().confined(Arc::new(Fake));
-        let sandbox =
-            Sandbox::On { read: vec!["/usr".into()], write: Vec::new(), network: false, trace: true, services: Vec::new() };
+        let sandbox = Sandbox::On {
+            read: vec!["/usr".into()],
+            write: Vec::new(),
+            network: false,
+            trace: true,
+            services: Vec::new(),
+        };
         let mut effects = vec![Effect::Spawn {
             command: Box::new(Command { sandbox, ..command("/usr/bin/env", &["a", "b"], b"") }),
             tag: Tag(1),
@@ -2757,17 +2935,41 @@ mod tests {
             if !pinged {
                 pinged = true;
                 effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(4) });
-                effects.push(Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(5) });
+                effects.push(Effect::Recv {
+                    conn: server,
+                    most: 64,
+                    into: Vec::new(),
+                    tag: Tag(5),
+                });
             }
             match tag {
                 5 => {
-                    effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(6) });
-                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(7) });
+                    effects.push(Effect::Send {
+                        conn: server,
+                        bytes: b"pong".to_vec(),
+                        tag: Tag(6),
+                    });
+                    effects.push(Effect::Recv {
+                        conn: client,
+                        most: 64,
+                        into: Vec::new(),
+                        tag: Tag(7),
+                    });
                 }
                 7 => effects.push(Effect::Hangup { conn: client, tag: Tag(8) }),
                 8 => {
-                    effects.push(Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(9) });
-                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(10) });
+                    effects.push(Effect::Recv {
+                        conn: server,
+                        most: 64,
+                        into: Vec::new(),
+                        tag: Tag(9),
+                    });
+                    effects.push(Effect::Recv {
+                        conn: client,
+                        most: 64,
+                        into: Vec::new(),
+                        tag: Tag(10),
+                    });
                 }
                 9 => {
                     effects.push(Effect::Hangup { conn: server, tag: Tag(11) });
@@ -2844,7 +3046,9 @@ mod tests {
             Effect::Map { file: name("store/missing"), tag: Tag(3) },
         ];
         let mut seen = BTreeMap::new();
-        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, shown(&done.done)));
+        run_until_idle(driver, &mut effects, |done, _| {
+            _ = seen.insert(done.tag.0, shown(&done.done))
+        });
         seen
     }
 
@@ -2931,7 +3135,12 @@ mod tests {
             });
         }
         let client = client.expect("connected");
-        ring.submit(&mut vec![Effect::Recv { conn: client, most: 16, into: Vec::new(), tag: Tag(5) }]);
+        ring.submit(&mut vec![Effect::Recv {
+            conn: client,
+            most: 16,
+            into: Vec::new(),
+            tag: Tag(5),
+        }]);
         let pid = ring.spawns.get(ring.spawning[&Tag(1)]).expect("in flight").pid;
         let began = Instant::now();
         drop(ring);
@@ -2956,7 +3165,9 @@ mod tests {
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
         assert_eq!(seen, [Done::Appended, Done::Appended]);
-        let slot = |driver: &Uring, it: &str| driver.kept.get(driver.names[&name(it)]).expect("kept").fixed.slot;
+        let slot = |driver: &Uring, it: &str| {
+            driver.kept.get(driver.names[&name(it)]).expect("kept").fixed.slot
+        };
         let (a, b) = (slot(&driver, "a").expect("a slot"), slot(&driver, "b").expect("a slot"));
         assert!(a != b && a < driver.table.ours && b < driver.table.ours, "{a} {b}");
         let free = driver.table.free.borrow().len();
@@ -2991,7 +3202,8 @@ mod tests {
                 || driver.ring.flags() & SQ_NEED_WAKEUP != 0,
             );
             let began = Instant::now();
-            let mut effects = vec![Effect::Append { file: file.clone(), bytes: vec![n], tag: Tag(n.into()) }];
+            let mut effects =
+                vec![Effect::Append { file: file.clone(), bytes: vec![n], tag: Tag(n.into()) }];
             let mut seen = Vec::new();
             run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
             assert_eq!(seen, [Done::Appended]);
@@ -3013,14 +3225,25 @@ mod tests {
         let pack = FileName::new("store/pack").unwrap();
         let piece = 3 * DIRECT_PIECE / 2;
         let count = 2 * DIRECT_BUFFERS as usize;
-        let bytes = |n: usize| -> Vec<u8> { (0..piece).map(|at| (at * 31 + n * 7) as u8).collect() };
+        let bytes =
+            |n: usize| -> Vec<u8> { (0..piece).map(|at| (at * 31 + n * 7) as u8).collect() };
         std::fs::create_dir_all(root.join("store")).unwrap();
         std::fs::write(root.join("store/pack"), b"").unwrap();
         let mut effects: Vec<Effect> = (0..count)
-            .map(|n| Effect::WriteAt { file: pack.clone(), at: (n * piece) as u64, bytes: bytes(n), tag: Tag(n as u64) })
+            .map(|n| Effect::WriteAt {
+                file: pack.clone(),
+                at: (n * piece) as u64,
+                bytes: bytes(n),
+                tag: Tag(n as u64),
+            })
             .collect();
         let odd = (count * piece) as u64 + 7;
-        effects.push(Effect::WriteAt { file: pack.clone(), at: odd, bytes: vec![9; DIRECT_PIECE + 1], tag: Tag(99) });
+        effects.push(Effect::WriteAt {
+            file: pack.clone(),
+            at: odd,
+            bytes: vec![9; DIRECT_PIECE + 1],
+            tag: Tag(99),
+        });
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
         assert_eq!(seen, vec![Done::Written; count + 1]);
@@ -3031,10 +3254,14 @@ mod tests {
         assert!(file[odd as usize..].iter().all(|&it| it == 9));
         let fd = std::fs::File::open(root.join("store/pack")).unwrap();
         let (_, align) = direct_alignment(fd.as_raw_fd()).unwrap();
-        let aligned = align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
+        let aligned =
+            align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
         let direct = if aligned { count as u64 } else { 0 };
         assert_eq!(driver.direct_writes(), direct, "alignment {align}");
-        assert_eq!((driver.lent.free(), driver.lent.waiters().count()), (DIRECT_BUFFERS as usize, 0));
+        assert_eq!(
+            (driver.lent.free(), driver.lent.waiters().count()),
+            (DIRECT_BUFFERS as usize, 0)
+        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3073,7 +3300,12 @@ mod tests {
             }
             let (Some(server), Some(client)) = (server, client) else { return };
             if matches!(done.done, Done::Accepted { .. } | Done::Connected { .. }) {
-                effects.push(Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: next() });
+                effects.push(Effect::Recv {
+                    conn: server,
+                    most: 64 << 10,
+                    into: Vec::new(),
+                    tag: next(),
+                });
                 effects.push(Effect::Send { conn: client, bytes: message(0), tag: next() });
                 return;
             }
@@ -3082,7 +3314,12 @@ mod tests {
             }
             if matches!(done.done, Done::Read(_)) {
                 if got.len() < messages * 4096 {
-                    effects.push(Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: next() });
+                    effects.push(Effect::Recv {
+                        conn: server,
+                        most: 64 << 10,
+                        into: Vec::new(),
+                        tag: next(),
+                    });
                 } else {
                     effects.push(Effect::Hangup { conn: client, tag: next() });
                     effects.push(Effect::Hangup { conn: server, tag: next() });
@@ -3116,10 +3353,16 @@ mod tests {
             Effect::Write { file: name("out/fresh"), bytes: Vec::new(), tag: Tag(3) },
         ];
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, shown(&done.done)));
+        run_until_idle(&mut driver, &mut effects, |done, _| {
+            _ = seen.insert(done.tag.0, shown(&done.done))
+        });
         assert_eq!(
             seen,
-            BTreeMap::from([(1, "failed".to_owned()), (2, "Written".to_owned()), (3, "Written".to_owned())])
+            BTreeMap::from([
+                (1, "failed".to_owned()),
+                (2, "Written".to_owned()),
+                (3, "Written".to_owned())
+            ])
         );
         assert_eq!(std::fs::read(root.join("out/blocked/kept")).unwrap(), b"old");
         assert_eq!(std::fs::read(root.join("out/file")).unwrap(), vec![5; 3 << 20]);
@@ -3135,7 +3378,9 @@ mod tests {
             Effect::Rename { from: name("out/missing"), to: name("out/other"), tag: Tag(5) },
         ];
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, shown(&done.done)));
+        run_until_idle(&mut driver, &mut effects, |done, _| {
+            _ = seen.insert(done.tag.0, shown(&done.done))
+        });
         assert_eq!(seen, BTreeMap::from([(4, "Renamed".to_owned()), (5, "failed".to_owned())]));
         assert_eq!(std::fs::read(root.join("moved/file")).unwrap().len(), 3 << 20);
         assert!(!root.join("out/file").exists());
@@ -3167,7 +3412,17 @@ mod tests {
         std::fs::create_dir_all(root.join("src/sealed")).unwrap();
         std::fs::write(root.join("src/sealed/inside.rs"), b"in").unwrap();
         crate::fs::set_mode(&root.join("src/sealed"), 0o111).unwrap();
-        let others = ["src", "src/d0", "src/link", "src/dangling", "src/via", "src/via/f0.rs", "top.rs", "src/sealed", "src/sealed/inside.rs"];
+        let others = [
+            "src",
+            "src/d0",
+            "src/link",
+            "src/dangling",
+            "src/via",
+            "src/via/f0.rs",
+            "top.rs",
+            "src/sealed",
+            "src/sealed/inside.rs",
+        ];
         for name in GONE.iter().chain(&others) {
             assert!(names.push_str(name));
         }
@@ -3183,8 +3438,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    const GONE: [&str; 5] =
-        ["src/missing", "src/d0/f0.rs/under-a-file", "gone/deep/name", "src/dangling/name", "src/via/missing"];
+    const GONE: [&str; 5] = [
+        "src/missing",
+        "src/d0/f0.rs/under-a-file",
+        "gone/deep/name",
+        "src/dangling/name",
+        "src/via/missing",
+    ];
 
     /// The stampers' sweep, over many chunks and directories, gives name by name the stamps of
     /// the reference sweep's `fstatat`s of whole names: files, directories, links not followed
@@ -3200,7 +3460,9 @@ mod tests {
         let mut effects = vec![Effect::Stamp { files: names.clone(), tag: Tag(1) }];
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done));
-        let [Completion { tag: Tag(1), done: Done::Stamped(stamps) }] = &seen[..] else { panic!("{seen:?}") };
+        let [Completion { tag: Tag(1), done: Done::Stamped(stamps) }] = &seen[..] else {
+            panic!("{seen:?}")
+        };
         assert_eq!(stamps.len(), names.len());
         for (at, (ours, theirs)) in stamps.iter().zip(&reference).enumerate() {
             assert_eq!(ours, theirs, "{}", names.get(at));
@@ -3209,10 +3471,15 @@ mod tests {
         assert_eq!(stamps.iter().filter(|it| it.is_file()).count(), 10_000 + OTHER_FILES);
         assert!(stamps.iter().all(|it| !it.is_unknown()));
         assert!(of("src").is_dir() && of("src/d0").is_dir() && of("src/sealed").is_dir());
-        assert!(of("src/link").is_link() && of("src/dangling").is_link() && of("src/via").is_link());
+        assert!(
+            of("src/link").is_link() && of("src/dangling").is_link() && of("src/via").is_link()
+        );
         assert_eq!(of("src/via/f0.rs"), of("src/d0/f0.rs"));
         assert!(of("src/d0/f1.rs").executable() && !of("src/d0/f0.rs").executable());
-        assert_eq!((of("src/d0/f3.rs").size, of("top.rs").size, of("src/sealed/inside.rs").size), (8, 3, 2));
+        assert_eq!(
+            (of("src/d0/f3.rs").size, of("top.rs").size, of("src/sealed/inside.rs").size),
+            (8, 3, 2)
+        );
         for gone in GONE {
             assert_eq!(of(gone), Stamp::GONE, "{gone}");
         }
@@ -3233,7 +3500,9 @@ mod tests {
         let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
         let mut stamps = vec![Stamp::UNKNOWN; names.len()];
         blaze_alloc_count::assert_at_most(0, "stamp_names", || {
-            stamp_names(fd.as_raw_fd(), &names, 0..names.len(), &mut parent, |at, stamp| stamps[at] = stamp);
+            stamp_names(fd.as_raw_fd(), &names, 0..names.len(), &mut parent, |at, stamp| {
+                stamps[at] = stamp
+            });
         });
         assert!(stamps.iter().all(|it| !it.is_unknown()));
         let mut driver = Uring::new(&root).unwrap();
@@ -3243,7 +3512,9 @@ mod tests {
             // The first starts the stampers.
             match round {
                 0 => driver.submit(&mut effects),
-                _ => blaze_alloc_count::assert_at_most(4, "submitting a sweep", || driver.submit(&mut effects)),
+                _ => blaze_alloc_count::assert_at_most(4, "submitting a sweep", || {
+                    driver.submit(&mut effects)
+                }),
             }
             let mut seen = 0;
             run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
@@ -3254,8 +3525,13 @@ mod tests {
         }
         for round in 0..3 {
             let mut effects = Vec::with_capacity(1);
-            effects.push(Effect::Entries { dir: FileName::new("src/d0").unwrap(), tag: Tag(10 + round) });
-            blaze_alloc_count::assert_at_most(1, "submitting a listing", || driver.submit(&mut effects));
+            effects.push(Effect::Entries {
+                dir: FileName::new("src/d0").unwrap(),
+                tag: Tag(10 + round),
+            });
+            blaze_alloc_count::assert_at_most(1, "submitting a listing", || {
+                driver.submit(&mut effects)
+            });
             let mut seen = 0;
             run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
                 assert!(matches!(done.done, Done::Entries(_)), "{done:?}");
@@ -3284,7 +3560,11 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let mut effects = vec![
             Effect::Stamp { files: names.clone(), tag: Tag(1) },
-            Effect::Append { file: FileName::new("log").unwrap(), bytes: b"x".to_vec(), tag: Tag(2) },
+            Effect::Append {
+                file: FileName::new("log").unwrap(),
+                bytes: b"x".to_vec(),
+                tag: Tag(2),
+            },
             Effect::Stamp { files: Arc::new(reversed), tag: Tag(3) },
             Effect::Stamp { files: Arc::default(), tag: Tag(4) },
             Effect::Timer { after: Duration::from_millis(1), tag: Tag(5) },
@@ -3295,7 +3575,9 @@ mod tests {
         assert_eq!(driver.in_flight(), 7);
         assert_eq!(driver.offload.out, 4, "two sweeps and two listings off the ring");
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut driver, &mut Vec::new(), |done, _| _ = seen.insert(done.tag.0, done.done));
+        run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
+            _ = seen.insert(done.tag.0, done.done)
+        });
         assert!(seen[&1] == Done::Stamped(reference.clone()), "the first sweep");
         let mut backwards = reference;
         backwards.reverse();
@@ -3413,13 +3695,15 @@ mod tests {
             }
             assert!(flushed, "the flush never came; heard {heard:?}");
             let mut ended = false;
-            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(7) }], |it, _| {
-                match (it.tag.0, it.done) {
+            run_until_idle(
+                &mut driver,
+                &mut vec![Effect::Unwatch { tag: Tag(7) }],
+                |it, _| match (it.tag.0, it.done) {
                     (7, Done::Journaled(_)) => {}
                     (7, Done::Unwatched) => ended = true,
                     other => panic!("{other:?}"),
-                }
-            });
+                },
+            );
             assert!(ended);
             assert_eq!(driver.in_flight(), 0);
             drop(driver);
@@ -3447,9 +3731,19 @@ mod tests {
             for next in 0..2_000u64 {
                 match rng.below(4) {
                     _ if live.is_empty() || (live.len() < 256 && rng.below(3) != 0) => {
-                        let model = (Tag(next), next.wrapping_mul(7), 0, next.to_le_bytes().to_vec(), next * 3);
+                        let model = (
+                            Tag(next),
+                            next.wrapping_mul(7),
+                            0,
+                            next.to_le_bytes().to_vec(),
+                            next * 3,
+                        );
                         let cold = Cold { at: model.4, ..Cold::EMPTY };
-                        let id = ours.insert(Hot::new(model.0, Kind::Read, model.1), model.3.clone(), cold);
+                        let id = ours.insert(
+                            Hot::new(model.0, Kind::Read, model.1),
+                            model.3.clone(),
+                            cold,
+                        );
                         theirs.insert(next, model);
                         live.push((next, id));
                     }
@@ -3485,7 +3779,8 @@ mod tests {
             for (key, id) in &live {
                 assert_eq!(shown(&ours, *id).as_ref(), theirs.get(key));
             }
-            let reused = ended.iter().any(|old| live.iter().any(|(_, it)| it.index() == old.index()));
+            let reused =
+                ended.iter().any(|old| live.iter().any(|(_, it)| it.index() == old.index()));
             assert!(reused, "seed {seed}: no slot of an ended request holds another");
         }
     }
@@ -3506,7 +3801,11 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let file = FileName::new("file").unwrap();
         // Kept open from here, so each request on it is its own alone.
-        run_until_idle(&mut driver, &mut vec![Effect::Sync { file: file.clone(), tag: Tag(0) }], |_, _| {});
+        run_until_idle(
+            &mut driver,
+            &mut vec![Effect::Sync { file: file.clone(), tag: Tag(0) }],
+            |_, _| {},
+        );
         driver.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         let ids = requests(&driver);
         let [synced] = ids[..] else { panic!("{ids:?}") };
@@ -3530,12 +3829,17 @@ mod tests {
         driver.submit(&mut vec![Effect::Watch { dir: src.clone(), tag: Tag(3) }]);
         let watched = driver.watches[&Tag(3)];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(3) }], |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(3) }], |done, _| {
+            seen.push(done.done)
+        });
         let (last, rest) = seen.split_last().expect("unwatched");
         assert_eq!(last, &Done::Unwatched);
         assert!(rest.iter().all(|it| matches!(it, Done::Changed { .. })), "{seen:?}");
         // The two slots let go (the read's and its cancel's), both taken again.
-        driver.submit(&mut vec![Effect::Watch { dir: src, tag: Tag(4) }, Effect::Sync { file, tag: Tag(5) }]);
+        driver.submit(&mut vec![
+            Effect::Watch { dir: src, tag: Tag(4) },
+            Effect::Sync { file, tag: Tag(5) },
+        ]);
         let reused = requests(&driver).into_iter().find(|it| it.index() == watched.index());
         let reused = reused.expect("the watch's read's slot is taken again");
         assert_ne!(reused, watched);
@@ -3555,7 +3859,11 @@ mod tests {
 
     /// Polls `driver` into `out` until `enough` says it holds what is waited for, or ten
     /// seconds pass.
-    fn poll_until(driver: &mut Uring, out: &mut Vec<Completion>, mut enough: impl FnMut(&[Completion]) -> bool) {
+    fn poll_until(
+        driver: &mut Uring,
+        out: &mut Vec<Completion>,
+        mut enough: impl FnMut(&[Completion]) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !enough(out) && Instant::now() < deadline {
             driver.poll(out, Duration::from_millis(50));
@@ -3579,7 +3887,12 @@ mod tests {
             let mut effects = Vec::with_capacity(4);
             effects.push(Effect::Sync { file: file.clone(), tag: Tag(3 * round) });
             effects.push(Effect::Stat { file: file.clone(), tag: Tag(3 * round + 1) });
-            effects.push(Effect::Read { file: file.clone(), at: 0, len: 6, tag: Tag(3 * round + 2) });
+            effects.push(Effect::Read {
+                file: file.clone(),
+                at: 0,
+                len: 6,
+                tag: Tag(3 * round + 2),
+            });
             out.clear();
             let ((), used) = blaze_alloc_count::measure(|| {
                 driver.submit(&mut effects);
@@ -3587,10 +3900,18 @@ mod tests {
             });
             out.sort_by_key(|it| it.tag.0);
             let [synced, stat, read] = &out[..] else { panic!("{out:?}") };
-            assert_eq!((&synced.done, &read.done), (&Done::Synced, &Done::Read(b"cached".to_vec())));
+            assert_eq!(
+                (&synced.done, &read.done),
+                (&Done::Synced, &Done::Read(b"cached".to_vec()))
+            );
             assert!(matches!(stat.done, Done::Stat(Some(_))), "{stat:?}");
             if round >= WARM {
-                assert!(used.allocations <= 1, "round {round}: {} allocations ({} bytes), budget 1", used.allocations, used.bytes);
+                assert!(
+                    used.allocations <= 1,
+                    "round {round}: {} allocations ({} bytes), budget 1",
+                    used.allocations,
+                    used.bytes
+                );
             }
         }
         assert_eq!(driver.in_flight(), 0);
@@ -3611,7 +3932,10 @@ mod tests {
                 driver.submit(&mut effects);
                 poll_until(&mut driver, &mut out, |out| !out.is_empty());
             });
-            assert_eq!(out.iter().map(|it| (it.tag, &it.done)).collect::<Vec<_>>(), [(Tag(round), &Done::Fired)]);
+            assert_eq!(
+                out.iter().map(|it| (it.tag, &it.done)).collect::<Vec<_>>(),
+                [(Tag(round), &Done::Fired)]
+            );
             if round >= WARM {
                 assert_eq!(used.allocations, 0, "round {round}: {} bytes", used.bytes);
             }
@@ -3643,7 +3967,8 @@ mod tests {
             let unwatched = |out: &[Completion]| out.iter().any(|it| it.done == Done::Unwatched);
             let ((), added) = blaze_alloc_count::measure(|| driver.submit(&mut watch));
             std::fs::write(&path, b"fn f() {}").unwrap();
-            let ((), told) = blaze_alloc_count::measure(|| poll_until(&mut driver, &mut out, heard));
+            let ((), told) =
+                blaze_alloc_count::measure(|| poll_until(&mut driver, &mut out, heard));
             let ((), removed) = blaze_alloc_count::measure(|| {
                 driver.submit(&mut unwatch);
                 poll_until(&mut driver, &mut out, unwatched);
@@ -3681,7 +4006,10 @@ mod tests {
         let root = dir("uring-warm-conn");
         let mut ring = Uring::new(&root).unwrap();
         let at = Address::Unix(FileName::new("s.sock").unwrap());
-        ring.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }, Effect::Connect { at, tag: Tag(2) }]);
+        ring.submit(&mut vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ]);
         let (mut server, mut client) = (None, None);
         let mut out = Vec::with_capacity(16);
         poll_until(&mut ring, &mut out, |out| {
@@ -3702,7 +4030,11 @@ mod tests {
             out.clear();
             let ((), used) = blaze_alloc_count::measure(|| {
                 sending.extend_from_slice(b"ping");
-                effects.push(Effect::Send { conn: client, bytes: std::mem::take(&mut sending), tag: Tag(10 + 2 * round) });
+                effects.push(Effect::Send {
+                    conn: client,
+                    bytes: std::mem::take(&mut sending),
+                    tag: Tag(10 + 2 * round),
+                });
                 effects.push(Effect::Recv {
                     conn: server,
                     most: 64,
@@ -3722,7 +4054,12 @@ mod tests {
                             }
                             Done::Read(bytes) if bytes.len() < 4 => {
                                 let into = std::mem::take(bytes);
-                                effects.push(Effect::Recv { conn: server, most: 64, into, tag: it.tag });
+                                effects.push(Effect::Recv {
+                                    conn: server,
+                                    most: 64,
+                                    into,
+                                    tag: it.tag,
+                                });
                             }
                             Done::Read(bytes) => {
                                 read = true;
@@ -3737,8 +4074,15 @@ mod tests {
                     }
                 }
             });
-            assert!(out.iter().all(|it| matches!(it.done, Done::Sent(_) | Done::Read(_))), "{out:?}");
-            assert_eq!((&receiving[..], sending.len(), sending.capacity() >= 4), (&b"ping"[..], 0, true), "{out:?}");
+            assert!(
+                out.iter().all(|it| matches!(it.done, Done::Sent(_) | Done::Read(_))),
+                "{out:?}"
+            );
+            assert_eq!(
+                (&receiving[..], sending.len(), sending.capacity() >= 4),
+                (&b"ping"[..], 0, true),
+                "{out:?}"
+            );
             receiving.clear();
             if round >= WARM {
                 assert_eq!(used.allocations, 0, "round {round}");
@@ -3749,7 +4093,10 @@ mod tests {
         let mut seen = Vec::new();
         let mut send = vec![Effect::Send { conn: forged, bytes: b"x".to_vec(), tag: Tag(5) }];
         run_until_idle(&mut ring, &mut send, |done, _| seen.push(done.done));
-        assert!(matches!(&seen[..], [Done::Broken { buffer, .. }] if buffer.is_empty()), "{seen:?}");
+        assert!(
+            matches!(&seen[..], [Done::Broken { buffer, .. }] if buffer.is_empty()),
+            "{seen:?}"
+        );
         let mut effects = vec![
             Effect::Hangup { conn: client, tag: Tag(3) },
             Effect::Hangup { conn: server, tag: Tag(4) },
@@ -3829,7 +4176,10 @@ mod tests {
                 action.sa_sigaction = trapped as usize;
                 action.sa_flags = libc::SA_SIGINFO;
                 // SAFETY: a handler that touches an atomic and its context alone.
-                assert_eq!(unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) }, 0);
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) },
+                    0
+                );
             });
             const LD_W_ABS: u16 = 0x20;
             const JEQ_K: u16 = 0x15;
@@ -3847,11 +4197,14 @@ mod tests {
                 program.extend([insn(JEQ_K, 0, 1, call as u32), insn(RET_K, 0, 0, TRAP)]);
             }
             program.push(insn(RET_K, 0, 0, ALLOW));
-            let fprog = libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
+            let fprog =
+                libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
             // SAFETY: no pointers.
             assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
             // SAFETY: a program of `len` instructions, which the call copies and does not keep.
-            let set = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const fprog) };
+            let set = unsafe {
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const fprog)
+            };
             assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
         }
 
@@ -3874,7 +4227,8 @@ mod tests {
         std::thread::spawn(move || {
             let mut driver = Uring::new(&ours).unwrap();
             let name = |it: &str| FileName::new(it).unwrap();
-            let (log, block, whole, moved) = (name("d/log"), name("d/block"), name("d/whole"), name("d/moved"));
+            let (log, block, whole, moved) =
+                (name("d/log"), name("d/block"), name("d/whole"), name("d/moved"));
             let mut out = Vec::with_capacity(16);
             for round in 0..2 * WARM {
                 if round == WARM {
@@ -3882,13 +4236,26 @@ mod tests {
                 }
                 let at = 8 * round;
                 let mut writes = Vec::with_capacity(4);
-                writes.push(Effect::Append { file: log.clone(), bytes: b"line\n".to_vec(), tag: Tag(10 * round) });
+                writes.push(Effect::Append {
+                    file: log.clone(),
+                    bytes: b"line\n".to_vec(),
+                    tag: Tag(10 * round),
+                });
                 let bytes = round.to_le_bytes().to_vec();
-                writes.push(Effect::WriteAt { file: block.clone(), at, bytes, tag: Tag(10 * round + 1) });
+                writes.push(Effect::WriteAt {
+                    file: block.clone(),
+                    at,
+                    bytes,
+                    tag: Tag(10 * round + 1),
+                });
                 let bytes = round.to_le_bytes().to_vec();
                 writes.push(Effect::Write { file: whole.clone(), bytes, tag: Tag(10 * round + 2) });
                 let mut renames = Vec::with_capacity(1);
-                renames.push(Effect::Rename { from: whole.clone(), to: moved.clone(), tag: Tag(10 * round + 3) });
+                renames.push(Effect::Rename {
+                    from: whole.clone(),
+                    to: moved.clone(),
+                    tag: Tag(10 * round + 3),
+                });
                 out.clear();
                 let calls = path_calls::count();
                 let ((), used) = blaze_alloc_count::measure(|| {
@@ -3900,7 +4267,11 @@ mod tests {
                 let calls = path_calls::count() - calls;
                 out.sort_by_key(|it| it.tag.0);
                 let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
-                assert_eq!(done, [&Done::Appended, &Done::Written, &Done::Written, &Done::Renamed], "round {round}");
+                assert_eq!(
+                    done,
+                    [&Done::Appended, &Done::Written, &Done::Written, &Done::Renamed],
+                    "round {round}"
+                );
                 if round >= WARM {
                     assert_eq!(used.allocations, 0, "round {round}: {} bytes", used.bytes);
                     assert_eq!(calls, 0, "round {round}: calls on names on the driver's thread");
@@ -3913,7 +4284,10 @@ mod tests {
         .unwrap();
         let last = 2 * WARM - 1;
         assert_eq!(std::fs::read(root.join("d/moved")).unwrap(), last.to_le_bytes());
-        assert_eq!(std::fs::read(root.join("d/block")).unwrap()[8 * last as usize..][..8], last.to_le_bytes());
+        assert_eq!(
+            std::fs::read(root.join("d/block")).unwrap()[8 * last as usize..][..8],
+            last.to_le_bytes()
+        );
         assert_eq!(std::fs::read(root.join("d/log")).unwrap().len(), 5 * 2 * WARM as usize);
         assert!(!root.join("d/whole").exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -3942,7 +4316,10 @@ mod tests {
         let opened = |tag: u64, path: PathBuf| match &seen[&tag] {
             Done::Failed(IoError(why)) => {
                 let path = path.display().to_string();
-                assert!(why.starts_with(&format!("opening {path}: ")), "{tag}: {why} (wanted {path})");
+                assert!(
+                    why.starts_with(&format!("opening {path}: ")),
+                    "{tag}: {why} (wanted {path})"
+                );
             }
             other => panic!("{tag}: {other:?}"),
         };
@@ -3951,10 +4328,15 @@ mod tests {
         opened(3, root.join("plain"));
         opened(4, root.join("plain/under"));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (driver.table.free.borrow().len() < free || driver.closes > 0) && Instant::now() < deadline {
+        while (driver.table.free.borrow().len() < free || driver.closes > 0)
+            && Instant::now() < deadline
+        {
             driver.poll(&mut Vec::new(), Duration::from_millis(1));
         }
-        assert_eq!((driver.table.free.borrow().len(), driver.closes, driver.slots_held), (free, 0, 0));
+        assert_eq!(
+            (driver.table.free.borrow().len(), driver.closes, driver.slots_held),
+            (free, 0, 0)
+        );
         assert_eq!(driver.paths.held(), [0, 0]);
         drop(driver);
         assert!(!root.join("missing").exists());
@@ -4032,7 +4414,10 @@ mod tests {
             std::fs::write(root.join(format!("f/{n}")), n.to_string().repeat(n % 7)).unwrap();
         }
         let mut effects: Vec<Effect> = (0..count)
-            .map(|n| Effect::ReadAll { file: FileName::new(&format!("f/{n}")).unwrap(), tag: Tag(n as u64) })
+            .map(|n| Effect::ReadAll {
+                file: FileName::new(&format!("f/{n}")).unwrap(),
+                tag: Tag(n as u64),
+            })
             .collect();
         driver.submit(&mut effects);
         assert_eq!((driver.loading, driver.load_waiting.len()), (most, count - most));
@@ -4052,7 +4437,11 @@ mod tests {
         }
         assert_eq!(seen.len(), count);
         for (n, done) in seen {
-            assert_eq!(done, Done::Read(std::fs::read(root.join(format!("f/{n}"))).unwrap()), "f/{n}");
+            assert_eq!(
+                done,
+                Done::Read(std::fs::read(root.join(format!("f/{n}"))).unwrap()),
+                "f/{n}"
+            );
         }
         assert_eq!((driver.loading, driver.load_waiting.len()), (0, 0));
         assert_eq!(driver.paths.held(), [0, 0]);
@@ -4079,7 +4468,12 @@ mod tests {
                 }
                 let mut reads = Vec::with_capacity(2);
                 reads.push(Effect::ReadAll { file: file.clone(), tag: Tag(2 * round) });
-                reads.push(Effect::Read { file: file.clone(), at: 3, len: 4, tag: Tag(2 * round + 1) });
+                reads.push(Effect::Read {
+                    file: file.clone(),
+                    at: 3,
+                    len: 4,
+                    tag: Tag(2 * round + 1),
+                });
                 out.clear();
                 let calls = path_calls::count();
                 let ((), used) = blaze_alloc_count::measure(|| {
@@ -4089,9 +4483,16 @@ mod tests {
                 let calls = path_calls::count() - calls;
                 out.sort_by_key(|it| it.tag.0);
                 let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
-                assert_eq!(done, [&Done::Read(b"fn main() {}\n".to_vec()), &Done::Read(b"main".to_vec())]);
+                assert_eq!(
+                    done,
+                    [&Done::Read(b"fn main() {}\n".to_vec()), &Done::Read(b"main".to_vec())]
+                );
                 if round >= WARM {
-                    assert!(used.allocations <= 2, "round {round}: {} allocations", used.allocations);
+                    assert!(
+                        used.allocations <= 2,
+                        "round {round}: {} allocations",
+                        used.allocations
+                    );
                     assert_eq!(calls, 0, "round {round}: calls on names on the driver's thread");
                 }
             }
@@ -4103,6 +4504,59 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A timed poll ends within its wait while signals keep interrupting it, as the profile's
+    /// sampler does every 20 ms: `Ring::enter` once entered again with the whole relative
+    /// timeout after each EINTR, so a wait longer than the gap between signals never ended and
+    /// the daemon never got past its first turn.
+    #[test]
+    fn a_timed_poll_ends_under_a_storm_of_signals() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        let signal = libc::SIGRTMIN() + 5;
+        // SAFETY: `sigaction` is a C struct of integers, pointers and a mask, for which all
+        // zeroes is valid; no SA_RESTART, as the sampler's handler has none.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = nothing as usize;
+        // SAFETY: a handler that does nothing, for a signal nothing else in the test uses.
+        assert_eq!(unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) }, 0);
+        let root = dir("uring-eintr");
+        let mut ring = Uring::new(&root).unwrap();
+        let at = Address::Unix(FileName::new("s.sock").unwrap());
+        ring.submit(&mut vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ]);
+        let mut out = Vec::new();
+        poll_until(&mut ring, &mut out, |out| out.len() == 2);
+        out.sort_by_key(|it| it.tag.0);
+        let server = match &out[0].done {
+            Done::Accepted { conn } => *conn,
+            other => panic!("{other:?}"),
+        };
+        // Nothing is sent, so the receive stays in flight through the poll.
+        ring.submit(&mut vec![Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(3) }]);
+        // SAFETY: the calling thread's own handle.
+        let me = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storm = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: `me` is the test's thread, which lives until this one is joined.
+                    unsafe { libc::pthread_kill(me, signal) };
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let started = Instant::now();
+        let mut out = Vec::new();
+        ring.poll(&mut out, Duration::from_millis(50));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        storm.join().unwrap();
+        assert!(out.is_empty(), "nothing was sent, and the poll ended with {out:?}");
+        assert!(took < Duration::from_secs(2), "a 50 ms poll under signals every 5 ms took {took:?}");
+    }
+
     /// The provided buffers a pass of completions gives back are shown to the kernel together,
     /// with one store of the ring's tail after the pass, not one per buffer; between, the
     /// kernel's tail is as it was.
@@ -4112,7 +4566,10 @@ mod tests {
         let mut ring = Uring::new(&root).unwrap();
         assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (0, RECV_BUFFERS));
         let at = Address::Unix(FileName::new("s.sock").unwrap());
-        ring.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }, Effect::Connect { at, tag: Tag(2) }]);
+        ring.submit(&mut vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ]);
         let mut out = Vec::new();
         poll_until(&mut ring, &mut out, |out| out.len() == 2);
         let conn = |it: &Done| match it {
@@ -4148,7 +4605,10 @@ mod tests {
             }
             assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (given, shown));
             ring.provided.publish();
-            assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (0, shown.wrapping_add(given)));
+            assert_eq!(
+                (ring.provided.unpublished(), ring.provided.shown()),
+                (0, shown.wrapping_add(given))
+            );
         }
         assert_eq!(received, sent);
         let mut effects = vec![
@@ -4168,7 +4628,10 @@ mod tests {
     #[test]
     fn a_large_tcp_send_goes_from_the_askers_pages() {
         let mut ring = Uring::new(dir("uring-zero-copy")).unwrap();
-        ring.submit(&mut vec![Effect::Listen { at: Address::Tcp("127.0.0.1:0".parse().unwrap()), tag: Tag(1) }]);
+        ring.submit(&mut vec![Effect::Listen {
+            at: Address::Tcp("127.0.0.1:0".parse().unwrap()),
+            tag: Tag(1),
+        }]);
         let at = ring.local_addr(Tag(1)).expect("listening");
         ring.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
         let mut out = Vec::new();
@@ -4191,14 +4654,23 @@ mod tests {
             Done::Sent(bytes) => {
                 sent.push((done.tag, bytes.len(), bytes.capacity()));
                 if done.tag == Tag(3) {
-                    effects.push(Effect::Send { conn: client, bytes: b"tail".to_vec(), tag: Tag(4) });
+                    effects.push(Effect::Send {
+                        conn: client,
+                        bytes: b"tail".to_vec(),
+                        tag: Tag(4),
+                    });
                 }
             }
             Done::Read(mut bytes) => {
                 got.extend_from_slice(&bytes);
                 bytes.clear();
                 if got.len() < whole {
-                    effects.push(Effect::Recv { conn: server, most: 64 << 10, into: bytes, tag: Tag(next) });
+                    effects.push(Effect::Recv {
+                        conn: server,
+                        most: 64 << 10,
+                        into: bytes,
+                        tag: Tag(next),
+                    });
                     next += 1;
                 } else {
                     effects.push(Effect::Hangup { conn: client, tag: Tag(5) });
@@ -4211,7 +4683,10 @@ mod tests {
         });
         assert_eq!(got.len(), whole);
         assert!(got[..large.len()] == large[..] && got[large.len()..] == b"tail"[..]);
-        assert_eq!(sent.iter().map(|it| (it.0, it.1)).collect::<Vec<_>>(), [(Tag(3), 0), (Tag(4), 0)]);
+        assert_eq!(
+            sent.iter().map(|it| (it.0, it.1)).collect::<Vec<_>>(),
+            [(Tag(3), 0), (Tag(4), 0)]
+        );
         assert!(sent[0].2 >= large.len(), "the asker's own buffer handed back");
         assert_eq!(ring.zero_copy_sends(), 1);
         assert_eq!(ring.in_flight(), 0);
@@ -4237,9 +4712,27 @@ mod tests {
             super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "5.0.0")
         };
         let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
-            (libc::EPERM, Some(2), "with EPERM", "kernel.io_uring_disabled is 2", "sysctl -w kernel.io_uring_disabled=0"),
-            (libc::EPERM, Some(1), "with EPERM", "kernel.io_uring_group", "sysctl -w kernel.io_uring_disabled=0"),
-            (libc::EPERM, None, "with EPERM", "seccomp", "io_uring_setup, io_uring_enter and io_uring_register"),
+            (
+                libc::EPERM,
+                Some(2),
+                "with EPERM",
+                "kernel.io_uring_disabled is 2",
+                "sysctl -w kernel.io_uring_disabled=0",
+            ),
+            (
+                libc::EPERM,
+                Some(1),
+                "with EPERM",
+                "kernel.io_uring_group",
+                "sysctl -w kernel.io_uring_disabled=0",
+            ),
+            (
+                libc::EPERM,
+                None,
+                "with EPERM",
+                "seccomp",
+                "io_uring_setup, io_uring_enter and io_uring_register",
+            ),
             (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
             (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
             (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),

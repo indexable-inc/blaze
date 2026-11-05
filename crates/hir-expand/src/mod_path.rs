@@ -11,7 +11,7 @@ use crate::{
     name::{AsName, Name},
     tt,
 };
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use intern::{InternedSlice, sym};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
@@ -105,11 +105,14 @@ impl Ord for ModPath {
 
 impl fmt::Debug for ModPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ModPath")
-            .field("kind", &self.kind)
-            .field("segments", &self.segments())
-            .field("contexts", &self.contexts())
-            .finish()
+        let mut out = f.debug_struct("ModPath");
+        out.field("kind", &self.kind).field("segments", &self.segments());
+        // Only a path some of whose segments a macro 2.0 wrote has contexts: every other prints
+        // as it did before paths had them.
+        if let Some(contexts) = self.contexts() {
+            out.field("contexts", &contexts);
+        }
+        out.finish()
     }
 }
 
@@ -227,9 +230,11 @@ impl ModPath {
         match (self.contexts(), last.is_root()) {
             (None, true) => ContextBuf::new(),
             (Some(it), _) => it.iter().copied().chain(iter::once(last)).collect(),
-            (None, false) => iter::repeat_n(SyntaxContext::root(Edition::Edition2015), self.segments().len())
-                .chain(iter::once(last))
-                .collect(),
+            (None, false) => {
+                iter::repeat_n(SyntaxContext::root(Edition::Edition2015), self.segments().len())
+                    .chain(iter::once(last))
+                    .collect()
+            }
         }
     }
 
@@ -301,11 +306,7 @@ impl ModPath {
         Display { db, path: self, edition: None }
     }
 
-    pub fn display<'a>(
-        &'a self,
-        db: &'a Db,
-        edition: Edition,
-    ) -> impl fmt::Display + 'a {
+    pub fn display<'a>(&'a self, db: &'a Db, edition: Edition) -> impl fmt::Display + 'a {
         Display { db, path: self, edition: Some(edition) }
     }
 }
@@ -397,7 +398,9 @@ fn convert_path_view(
     let handle_super_kw = &mut |init_deg,
                                 names: &mut SegmentBuf,
                                 contexts: &mut ContextBuf,
-                                span_for_range: &mut (dyn FnMut(::tt::TextRange) -> SyntaxContext + '_)| {
+                                span_for_range: &mut (
+                                         dyn FnMut(::tt::TextRange) -> SyntaxContext + '_
+                                     )| {
         let mut deg = init_deg;
         for segment in segments.by_ref() {
             match segment.kind()? {
@@ -405,7 +408,9 @@ fn convert_path_view(
                 view::PathSegmentKind::Name(name) => {
                     names.push(name.as_name());
                     contexts.push(match with_contexts {
-                        true => span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db),
+                        true => {
+                            span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db)
+                        }
                         false => root,
                     });
                     break;
@@ -428,7 +433,9 @@ fn convert_path_view(
             } else {
                 names.push(name_ref.as_name());
                 contexts.push(match with_contexts {
-                    true => span_for_range(name_ref.syntax().text_range()).normalize_to_macros_2_0(db),
+                    true => {
+                        span_for_range(name_ref.syntax().text_range()).normalize_to_macros_2_0(db)
+                    }
                     false => root,
                 });
                 segment.coloncolon_token().map_or(PathKind::Plain, |_| PathKind::Abs)
@@ -440,8 +447,12 @@ fn convert_path_view(
             PathKind::Plain
         }
         view::PathSegmentKind::CrateKw => PathKind::Crate,
-        view::PathSegmentKind::SelfKw => handle_super_kw(0, &mut names, &mut contexts, &mut |range| span_for_range(range))?,
-        view::PathSegmentKind::SuperKw => handle_super_kw(1, &mut names, &mut contexts, &mut |range| span_for_range(range))?,
+        view::PathSegmentKind::SelfKw => {
+            handle_super_kw(0, &mut names, &mut contexts, &mut |range| span_for_range(range))?
+        }
+        view::PathSegmentKind::SuperKw => {
+            handle_super_kw(1, &mut names, &mut contexts, &mut |range| span_for_range(range))?
+        }
         view::PathSegmentKind::Type { .. } => {
             // not allowed in imports
             return None;
@@ -659,8 +670,10 @@ mod tests {
     #[test]
     fn same_answers_as_a_list() {
         let corpus = corpus();
-        let paths: Vec<ModPath> =
-            corpus.iter().map(|(kind, words)| ModPath::from_segments(*kind, names(words))).collect();
+        let paths: Vec<ModPath> = corpus
+            .iter()
+            .map(|(kind, words)| ModPath::from_segments(*kind, names(words)))
+            .collect();
         for (path, (kind, words)) in paths.iter().zip(&corpus) {
             assert_eq!(path.kind, *kind);
             assert_eq!(path.segments(), &names(words)[..]);
@@ -714,10 +727,7 @@ mod tests {
     fn debug_is_as_before() {
         let path = ModPath::from_segments(PathKind::Abs, names(&["core", "fmt"]));
         let segments: smallvec::SmallVec<[Name; 1]> = path.segments().iter().copied().collect();
-        assert_eq!(
-            format!("{path:?}"),
-            format!("ModPath {{ kind: Abs, segments: {segments:?} }}")
-        );
+        assert_eq!(format!("{path:?}"), format!("ModPath {{ kind: Abs, segments: {segments:?} }}"));
         assert_eq!(
             format!("{:?}", ModPath::from_kind(PathKind::Crate)),
             "ModPath { kind: Crate, segments: [] }"

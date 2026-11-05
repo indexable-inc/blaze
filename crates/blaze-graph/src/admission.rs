@@ -14,8 +14,10 @@
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
 //!
-//! A task's peak is everything it held: what it allocated through the global allocator
-//! (`arena::measure`) and what its frames held (`blaze_mem::frame`). Each kind belongs to a
+//! A task's peak is everything it held: what its work allocated through the global allocator,
+//! on its own job and on every job of the pool scopes it opened (its memory account,
+//! `arena::account`), never a sample of the whole process, and what its frames held
+//! (`blaze_mem::frame`). Each kind belongs to a
 //! subsystem ([`tag_of`]), and each subsystem has a budget, a share of the machine's
 //! ([`set_budgets`]): the scheduler holds back a task of a subsystem over its budget
 //! (`blaze_mem::tag::over_budget`) before the machine's budget is reached.
@@ -29,10 +31,10 @@ use std::{
 
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 /// How many peaks under a prediction, in a row, bring it down a step.
 pub const WINDOW: u32 = 64;
@@ -83,6 +85,30 @@ pub mod kinds {
     pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
 }
 
+/// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
+/// says it; `None` for a query kind, which its query's name says.
+pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
+    Some(match kind {
+        kinds::PLAN => "plan",
+        kinds::FETCH => "fetch",
+        kinds::LIBRARY => "library",
+        kinds::LOWER => "lower",
+        kinds::COMPILE => "compile",
+        kinds::REACH => "reach",
+        kinds::WALK => "walk",
+        kinds::UB_TESTS => "ub tests",
+        kinds::EVALUATE => "evaluate",
+        kinds::PROGRAM => "program",
+        kinds::UNIT_NAMES => "unit names",
+        kinds::UNIT_BODIES => "unit bodies",
+        kinds::UNIT_LINK => "unit link",
+        kinds::UNIT_STORE => "unit store",
+        kinds::PROGRAM_LINK => "program link",
+        kinds::STORE_KEPT => "store kept",
+        _ => return None,
+    })
+}
+
 /// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
 ///
 /// Query kinds go by `blaze_query::kinds`' ranges (inputs, facts `0x1000`, the front end
@@ -116,14 +142,16 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
 
 /// Runs `f` as a task of `kind`: in a [`blaze_mem::frame::task`] of [`tag_of`]`(kind)`, so
 /// what it allocates from the global heap is charged to that subsystem's line and not to the
-/// heap outside any task, and says the most it held: its global allocations
-/// ([`crate::arena::measure`]) and its frames' together, the peak [`Estimates`] learn from.
+/// heap outside any task, and says the most it held: its global allocations, its fan-out's
+/// included ([`crate::arena::account`]), and its frames' together, the peak [`Estimates`]
+/// learn from.
 /// Every runner of tasks (the exec scheduler's, the daemon's plane) runs a task's work through
 /// this, so a task's memory has one home whoever runs it.
 pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, u64) {
     let tag = tag_of(kind);
-    let ((out, bytes), frames) =
-        blaze_mem::frame::measure(|| crate::arena::measure(|| blaze_mem::frame::task(tag, |_| f())));
+    let ((out, bytes), frames) = blaze_mem::frame::measure(|| {
+        crate::arena::account(|| blaze_mem::frame::task(tag, |_| f()))
+    });
     (out, bytes + frames as u64)
 }
 
@@ -256,6 +284,16 @@ impl Squeeze {
         now.limit != u64::MAX && (now.squeezed() || now.over.is_some()) && now.held >= self.after
     }
 
+    /// Whether a release is due at `now` for a task the plane holds back for memory the
+    /// process holds besides its tasks (`crate::Plane::short`): under a limit, whatever the
+    /// line, once blaze has grown by a [`STEP`]th of the limit since the last release ended.
+    /// Waiting would never free that memory, and the line (an eighth under the limit) may be
+    /// far above what keeps a task out: 31 GB held of 47 kept out a task predicted 15.78 GB
+    /// with the line at 41 (memadmit).
+    pub const fn short(&self, now: Pressure) -> bool {
+        now.limit != u64::MAX && now.held >= self.after
+    }
+
     /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.
     pub fn released(&mut self, now: Pressure) {
         self.after = now.held.saturating_add(now.limit / STEP);
@@ -341,8 +379,8 @@ pub struct Estimates {
 /// bytes whatever order their kinds were first seen in.
 mod in_order {
     use blaze_hash::HashMap;
-    use std::alloc::Global;
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::alloc::Global;
 
     use super::{Estimate, TaskKind};
 
@@ -355,13 +393,15 @@ mod in_order {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> { // alloc: the estimates, kept across builds and persisted
+    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> {
+        // alloc: the estimates, kept across builds and persisted
         HashMap::deserialize(deserializer)
     }
 }
 
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
-fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> { // alloc: the estimates, kept across builds and persisted
+fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> {
+    // alloc: the estimates, kept across builds and persisted
     // alloc: once per encoding of the estimates, as the daemon's image is written
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
     radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
@@ -453,13 +493,22 @@ impl Estimates {
 pub enum DecodeError {
     /// Not of this version of [`Estimates::encode`].
     Version,
-    Short { at: usize },
+    Short {
+        at: usize,
+    },
     /// Not as many bytes as `count` kinds take.
-    Length { count: u64, bytes: usize },
+    Length {
+        count: u64,
+        bytes: usize,
+    },
     /// A kind not after the one before it.
-    Order { kind: u32 },
+    Order {
+        kind: u32,
+    },
     /// An estimate no observations make.
-    Unsound { kind: u32 },
+    Unsound {
+        kind: u32,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -730,7 +779,8 @@ mod tests {
                 estimates.observe(kind, peak);
                 model.entry(kind).or_default().observe(peak);
                 let asked = TaskKind(kinds[random.index(kinds.len())]);
-                let want = model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
+                let want =
+                    model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
                 assert_eq!(estimates.predict(asked), want, "seed {seed}");
             }
             assert_eq!(estimates.by_kind.len(), model.len(), "seed {seed}");
@@ -881,11 +931,17 @@ mod tests {
         assert!(squeeze.due(at(42 * GIB, None)), "at the line");
         assert!(squeeze.due(at(10 * GIB, Some(Tag::Mir))), "a released subsystem past its share");
         squeeze.released(at(40 * GIB, None));
-        assert!(!squeeze.due(at(42 * GIB, None)), "past the line, but under 40 + 3 since the release");
+        assert!(
+            !squeeze.due(at(42 * GIB, None)),
+            "past the line, but under 40 + 3 since the release"
+        );
         assert!(!squeeze.due(at(42 * GIB, Some(Tag::Infer))), "past a share, still under the step");
         assert!(squeeze.due(at(43 * GIB, None)), "a sixteenth (3 GiB) past what the release left");
         squeeze.released(at(20 * GIB, None));
-        assert!(squeeze.due(at(23 * GIB, Some(Tag::Infer))), "a release that freed much lowers the step's floor");
+        assert!(
+            squeeze.due(at(23 * GIB, Some(Tag::Infer))),
+            "a release that freed much lowers the step's floor"
+        );
         let unlimited = Pressure { held: u64::MAX - 1, limit: u64::MAX, over: Some(Tag::Mir) };
         assert!(!Squeeze::default().due(unlimited), "no limit: never due");
     }
@@ -908,7 +964,10 @@ mod tests {
         for tag in Tag::ALL {
             assert_eq!(caps[tag.index()], 48 * GIB / SHARES * share(tag), "{tag}");
         }
-        assert!(caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer), "tighter than the budget");
+        assert!(
+            caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer),
+            "tighter than the budget"
+        );
     }
 
     /// The plane predicts every node it admits and observes every task that ends: once each

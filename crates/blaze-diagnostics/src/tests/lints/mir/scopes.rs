@@ -324,7 +324,10 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0571`.
 "#;
-    assert_eq!(ui_core("issue-114529-illegal-break-with-value.rs", "2015", "option", source), stderr);
+    assert_eq!(
+        ui_core("issue-114529-illegal-break-with-value.rs", "2015", "option", source),
+        stderr
+    );
 }
 
 #[test]
@@ -524,12 +527,7 @@ fn main() {
 "#;
     assert_reports(
         &ui("issue-86188-return-not-in-fn-body.rs", "2015", source),
-        &[
-            error(9, &[]),
-            error(20, &[]),
-            error(28, &[]),
-            error(36, &[]),
-        ],
+        &[error(9, &[]), error(20, &[]), error(28, &[]), error(36, &[])],
     );
 }
 

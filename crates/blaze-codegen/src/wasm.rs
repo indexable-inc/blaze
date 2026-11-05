@@ -234,7 +234,8 @@ fn read_string(bytes: &[u8], at: &mut usize) -> Result<String, String> {
         .and_then(|len| at.checked_add(len))
         .filter(|&end| end <= bytes.len())
         .ok_or("wasm: a truncated code header")?;
-    let string = std::str::from_utf8(&bytes[*at..end]).map_err(|_| "wasm: a name that is not UTF-8")?;
+    let string =
+        std::str::from_utf8(&bytes[*at..end]).map_err(|_| "wasm: a name that is not UTF-8")?;
     *at = end;
     // alloc: an import's name, which `Code` owns; a few per function that imports
     Ok(string.to_owned())
@@ -248,7 +249,10 @@ mod tests {
     fn code_round_trips() {
         let code = Code {
             ty: Signature { params: vec![ValType::I32, ValType::I64], results: vec![ValType::F32] },
-            types: vec![Signature::default(), Signature { params: vec![ValType::V128], results: vec![] }],
+            types: vec![
+                Signature::default(),
+                Signature { params: vec![ValType::V128], results: vec![] },
+            ],
             type_fixups: vec![(3, 1), (200, 0)],
             stack_pointer: vec![9],
             imports: vec![(
@@ -280,8 +284,14 @@ mod tests {
     #[test]
     fn a_leb_past_64_bits_is_refused() {
         let mut at = 0;
-        assert_eq!(read_uleb(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01], &mut at), Ok(u64::MAX));
+        assert_eq!(
+            read_uleb(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01], &mut at),
+            Ok(u64::MAX)
+        );
         let mut at = 0;
-        assert!(read_uleb(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02], &mut at).is_err());
+        assert!(
+            read_uleb(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02], &mut at)
+                .is_err()
+        );
     }
 }

@@ -56,12 +56,16 @@ pub fn serve() -> ! {
             // alloc: once per run, its thread's name.
             .name(format!("blaze-sandbox-run-{started}"))
             .spawn(move || {
-                let code = crate::sandbox::v2::launch_with(&spec, |spec, _live| super::run(spec, given));
+                let code =
+                    crate::sandbox::v2::launch_with(&spec, |spec, _live| super::run(spec, given));
                 answer(Answer { run: handed.run, code });
             });
         if let Err(error) = thread {
             // alloc: the fault, once, and the launcher ends.
-            stop(Exit::CouldNot.code(), Some(&format!("starting the thread of run {}: {error}", handed.run)));
+            stop(
+                Exit::CouldNot.code(),
+                Some(&format!("starting the thread of run {}: {error}", handed.run)),
+            );
         }
     }
 }
@@ -72,7 +76,10 @@ fn answer(answer: Answer) {
     if let Err(error) = out.write_all(&answer.to_bytes()).and_then(|()| out.flush()) {
         drop(out);
         // alloc: the fault, once, and the launcher ends.
-        stop(Exit::CouldNot.code(), Some(&format!("writing the answer of run {}: {error}", answer.run)));
+        stop(
+            Exit::CouldNot.code(),
+            Some(&format!("writing the answer of run {}: {error}", answer.run)),
+        );
     }
 }
 

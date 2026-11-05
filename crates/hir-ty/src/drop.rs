@@ -6,8 +6,9 @@ use hir_def::{AdtId, ImplId, signatures::StructFlags};
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
 
 use crate::{
-    FrameSet, consteval, frame_set,
+    FrameSet, consteval,
     db::HirDatabase,
+    frame_set,
     layout::{enum_variant_ids, struct_flags},
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{

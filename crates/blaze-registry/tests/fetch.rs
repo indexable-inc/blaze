@@ -11,16 +11,17 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
-    download::{From, checksum, crate_key, crate_url, parse_checksum, unpack_package_in},
+    download::{From, checksum, crate_url, unpack_package_in},
     http::{Http, Response},
     index::Status,
+    pinned::crate_pin,
 };
 use blaze_source::SourceId;
 use parking_lot::Mutex;
 use semver::{Version, VersionReq};
+use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 
@@ -243,8 +244,12 @@ fn fetches_into_cargos_directories_and_the_store() {
     let crate_file =
         fixture.home.join("registry/cache").join(registry.dir_name()).join("Demo-1.0.0.crate");
     assert_eq!(checksum(&std::fs::read(&crate_file).unwrap()), package.checksum);
-    let key = crate_key(&parse_checksum(&package.checksum).unwrap());
-    assert!(fixture.store.has(&key));
+    let pin = crate_pin(&package.checksum).unwrap();
+    let kept = |store: &'static blaze_cas::Handle| {
+        let origin = blaze_fetch::Origin::Pinned { pin: &pin, form: blaze_fetch::Form::Blob };
+        blaze_fetch::Objects::new(store).lookup(origin).unwrap().is_some()
+    };
+    assert!(kept(fixture.store));
 
     // Unpacked already: nothing read.
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::Unpacked);
@@ -260,7 +265,7 @@ fn fetches_into_cargos_directories_and_the_store() {
     let empty = store(&fixture.home.join("empty-store"));
     let registry = fixture.registry_with(false, empty);
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::CargoCache);
-    assert!(empty.has(&key));
+    assert!(kept(empty));
     // An unpacking cut short (no `.cargo-ok`) is done again.
     std::fs::remove_file(src.join(".cargo-ok")).unwrap();
     std::fs::write(src.join("stray"), b"").unwrap();
@@ -269,6 +274,14 @@ fn fetches_into_cargos_directories_and_the_store() {
     std::fs::write(src.join(".cargo-ok"), b"").unwrap();
     registry.fetch_one(&package).unwrap();
     assert!(src.join("src/lib.rs").is_file());
+    // A directory with files and no `.cargo-ok` at all (an unpacking killed midway) is removed
+    // and unpacked again, never failing on the files it left.
+    std::fs::remove_file(src.join(".cargo-ok")).unwrap();
+    std::fs::write(src.join("stray"), b"").unwrap();
+    registry.fetch_one(&package).unwrap();
+    assert!(src.join("src/lib.rs").is_file());
+    assert!(!src.join("stray").exists());
+    assert_eq!(std::fs::read_to_string(src.join(".cargo-ok")).unwrap(), r#"{"v":1}"#);
 }
 
 #[test]
@@ -285,8 +298,13 @@ fn refuses_what_cargo_refuses() {
         &bytes,
         "x",
     );
+    let specified = format!("specified: sha256:{}", wrong.checksum);
     let e = format!("{:#}", registry.fetch(&[wrong]).unwrap_err());
+    assert!(e.contains("failed to download `wrong v1.0.0`"), "{e}");
     assert!(e.contains("failed to verify the checksum of `wrong v1.0.0`"), "{e}");
+    assert!(e.contains("is not the bytes pinned by sha256, so nothing of it was kept"), "{e}");
+    assert!(e.contains(&specified), "{e}");
+    assert!(e.contains(&format!("got:       sha256:{}", checksum(&bytes))), "{e}");
 
     let outside = fixture.publish("outside", &[("other-1.0.0/a", b"a", 0o644)]);
     let e = format!("{:#}", registry.fetch(&[outside]).unwrap_err());

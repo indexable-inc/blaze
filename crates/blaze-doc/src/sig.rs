@@ -628,10 +628,7 @@ impl<'a> Sig<'a> {
                     binder: BinderParams { len: 0, .. },
                     target,
                     bound,
-                } if self.is_param(*target, id) =>
-                {
-                    Some(bound)
-                }
+                } if self.is_param(*target, id) => Some(bound),
                 _ => None,
             })
             .collect()

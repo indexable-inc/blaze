@@ -24,7 +24,18 @@ fn config(unix: bool, http: bool) -> Config {
 }
 
 fn status() -> Status {
-    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5, build: crate::Build::default(), bugs: Vec::new() }
+    Status {
+        pid: 6,
+        requests: vec![1, 2],
+        views: 3,
+        history: None,
+        memory_bytes: 4,
+        budget_bytes: 5,
+        uptime_ms: 40,
+        build: crate::Build::default(),
+        bugs: Vec::new(),
+        settings: Vec::new(),
+    }
 }
 
 /// The server and a driver played by hand: what it asked for and has not been told of.
@@ -61,7 +72,9 @@ impl Rig {
 
     fn listen(&self, unix: bool) -> Option<Tag> {
         self.in_flight.iter().find_map(|it| match it {
-            Effect::Listen { at: Address::Unix(_) | Address::Inherited { .. }, tag } if unix => Some(*tag),
+            Effect::Listen { at: Address::Unix(_) | Address::Inherited { .. }, tag } if unix => {
+                Some(*tag)
+            }
             Effect::Listen { at: Address::Tcp(_), tag } if !unix => Some(*tag),
             _ => None,
         })
@@ -220,10 +233,13 @@ fn a_request_in_one_frame_arrives_and_its_replies_go_back() {
     assert_eq!(rig.arrived(), [asked(conn, 5, Request::Status)]);
     rig.reply(conn, 5, Response::Status(status()));
     rig.reply(conn, 5, Response::Done { ok: true });
-    assert_eq!(responses(&rig.sent(conn)), [
-        Envelope::new(5, Response::Status(status())),
-        Envelope::new(5, Response::Done { ok: true }),
-    ]);
+    assert_eq!(
+        responses(&rig.sent(conn)),
+        [
+            Envelope::new(5, Response::Status(status())),
+            Envelope::new(5, Response::Done { ok: true }),
+        ]
+    );
     assert!(rig.receiving(conn).is_some());
 }
 
@@ -283,16 +299,19 @@ fn pipelined_requests_arrive_in_order_and_replies_go_in_any() {
     let mut bytes = frame_of(1, Request::Status);
     bytes.extend(frame_of(2, Request::Cancel { id: 1 }));
     rig.deliver(conn, &bytes);
-    assert_eq!(rig.arrived(), [
-        asked(conn, 1, Request::Status),
-        asked(conn, 2, Request::Cancel { id: 1 }),
-    ]);
+    assert_eq!(
+        rig.arrived(),
+        [asked(conn, 1, Request::Status), asked(conn, 2, Request::Cancel { id: 1 }),]
+    );
     rig.reply(conn, 2, Response::Done { ok: true });
     rig.reply(conn, 1, Response::Done { ok: false });
-    assert_eq!(responses(&rig.sent(conn)), [
-        Envelope::new(2, Response::Done { ok: true }),
-        Envelope::new(1, Response::Done { ok: false }),
-    ]);
+    assert_eq!(
+        responses(&rig.sent(conn)),
+        [
+            Envelope::new(2, Response::Done { ok: true }),
+            Envelope::new(1, Response::Done { ok: false }),
+        ]
+    );
 }
 
 #[test]
@@ -382,10 +401,13 @@ fn one_send_is_in_flight_and_later_replies_are_concatenated_behind_it() {
     rig.complete(sends[0].0, Done::Sent(Vec::new()));
     let sends = rig.sends(conn);
     assert_eq!(sends.len(), 1);
-    assert_eq!(responses(&sends[0].1), [
-        Envelope::new(2, Response::Done { ok: true }),
-        Envelope::new(3, Response::Done { ok: true }),
-    ]);
+    assert_eq!(
+        responses(&sends[0].1),
+        [
+            Envelope::new(2, Response::Done { ok: true }),
+            Envelope::new(3, Response::Done { ok: true }),
+        ]
+    );
 }
 
 #[test]
@@ -451,7 +473,10 @@ fn a_passed_socket_is_listened_on_as_inherited_and_kept_open() {
     let socket = Passed::new(OwnedFd::from(UnixListener::bind(&path).unwrap()), Manager::Launchd);
     let fd = socket.fd();
     let at = FileName::new("run/blaze.sock").unwrap();
-    let mut rig = Rig::new(Config { unix: Some(Unix::Passed { socket, at: at.clone() }), ..config(false, false) });
+    let mut rig = Rig::new(Config {
+        unix: Some(Unix::Passed { socket, at: at.clone() }),
+        ..config(false, false)
+    });
     assert!(rig.server.failed().is_none());
     assert!(
         rig.in_flight.iter().any(|it| matches!(it, Effect::Listen { at: Address::Inherited { fd: of, at: name }, .. } if *of == fd && *name == at)),
@@ -479,7 +504,8 @@ fn an_empty_token_or_no_address_is_a_failure() {
     let rig = Rig::new(config);
     assert!(rig.server.failed().unwrap().contains("empty token"));
     assert!(rig.listen(false).is_none());
-    let rig = Rig::new(Config { unix: None, http: None, local: false, tags: 0, most_connections: 1 });
+    let rig =
+        Rig::new(Config { unix: None, http: None, local: false, tags: 0, most_connections: 1 });
     assert!(rig.server.failed().is_some());
 }
 
@@ -533,7 +559,10 @@ fn stop_sends_what_was_replied_before_it_hangs_up() {
     let arrived = rig.arrived();
     assert!(arrived.is_empty(), "a stopped server took a request: {arrived:?}");
     rig.reply(conn, 2, Response::Done { ok: true });
-    assert_eq!(responses(&rig.sent(conn)), [Envelope::new(1, error), Envelope::new(1, Response::Done { ok: false })]);
+    assert_eq!(
+        responses(&rig.sent(conn)),
+        [Envelope::new(1, error), Envelope::new(1, Response::Done { ok: false })]
+    );
     assert!(rig.hung_up(conn), "not hung up once all was sent");
     assert_eq!(rig.arrived(), [Arrived::Gone { conn }]);
     assert_eq!(rig.receiving(conn), None);
@@ -580,7 +609,9 @@ fn abandon_hangs_up_on_a_connection_a_stop_left_sending_and_names_what_went_unse
 #[test]
 fn any_split_of_a_unix_stream_gives_the_same_arrivals_and_answers() {
     let mut stream = frame_of(1, Request::Status);
-    stream.extend(framed(&cbor::to_vec(&Envelope { schema: 2, id: 4, body: Request::Status }).unwrap()));
+    stream.extend(framed(
+        &cbor::to_vec(&Envelope { schema: 2, id: 4, body: Request::Status }).unwrap(),
+    ));
     stream.extend(frame_of(2, Request::Cancel { id: 1 }));
     stream.extend(framed(&[0xa0]));
     stream.extend(frame_of(3, Request::Status));
@@ -601,11 +632,14 @@ fn any_split_of_a_unix_stream_gives_the_same_arrivals_and_answers() {
         (rig.arrived(), out)
     };
     let (arrived, out) = run(&mut |left: usize| left);
-    assert_eq!(arrived, [
-        asked(Conn(1), 1, Request::Status),
-        asked(Conn(1), 2, Request::Cancel { id: 1 }),
-        asked(Conn(1), 3, Request::Status),
-    ]);
+    assert_eq!(
+        arrived,
+        [
+            asked(Conn(1), 1, Request::Status),
+            asked(Conn(1), 2, Request::Cancel { id: 1 }),
+            asked(Conn(1), 3, Request::Status),
+        ]
+    );
     let ids: Vec<u64> = responses(&out).iter().map(|it| it.id).collect();
     assert_eq!(ids, [4, 4, 0, 0]);
     for seed in 0..300 {
@@ -621,18 +655,27 @@ fn http_without_the_token_is_401_and_never_arrives() {
     let conn = rig.accept(false, 1);
     let item = cbor::to_vec(&Envelope::new(1, Request::Status)).unwrap();
     rig.deliver(conn, &post(&item, &[("Content-Type", "application/cbor")]));
-    rig.deliver(conn, &post(&item, &[
-        ("Authorization", "Bearer wrong-token"),
-        ("Content-Type", "application/cbor"),
-    ]));
-    rig.deliver(conn, &post(&item, &[
-        ("Authorization", "Basic s3cret-token"),
-        ("Content-Type", "application/cbor"),
-    ]));
-    rig.deliver(conn, &post(&item, &[
-        ("Authorization", "Bearer s3cret-toke"),
-        ("Content-Type", "application/cbor"),
-    ]));
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[("Authorization", "Bearer wrong-token"), ("Content-Type", "application/cbor")],
+        ),
+    );
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[("Authorization", "Basic s3cret-token"), ("Content-Type", "application/cbor")],
+        ),
+    );
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[("Authorization", "Bearer s3cret-toke"), ("Content-Type", "application/cbor")],
+        ),
+    );
     assert!(rig.arrived().is_empty());
     let out = http_responses(&rig.sent(conn));
     assert_eq!(out.iter().map(|it| it.status).collect::<Vec<_>>(), [401; 4]);
@@ -649,10 +692,16 @@ fn http_with_the_token_arrives_and_is_answered_in_chunks_of_frames() {
     let mut rig = Rig::new(config(false, true));
     let conn = rig.accept(false, 1);
     let item = cbor::to_vec(&Envelope::new(5, Request::Status)).unwrap();
-    rig.deliver(conn, &post(&item, &[
-        ("authorization", "bearer s3cret-token"),
-        ("Content-Type", "application/cbor; charset=binary"),
-    ]));
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[
+                ("authorization", "bearer s3cret-token"),
+                ("Content-Type", "application/cbor; charset=binary"),
+            ],
+        ),
+    );
     assert_eq!(rig.arrived(), [asked(conn, 5, Request::Status)]);
     rig.reply(conn, 5, Response::Status(status()));
     rig.reply(conn, 5, Response::Done { ok: true });
@@ -661,10 +710,13 @@ fn http_with_the_token_arrives_and_is_answered_in_chunks_of_frames() {
     assert_eq!(response.status, 200);
     assert_eq!(response.header("Content-Type"), Some("application/cbor"));
     assert_eq!(response.header("Transfer-Encoding"), Some("chunked"));
-    assert_eq!(responses(&response.body), [
-        Envelope::new(5, Response::Status(status())),
-        Envelope::new(5, Response::Done { ok: true }),
-    ]);
+    assert_eq!(
+        responses(&response.body),
+        [
+            Envelope::new(5, Response::Status(status())),
+            Envelope::new(5, Response::Done { ok: true }),
+        ]
+    );
     assert!(rig.receiving(conn).is_some() && !rig.hung_up(conn));
 }
 
@@ -673,11 +725,17 @@ fn http_asking_for_json_is_answered_in_lines() {
     let mut rig = Rig::new(config(false, true));
     let conn = rig.accept(false, 1);
     let item = cbor::to_vec(&Envelope::new(8, Request::Status)).unwrap();
-    rig.deliver(conn, &post(&item, &[
-        ("Authorization", AUTHORIZATION),
-        ("Content-Type", "application/cbor"),
-        ("Accept", "text/html, application/json;q=0.9"),
-    ]));
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[
+                ("Authorization", AUTHORIZATION),
+                ("Content-Type", "application/cbor"),
+                ("Accept", "text/html, application/json;q=0.9"),
+            ],
+        ),
+    );
     rig.arrived();
     rig.reply(conn, 8, Response::Status(status()));
     rig.reply(conn, 8, Response::Done { ok: true });
@@ -685,10 +743,13 @@ fn http_asking_for_json_is_answered_in_lines() {
     assert_eq!(out[0].header("Content-Type"), Some("application/x-ndjson"));
     let body = String::from_utf8(out[0].body.clone()).unwrap();
     let lines: Vec<&str> = body.lines().collect();
-    assert_eq!(lines, [
-        json::response(&Envelope::new(8, Response::Status(status()))),
-        json::response(&Envelope::new(8, Response::Done { ok: true })),
-    ]);
+    assert_eq!(
+        lines,
+        [
+            json::response(&Envelope::new(8, Response::Status(status()))),
+            json::response(&Envelope::new(8, Response::Done { ok: true })),
+        ]
+    );
     assert!(body.ends_with('\n'));
 }
 
@@ -699,7 +760,10 @@ fn http_to_another_path_or_with_another_method_or_body_is_refused() {
     let auth = ("Authorization", AUTHORIZATION);
     rig.deliver(conn, &http::request("POST", "d", "/other", &[auth], b""));
     rig.deliver(conn, &http::request("GET", "d", "/api", &[auth], b""));
-    rig.deliver(conn, &http::request("POST", "d", "/api", &[auth, ("Content-Type", "text/plain")], b"x"));
+    rig.deliver(
+        conn,
+        &http::request("POST", "d", "/api", &[auth, ("Content-Type", "text/plain")], b"x"),
+    );
     assert!(rig.arrived().is_empty());
     let out = http_responses(&rig.sent(conn));
     assert_eq!(out.iter().map(|it| it.status).collect::<Vec<_>>(), [404, 405, 415]);
@@ -750,11 +814,17 @@ fn an_http_connection_that_asks_to_close_is_hung_up_on_after_its_answer() {
     let mut rig = Rig::new(config(false, true));
     let conn = rig.accept(false, 1);
     let item = cbor::to_vec(&Envelope::new(1, Request::Status)).unwrap();
-    rig.deliver(conn, &post(&item, &[
-        ("Authorization", AUTHORIZATION),
-        ("Content-Type", "application/cbor"),
-        ("Connection", "close"),
-    ]));
+    rig.deliver(
+        conn,
+        &post(
+            &item,
+            &[
+                ("Authorization", AUTHORIZATION),
+                ("Content-Type", "application/cbor"),
+                ("Connection", "close"),
+            ],
+        ),
+    );
     rig.arrived();
     rig.reply(conn, 1, Response::Done { ok: true });
     let out = http_responses(&rig.sent(conn));
@@ -824,10 +894,10 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
         (arrived, out)
     };
     let (arrived, out) = run(&mut |left: usize| left);
-    assert_eq!(arrived, [
-        asked(Conn(1), 1, Request::Status),
-        asked(Conn(1), 3, Request::Cancel { id: 1 }),
-    ]);
+    assert_eq!(
+        arrived,
+        [asked(Conn(1), 1, Request::Status), asked(Conn(1), 3, Request::Cancel { id: 1 }),]
+    );
     assert_eq!(http_responses(&out).len(), 3);
     for seed in 0..200 {
         let mut rng = Rng::new(seed);
@@ -861,15 +931,25 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
                     }
                     _ => None,
                 });
-                assert_eq!(lent, Some(true), "{unix}: a warm receive is given room for what it reads");
+                assert_eq!(
+                    lent,
+                    Some(true),
+                    "{unix}: a warm receive is given room for what it reads"
+                );
             }
             let (tag, into) = rig.received_into(conn, &bytes);
             let (_, read) = blaze_alloc_count::measure(|| {
-                rig.server.complete(Completion { tag, done: Done::Read(into) }, &mut effects, &mut arrived)
+                rig.server.complete(
+                    Completion { tag, done: Done::Read(into) },
+                    &mut effects,
+                    &mut arrived,
+                )
             });
             let head = u64::from(!unix);
             assert!(!warm || read.allocations <= head, "{unix}: a warm request read: {read:?}");
-            assert!(matches!(arrived[..], [Arrived::Request { request: Request::Cancel { id: got }, .. }] if got == id));
+            assert!(
+                matches!(arrived[..], [Arrived::Request { request: Request::Cancel { id: got }, .. }] if got == id)
+            );
             arrived.clear();
             rig.in_flight.extend(effects.drain(..));
             let to = RequestRef { conn, id };
@@ -879,7 +959,10 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
             assert!(!warm || replied.allocations <= head, "{unix}: a warm reply: {replied:?}");
             rig.in_flight.extend(effects.drain(..));
             let sending = |rig: &mut Rig| {
-                let at = rig.in_flight.iter().position(|it| matches!(it, Effect::Send { conn: of, .. } if *of == conn))?;
+                let at = rig
+                    .in_flight
+                    .iter()
+                    .position(|it| matches!(it, Effect::Send { conn: of, .. } if *of == conn))?;
                 match rig.in_flight.remove(at) {
                     Effect::Send { mut bytes, tag, .. } => {
                         bytes.clear();
@@ -891,7 +974,11 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
             let mut sends = 0;
             while let Some((sent, bytes)) = sending(&mut rig) {
                 let (_, done) = blaze_alloc_count::measure(|| {
-                    rig.server.complete(Completion { tag: sent, done: Done::Sent(bytes) }, &mut effects, &mut arrived)
+                    rig.server.complete(
+                        Completion { tag: sent, done: Done::Sent(bytes) },
+                        &mut effects,
+                        &mut arrived,
+                    )
                 });
                 assert!(!warm || done.allocations == 0, "{unix}: a warm send's end: {done:?}");
                 rig.in_flight.extend(effects.drain(..));
@@ -926,7 +1013,11 @@ fn a_local_connection_takes_its_replies_from_the_server_never_the_driver() {
     let mut rig = Rig::new(config(true, false));
     assert_eq!(rig.server.open_local(), None);
     let mixed = Rig::new(Config { local: true, ..config(true, false) });
-    assert!(mixed.server.failed().unwrap().contains("only when it listens on nothing"), "{:?}", mixed.server.failed());
+    assert!(
+        mixed.server.failed().unwrap().contains("only when it listens on nothing"),
+        "{:?}",
+        mixed.server.failed()
+    );
     let mut rig = Rig::new(Config { local: true, ..config(false, false) });
     assert_eq!(rig.server.failed(), None);
     assert!(rig.in_flight.is_empty(), "{:?}", rig.in_flight);
@@ -934,7 +1025,10 @@ fn a_local_connection_takes_its_replies_from_the_server_never_the_driver() {
     let (mut effects, mut arrived) = (Vec::new(), Vec::new());
     rig.server.send_local(conn, &frame_of(3, Request::Status), &mut effects, &mut arrived);
     assert_eq!(arrived, [asked(conn, 3, Request::Status)]);
-    rig.server.reply(&Reply { to: RequestRef { conn, id: 3 }, response: Response::Done { ok: true } }, &mut effects);
+    rig.server.reply(
+        &Reply { to: RequestRef { conn, id: 3 }, response: Response::Done { ok: true } },
+        &mut effects,
+    );
     rig.server.stop(&mut effects);
     assert!(effects.is_empty(), "{effects:?}");
     let mut taken = Vec::new();

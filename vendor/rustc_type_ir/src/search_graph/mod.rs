@@ -746,8 +746,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
 
     /// Its storage, emptied with its capacity kept, for the next graph.
     pub fn into_storage(self) -> SearchGraphStorage<D::Cx, D::Scratch> {
-        let SearchGraph { mut stack, mut provisional_cache, mut spare_entries, scratch, .. } =
-            self;
+        let SearchGraph { mut stack, mut provisional_cache, mut spare_entries, scratch, .. } = self;
         stack.clear();
         // Every list is emptied, so the order they are kept in cannot be observed.
         #[allow(rustc::potential_query_instability)]
@@ -1743,11 +1742,7 @@ mod tests {
         fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, ()) {
             (task(), ())
         }
-        fn with_global_cache<R>(
-            self,
-            _: CacheScope,
-            f: impl FnOnce(&GlobalCache<Self>) -> R,
-        ) -> R {
+        fn with_global_cache<R>(self, _: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R) -> R {
             CACHE.with(f)
         }
         fn cache_scope(self, _: &()) -> CacheScope {

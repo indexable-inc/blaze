@@ -101,7 +101,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
                 Diag::lint("non_camel_case_types", format!("{sort} `{name}` should have an upper camel case name"), span.clone());
             let cc = to_upper_camel_case(name);
             match cc != name {
-                true => diag.suggestion(span, "convert the identifier to upper camel case", cc, Applicability::MaybeIncorrect),
+                true => diag.suggestion(
+                    span,
+                    "convert the identifier to upper camel case",
+                    cc,
+                    Applicability::MaybeIncorrect,
+                ),
                 false => diag.span_label(span, "should have an UpperCamelCase name"),
             };
             Found::lint(diag, Phase::Resolve, at(lint_at))
@@ -110,12 +115,21 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
             let span = cx.span_of_ptr(name_ptr);
             let sort = snake_sort(owner);
             // alloc: the error's text, for an error hir found
-            let mut diag = Diag::lint("non_snake_case", format!("{sort} `{name}` should have a snake case name"), span.clone());
+            let mut diag = Diag::lint(
+                "non_snake_case",
+                format!("{sort} `{name}` should have a snake case name"),
+                span.clone(),
+            );
             let sc = to_snake_case(name);
             if sc == name {
                 diag.span_label(span, "should have a snake_case name");
             } else if !is_reserved(&sc, cx.edition) {
-                diag.suggestion(span, "convert the identifier to snake case", sc, Applicability::MaybeIncorrect);
+                diag.suggestion(
+                    span,
+                    "convert the identifier to snake case",
+                    sc,
+                    Applicability::MaybeIncorrect,
+                );
             } else if can_be_raw(&sc) {
                 diag.suggestion(
                     span,
@@ -154,7 +168,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
             let diag = Diag::error(
                 None,
                 // alloc: the error's text, for an error hir found
-                format!("blaze does not know rustc's style lint of a name of kind `{}`: `{name}`", d.ident_type),
+                format!(
+                    "blaze does not know rustc's style lint of a name of kind `{}`: `{name}`",
+                    d.ident_type
+                ),
                 cx.span_of_ptr(name_ptr),
             );
             Found::new(diag, Phase::Late)
@@ -181,7 +198,9 @@ fn camel_sort(owner: ast::Node<'_>) -> (&'static str, ast::Node<'_>) {
         },
         SyntaxKind::VARIANT => ("variant", owner),
         SyntaxKind::TYPE_ALIAS => match assoc_container(owner) {
-            Some(container) if container.kind() == SyntaxKind::IMPL => ("associated type", container),
+            Some(container) if container.kind() == SyntaxKind::IMPL => {
+                ("associated type", container)
+            }
             Some(_) => ("associated type", owner),
             None => ("type", owner),
         },
@@ -214,7 +233,10 @@ fn upper_sort<'db>(cx: &Cx<'_, 'db>, owner: ast::Node<'db>) -> (&'static str, Op
     }
     if let Some(it) = ast::Static::cast(owner) {
         let def = cx.vsema.to_def(it);
-        return ("static variable", def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))));
+        return (
+            "static variable",
+            def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))),
+        );
     }
     ("constant", None)
 }
@@ -270,7 +292,8 @@ fn to_titlecase(c: char) -> TitleCase {
     if !special.is_empty() {
         return TitleCase::Special(special.iter().copied());
     }
-    let offset = |by: u32| char::from_u32(c as u32 + by).expect("a letter of the Greek Extended block");
+    let offset =
+        |by: u32| char::from_u32(c as u32 + by).expect("a letter of the Greek Extended block");
     let single = match c {
         '\u{01C4}'..='\u{01C6}' => '\u{01C5}',
         '\u{01C7}'..='\u{01C9}' => '\u{01C8}',

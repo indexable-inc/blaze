@@ -16,8 +16,8 @@
 //! example alone.
 
 use base_db::{
-    AbsPathBuf, BuiltCrateData, Crate, CrateDisplayName, CrateOrigin, ExtraCrateData, FileId, FileSet, SourceRoot,
-    SourceRootId, TargetKind, Trigger, VfsPath,
+    AbsPathBuf, BuiltCrateData, Crate, CrateDisplayName, CrateOrigin, ExtraCrateData, FileId,
+    FileSet, SourceRoot, SourceRootId, TargetKind, Trigger, VfsPath,
 };
 use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgDiff};
@@ -72,10 +72,16 @@ impl Lowered {
     /// file can't be made.
     ///
     /// A write, as [`Lowered::ran`] is: one batch.
-    pub fn doctests(&mut self, unit: usize, programs: &[DoctestProgram<'_>]) -> Result<Vec<Crate>, LowerError> {
+    pub fn doctests(
+        &mut self,
+        unit: usize,
+        programs: &[DoctestProgram<'_>],
+    ) -> Result<Vec<Crate>, LowerError> {
         let Some(lowering) = self.crates.units.get(unit) else {
             // alloc: an error
-            return Err(LowerError::new(format!("the build has no unit {unit} to make doctests of")));
+            return Err(LowerError::new(format!(
+                "the build has no unit {unit} to make doctests of"
+            )));
         };
         // clone: once per doctest unit written, what its trigger names
         let what = lowering.what.clone();
@@ -87,15 +93,23 @@ impl Lowered {
     /// ([`DoctestProgram::appended`]), by its id, copied out for the caller to give back while
     /// it writes: none before its first [`Lowered::doctests`].
     pub fn doctest_harnesses(&self, unit: usize) -> Vec<(String, Appended)> {
-        let made = self.doctests.iter().find(|it| it.unit == unit).map_or(&[][..], |it| &it.made[..]);
+        let made =
+            self.doctests.iter().find(|it| it.unit == unit).map_or(&[][..], |it| &it.made[..]);
         // alloc: once per doctest unit made, its test examples' ids and harnesses
         made.iter().filter_map(|it| Some((it.id.clone(), it.appended.clone()?))).collect()
     }
 
-    fn doctest_writes(&mut self, unit: usize, programs: &[DoctestProgram<'_>]) -> Result<Vec<Crate>, LowerError> {
+    fn doctest_writes(
+        &mut self,
+        unit: usize,
+        programs: &[DoctestProgram<'_>],
+    ) -> Result<Vec<Crate>, LowerError> {
         let lowering = &self.crates.units[unit];
         let Some(library) = lowering.krate else {
-            return Err(LowerError::at("a unit with no crate has no doctests", lowering.what.clone()));
+            return Err(LowerError::at(
+                "a unit with no crate has no doctests",
+                lowering.what.clone(),
+            ));
         };
         // clone: once per doctest unit written, what its examples' crates are made of
         let what = lowering.what.clone();
@@ -111,7 +125,6 @@ impl Lowered {
             display_name: Some(CrateDisplayName::from_canonical_name("rust_out")),
             potential_cfg_options: None,
             built_for: library.extra_data(db).built_for.clone(),
-            build_script_runs: library.extra_data(db).build_script_runs.clone(), // clone: the example reads the library's runs
         };
 
         let at = match self.doctests.iter().position(|it| it.unit == unit) {
@@ -124,7 +137,8 @@ impl Lowered {
         };
         // Each example's source root is its own, after the packages' and every one an example
         // of any unit has.
-        let taken = self.doctests.iter().flat_map(|it| it.made.iter().map(|made| made.root.0)).max();
+        let taken =
+            self.doctests.iter().flat_map(|it| it.made.iter().map(|made| made.root.0)).max();
         let mut next = taken.map_or(self.crates.sets as u32 + 1, |it| it + 1);
         let mut was = std::mem::take(&mut self.doctests[at].made);
         // alloc: once per doctest unit written, its programs' crates
@@ -132,15 +146,23 @@ impl Lowered {
         for program in programs {
             // alloc: a program's path, once per program written
             let path = format!("{}.{}.doctest.rs", program.named, program.id);
-            let path = AbsPathBuf::try_from(path.as_str())
-                .map_err(|_| LowerError::at(format!("the file of doctest `{}` is no absolute path", program.id), path.clone()))?;
-            let reused = was.iter().position(|it| it.id == program.id).map(|at| was.swap_remove(at));
+            let path = AbsPathBuf::try_from(path.as_str()).map_err(|_| {
+                LowerError::at(
+                    format!("the file of doctest `{}` is no absolute path", program.id),
+                    path.clone(),
+                )
+            })?;
+            let reused =
+                was.iter().position(|it| it.id == program.id).map(|at| was.swap_remove(at));
             let (file, root) = match &reused {
                 Some(it) => (it.file, it.root),
                 None => {
                     let file = db.new_file_id().ok_or_else(|| {
                         // alloc: an error
-                        LowerError::at(format!("base-db has no file ID left for doctest `{}`", program.id), what.clone())
+                        LowerError::at(
+                            format!("base-db has no file ID left for doctest `{}`", program.id),
+                            what.clone(),
+                        )
                     })?;
                     next += 1;
                     (file, SourceRootId(next - 1))
@@ -159,13 +181,23 @@ impl Lowered {
                 }
             }
             db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            // The origin sets the kind of the example crate's maintained state
+            // (`base_db::crate_durability`): a registry library's examples are `Library`, so
+            // `HIGH` like it; any other's are `Local`, so `LOW`. Its file and source root stay
+            // `LOW`: they are rewritten whenever the examples are.
             let origin = match &base.origin {
                 CrateOrigin::Library { repo, .. } => {
                     // alloc: the crate's origin, once per program made
-                    CrateOrigin::Library { repo: repo.clone(), name: Symbol::intern(&format!("{what} doctest {}", program.id)) }
+                    CrateOrigin::Library {
+                        repo: repo.clone(),
+                        name: Symbol::intern(&format!("{what} doctest {}", program.id)),
+                    }
                 }
                 // alloc: as above
-                _ => CrateOrigin::Local { repo: None, name: Some(Symbol::intern(&format!("{what} doctest {}", program.id))) },
+                _ => CrateOrigin::Local {
+                    repo: None,
+                    name: Some(Symbol::intern(&format!("{what} doctest {}", program.id))),
+                },
             };
             // A test's crate is a test target's, whose `main` is its harness's, as rustc's
             // `--test` makes it; any other program's is a binary's.
@@ -206,13 +238,21 @@ impl Lowered {
             if !holds {
                 let mut files = FileSet::default();
                 files.insert(file, path);
-                db.set_source_root_with_durability(root, Arc::new(SourceRoot::new_local(files)), Durability::LOW);
+                db.set_source_root_with_durability(
+                    root,
+                    Arc::new(SourceRoot::new_local(files)),
+                    Durability::LOW,
+                );
             }
             made.push((program, file, root, reused.map(|it| it.krate), data, cfg));
         }
         // An example no longer given leaves its source root empty.
         for gone in &was {
-            db.set_source_root_with_durability(gone.root, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
+            db.set_source_root_with_durability(
+                gone.root,
+                Arc::new(SourceRoot::new_local(FileSet::default())),
+                Durability::LOW,
+            );
         }
         let mut kept = Vec::with_capacity(made.len());
         for (program, file, root, krate, data, cfg) in made {
@@ -230,10 +270,24 @@ impl Lowered {
                     krate
                 }
                 // clone: as `data`
-                None => Crate::create(db, data, extra.clone(), workspace.clone(), cfg, env.clone(), Durability::MEDIUM),
+                None => Crate::create(
+                    db,
+                    data,
+                    extra.clone(),
+                    workspace.clone(),
+                    cfg,
+                    env.clone(),
+                    Durability::MEDIUM,
+                ),
             };
             // alloc: a program's id, once per program made, and a test's harness (cloned)
-            kept.push(Made { id: program.id.to_owned(), file, root, krate, appended: program.appended.cloned() });
+            kept.push(Made {
+                id: program.id.to_owned(),
+                file,
+                root,
+                krate,
+                appended: program.appended.cloned(),
+            });
         }
         let paths = std::sync::Arc::make_mut(&mut self.paths);
         for gone in &was {
@@ -248,7 +302,8 @@ impl Lowered {
         // library's, and that one is of the request ([`base_db::PRIMARY_PACKAGE`]).
         if base_db::is_primary(db, library) {
             // alloc: once per doctest unit written of a primary package, the primary crates
-            let primary: Vec<Crate> = base_db::primary_crates(db).iter().copied().chain(crates.iter().copied()).collect();
+            let primary: Vec<Crate> =
+                base_db::primary_crates(db).iter().copied().chain(crates.iter().copied()).collect();
             base_db::set_primary_crates(db, primary);
         }
         self.doctests[at].made = kept;

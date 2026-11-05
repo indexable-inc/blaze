@@ -8,8 +8,9 @@
 //   key: a character as typed without modifiers ("n", "[", "=") or a named key (left right up down return enter tab
 //   space backspace delete escape home end pageup pagedown f1..f12). Modifiers are 0 or 1 and must match exactly.
 //   No When: the binding holds everywhere (below every context). With When it holds only while that context is active;
-//   the innermost active context wins (ctx.Palette, ctx.Archive, then ctx.Tree over ctx.Terminal), then later bindings
-//   over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's search).
+//   the innermost active context wins (ctx.Palette or ctx.Picker, ctx.Archive, then ctx.Tree over ctx.Terminal), then
+//   later bindings over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's
+//   search; the picker drops it).
 // An action: act.<Name>, run by the handler registered under its name, else its base's (`act.SpawnClaude : act.Spawn`).
 //   MenuItem puts it in the menu bar (bar order is first appearance; sep: 1 draws a separator above it); Selector sends an
 //   AppKit action up the responder chain instead of a handler.
@@ -23,7 +24,11 @@ ctx {
   Terminal {}
   Tree {}
   Palette {}
+  // The new-object picker (cmd+N) while it is open.
+  Picker {}
   Archive {}
+  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
+  Chat {}
 }
 
 // ---- actions ----
@@ -35,14 +40,26 @@ act {
   Quit { Selector: {sel: "terminate:"}
     MenuItem: {bar: "harness", title: "Quit harness", sep: 1} }
 
+  // The picker (cmd+N): a row for each act.Spawn below with a `title`, in this order (the one picked last is highlighted
+  // when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
+  Picker { MenuItem: {bar: "File", title: "New…"} }
+  // A new object of `kind` in the selected object's directory (else home); `title` names it in the picker (none: not
+  // in the picker). The palette offers every one, by its menu title.
   prefab Spawn
-  SpawnShell : act.Spawn { SpawnKind: {kind: "shell"}
-    MenuItem: {bar: "File", title: "New Shell"} }
-  SpawnClaude : act.Spawn { SpawnKind: {kind: "claude"}
+  SpawnClaude : act.Spawn { SpawnKind: {kind: "claude", title: "Claude"}
     MenuItem: {bar: "File", title: "New Claude"} }
-  SpawnCodex : act.Spawn { SpawnKind: {kind: "codex"}
+  // Claude (and Codex, below) in its own terminal UI (a PTY) instead of the chat pane; no title, so the palette and the
+  // menu offer it but the picker does not.
+  SpawnClaudeTui : act.Spawn { SpawnKind: {kind: "claude-tui"}
+    MenuItem: {bar: "File", title: "New Claude (Terminal)"} }
+  SpawnCodex : act.Spawn { SpawnKind: {kind: "codex", title: "Codex"}
     MenuItem: {bar: "File", title: "New Codex"} }
-  SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor"} }
+  SpawnCodexTui : act.Spawn { SpawnKind: {kind: "codex-tui"}
+    MenuItem: {bar: "File", title: "New Codex (Terminal)"} }
+  SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor", title: "Cursor"}
+    MenuItem: {bar: "File", title: "New Cursor"} }
+  SpawnShell : act.Spawn { SpawnKind: {kind: "shell", title: "Shell"}
+    MenuItem: {bar: "File", title: "New Shell"} }
   Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
 
   Copy { Selector: {sel: "copy:"}
@@ -90,6 +107,7 @@ act {
   // Hand the keyboard back to the terminal.
   TreeLeave {}
 
+  // The palette's, and the picker's too (its rows are the palette's entries while it is open; its arrows go round).
   PaletteClose {}
   PaletteUp {}
   PaletteDown {}
@@ -111,6 +129,36 @@ act {
   LineEnd : act.SendBytes { Bytes: {bytes: "^E"} }
   LineErase : act.SendBytes { Bytes: {bytes: "^U"} }
   Undo : act.SendBytes { Bytes: {bytes: "^_"} }
+
+  // The chat input's editing (src/app/chat.rs): each an EditOp.
+  prefab Edit
+  ChatSend : act.Edit { EditOp: {op: "send"} }
+  ChatNewline : act.Edit { EditOp: {op: "newline"} }
+  ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
+  ChatLeft : act.Edit { EditOp: {op: "left"} }
+  ChatRight : act.Edit { EditOp: {op: "right"} }
+  ChatUp : act.Edit { EditOp: {op: "up"} }
+  ChatDown : act.Edit { EditOp: {op: "down"} }
+  ChatWordLeft : act.Edit { EditOp: {op: "word_left"} }
+  ChatWordRight : act.Edit { EditOp: {op: "word_right"} }
+  ChatLineStart : act.Edit { EditOp: {op: "line_start"} }
+  ChatLineEnd : act.Edit { EditOp: {op: "line_end"} }
+  ChatDocStart : act.Edit { EditOp: {op: "doc_start"} }
+  ChatDocEnd : act.Edit { EditOp: {op: "doc_end"} }
+  ChatSelectLeft : act.Edit { EditOp: {op: "select_left"} }
+  ChatSelectRight : act.Edit { EditOp: {op: "select_right"} }
+  ChatSelectUp : act.Edit { EditOp: {op: "select_up"} }
+  ChatSelectDown : act.Edit { EditOp: {op: "select_down"} }
+  ChatSelectWordLeft : act.Edit { EditOp: {op: "select_word_left"} }
+  ChatSelectWordRight : act.Edit { EditOp: {op: "select_word_right"} }
+  ChatSelectLineStart : act.Edit { EditOp: {op: "select_line_start"} }
+  ChatSelectLineEnd : act.Edit { EditOp: {op: "select_line_end"} }
+  ChatBackspace : act.Edit { EditOp: {op: "backspace"} }
+  ChatDelete : act.Edit { EditOp: {op: "delete"} }
+  ChatWordErase : act.Edit { EditOp: {op: "word_erase"} }
+  ChatWordDelete : act.Edit { EditOp: {op: "word_delete"} }
+  ChatLineErase : act.Edit { EditOp: {op: "line_erase"} }
+  ChatCut : act.Edit { EditOp: {op: "cut"} }
 }
 
 // ---- bindings ----
@@ -122,7 +170,9 @@ key {
   quit { Keybind: {key: "q", cmd: 1}
     (Does, act.Quit) }
 
-  new_shell { Keybind: {key: "n", cmd: 1}
+  pick_new { Keybind: {key: "n", cmd: 1}
+    (Does, act.Picker) }
+  new_shell { Keybind: {key: "n", cmd: 1, shift: 1}
     (Does, act.SpawnShell) }
   new_claude { Keybind: {key: "t", cmd: 1}
     (Does, act.SpawnClaude) }
@@ -227,6 +277,54 @@ key {
     (Does, act.PaletteErase)
     (When, ctx.Palette) }
 
+  // The picker: arrows or Tab move the highlight, Return starts it, a digit (first, so the keycaps show it) or a letter
+  // starts one at once, Escape closes it.
+  picker_escape { Keybind: {key: "escape"}
+    (Does, act.PaletteClose)
+    (When, ctx.Picker) }
+  picker_up { Keybind: {key: "up"}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_tab { Keybind: {key: "tab"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_backtab { Keybind: {key: "tab", shift: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_return { Keybind: {key: "return"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_enter { Keybind: {key: "enter"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_1 { Keybind: {key: "1"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_2 { Keybind: {key: "2"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_3 { Keybind: {key: "3"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_4 { Keybind: {key: "4"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
+  picker_claude { Keybind: {key: "c"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_codex { Keybind: {key: "x"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_cursor { Keybind: {key: "u"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_shell { Keybind: {key: "s"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
+
   archive_escape { Keybind: {key: "escape"}
     (Does, act.SearchClear)
     (When, ctx.Archive) }
@@ -264,4 +362,37 @@ key {
   undo { Keybind: {key: "z", cmd: 1}
     (Does, act.Undo)
     (When, ctx.Terminal) }
+
+  chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
+  chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
+  chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  chat_left { Keybind: {key: "left"}; (Does, act.ChatLeft); (When, ctx.Chat) }
+  chat_right { Keybind: {key: "right"}; (Does, act.ChatRight); (When, ctx.Chat) }
+  chat_up { Keybind: {key: "up"}; (Does, act.ChatUp); (When, ctx.Chat) }
+  chat_down { Keybind: {key: "down"}; (Does, act.ChatDown); (When, ctx.Chat) }
+  chat_word_left { Keybind: {key: "left", opt: 1}; (Does, act.ChatWordLeft); (When, ctx.Chat) }
+  chat_word_right { Keybind: {key: "right", opt: 1}; (Does, act.ChatWordRight); (When, ctx.Chat) }
+  chat_line_start { Keybind: {key: "left", cmd: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }
+  chat_line_end { Keybind: {key: "right", cmd: 1}; (Does, act.ChatLineEnd); (When, ctx.Chat) }
+  chat_ctrl_a { Keybind: {key: "a", ctrl: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }
+  chat_ctrl_e { Keybind: {key: "e", ctrl: 1}; (Does, act.ChatLineEnd); (When, ctx.Chat) }
+  chat_doc_start { Keybind: {key: "up", cmd: 1}; (Does, act.ChatDocStart); (When, ctx.Chat) }
+  chat_doc_end { Keybind: {key: "down", cmd: 1}; (Does, act.ChatDocEnd); (When, ctx.Chat) }
+  chat_sel_left { Keybind: {key: "left", shift: 1}; (Does, act.ChatSelectLeft); (When, ctx.Chat) }
+  chat_sel_right { Keybind: {key: "right", shift: 1}; (Does, act.ChatSelectRight); (When, ctx.Chat) }
+  chat_sel_up { Keybind: {key: "up", shift: 1}; (Does, act.ChatSelectUp); (When, ctx.Chat) }
+  chat_sel_down { Keybind: {key: "down", shift: 1}; (Does, act.ChatSelectDown); (When, ctx.Chat) }
+  chat_sel_word_left { Keybind: {key: "left", shift: 1, opt: 1}; (Does, act.ChatSelectWordLeft); (When, ctx.Chat) }
+  chat_sel_word_right { Keybind: {key: "right", shift: 1, opt: 1}; (Does, act.ChatSelectWordRight); (When, ctx.Chat) }
+  chat_sel_line_start { Keybind: {key: "left", shift: 1, cmd: 1}; (Does, act.ChatSelectLineStart); (When, ctx.Chat) }
+  chat_sel_line_end { Keybind: {key: "right", shift: 1, cmd: 1}; (Does, act.ChatSelectLineEnd); (When, ctx.Chat) }
+  chat_backspace { Keybind: {key: "backspace"}; (Does, act.ChatBackspace); (When, ctx.Chat) }
+  chat_delete { Keybind: {key: "delete"}; (Does, act.ChatDelete); (When, ctx.Chat) }
+  chat_word_erase { Keybind: {key: "backspace", opt: 1}; (Does, act.ChatWordErase); (When, ctx.Chat) }
+  chat_word_delete { Keybind: {key: "delete", opt: 1}; (Does, act.ChatWordDelete); (When, ctx.Chat) }
+  chat_line_erase { Keybind: {key: "backspace", cmd: 1}; (Does, act.ChatLineErase); (When, ctx.Chat) }
+  chat_cut { Keybind: {key: "x", cmd: 1}; (Does, act.ChatCut); (When, ctx.Chat) }
 }

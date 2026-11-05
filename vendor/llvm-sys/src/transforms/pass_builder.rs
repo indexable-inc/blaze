@@ -93,6 +93,9 @@ extern "C" {
     /// Whether the target of `TM` has a feature named `Name` (`Length` bytes, no NUL needed),
     /// as rustc's `LLVMRustHasFeature` asks. LLVM told a name it lacks warns and ignores it.
     pub fn LLVMBlazeHasFeature(TM: LLVMTargetMachineRef, Name: *const ::libc::c_char, Length: usize) -> LLVMBool;
+    /// Whether the target of `TM` knows the CPU `Name` (`Length` bytes, no NUL needed), its
+    /// aliases included. LLVM told a CPU it does not know warns and compiles for none.
+    pub fn LLVMBlazeHasCpu(TM: LLVMTargetMachineRef, Name: *const ::libc::c_char, Length: usize) -> LLVMBool;
     pub fn LLVMBlazeDisposePasses(Passes: LLVMBlazePassesRef);
     /// Runs the pipeline `Pipeline` (`Length` bytes, no NUL needed) over `M`, as
     /// [`LLVMRunPasses`] does with default options but `SLPVectorization`.

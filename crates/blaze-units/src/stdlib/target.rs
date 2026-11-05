@@ -19,6 +19,10 @@
 //! the target spec's facts and every `target_feature="..."` line made once. [`target_cfg`] is
 //! then a binary search for the triple, a few word operations per `-C target-feature`, and the
 //! copy of the output; it reads no lock (a `OnceLock` once set is one atomic load).
+//!
+//! The CPUs of `-C target-cpu` and the features each has are `target_features::cpus`'s, the one
+//! table of them (`tools/cpus.py` writes it from `cpus` and `cpu_features` here and the pinned
+//! LLVM's aliases of those CPUs, such as `apple-m1` of `apple-a14`).
 
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -74,11 +78,8 @@ struct RawTarget {
     /// those that need it.
     #[serde(default)]
     features_off: BTreeMap<String, Vec<String>>,
-    /// Each CPU of `-C target-cpu`, by the index of its `target_feature`s in `cpu_features`.
-    #[serde(default)]
-    cpus: BTreeMap<String, usize>,
-    #[serde(default)]
-    cpu_features: Vec<Vec<String>>,
+    // `cpus` and `cpu_features` are read by `tools/cpus.py` into `target_features::cpus`,
+    // which is what blaze reads of CPUs.
     /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
@@ -202,8 +203,6 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
         features,
         llvm_features,
         features_off,
-        cpus,
-        cpu_features,
         feature_cfgs,
         other_features,
     } = raw;
@@ -216,7 +215,8 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
             names.extend(turned.iter().map(String::as_str));
         }
     }
-    names.extend(cpu_features.iter().flatten().map(String::as_str));
+    let cpus = target_features::cpus::of(triple);
+    names.extend(cpus.iter().flat_map(|it| it.sets().iter().copied().flatten().copied()));
     names.extend(feature_cfgs.keys().map(String::as_str));
     names.sort_unstable();
     names.dedup();
@@ -281,11 +281,29 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
             pulls[usize::from(index(needed))].insert(at);
         }
     }
-    let cpus = cpus
+    // Each CPU of the target, sorted by name, for the binary search of `tuned`.
+    let cpus: Box<[(Box<str>, Option<Features>)]> = cpus
         .iter()
-        .map(|(name, at)| (name.clone().into_boxed_str(), cpu_features.get(*at).map(|it| set(it.as_slice()))))
+        .flat_map(|it| {
+            let set = move |at: u16| it.sets().get(usize::from(at)).copied();
+            it.names().iter().map(move |&(name, at)| (name, set(at)))
+        })
+        .map(|(name, of)| {
+            let set = of.map(|list| {
+                let mut bits = Features::default();
+                for &feature in list {
+                    bits.insert(index(feature));
+                }
+                bits
+            });
+            (Box::<str>::from(name), set)
+        })
+        // alloc: a target's columns, compiled once per process
         .collect();
-    let feature_cfgs = feature_cfgs.iter().map(|(name, cfgs)| (index(name), boxed(cfgs.iter().cloned()))).collect();
+    let feature_cfgs = feature_cfgs
+        .iter()
+        .map(|(name, cfgs)| (index(name), boxed(cfgs.iter().cloned())))
+        .collect();
     let spec = match target_spec_json.values().next() {
         None => Err(format!("blaze recorded no target spec of `{triple}`")),
         Some(text) => serde_json::from_str::<RawSpec>(text)
@@ -298,10 +316,12 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
             .map_err(|error| format!("the recorded target spec of `{triple}`: {error}")),
     };
     let crt_static = names.binary_search(&"crt-static").ok().map(|it| it as u16);
-    let feature_lines = names.iter().map(|it| format!("{FEATURE_PREFIX}{it}\"").into_boxed_str()).collect();
+    let feature_lines =
+        names.iter().map(|it| format!("{FEATURE_PREFIX}{it}\"").into_boxed_str()).collect();
     let names = names.iter().map(|it| Box::<str>::from(*it)).collect();
     // alloc: a target's columns, compiled once per process
-    let mut other_features: Vec<Box<str>> = other_features.into_iter().map(String::into_boxed_str).collect();
+    let mut other_features: Vec<Box<str>> =
+        other_features.into_iter().map(String::into_boxed_str).collect();
     other_features.sort_unstable();
     Ok(Compiled {
         base: base.into_boxed_slice(),
@@ -322,7 +342,10 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
         other_features: other_features.into_boxed_slice(),
         panic: panic.into_boxed_str(),
         split_debuginfo: boxed(split_debuginfo),
-        file_names: file_names.into_iter().map(|(kind, name)| (kind.into_boxed_str(), name.map(String::into_boxed_str))).collect(),
+        file_names: file_names
+            .into_iter()
+            .map(|(kind, name)| (kind.into_boxed_str(), name.map(String::into_boxed_str)))
+            .collect(),
         spec_json: target_spec_json
             .into_iter()
             .map(|(host, spec)| (host.into_boxed_str(), spec.into_boxed_str()))
@@ -338,9 +361,10 @@ fn release() -> &'static Release {
     )]
     static READ: std::sync::OnceLock<Release> = std::sync::OnceLock::new();
     READ.get_or_init(|| {
-        let mut raw: RawRelease =
-            serde_json::from_str(DATA).expect("stdlib/rustc.json is what harness/answers.py writes");
-        let own: RawOwn = serde_json::from_str(OWN).expect("stdlib/own_targets.json is blaze's targets");
+        let mut raw: RawRelease = serde_json::from_str(DATA)
+            .expect("stdlib/rustc.json is what harness/answers.py writes");
+        let own: RawOwn =
+            serde_json::from_str(OWN).expect("stdlib/own_targets.json is blaze's targets");
         for (triple, target) in own.targets {
             // A target of rustc's that blaze also defined would be two answers for one triple.
             assert!(
@@ -392,7 +416,14 @@ impl Compiled {
 
     /// One `-C target-feature` (or, `from_host`, one of the host's for `target-cpu=native`)
     /// applied to `have`, as rustc's `cfg_target_feature` does.
-    fn apply(&self, triple: &str, have: &mut Features, enable: bool, name: &str, from_host: bool) -> Result<(), String> {
+    fn apply(
+        &self,
+        triple: &str,
+        have: &mut Features,
+        enable: bool,
+        name: &str,
+        from_host: bool,
+    ) -> Result<(), String> {
         let at = self.index(name);
         let on = at.filter(|it| self.has_on.contains(*it));
         match (enable, on, at) {
@@ -442,13 +473,17 @@ impl Compiled {
     ) -> Result<Features, String> {
         let mut have = match cpu {
             Some((name, _)) => {
-                let at = self
-                    .cpus
-                    .binary_search_by(|(it, _)| (**it).cmp(name))
-                    .map_err(|_| format!("`-C target-cpu={name}` is no CPU blaze knows of target `{triple}`"))?;
-                self.cpus[at]
-                    .1
-                    .ok_or_else(|| format!("blaze's data of target `{triple}` lists no features of CPU `{name}`"))?
+                let at = self.cpus.binary_search_by(|(it, _)| (**it).cmp(name)).map_err(|_| {
+                    target_features::cpus::UnknownCpu {
+                        triple: triple.to_owned(),
+                        cpu: name.to_owned(),
+                        known_target: target_features::cpus::of(triple).is_some(),
+                    }
+                    .to_string()
+                })?;
+                self.cpus[at].1.ok_or_else(|| {
+                    format!("blaze's data of target `{triple}` lists no features of CPU `{name}`")
+                })?
             }
             None => self.own,
         };
@@ -461,7 +496,9 @@ impl Compiled {
             }
         }
         for (enable, name) in features {
-            let listed = self.index(name).is_some_and(|it| self.has_on.contains(it) || self.has_off.contains(it));
+            let listed = self
+                .index(name)
+                .is_some_and(|it| self.has_on.contains(it) || self.has_off.contains(it));
             if !listed {
                 if self.other_features.is_empty() {
                     return Err(format!(
@@ -614,7 +651,9 @@ fn yes(flag: &str, value: Option<&str>) -> Result<bool, String> {
     match value {
         None | Some("y" | "yes" | "on" | "true") => Ok(true),
         Some("n" | "no" | "off" | "false") => Ok(false),
-        Some(other) => Err(format!("`-C {flag}={other}`: rustc takes a boolean (`y`, `yes`, `on`, `true`, `n`, `no`, `off`, `false`)")),
+        Some(other) => Err(format!(
+            "`-C {flag}={other}`: rustc takes a boolean (`y`, `yes`, `on`, `true`, `n`, `no`, `off`, `false`)"
+        )),
     }
 }
 
@@ -628,18 +667,22 @@ impl CfgArgs {
             let (flag, joined) = match word.split_once('=') {
                 Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
                 _ => match word.as_bytes() {
-                    [b'-', b'C' | b'Z' | b'W' | b'A' | b'D' | b'F' | b'L' | b'l', _, ..] => (&word[..2], Some(&word[2..])),
+                    [b'-', b'C' | b'Z' | b'W' | b'A' | b'D' | b'F' | b'L' | b'l', _, ..] => {
+                        (&word[..2], Some(&word[2..]))
+                    }
                     _ => (word, None),
                 },
             };
             let mut value = || {
-                joined
-                    .or_else(|| words.next())
-                    .ok_or_else(|| format!("rustc's `{flag}` takes a value, and the flags end after it"))
+                joined.or_else(|| words.next()).ok_or_else(|| {
+                    format!("rustc's `{flag}` takes a value, and the flags end after it")
+                })
             };
             match flag {
                 "--cfg" => args.cfgs.push(value()?.to_owned()),
-                "--crate-type" => args.proc_macro |= value()?.split(',').any(|it| it == "proc-macro"),
+                "--crate-type" => {
+                    args.proc_macro |= value()?.split(',').any(|it| it == "proc-macro")
+                }
                 "-O" => args.opt_level = Some("2".to_owned()),
                 "-g" => {}
                 "-C" | "--codegen" => {
@@ -648,9 +691,15 @@ impl CfgArgs {
                         Some((name, value)) => (name, Some(value)),
                         None => (option, None),
                     };
-                    let name = if name.contains('_') { Cow::Owned(name.replace('_', "-")) } else { Cow::Borrowed(name) };
+                    let name = if name.contains('_') {
+                        Cow::Owned(name.replace('_', "-"))
+                    } else {
+                        Cow::Borrowed(name)
+                    };
                     let needed = |value: Option<&str>| {
-                        value.map(str::to_owned).ok_or_else(|| format!("rustc's `-C {name}` takes a value"))
+                        value
+                            .map(str::to_owned)
+                            .ok_or_else(|| format!("rustc's `-C {name}` takes a value"))
                     };
                     match &*name {
                         "opt-level" => args.opt_level = Some(needed(value)?),
@@ -659,7 +708,8 @@ impl CfgArgs {
                         "panic" => args.panic = Some(needed(value)?),
                         "target-cpu" => args.target_cpu = Some(needed(value)?),
                         "target-feature" => {
-                            let list = value.ok_or_else(|| format!("rustc's `-C {name}` takes a value"))?;
+                            let list = value
+                                .ok_or_else(|| format!("rustc's `-C {name}` takes a value"))?;
                             for feature in list.split(',').filter(|it| !it.is_empty()) {
                                 let enable = match feature.as_bytes()[0] {
                                     b'+' => true,
@@ -674,7 +724,11 @@ impl CfgArgs {
                             }
                         }
                         other if NO_CFG_CODEGEN.contains(&other) => {}
-                        other => return Err(format!("blaze does not know which cfgs `-C {other}` decides")),
+                        other => {
+                            return Err(format!(
+                                "blaze does not know which cfgs `-C {other}` decides"
+                            ));
+                        }
                     }
                 }
                 "-Z" => {
@@ -683,10 +737,20 @@ impl CfgArgs {
                         Some((name, value)) => (name, Some(value)),
                         None => (option, None),
                     };
-                    let name = if name.contains('_') { Cow::Owned(name.replace('_', "-")) } else { Cow::Borrowed(name) };
+                    let name = if name.contains('_') {
+                        Cow::Owned(name.replace('_', "-"))
+                    } else {
+                        Cow::Borrowed(name)
+                    };
                     match &*name {
-                        "unstable-options" | "threads" | "macro-backtrace" | "time-passes" | "share-generics"
-                        | "external-clangrt" | "linker-features" | "sanitizer-recover"
+                        "unstable-options"
+                        | "threads"
+                        | "macro-backtrace"
+                        | "time-passes"
+                        | "share-generics"
+                        | "external-clangrt"
+                        | "linker-features"
+                        | "sanitizer-recover"
                         | "sanitizer-memory-track-origins" => {}
                         // rustc's `parse_bool`: no value is `yes`.
                         "contract-checks" => {
@@ -702,7 +766,9 @@ impl CfgArgs {
                         }
                         "sanitizer" => {
                             let list = value.ok_or_else(|| {
-                                format!("-Z {option}: rustc wants a comma-separated list of sanitizers")
+                                format!(
+                                    "-Z {option}: rustc wants a comma-separated list of sanitizers"
+                                )
                             })?;
                             for name in list.split(',') {
                                 let on = SANITIZERS[sanitizer(name, option)?];
@@ -717,14 +783,22 @@ impl CfgArgs {
                                 }
                             }
                         }
-                        other => return Err(format!("blaze does not know which cfgs `-Z {other}` decides")),
+                        other => {
+                            return Err(format!(
+                                "blaze does not know which cfgs `-Z {other}` decides"
+                            ));
+                        }
                     }
                 }
                 _ if NO_CFG_VALUED.contains(&flag) || NO_CFG_LINTS.contains(&flag) => {
                     value()?;
                 }
                 _ if !flag.starts_with('-') => {}
-                other => return Err(format!("blaze does not know which cfgs rustc's `{other}` decides")),
+                other => {
+                    return Err(format!(
+                        "blaze does not know which cfgs rustc's `{other}` decides"
+                    ));
+                }
             }
         }
         Ok(args)
@@ -740,9 +814,9 @@ impl CfgArgs {
 pub fn sanitizer(name: &str, given: &str) -> Result<usize, String> {
     match SANITIZERS.iter().position(|it| *it == name) {
         Some(at) => Ok(at),
-        None if UNSANITIZED.contains(&name) => {
-            Err(format!("-Z {given}: blaze's code generator does not instrument with the `{name}` sanitizer"))
-        }
+        None if UNSANITIZED.contains(&name) => Err(format!(
+            "-Z {given}: blaze's code generator does not instrument with the `{name}` sanitizer"
+        )),
         None => Err(format!("-Z {given}: rustc has no sanitizer `{name}`")),
     }
 }
@@ -776,7 +850,9 @@ fn is_plain_cfg(cfg: &str) -> bool {
         || BUILTIN_CFGS.iter().any(|it| name == *it || (it.ends_with('_') && name.starts_with(it)));
     let plain_value = value.is_none_or(|value| {
         let inner = value.strip_prefix('"').and_then(|it| it.strip_suffix('"'));
-        inner.is_some_and(|it| it.chars().all(|c| c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' '))
+        inner.is_some_and(|it| {
+            it.chars().all(|c| c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ')
+        })
     });
     plain_name && !builtin && plain_value
 }
@@ -793,7 +869,10 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
 }
 
 /// [`target_cfg`], and the features of `args` that change no cfg, which rustc warns of.
-pub fn target_cfg_told<'a>(triple: &str, args: &'a CfgArgs) -> Result<(Vec<String>, Skipped<'a>), String> {
+pub fn target_cfg_told<'a>(
+    triple: &str,
+    args: &'a CfgArgs,
+) -> Result<(Vec<String>, Skipped<'a>), String> {
     let target = target(triple)?;
     let (base, own) = match args.stable {
         true => (&target.base[..target.stable_base], target.own_stable),
@@ -816,7 +895,9 @@ pub fn target_cfg_told<'a>(triple: &str, args: &'a CfgArgs) -> Result<(Vec<Strin
         }
         let cpu = match args.target_cpu.as_deref() {
             Some("native") => match &args.host_cpu {
-                Some(host) if host.arch == arch(triple) => Some((host.name.as_str(), Some(host.features.as_str()))),
+                Some(host) if host.arch == arch(triple) => {
+                    Some((host.name.as_str(), Some(host.features.as_str())))
+                }
                 Some(host) => {
                     return Err(format!(
                         "`-C target-cpu=native` for target `{triple}` on a {} host: rustc's native CPU \
@@ -886,7 +967,9 @@ pub fn target_cfg_told<'a>(triple: &str, args: &'a CfgArgs) -> Result<(Vec<Strin
         cfgs.push("proc_macro".to_owned());
         // A proc macro is a dynamic library, which a target that respects `crt-static` builds
         // without it unless it is asked for (rustc's `Session::crt_static`).
-        if !args.target_features.iter().any(|(_, name)| name == "crt-static") && target.spec()?.crt_static_respected {
+        if !args.target_features.iter().any(|(_, name)| name == "crt-static")
+            && target.spec()?.crt_static_respected
+        {
             if let Some(it) = target.crt_static {
                 features.remove(it);
             }
@@ -910,7 +993,9 @@ pub fn target_cfg_told<'a>(triple: &str, args: &'a CfgArgs) -> Result<(Vec<Strin
 pub fn target_cfgs(triple: &str, args: &CfgArgs) -> Result<Vec<Cfg>, String> {
     target_cfg(triple, args)?
         .iter()
-        .map(|it| it.parse::<Cfg>().map_err(|error| format!("cfg `{it}` of target `{triple}`: {error}")))
+        .map(|it| {
+            it.parse::<Cfg>().map_err(|error| format!("cfg `{it}` of target `{triple}`: {error}"))
+        })
         .collect()
 }
 
@@ -922,7 +1007,10 @@ pub fn cargo_cfg_env(cfgs: &[String]) -> Vec<(String, String)> {
     let mut pairs: Vec<(&str, Option<&str>)> = cfgs
         .iter()
         .map(|cfg| match cfg.split_once('=') {
-            Some((name, value)) => (name, Some(value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value))),
+            Some((name, value)) => (
+                name,
+                Some(value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value)),
+            ),
             None => (cfg.as_str(), None),
         })
         .collect();
@@ -972,10 +1060,9 @@ pub struct TargetFacts {
 
 pub fn target_facts(triple: &str) -> Result<TargetFacts, String> {
     let target = target(triple)?;
-    let has_std = target
-        .spec()?
-        .std
-        .ok_or_else(|| format!("the recorded target spec of `{triple}` does not say whether it has std"))?;
+    let has_std = target.spec()?.std.ok_or_else(|| {
+        format!("the recorded target spec of `{triple}` does not say whether it has std")
+    })?;
     Ok(TargetFacts {
         panic: String::from(&*target.panic),
         has_std,
@@ -1006,10 +1093,12 @@ pub fn has_thumb_interworking(triple: &str) -> Result<bool, String> {
 /// it; `None` for a crate type the target does not have.
 pub fn file_name(triple: &str, crate_type: &str, name: &str) -> Result<Option<String>, String> {
     let target = target(triple)?;
-    let at = target
-        .file_names
-        .binary_search_by(|(it, _)| (**it).cmp(crate_type))
-        .map_err(|_| format!("blaze does not know rustc's file of a `{crate_type}` crate for target `{triple}`"))?;
+    let at =
+        target.file_names.binary_search_by(|(it, _)| (**it).cmp(crate_type)).map_err(|_| {
+            format!(
+                "blaze does not know rustc's file of a `{crate_type}` crate for target `{triple}`"
+            )
+        })?;
     Ok(target.file_names[at].1.as_deref().map(|it| it.replace("___", name)))
 }
 

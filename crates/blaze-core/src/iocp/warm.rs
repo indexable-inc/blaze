@@ -18,10 +18,13 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
+    Foundation::{
+        DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    },
     System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetProcessId,
-        WaitForSingleObject,
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+        GetCurrentProcess, GetProcessId, WaitForSingleObject,
     },
 };
 
@@ -47,7 +50,8 @@ pub(super) fn launch(warm: &Confined, n: u64) -> io::Result<Launched> {
     let (control, child_control) = process::pipe(false, n, "warm-in")?;
     let (answers, child_answers) = process::pipe(true, n, "warm-out")?;
     let stderr = driver_stderr()?;
-    let mut inherited = [child_control.as_raw_handle(), child_answers.as_raw_handle(), std::ptr::null_mut()];
+    let mut inherited =
+        [child_control.as_raw_handle(), child_answers.as_raw_handle(), std::ptr::null_mut()];
     let count = match &stderr {
         Some(stderr) => {
             inherited[2] = stderr.as_raw_handle();
@@ -55,7 +59,8 @@ pub(super) fn launch(warm: &Confined, n: u64) -> io::Result<Launched> {
         }
         None => 2,
     };
-    let launch = Launch { program: &warm.program, args: &warm.args, env: &warm.env, dir: &warm.dir };
+    let launch =
+        Launch { program: &warm.program, args: &warm.args, env: &warm.env, dir: &warm.dir };
     let flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
     let (process, thread) = process::create(&launch, inherited, &inherited[..count], flags)?;
     drop(thread);
@@ -77,7 +82,15 @@ fn driver_stderr() -> io::Result<Option<OwnedHandle>> {
     // SAFETY: this process's own handle of its standard error, which std keeps open for the
     // process's life, copied into this process.
     sys::check(unsafe {
-        DuplicateHandle(GetCurrentProcess(), own, GetCurrentProcess(), &mut copy, 0, 1, DUPLICATE_SAME_ACCESS)
+        DuplicateHandle(
+            GetCurrentProcess(),
+            own,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        )
     })?;
     sys::owned(copy).map(Some)
 }
@@ -191,7 +204,8 @@ pub(super) fn hand(
         )
     };
     let job = process::job(command.memory).map_err(handing)?;
-    let Standard { stdin, stdout, stderr, theirs } = process::standard(&command, n).map_err(handing)?;
+    let Standard { stdin, stdout, stderr, theirs } =
+        process::standard(&command, n).map_err(handing)?;
     let mut remote = Remote {
         launcher: launcher.as_raw_handle(),
         handed: Handed { run, stdin: 0, stdout: 0, stderr: 0, job: 0 },
@@ -209,7 +223,10 @@ pub(super) fn hand(
         Err(why) => {
             dirs.remove(scratch);
             // alloc: an error path.
-            return Err(io::Error::other(format!("{}: no sandbox can be made here: {why}", command.program.display())));
+            return Err(io::Error::other(format!(
+                "{}: no sandbox can be made here: {why}",
+                command.program.display()
+            )));
         }
     };
     Ok(Handing {
@@ -265,8 +282,9 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let count = rng.below(40) as usize;
-            let written: Vec<Answer> =
-                (0..count).map(|_| Answer { run: rng.next_u64(), code: rng.next_u64() as i32 }).collect();
+            let written: Vec<Answer> = (0..count)
+                .map(|_| Answer { run: rng.next_u64(), code: rng.next_u64() as i32 })
+                .collect();
             let stream: Vec<u8> = written.iter().flat_map(|it| it.to_bytes()).collect();
             let reference: Vec<Answer> = stream
                 .chunks_exact(Answer::LEN)

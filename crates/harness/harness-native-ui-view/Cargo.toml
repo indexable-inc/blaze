@@ -8,11 +8,13 @@ publish = false
 
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-api = { path = "../harness-native-api" }
 harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
 harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
 
 [lints.rust]
 unsafe_code = "forbid"

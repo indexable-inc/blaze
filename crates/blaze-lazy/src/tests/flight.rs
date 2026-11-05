@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey, plan::Mode, plan::OptLevel};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_inproc::CodeMemory;
 use blaze_inproc::frame::Kind;
 use blaze_items::ItemKey;
 use blaze_stencil::tier::{self, CALLS, Policy, Tier};
 use parking_lot::{Condvar, Mutex};
+use std::alloc::Global;
 
 use super::{Rng, compiled, function, key, policy};
 use crate::{
@@ -43,7 +43,8 @@ impl Mailbox {
             if let Some(answer) = answers.remove(&(client, seq)) {
                 return answer;
             }
-            let left = deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
+            let left =
+                deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
             self.arrived.wait_for(&mut answers, left);
         }
     }
@@ -127,7 +128,10 @@ pub(crate) struct Addresses(pub(crate) HashMap<InstanceKey, u64, Global>);
 
 impl Placer for Addresses {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
-        self.0.get(&function.key).copied().ok_or_else(|| format!("no address for {:?}", function.key))
+        self.0
+            .get(&function.key)
+            .copied()
+            .ok_or_else(|| format!("no address for {:?}", function.key))
     }
 
     fn cells(&self, _: &InstanceKey) -> Option<u64> {
@@ -198,7 +202,11 @@ fn many_threads_asking_at_once_compile_each_function_once() {
                     assert_eq!(kind, READY_KIND);
                     assert_eq!(
                         Frame::decode(&body).unwrap(),
-                        Frame::Ready { request: u64::from(seq) << 8, lazy, target: target_of(lazy) }
+                        Frame::Ready {
+                            request: u64::from(seq) << 8,
+                            lazy,
+                            target: target_of(lazy)
+                        }
                     );
                 }
             });
@@ -238,11 +246,14 @@ fn a_failed_or_panicking_compile_answers_every_asker_and_stops_the_run_once() {
         for client in 0..8u32 {
             let (runner, mail, seq) = (&runner, &mail, &seq);
             scope.spawn(move || {
-                for (lazy, why) in [(3, "its MIR could not be built"), (5, "the compiler panicked: boom")] {
+                for (lazy, why) in
+                    [(3, "its MIR could not be built"), (5, "the compiler panicked: boom")]
+                {
                     let seq = seq.fetch_add(1, Ordering::Relaxed);
                     let (kind, body) = ask(runner, mail, client, seq, lazy);
                     assert_eq!(kind, wire::FAILED_KIND);
-                    let Frame::Failed { lazy: of, why: text, .. } = Frame::decode(&body).unwrap() else {
+                    let Frame::Failed { lazy: of, why: text, .. } = Frame::decode(&body).unwrap()
+                    else {
                         panic!("not a failure");
                     };
                     assert_eq!(of, lazy);
@@ -289,8 +300,14 @@ fn an_id_past_the_session_is_answered_failed_and_stops_the_run() {
     assert_eq!(kind, wire::FAILED_KIND);
     assert_eq!(mail.stops().len(), 1);
     assert_eq!(mail.stops()[0].0, None);
-    assert_eq!(runner.frame(0, READY_KIND, 2, &wire::ready(1, 0, 8)), Err(wire::WireError::Unasked));
-    assert!(matches!(runner.frame(0, READY_KIND, 3, &wire::ask(1, 0)), Err(wire::WireError::Kind(_))));
+    assert_eq!(
+        runner.frame(0, READY_KIND, 2, &wire::ready(1, 0, 8)),
+        Err(wire::WireError::Unasked)
+    );
+    assert!(matches!(
+        runner.frame(0, READY_KIND, 3, &wire::ask(1, 0)),
+        Err(wire::WireError::Kind(_))
+    ));
 }
 
 #[test]
@@ -309,7 +326,8 @@ fn idle_workers_compile_the_rest_and_close_reports_what_failed_unasked() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while (0..10).any(|n| runner.target(&key(n)).is_none() && n != 2) || compiler.times(key(2)) == 0 {
+    while (0..10).any(|n| runner.target(&key(n)).is_none() && n != 2) || compiler.times(key(2)) == 0
+    {
         assert!(Instant::now() < deadline, "idle compiles within a minute");
         std::thread::yield_now();
     }
@@ -433,7 +451,10 @@ fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
         [0, 2].iter().all(|&n| runner.target(&key(n)) == Some(target_of(n) + TIERED))
     });
     let (_, body) = ask(&runner, &mail, 0, 4, 0);
-    assert_eq!(Frame::decode(&body).unwrap(), Frame::Ready { request: 4 << 8, lazy: 0, target: target_of(0) + TIERED });
+    assert_eq!(
+        Frame::decode(&body).unwrap(),
+        Frame::Ready { request: 4 << 8, lazy: 0, target: target_of(0) + TIERED }
+    );
     assert_eq!(runner.target(&key(1)), Some(target_of(1)), "nothing counted in function 1");
     assert_eq!(runner.tier_stopped(), None);
     let closed = runner.close();
@@ -483,7 +504,10 @@ fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
     assert_eq!(tiered.failures.len(), 1, "{tiered:?}");
     let failure = &tiered.failures[0];
     assert_eq!((failure.function, failure.to), (0, Tier::Cranelift));
-    assert!(failure.why.contains("its MIR could not be built") && failure.why.contains("recompiling"), "{failure:?}");
+    assert!(
+        failure.why.contains("its MIR could not be built") && failure.why.contains("recompiling"),
+        "{failure:?}"
+    );
     assert!(closed.failures.is_empty() && mail.stops().is_empty());
 }
 
@@ -562,7 +586,8 @@ mod through_stubs {
             let functions: Vec<Function> = (0..FUNCTIONS).map(function).collect();
             let compiler = Counting { delay: Duration::from_millis(20), ..Counting::default() };
             let mail = Arc::new(Mailbox::default());
-            let places = (0..FUNCTIONS).map(|n| (key(n), DIRECT[n as usize] as usize as u64)).collect();
+            let places =
+                (0..FUNCTIONS).map(|n| (key(n), DIRECT[n as usize] as usize as u64)).collect();
             let runner = Runner::start(
                 session(&functions),
                 &[],
@@ -575,7 +600,14 @@ mod through_stubs {
             .unwrap();
             let isa = Isa::host().unwrap();
             let stubs = stub::generate(&isa, FUNCTIONS, hook as *const () as u64).unwrap();
-            World { runner, mail, compiler, seq: AtomicU32::new(1), code: Code::new(&stubs.bytes), layout: stubs.layout }
+            World {
+                runner,
+                mail,
+                compiler,
+                seq: AtomicU32::new(1),
+                code: Code::new(&stubs.bytes),
+                layout: stubs.layout,
+            }
         })
     }
 

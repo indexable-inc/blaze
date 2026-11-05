@@ -10,7 +10,11 @@
 //! stops naming the flags. `run`, `minimize` and `seeds` work in any build, and each target's
 //! `#[test]` runs its seeds in a plain one.
 
-#![feature(core_intrinsics, sanitize)]
+// `cfg_sanitize`: raw.rs writes `sanitize(address = "off")` under `cfg(sanitize = "address")`,
+// the one build it does anything in, so the stage 0 blaze (0.20261030), whose check knows only
+// the removed `no_sanitize`, never sees it. Go back to the bare attribute once the pinned
+// release's check is the v2 front end (crates/hir-expand/src/inert_attr_macro.rs has it).
+#![feature(core_intrinsics, sanitize, cfg_sanitize)]
 #![allow(internal_features)]
 #![deny(unsafe_code)]
 // A command-line tool: it reports on stderr.
@@ -91,8 +95,9 @@ impl Target {
 /// on every core (`check` may run on several threads at once). The first failure stops the
 /// rest.
 pub fn seeds(target: &Target) {
-    let inputs: Vec<Vec<u8>> = blaze_fuzz::inputs(target.corpus(), (target.seeds)()).collect();  // alloc: the plain test's inputs, setup
-    let threads = std::thread::available_parallelism().map_or(1, NonZero::get).min(inputs.len()).max(1);
+    let inputs: Vec<Vec<u8>> = blaze_fuzz::inputs(target.corpus(), (target.seeds)()).collect(); // alloc: the plain test's inputs, setup
+    let threads =
+        std::thread::available_parallelism().map_or(1, NonZero::get).min(inputs.len()).max(1);
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -119,7 +124,7 @@ pub fn case(data: &[u8], cases: usize) -> usize {
 /// every case on every run would. On every core, as [`seeds`]. An input with fewer ways than
 /// `cases` is given the rest too, and checks only what every way does.
 pub fn every_case(target: &Target, cases: usize, check_case: fn(&[u8], usize)) {
-    let mut inputs = corpus::read_dir(&target.corpus()).unwrap_or_else(|e| panic!("{e}"));  // alloc: the plain test's inputs, setup
+    let mut inputs = corpus::read_dir(&target.corpus()).unwrap_or_else(|e| panic!("{e}")); // alloc: the plain test's inputs, setup
     inputs.extend((target.seeds)());
     let runs = inputs.len() * cases;
     let threads = std::thread::available_parallelism().map_or(1, NonZero::get).min(runs).max(1);
@@ -200,37 +205,43 @@ impl Options {
             jobs: 1,
             worker: None,
         };
-        let mut files = Vec::new();  // alloc: command-line parsing, once
+        let mut files = Vec::new(); // alloc: command-line parsing, once
         while let Some(arg) = args.next() {
-            let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));  // alloc: error message
-            let number = |name: &str, text: String| text.parse::<u64>().map_err(|e| format!("{name} {text}: {e}"));  // alloc: error message
+            let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value")); // alloc: error message
+            let number = |name: &str, text: String| {
+                text.parse::<u64>().map_err(|e| format!("{name} {text}: {e}"))
+            }; // alloc: error message
             match arg.as_str() {
                 "--seconds" => options.seconds = Some(number(&arg, value(&arg)?)?),
                 "--runs" => options.runs = Some(number(&arg, value(&arg)?)?),
                 "--seed" => options.seed = Some(number(&arg, value(&arg)?)?),
                 "--max-len" => options.max_len = Some(number(&arg, value(&arg)?)? as usize),
-                "--timeout-ms" => options.timeout = Duration::from_millis(number(&arg, value(&arg)?)?),
+                "--timeout-ms" => {
+                    options.timeout = Duration::from_millis(number(&arg, value(&arg)?)?)
+                }
                 "--no-value-profile" => options.value_profile = false,
                 "--out" => options.out = Some(PathBuf::from(value(&arg)?)),
                 "--jobs" => match number(&arg, value(&arg)?)? {
-                    0 => return Err("--jobs 0: at least one".to_owned()),  // alloc: error message
+                    0 => return Err("--jobs 0: at least one".to_owned()), // alloc: error message
                     n => options.jobs = n as usize,
                 },
                 "--worker" => options.worker = Some(number(&arg, value(&arg)?)? as usize),
-                flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),  // alloc: error message
+                flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")), // alloc: error message
                 _ => files.push(PathBuf::from(arg)),
             }
         }
         options.command = match command.as_str() {
-            "fuzz" | "seeds" | "serve" if !files.is_empty() => return Err(format!("`{command}` takes no files")),  // alloc: error message
+            "fuzz" | "seeds" | "serve" if !files.is_empty() => {
+                return Err(format!("`{command}` takes no files"));
+            } // alloc: error message
             "fuzz" => Command::Fuzz,
             "seeds" => Command::Seeds,
             "serve" => Command::Serve,
-            "run" if files.is_empty() => return Err("`run` needs a file".to_owned()),  // alloc: error message
+            "run" if files.is_empty() => return Err("`run` needs a file".to_owned()), // alloc: error message
             "run" => Command::Run(files),
             "minimize" if files.len() == 1 => Command::Minimize(files.remove(0)),
-            "minimize" => return Err("`minimize` takes one file".to_owned()),  // alloc: error message
-            other => return Err(format!("unknown command {other:?}")),  // alloc: error message
+            "minimize" => return Err("`minimize` takes one file".to_owned()), // alloc: error message
+            other => return Err(format!("unknown command {other:?}")), // alloc: error message
         };
         Ok(options)
     }
@@ -246,7 +257,7 @@ pub fn main(target: &Target) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let out = options.out.clone().unwrap_or_else(|| target.out());  // clone: the output path, once at start
+    let out = options.out.clone().unwrap_or_else(|| target.out()); // clone: the output path, once at start
     let done = match &options.command {
         Command::Fuzz if options.jobs > 1 => jobs(&options, &out),
         Command::Fuzz => fuzz(target, &options, &out),
@@ -290,18 +301,23 @@ fn run(target: &Target, files: &[PathBuf], timeout: Duration) -> Result<ExitCode
 fn serve(target: &Target, timeout: Duration) -> Result<ExitCode, String> {
     timer(timeout)?;
     let (mut stdin, mut stdout) = (std::io::stdin().lock(), std::io::stdout().lock());
-    let mut input = Vec::new();  // alloc: serve's input buffer, reused for every input
+    let mut input = Vec::new(); // alloc: serve's input buffer, reused for every input
     loop {
         let mut len = [0u8; 4];
         match stdin.read_exact(&mut len) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(ExitCode::SUCCESS),
-            Err(e) => return Err(format!("stdin: {e}")),  // alloc: error message
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(ExitCode::SUCCESS);
+            }
+            Err(e) => return Err(format!("stdin: {e}")), // alloc: error message
         }
         input.resize(u32::from_le_bytes(len) as usize, 0);
-        stdin.read_exact(&mut input).map_err(|e| format!("stdin: {e}"))?;  // alloc: error message
+        stdin.read_exact(&mut input).map_err(|e| format!("stdin: {e}"))?; // alloc: error message
         let passed = timed(|| catch_unwind(AssertUnwindSafe(|| (target.check)(&input))).is_ok());
-        stdout.write_all(&[u8::from(!passed)]).and_then(|()| stdout.flush()).map_err(|e| format!("stdout: {e}"))?;  // alloc: error message
+        stdout
+            .write_all(&[u8::from(!passed)])
+            .and_then(|()| stdout.flush())
+            .map_err(|e| format!("stdout: {e}"))?; // alloc: error message
     }
 }
 
@@ -321,10 +337,13 @@ fn timer(timeout: Duration) -> Result<(), String> {
     let limit = timeout.as_millis() as u64;
     now_ms();
     std::thread::Builder::new()
-        .name("timer".to_owned())  // alloc: a thread's name, once at start
+        .name("timer".to_owned()) // alloc: a thread's name, once at start
         .spawn(move || {
             loop {
-                #[allow(clippy::disallowed_methods, reason = "the input's limit on the wall clock: what runs past it says nothing")]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "the input's limit on the wall clock: what runs past it says nothing"
+                )]
                 std::thread::sleep(Duration::from_millis((limit / 4).clamp(10, 1000)));
                 let since = RUNNING_SINCE.load(Ordering::Acquire);
                 if since != 0 && now_ms().saturating_sub(since - 1) > limit {
@@ -334,30 +353,30 @@ fn timer(timeout: Duration) -> Result<(), String> {
             }
         })
         .map(drop)
-        .map_err(|e| format!("the timer: {e}"))  // alloc: error message
+        .map_err(|e| format!("the timer: {e}")) // alloc: error message
 }
 
 /// `fuzz --jobs N`: N processes of this binary's `fuzz`, worker `k` seeded `seed + k`, which
 /// share what they keep through `out/corpus/`. It ends when they all have, or at the first
 /// that fails, stopping the rest, with that one's exit code.
 fn jobs(options: &Options, out: &Path) -> Result<ExitCode, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;  // alloc: error message
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?; // alloc: error message
     let seed = options.seed.unwrap_or_else(clock_seed);
     let mut workers = Vec::with_capacity(options.jobs);
     for worker in 0..options.jobs {
         let mut command = std::process::Command::new(&exe);
-        command.arg("fuzz").args(["--worker", &worker.to_string()]);  // alloc: a worker's command line, once per worker
-        command.args(["--seed", &seed.wrapping_add(worker as u64).to_string()]);  // alloc: a worker's command line, once per worker
-        command.args(["--timeout-ms", &options.timeout.as_millis().to_string()]);  // alloc: a worker's command line, once per worker
+        command.arg("fuzz").args(["--worker", &worker.to_string()]); // alloc: a worker's command line, once per worker
+        command.args(["--seed", &seed.wrapping_add(worker as u64).to_string()]); // alloc: a worker's command line, once per worker
+        command.args(["--timeout-ms", &options.timeout.as_millis().to_string()]); // alloc: a worker's command line, once per worker
         command.arg("--out").arg(out);
         if let Some(seconds) = options.seconds {
-            command.args(["--seconds", &seconds.to_string()]);  // alloc: a worker's command line, once per worker
+            command.args(["--seconds", &seconds.to_string()]); // alloc: a worker's command line, once per worker
         }
         if let Some(runs) = options.runs {
-            command.args(["--runs", &runs.to_string()]);  // alloc: a worker's command line, once per worker
+            command.args(["--runs", &runs.to_string()]); // alloc: a worker's command line, once per worker
         }
         if let Some(max_len) = options.max_len {
-            command.args(["--max-len", &max_len.to_string()]);  // alloc: a worker's command line, once per worker
+            command.args(["--max-len", &max_len.to_string()]); // alloc: a worker's command line, once per worker
         }
         if !options.value_profile {
             command.arg("--no-value-profile");
@@ -366,7 +385,7 @@ fn jobs(options: &Options, out: &Path) -> Result<ExitCode, String> {
             Ok(child) => workers.push(child),
             Err(e) => {
                 stop(&mut workers);
-                return Err(format!("worker {worker}: {e}"));  // alloc: error message
+                return Err(format!("worker {worker}: {e}")); // alloc: error message
             }
         }
     }
@@ -379,18 +398,23 @@ fn jobs(options: &Options, out: &Path) -> Result<ExitCode, String> {
                 Ok(Some(status)) => {
                     stop(&mut workers);
                     eprintln!("blaze-fuzzer: worker {worker} ended with {status}");
-                    return Ok(status.code().map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)));
+                    return Ok(status
+                        .code()
+                        .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)));
                 }
                 Err(e) => {
                     stop(&mut workers);
-                    return Err(format!("worker {worker}: {e}"));  // alloc: error message
+                    return Err(format!("worker {worker}: {e}")); // alloc: error message
                 }
             }
         }
         if running == 0 {
             return Ok(ExitCode::SUCCESS);
         }
-        #[allow(clippy::disallowed_methods, reason = "std waits on one child, not the first of many, and the rest must stay killable")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "std waits on one child, not the first of many, and the rest must stay killable"
+        )]
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -403,7 +427,9 @@ fn stop(workers: &mut [std::process::Child]) {
 }
 
 fn clock_seed() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.as_nanos() as u64)
 }
 
 /// What ended a run.
@@ -461,7 +487,10 @@ fn report(finding: Finding, input: &[u8]) {
 #[inline(never)]
 fn watchdog(timeout: u64) {
     loop {
-        #[allow(clippy::disallowed_methods, reason = "the input's limit on the wall clock: what runs past it says nothing")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the input's limit on the wall clock: what runs past it says nothing"
+        )]
         std::thread::sleep(Duration::from_millis((timeout / 4).clamp(10, 1000)));
         if raw::claim_timed_out(now_ms(), timeout) {
             eprintln!("blaze-fuzzer: an input ran past {timeout} ms");
@@ -475,7 +504,7 @@ fn watchdog(timeout: u64) {
 fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, String> {
     let coverage = Coverage::new(&[watchdog as usize, dump as usize, now_ms as usize])?;
     if !raw::asan() {
-        return Err(format!("this binary was built without AddressSanitizer: {FLAGS}"));  // alloc: error message
+        return Err(format!("this binary was built without AddressSanitizer: {FLAGS}")); // alloc: error message
     }
     if options.value_profile && !raw::return_address_works() {
         return Err(
@@ -485,15 +514,15 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
         );
     }
     let kept = out.join("corpus");
-    std::fs::create_dir_all(&kept).map_err(|e| format!("{}: {e}", kept.display()))?;  // alloc: error message
-    _ = OUT.set(out.to_owned());  // alloc: the output path, once at start
+    std::fs::create_dir_all(&kept).map_err(|e| format!("{}: {e}", kept.display()))?; // alloc: error message
+    _ = OUT.set(out.to_owned()); // alloc: the output path, once at start
     _ = NAME.set(target.name);
     now_ms();
     let timeout = options.timeout.as_millis() as u64;
     std::thread::Builder::new()
-        .name("watchdog".to_owned())  // alloc: a thread's name, once at start
+        .name("watchdog".to_owned()) // alloc: a thread's name, once at start
         .spawn(move || watchdog(timeout))
-        .map_err(|e| format!("the watchdog: {e}"))?;  // alloc: error message
+        .map_err(|e| format!("the watchdog: {e}"))?; // alloc: error message
 
     let seed = options.seed.unwrap_or_else(clock_seed);
     let budget = Duration::from_secs(options.seconds.unwrap_or(target.budget.as_secs()));
@@ -503,14 +532,14 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
         target,
         coverage: &coverage,
         seen: Seen::new((coverage.total() << 3) + raw::VALUE_BITS),
-        corpus: Corpus::new().map_err(|e| format!("the corpus: {e}"))?,  // alloc: error message
+        corpus: Corpus::new().map_err(|e| format!("the corpus: {e}"))?, // alloc: error message
         features: Vec::with_capacity(coverage.total() + raw::VALUE_BITS),
         value_profile: options.value_profile,
         runs: 0,
         started: Instant::now(),
         worker: options.worker,
         kept,
-        known: HashSet::with_capacity(KNOWN),  // alloc: setup
+        known: HashSet::with_capacity(KNOWN), // alloc: setup
         scratch: Scratch::default(),
     };
     eprintln!(
@@ -525,7 +554,7 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
     if let Some(failed) = fuzzer.sync()? {
         return Ok(failed);
     }
-    let mut initial = vec![Vec::new()];  // alloc: the initial inputs, setup
+    let mut initial = vec![Vec::new()]; // alloc: the initial inputs, setup
     initial.extend(corpus::read_dir(&target.corpus())?);
     initial.extend((target.seeds)());
     for input in &initial {
@@ -534,7 +563,10 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
         }
     }
     if fuzzer.corpus.len() == 0 {
-        return Err(format!("no input reached a counter: `{}` itself was built without coverage", target.name));  // alloc: error message
+        return Err(format!(
+            "no input reached a counter: `{}` itself was built without coverage",
+            target.name
+        )); // alloc: error message
     }
     fuzzer.status("loaded");
 
@@ -636,10 +668,13 @@ impl Fuzzer<'_> {
         if new == 0 {
             return Ok(Tried::Dropped);
         }
-        if self.known.insert(corpus::hash(input)) {  // alloc: grows past KNOWN kept files only, by doubling
+        if self.known.insert(corpus::hash(input)) {
+            // alloc: grows past KNOWN kept files only, by doubling
             self.scratch.write(&self.kept, "", input)?;
         }
-        self.corpus.add(input, new).map_err(|e| format!("keeping an input of {} bytes: {e}", input.len()))?;  // alloc: error message
+        self.corpus
+            .add(input, new)
+            .map_err(|e| format!("keeping an input of {} bytes: {e}", input.len()))?; // alloc: error message
         Ok(Tried::Kept)
     }
 
@@ -647,10 +682,11 @@ impl Fuzzer<'_> {
     /// in a `--jobs` worker. One directory listing; only new files are read.
     fn sync(&mut self) -> Result<Option<ExitCode>, String> {
         for name in corpus::names(&self.kept)? {
-            if !self.known.insert(corpus::key(&name)) {  // alloc: grows past KNOWN kept files only, by doubling
+            if !self.known.insert(corpus::key(&name)) {
+                // alloc: grows past KNOWN kept files only, by doubling
                 continue;
             }
-            let input = corpus::read(&self.kept.join(&name))?;  // alloc: a file another worker kept, read once
+            let input = corpus::read(&self.kept.join(&name))?; // alloc: a file another worker kept, read once
             if let Tried::Failed = self.try_input(&input, now_ms())? {
                 return Ok(Some(self.failed()));
             }

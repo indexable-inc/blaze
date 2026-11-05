@@ -37,7 +37,7 @@ env:
 jobs:
   platforms:
     name: platforms with a registered runner
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64]
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any: ${{ steps.matrix.outputs.any }}
@@ -74,10 +74,17 @@ jobs:
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names, installed into $BENCH_HOME (kept between runs, as its store under ~/.cache/blaze
+      # is, so blaze itself builds incrementally), run in the bench shell for the pinned LLVM and
+      # the C toolchain. Its daemon ends before the measured blaze starts.
       - name: Build blaze
         run: |
           mkdir -p "$BENCH_HOME"
-          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c cargo build -p blaze-engine --release
+          CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+          stage0="$BENCH_HOME/stage0/bin/blaze"
+          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
       # Edits: bun's own build of its C and C++ goes to BLAZE_PROJECTS/bun-native once per
       # revision (bunprep.py); the measured trees are copies of it.
       - name: Bench
@@ -107,7 +114,7 @@ jobs:
     name: README
     needs: [platforms, bench]
     if: always() && needs.platforms.outputs.any == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64, ix-mode-cold]
     steps:
       - uses: actions/checkout@v7
         with:

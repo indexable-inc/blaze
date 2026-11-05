@@ -1,14 +1,19 @@
 //! `BLAZE_VERSION` and `BLAZE_VERSION_LINE`: which blaze this is (see [`version`]);
 //! `BLAZE_CODEGEN_CODE`, the code identity of its code generator, which stored templates are
-//! keyed by; and `BLAZE_FRONT_END_CODE`, that of its front end, which images, stored goals and
-//! bodies and kept expansions are keyed by. Both are worked out in one walk of the workspace
-//! (`blaze_codegen_code::emit_all`).
+//! keyed by; `BLAZE_FRONT_END_CODE`, that of its front end, which images, stored goals and
+//! bodies and kept expansions are keyed by; and `BLAZE_RECORD_CODE`, that of what makes a unit's
+//! record, which records and the standard library's shared directory are keyed by with the other
+//! two. All three are worked out in one walk of the workspace (`blaze_codegen_code::emit_all`).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     seed();
     version();
-    blaze_codegen_code::emit_all(&[&blaze_codegen_code::CODEGEN, &blaze_codegen_code::FRONT_END]);
+    blaze_codegen_code::emit_all(&[
+        &blaze_codegen_code::CODEGEN,
+        &blaze_codegen_code::FRONT_END,
+        &blaze_codegen_code::RECORD,
+    ]);
 }
 
 /// The `seed` feature is the seed profile, `--no-default-features --features seed`

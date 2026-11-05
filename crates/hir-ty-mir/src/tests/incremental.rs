@@ -1,9 +1,13 @@
+use blaze_query::db::{Database as _, EventKind};
 use expect_test::Expect;
 use hir_def::{DefWithBodyId, ModuleDefId};
-use blaze_query::db::{Database as _, EventKind};
 use hir_expand::fixture;
 
-use crate::{InferenceResult, method_resolution::TraitImpls, test_db::{TestDB, TestDBExt as _}};
+use crate::{
+    InferenceResult,
+    method_resolution::TraitImpls,
+    test_db::{TestDB, TestDBExt as _},
+};
 
 use super::visit_module;
 
@@ -43,9 +47,6 @@ fn foo() -> i32 {
                 "Body::of",
                 "file_body_syntax",
                 "trait_environment_query",
-                "lang_items",
-                "crate_lang_items",
-                "frozen_lang_items",
                 "crate_recursion_limit",
                 "UnstableFeatures::query",
                 "generic_predicates_of",
@@ -134,9 +135,6 @@ fn baz() -> i32 {
                 "Body::of",
                 "file_body_syntax",
                 "trait_environment_query",
-                "lang_items",
-                "crate_lang_items",
-                "frozen_lang_items",
                 "crate_recursion_limit",
                 "UnstableFeatures::query",
                 "generic_predicates_of",
@@ -535,6 +533,7 @@ fn main() {
                 "trait_environment_query",
                 "generic_predicates_of",
                 "generic_predicates_of",
+                "explicit_implied_clauses_of",
                 "fn_sig_for_fn",
                 "elided_lifetimes",
                 "trait_type_aliases",
@@ -562,6 +561,7 @@ fn main() {
                 "crates_that_name",
                 "TraitImpls::for_crate_and_trait",
                 "trait_slice",
+                "int_gates",
                 "generic_predicates_of",
                 "impl_super_outlives",
                 "TraitImpls::blanket_in_crate_and_deps",

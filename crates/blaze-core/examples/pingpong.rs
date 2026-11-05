@@ -35,7 +35,10 @@ mod affinity {
 #[repr(align(128))]
 struct Line(AtomicU64);
 
-#[allow(clippy::disallowed_methods, reason = "measures the bare handoff of a cache line, which any bounded spin adds rounds to")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "measures the bare handoff of a cache line, which any bounded spin adds rounds to"
+)]
 fn spun(a: usize, b: usize, rounds: u64) -> Duration {
     let line = Line(AtomicU64::new(0));
     std::thread::scope(|scope| {

@@ -92,12 +92,8 @@ impl UllbcPass for Transform {
             let Some(block) = outer_body.body.get_mut(block_id) else {
                 continue;
             };
-            let TerminatorKind::Call {
-                call: Call { func, args, .. },
-                dest,
-                target,
-                on_unwind,
-            } = &mut block.terminator.kind
+            let TerminatorKind::Call { call: Call { func, args, .. }, dest, target, on_unwind } =
+                &mut block.terminator.kind
             else {
                 continue;
             };
@@ -146,10 +142,7 @@ impl UllbcPass for Transform {
             inner_body.dyn_visit_in_body_mut(|l: &mut LocalId| {
                 *l += return_local;
             });
-            outer_body
-                .locals
-                .locals
-                .extend(mem::take(&mut inner_body.locals.locals));
+            outer_body.locals.locals.extend(mem::take(&mut inner_body.locals.locals));
 
             // The inner body assumes the arg places are live; allocate them, and initialize the
             // args.
@@ -187,28 +180,23 @@ impl UllbcPass for Transform {
             inner_body.visit_block_ids_mut(|b: &mut BlockId| {
                 *b += start_block;
             });
-            inner_body
-                .body
-                .dyn_visit_in_body_mut(|t: &mut Terminator| match t.kind {
-                    TerminatorKind::Return => {
-                        t.kind = TerminatorKind::Goto {
-                            target: final_block,
-                        };
-                    }
-                    TerminatorKind::UnwindResume => {
-                        t.kind = TerminatorKind::Goto { target: on_unwind };
-                    }
-                    _ => (),
-                });
+            inner_body.body.dyn_visit_in_body_mut(|t: &mut Terminator| match t.kind {
+                TerminatorKind::Return => {
+                    t.kind = TerminatorKind::Goto { target: final_block };
+                }
+                TerminatorKind::UnwindResume => {
+                    t.kind = TerminatorKind::Goto { target: on_unwind };
+                }
+                _ => (),
+            });
             if kind == UnwindKind::Cleanup {
                 for block in &mut inner_body.body {
                     block.kind = block.kind.further_unwind_kind();
                 }
             }
             // At the end of the current block, start evaluating the inner body.
-            outer_body.body[block_id].terminator.kind = TerminatorKind::Goto {
-                target: start_block,
-            };
+            outer_body.body[block_id].terminator.kind =
+                TerminatorKind::Goto { target: start_block };
             // Add the blocks for the inner body.
             outer_body.body.extend(inner_body.body);
         }

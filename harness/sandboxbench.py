@@ -7,12 +7,14 @@ usage: sandboxbench.py [--cpus 0-15] [--rounds 5] [--runs 600] [--tests 600] [--
 Two measurements, each in `--rounds` rounds whose setups alternate, as medians with the
 lowest and highest of the rounds:
 
-- a program that does nothing, run `--runs` times one after another and 16 at a time, bare
+- a program that does nothing (`fn main() {}`, a package `blaze build --release` builds), run `--runs` times one after another and 16 at a time, bare
   and in `blaze sandbox` (with no record, which installs no seccomp filter, and with a
   record of what it wrote and reached);
 - a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
   read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `blaze test`
-  once the daemon serves its build: with `BLAZE_SANDBOX=off`, in the sandbox under
+  once the daemon has built it (the first `blaze test`, whose `blaze-work` line says the daemon
+  served it and whose `compiler-artifact` names the program of the tests): with
+  `BLAZE_SANDBOX=off`, in the sandbox under
   `BLAZE_TESTS=all`, under `affected` with what passed forgotten before each run (so every
   test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
   time), in a sandbox each and bare. The command's wall time is given whole and less that of
@@ -36,6 +38,10 @@ import statistics
 import sys
 import tempfile
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import artifact, worked  # noqa: E402
 
 STEP_TIMEOUT_S = 900
 
@@ -113,6 +119,23 @@ def library(root, tests, io):
     open(os.path.join(root, "src", "lib.rs"), "w").write("\n".join(lines) + "\n")
 
 
+async def built_nothing(ws, env):
+    """`fn main() {}` as a package of its own in `ws`, built by `blaze build --release`: the
+    executable it printed, or `Failed` naming the build when it printed none."""
+    os.makedirs(os.path.join(ws, "src"))
+    with open(os.path.join(ws, "Cargo.toml"), "w") as f:
+        f.write('[package]\nname = "nothing"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
+    with open(os.path.join(ws, "src", "main.rs"), "w") as f:
+        f.write("fn main() {}\n")
+    argv = ["blaze", "build", "--release", "--message-format=json-render-diagnostics"]
+    _, said = await run(argv, cwd=ws, env=env)
+    # `run` hands stdout and stderr together; `artifact` reads only the JSON lines of it.
+    exe = artifact(said, "nothing")
+    if not exe:
+        raise Failed(f"`{' '.join(argv)}` in {ws} printed no executable of `nothing`:\n{said[-2000:]}")
+    return exe
+
+
 def forget_passed(root):
     """Removes what `affected` keeps of the tests that passed, so that each runs again."""
     for top in root:
@@ -120,19 +143,6 @@ def forget_passed(root):
             for name in names:
                 if name in ("tests-passed", "tests-inputs"):
                     os.remove(os.path.join(dirpath, name))
-
-
-def test_executable(pkg):
-    """The program of the library's tests the daemon built: the newest `sbxbench-*` that runs."""
-    found = []
-    for dirpath, _, names in os.walk(os.path.join(pkg, "target")):
-        for name in names:
-            path = os.path.join(dirpath, name)
-            if name.startswith("sbxbench-") and "." not in name and os.access(path, os.X_OK):
-                found.append((os.path.getmtime(path), path))
-    if not found:
-        raise Failed(f"no program of tests under {pkg}/target")
-    return max(found)[1]
 
 
 def table(rows):
@@ -171,11 +181,12 @@ async def main():
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "BLAZE_TESTS", "BLAZE_SANDBOX"):
         env.pop(name, None)
     pkg = os.path.join(root, "sbxbench")
+    nothing_pkg = os.path.join(root, "nothing-pkg")
     try:
-        # A program that does nothing.
+        # A program that does nothing, built by blaze and copied into `root`, which the sandbox
+        # overlays.
         nothing = os.path.join(root, "nothing")
-        open(nothing + ".rs", "w").write("fn main() {}\n")
-        await run(["rustc", "-O", "-o", nothing, nothing + ".rs"], env=env)
+        shutil.copy2(await built_nothing(nothing_pkg, env), nothing)
         bare_spec = spec(os.path.join(root, "bare.json"), root, env, [root])
         rec_spec = spec(os.path.join(root, "rec.json"), root, env, [root], os.path.join(root, "rec"))
         setups = {
@@ -197,16 +208,15 @@ async def main():
         # The library of tests.
         library(pkg, args.tests, args.io)
         test = ["blaze", "test", "--lib"]
-        deadline = time.monotonic() + 600
-        while True:
-            _, said = await run(test, cwd=pkg, env=env)
-            if "[blaze]" in said:
-                break
-            if time.monotonic() > deadline:
-                raise Failed(f"the daemon did not serve the build in 600 s:\n{said[-2000:]}")
-            await asyncio.sleep(1)
+        # The first `blaze test` starts the daemon and is served by it: nothing to wait for.
+        _, said = await run([*test, "--message-format=json"], cwd=pkg, env=env)
+        if not worked(said):
+            raise Failed(f"`blaze test` printed no `blaze-work` line: not served by the daemon:\n{said[-2000:]}")
+        # The program of the library's tests the daemon built, as its `compiler-artifact` names it.
+        exe = artifact(said, "sbxbench")
+        if exe is None:
+            raise Failed(f"`blaze test` named no executable of sbxbench's tests:\n{said[-2000:]}")
         await run(test, cwd=pkg, env=dict(env, BLAZE_TESTS="affected"))
-        exe = test_executable(pkg)
         _, listed = await run([exe, "--list", "--format", "terse"], cwd=pkg, env=env)
         names = [line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")]
         if len(names) != args.tests:
@@ -265,8 +275,9 @@ async def main():
         for name in list(modes)[1:4]:
             print(f"  {name}: {statistics.median(times[name]) - base:.3f}")
     finally:
-        if os.path.isdir(pkg):
-            await run(["blaze", "stop"], cwd=pkg, env=env, timeout=120, ok=None)
+        # One daemon serves the home: stopped from whichever package was built last.
+        if (served := pkg if os.path.isdir(pkg) else nothing_pkg) and os.path.isdir(served):
+            await run(["blaze", "stop"], cwd=served, env=env, timeout=120, ok=None)
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(home, ignore_errors=True)
 

@@ -104,7 +104,8 @@ pub enum Outcome {
 
 impl Outcome {
     /// Every outcome, each at its [`Outcome::index`].
-    pub const ALL: [Outcome; 5] = [Outcome::Ok, Outcome::Panic, Outcome::StepLimit, Outcome::MemoryLimit, Outcome::Error];
+    pub const ALL: [Outcome; 5] =
+        [Outcome::Ok, Outcome::Panic, Outcome::StepLimit, Outcome::MemoryLimit, Outcome::Error];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -163,10 +164,15 @@ pub trait Value: Copy + fmt::Debug + PartialEq {
     fn number(word: u64) -> Option<u64>;
     /// The word of a text cell read back from a table (0: none of these is named so).
     fn of_text(text: &str) -> u64;
+    /// Whether its word is a [`Sym`] of the process that wrote it: the flight recorder's
+    /// postmortem gives each such word of a dead process a number of this one
+    /// ([`SYM_COLUMNS`]).
+    const SYM: bool = false;
 }
 
 impl Value for Name {
     const TEXT: bool = true;
+    const SYM: bool = true;
 
     #[inline]
     fn word(self) -> u64 {
@@ -219,6 +225,7 @@ impl Value for u64 {
 /// A field that may go unsaid: `None` is the word 0.
 impl<T: Value> Value for Option<T> {
     const TEXT: bool = T::TEXT;
+    const SYM: bool = T::SYM;
 
     #[inline]
     fn word(self) -> u64 {
@@ -438,7 +445,10 @@ impl tracing::callsite::Callsite for KindCallsite {
 }
 
 /// The metadata of the kind `name`: target `blaze`, info, no fields.
-pub const fn kind_meta(name: &'static str, callsite: &'static KindCallsite) -> tracing::Metadata<'static> {
+pub const fn kind_meta(
+    name: &'static str,
+    callsite: &'static KindCallsite,
+) -> tracing::Metadata<'static> {
     tracing::Metadata::new(
         name,
         "blaze",
@@ -519,15 +529,51 @@ impl<E: Fields> Ending<E> {
     }
 }
 
+/// A span on no thread's stack and under no span, for a wait no thread does (a queued task's
+/// wait for admission): opened by [`detached`] on one thread and closed on whichever its wait
+/// ends on, by [`Detached::ended`] or by its drop, which closes it with its end's columns
+/// null ("did not end"). Not entered, so the spans its opener makes meanwhile are not its
+/// children.
+#[must_use = "a detached span that ends with fields says them with `ended`"]
+pub struct Detached<E: Fields> {
+    id: u64,
+    _ended: PhantomData<E>,
+}
+
+/// Opens `kind` detached ([`Detached`]), of the build the thread works for
+/// ([`flight::building`]).
+pub fn detached<K: Span>(kind: K) -> Detached<K::Ended> {
+    let id = match K::site() {
+        None => flight::UNRECORDED,
+        Some(site) => {
+            let mut said = Said::EMPTY;
+            kind.write(&mut said);
+            flight::open_detached(site, &said)
+        }
+    };
+    Detached { id, _ended: PhantomData }
+}
+
+impl<E: Fields> Detached<E> {
+    /// Says `ended`, then closes the span.
+    pub fn ended(self, ended: E) {
+        flight::said_after(self.id, |said| ended.write(said));
+    }
+}
+
+impl<E: Fields> Drop for Detached<E> {
+    fn drop(&mut self) {
+        _ = flight::closed(self.id);
+    }
+}
+
 /// Opens `kind` on this thread and enters it: its id, [`flight::UNRECORDED`] when not recorded.
 #[inline]
 fn open_id<K: Span>(kind: K) -> u64 {
     let Some(site) = K::site() else { return flight::UNRECORDED };
     let mut said = Said::EMPTY;
     kind.write(&mut said);
-    let id = flight::open_said(site, &said);
-    crate::profile_began(id);
-    id
+    flight::open_said(site, &said)
 }
 
 #[inline]
@@ -599,7 +645,11 @@ fn typed<K: Span>(said: &Said, span_id: u64) -> Result<Typed<K>, KindError> {
 /// and the Parquet history keeps it, in order. Names are interned in this process as they are
 /// read.
 pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindError> {
-    let missing = |column: &'static str| KindError::Column { kind: K::NAME, column, why: "is not in the batch" };
+    let missing = |column: &'static str| KindError::Column {
+        kind: K::NAME,
+        column,
+        why: "is not in the batch",
+    };
     let names = batch.column_by_name("name").ok_or(missing("name"))?;
     let ids = batch.column_by_name("span_id").ok_or(missing("span_id"))?;
     let ids = ids.as_primitive_opt::<UInt64Type>().ok_or(KindError::Column {
@@ -623,7 +673,11 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
         for &(cells, column) in &columns {
             let word = if cells.column.ty == Type::U64 {
                 let Some(numbers) = column.as_primitive_opt::<UInt64Type>() else {
-                    return Err(KindError::Column { kind: K::NAME, column: cells.column.name, why: "is not UInt64" });
+                    return Err(KindError::Column {
+                        kind: K::NAME,
+                        column: cells.column.name,
+                        why: "is not UInt64",
+                    });
                 };
                 if numbers.is_valid(row) { numbers.value(row).saturating_add(1) } else { 0 }
             } else {
@@ -656,7 +710,8 @@ pub struct KindTable {
 }
 
 /// The columns every kind's view has, before its fields.
-const VIEW_COLUMNS: &str = "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
+const VIEW_COLUMNS: &str =
+    "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
 
 /// Writes into `out` one view a kind, `span_<name>` (`span_macro_expand`): its rows of `spans`
 /// with its fields as columns of their names (`path` for a `macro expand`'s `function`). What
@@ -666,7 +721,11 @@ pub fn views(out: &mut String) {
     for kind in KINDS {
         // alloc: once per kind as a connection's views are made
         // Writing to a `String` does not fail.
-        _ = write!(out, "\nCREATE OR REPLACE VIEW span_{} AS\nSELECT {VIEW_COLUMNS}", kind.name.replace(' ', "_"));
+        _ = write!(
+            out,
+            "\nCREATE OR REPLACE VIEW span_{} AS\nSELECT {VIEW_COLUMNS}",
+            kind.name.replace(' ', "_")
+        );
         for (field, column) in kind.fields {
             _ = write!(out, ", \"{column}\" AS \"{field}\"");
         }
@@ -739,6 +798,9 @@ macro_rules! span_kinds {
 
         pub const GENERIC_COLUMNS: [schema::Column; GENERIC] = [$( <col::$G as Column>::SCHEMA ),*];
         pub const TYPED_COLUMNS: [schema::Column; TYPED] = [$( <col::$T as Column>::SCHEMA ),*];
+        /// Which columns, generic then typed, hold a [`Sym`] ([`Value::SYM`]).
+        pub const SYM_COLUMNS: [bool; COLUMNS] =
+            [$( <<col::$G as Column>::Value as Value>::SYM, )* $( <<col::$T as Column>::Value as Value>::SYM, )*];
         /// Every column, generic then typed, as `batches.rs` writes it.
         pub static CELLS: [Cells; COLUMNS] = [$( Cells::of::<col::$G>(), )* $( Cells::of::<col::$T>(), )*];
 
@@ -859,13 +921,13 @@ span_kinds! {
     }
     typed {
         Awaits = "awaits" (Utf8): Name,
-            "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it";
+            "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it. For an `admission` span, what held the task back: memory, a work or io thread, or nothing";
         Owner = "owner" (U64): u64,
             "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
             "the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (the same on a cold, warm or busy daemon: the margin under its bound); null for a compiled run, a run or proof that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
-            "the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is";
+            "the most stack and heap a `macro expand`'s evaluator held at once (null as `steps` is), or the most a daemon `task` held at once, its global allocations and frames together (`blaze_graph::admission::run_as`); null for a task that gave way or panicked, and any other span";
         Outcome = "outcome" (Dict): Outcome,
             "how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind)";
         WaitsOn = "waits_on" (Dict): WaitKind,
@@ -878,6 +940,12 @@ span_kinds! {
             "the bytes of a `macro module`'s machine code: read from the store, or made by its compile and kept; null for a memo hit, a compile with no store to keep it in, and any other span";
         Creator = "creator" (U64): u64,
             "the span open on the thread that gave a `job` span's job to the pool, as `span_id` numbers it in the same process: what the job stands on when no job gave it (the daemon's loop on no fiber), which the critical path crosses into; null when the giver was inside no span, and for any other span";
+        GrantedBytes = "granted_bytes" (U64): u64,
+            "the memory the plane granted a daemon `task` as it started: its predicted peak (`blaze_graph::admission`), what its memory admission held it to; against `peak_bytes`, how far off the forecast was; null for any other span";
+        Passed = "passed" (U64): u64,
+            "the times a daemon `task` was passed over for memory before it started: another task started while its granted bytes did not fit (0: memory never held it back); null for any other span";
+        Node = "node" (U64): u64,
+            "the plane node a daemon `task` ran as, as the build's records number it; null for any other span";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -920,6 +988,23 @@ span_kinds! {
         /// (`build-script-build`): as it ends, `steps`, the instances its walk took.
         ScriptProof = "build script proof" { krate: Name => Crate, unit: Name => Unit }
             => ScriptProved { steps: u64 => Steps }
+        /// One run of a daemon plane task on a thread (`blaze_cargo::serve::plane`): `kind` its
+        /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
+        /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
+        /// times it was passed over for memory before it started; as it ends, `peak` the most
+        /// it held. The unit phase and query spans of its work are under it.
+        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed }
+            => TaskEnded { peak: Option<u64> => PeakBytes }
+        /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
+        /// step its node became ready to the step it started, `kind` its task kind as its
+        /// `task` span names it and `node` its plane node. No thread waits in it (the plane
+        /// queues the task), so it is [`detached`]: on no thread's stack, under no span. As
+        /// it ends, `waited_for` what held it back (memory when another task with memory
+        /// started while it did not fit, else a thread of its pool, or nothing when it started
+        /// in the step it became ready), `passed` and `granted` as its `task` span's. One
+        /// that never started (its request cancelled, it settled from the memo) ends unsaid.
+        Admission = "admission" { kind: Name => Function, node: u64 => Node }
+            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes }
     }
 }
 
@@ -941,7 +1026,11 @@ mod tests {
         let krate = Name::of("span kinds test");
         let unit = Name::of("span-kinds v0.1.0 (lib)");
         let expand = MacroExpand { path: Name::of("span_kinds::Derive"), krate };
-        let expanded = MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::MemoryLimit };
+        let expanded = MacroExpanded {
+            steps: Some(4_200_000),
+            peak_bytes: Some(48 << 20),
+            outcome: Outcome::MemoryLimit,
+        };
         let awaits = Name::of("span kinds key");
         let wait = Wait { awaits, function: awaits, owner: Some(7), on: WaitKind::Channel };
         let hold = Hold { what: Name::of("span kinds round"), holder: 9 };
@@ -973,13 +1062,26 @@ mod tests {
         let rows = rows_of(tid);
         let from_ring = |row: &SpanRow| read::<MacroExpand>(row).unwrap();
         let expands: Vec<_> = rows.iter().filter_map(from_ring).collect();
-        assert_eq!(expands, [Typed { fields: expand, ended: Some(expanded) }], "the ring's row is the kind");
+        assert_eq!(
+            expands,
+            [Typed { fields: expand, ended: Some(expanded) }],
+            "the ring's row is the kind"
+        );
         let waits: Vec<_> = rows.iter().filter_map(|it| read::<Wait>(it).unwrap()).collect();
         assert_eq!(waits, [Typed { fields: wait, ended: Some(()) }]);
-        assert_eq!(rows.iter().filter_map(|it| read::<UnitNames>(it).unwrap()).count(), 1, "a kind is its own site");
+        assert_eq!(
+            rows.iter().filter_map(|it| read::<UnitNames>(it).unwrap()).count(),
+            1,
+            "a kind is its own site"
+        );
 
-        let batch = batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None }).unwrap();
-        assert_eq!(read_batch::<MacroExpand>(&batch).unwrap(), [Typed { fields: expand, ended: Some(expanded) }]);
+        let batch =
+            batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
+                .unwrap();
+        assert_eq!(
+            read_batch::<MacroExpand>(&batch).unwrap(),
+            [Typed { fields: expand, ended: Some(expanded) }]
+        );
         assert_eq!(read_batch::<Wait>(&batch).unwrap(), [Typed { fields: wait, ended: Some(()) }]);
         assert_eq!(read_batch::<Hold>(&batch).unwrap(), [Typed { fields: hold, ended: Some(()) }]);
         let phases = [
@@ -1005,7 +1107,9 @@ mod tests {
         .join()
         .unwrap();
         let rows = rows_of(tid);
-        let [unwound] = &rows.iter().filter_map(|it| read::<MacroExpand>(it).unwrap()).collect::<Vec<_>>()[..] else {
+        let [unwound] =
+            &rows.iter().filter_map(|it| read::<MacroExpand>(it).unwrap()).collect::<Vec<_>>()[..]
+        else {
             panic!("one `macro expand`")
         };
         assert_eq!(unwound.fields.path, path);
@@ -1015,7 +1119,11 @@ mod tests {
     #[test]
     fn a_batch_of_another_layout_is_a_typed_error() {
         let (tid, ..) = spans_of_every_kind();
-        let batch = batches::spans(&rows_of(tid), Process { pid: 1, name: "span kinds test", commit: None }).unwrap();
+        let batch = batches::spans(
+            &rows_of(tid),
+            Process { pid: 1, name: "span kinds test", commit: None },
+        )
+        .unwrap();
         let at = batch.schema().index_of("waits_on").unwrap();
         let mut older = batch.clone();
         older.remove_column(at);
@@ -1029,11 +1137,18 @@ mod tests {
     fn every_typed_column_is_a_column_of_spans_after_the_generic_ones() {
         let spans = schema::SPANS;
         for cells in &CELLS {
-            let at = spans.column(cells.column.name).unwrap_or_else(|| panic!("`{}` is a spans column", cells.column.name));
+            let at = spans
+                .column(cells.column.name)
+                .unwrap_or_else(|| panic!("`{}` is a spans column", cells.column.name));
             assert_eq!(spans.columns[at].ty, cells.column.ty);
         }
-        let last: Vec<&str> = spans.columns[spans.columns.len() - TYPED..].iter().map(|it| it.name).collect();
-        assert_eq!(last, TYPED_COLUMNS.map(|it| it.name), "a typed column goes at the end, keeping `VERSION`");
+        let last: Vec<&str> =
+            spans.columns[spans.columns.len() - TYPED..].iter().map(|it| it.name).collect();
+        assert_eq!(
+            last,
+            TYPED_COLUMNS.map(|it| it.name),
+            "a typed column goes at the end, keeping `VERSION`"
+        );
         assert_eq!(spans.columns[schema::SPANS_GENERIC_AT].name, "crate");
     }
 

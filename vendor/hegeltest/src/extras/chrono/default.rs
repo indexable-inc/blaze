@@ -17,20 +17,14 @@ use super::{
 impl DefaultGenerator for Weekday {
     type Generator = Mapped<u8, Weekday, fn(u8) -> Weekday, IntegerGenerator<u8>>;
     fn default_generator() -> Self::Generator {
-        integers::<u8>()
-            .min_value(0)
-            .max_value(6)
-            .map(|n| Weekday::try_from(n).unwrap())
+        integers::<u8>().min_value(0).max_value(6).map(|n| Weekday::try_from(n).unwrap())
     }
 }
 
 impl DefaultGenerator for Month {
     type Generator = Mapped<u8, Month, fn(u8) -> Month, IntegerGenerator<u8>>;
     fn default_generator() -> Self::Generator {
-        integers::<u8>()
-            .min_value(1)
-            .max_value(12)
-            .map(|n| Month::try_from(n).unwrap())
+        integers::<u8>().min_value(1).max_value(12).map(|n| Month::try_from(n).unwrap())
     }
 }
 

@@ -11,12 +11,16 @@
 //! reads that numbering, and what each asks of a definition (its level, its attributes, what
 //! its impl is of) is computed once.
 //!
+//! blaze: `observe` runs the same pass for the lints over every configuration at once
+//! (`crate::reach`), with no diagnostic made.
+//!
 //! Follows `compiler/rustc_passes/src/dead.rs` (`live_symbols_and_ignored_derived_traits`,
 //! `check_mod_deathness`) (MIT or Apache-2.0).
 
 mod defs;
 mod level;
 mod mark;
+mod observe;
 mod reach;
 mod report;
 mod res;
@@ -29,8 +33,15 @@ use crate::{
     lower::Found,
 };
 
+/// blaze: what the crate says of its definitions for the lints over every configuration
+/// ([`observe::observe`]).
+pub(super) fn observe(cx: &Cx<'_, '_>, effective: &Effective) -> crate::reach::Observation {
+    observe::observe(cx, effective)
+}
+
 pub(super) fn lints(cx: &Cx<'_, '_>, effective: &Effective) -> Vec<Found> {
-    const GIVES: LintSet = LintSet::of(&[LintId::DEAD_CODE, LintId::named("dead_code_pub_in_binary")]);
+    const GIVES: LintSet =
+        LintSet::of(&[LintId::DEAD_CODE, LintId::named("dead_code_pub_in_binary")]);
     if !cx.any_may_fire(&GIVES) {
         return Vec::new(); // alloc: empty, allocates nothing
     }

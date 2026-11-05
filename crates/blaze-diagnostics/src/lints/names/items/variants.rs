@@ -23,8 +23,9 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
     let db = cx.db;
     let Ok(layout) = enum_.layout(db) else { return Vec::new() }; // alloc: as above
     let Some((tag, sizes)) = layout.direct_tag_variant_sizes() else { return Vec::new() }; // alloc: as above
-    let (largest, second, at) =
-        sizes.map(|it| it.saturating_sub(tag)).enumerate().fold((0, 0, 0), |(l, s, li), (idx, size)| {
+    let (largest, second, at) = sizes.map(|it| it.saturating_sub(tag)).enumerate().fold(
+        (0, 0, 0),
+        |(l, s, li), (idx, size)| {
             if size > l {
                 (size, l, idx)
             } else if size > s {
@@ -32,17 +33,22 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
             } else {
                 (l, s, li)
             }
-        });
+        },
+    );
     if largest <= second * 3 || second == 0 {
         return Vec::new(); // alloc: empty, allocates nothing
     }
     // alloc: the firing lint's message
-    let message = format!("enum variant is more than three times larger ({largest} bytes) than the next largest");
+    let message = format!(
+        "enum variant is more than three times larger ({largest} bytes) than the next largest"
+    );
     // The layout's variants are the enum's, in order: one without a source is hir's bug.
     let Some(variant) = enum_.variants_iter(db).nth(at).and_then(|it| cx.vsema.source(it)) else {
         let span = cx.span(node.map(|it| item_range_view(it.syntax())));
         // alloc: the error's message, on the error path
-        let why = format!("blaze can't place `variant_size_differences`: the layout's variant {at} has no source");
+        let why = format!(
+            "blaze can't place `variant_size_differences`: the layout's variant {at} has no source"
+        );
         return vec![Found::new(Diag::error(None, why, span), Phase::Late)]; // alloc: the one error
     };
     let span = cx.span(variant.map(|it| item_range_view(it.syntax())));

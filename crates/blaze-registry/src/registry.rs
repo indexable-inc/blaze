@@ -360,9 +360,13 @@ impl Registry {
         let in_cache =
             std::fs::metadata(self.crate_file(name, version)).is_ok_and(|it| it.len() > 0);
         in_cache
-            || crate::download::parse_checksum(checksum).is_some_and(|key| {
-                let key = crate::download::crate_key(&key);
-                self.context.store.is_some_and(|store| store.has(&key))
+            || crate::pinned::crate_pin(checksum).is_some_and(|pin| {
+                self.context.store.is_some_and(|store| {
+                    let origin =
+                        blaze_fetch::Origin::Pinned { pin: &pin, form: blaze_fetch::Form::Blob };
+                    let lookup = blaze_fetch::Objects::new(store).lookup(origin);
+                    lookup.is_ok_and(|it| it.is_some())
+                })
             })
     }
 }

@@ -2,13 +2,13 @@
 //! `src/util/canonical_url.rs` and `cargo-util-schemas`' `core/source_kind.rs` of cargo 1.99.0
 //! (5f94df4789).
 
+use anyhow::{Result, anyhow, bail};
+use blaze_ids::{ContentId, Domain, Interner, Sharded};
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use anyhow::{Result, anyhow, bail};
-use blaze_ids::{ContentId, Domain, Interner, Sharded};
 use url::Url;
 
 use crate::interning::InternedString;

@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use blaze_codegen::memo::Memo;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::{Mutex, MutexGuard};
+use std::alloc::Global;
 
 /// How many entries the memo may hold past what the kept front ends used before a job's start
 /// collects it: a collection is a pass over every entry, so it runs only once there is this
@@ -42,7 +42,10 @@ pub(crate) struct Held {
 impl Memos {
     pub(crate) fn new() -> Arc<Memos> {
         // alloc: once a daemon
-        Arc::new(Memos { memo: Mutex::new(blaze_codegen::driver::shared_memo()), kept: Mutex::default() })
+        Arc::new(Memos {
+            memo: Mutex::new(blaze_codegen::driver::shared_memo()),
+            kept: Mutex::default(),
+        })
     }
 
     /// The memo for a job about to start, collected first when it holds [`SLACK`] entries more
@@ -105,7 +108,9 @@ fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_codegen::{Arch, Backend, Instance, Relocs, Settings, Unit, backend::Shape, template::Template};
+    use blaze_codegen::{
+        Arch, Backend, Instance, Relocs, Settings, Unit, backend::Shape, template::Template,
+    };
     use blaze_items::{CodeHash, ItemKey};
 
     use super::*;
@@ -113,7 +118,11 @@ mod tests {
     /// The shape of a prepared function whose canonical bytes are `n`.
     fn shaped(n: u32) -> Shape {
         let unit = Unit {
-            instance: Instance { code: CodeHash(ContentId::default()), args: ContentId::default(), settings: Settings(ContentId::default()) },
+            instance: Instance {
+                code: CodeHash(ContentId::default()),
+                args: ContentId::default(),
+                settings: Settings(ContentId::default()),
+            },
             backend: Backend::Stencil,
             arch: Arch::X86_64,
             item: ItemKey(ContentId::default()),
@@ -161,14 +170,21 @@ mod tests {
         let other = memos.hold((4..6).map(shape).collect());
 
         let held = memos.for_job();
-        assert_eq!(held.len(), count as usize, "the first job still holds the memo: nothing is collected");
+        assert_eq!(
+            held.len(),
+            count as usize,
+            "the first job still holds the memo: nothing is collected"
+        );
         drop((first, held));
 
         drop(other);
         let next = memos.for_job();
         assert_eq!(next.len(), 4, "only what the kept front end used is left");
         for n in 0..4 {
-            assert_eq!(next.get(&shape(n)).map(|it| it.code.as_slice()), Some(&n.to_le_bytes()[..]));
+            assert_eq!(
+                next.get(&shape(n)).map(|it| it.code.as_slice()),
+                Some(&n.to_le_bytes()[..])
+            );
         }
         assert!(next.get(&shape(4)).is_none(), "a dropped hold keeps nothing");
         drop(next);

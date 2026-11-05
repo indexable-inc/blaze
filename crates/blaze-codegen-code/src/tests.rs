@@ -25,11 +25,22 @@ fn relock(root: &Path, from: &str, to: &str) {
 fn an_edit_outside_the_code_generator_keeps_its_code() {
     let code = base();
     let edits: [(&str, Box<dyn FnOnce(&Path)>); 6] = [
-        ("the program's source", Box::new(|root| write(root, "crates/cli/src/main.rs", "fn main() { println!(\"hi\") }\n"))),
-        ("a test of a dependency", Box::new(|root| write(root, "crates/front/tests/it.rs", "#[test] fn other() {}\n"))),
+        (
+            "the program's source",
+            Box::new(|root| {
+                write(root, "crates/cli/src/main.rs", "fn main() { println!(\"hi\") }\n")
+            }),
+        ),
+        (
+            "a test of a dependency",
+            Box::new(|root| write(root, "crates/front/tests/it.rs", "#[test] fn other() {}\n")),
+        ),
         ("a dotfile", Box::new(|root| write(root, "crates/front/.hidden", "x"))),
         ("a file outside every package", Box::new(|root| write(root, "README.md", "x"))),
-        ("a checkout dev-dependency", Box::new(|root| write(root, "crates/devonly/src/lib.rs", "pub fn helps() { }\n"))),
+        (
+            "a checkout dev-dependency",
+            Box::new(|root| write(root, "crates/devonly/src/lib.rs", "pub fn helps() { }\n")),
+        ),
         (
             "a registry dev-dependency's checksum",
             Box::new(|root| relock(root, "checksum = \"cc\"", "checksum = \"dd\"")),
@@ -44,18 +55,36 @@ fn an_edit_outside_the_code_generator_keeps_its_code() {
 fn an_edit_of_the_code_generator_changes_its_code() {
     let code = base();
     let edits: [(&str, Box<dyn FnOnce(&Path)>); 6] = [
-        ("its own source", Box::new(|root| write(root, "crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { }\n"))),
-        ("a dependency's source", Box::new(|root| write(root, "crates/front/src/lib.rs", "pub fn lower() { }\n"))),
+        (
+            "its own source",
+            Box::new(|root| {
+                write(root, "crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { }\n")
+            }),
+        ),
+        (
+            "a dependency's source",
+            Box::new(|root| write(root, "crates/front/src/lib.rs", "pub fn lower() { }\n")),
+        ),
         ("a new file in a dependency", Box::new(|root| write(root, "crates/front/src/new.rs", ""))),
         (
             "a workspace manifest",
             Box::new(|root| {
                 let manifest = std::fs::read_to_string(root.join("crates/cli/Cargo.toml")).unwrap();
-                write(root, "crates/cli/Cargo.toml", &format!("{manifest}\n[features]\nextra = []\n"));
+                write(
+                    root,
+                    "crates/cli/Cargo.toml",
+                    &format!("{manifest}\n[features]\nextra = []\n"),
+                );
             }),
         ),
-        ("the pinned nightly", Box::new(|root| write(root, "harness/toolchain", "nightly-2026-11-02\n"))),
-        ("a registry package's checksum", Box::new(|root| relock(root, "checksum = \"aa\"", "checksum = \"bb\""))),
+        (
+            "the pinned nightly",
+            Box::new(|root| write(root, "harness/toolchain", "nightly-2026-11-02\n")),
+        ),
+        (
+            "a registry package's checksum",
+            Box::new(|root| relock(root, "checksum = \"aa\"", "checksum = \"bb\"")),
+        ),
     ];
     for (what, edit) in edits {
         assert_ne!(code_after(edit), code, "{what} is an input of the code generator's code");
@@ -68,7 +97,11 @@ fn an_edit_of_the_code_generator_changes_its_code() {
 #[test]
 fn an_edit_of_code_the_front_end_runs_through_a_hook_changes_the_code() {
     assert_ne!(
-        code_after(|root| write(root, "crates/blaze-item-hash/src/lib.rs", "pub fn facts() { /* other MIR */ }\n")),
+        code_after(|root| write(
+            root,
+            "crates/blaze-item-hash/src/lib.rs",
+            "pub fn facts() { /* other MIR */ }\n"
+        )),
         base(),
         "blaze-item-hash, installed as `BodyFacts`, is an input"
     );
@@ -95,7 +128,11 @@ fn how_blaze_is_built_is_in_the_code() {
     }
     let mut other = env();
     other.compiler = Some("rustc 1.101.0-nightly (1111111 2026-11-02)\n".to_owned());
-    assert_ne!(work_out(&read, &other).unwrap().code, code, "the compiler that builds blaze is an input");
+    assert_ne!(
+        work_out(&read, &other).unwrap().code,
+        code,
+        "the compiler that builds blaze is an input"
+    );
     assert!(!env().vars.contains_key("HOME"), "$HOME is no input");
 }
 
@@ -108,10 +145,19 @@ fn the_code_is_of_the_contents_alone() {
     assert_eq!(a.listing(), b.listing());
     assert_eq!(
         a.crates,
-        ["blaze_codegen_code", "blaze_item_hash", "blaze_macro_eval", "front", "hir_def", "hir_ty", "hir_ty_codegen", "reg"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "blaze_codegen_code",
+            "blaze_item_hash",
+            "blaze_macro_eval",
+            "front",
+            "hir_def",
+            "hir_ty",
+            "hir_ty_codegen",
+            "reg"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     );
 }
 
@@ -128,7 +174,11 @@ fn an_input_that_cant_be_had_is_an_error_naming_it() {
     assert!(why.contains("reg 1.0.0") && why.contains("checksum"), "{why}");
 
     let workspace = Workspace::new("git", false);
-    relock(workspace.root(), &format!("source = \"{}\"\nchecksum = \"aa\"", fixture::REGISTRY), "source = \"git+https://example.com/reg#0123abcd\"");
+    relock(
+        workspace.root(),
+        &format!("source = \"{}\"\nchecksum = \"aa\"", fixture::REGISTRY),
+        "source = \"git+https://example.com/reg#0123abcd\"",
+    );
     let why = workspace.work_out().unwrap_err();
     assert!(why.contains("reg 1.0.0") && why.contains("git"), "{why}");
 
@@ -163,10 +213,19 @@ fn a_lock_manifest_or_new_file_saved_while_it_was_worked_out_is_named() {
         let changed = work_out(&read, &env()).unwrap().changed();
         assert!(changed.iter().any(|it| it.ends_with(named)), "{what}: {changed:?}");
     };
-    saved("the lock", &|it| relock(it.root(), "checksum = \"cc\"", "checksum = \"ddd\""), "Cargo.lock");
+    saved(
+        "the lock",
+        &|it| relock(it.root(), "checksum = \"cc\"", "checksum = \"ddd\""),
+        "Cargo.lock",
+    );
     saved(
         "a manifest",
-        &|it| it.write("crates/cli/Cargo.toml", "[package]\nname = \"cli\"\nversion = \"0.1.0\"\n# saved\n"),
+        &|it| {
+            it.write(
+                "crates/cli/Cargo.toml",
+                "[package]\nname = \"cli\"\nversion = \"0.1.0\"\n# saved\n",
+            )
+        },
         "crates/cli/Cargo.toml",
     );
     let workspace = Workspace::new("added", false);
@@ -178,7 +237,14 @@ fn a_lock_manifest_or_new_file_saved_while_it_was_worked_out_is_named() {
 
 #[test]
 fn the_c_compiler_is_no_input_and_what_else_a_build_script_reads_is() {
-    for name in ["CC", "CXX", "HOST_CFLAGS", "CC_aarch64-apple-darwin", "CXXFLAGS_aarch64_apple_darwin", "MACOSX_DEPLOYMENT_TARGET"] {
+    for name in [
+        "CC",
+        "CXX",
+        "HOST_CFLAGS",
+        "CC_aarch64-apple-darwin",
+        "CXXFLAGS_aarch64_apple_darwin",
+        "MACOSX_DEPLOYMENT_TARGET",
+    ] {
         assert!(unkeyed_env(name).is_some(), "{name}");
     }
     for name in ["LLVM_SYS_231_FFI_WORKAROUND", "ISLE_SOURCE_DIR", "CI", "CCACHE"] {
@@ -188,7 +254,12 @@ fn the_c_compiler_is_no_input_and_what_else_a_build_script_reads_is() {
 
 /// The inputs of `worked` of `kind`, by name.
 fn of_kind(worked: &Worked, kind: &str) -> BTreeMap<String, [u8; 32]> {
-    worked.inputs.iter().filter(|it| it.kind == kind).map(|it| (it.name.clone(), it.digest)).collect()
+    worked
+        .inputs
+        .iter()
+        .filter(|it| it.kind == kind)
+        .map(|it| (it.name.clone(), it.digest))
+        .collect()
 }
 
 /// N1 of the re-review: LLVM is an input by the pin llvm-sys checks it against (llvm.json's
@@ -202,7 +273,12 @@ fn llvm_is_an_input_by_its_pin_and_needs_no_prefix() {
     let workspace = Workspace::with_llvm("pin");
     let worked = workspace.work_out().expect("no $LLVM_SYS_231_PREFIX is no error");
     let llvm = of_kind(&worked, "llvm");
-    assert_eq!(llvm.keys().collect::<Vec<_>>(), ["pin aarch64-apple-darwin"], "{}", worked.listing());
+    assert_eq!(
+        llvm.keys().collect::<Vec<_>>(),
+        ["pin aarch64-apple-darwin"],
+        "{}",
+        worked.listing()
+    );
     assert!(worked.llvm_prefix.is_none());
     assert!(worked.rerun_env.iter().any(|it| it == LLVM_PREFIX));
     let pin_of = |json: &str| {
@@ -215,15 +291,26 @@ fn llvm_is_an_input_by_its_pin_and_needs_no_prefix() {
     let own_target = fixture::LLVM_JSON.replace(&"1".repeat(64), &"3".repeat(64));
     assert_ne!(pin_of(&own_target), pinned, "the release of the target built for is an input");
     let (version, commit) = fixture::LLVM_PIN;
-    assert_ne!(pin_of(&fixture::LLVM_JSON.replace(version, "23.1.5")), pinned, "the pinned version is an input");
-    assert_ne!(pin_of(&fixture::LLVM_JSON.replace(commit, &"0".repeat(40))), pinned, "the pinned commit is an input");
+    assert_ne!(
+        pin_of(&fixture::LLVM_JSON.replace(version, "23.1.5")),
+        pinned,
+        "the pinned version is an input"
+    );
+    assert_ne!(
+        pin_of(&fixture::LLVM_JSON.replace(commit, &"0".repeat(40))),
+        pinned,
+        "the pinned commit is an input"
+    );
 
     // Built on one host for another target: both releases are.
     workspace.write("crates/hir-ty-codegen/llvm.json", fixture::LLVM_JSON);
     let mut cross = env();
     cross.vars.insert("TARGET".to_owned(), Some("x86_64-unknown-linux-gnu".to_owned()));
     let cross = of_kind(&work_out(&workspace.read().unwrap(), &cross).unwrap(), "llvm");
-    assert_eq!(cross.keys().collect::<Vec<_>>(), ["pin aarch64-apple-darwin", "pin x86_64-unknown-linux-gnu"]);
+    assert_eq!(
+        cross.keys().collect::<Vec<_>>(),
+        ["pin aarch64-apple-darwin", "pin x86_64-unknown-linux-gnu"]
+    );
 }
 
 /// C3 of the seedprof review: the stencil libraries are inputs by the ids their pin names
@@ -234,9 +321,17 @@ fn the_stencils_are_inputs_by_their_pin_and_the_seed_keys_no_llvm() {
     let workspace = Workspace::with_llvm("stencils");
     let worked = workspace.work_out().unwrap();
     let stencils = of_kind(&worked, "stencils");
-    assert_eq!(stencils.keys().collect::<Vec<_>>(), ["aarch64.stencils", "x86_64.stencils"], "{}", worked.listing());
+    assert_eq!(
+        stencils.keys().collect::<Vec<_>>(),
+        ["aarch64.stencils", "x86_64.stencils"],
+        "{}",
+        worked.listing()
+    );
     assert_eq!(stencils["x86_64.stencils"], [0x44; 32]);
-    workspace.write("crates/blaze-stencil/stencils.json", &fixture::STENCILS_JSON.replace(&"4".repeat(64), &"6".repeat(64)));
+    workspace.write(
+        "crates/blaze-stencil/stencils.json",
+        &fixture::STENCILS_JSON.replace(&"4".repeat(64), &"6".repeat(64)),
+    );
     let repinned = workspace.work_out().unwrap();
     assert_eq!(of_kind(&repinned, "stencils")["x86_64.stencils"], [0x66; 32]);
     assert_ne!(repinned.code, worked.code, "another pinned library is another code");
@@ -246,7 +341,8 @@ fn the_stencils_are_inputs_by_their_pin_and_the_seed_keys_no_llvm() {
     // No LLVM is read in the seed; the stencil libraries are blaze-stencil's committed files,
     // keyed by the pin as in every build.
     seed.llvm_prefix = Some(workspace.above().join("no-llvm").to_str().unwrap().to_owned());
-    let worked = work_out(&workspace.read().unwrap(), &seed).expect("the seed checks no LLVM prefix");
+    let worked =
+        work_out(&workspace.read().unwrap(), &seed).expect("the seed checks no LLVM prefix");
     assert!(of_kind(&worked, "llvm").is_empty(), "{}", worked.listing());
     assert!(!worked.rerun_env.iter().any(|it| it == LLVM_PREFIX));
     assert!(worked.llvm_prefix.is_none());
@@ -273,7 +369,13 @@ fn a_prefix_is_checked_to_be_the_pin() {
     assert!(why.contains("blaze links only the LLVM") && why.contains(pin::PIN_MARKER), "{why}");
     let marker = |commit: &str| {
         let (version, _) = fixture::LLVM_PIN;
-        write(&prefix, pin::PIN_MARKER, &format!("{{\"version\": \"{version}\", \"commit\": \"{commit}\", \"target\": \"t\"}}\n"));
+        write(
+            &prefix,
+            pin::PIN_MARKER,
+            &format!(
+                "{{\"version\": \"{version}\", \"commit\": \"{commit}\", \"target\": \"t\"}}\n"
+            ),
+        );
     };
     marker(&"0".repeat(40));
     let why = with_prefix().unwrap_err();
@@ -289,11 +391,15 @@ fn a_prefix_is_checked_to_be_the_pin() {
         assert!(of_kind(&worked, "llvm").contains_key(pin::PIN_MARKER), "{}", worked.listing());
         assert_eq!(worked.llvm_prefix.as_deref(), Some(prefix.canonicalize().unwrap().as_path()));
         let code = worked.code;
-        write(&prefix, pin::PIN_MARKER, &format!(
-            "{{\"version\": \"{}\", \"commit\": \"{}\", \"target\": \"other\"}}\n",
-            fixture::LLVM_PIN.0,
-            fixture::LLVM_PIN.1
-        ));
+        write(
+            &prefix,
+            pin::PIN_MARKER,
+            &format!(
+                "{{\"version\": \"{}\", \"commit\": \"{}\", \"target\": \"other\"}}\n",
+                fixture::LLVM_PIN.0,
+                fixture::LLVM_PIN.1
+            ),
+        );
         assert_ne!(with_prefix().unwrap().code, code, "the prefix's marker is an input");
     }
 }
@@ -307,7 +413,11 @@ fn which_blaze_built_blaze_is_in_the_code() {
     assert_eq!(check_compiler("rustc", rustc.to_owned()).as_deref(), Ok(rustc));
     let one = blaze(&"ab".repeat(32));
     assert_eq!(check_compiler("blaze", one.clone()), Ok(one.clone()));
-    for bad in [blaze("ab"), blaze(&"zz".repeat(32)), format!("{one}{BLAZE_IDENTITY}{}\n", "cd".repeat(32))] {
+    for bad in [
+        blaze("ab"),
+        blaze(&"zz".repeat(32)),
+        format!("{one}{BLAZE_IDENTITY}{}\n", "cd".repeat(32)),
+    ] {
         let why = check_compiler("blaze", bad).unwrap_err();
         assert!(why.contains(BLAZE_IDENTITY.trim()), "{why}");
     }
@@ -351,7 +461,11 @@ fn cargo_configuration_above_the_workspace_and_in_cargo_home_is_an_input() {
     with_home.cargo_home = Some(home.clone());
     let worked = work_out(&workspace.read().unwrap(), &with_home).unwrap();
     assert_ne!(worked.code, above, "$CARGO_HOME's configuration is an input");
-    assert!(of_kind(&worked, "manifest").contains_key("$CARGO_HOME/config.toml"), "{}", worked.listing());
+    assert!(
+        of_kind(&worked, "manifest").contains_key("$CARGO_HOME/config.toml"),
+        "{}",
+        worked.listing()
+    );
     assert!(worked.files.contains(&home.join("config.toml")));
 }
 
@@ -368,18 +482,45 @@ fn front_end_after(edit: impl FnOnce(&Path)) -> [u8; 32] {
 fn the_front_end_is_keyed_by_its_own_code_alone() {
     let code = front_end_after(|_| {});
     let kept: [(&str, Box<dyn FnOnce(&Path)>); 3] = [
-        ("the code generator", Box::new(|root| write(root, "crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { }\n"))),
-        ("the code generator's build dependency", Box::new(|root| relock(root, "checksum = \"aa\"", "checksum = \"bb\""))),
-        ("the program's source", Box::new(|root| write(root, "crates/cli/src/main.rs", "fn main() { println!(\"hi\") }\n"))),
+        (
+            "the code generator",
+            Box::new(|root| {
+                write(root, "crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { }\n")
+            }),
+        ),
+        (
+            "the code generator's build dependency",
+            Box::new(|root| relock(root, "checksum = \"aa\"", "checksum = \"bb\"")),
+        ),
+        (
+            "the program's source",
+            Box::new(|root| {
+                write(root, "crates/cli/src/main.rs", "fn main() { println!(\"hi\") }\n")
+            }),
+        ),
     ];
     for (what, edit) in kept {
         assert_eq!(front_end_after(edit), code, "{what} is no input of the front end's code");
     }
     let changed: [(&str, Box<dyn FnOnce(&Path)>); 4] = [
-        ("hir-def", Box::new(|root| write(root, "crates/hir-def/src/lib.rs", "pub fn resolve() { }\n"))),
-        ("a package a hook is built from", Box::new(|root| write(root, "crates/front/src/lib.rs", "pub fn lower() { }\n"))),
-        ("a hook (`BodyFacts`)", Box::new(|root| write(root, "crates/blaze-item-hash/src/lib.rs", "pub fn facts() { }\n"))),
-        ("the pinned nightly", Box::new(|root| write(root, "harness/toolchain", "nightly-2026-11-02\n"))),
+        (
+            "hir-def",
+            Box::new(|root| write(root, "crates/hir-def/src/lib.rs", "pub fn resolve() { }\n")),
+        ),
+        (
+            "a package a hook is built from",
+            Box::new(|root| write(root, "crates/front/src/lib.rs", "pub fn lower() { }\n")),
+        ),
+        (
+            "a hook (`BodyFacts`)",
+            Box::new(|root| {
+                write(root, "crates/blaze-item-hash/src/lib.rs", "pub fn facts() { }\n")
+            }),
+        ),
+        (
+            "the pinned nightly",
+            Box::new(|root| write(root, "harness/toolchain", "nightly-2026-11-02\n")),
+        ),
     ];
     for (what, edit) in changed {
         assert_ne!(front_end_after(edit), code, "{what} is an input of the front end's code");
@@ -389,12 +530,23 @@ fn the_front_end_is_keyed_by_its_own_code_alone() {
     let worked = work_out_of(&read, &FRONT_END, &env()).unwrap();
     assert_eq!(
         worked.packages,
-        ["blaze-codegen-code", "blaze-item-hash", "blaze-macro-eval", "front", "hir-def", "hir-ty"].into_iter().map(str::to_owned).collect()
+        ["blaze-codegen-code", "blaze-item-hash", "blaze-macro-eval", "front", "hir-def", "hir-ty"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     );
     let mut other = env();
     other.vars.insert("CARGO_ENCODED_RUSTFLAGS".to_owned(), Some("-Copt-level=1".to_owned()));
-    assert_ne!(work_out_of(&read, &FRONT_END, &other).unwrap().code, worked.code, "how blaze is built is an input (rule 18)");
-    assert_ne!(worked.code, work_out(&read, &env()).unwrap().code, "each identity is of its own domain");
+    assert_ne!(
+        work_out_of(&read, &FRONT_END, &other).unwrap().code,
+        worked.code,
+        "how blaze is built is an input (rule 18)"
+    );
+    assert_ne!(
+        worked.code,
+        work_out(&read, &env()).unwrap().code,
+        "each identity is of its own domain"
+    );
 }
 
 /// C3 of the fekey review: cargo unifies features across the packages it builds together, so a
@@ -405,24 +557,50 @@ fn the_front_end_is_keyed_by_its_own_code_alone() {
 #[test]
 fn a_package_that_can_turn_on_a_feature_of_the_closure_is_an_input() {
     let (codegen, front_end) = (base(), front_end_after(|_| {}));
-    let feat = |root: &Path| relock(root, &format!("checksum = \"{}\"", fixture::FEAT_CHECKSUM), "checksum = \"ef\"");
-    assert_ne!(code_after(feat), codegen, "`feat` can turn on a feature of `reg`, of the code generator's closure");
-    assert_eq!(front_end_after(feat), front_end, "`feat` reaches nothing of the front end's closure");
+    let feat = |root: &Path| {
+        relock(root, &format!("checksum = \"{}\"", fixture::FEAT_CHECKSUM), "checksum = \"ef\"")
+    };
+    assert_ne!(
+        code_after(feat),
+        codegen,
+        "`feat` can turn on a feature of `reg`, of the code generator's closure"
+    );
+    assert_eq!(
+        front_end_after(feat),
+        front_end,
+        "`feat` reaches nothing of the front end's closure"
+    );
     let outside = |root: &Path| {
-        let features = "[dependencies]\nhir-def = { path = \"../../crates/hir-def\", features = [\"x\"] }\n";
+        let features =
+            "[dependencies]\nhir-def = { path = \"../../crates/hir-def\", features = [\"x\"] }\n";
         write(root, fixture::OUTSIDE_MANIFEST, &fixture::manifest("outside", features));
     };
     assert_ne!(front_end_after(outside), front_end, "`outside` can turn on a feature of `hir-def`");
-    assert_ne!(code_after(outside), codegen, "and `hir-def` is of the code generator's closure too");
+    assert_ne!(
+        code_after(outside),
+        codegen,
+        "and `hir-def` is of the code generator's closure too"
+    );
     assert_eq!(
         code_after(|root| write(root, "vendor/outside/src/lib.rs", "pub fn outside() { }\n")),
         codegen,
         "what a dependent's code is turns on no feature"
     );
     let worked = Workspace::new("dependents", false).work_out().unwrap();
-    assert!(of_kind(&worked, "dependent").keys().any(|it| it.starts_with("feat 1.0.0")), "{}", worked.listing());
-    assert!(of_kind(&worked, "manifest").contains_key(fixture::OUTSIDE_MANIFEST), "{}", worked.listing());
-    assert!(!worked.packages.contains("feat") && !worked.packages.contains("outside"), "a dependent is no package of the closure");
+    assert!(
+        of_kind(&worked, "dependent").keys().any(|it| it.starts_with("feat 1.0.0")),
+        "{}",
+        worked.listing()
+    );
+    assert!(
+        of_kind(&worked, "manifest").contains_key(fixture::OUTSIDE_MANIFEST),
+        "{}",
+        worked.listing()
+    );
+    assert!(
+        !worked.packages.contains("feat") && !worked.packages.contains("outside"),
+        "a dependent is no package of the closure"
+    );
 }
 
 /// C4 of the fekey review: a file outside every package whose reader is not in the closure is an
@@ -434,6 +612,69 @@ fn an_extra_whose_reader_is_outside_the_closure_is_an_error() {
     let read = workspace.read().unwrap();
     let why = work_out_of(&read, &wrong, &env()).unwrap_err();
     assert!(why.contains("`nowhere`") && why.contains("harness/toolchain"), "{why}");
+}
+
+/// A package an identity cuts is no input, nor what only it is built from, though a root is
+/// built from it: an edit of it keeps the identity, and an edit of a root still moves it. A cut
+/// that names no package the program links, or a root, is refused, naming it (rule 18: a cut
+/// names a package that is there, never one gone stale).
+#[test]
+fn a_cut_package_is_no_input_and_a_stale_cut_is_refused() {
+    let cut =
+        Identity { cut: &[Cut { package: "front", why: "the test's", named_in: &[] }], ..CODEGEN };
+    let workspace = Workspace::new("cut", false);
+    let worked = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert!(worked.packages.contains(CODE_GENERATOR), "{}", worked.listing());
+    for gone in ["front", "hir-def", "blaze-macro-eval"] {
+        assert!(
+            !worked.packages.contains(gone),
+            "{gone} is reached through the cut alone: {}",
+            worked.listing()
+        );
+    }
+    assert_ne!(worked.code, workspace.code(), "a cut is another closure");
+    workspace.write("crates/front/src/lib.rs", "pub fn lower() { let _ = 1; }\n");
+    let edited = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert_eq!(edited.code, worked.code, "an edit of a cut package keeps the identity");
+    workspace.write("crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { let _ = 2; }\n");
+    let rooted = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert_ne!(rooted.code, worked.code, "an edit of a root moves the identity");
+
+    let read = workspace.read().unwrap();
+    let stale = Identity {
+        cut: &[Cut { package: "nowhere", why: "the test's", named_in: &[] }],
+        ..CODEGEN
+    };
+    let why = work_out_of(&read, &stale, &env()).unwrap_err();
+    assert!(why.contains("`nowhere`") && why.contains("does not link"), "{why}");
+    let both = Identity {
+        cut: &[Cut { package: CODE_GENERATOR, why: "the test's", named_in: &[] }],
+        ..CODEGEN
+    };
+    let why = work_out_of(&read, &both, &env()).unwrap_err();
+    assert!(why.contains("both roots and cuts"), "{why}");
+    // M2 of the overkey review: a root and a cut are one package by either of its names.
+    let short = Identity {
+        cut: &[Cut { package: "item-hash", why: "the test's", named_in: &[] }],
+        ..CODEGEN
+    };
+    let why = work_out_of(&read, &short, &env()).unwrap_err();
+    assert!(why.contains("both roots and cuts"), "{why}");
+
+    // C1 of the overkey review: `hir-def` is built from by `front` and `hir-ty`, which are of the
+    // closure and no root, so code the closure runs would be past it unreviewed.
+    let reached = Identity {
+        cut: &[Cut { package: "hir-def", why: "the test's", named_in: &[] }],
+        ..CODEGEN
+    };
+    let why = work_out_of(&read, &reached, &env()).unwrap_err();
+    assert!(
+        why.contains("`hir-def`")
+            && why.contains("`front`")
+            && why.contains("`hir-ty`")
+            && why.contains("no root"),
+        "{why}"
+    );
 }
 
 /// M2 of the fekey review: a link to a directory under a directory an identity reads outside
@@ -457,7 +698,10 @@ fn one_walk_for_two_identities_is_each_walk_alone() {
     let mut walk = Walk::default();
     let codegen = walk.work_out(&read, &CODEGEN, &env()).unwrap();
     let front_end = walk.work_out(&read, &FRONT_END, &env()).unwrap();
-    for (shared, alone) in [(&codegen, work_out(&read, &env()).unwrap()), (&front_end, work_out_of(&read, &FRONT_END, &env()).unwrap())] {
+    for (shared, alone) in [
+        (&codegen, work_out(&read, &env()).unwrap()),
+        (&front_end, work_out_of(&read, &FRONT_END, &env()).unwrap()),
+    ] {
         assert_eq!(shared.code, alone.code);
         assert_eq!(shared.listing(), alone.listing());
         assert_eq!(shared.files, alone.files);
@@ -484,17 +728,48 @@ fn a_shipped_tree_works_out_the_identity_the_checkout_does() {
         write(&package, identity.shipped, &ship(&read, identity).unwrap());
         let shipped = package.join(identity.shipped);
         let from_package = work_out_shipped(&shipped, identity, &built).unwrap();
-        assert_eq!(from_package.listing(), checkout.listing(), "{}: the same inputs", identity.what);
+        assert_eq!(
+            from_package.listing(),
+            checkout.listing(),
+            "{}: the same inputs",
+            identity.what
+        );
         assert_eq!(from_package.code, checkout.code, "{}: the same identity", identity.what);
         assert!(from_package.watched.contains(&shipped), "{:?}", from_package.watched);
-        assert!(!from_package.watched.iter().any(|it| it.starts_with(workspace.root())), "{:?}", from_package.watched);
+        assert!(
+            !from_package.watched.iter().any(|it| it.starts_with(workspace.root())),
+            "{:?}",
+            from_package.watched
+        );
         let (here, lock) = work_out_here(&package, &[identity], &built).unwrap();
-        assert_eq!((here[0].code, lock), (checkout.code, None), "{}: the shipped tree, and no lock to rerun on", identity.what);
-        let (here, lock) = work_out_here(&workspace.root().join("crates/cli"), &[identity], &built).unwrap();
-        assert_eq!((here[0].code, lock), (checkout.code, Some(read.lock_path.clone())), "{}: the checkout", identity.what);
-        workspace.write("crates/hir-def/src/lib.rs", "pub fn resolve() { /* edited after shipping */ }\n");
-        assert_eq!(work_out_shipped(&shipped, identity, &built).unwrap().code, checkout.code, "{}: of the tree shipped", identity.what);
-        assert_ne!(work_out_of(&workspace.read().unwrap(), identity, &built).unwrap().code, checkout.code);
+        assert_eq!(
+            (here[0].code, lock),
+            (checkout.code, None),
+            "{}: the shipped tree, and no lock to rerun on",
+            identity.what
+        );
+        let (here, lock) =
+            work_out_here(&workspace.root().join("crates/cli"), &[identity], &built).unwrap();
+        assert_eq!(
+            (here[0].code, lock),
+            (checkout.code, Some(read.lock_path.clone())),
+            "{}: the checkout",
+            identity.what
+        );
+        workspace.write(
+            "crates/hir-def/src/lib.rs",
+            "pub fn resolve() { /* edited after shipping */ }\n",
+        );
+        assert_eq!(
+            work_out_shipped(&shipped, identity, &built).unwrap().code,
+            checkout.code,
+            "{}: of the tree shipped",
+            identity.what
+        );
+        assert_ne!(
+            work_out_of(&workspace.read().unwrap(), identity, &built).unwrap().code,
+            checkout.code
+        );
     }
     let other = Workspace::new("ship-other", false);
     let read = other.read().unwrap();
@@ -529,17 +804,31 @@ fn the_vendored_solver_is_of_the_front_ends_identity() {
     let (source, text) = fixture::SOLVER_SOURCE;
     let changed: [(&str, &dyn Fn(&Workspace)); 3] = [
         ("its source", &|it| it.write(source, &format!("{text}// another rule\n"))),
-        ("its patch series", &|it| it.write("vendor/rustc_next_trait_solver/PATCHES.md", "# Patches\n")),
-        ("a patch", &|it| it.write("vendor/rustc_next_trait_solver/patches/0001-one.patch", "--- a\n+++ c\n")),
+        ("its patch series", &|it| {
+            it.write("vendor/rustc_next_trait_solver/PATCHES.md", "# Patches\n")
+        }),
+        ("a patch", &|it| {
+            it.write("vendor/rustc_next_trait_solver/patches/0001-one.patch", "--- a\n+++ c\n")
+        }),
     ];
     for (what, edit) in changed {
         assert_ne!(after(edit), code, "the solver's {what} is an input of the front end's code");
     }
-    assert_eq!(after(&|it| it.write("vendor/rustc_next_trait_solver/tests/it.rs", "#[test] fn other() {}\n")), code);
+    assert_eq!(
+        after(
+            &|it| it.write("vendor/rustc_next_trait_solver/tests/it.rs", "#[test] fn other() {}\n")
+        ),
+        code
+    );
     let workspace = Workspace::with_solver("solver-files");
     let worked = work_out_of(&workspace.read().unwrap(), &FRONT_END, &env()).unwrap();
     assert!(worked.packages.contains("rustc_next_trait_solver"), "{:?}", worked.packages);
-    assert!(worked.files.contains(&workspace.root().join(source).canonicalize().unwrap()), "{:?}", worked.files);
+    assert!(
+        worked.files.contains(&workspace.root().join(source).canonicalize().unwrap()),
+        "{:?}",
+        worked.files
+    );
 }
 
+mod cuts;
 mod hooks;

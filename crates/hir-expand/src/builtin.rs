@@ -6,6 +6,8 @@ mod attr_macro;
 mod derive_macro;
 mod fn_macro;
 
+#[cfg(test)]
+pub(crate) use self::fn_macro::concat_of_literals_in;
 pub use self::{
     attr_macro::{
         ALLOC_ERROR_HANDLER_EXPORT, BuiltinAttrExpander, find_builtin_attr,
@@ -17,5 +19,3 @@ pub use self::{
         include_input_to_file_id, line_and_column, written_place,
     },
 };
-#[cfg(test)]
-pub(crate) use self::fn_macro::concat_of_literals_in;

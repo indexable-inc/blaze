@@ -36,25 +36,36 @@ defaults:
 jobs:
   tango:
     name: tango
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    runs-on: [ix, arm64, ix-cpu-64, blaze-tango]
+    # Two builds by blaze from main's build store, which runs longer than an hour when cold.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # cargo, with no cache: blaze has no `bench` and leaves --message-format to cargo, and what
-      # is timed is the store as rustc compiles it, which is how a release ships (build_release.py).
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names, with the pinned LLVM, from the store main's build job pushed, and the store as the
+      # blaze users get compiles it. The bench binary is a release build of blaze-bench's `store`
+      # bench target, found where blaze writes a target's program: `target/release/deps/store-<hash>`.
+      - uses: ./.github/actions/blaze
+        with:
+          job: build
+          llvm: true
       # The base first, in the same checkout, so that the change's build reuses whatever of
       # it the change did not touch. A base without the benchmarks has nothing to pair with.
       - name: Build the base
         if: github.event_name == 'pull_request'
         run: |
+          build_store() {
+            blaze build --release --locked -p blaze-bench --bench store
+            # The newest: the base's build left one of another hash beside it.
+            exe=$(find target/release/deps -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
+            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no target/release/deps/store-<hash>"; exit 1; }
+            cp "$exe" "$1"
+          }
           git checkout -q --detach ${{ github.event.pull_request.base.sha }}
           if [ -d crates/blaze-bench ]; then
-            cargo bench -p blaze-bench --bench store --no-run --message-format=json \
-              | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-              | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
+            build_store "$RUNNER_TEMP/bench-base"
           fi
           # A base built before blaze-bench had its own runner speaks no protocol to pair with.
           if [ -x "$RUNNER_TEMP/bench-base" ] && [ "$("$RUNNER_TEMP/bench-base" protocol 2>/dev/null)" != "blaze-bench-protocol 1" ]; then
@@ -64,9 +75,14 @@ jobs:
           git checkout -q --detach ${{ github.sha }}
       - name: Build the change
         run: |
-          cargo bench -p blaze-bench --bench store --no-run --message-format=json \
-            | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
-            | xargs -I{} cp {} "$RUNNER_TEMP/bench-head"
+          build_store() {
+            blaze build --release --locked -p blaze-bench --bench store
+            # The newest: the base's build left one of another hash beside it.
+            exe=$(find target/release/deps -maxdepth 1 -type f -perm -u+x -name 'store-*' -exec ls -t {} + | head -n 1)
+            [ -n "$exe" ] || { echo "::error::blaze build -p blaze-bench --bench store made no target/release/deps/store-<hash>"; exit 1; }
+            cp "$exe" "$1"
+          }
+          build_store "$RUNNER_TEMP/bench-head"
       - name: Compare with the base
         if: github.event_name == 'pull_request'
         run: |
@@ -84,3 +100,6 @@ jobs:
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
           "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
           { echo '### blaze-bench'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log

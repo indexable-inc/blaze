@@ -43,8 +43,8 @@ pub mod relocs;
 pub mod settings;
 pub mod summary;
 pub mod template;
-pub mod wasm;
 pub mod unwind;
+pub mod wasm;
 
 pub use driver::Owner;
 pub use exec::ExecTable;
@@ -86,8 +86,12 @@ pub struct Settings(pub ContentId);
 pub enum Backend {
     /// `speed`: Cranelift's `opt_level=speed`, for code no edit reaches (std's, dependencies',
     /// build-time code), which is compiled once; else `opt_level=none`.
-    Cranelift { speed: bool },
-    Llvm { opt: u8 },
+    Cranelift {
+        speed: bool,
+    },
+    Llvm {
+        opt: u8,
+    },
     /// Copy-and-patch (`blaze-stencil`): tier 0 of a tiered dev or test run
     /// (docs/v2/plan/lanes/fastcompile/stencil.md).
     Stencil,
@@ -111,6 +115,16 @@ impl Backend {
     pub const fn is_release(self) -> bool {
         matches!(self, Backend::Llvm { .. })
     }
+}
+
+/// How a function of a build was made: the backend that compiled it, and whose code it is
+/// ([`plan::Origin`]: the crate that asked for it). What a linked image's code is summed by
+/// (blaze-link's `link code` events, `blaze explain link_code`); never part of a key, as the
+/// backend already is in the instance's settings.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Made {
+    pub backend: Backend,
+    pub origin: plan::Origin,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -483,9 +497,5 @@ pub struct FrontItem {
 pub trait Compile: Sync {
     /// The front end's MIR of an instance, as the codegen lane reads it (`hir-ty-mir`).
     type Mir<'a>;
-    fn compile(
-        &self,
-        unit: &Unit,
-        mir: Self::Mir<'_>,
-    ) -> Result<CompiledFunction, CodegenError>;
+    fn compile(&self, unit: &Unit, mir: Self::Mir<'_>) -> Result<CompiledFunction, CodegenError>;
 }

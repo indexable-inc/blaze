@@ -268,14 +268,21 @@ impl Runtime {
     }
 
     /// The index of the object `id` names in this execution, made by `make` if it names none.
-    pub(crate) fn object(&mut self, id: &AtomicU64, make: impl FnOnce(&mut Runtime) -> Object) -> u32 {
+    pub(crate) fn object(
+        &mut self,
+        id: &AtomicU64,
+        make: impl FnOnce(&mut Runtime) -> Object,
+    ) -> u32 {
         let raw = id.load(Relaxed);
         if raw >> INDEX_BITS == self.epoch {
             return (raw & ((1 << INDEX_BITS) - 1)) as u32 - 1;
         }
         let obj = make(self);
         let index = self.objects.len();
-        assert!(index + 1 < 1 << INDEX_BITS, "blaze-check: more than 2^24 objects in one execution");
+        assert!(
+            index + 1 < 1 << INDEX_BITS,
+            "blaze-check: more than 2^24 objects in one execution"
+        );
         self.objects.push(Entry { obj, last: None, last_store: None });
         id.store(self.epoch << INDEX_BITS | (index as u64 + 1), Relaxed);
         index as u32
@@ -308,7 +315,9 @@ impl Runtime {
                  a random number, or a static an earlier execution changed?)"
             ),
             // alloc: a finding's or an error's text, made once, when the model stops
-            Stuck::BadReplay(at, what) => format!("the replayed schedule does not fit: at branch {at}, {what}"),
+            Stuck::BadReplay(at, what) => {
+                format!("the replayed schedule does not fit: at branch {at}, {what}")
+            }
         }
     }
 

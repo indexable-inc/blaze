@@ -179,7 +179,11 @@ pub(crate) enum Class {
     PatchData,
     /// A section a static or a native object names (`#[link_section]`), kept whole and in
     /// input order so the program can walk it between its start and stop symbols.
-    Named { name: SectionName, write: bool, exec: bool },
+    Named {
+        name: SectionName,
+        write: bool,
+        exec: bool,
+    },
     /// Mach-O thread-local variable descriptors (`__thread_vars`): three words each, the
     /// `_tlv_bootstrap` thunk (bound), a key (0) and the variable's offset in the template.
     /// The core makes one for each thread-local static when [`Plan::tls_descriptors`].
@@ -268,7 +272,10 @@ pub(crate) enum Special {
     Stop(Class),
     /// The start or the end of the [`Class::Named`] regions of this name, whatever their
     /// flags; an error naming the section when there is none (ELF `__start_X`, #1496).
-    Section { name: SectionName, end: bool },
+    Section {
+        name: SectionName,
+        end: bool,
+    },
     /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
     /// `__bss_start`, `_DYNAMIC`).
     Placed(fn(&[Region]) -> u64),
@@ -280,7 +287,9 @@ pub(crate) enum Special {
     /// is: an import's import address table entry, or a cell holding a local symbol's
     /// address (PE's `__imp_X`; link.exe's LNK4217 case). The symbol's name is the special's
     /// own from byte `from` (6 for `__imp_X`), so the writer makes no string for it.
-    Got { from: u32 },
+    Got {
+        from: u32,
+    },
 }
 
 impl Special {
@@ -336,11 +345,15 @@ pub(crate) enum Apply {
     A64Page21,
     A64Adr21,
     /// The low 12 bits of `S + A`, shifted right by `shift` (`ADD` 0, `LDR`/`STR` 0 to 4).
-    A64Lo12 { shift: u8 },
+    A64Lo12 {
+        shift: u8,
+    },
     A64CondBr19,
     A64TstBr14,
     /// `MOVZ`/`MOVK` of 16 bits of `S + A` at `group * 16`.
-    A64MovW { group: u8 },
+    A64MovW {
+        group: u8,
+    },
     /// The GOT cell of `S`: its page, its low 12 bits for an `LDR` (Mach-O's `GOT_LOAD_*`).
     A64GotPage21,
     A64GotLo12,
@@ -540,7 +553,11 @@ impl Object {
 
     /// `data`'s bytes, `data` being one of this object's and `input` the slice it was read
     /// from: [`Data::bytes`], with [`Data::Made`] read from [`Object::made`].
-    pub fn section_bytes<'b>(&'b self, data: &'b Data, input: &'b [u8]) -> Result<Option<&'b [u8]>, String> {
+    pub fn section_bytes<'b>(
+        &'b self,
+        data: &'b Data,
+        input: &'b [u8],
+    ) -> Result<Option<&'b [u8]>, String> {
         match data {
             Data::Made(range) => slice(&self.made, range, "reader's made bytes"),
             _ => data.bytes(input),
@@ -620,7 +637,9 @@ impl Data {
             Data::Input(range) => slice(input, range, "input"),
             Data::Made(range) => {
                 // alloc: error path
-                Err(format!("bytes {range:?} the reader made, read without their object (`Object::section_bytes`)"))
+                Err(format!(
+                    "bytes {range:?} the reader made, read without their object (`Object::section_bytes`)"
+                ))
             }
             Data::Bytes(bytes) => Ok(Some(bytes)),
             Data::Zero(_) => Ok(None),
@@ -685,16 +704,26 @@ const _: () = assert!(std::mem::size_of::<Symbol>() <= 48);
 pub(crate) enum SymbolDef {
     Undefined,
     /// At `value` from the start of the object's section `section`.
-    Section { section: u32, value: u64, size: u64 },
+    Section {
+        section: u32,
+        value: u64,
+        size: u64,
+    },
     /// A tentative definition, merged by name; the largest wins.
-    Common { size: u64, align: u64 },
+    Common {
+        size: u64,
+        align: u64,
+    },
     Absolute(u64),
     /// Undefined here; when the link leaves the name undefined, it is the object's symbol
     /// `symbol` (COFF weak externals, `/ALTERNATENAME:from=to`). Archives are searched for it
     /// on this object's account only when `search` (`IMAGE_WEAK_EXTERN_SEARCH_LIBRARY`,
     /// `ALIAS`); another object's reference still may. `symbol` is resolved (and an error
     /// when undefined) only when the fallback is taken.
-    Fallback { symbol: u32, search: bool },
+    Fallback {
+        symbol: u32,
+        search: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -994,7 +1023,9 @@ impl Delta<'_> {
     /// they are of the link this is from, no region moved and every splice of `lists` keeps
     /// its length.
     pub fn patches(&self, last: u64, lists: &[&[Splice]]) -> bool {
-        self.from == last && self.same_regions && lists.iter().all(|it| it.iter().all(Splice::same_len))
+        self.from == last
+            && self.same_regions
+            && lists.iter().all(|it| it.iter().all(Splice::same_len))
     }
 }
 
@@ -1004,7 +1035,10 @@ impl<'a> Placed<'a> {
     /// and kept tables, may be in pages ([`Placed::paged`]): reading one here is a writer's
     /// bug, and it reads them through [`Placed::view`].
     pub fn bytes(&self, region: usize) -> &[u8] {
-        assert!(self.paged(region).is_none(), "region {region}'s bytes are in pages: read them with `Placed::view`");
+        assert!(
+            self.paged(region).is_none(),
+            "region {region}'s bytes are in pages: read them with `Placed::view`"
+        );
         self.contents[region]
     }
 
@@ -1180,7 +1214,10 @@ impl<'a> View<'a> {
     /// page at a time, and a chunk across two pages put together. `end - at` is a multiple of
     /// `N`, within the bytes.
     pub fn arrays<const N: usize>(self, at: usize, end: usize) -> Arrays<'a, N> {
-        assert!(at <= end && end <= self.len() && (end - at).is_multiple_of(N), "{N}-byte chunks of {at}..{end}");
+        assert!(
+            at <= end && end <= self.len() && (end - at).is_multiple_of(N),
+            "{N}-byte chunks of {at}..{end}"
+        );
         let window = match self {
             View::Slice(bytes) => &bytes[at..end],
             View::Pages(_) => &[][..],
@@ -1277,6 +1314,15 @@ pub(crate) struct File {
     pub debug: Vec<(u64, usize)>,
 }
 
+/// How far from its base a format's image may reach ([`Writer::window`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Window {
+    /// The most bytes from the base to the end of the last region's room.
+    pub bytes: u64,
+    /// What in the format sets it, as an error says it.
+    pub why: &'static str,
+}
+
 /// An object format.
 pub(crate) trait Writer: Send + Sync {
     fn format(&self) -> Format;
@@ -1291,12 +1337,32 @@ pub(crate) trait Writer: Send + Sync {
 
     fn prot(&self, class: &Class) -> Prot;
 
+    /// How far from the base the image's regions may reach, their room included (a dev run's
+    /// reservations, which hold no bytes, aside): checked on the laid-out addresses before
+    /// anything is written (`Stage::check_reach`). `None` where the format sets no such limit
+    /// of its own.
+    fn window(&self) -> Option<Window> {
+        None
+    }
+
+    /// The section a region of `class` is in the file, as the format names it: what an error
+    /// about the region says.
+    fn section_name(&self, class: &Class) -> String {
+        // alloc: error path
+        format!("{class:?}")
+    }
+
     /// The class a section a static or native object names goes in, and its rank in that
     /// class: pieces of a lower rank go first, of one rank in input order. `.init_array.00099`
     /// is [`Class::InitArray`] of rank 99 (before `.init_array`, of rank `u32::MAX`, as GNU
     /// ld sorts them), `.CRT$XCU` the PE writer's own; `linkme_ITEMS` a [`Class::Named`].
-    fn section(&self, name: &str, write: bool, exec: bool, tls: bool)
-    -> Result<(Class, u32), String>;
+    fn section(
+        &self,
+        name: &str,
+        write: bool,
+        exec: bool,
+        tls: bool,
+    ) -> Result<(Class, u32), String>;
 
     /// The symbol the linker defines under `name`, if it defines one.
     fn special(&self, name: &str) -> Option<Special>;
@@ -1327,16 +1393,26 @@ pub(crate) trait Writer: Send + Sync {
     }
 
     /// Reads a native input of the format.
-    fn read(&self, name: &str, bytes: &[u8], kind: &crate::NativeKind)
-    -> Result<NativeFile, String>;
+    fn read(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        kind: &crate::NativeKind,
+    ) -> Result<NativeFile, String>;
 
     /// The synthetic regions the writer fills and how big each may get.
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)>;
 
     /// Applies an [`Apply::Native`] relocation at `place` of `bytes`, which is at address
     /// `p`, to the target at `s`.
-    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64)
-    -> Result<(), String>;
+    fn apply(
+        &self,
+        r_type: u32,
+        bytes: &mut [u8],
+        p: u64,
+        s: u64,
+        addend: i64,
+    ) -> Result<(), String>;
 
     /// The contents of each synthetic region, the image placed and its other regions filled. A
     /// table the writer keeps across links is a clone of what it keeps, so a patch shares
@@ -1406,8 +1482,22 @@ impl Writer for Formats {
         each!(self, it => it.prot(class))
     }
 
+    fn window(&self) -> Option<Window> {
+        each!(self, it => it.window())
+    }
+
+    fn section_name(&self, class: &Class) -> String {
+        each!(self, it => it.section_name(class))
+    }
+
     #[inline]
-    fn section(&self, name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+    fn section(
+        &self,
+        name: &str,
+        write: bool,
+        exec: bool,
+        tls: bool,
+    ) -> Result<(Class, u32), String> {
         each!(self, it => it.section(name, write, exec, tls))
     }
 
@@ -1434,7 +1524,12 @@ impl Writer for Formats {
         each!(self, it => it.own(class))
     }
 
-    fn read(&self, name: &str, bytes: &[u8], kind: &crate::NativeKind) -> Result<NativeFile, String> {
+    fn read(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        kind: &crate::NativeKind,
+    ) -> Result<NativeFile, String> {
         each!(self, it => it.read(name, bytes, kind))
     }
 
@@ -1443,7 +1538,14 @@ impl Writer for Formats {
     }
 
     #[inline]
-    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
+    fn apply(
+        &self,
+        r_type: u32,
+        bytes: &mut [u8],
+        p: u64,
+        s: u64,
+        addend: i64,
+    ) -> Result<(), String> {
         each!(self, it => it.apply(r_type, bytes, p, s, addend))
     }
 
@@ -1467,7 +1569,11 @@ impl Writer for Formats {
 /// The writer of an output's format.
 pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
     if output.exec_log {
-        exec_log(output).map_err(|what| LinkError { function: None, what: what.into(), refusal: None })?;
+        exec_log(output).map_err(|what| LinkError {
+            function: None,
+            what: what.into(),
+            refusal: None,
+        })?;
     }
     Ok(match output.format {
         Format::Elf => Formats::Elf(crate::elf::writer(output)?),
@@ -1482,13 +1588,17 @@ pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
 /// live descriptor's table.
 fn exec_log(output: &Output) -> Result<(), &'static str> {
     if output.format == Format::Wasm {
-        return Err("an execution log on wasm, which reaches code by index and has no slot stubs to log calls in");
+        return Err(
+            "an execution log on wasm, which reaches code by index and has no slot stubs to log calls in",
+        );
     }
     if !output.incremental {
         return Err("an execution log in an image linked without a jump table (not incremental)");
     }
     if output.live.is_none() {
-        return Err("an execution log in an image with no live descriptor, by which the runtime finds the log");
+        return Err(
+            "an execution log in an image with no live descriptor, by which the runtime finds the log",
+        );
     }
     Ok(())
 }
@@ -1516,6 +1626,7 @@ mod tests {
             exec_log: true,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
+            link: crate::LinkArgs::default(),
         };
         assert!(exec_log(&ok).is_ok());
         assert!(writer(&ok).is_ok());
@@ -1557,18 +1668,29 @@ mod tests {
             assert_eq!(slice.u64(at), pages.u64(at), "u64 at {at}");
             assert_eq!(slice.u32(at), pages.u32(at), "u32 at {at}");
             let want = slice.read(at, 7.min(len - at), &mut Vec::new()).map(<[u8]>::to_vec);
-            assert_eq!(pages.read(at, 7.min(len - at), &mut scratch).map(<[u8]>::to_vec), want, "read at {at}");
+            assert_eq!(
+                pages.read(at, 7.min(len - at), &mut scratch).map(<[u8]>::to_vec),
+                want,
+                "read at {at}"
+            );
         }
         assert_eq!((slice.u64(len - 7), pages.read(len - 3, 4, &mut scratch)), (None, None));
         for (at, end) in [(0, len - len % 12), (4, 4 + 12 * 2000), (page - 6, page + 6)] {
             let want: Vec<[u8; 12]> = slice.arrays(at, end).collect();
-            assert_eq!(pages.arrays::<12>(at, end).collect::<Vec<_>>(), want, "chunks of {at}..{end}");
+            assert_eq!(
+                pages.arrays::<12>(at, end).collect::<Vec<_>>(),
+                want,
+                "chunks of {at}..{end}"
+            );
         }
         let mut rebuilt = vec![0u8; len];
         pages.runs(|at, run| rebuilt[at..at + run.len()].copy_from_slice(run));
         assert_eq!(rebuilt, flat[..len]);
         let short = pages.prefix(page + 1).unwrap();
-        assert_eq!((short.len(), short.u32(page - 3), short.u32(page - 2)), (page + 1, slice.u32(page - 3), None));
+        assert_eq!(
+            (short.len(), short.u32(page - 3), short.u32(page - 2)),
+            (page + 1, slice.u32(page - 3), None)
+        );
         assert!(pages.prefix(len + 1).is_none());
     }
 
@@ -1590,13 +1712,16 @@ mod tests {
     #[test]
     fn a_names_lookup_allocates_nothing() {
         let mut names = Names::with_capacity(16 * 1000);
-        let list: Vec<Name> = (0..1000).map(|n| names.push(&format!("symbol{n}")).unwrap()).collect();
+        let list: Vec<Name> =
+            (0..1000).map(|n| names.push(&format!("symbol{n}")).unwrap()).collect();
         blaze_alloc_count::assert_at_most(0, "a name's bytes and a suffix of it", || {
             assert_eq!(names.at(list[500]), "symbol500");
             assert_eq!(names.get(list[999]), Some("symbol999"));
             assert_eq!(names.at(names.suffix(list[7], 6).unwrap()), "7");
         });
-        let pushed = blaze_alloc_count::assert_at_most(0, "a push into reserved room", || names.push("one more"));
+        let pushed = blaze_alloc_count::assert_at_most(0, "a push into reserved room", || {
+            names.push("one more")
+        });
         assert_eq!(names.at(pushed.unwrap()), "one more");
     }
 }

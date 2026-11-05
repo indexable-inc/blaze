@@ -17,7 +17,10 @@ use either::Either;
 use hir::InFile;
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasArgList as _, HasGenericParams as _, HasName as _, Node, RangeItem as _},
+    view::{
+        self as ast, AstNode as _, HasArgList as _, HasGenericParams as _, HasName as _, Node,
+        RangeItem as _,
+    },
 };
 
 use crate::{
@@ -58,7 +61,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) 
         diag.primary(it.span.clone());
     }
     // alloc: clone: the error's parts, for an error hir found
-    diag.span_label(last_subpat.clone(), format!("expected {fields} field{}, found {found}", s(fields)));
+    diag.span_label(
+        last_subpat.clone(),
+        format!("expected {fields} field{}, found {found}", s(fields)),
+    );
     if multiline(cx, &pat.path, last_subpat) {
         // clone: on the error path, for an error hir found
         diag.span_label(pat.path.clone(), "");
@@ -176,7 +182,10 @@ fn pat<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedTupleStructPatArgCount) -> Opti
                 .filter(|it| !matches!(it, ast::Pat::RestPat(_)))
                 .map(|it| {
                     let it = strip_pat(it);
-                    Subpat { span: span_of(it.syntax()), wild: matches!(it, ast::Pat::WildcardPat(_)) }
+                    Subpat {
+                        span: span_of(it.syntax()),
+                        wild: matches!(it, ast::Pat::WildcardPat(_)),
+                    }
                 })
                 // alloc: the error's parts, for an error hir found
                 .collect();

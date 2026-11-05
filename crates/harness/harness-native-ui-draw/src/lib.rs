@@ -6,11 +6,11 @@
 //! frame number the host set in the [`Paint`] singleton before `progress`; [`painted`] sorts roots by layer, `Z` and id.
 use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{Paint, PaintKind, Painted};
-use harness_native_ui_look_api::{Edge, Fill, Ribbon};
-use harness_native_ui_layout_api::{Background, Overlay};
-use harness_native_ui_motion_api::{Drawn, Reveal, Shown};
+use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
+use harness_native_ui_layout_api::{Background, Overlay, ScrollerPart};
+use harness_native_ui_motion_api::{Drawn, Pose, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
-use harness_native_ui_text_api::{Icon, Mark, Picture, Text};
+use harness_native_ui_text_api::{BlazeMark, Icon, Mark, Picture, Text};
 
 /// A clip rectangle in window points.
 #[derive(Clone, Copy)]
@@ -45,7 +45,8 @@ struct Stack {
 
 /// Create the draw systems in the module scope; deleting that scope removes them before unloading.
 pub fn install(world: WorldRef<'_>) {
-    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).each_iter(|it, row, _| {
+    // Last, from this pass's Laid and Drawn (layout and motion `writes` them; flecs merges them first).
+    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).reads(Pose::id()).each_iter(|it, row, _| {
         let e = it.entity(row);
         if e.parent().is_some_and(|p| p.has(Node::id())) {
             return;
@@ -54,7 +55,7 @@ pub fn install(world: WorldRef<'_>) {
         let level = e.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
         let z = e.try_cloned::<&Z>().map_or(0.0, |z| z.z);
         let stack = Stack { frame, level, z, root: *e.id() as u32 };
-        walk(e, 1.0, Affine::ID, None, stack, &mut 0);
+        walk(e, 1.0, Affine::ID, None, 0, stack, &mut 0);
     });
 }
 
@@ -79,9 +80,20 @@ impl Affine {
     }
 }
 
-/// How shown a node is (1 without a Motion) and what its Reveal does to it there: its alpha eased from the Reveal's, and
-/// its move and scale about the middle of `r` (its rectangle) eased to none.
+/// How shown a node is (1 without a Motion or a Pose) and what its Reveal and Pose do to it there: its alpha eased from the
+/// Reveal's and faded by the Pose's, and its move and scale about the middle of `r` (its rectangle).
 fn shown(e: EntityView<'_>, r: Cut) -> (f32, Affine) {
+    let (alpha, affine) = revealed(e, r);
+    let Some(p) = e.try_cloned::<&Pose>() else { return (alpha, affine) };
+    // Its Pose after its Reveal: scaled about its middle, then moved.
+    let sc = 1.0 - p.shrink;
+    let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+    let pose = Affine { s: sc, tx: cx - cx * sc + p.dx, ty: cy - cy * sc + p.dy };
+    (alpha * (1.0 - p.fade).clamp(0.0, 1.0), pose.then(affine))
+}
+
+/// The Reveal half of [`shown`].
+fn revealed(e: EntityView<'_>, r: Cut) -> (f32, Affine) {
     let Some(s) = e.try_cloned::<&Shown>() else { return (1.0, Affine::ID) };
     let k = s.spring.x.clamp(0.0, 1.0);
     let rv = e.try_cloned::<&Reveal>().unwrap_or(Reveal { alpha0: 0.0, dx: 0.0, dy: 0.0, scale0: 1.0 });
@@ -94,7 +106,7 @@ fn shown(e: EntityView<'_>, r: Cut) -> (f32, Affine) {
     (alpha, Affine { s: sc, tx: cx - cx * sc + rv.dx * off, ty: cy - cy * sc + rv.dy * off })
 }
 
-fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>, stack: Stack, seq: &mut u32) {
+fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>, scheme: u8, stack: Stack, seq: &mut u32) {
     if e.has(Hidden::id()) {
         return;
     }
@@ -108,6 +120,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
         return;
     }
     let mine = parent.then(own);
+    let scheme = e.try_cloned::<&Scheme>().map_or(scheme, |s| if s.dark { 1 } else { 2 });
     let (vx, vy) = mine.at(frame.x, frame.y);
     // Children: laid out against `laid`, drawn where the frame went.
     let kids_affine = mine.then(Affine { s: 1.0, tx: frame.x - laid.x, ty: frame.y - laid.y });
@@ -117,7 +130,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
         Some(PaintKind::Mark)
     } else if e.has(Icon::id()) {
         Some(PaintKind::Icon)
-    } else if e.has(Picture::id()) {
+    } else if e.has(Picture::id()) || e.has(BlazeMark::id()) {
         Some(PaintKind::Picture)
     } else if e.has(Ribbon::id()) {
         Some(PaintKind::Ribbon)
@@ -146,6 +159,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
             w: frame.w,
             h: frame.h,
             scale: mine.s,
+            scheme,
         };
         if e.try_cloned::<&Painted>() != Some(next) {
             e.set(next);
@@ -155,12 +169,12 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
     // A clipping node cuts its children (not itself) to its rectangle, inside any clip it is already in.
     let seen = Cut { x: vx, y: vy, w: frame.w * mine.s, h: frame.h * mine.s };
     let inner = if e.has(Clip::id()) { Some(seen.within(clip)) } else { clip };
-    // A Background child first, an Overlay child last, the rest by Z in between.
-    let layer = |c: EntityView<'_>| if c.has(Background::id()) { 0u8 } else if c.has(Overlay::id()) { 2 } else { 1 };
+    // A Background child first, an Overlay child (or a scroller's part) last, the rest by Z in between.
+    let layer = |c: EntityView<'_>| if c.has(Background::id()) { 0u8 } else if c.has(Overlay::id()) || c.has(ScrollerPart::id()) { 2 } else { 1 };
     let mut kids: Vec<_> = harness_native_ui_node_api::children(e).into_iter().map(|c| (layer(c), c.try_cloned::<&Z>().map_or(0.0, |z| z.z), c)).collect();
     kids.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     for (_, _, c) in kids {
-        walk(c, alpha, kids_affine, inner, stack, seq);
+        walk(c, alpha, kids_affine, inner, scheme, stack, seq);
     }
 }
 

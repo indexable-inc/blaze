@@ -143,6 +143,32 @@ fn associated_types_satisfy_the_trait_s_bounds() {
              impl Two for u8 { type I = u8; type E = &'static u8; }",
             &[],
         ),
+        // wasmtime 50.0.1's `AsContext for &T` and `for &mut T` (store/context.rs:180, 190) and
+        // `AsContext for RootScope<T>` with `T: AsContextMut` (gc/disabled/rooting.rs:139):
+        // `T::Data`, rigid once normalized, outlives `'static` by the trait's own bound.
+        (
+            "forwarded associated type with a declared bound",
+            "pub trait Ac { type Data: 'static; }
+             pub trait AcMut: Ac {}
+             impl<T: Ac> Ac for &'_ T { type Data = T::Data; }
+             impl<T: Ac> Ac for &'_ mut T { type Data = T::Data; }
+             impl<T: AcMut> Ac for Wrap<T> { type Data = T::Data; }",
+            &[],
+        ),
+        (
+            "forwarded associated type bounded by a where clause",
+            "pub trait Un { type Data; }
+             pub trait Out<'b> { type A: 'b; }
+             impl<'b, T: Un> Out<'b> for Wrap<T> where T::Data: 'b { type A = T::Data; }",
+            &[],
+        ),
+        (
+            "forwarded associated type with no bound",
+            "pub trait Un { type Data; }
+             pub trait Ts { type A: 'static; }
+             impl<T: Un> Ts for Wrap<T> { type A = T::Data; }",
+            &[("E0310", "assoc type")],
+        ),
         (
             "projection bound that fails",
             "pub trait It { type Item; }

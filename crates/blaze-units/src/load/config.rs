@@ -11,11 +11,12 @@ use blaze_manifest::Config;
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
-use super::files::{FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through};
+use super::files::{
+    FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through,
+};
 use super::invocation::Asking;
-use super::load_error;
-use super::key_id;
-use crate::query::{Cbor, LoadError, Mount, Versioned, producer};
+use super::{Unread, key_id, load_error};
+use crate::query::{Cbor, Mount, Versioned, producer};
 
 /// Which configuration a workspace is read with.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -47,7 +48,8 @@ impl ConfigOf {
         match self {
             ConfigOf::View => read_file(cx, path),
             ConfigOf::Fixed { mounts, cwd, env } => {
-                let key = FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
+                let key =
+                    FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
                 Ok(cx.get::<FixedFile>(&key)?.get())
             }
         }
@@ -66,8 +68,8 @@ pub(crate) struct ConfigRead {
     pub warnings: Vec<String>,
 }
 
-impl Versioned for Result<ConfigRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 4");
+impl Versioned for Result<ConfigRead, Unread> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 5");
 }
 
 pub(crate) struct ConfigChain;
@@ -75,15 +77,15 @@ pub(crate) struct ConfigChain;
 impl Query for ConfigChain {
     const KIND: QueryKind = QueryKind(0x6015);
     const NAME: &'static str = "cargo config";
-    const PRODUCER: ContentId = producer("blaze v2 cargo config 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo config 4");
     type Key = ConfigOf;
-    type Value = Cbor<Result<ConfigRead, LoadError>>;
+    type Value = Cbor<Result<ConfigRead, Unread>>;
 
     fn input(key: &ConfigOf) -> ContentId {
         key_id("blaze v2 cargo config key 2", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, Unread>>, Cancelled> {
         let (cwd, env, command, cli, unstable) = match key {
             ConfigOf::View => match cx.get::<Asking>(&())?.get() {
                 Ok(asked) => (
@@ -93,23 +95,30 @@ impl Query for ConfigChain {
                     asked.config.clone(),
                     asked.unstable.clone(),
                 ),
-                Err(error) => return Ok(Cbor(Err(error))),
+                Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
             },
-            ConfigOf::Fixed { cwd, env, .. } => (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new()),
+            ConfigOf::Fixed { cwd, env, .. } => {
+                (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new())
+            }
         };
         let read = ConfigRead { cwd, env, command, cli, unstable, warnings: Vec::new() };
-        let loaded = read_through(cx, key, |files| Ok(build(&read, files).map(|config| config.take_warnings())))?;
+        let loaded = read_through(cx, key, |files| {
+            Ok(build(&read, files).map(|config| config.take_warnings()))
+        })?;
         Ok(Cbor(match loaded {
             Ok(Ok(warnings)) => Ok(ConfigRead { warnings, ..read }),
-            Ok(Err(error)) => Err(load_error(&error, None)),
-            Err(unmounted) => Err(unmounted),
+            Ok(Err(error)) => Err(Unread::Failed(load_error(&error, None))),
+            Err(unread) => Err(unread),
         }))
     }
 }
 
 /// The configuration `read` describes, reading its files through `files`: every file read at
 /// once, as cargo's `GlobalContext` does.
-pub(crate) fn build<'r, 'db>(read: &ConfigRead, files: Snap<'r, 'db>) -> anyhow::Result<Config<Snap<'r, 'db>>> {
+pub(crate) fn build<'r, 'db>(
+    read: &ConfigRead,
+    files: Snap<'r, 'db>,
+) -> anyhow::Result<Config<Snap<'r, 'db>>> {
     // clone: the variables, which the configuration takes owned.
     let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), files)?;
     config.start(&read.command, &read.cli)?;

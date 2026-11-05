@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use blaze_hash::HashMap;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
@@ -15,21 +16,24 @@ use blaze_manifest::metadata::export_package;
 use blaze_manifest::{Context, Workspace};
 use blaze_query::Cancelled;
 use blaze_resolve::lockfile::{self, PathDeps};
-use blaze_resolve::resolver::{CliFeatures, HasDevUnits, Members, ResolveBehavior, VersionOrdering, members_with_features};
+use blaze_resolve::resolver::{
+    CliFeatures, HasDevUnits, Members, ResolveBehavior, VersionOrdering, members_with_features,
+};
 use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
 use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, QueryKind, Registry, Resolve,
     ResolveVersion, RustVersion, SourceId, Summary,
 };
-use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use super::files::Snap;
 use super::source::{Index, Located, Sources};
 use super::{Select, Spec, Staged, load_error};
-use crate::query::{Fetch, LockWrite, LoadError};
+use crate::lock;
+use crate::query::{Fetch, LoadError, LockWrite};
 use crate::read::{
-    self as summary, Package, Read, feature_unification, manifest_source, path_packages, rust_versions,
+    self as summary, Package, Read, feature_unification, manifest_source, path_packages,
+    rust_versions,
 };
 
 /// The workspace resolved, as the unit graph is made from it.
@@ -71,10 +75,23 @@ pub(crate) fn resolved<'r, 'db, R>(
     let at = Some(ws.root_manifest().display().to_string());
     let fail = |error: anyhow::Error| Staged::Failed(load_error(&error, at.clone()));
     let root = ws.root().to_owned();
-    let root_text = match files.read(&root.join("Cargo.toml")).map(|bytes| String::from_utf8(bytes.into_owned())) {
+    let root_text = match files
+        .read(&root.join("Cargo.toml"))
+        .map(|bytes| String::from_utf8(bytes.into_owned()))
+    {
         Ok(Ok(text)) => text,
-        Ok(Err(error)) => return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", ws.root_manifest().display())))),
-        Err(error) => return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", ws.root_manifest().display())))),
+        Ok(Err(error)) => {
+            return Ok(fail(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read `{}`", ws.root_manifest().display())),
+            ));
+        }
+        Err(error) => {
+            return Ok(fail(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read `{}`", ws.root_manifest().display())),
+            ));
+        }
     };
     let root_table = match summary::Root::new(&root, &root_text) {
         Ok(it) => it,
@@ -85,12 +102,18 @@ pub(crate) fn resolved<'r, 'db, R>(
         Ok(bytes) => match String::from_utf8(bytes.into_owned()) {
             Ok(text) => Some(text),
             Err(error) => {
-                return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", lock_path.display()))));
+                return Ok(fail(
+                    anyhow::Error::new(error)
+                        .context(format!("failed to read `{}`", lock_path.display())),
+                ));
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", lock_path.display()))));
+            return Ok(fail(
+                anyhow::Error::new(error)
+                    .context(format!("failed to read `{}`", lock_path.display())),
+            ));
         }
     };
     let prepared = match prepare(ws, &root_table, ctx, lock_text.as_deref()) {
@@ -122,7 +145,9 @@ pub(crate) fn resolved<'r, 'db, R>(
     // Of each of `members` then `owned`, in order, its id.
     let mut ids: Vec<PackageId> = Vec::with_capacity(known);
     let all = members.iter().map(|(path, m)| (*path, *m, None)).chain(
-        owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest, it.locked_source.as_deref())),
+        owned
+            .iter()
+            .map(|it| (it.manifest_path.as_path(), &*it.manifest, it.locked_source.as_deref())),
     );
     for (path, manifest, source) in all {
         match read_of(path, manifest, source, lock.as_ref()) {
@@ -144,9 +169,13 @@ pub(crate) fn resolved<'r, 'db, R>(
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
         .collect();
-    let member_summaries: Vec<Summary> = member_ids.iter().map(|id| reads[id].summary.clone()).collect();
+    let member_summaries: Vec<Summary> =
+        member_ids.iter().map(|id| reads[id].summary.clone()).collect();
     let member_refs: Vec<&Summary> = member_summaries.iter().collect();
-    let current = members.iter().position(|(path, _)| *path == ws.current_manifest()).map(|at| member_ids[at]);
+    let current = members
+        .iter()
+        .position(|(path, _)| *path == ws.current_manifest())
+        .map(|at| member_ids[at]);
     let behavior = ws.resolve_behavior();
     let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
     let members_of = || Members { members: &member_refs, current, new_cli_feature_behavior };
@@ -160,7 +189,12 @@ pub(crate) fn resolved<'r, 'db, R>(
         Err(error) => return Ok(fail(error)),
     };
     let lowest_rust_version = member_rust_versions.iter().min().cloned();
-    let rust_versions = match rust_versions(ctx, behavior, &member_rust_versions, Some(spec.rustc_version.as_str())) {
+    let rust_versions = match rust_versions(
+        ctx,
+        behavior,
+        &member_rust_versions,
+        Some(spec.rustc_version.as_str()),
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
@@ -180,7 +214,11 @@ pub(crate) fn resolved<'r, 'db, R>(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let cli_features = match CliFeatures::from_command_line(&spec.features, spec.all_features, !spec.no_default_features) {
+    let cli_features = match CliFeatures::from_command_line(
+        &spec.features,
+        spec.all_features,
+        !spec.no_default_features,
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
@@ -224,11 +262,17 @@ pub(crate) fn resolved<'r, 'db, R>(
     }
 
     // The registry packages the resolve picked that the lock file does not pin.
-    let unread: Vec<PackageId> = locked_ids(&whole).into_iter().filter(|id| !reads.contains_key(id)).collect();
+    let unread: Vec<PackageId> =
+        locked_ids(&whole).into_iter().filter(|id| !reads.contains_key(id)).collect();
     match locate_all(ctx, &sources, &unread, whole.checksums())? {
         Staged::Done(picked) => {
             for package in &picked {
-                match read_of(&package.manifest_path, &package.manifest, package.locked_source.as_deref(), Some(&whole)) {
+                match read_of(
+                    &package.manifest_path,
+                    &package.manifest,
+                    package.locked_source.as_deref(),
+                    Some(&whole),
+                ) {
                     Ok(read) => {
                         ids.push(read.summary.package_id());
                         reads.insert(read.summary.package_id(), read);
@@ -242,18 +286,37 @@ pub(crate) fn resolved<'r, 'db, R>(
         Staged::Failed(error) => return Ok(Staged::Failed(error)),
     }
 
-    let locked = spec.locked.map(|flag| lockfile::Locked { flag, path: &lock_path, path_deps: &path_deps });
-    let lock_write = match lockfile::lockfile_to_write(&mut whole, lock_text.as_deref(), lowest_rust_version.as_ref(), locked) {
-        Ok(text) => text.map(|text| LockWrite { path: lock_path.display().to_string(), text }),
-        Err(error) => return Ok(fail(error)),
+    let inputs = lock::Inputs {
+        ask: spec.lock,
+        running: spec.blaze.as_deref(),
+        ignore_pin_for: spec.ignore_pin_for.as_deref(),
+        foreign: spec.foreign.is_some(),
+    };
+    let lock_write = match lock::after_resolve(
+        &files,
+        ws,
+        inputs,
+        &mut whole,
+        lock.as_ref(),
+        lock_text.as_deref(),
+        lowest_rust_version.as_ref(),
+        &path_deps,
+    ) {
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
     };
 
-    let feature_members = match feature_roots(&members_of(), &member_ids, &specs, &cli_features, unification) {
-        Ok(it) => it,
-        Err(error) => return Ok(fail(error)),
-    };
-    let all = members.iter().map(|(path, m)| (*path, *m)).chain(owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest)));
-    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> = ids.iter().copied().zip(all).collect();
+    let feature_members =
+        match feature_roots(&members_of(), &member_ids, &specs, &cli_features, unification) {
+            Ok(it) => it,
+            Err(error) => return Ok(fail(error)),
+        };
+    let all = members
+        .iter()
+        .map(|(path, m)| (*path, *m))
+        .chain(owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest)));
+    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> =
+        ids.iter().copied().zip(all).collect();
     if let Some(missing) = targeted.iter().find(|id| !manifests.contains_key(id)) {
         return Ok(fail(anyhow::anyhow!("no manifest of `{missing}` was read")));
     }
@@ -279,7 +342,12 @@ pub(crate) fn resolved<'r, 'db, R>(
 struct Through<'i, R>(&'i R);
 
 impl<R: Registry> Registry for Through<'_, R> {
-    async fn query(&self, dep: &Dependency, kind: QueryKind, f: &mut impl FnMut(IndexSummary)) -> anyhow::Result<()> {
+    async fn query(
+        &self,
+        dep: &Dependency,
+        kind: QueryKind,
+        f: &mut impl FnMut(IndexSummary),
+    ) -> anyhow::Result<()> {
         self.0.query(dep, kind, f).await
     }
 
@@ -323,7 +391,12 @@ fn prepare<F: Files>(
 }
 
 /// What the resolve reads of a package, its checksum the lock file's.
-fn read_of(path: &Path, manifest: &Manifest, source: Option<&str>, lock: Option<&Resolve>) -> anyhow::Result<Read> {
+fn read_of(
+    path: &Path,
+    manifest: &Manifest,
+    source: Option<&str>,
+    lock: Option<&Resolve>,
+) -> anyhow::Result<Read> {
     let mut package = export_package(path, manifest);
     if let Some(source) = source {
         package.set_source(source.to_owned());
@@ -355,13 +428,21 @@ fn locate_all(
     let files = *ctx.files();
     let mut here = Vec::new();
     let mut needs: Vec<Fetch> = Vec::new();
+    // Every package that can't be had, not the first: an offline build lacking ten says ten
+    // in one run (lane earlyfail).
+    // Each with whether one run that may fetch has it ([`Located::Unfetched`]).
+    let mut failed: Vec<(LoadError, bool)> = Vec::new();
     for &id in ids {
         let checksum = checksums.get(&id).and_then(Option::as_deref);
         match files.with_cx(|cx| sources.locate(cx, id, checksum))? {
             Located::Here { manifest } => here.push((id, manifest)),
             Located::Needs(fetch) => needs.push(fetch),
-            Located::Failed(error) => return Ok(Staged::Failed(error)),
+            Located::Failed(error) => failed.push((error, false)),
+            Located::Unfetched(error) => failed.push((error, true)),
         }
+    }
+    if !failed.is_empty() {
+        return Ok(Staged::Failed(all_failed(failed, sources)));
     }
     if !needs.is_empty() {
         return Ok(Staged::Needs(needs));
@@ -387,6 +468,45 @@ fn locate_all(
     Ok(Staged::Done(read))
 }
 
+/// The packages the lock pins that can't be had (`failed`, in the lock's order, each with
+/// whether one run that may fetch has it), as one error: one alone as it is (cargo's own), more
+/// each under its own line; and, for those only a fetch lacks ([`Located::Unfetched`]), where
+/// blaze looked and how to have them. A path package, a git index or a bad replacement is no
+/// fetch's to fix, and gets no such note.
+fn all_failed(mut failed: Vec<(LoadError, bool)>, sources: &Sources) -> LoadError {
+    if failed.len() == 1 {
+        return failed.pop().expect("one error").0;
+    }
+    // alloc: an error, once per load that failed
+    let mut what = format!("{} packages the lock file pins can't be had:", failed.len());
+    for (error, _) in &failed {
+        let mut lines = error.what.lines().filter(|it| !it.trim().is_empty());
+        if let Some(first) = lines.next() {
+            what.push_str("\n  - ");
+            what.push_str(first);
+        }
+        for line in lines {
+            what.push_str("\n      ");
+            what.push_str(line.trim_start());
+        }
+    }
+    let unfetched: Vec<&str> = failed
+        .iter()
+        .filter(|(_, fetch)| *fetch)
+        .filter_map(|(error, _)| error.at.as_deref())
+        .collect();
+    if let (Some(flag), false) = (sources.offline(), unfetched.is_empty()) {
+        what.push_str(&format!(
+            "\nthis build is offline ({flag}), and blaze's sources ({}) hold {} of them ({}): one run without \
+             {flag} fetches them there",
+            sources.kept(),
+            unfetched.len(),
+            unfetched.join(", ")
+        ));
+    }
+    LoadError { what, at: None }
+}
+
 /// The members `select` selects, as cargo's `Packages::from_flags` and
 /// `Packages::to_package_id_specs` select them.
 fn selected(
@@ -402,8 +522,10 @@ fn selected(
             if let Some(it) = excludes.iter().find(|it| pattern(it)) {
                 anyhow::bail!("blaze does not read package patterns in `--exclude` yet (`{it}`)");
             }
-            let ids: Vec<PackageIdSpec> =
-                excludes.iter().map(|it| PackageIdSpec::parse(it)).collect::<anyhow::Result<_>>()?;
+            let ids: Vec<PackageIdSpec> = excludes
+                .iter()
+                .map(|it| PackageIdSpec::parse(it))
+                .collect::<anyhow::Result<_>>()?;
             let not_found: Vec<String> = ids
                 .iter()
                 .filter(|spec| !member_ids.iter().any(|id| spec.matches(*id)))
@@ -432,9 +554,11 @@ fn selected(
             specs.into_iter().map(|(_, spec)| spec).collect()
         }
         Select::Default => {
-            let named = |name: &str| member_ids.iter().find(|id| id.name().as_str() == name).copied();
+            let named =
+                |name: &str| member_ids.iter().find(|id| id.name().as_str() == name).copied();
             let defaults = ws.default_members().map(|(_, m)| named(&m.package_id.name));
-            let ids: Vec<PackageId> = defaults.collect::<Option<_>>().context("a default member that is not a member")?;
+            let ids: Vec<PackageId> =
+                defaults.collect::<Option<_>>().context("a default member that is not a member")?;
             ids.iter().map(|id| id.to_spec()).collect()
         }
     };

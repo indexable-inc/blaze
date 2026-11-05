@@ -17,11 +17,14 @@ fn one_socket_for_this_process_named_blaze() {
 
 #[test]
 fn a_valid_activation_is_read_without_allocating() {
-    let fd = blaze_alloc_count::assert_at_most(0, "systemd's variables of a valid activation", || {
-        systemd(listen("4242", "1", Some("blaze")), OWN, SOCKET)
-    });
+    let fd =
+        blaze_alloc_count::assert_at_most(0, "systemd's variables of a valid activation", || {
+            systemd(listen("4242", "1", Some("blaze")), OWN, SOCKET)
+        });
     assert_eq!(fd, Ok(FIRST_FD));
-    let one = blaze_alloc_count::assert_at_most(0, "launchd's one descriptor", || launchd(Launchd::Fds(1), SOCKET));
+    let one = blaze_alloc_count::assert_at_most(0, "launchd's one descriptor", || {
+        launchd(Launchd::Fds(1), SOCKET)
+    });
     assert_eq!(one, Ok(()));
 }
 
@@ -65,7 +68,10 @@ fn numbers_are_digits_only() {
 #[test]
 fn names_must_be_one_and_blaze() {
     let what = said(systemd(listen("4242", "1", None), OWN, SOCKET));
-    assert!(what.contains("no LISTEN_FDNAMES") && what.contains("FileDescriptorName=blaze"), "{what}");
+    assert!(
+        what.contains("no LISTEN_FDNAMES") && what.contains("FileDescriptorName=blaze"),
+        "{what}"
+    );
     let what = said(systemd(listen("4242", "1", Some("other")), OWN, SOCKET));
     assert!(what.contains("named \"other\", not \"blaze\""), "{what}");
     let what = said(systemd(listen("4242", "1", Some("blaze:blaze")), OWN, SOCKET));
@@ -87,7 +93,10 @@ fn launchd_answers() {
     ];
     for (answer, says) in cases {
         let what = launchd(answer, SOCKET).expect_err("refused").to_string();
-        assert!(what.starts_with("blaze serve --activated: ") && what.contains(says), "{answer:?}: {what}");
+        assert!(
+            what.starts_with("blaze serve --activated: ") && what.contains(says),
+            "{answer:?}: {what}"
+        );
     }
 }
 
@@ -108,6 +117,9 @@ fn passed_owns_its_descriptor() {
     assert_eq!(passed.by(), Manager::Systemd);
     assert!(format!("{passed:?}").contains("Systemd"));
     drop(passed);
-    assert!(std::os::unix::net::UnixStream::connect(&path).is_err(), "the socket is closed with it");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&path).is_err(),
+        "the socket is closed with it"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

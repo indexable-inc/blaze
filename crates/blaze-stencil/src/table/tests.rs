@@ -100,7 +100,10 @@ fn a_written_library_reads_back() {
         assert_eq!(stencil.faults().collect::<Vec<_>>(), faults(i));
         let holes: Vec<Hole> = stencil.holes().collect();
         assert_eq!(holes.len(), if i % 3 == 0 { 3 } else { 2 });
-        assert_eq!(holes[0], Hole { at: 0, form: Form::Abs32S, kind: HoleKind::Slot0, addend: i as i32 });
+        assert_eq!(
+            holes[0],
+            Hole { at: 0, form: Form::Abs32S, kind: HoleKind::Slot0, addend: i as i32 }
+        );
         assert_eq!(holes[1].kind, HoleKind::Next);
         if i % 3 == 0 {
             let (entry, addend) = holes[2].rodata();
@@ -170,15 +173,32 @@ fn the_writer_refuses_what_the_reader_would() {
     let past = Hole { at: 6, form: Form::Abs32S, kind: HoleKind::Slot0, addend: 0 };
     assert_eq!(writer.push(set[1], &[0; 8], 0, &[past]), Err(FormatError::Bounds("a hole")));
     let place_in_number = Hole { at: 0, form: Form::Abs32S, kind: HoleKind::Next, addend: 0 };
-    assert_eq!(writer.push(set[1], &[0; 8], 0, &[place_in_number]), Err(FormatError::Form(Form::Abs32S as u8)));
+    assert_eq!(
+        writer.push(set[1], &[0; 8], 0, &[place_in_number]),
+        Err(FormatError::Form(Form::Abs32S as u8))
+    );
     assert_eq!(writer.push(set[1], &[0; 8], 9, &[]), Err(FormatError::Bounds("a stencil's code")));
-    let entry = Hole { at: 0, form: Form::Rel32, kind: HoleKind::Rodata, addend: Hole::rodata_addend(3, 0).unwrap() };
-    assert_eq!(writer.push(set[1], &[0; 8], 0, &[entry]), Err(FormatError::Bounds("a rodata hole's entry")));
+    let entry = Hole {
+        at: 0,
+        form: Form::Rel32,
+        kind: HoleKind::Rodata,
+        addend: Hole::rodata_addend(3, 0).unwrap(),
+    };
+    assert_eq!(
+        writer.push(set[1], &[0; 8], 0, &[entry]),
+        Err(FormatError::Bounds("a rodata hole's entry"))
+    );
     assert_eq!(writer.rodata(&[0; 17], 1), Err(FormatError::Bounds("a rodata entry")));
-    assert_eq!(writer.push_with_faults(set[1], &[0; 8], 0, &[], &[8]), Err(FormatError::Bounds("a fault")));
+    assert_eq!(
+        writer.push_with_faults(set[1], &[0; 8], 0, &[], &[8]),
+        Err(FormatError::Bounds("a fault"))
+    );
     let mut a64 = Writer::new(Variant::Aarch64);
     let shape = shapes(Isa::Aarch64)[0];
-    assert_eq!(a64.push_with_faults(shape, &[0; 8], 0, &[], &[2]), Err(FormatError::Bounds("a fault")));
+    assert_eq!(
+        a64.push_with_faults(shape, &[0; 8], 0, &[], &[2]),
+        Err(FormatError::Bounds("a fault"))
+    );
     assert_eq!(a64.push_with_faults(shape, &[0; 8], 0, &[], &[4]), Ok(0));
 }
 
@@ -263,16 +283,26 @@ fn every_corruption_is_refused() {
     // The first hole: past its stencil, of no form, of no kind, of the other architecture's
     // form, a place in a number's field, an entry past the rodata.
     let hole = holes_at(&bytes);
-    assert_eq!(edit(&|it| it[hole..hole + 2].copy_from_slice(&u16::MAX.to_le_bytes())), FormatError::Bounds("a hole"));
+    assert_eq!(
+        edit(&|it| it[hole..hole + 2].copy_from_slice(&u16::MAX.to_le_bytes())),
+        FormatError::Bounds("a hole")
+    );
     assert_eq!(edit(&|it| it[hole + 2] = 200), FormatError::Form(200));
     assert_eq!(edit(&|it| it[hole + 3] = 200), FormatError::Kind(200));
-    assert_eq!(edit(&|it| it[hole + 2] = Form::A64MovwG0 as u8), FormatError::Form(Form::A64MovwG0 as u8));
-    assert_eq!(edit(&|it| it[hole + 3] = HoleKind::Next as u8), FormatError::Form(Form::Abs32S as u8));
+    assert_eq!(
+        edit(&|it| it[hole + 2] = Form::A64MovwG0 as u8),
+        FormatError::Form(Form::A64MovwG0 as u8)
+    );
+    assert_eq!(
+        edit(&|it| it[hole + 3] = HoleKind::Next as u8),
+        FormatError::Form(Form::Abs32S as u8)
+    );
     // Stencil 0 has a `Rodata` hole third.
     let rodata = hole + 2 * format::HOLE;
     assert_eq!(bytes[rodata + 3], HoleKind::Rodata as u8);
     assert_eq!(
-        edit(&|it| it[rodata + 4..rodata + 8].copy_from_slice(&Hole::rodata_addend(1000, 0).unwrap().to_le_bytes())),
+        edit(&|it| it[rodata + 4..rodata + 8]
+            .copy_from_slice(&Hole::rodata_addend(1000, 0).unwrap().to_le_bytes())),
         FormatError::Bounds("a rodata hole's entry")
     );
 
@@ -280,7 +310,10 @@ fn every_corruption_is_refused() {
     assert_eq!(edit(&|it| it[STENCILS + 15] = 200), FormatError::Bounds("a stencil's faults"));
     let fault = faults_at(&bytes);
     assert_eq!(u16::from_le_bytes([bytes[fault], bytes[fault + 1]]), 1);
-    assert_eq!(edit(&|it| it[fault..fault + 2].copy_from_slice(&500u16.to_le_bytes())), FormatError::Bounds("a fault"));
+    assert_eq!(
+        edit(&|it| it[fault..fault + 2].copy_from_slice(&500u16.to_le_bytes())),
+        FormatError::Bounds("a fault")
+    );
 }
 
 #[test]
@@ -307,9 +340,15 @@ fn a_corrupt_index_is_refused() {
         edit(&|it| it[slot + 4..slot + 8].copy_from_slice(&1u32.to_le_bytes())),
         FormatError::Bounds("a stencil indexed twice")
     );
-    assert_eq!(edit(&|it| it[slot..slot + 4].copy_from_slice(&u32::MAX.to_le_bytes())), FormatError::Bounds("an empty slot"));
+    assert_eq!(
+        edit(&|it| it[slot..slot + 4].copy_from_slice(&u32::MAX.to_le_bytes())),
+        FormatError::Bounds("an empty slot")
+    );
     // A key that is no shape of the set.
-    assert_eq!(edit(&|it| it[slot..slot + 4].copy_from_slice(&(1u32 << 30).to_le_bytes())), FormatError::Shape(1 << 30));
+    assert_eq!(
+        edit(&|it| it[slot..slot + 4].copy_from_slice(&(1u32 << 30).to_le_bytes())),
+        FormatError::Shape(1 << 30)
+    );
     // Another shape's key, which hashes to another slot.
     let other = shapes[1].key();
     assert!(matches!(
@@ -357,7 +396,8 @@ fn the_built_libraries_hold_every_shape_of_their_set() {
         assert_eq!(library.reader().len() as usize, set.len(), "{variant:?}");
         let a64 = variant.isa() == Isa::Aarch64;
         for shape in set {
-            let stencil = library.find(shape).unwrap_or_else(|| panic!("{variant:?} has no {shape}"));
+            let stencil =
+                library.find(shape).unwrap_or_else(|| panic!("{variant:?} has no {shape}"));
             assert!(!stencil.code.is_empty(), "{shape}");
             if a64 {
                 assert_eq!(stencil.code.len() % 4, 0, "{shape}");
@@ -368,11 +408,17 @@ fn the_built_libraries_hold_every_shape_of_their_set() {
             let holes: Vec<Hole> = stencil.holes().collect();
             if tail > 0 {
                 let next = (len - 4) as u16;
-                assert!(holes.iter().any(|it| it.kind == HoleKind::Next && it.at == next), "{shape}");
+                assert!(
+                    holes.iter().any(|it| it.kind == HoleKind::Next && it.at == next),
+                    "{shape}"
+                );
             }
             for hole in holes {
                 assert!(format::fits(hole.kind, hole.form), "{shape}: {hole:?}");
-                assert!(usize::from(hole.at) + usize::from(hole.form.bytes()) <= len, "{shape}: {hole:?}");
+                assert!(
+                    usize::from(hole.at) + usize::from(hole.form.bytes()) <= len,
+                    "{shape}: {hole:?}"
+                );
                 if hole.kind == HoleKind::Rodata {
                     assert!(hole.rodata().0 < library.reader().entries(), "{shape}: {hole:?}");
                 }

@@ -5,7 +5,9 @@ use std::task::{Context, Poll, Waker};
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Config, Cx, Database, MemTree, Query, QueryKind};
-use blaze_resolve::{Dependency, MemRegistry, PackageId, QueryKind as Matching, Registry, SourceId};
+use blaze_resolve::{
+    Dependency, MemRegistry, PackageId, QueryKind as Matching, Registry, SourceId,
+};
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
 
@@ -15,14 +17,17 @@ use crate::load::files::{LoadDir, LoadFile, Mounts};
 use crate::load::invocation::Invocation as InvocationQuery;
 use crate::load::key_id;
 use crate::query::{
-    BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, Mount, Origin, Versioned, producer,
+    BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, Mount, Origin, Versioned,
+    producer,
 };
 
 /// Where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]): blaze's,
 /// never `$CARGO_HOME`.
 const SOURCES: &str = "/home/u/.cache/blaze/sources";
-const CRATES_IO_SRC: &str = "/home/u/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f";
-const CRATES_IO_INDEX: &str = "/home/u/.cache/blaze/sources/registry/index/index.crates.io-1949cf8c6b5b557f";
+const CRATES_IO_SRC: &str =
+    "/home/u/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f";
+const CRATES_IO_INDEX: &str =
+    "/home/u/.cache/blaze/sources/registry/index/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 /// A package to locate, with the configuration the sources are made of.
 #[derive(Serialize, Deserialize, Clone)]
@@ -85,7 +90,7 @@ impl Query for Locate {
         Ok(Cbor(match sources.locate(cx, id, key.checksum.as_deref())? {
             Located::Here { manifest } => Answer::Here(manifest),
             Located::Needs(fetch) => Answer::Needs(fetch),
-            Located::Failed(error) => Answer::Failed(error),
+            Located::Failed(error) | Located::Unfetched(error) => Answer::Failed(error),
         }))
     }
 }
@@ -116,11 +121,15 @@ impl Query for IndexQuery {
         key_id("blaze v2 cargo test index query key 1", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, (offline, name, req): &(bool, String, String)) -> Result<Cbor<Versions>, Cancelled> {
+    fn execute(
+        cx: &mut Cx<'_>,
+        (offline, name, req): &(bool, String, String),
+    ) -> Result<Cbor<Versions>, Cancelled> {
         let mut key = asked(CRATES_IO, name, "0.0.0", None);
         key.offline = *offline;
         let sources = sources(&key);
-        let dep = Dependency::parse(name.as_str(), Some(req.as_str()), SourceId::crates_io()).expect("a dependency");
+        let dep = Dependency::parse(name.as_str(), Some(req.as_str()), SourceId::crates_io())
+            .expect("a dependency");
         let index = Index::new(&sources, cx, MemRegistry::new());
         let found = {
             let mut query = std::pin::pin!(index.query_vec(&dep, Matching::Exact));
@@ -133,7 +142,13 @@ impl Query for IndexQuery {
         let needs = index.finish()?;
         let mut found: Vec<String> = found
             .iter()
-            .map(|it| format!("{}{}", it.package_id().version(), if it.is_yanked() { " yanked" } else { "" }))
+            .map(|it| {
+                format!(
+                    "{}{}",
+                    it.package_id().version(),
+                    if it.is_yanked() { " yanked" } else { "" }
+                )
+            })
             .collect();
         found.sort();
         Ok(Cbor(Versions { found, needs }))
@@ -158,7 +173,8 @@ fn mount(at: &str, under: &str) -> Mount {
 /// A view of `files` with `mounts`, opened with a build of `/home/u/ws` by a user whose home
 /// is `/home/u`.
 fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)], mounts: Vec<Mount>) -> ViewId {
-    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
+    let files: Vec<(&str, &[u8])> =
+        files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
     let config = BuildConfig {
         invocation: Invocation {
             command: Command::Build,
@@ -174,6 +190,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)], mounts: Vec<Mount
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: SOURCES.to_owned(),
+        blaze: String::new(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }
@@ -204,7 +221,10 @@ fn a_crates_io_package_is_fetched_from_static_crates_io_into_blazes_sources_neve
     let serde = asked(CRATES_IO, "serde", "1.0.219", Some(SERDE_SHA256));
     let at = format!("{CRATES_IO_SRC}/serde-1.0.219");
     assert!(at.starts_with(&format!("{SOURCES}/registry/src/")), "{at}");
-    assert!(!at.contains(".cargo"), "a fetched package is kept under blaze's sources, never $CARGO_HOME: {at}");
+    assert!(
+        !at.contains(".cargo"),
+        "a fetched package is kept under blaze's sources, never $CARGO_HOME: {at}"
+    );
     assert_eq!(
         locate(&[], vec![], &serde),
         Answer::Needs(Fetch {
@@ -226,9 +246,13 @@ fn a_crates_io_package_is_fetched_from_static_crates_io_into_blazes_sources_neve
 /// is ever asked to write outside `<sources>`.
 #[test]
 fn a_lock_file_with_a_traversal_name_is_refused() {
-    let evil = asked(CRATES_IO, "../../../../home/u/.vim/pack/p/start/x", "1.0.0", Some(SERDE_SHA256));
+    let evil =
+        asked(CRATES_IO, "../../../../home/u/.vim/pack/p/start/x", "1.0.0", Some(SERDE_SHA256));
     let error = failed(locate(&[], vec![], &evil));
-    assert!(error.contains("whose name cargo refuses") && error.contains("invalid character"), "{error}");
+    assert!(
+        error.contains("whose name cargo refuses") && error.contains("invalid character"),
+        "{error}"
+    );
     let url = "git+https://github.com/o/r?branch=main#../../../../escaped";
     let error = failed(locate(&[], vec![], &asked(url, "r", "0.1.0", None)));
     assert!(error.contains("no git object id"), "{error}");
@@ -243,10 +267,16 @@ fn offline_a_package_not_fetched_is_cargos_error() {
         "failed to download `serde v1.0.219`\n\nCaused by:\n  attempting to make an HTTP request, \
          but --offline was specified"
     );
-    let git = format!("git+https://github.com/o/r?branch=main#{}", "0123456789abcdef0123456789abcdef01234567");
+    let git = format!(
+        "git+https://github.com/o/r?branch=main#{}",
+        "0123456789abcdef0123456789abcdef01234567"
+    );
     let mut r = asked(&git, "r", "0.1.0", None);
     r.offline = true;
-    assert!(failed(locate(&[], vec![], &r)).starts_with("failed to download `r v0.1.0`\n\nCaused by:\n"));
+    assert!(
+        failed(locate(&[], vec![], &r))
+            .starts_with("failed to download `r v0.1.0`\n\nCaused by:\n")
+    );
 }
 
 #[test]
@@ -262,11 +292,19 @@ fn a_lock_file_without_checksums_takes_the_index_s() {
             at: index_file.clone(),
         }
     );
-    let fetch = needs(locate(&[("serde-index", SERDE_LINE)], vec![mount(&index_file, "serde-index")], &serde));
+    let fetch = needs(locate(
+        &[("serde-index", SERDE_LINE)],
+        vec![mount(&index_file, "serde-index")],
+        &serde,
+    ));
     assert_eq!(fetch.kind, FetchKind::Crate { sha256: SERDE_SHA256.to_owned() });
     let other = asked(CRATES_IO, "serde", "1.0.0", None);
     assert_eq!(
-        failed(locate(&[("serde-index", SERDE_LINE)], vec![mount(&index_file, "serde-index")], &other)),
+        failed(locate(
+            &[("serde-index", SERDE_LINE)],
+            vec![mount(&index_file, "serde-index")],
+            &other
+        )),
         "failed to download `serde v1.0.0`\n\nCaused by:\n  no hash listed for serde v1.0.0"
     );
 }
@@ -284,7 +322,8 @@ fn an_alternative_sparse_registry_needs_its_config_json_then_its_dl_template() {
         ("https://alt.example.com/index/config.json", &FetchKind::IndexFile, config_json.as_str())
     );
     let template = r#"{"dl":"https://dl.example.com/{crate}/{version}/{prefix}/{lowerprefix}/{sha256-checksum}","api":null}"#;
-    let fetch = needs(locate(&[("alt.json", template)], vec![mount(&config_json, "alt.json")], &demo));
+    let fetch =
+        needs(locate(&[("alt.json", template)], vec![mount(&config_json, "alt.json")], &demo));
     assert_eq!(
         fetch,
         Fetch {
@@ -298,7 +337,8 @@ fn an_alternative_sparse_registry_needs_its_config_json_then_its_dl_template() {
     let fetch = needs(locate(&[("alt.json", plain)], vec![mount(&config_json, "alt.json")], &demo));
     assert_eq!(fetch.url, "https://dl.example.com/api/v1/crates/Demo/0.1.0/download");
     let private = r#"{"dl":"https://dl.example.com","auth-required":true}"#;
-    let error = failed(locate(&[("alt.json", private)], vec![mount(&config_json, "alt.json")], &demo));
+    let error =
+        failed(locate(&[("alt.json", private)], vec![mount(&config_json, "alt.json")], &demo));
     assert!(error.contains("requires authentication"), "{error}");
 }
 
@@ -309,13 +349,15 @@ fn a_mirror_of_crates_io_changes_the_directory_and_the_url() {
         "source.crates-io.replace-with=\"mirror\"".to_owned(),
         "source.mirror.registry=\"sparse+https://mirror.example.com/index/\"".to_owned(),
     ];
-    let dir = SourceId::from_url("sparse+https://mirror.example.com/index/").unwrap().registry_dir_name();
+    let dir =
+        SourceId::from_url("sparse+https://mirror.example.com/index/").unwrap().registry_dir_name();
     let config_json = format!("{SOURCES}/registry/index/{dir}/config.json");
     let fetch = needs(locate(&[], vec![], &serde));
     assert_eq!(fetch.url, "https://mirror.example.com/index/config.json");
     assert_eq!(fetch.at, config_json);
     let dl = r#"{"dl":"https://mirror.example.com/dl"}"#;
-    let fetch = needs(locate(&[("mirror.json", dl)], vec![mount(&config_json, "mirror.json")], &serde));
+    let fetch =
+        needs(locate(&[("mirror.json", dl)], vec![mount(&config_json, "mirror.json")], &serde));
     assert_eq!(fetch.url, "https://mirror.example.com/dl/serde/1.0.219/download");
     assert_eq!(fetch.at, format!("{SOURCES}/registry/src/{dir}/serde-1.0.219"));
 }
@@ -345,7 +387,8 @@ fn a_git_package_is_found_in_its_checkout() {
             at: at.clone(),
         })
     );
-    let package = |name: &str, version: &str| format!("[package]\nname = \"{name}\"\nversion = {version}\n");
+    let package =
+        |name: &str, version: &str| format!("[package]\nname = \"{name}\"\nversion = {version}\n");
     let workspace = "[workspace]\nmembers = [\"serde\", \"serde_derive\"]\n\n[workspace.package]\nversion = \"1.0.219\"\n";
     let serde_manifest = package("serde", "{ workspace = true }");
     let derive = package("serde_derive", "\"1.0.219\"");
@@ -358,9 +401,15 @@ fn a_git_package_is_found_in_its_checkout() {
         ("co/serde_derive/Cargo.toml", derive.as_str()),
         ("co/target/Cargo.toml", decoy.as_str()),
     ];
-    assert_eq!(locate(&files, vec![mount(&at, "co")], &serde), Answer::Here(format!("{at}/serde/Cargo.toml")));
+    assert_eq!(
+        locate(&files, vec![mount(&at, "co")], &serde),
+        Answer::Here(format!("{at}/serde/Cargo.toml"))
+    );
     let derive = asked(&url, "serde_derive", "1.0.219", None);
-    assert_eq!(locate(&files, vec![mount(&at, "co")], &derive), Answer::Here(format!("{at}/serde_derive/Cargo.toml")));
+    assert_eq!(
+        locate(&files, vec![mount(&at, "co")], &derive),
+        Answer::Here(format!("{at}/serde_derive/Cargo.toml"))
+    );
     let missing = asked(&url, "serde_json", "1.0.0", None);
     let error = failed(locate(&files, vec![mount(&at, "co")], &missing));
     assert!(error.starts_with("failed to find serde_json v1.0.0"), "{error}");
@@ -370,7 +419,10 @@ fn versions(files: &[(&str, &str)], mounts: Vec<Mount>, offline: bool) -> Versio
     let tree = Arc::new(MemTree::default());
     let db = database(&tree);
     let view = open(&db, &tree, files, mounts);
-    db.pin().get::<IndexQuery>(view, &(offline, "serde".to_owned(), "^1.0".to_owned())).expect("queried").get()
+    db.pin()
+        .get::<IndexQuery>(view, &(offline, "serde".to_owned(), "^1.0".to_owned()))
+        .expect("queried")
+        .get()
 }
 
 #[test]
@@ -389,9 +441,16 @@ fn the_resolver_reads_the_index_files_mounted_and_asks_for_the_rest() {
     );
     let offline = versions(&[], vec![], true);
     assert_eq!(offline, Versions { found: Vec::new(), needs: Vec::new() });
-    let yanked = SERDE_LINE.replace("1.0.219", "1.0.220").replace("\"yanked\":false", "\"yanked\":true");
+    let yanked =
+        SERDE_LINE.replace("1.0.219", "1.0.220").replace("\"yanked\":false", "\"yanked\":true");
     let too_new = SERDE_LINE.replace("1.0.219", "1.0.221").replace("\"yanked\":false", "\"v\":3");
     let file = format!("{SERDE_LINE}\n{yanked}\n{too_new}\nnot json\n");
     let read = versions(&[("serde-index", &file)], vec![mount(&index_file, "serde-index")], false);
-    assert_eq!(read, Versions { found: vec!["1.0.219".to_owned(), "1.0.220 yanked".to_owned()], needs: Vec::new() });
+    assert_eq!(
+        read,
+        Versions {
+            found: vec!["1.0.219".to_owned(), "1.0.220 yanked".to_owned()],
+            needs: Vec::new()
+        }
+    );
 }

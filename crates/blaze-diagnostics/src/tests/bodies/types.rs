@@ -13,7 +13,8 @@ use crate::{
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -468,7 +469,10 @@ fn main() {
         "{messages:#?}"
     );
     let e0277 = messages.iter().filter(|it| it.starts_with("E0277"));
-    assert!(e0277.clone().count() >= 4 && e0277.clone().all(|it| !it.contains('{')), "{messages:#?}");
+    assert!(
+        e0277.clone().count() >= 4 && e0277.clone().all(|it| !it.contains('{')),
+        "{messages:#?}"
+    );
     let stderr = checked.stderr();
     assert!(stderr.contains("Marker<T> of `u8`"), "{stderr}");
     assert!(!stderr.contains("{this") && !stderr.contains("{item_context}"), "{stderr}");
@@ -653,7 +657,10 @@ For more information about this error, try `rustc --explain E0525`.
          //- /closure-origin-tuple-diagnostics.rs crate:other:main edition:2021 deps:std\n{source}"
     );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
-    assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
+    assert_eq!(
+        normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })),
+        stderr
+    );
 }
 
 #[test]
@@ -806,12 +813,7 @@ fn main() {
 }
 ";
     let checked = checked(fixture);
-    assert_eq!(
-        checked.messages(),
-        [
-            "E0277: the trait bound `Digest: Debug` is not satisfied",
-        ]
-    );
+    assert_eq!(checked.messages(), ["E0277: the trait bound `Digest: Debug` is not satisfied",]);
     let notes: Vec<&str> = checked.diags[0].children.iter().map(|it| it.message.as_str()).collect();
     assert!(notes.contains(&"required for `Wrapper<Digest>` to implement `Debug`"), "{notes:?}");
     assert!(notes.contains(&"required by a bound in `assert_failed`"), "{notes:?}");
@@ -853,8 +855,9 @@ fn in_closure(s: &Set<u64>, it: &&u64) -> bool { call(|it| !s.contains(it), it) 
     let e0277 = |fixture: &str| -> Vec<String> {
         checked(fixture).messages().into_iter().filter(|it| it.starts_with("E0277: ")).collect()
     };
-    let same_crate =
-        format!("//- minicore: sized, fn\n//- /main.rs crate:other:main\n{items}{calls}fn main() {{}}\n");
+    let same_crate = format!(
+        "//- minicore: sized, fn\n//- /main.rs crate:other:main\n{items}{calls}fn main() {{}}\n"
+    );
     assert_eq!(e0277(&same_crate), expected, "the impl in the same crate");
     let dependency = format!(
         "//- minicore: sized, fn\n//- /dep.rs crate:dep\n{items}//- /main.rs crate:other:main deps:dep\nuse dep::Set;\n{calls}fn main() {{}}\n"
@@ -870,8 +873,9 @@ fn in_closure(s: &Set<u64>, it: &&u64) -> bool { call(|it| !s.contains(it), it) 
 #[test]
 fn a_reference_compared_with_an_integer_is_e0277() {
     let e0277 = |body: &str| -> Vec<String> {
-        let fixture =
-            format!("//- minicore: sized, eq, ord, builtin_impls\nfn f(bits: &u32) -> bool {{ {body} }}\nfn main() {{}}\n");
+        let fixture = format!(
+            "//- minicore: sized, eq, ord, builtin_impls\nfn f(bits: &u32) -> bool {{ {body} }}\nfn main() {{}}\n"
+        );
         checked(&fixture).messages().into_iter().filter(|it| it.contains("E0277")).collect()
     };
     let refused = e0277("bits == 0");
@@ -903,7 +907,9 @@ trait Head {
     let notes: Vec<&str> = checked.diags[0].children.iter().map(|it| it.message.as_str()).collect();
     assert_eq!(
         notes,
-        ["blaze could not place this error more precisely: it is in code with no syntax of its own"]
+        [
+            "blaze could not place this error more precisely: it is in code with no syntax of its own"
+        ]
     );
 }
 
@@ -926,7 +932,10 @@ fn a_let_of_an_empty_vec_macro() {
     //~^ ERROR type annotations needed
 }
 ";
-    assert_reports(&ui_vec("cannot_infer_local_or_vec.rs", "sized", source), &[error(2, &["`Vec<_>`"])]);
+    assert_reports(
+        &ui_vec("cannot_infer_local_or_vec.rs", "sized", source),
+        &[error(2, &["`Vec<_>`"])],
+    );
 }
 
 #[test]
@@ -951,10 +960,7 @@ fn main() {}
 ";
     assert_reports(
         &ui_vec("underscore-placeholder-wording.rs", "sized, slice, iterator", source),
-        &[
-            error(5, &["`&[_; 0]`"]),
-            error(11, &["`(Vec<_>, Vec<_>)`"]),
-        ],
+        &[error(5, &["`&[_; 0]`"]), error(11, &["`(Vec<_>, Vec<_>)`"])],
     );
 }
 
@@ -1142,7 +1148,10 @@ fn magic_foo(arg: Baz) -> Foo {
     arg.into()
 }
 ";
-    assert_reports(&ui_core("multiple-impl-apply.rs", "derive, clone, copy, from", source), &[error(34, &[])]);
+    assert_reports(
+        &ui_core("multiple-impl-apply.rs", "derive, clone, copy, from", source),
+        &[error(34, &[])],
+    );
 }
 
 #[test]
@@ -1159,7 +1168,10 @@ fn main() {
     //~| NOTE the type must implement
 }
 ";
-    assert_reports(&ui_std("type-annotation-needed.rs", "from", STRING_STD, source), &[error(6, &[])]);
+    assert_reports(
+        &ui_std("type-annotation-needed.rs", "from", STRING_STD, source),
+        &[error(6, &[])],
+    );
 }
 
 #[test]
@@ -1186,7 +1198,10 @@ fn main() {
     //~^ ERROR type mismatch resolving `<W<i32> as Tr>::Assoc == ()`
 }
 ";
-    assert_reports(&ui("mismatch-two-relevant-impls.rs", "2015", source), &[error(18, &["`()`", "`u32`"])]);
+    assert_reports(
+        &ui("mismatch-two-relevant-impls.rs", "2015", source),
+        &[error(18, &["`()`", "`u32`"])],
+    );
 }
 
 #[test]
@@ -1263,7 +1278,8 @@ const fn test() {
 
 fn main() {}
 ";
-    let stderr = "error[E0277]: the trait bound `NonConstImpl: [const] ConstDefaultFn` is not satisfied
+    let stderr =
+        "error[E0277]: the trait bound `NonConstImpl: [const] ConstDefaultFn` is not satisfied
   --> $DIR/const-default-method-bodies.rs:24:18
    |
 LL |     NonConstImpl.a();
@@ -1284,7 +1300,8 @@ For more information about this error, try `rustc --explain E0277`.
 #[test]
 fn an_overflow_assigning_a_variable_to_a_type_holding_it() {
     // tests/ui/traits/mutual-recursion-issue-75860.rs
-    let source = "pub fn iso<A, B, F1, F2>(a: F1, b: F2) -> (Box<dyn Fn(A) -> B>, Box<dyn Fn(B) -> A>)
+    let source =
+        "pub fn iso<A, B, F1, F2>(a: F1, b: F2) -> (Box<dyn Fn(A) -> B>, Box<dyn Fn(B) -> A>)
     where
         F1: (Fn(A) -> B) + 'static,
         F2: (Fn(B) -> A) + 'static,
@@ -1301,7 +1318,10 @@ pub fn iso_un_option<A, B>() -> (Box<dyn Fn(A) -> B>, Box<dyn Fn(B) -> A>) {
 fn main() {}
 ";
     let flags = "fn, option, deref, unsize, coerce_unsized, dispatch_from_dyn";
-    assert_reports(&ui_std("mutual-recursion-issue-75860.rs", flags, BOX_STD, source), &[error(9, &[])]);
+    assert_reports(
+        &ui_std("mutual-recursion-issue-75860.rs", flags, BOX_STD, source),
+        &[error(9, &[])],
+    );
 }
 
 #[test]
@@ -1415,7 +1435,10 @@ fn main() {
 }
 ";
     let name = "expectated-input-not-satisfying-fn-bounds-issue-149881.rs";
-    assert_reports(&ui_std(name, "deref, unsize, coerce_unsized", BOX_STD, source), &[error(15, &["`[{integer}]`", "`Sized`", "`id`"])]);
+    assert_reports(
+        &ui_std(name, "deref, unsize, coerce_unsized", BOX_STD, source),
+        &[error(15, &["`[{integer}]`", "`Sized`", "`id`"])],
+    );
 }
 
 #[test]
@@ -1501,14 +1524,13 @@ fn c() {
 
 fn main() {}
 ";
-    let fixture = format!("{STD_UNSAFE_BINDER}//- /mismatch.rs crate:other:main edition:2021 deps:std\n{source}");
+    let fixture = format!(
+        "{STD_UNSAFE_BINDER}//- /mismatch.rs crate:other:main edition:2021 deps:std\n{source}"
+    );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     assert_reports(
         &normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })),
-        &[
-            error(6, &["`i32`", "`wrap_binder!()`"]),
-            error(12, &["`unwrap_binder!()`"]),
-        ],
+        &[error(6, &["`i32`", "`wrap_binder!()`"]), error(12, &["`unwrap_binder!()`"])],
     );
 }
 

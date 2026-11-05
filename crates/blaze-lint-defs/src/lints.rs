@@ -11,8 +11,8 @@ use super::{
     Level::{Allow, Deny, Warn},
     Lint,
     Reason::{
-        Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange,
-        EditionError, EditionSemanticsChange, FutureReleaseError,
+        Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
+        EditionSemanticsChange, FutureReleaseError,
     },
 };
 
@@ -904,6 +904,11 @@ pub(super) const BLAZE: &[Lint] = &[
         Warn,
         "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
     ),
+    // The cross-configuration reachability lints: one check over every configuration of a
+    // package (its lib, bins, tests, ...), docs/v2/plan/multiconfig-check.md.
+    l("blaze::dead", Warn, "detects an item no configuration of its package that was checked uses (rustc's `dead_code`, over every configuration at once)"),
+    l("blaze::test_only", Warn, "detects an item only the tests use, which `#[cfg(test)]` would leave out of every other build"),
+    l("blaze::cfg_only", Warn, "detects an item only some configurations use (a feature, a platform, a target), which a `#[cfg]` naming them would leave out of the rest"),
     l("blaze::hot_clone", Allow, "detects a clone in hot code that costs more than a copy")
         .externally_loaded(),
     l("blaze::hot_alloc", Allow, "detects a call in hot code that reaches the global allocator")
@@ -1067,6 +1072,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::thread_local_in_waiting_fn", Allow, "detects a thread-local read in, or inlinable into, a function that may park the fiber, which can keep the first thread's address after resuming on another")
         .externally_loaded(),
+    l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];
@@ -1074,12 +1081,8 @@ pub(super) const BLAZE: &[Lint] = &[
 /// Lints rustc declares and never registers: an attribute can't name them, but
 /// `private_macro_use` is still emitted by name resolution at its default level.
 pub(super) const UNREGISTERED: &[Lint] = &[
-    l(
-        "private_macro_use",
-        Deny,
-        "detects certain macro bindings that should not be re-exported",
-    )
-    .fcw_deps(FutureReleaseError(120192)),
+    l("private_macro_use", Deny, "detects certain macro bindings that should not be re-exported")
+        .fcw_deps(FutureReleaseError(120192)),
     l(
         "unsupported_fn_ptr_calling_conventions",
         Warn,

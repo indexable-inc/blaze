@@ -3,15 +3,21 @@
 //!
 //! Spring tunes are the node's own `Motion`, else a token prefab's (`ui.spring.transition`, `ui.spring.matched`,
 //! `ui.spring.layout` in prims.flecs). With neither, the change lands at once.
+//!
+//! It also runs each scroll's overlay scroller (`Scroller`): when it shows and fades, how wide each axis's knob is
+//! (`ScrollerState`), and its parts' fade.
 use std::collections::HashMap;
 
 use harness_native_api::{Clock, moving, settle};
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{Collapse, Flex, FlexAxis, Padding, ScrollState, Size, Sizing};
+use harness_native_ui_layout_api::{
+    Collapse, Flex, FlexAxis, NoScroller, Padding, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, Size, Sizing,
+    Viewport, axis_bit, overflows,
+};
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
-    Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Reveal, Shown, ShownWhen, SizeTween, Target, Transition,
-    TransitionKind,
+    Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Pose, Reveal, Shown, ShownWhen, SizeTween, Target,
+    Transition, TransitionKind,
 };
 use harness_native_ui_node_api::{Hidden, Laid};
 use harness_native_ui_spring_api::{Spring, Tune};
@@ -113,15 +119,21 @@ fn scrolled(e: EntityView<'_>) -> (f32, f32) {
 
 /// One frame of a matched id's springs toward `to` (content space); whether it still moves. A slide retargets from where
 /// it is drawn and how fast it goes. From rest (not moving last frame), a move of more than `jump` of its heights lands
-/// at once; mid-slide it never does. With no tune (or on its first frame) it lands.
-fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, dt: f32) -> bool {
+/// at once; mid-slide it never does. With no tune, on its first frame or when `land` (the view was rescaled under it:
+/// its node moved because the room did, not because the selection did) it lands.
+fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, land: bool, dt: f32) -> bool {
     let rows = |a: f32, b: f32| ((a - b).abs() / to.h.max(1.0)).floor();
     let far = jump > 0.0 && !st.moving && (rows(to.y, st.y.x) > jump || rows(to.x, st.x.x) > jump);
-    let still = match tune.filter(|_| st.started && !far) {
+    let still = match tune.filter(|_| st.started && !far && !land) {
         Some(tune) => {
             let mut still = false;
             for (s, v) in [(&mut st.x, to.x), (&mut st.y, to.y), (&mut st.w, to.w), (&mut st.h, to.h)] {
                 still |= settle(s, v, tune, dt);
+            }
+            if !still {
+                // At rest exactly on its node (a settled spring is only within 1e-3 of it), so the painter sees a node at
+                // rest and puts it on the pixel grid with the row it sits behind.
+                (st.x, st.y, st.w, st.h) = (Spring::at(to.x), Spring::at(to.y), Spring::at(to.w), Spring::at(to.h));
             }
             still
         }
@@ -133,6 +145,18 @@ fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, dt: f32) -> 
     };
     st.moving = still;
     still
+}
+
+/// Whether a matched id lands this pass because the room changed under it: the room differs from the one it last chased
+/// in, or it changed earlier this same frame (layout runs more than once a frame; a later pass may still move the node).
+/// Records the room and when it came in.
+fn rescaled(st: &mut Matched, room: (f32, f32), now: f32) -> bool {
+    if st.started && (st.room_w, st.room_h) != room {
+        st.room_at = now;
+        st.rescaled = true;
+    }
+    (st.room_w, st.room_h) = room;
+    st.rescaled && st.room_at == now
 }
 
 /// Install systems in the module scope; deleting that scope removes all callbacks before unloading.
@@ -161,7 +185,7 @@ pub fn install(world: WorldRef<'_>) {
 
     // Transitions: a node is made at 0 and springs to 1 (through Shown, Target and the Reveal its kind makes); a Leaving
     // node springs back to 0 and is deleted there.
-    world.system_named::<&Transition>("Transition").each_iter(|it, row, t| {
+    world.system_named::<&Transition>("Transition").reads(Laid::id()).writes(Drawn::id()).each_iter(|it, row, t| {
         let (e, w) = (it.entity(row), it.world());
         let leaving = e.has(Leaving::id());
         let laid = e.try_cloned::<&Laid>().unwrap_or_default();
@@ -216,8 +240,11 @@ pub fn install(world: WorldRef<'_>) {
 
     // Matched geometry: per id, the drawn frame springs to where the newest live node with that id is laid out, in its
     // scroll content's space (see `Matched`).
-    world.system_named::<&Clock>("Matched").each_iter(|it, _, _| {
+    // After layout, reading this pass's Laid (layout `writes` it); it writes Drawn, which the draw pass reads this pass.
+    world.system_named::<&Clock>("Matched").phase(Phase::AfterLayout).reads(Laid::id()).writes(Drawn::id()).each_iter(|it, _, _| {
         let (w, dt) = (it.world(), it.delta_time());
+        let room = w.try_get::<&Viewport>(|v| (v.w, v.h)).unwrap_or((0.0, 0.0));
+        let now = w.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
         // Per id, its newest live node and that node's Laid (None: made this frame, layout has not reached it yet).
         let mut by: HashMap<String, (u64, Option<Laid>, f32)> = HashMap::new();
         w.new_query::<&MatchedGeometry>().each_entity(|e, m| {
@@ -244,7 +271,8 @@ pub fn install(world: WorldRef<'_>) {
                 None => continue,
             };
             (st.gx, st.gy, st.gw, st.gh) = (to.x, to.y, to.w, to.h);
-            still |= chase(&mut st, to, tune_of(w, o, "matched"), jump, dt);
+            let land = rescaled(&mut st, room, now);
+            still |= chase(&mut st, to, tune_of(w, o, "matched"), jump, land, dt);
             st.owner = owner;
             holder.set(st);
             let d = Drawn { x: st.x.x - sx, y: st.y.x - sy, w: st.w.x.max(0.0), h: st.h.x.max(0.0) };
@@ -293,6 +321,72 @@ pub fn install(world: WorldRef<'_>) {
             moving(&w);
         }
     });
+
+    // Overlay scrollers (`Scroller`, layout-api): shown while the scroll moves, `hold` seconds after and while the pointer
+    // is near or holds it, then faded (the `ui.spring.scroller_show` / `scroller_hide` springs); each axis's knob wide
+    // over its track while the pointer is near that edge or drags it (`ui.spring.scroller_wide`). The parts fade by
+    // their Pose: the knob with the scroller, the track with it and its axis's width.
+    world
+        .system_named::<(&Scroller, &ScrollState)>("Scroller")
+        .without(NoScroller::id())
+        .reads(ScrollerGrip::id())
+        .reads(ScrollExtent::id())
+        .writes(ScrollerState::id())
+        .writes(Pose::id())
+        .each_iter(|it, row, (c, s)| {
+        let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
+        let grip = e.try_cloned::<&ScrollerGrip>().unwrap_or_default();
+        let was = e.try_cloned::<&ScrollerState>();
+        let mut st = was.unwrap_or_default();
+        if !st.started {
+            // A scroller flashes once as its scroll first shows, as AppKit's do.
+            st.started = true;
+            (st.seen_x, st.seen_y, st.still) = (s.x, s.y, 0.0);
+        } else if (s.x - st.seen_x).abs() > 0.01 || (s.y - st.seen_y).abs() > 0.01 {
+            (st.seen_x, st.seen_y, st.still) = (s.x, s.y, 0.0);
+        } else {
+            st.still += dt;
+        }
+        let view = e.try_cloned::<&Laid>().map_or([0.0; 2], |l| [l.w, l.h]);
+        let ext = e.try_cloned::<&ScrollExtent>().map_or(view, |x| [x.w, x.h]);
+        let moves = |a: ScrollAxis| overflows(view, ext, a);
+        let any = moves(ScrollAxis::Y) || moves(ScrollAxis::X);
+        let holding = st.still < c.hold;
+        let show = any && (holding || grip.near != 0 || grip.drag != 0 || grip.page != 0);
+        let target = f32::from(u8::from(show));
+        let spring = |name: &str, fallback: Tune| token(w, name).map_or(fallback, |m| Tune { omega: m.omega, zeta: m.zeta });
+        let shown_tune = spring(if target > st.shown.x { "scroller_show" } else { "scroller_hide" }, Tune { omega: 30.0, zeta: 1.0 });
+        let wide_tune = spring("scroller_wide", Tune { omega: 30.0, zeta: 1.0 });
+        let mut going = settle(&mut st.shown, target, shown_tune, dt);
+        if !going {
+            st.shown = Spring::at(target);
+        }
+        for (a, sp) in [(ScrollAxis::Y, &mut st.wide_y), (ScrollAxis::X, &mut st.wide_x)] {
+            let bit = axis_bit(a);
+            let want = f32::from(u8::from(show && moves(a) && (grip.near & bit != 0 || grip.drag == bit)));
+            if settle(sp, want, wide_tune, dt) {
+                going = true;
+            } else {
+                *sp = Spring::at(want);
+            }
+        }
+        // Through the hold nothing moves, but its end must be drawn: the fade starts then.
+        if going || (show && holding) {
+            moving(&w);
+        }
+        if was != Some(st) {
+            e.set(st);
+        }
+        let shown = st.shown.x.clamp(0.0, 1.0);
+        e.each_child(|p| {
+            let Some(part) = p.try_cloned::<&ScrollerPart>() else { return };
+            let a = if part.track { shown * st.wide(part.axis) } else { shown };
+            let pose = Pose { fade: 1.0 - a, ..p.try_cloned::<&Pose>().unwrap_or_default() };
+            if p.try_cloned::<&Pose>() != Some(pose) {
+                p.set(pose);
+            }
+        });
+    });
 }
 
 harness_native_api::module!(
@@ -318,27 +412,55 @@ mod tests {
         let tune = Some(Tune { omega: 32.0, zeta: 0.86 });
         let row = |i: f32| Laid { x: 0.0, y: i * 30.0, w: 200.0, h: 28.0 };
         let mut st = Matched::default();
-        assert!(!chase(&mut st, row(0.0), tune, 3.0, 1.0 / 60.0));
+        assert!(!chase(&mut st, row(0.0), tune, 3.0, false, 1.0 / 60.0));
         let mut last = st.y.x;
         for k in 1..=8 {
             for _ in 0..3 {
-                chase(&mut st, row(k as f32), tune, 3.0, 1.0 / 60.0);
+                chase(&mut st, row(k as f32), tune, 3.0, false, 1.0 / 60.0);
                 assert!(st.y.x >= last - 1e-3, "press {k}: {} after {last}", st.y.x);
                 assert!(st.y.x - last < 30.0, "a jump of {}", st.y.x - last);
                 last = st.y.x;
             }
         }
         for _ in 0..240 {
-            chase(&mut st, row(8.0), tune, 3.0, 1.0 / 60.0);
+            chase(&mut st, row(8.0), tune, 3.0, false, 1.0 / 60.0);
         }
         assert!(!st.moving);
-        chase(&mut st, row(5.0), tune, 3.0, 1.0 / 60.0);
+        chase(&mut st, row(5.0), tune, 3.0, false, 1.0 / 60.0);
         assert!(st.moving && st.y.x > row(5.0).y);
         for _ in 0..240 {
-            chase(&mut st, row(5.0), tune, 3.0, 1.0 / 60.0);
+            chase(&mut st, row(5.0), tune, 3.0, false, 1.0 / 60.0);
         }
-        chase(&mut st, row(0.0), tune, 3.0, 1.0 / 60.0);
+        chase(&mut st, row(0.0), tune, 3.0, false, 1.0 / 60.0);
         assert!(!st.moving && st.y.x == 0.0);
+    }
+
+    /// A zoom (the room changes) lands a slide on its node at once, mid-slide too, and through every layout pass of that
+    /// frame; the next frame in the same room slides again.
+    #[test]
+    fn a_rescale_lands_instead_of_sliding() {
+        let tune = Some(Tune { omega: 32.0, zeta: 0.86 });
+        let row = |y: f32| Laid { x: 0.0, y, w: 200.0, h: 24.0 };
+        let mut st = Matched::default();
+        let mut step = |st: &mut Matched, to: Laid, room: (f32, f32), now: f32| {
+            let land = rescaled(st, room, now);
+            chase(st, to, tune, 3.0, land, 1.0 / 60.0)
+        };
+        step(&mut st, row(0.0), (1280.0, 800.0), 0.0);
+        // A select one row down: it slides.
+        assert!(step(&mut st, row(24.0), (1280.0, 800.0), 0.1));
+        assert!(st.y.x < 24.0);
+        // Mid-slide the view zooms to 1.25: the room shrinks and the row moved; it lands there.
+        let (z, at) = (1.25, row(24.0 - 32.0 * (1.0 - 1.0 / 1.25)));
+        assert!(!step(&mut st, at, (1280.0 / z, 800.0 / z), 0.2));
+        assert_eq!((st.y.x, st.h.x, st.moving), (at.y, at.h, false));
+        // A second layout pass in the same frame moves it again: still the zoom's, still landed.
+        let later = row(at.y + 3.0);
+        assert!(!step(&mut st, later, (1280.0 / z, 800.0 / z), 0.2));
+        assert_eq!(st.y.x, later.y);
+        // The next frame, in the same room, a new selection slides as before.
+        assert!(step(&mut st, row(later.y + 24.0), (1280.0 / z, 800.0 / z), 0.3));
+        assert!(st.y.x < later.y + 24.0);
     }
 
     /// A width written mid-way is a new target: the eased value starts from where it was, reaches the target, and a

@@ -12,9 +12,9 @@ use blaze_cas::Store;
 use blaze_codegen::plan::{Mode as BuildMode, Policy};
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
+use std::alloc::Global;
 
 use super::{
     Job, Real, UnitWriter, codegen,
@@ -110,7 +110,11 @@ pub(crate) fn allows_live(profile: &str, policy: &Policy) -> Result<(), Refused>
 /// and the job's dynamic library search path after cargo's directories, as
 /// `Compilation::fill_env` joins them (on macOS, with none set, `$HOME/lib`, `/usr/local/lib`
 /// and `/usr/lib` after).
-pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &str) -> Vec<(OsString, OsString)> {
+pub(crate) fn process_env(
+    job: &[(String, String)],
+    artifact: &Artifact,
+    os: &str,
+) -> Vec<(OsString, OsString)> {
     let var = super::artifact::dylib_var(os);
     let separator = match os {
         "windows" => ";",
@@ -233,41 +237,50 @@ pub(crate) fn start(
         packages.dedup();
         match packages.as_slice() {
             [one] => {
-                let at = units
-                    .packages
-                    .binary_search_by(|it| it.id.as_str().cmp(one))
-                    .map_err(|_| ApiError::new(format!("the build has no package `{one}`"), None))?;
+                let at = units.packages.binary_search_by(|it| it.id.as_str().cmp(one)).map_err(
+                    |_| ApiError::new(format!("the build has no package `{one}`"), None),
+                )?;
                 units.packages[at].default_run.as_deref()
             }
             _ => None,
         }
     };
     let chosen = choose(built, bin, default_run).map_err(|what| ApiError::new(what, None))?;
-    let program =
-        chosen.executable.clone().ok_or_else(|| UnitError::NoExecutable { target: chosen.target.name.clone() })?;
+    let program = chosen
+        .executable
+        .clone()
+        .ok_or_else(|| UnitError::NoExecutable { target: chosen.target.name.clone() })?;
     let target = &chosen.target;
     let kinds: Vec<&str> = target.kinds().collect(); // alloc: once per run, a word or two
     let at = job
         .graph
         .find(&units.graph.units, &chosen.package, &target.name, &kinds, Mode::Build)
-        .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", target.name), None))? as usize;
+        .ok_or_else(|| {
+            ApiError::new(format!("no unit of `{}` is in the build", target.name), None)
+        })? as usize;
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;
-    let launch = launch(job, at, !chosen.runner.is_empty()).map_err(|what| ApiError::new(what, None))?;
+    let launch =
+        launch(job, at, !chosen.runner.is_empty()).map_err(|what| ApiError::new(what, None))?;
     let config = &job.input.config;
     let env = process_env(&config.invocation.env, chosen, std::env::consts::OS);
     // cargo's `target.<triple>.runner`: the runner, its arguments, then the program's.
     let (program, args): (String, Vec<String>) = match chosen.runner.split_first() {
-        Some((runner, before)) => {
-            (runner.clone(), before.iter().cloned().chain([program]).chain(args.iter().cloned()).collect())
-        }
+        Some((runner, before)) => (
+            runner.clone(),
+            before.iter().cloned().chain([program]).chain(args.iter().cloned()).collect(),
+        ),
         None => (program, args.to_vec()),
     };
     let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
     let sandbox = match job.sandbox_off() {
         true => Sandbox::Off,
         false => Sandbox::On {
-            read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir],
+            read: vec![
+                PathBuf::from(&config.invocation.root),
+                PathBuf::from(&units.target_dir),
+                manifest_dir,
+            ],
             write: Vec::new(),
             network: false,
             trace: false,
@@ -293,7 +306,8 @@ pub(crate) fn start(
                 .dev_runs
                 .loaded(&command.program.to_string_lossy())
                 .map_err(|what| ApiError::new(what, None))?;
-            let (command, started) = loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
+            let (command, started) =
+                loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
             (command, Some((loaded, started)))
         }
     };
@@ -309,6 +323,7 @@ impl Runs<Real> for Program {
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
         let command = self.command.take()?;
+        blaze_core::reaped::label(self.tag, "run", Some(&command.program.to_string_lossy()));
         effects.push(Effect::Spawn { command: Box::new(command), tag: self.tag });
         self.running = true;
         None

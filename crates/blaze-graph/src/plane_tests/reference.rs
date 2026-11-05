@@ -9,8 +9,8 @@
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_protocol::events::{Event, Level, NodeState, Record};
+use std::alloc::Global;
 
 use crate::{
     machine::{Error, NodeId, Outcome, Pool, Spec},
@@ -453,7 +453,11 @@ impl<M: Memo> Plane<M> {
     /// and that task runs on for the rest. Once what it runs is done the request finishes,
     /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
     /// does nothing.
-    pub(crate) fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+    pub(crate) fn cancel(
+        &mut self,
+        at_ns: u64,
+        request: RequestId,
+    ) -> Result<Vec<PlaneOutput>, Error> {
         let at = at_ns.max(self.last_ns);
         let r = self.open_request(request)?;
         let mut out = Vec::new();
@@ -471,9 +475,9 @@ impl<M: Memo> Plane<M> {
                     let me = self.requests[r].nodes[at_node];
                     let skip = match self.nodes[me].state {
                         NodeState::Waiting | NodeState::Ready => true,
-                        NodeState::Running => self.nodes[me]
-                            .task
-                            .is_some_and(|task| self.tasks[task].runner != me),
+                        NodeState::Running => {
+                            self.nodes[me].task.is_some_and(|task| self.tasks[task].runner != me)
+                        }
                         _ => false,
                     };
                     if skip {
@@ -496,7 +500,7 @@ impl<M: Memo> Plane<M> {
     ) -> Result<Vec<PlaneOutput>, Error> {
         self.settle_deferred(at, &mut out, &mut touched);
         self.last_ns = at;
-        self.dispatch(at, &mut out, &mut touched);
+        self.dispatch(at, &mut out);
         touched.sort_unstable_by_key(|&r| self.requests[r].seq);
         touched.dedup();
         for r in touched {
@@ -598,7 +602,9 @@ impl<M: Memo> Plane<M> {
                             blocker = Some(dep);
                         }
                     }
-                    NodeState::Failed { .. } if self.requests[r].keep_going && self.nodes[dep].open => {
+                    NodeState::Failed { .. }
+                        if self.requests[r].keep_going && self.nodes[dep].open =>
+                    {
                         let later = |it: usize| (self.nodes[it].done_at, self.nodes[it].seq);
                         if blocker.is_none_or(|it| later(dep) > later(it)) {
                             blocker = Some(dep);
@@ -700,8 +706,8 @@ impl<M: Memo> Plane<M> {
         if node.priority == priority {
             return;
         }
-        let ready = node.state == NodeState::Ready
-            && node.task.is_some_and(|it| !self.tasks[it].running);
+        let ready =
+            node.state == NodeState::Ready && node.task.is_some_and(|it| !self.tasks[it].running);
         if ready {
             let (r, p) = (node.request, pool_at(self.tasks[node.task.expect("a task")].pool));
             let entry = self.entry(me);
@@ -776,11 +782,12 @@ impl<M: Memo> Plane<M> {
             && spec.memory > budget.bytes
         {
             let why = format!(
-                "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
+                "{} needs {} of memory as predicted, more than blaze may use here: {} ({}); {}",
                 spec.name,
                 gb(spec.memory),
                 gb(budget.bytes),
-                budget.from
+                budget.from,
+                budget.advice(spec.memory)
             );
             self.deferred.push((me, NodeState::Failed { why }));
             return;
@@ -955,7 +962,7 @@ impl<M: Memo> Plane<M> {
         self.hold
     }
 
-    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<usize>) {
+    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             'next: while self.running[p] < limit {
@@ -975,13 +982,6 @@ impl<M: Memo> Plane<M> {
                                 self.pass(&passed);
                             }
                             self.start(at, me, out);
-                            continue 'next;
-                        }
-                        Pick::Fail(me, why) => {
-                            self.leave_task(me);
-                            touched.push(r);
-                            self.deferred.push((me, NodeState::Failed { why }));
-                            self.settle_deferred(at, out, touched);
                             continue 'next;
                         }
                         Pick::None => {}
@@ -1108,10 +1108,12 @@ impl<M: Memo> Plane<M> {
                 None => Pick::None,
             };
         };
-        let nothing_runs = self.running == [0, 0];
+        // A task that fits the budget starts once nothing granted memory runs, whatever the
+        // process holds besides: waiting could never make room for it.
+        let whole = self.config.budget.as_ref().expect("a budget").bytes;
+        let alone = self.granted == 0;
         let hold = self.hold();
         let counts = !self.requests[r].idle;
-        let mut unfit = None;
         for &(_, _, me) in &self.requests[r].ready[p] {
             let task = self.nodes[me].task.expect("a ready node's task");
             let memory = self.tasks[task].memory;
@@ -1122,35 +1124,16 @@ impl<M: Memo> Plane<M> {
                         return Pick::Start(me);
                     }
                 }
-                _ if memory <= free => return Pick::Start(me),
-                Some(_) => unfit = Some(me),
+                _ if memory <= free || (memory <= whole && alone) => return Pick::Start(me),
+                Some(_) => {}
                 None => {
-                    unfit.get_or_insert(me);
                     if counts {
                         passed.push(task);
                     }
                 }
             }
         }
-        match unfit {
-            Some(me) if nothing_runs => {
-                let budget = self.config.budget.as_ref().expect("a budget");
-                let spec = &self.nodes[me].spec;
-                Pick::Fail(
-                    me,
-                    format!(
-                        "{} needs {} of memory as predicted, and with nothing of blaze's running \
-                         the process holds {} of the {} it may use ({})",
-                        spec.name,
-                        gb(spec.memory),
-                        gb(self.held),
-                        gb(budget.bytes),
-                        budget.from
-                    ),
-                )
-            }
-            _ => Pick::None,
-        }
+        Pick::None
     }
 
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
@@ -1212,8 +1195,6 @@ impl<M: Memo> Plane<M> {
 
 enum Pick {
     Start(usize),
-    /// It cannot fit even with nothing running.
-    Fail(usize, String),
     None,
 }
 

@@ -13,7 +13,6 @@
 use std::borrow::Borrow;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{
@@ -28,6 +27,7 @@ use object::{
     RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     Symbol, Unhandled, pgo,
@@ -108,12 +108,13 @@ pub(super) fn read<S: Borrow<Signature>>(
 /// [`sanitize::COVERAGE`].
 pub(super) fn read_covered<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, S),
+    function: &(&str, S),
     recorder: &mut Wants,
 ) -> Result<(Code, Covered), Unhandled> {
     let instrumented = Instrumented { covered: true, profiled: false };
-    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
-    let (code, covered, _) = read.pop().ok_or(Unhandled::Shape("an object without the function"))??;
+    let mut read = read_all(object, std::slice::from_ref(function), recorder, instrumented)?;
+    let (code, covered, _) =
+        read.pop().ok_or(Unhandled::Shape("an object without the function"))??;
     Ok((code, covered))
 }
 
@@ -123,12 +124,12 @@ pub(super) fn read_covered<S: Borrow<Signature>>(
 /// of [`pgo::COUNTER_RELOCS`].
 pub(super) fn read_profiled<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, S),
+    function: &(&str, S),
     recorder: &mut Wants,
     covered: bool,
 ) -> Result<(Code, Covered, u32), Unhandled> {
     let instrumented = Instrumented { covered, profiled: true };
-    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    let mut read = read_all(object, std::slice::from_ref(function), recorder, instrumented)?;
     read.pop().ok_or(Unhandled::Shape("an object without the function"))?
 }
 
@@ -321,13 +322,15 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
         // alloc: the error's message
-        let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
+        let relocs =
+            Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
         Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage, counters))
     }
 
     /// Whether `file` has a section of PGO's counters.
     fn has_counters(file: &object::File<'_>) -> bool {
-        file.sections().any(|section| section.name().is_ok_and(|name| pgo::COUNTERS.contains(&name)))
+        file.sections()
+            .any(|section| section.name().is_ok_and(|name| pgo::COUNTERS.contains(&name)))
     }
 
     /// Whether `section` is the function's PGO counters, if the object is read with them.
@@ -337,7 +340,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     /// How many bytes the function's PGO counters take, which start zeroed.
     fn counters(&self) -> Result<u32, Unhandled> {
-        let mut sections = self.file.sections().filter(|it| it.name().is_ok_and(|it| pgo::COUNTERS.contains(&it)));
+        let mut sections =
+            self.file.sections().filter(|it| it.name().is_ok_and(|it| pgo::COUNTERS.contains(&it)));
         let Some(section) = sections.next() else {
             return Err(Unhandled::Shape("an object instrumented for PGO without its counters"));
         };
@@ -391,7 +395,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
         for (at, name) in sanitize::SECTIONS.iter().enumerate() {
             let Some(section) = self.only(name)? else { continue };
             if section.relocations().next().is_some() || section.data()?.iter().any(|it| *it != 0) {
-                return Err(Unhandled::Shape("a SanitizerCoverage array that does not start zeroed"));
+                return Err(Unhandled::Shape(
+                    "a SanitizerCoverage array that does not start zeroed",
+                ));
             }
             covered.arrays[at] = u32::try_from(section.size())
                 .map_err(|_| Unhandled::Shape("a SanitizerCoverage array of 4 GiB"))?;
@@ -400,7 +406,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
             covered.pcs = self.pcs(&section)?;
             let [counters, flags, guards] = covered.arrays;
             let blocks = covered.pcs.len();
-            if [counters, flags, guards / 4].into_iter().any(|it| it != 0 && it as usize != blocks) {
+            if [counters, flags, guards / 4].into_iter().any(|it| it != 0 && it as usize != blocks)
+            {
                 return Err(Unhandled::Shape("a PC table of other blocks than are counted"));
             }
         }
@@ -411,7 +418,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// block in the code and its flags (1 for the function's entry, as LLVM's
     /// `SanitizerCoveragePass` writes them).
     fn pcs(&self, section: &object::Section<'data, '_>) -> Result<Vec<(u32, u64)>, Unhandled> {
-        const MALFORMED: Unhandled = Unhandled::Shape("a SanitizerCoverage PC table that is not read");
+        const MALFORMED: Unhandled =
+            Unhandled::Shape("a SanitizerCoverage PC table that is not read");
         let word = if self.file.is_64() { 8 } else { 4 };
         let data = section.data()?;
         if data.len() % (2 * word) != 0 {
@@ -939,7 +947,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let section = self.file.section_by_index(text)?;
         self.align = section.align().max(1);
         let (start, end) = (self.range.start as usize, self.range.end as usize);
-        let code = section.data()?.get(start..end).ok_or(Unhandled::Shape("a function past the end of its section"))?;
+        let code = section
+            .data()?
+            .get(start..end)
+            .ok_or(Unhandled::Shape("a function past the end of its section"))?;
         self.bytes.extend_from_slice(code);
         self.code = Self::lengthen(recorder.target, &mut self.bytes)?;
         self.placed.insert(text, Placement::Inline(0));
@@ -1103,7 +1114,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     Placement::Counters => {
                         let within =
                             symbol.address() - self.file.section_by_index(target)?.address();
-                        (ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0), relocation.addend() + within as i64)
+                        (
+                            ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0),
+                            relocation.addend() + within as i64,
+                        )
                     }
                     Placement::Inline(_) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
@@ -1137,7 +1151,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         // A metered function's calls of the fuel runtime, as the IR named them.
         let fuel = [blaze_stencil::fuel::CELL, blaze_stencil::fuel::OUT];
-        if let Some(index) = fuel.into_iter().find(|&it| blaze_stencil::fuel::symbol(it) == Some(name)) {
+        if let Some(index) =
+            fuel.into_iter().find(|&it| blaze_stencil::fuel::symbol(it) == Some(name))
+        {
             return Ok(ModuleRelocTarget::user(blaze_stencil::fuel::NAMESPACE, index));
         }
         // A function LLVM calls of its own accord that Cranelift has no name for: a libm
@@ -1167,16 +1183,17 @@ impl<'data, 'file> Emitted<'data, 'file> {
         // `object` folds in) plus the function (`ARM64_RELOC_UNSIGNED`), against the symbol
         // that starts the function's atom ([`atom`]); the field holds the pair's difference.
         let start = self.start() - Self::base(self.text);
-        let ours: Option<HashSet<u64, Global>> = (self.texts.len() > 1 || self.shares_text).then(|| {
-            let starts = section.relocations().filter(|(_, relocation)| {
-                Self::symbol(self.file, relocation).is_ok_and(|it| {
-                    it.section() == SymbolSection::Section(self.text)
-                        && (!self.shares_text || it.address() == start)
-                })
+        let ours: Option<HashSet<u64, Global>> =
+            (self.texts.len() > 1 || self.shares_text).then(|| {
+                let starts = section.relocations().filter(|(_, relocation)| {
+                    Self::symbol(self.file, relocation).is_ok_and(|it| {
+                        it.section() == SymbolSection::Section(self.text)
+                            && (!self.shares_text || it.address() == start)
+                    })
+                });
+                // alloc: once per function of a unit, none for a function alone
+                starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
             });
-            // alloc: once per function of a unit, none for a function alone
-            starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
-        });
         let mut entries = eh_frame.entries(&bases);
         let mut rows = None;
         let mut table = None;
@@ -1216,7 +1233,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         let Some(rows) = rows else {
             if ours.is_some_and(|it| !it.is_empty()) {
-                return Err(Unhandled::Shape("an unwind table entry of the function that does not parse"));
+                return Err(Unhandled::Shape(
+                    "an unwind table entry of the function that does not parse",
+                ));
             }
             return Ok(None);
         };
@@ -1250,7 +1269,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
             // share `__text`: the function's piece of it runs to where the next entry's starts.
             // Each piece is an atom of its own, which the relocation names by its symbol.
             if name == "__gcc_except_tab" {
-                return self.piece_of(&table, symbol.address(), self.lsdas(eh_frame, index)).map(Some);
+                return self
+                    .piece_of(&table, symbol.address(), self.lsdas(eh_frame, index))
+                    .map(Some);
             }
         }
         Ok(None)
@@ -1284,10 +1305,16 @@ impl<'data, 'file> Emitted<'data, 'file> {
         if table.relocations().next().is_some() {
             return Err(Unhandled::Shape("landing pads that name a type"));
         }
-        let end = lsdas.into_iter().filter(|it| *it > lsda).min().unwrap_or(table.address() + table.size());
+        let end = lsdas
+            .into_iter()
+            .filter(|it| *it > lsda)
+            .min()
+            .unwrap_or(table.address() + table.size());
         let pads = lsda
             .checked_sub(table.address())
-            .and_then(|from| table.data().ok()?.get(from as usize..(end - table.address()) as usize))
+            .and_then(|from| {
+                table.data().ok()?.get(from as usize..(end - table.address()) as usize)
+            })
             .ok_or(Unhandled::Shape("landing pads outside their section"))?;
         // alloc: the landing pads, which the `Code` keeps
         Ok(pads.to_vec())
@@ -1616,7 +1643,11 @@ enum Field {
 }
 
 /// Whether `relocation` is against `section` or a symbol in it.
-fn relocation_in(file: &object::File<'_>, relocation: &object::Relocation, section: SectionIndex) -> bool {
+fn relocation_in(
+    file: &object::File<'_>,
+    relocation: &object::Relocation,
+    section: SectionIndex,
+) -> bool {
     match relocation.target() {
         RelocationTarget::Section(it) => it == section,
         RelocationTarget::Symbol(symbol) => file

@@ -72,6 +72,16 @@ These numbers are blaze v1's; v2 has not been measured yet.
 
 Every project, platform, chart, and the memory and disk it takes: [benchmarks](docs/benchmarks.md).
 
+### Over time
+
+<!-- benchtrend:start -->
+How blaze's own numbers move from run to run, each platform on its own benchmark machine: the instructions each merge to main retires, how long an edit takes and how soon a live edit runs, from [the history](docs/benchmarks/history) ([how it is kept](docs/benchmarks.md#history-and-regressions)). Every workflow that adds to the history draws these again and commits them with it.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/charts/trend-macos-arm64-live-dark.svg"><img alt="From saving an edit to the program running it, macOS arm64: 11 runs from Oct 21 to Oct 30, the first to the latest: bevy 83 ms to 3.79 s; egui 15 ms to 219 ms; life 22 ms to 34 ms (Oct 26); probe 7.7 ms to 14 ms" src="docs/benchmarks/charts/trend-macos-arm64-live-light.svg" width="760"></picture>
+
+Not drawn until there are two runs on one machine: macOS arm64 instructions per merge (none yet), macOS arm64 edit times (one run), Linux aarch64 instructions per merge (none yet), Linux aarch64 edit times (one run), Linux x86-64 instructions per merge (none yet), Linux x86-64 edit times (one run), Windows x86-64 live-edit latency (one run).
+<!-- benchtrend:end -->
+
 ## How it works
 
 blaze's daemon keeps your project compiled in memory, with no cargo or rustc under it. After an

@@ -15,6 +15,7 @@ mod config;
 mod files;
 mod invocation;
 mod manifest;
+pub(crate) mod native;
 mod plan;
 mod resolve;
 mod sandbox;
@@ -36,14 +37,15 @@ use self::invocation::{Asked, Asking};
 use self::manifest::{WorkspaceKey, WorkspaceQuery, in_workspace};
 use self::units::Built;
 use crate::query::{
-    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds, producer,
+    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds,
+    producer,
 };
 use crate::{Filter, Intent};
 
 pub use self::files::Snap;
 pub use self::files::normal_text;
-pub use crate::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
+pub use crate::Read;
 
 thread_local! {
     // alloc: grown once to the largest key the thread hashes, then reused by every key.
@@ -58,7 +60,9 @@ pub fn key_id<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
         let mut held = held.borrow_mut();
         let (writer, bytes) = &mut *held;
         bytes.clear();
-        writer.append(bytes, key).unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
+        writer
+            .append(bytes, key)
+            .unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
         ContentId::of(domain, bytes)
     })
 }
@@ -85,9 +89,24 @@ pub fn load_error(error: &anyhow::Error, at: Option<String>) -> LoadError {
     LoadError { what, at }
 }
 
-/// A path the load would read that is under no mount: not fetchable, so an error naming it.
-pub(crate) fn unmounted_error(path: &str) -> LoadError {
-    LoadError { what: format!("`{path}` is under no mount of the view"), at: Some(path.to_owned()) }
+/// What a step that reads files through the mounts came to when it did not come to its value:
+/// cargo's error, or the paths it read that no mount covers, each a [`crate::query::FetchKind::Local`]
+/// the daemon reads from the disk and mounts before the load is asked again. A path under no
+/// mount makes the step's answer this whatever else it answered, since that answer was made
+/// without the path's files.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Unread {
+    Failed(LoadError),
+    Needs(Vec<Fetch>),
+}
+
+impl Unread {
+    pub(crate) fn staged<T>(self) -> Staged<T> {
+        match self {
+            Unread::Failed(error) => Staged::Failed(error),
+            Unread::Needs(fetches) => Staged::Needs(fetches),
+        }
+    }
 }
 
 /// The packages a command selects (cargo's `Packages`).
@@ -106,8 +125,14 @@ pub(crate) struct Spec {
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,
-    /// `--locked` or `--frozen`: the lock file is never written.
-    pub locked: Option<&'static str>,
+    /// `--locked`, `--frozen`, `--no-locked` and whether the build runs on CI: with the
+    /// workspace's `lock = "required"`, whether a lock file may change ([`crate::lock::policy`]).
+    pub lock: crate::lock::LockAsk,
+    /// The release of the blaze that serves the build ([`crate::lock::Inputs::running`]); none
+    /// for a build of the tree, and for a foreign workspace, which has no `blaze.lock`.
+    pub blaze: Option<String>,
+    /// `BLAZE_IGNORE_PIN_FOR`, the root manifest `--ignore-pin` was given for.
+    pub ignore_pin_for: Option<String>,
     /// `--offline` or `--frozen` (`net.offline` is read with the config).
     pub offline: Option<&'static str>,
     pub require_optional_deps: bool,
@@ -163,7 +188,9 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     let select = match (asked.workspace, asked.exclude.is_empty(), asked.packages.is_empty()) {
         (false, true, true) => Select::Default,
         (false, true, false) => Select::Packages(asked.packages.clone()),
-        (false, false, _) => return Err(error("--exclude can only be used together with --workspace")),
+        (false, false, _) => {
+            return Err(error("--exclude can only be used together with --workspace"));
+        }
         (true, true, _) => Select::All,
         (true, false, _) => Select::OptOut(asked.exclude.clone()),
     };
@@ -199,7 +226,8 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     let mut build_std_features = None;
     for flag in &asked.unstable {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
-        let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        let list =
+            || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
         match name {
             "unstable-options" | "bindeps" | "codegen-backend" => {}
             "build-std" => build_std = Some(list()),
@@ -219,7 +247,9 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         features: asked.features.clone(),
         all_features: asked.all_features,
         no_default_features: asked.no_default_features,
-        locked: asked.locked_flag(),
+        lock: asked.lock_ask(),
+        blaze: crate::lock::is_version(&asked.blaze).then(|| asked.blaze.clone()),
+        ignore_pin_for: asked.ignore_pin_for.clone(),
         offline: asked.offline_flag(false),
         require_optional_deps: true,
         intent,
@@ -266,7 +296,10 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         features: ask.features.clone(),
         all_features: false,
         no_default_features: true,
-        locked: ask.locked.then_some("--locked"),
+        // The standard library's own lock file, never written: no `CI`, no `blaze.lock`.
+        lock: crate::lock::LockAsk { flag: ask.locked.then_some("--locked"), no_locked: false, ci: false, env_writes: false },
+        blaze: None,
+        ignore_pin_for: None,
         offline: Some("--offline"),
         require_optional_deps: false,
         intent: Intent::Build,
@@ -310,21 +343,21 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
 fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
     let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
-        Err(error) => return Ok(Staged::Failed(error)),
+        Err(unread) => return Ok(unread.staged()),
     };
     let outcome = in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
         resolve::resolved(ctx, ws, spec, |resolved| units::units(ctx, ws, spec, &read, resolved))
     })?;
     Ok(match outcome {
         Ok(staged) => staged,
-        Err(error) => Staged::Failed(error),
+        Err(unread) => unread.staged(),
     })
 }
 
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 7");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 8");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -354,6 +387,7 @@ impl Query for Plan {
                 finished: built.finished,
                 link_dirs: built.link_dirs,
                 sandboxed_tests: built.sandboxed_tests,
+                native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),
             Staged::Failed(error) => Planned::Failed(error),
@@ -430,7 +464,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 7");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 8");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 
@@ -447,7 +481,8 @@ impl Query for Foreign {
                 roots: built.roots,
             }),
             Staged::Needs(fetches) => {
-                let what: Vec<String> = fetches.iter().map(|it| format!("`{}` at `{}`", it.what, it.at)).collect();
+                let what: Vec<String> =
+                    fetches.iter().map(|it| format!("`{}` at `{}`", it.what, it.at)).collect();
                 StdPlanned::Failed(LoadError {
                     what: format!(
                         "the workspace at `{}` reads what nothing fetches for it: {}",

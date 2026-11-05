@@ -1,20 +1,23 @@
 //! A package's `.crate` file: found in blaze's store or cargo's cache, or downloaded by the
-//! registry's `dl` template; checked against its sha256; kept in the store by that hash and in
-//! cargo's cache; and unpacked where cargo unpacks it, with cargo 1.99's checks
+//! registry's `dl` template, all through blaze-fetch with its sha256 as the pin; kept in the
+//! store and in cargo's cache; and unpacked where cargo unpacks it, with cargo 1.99's checks
 //! (`src/sources/registry/{download,mod}.rs`).
 
 use std::{
     fs::OpenOptions,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context as _, bail};
+use blaze_fetch::{FetchError, Fetcher, Form, Objects, Origin, Producer, Source, StoreOf};
 use semver::Version;
-use tar::{Archive, EntryType};
 
-use crate::{http::HttpNotSuccessful, registry::Registry};
+use crate::registry::Registry;
 
 pub use blaze_units::index::crate_url;
 
@@ -56,17 +59,6 @@ pub enum From {
 /// The 32 bytes of a checksum written in hex.
 pub fn parse_checksum(hex: &str) -> Option<[u8; 32]> {
     blaze_format::hex::decode(hex)
-}
-
-/// The schema of a `.crate` file as the store keeps it: the file's bytes, as downloaded.
-const CRATE_FILE: blaze_format::SchemaHash = blaze_format::schema("a registry's .crate file 1");
-
-/// What the store keeps the `.crate` file whose sha256 is `sha256` under: the file is named by
-/// that hash alone, so every registry and every fetch shares it; nothing made it but the
-/// download, which is checked against the hash before it is kept.
-pub fn crate_key(sha256: &[u8; 32]) -> blaze_cas::Key {
-    let producer = blaze_ids::ContentId::of("blaze v2 registry download of a .crate file 1", &[]);
-    blaze_cas::Key::of(CRATE_FILE, producer, &[blaze_ids::ContentId(*sha256)])
 }
 
 impl Registry {
@@ -115,52 +107,56 @@ impl Registry {
         Ok((dst, from))
     }
 
-    /// The bytes of a package's `.crate` file, checked against its checksum, and kept in the
-    /// store and in cargo's cache.
+    /// The bytes of a package's `.crate` file, got through blaze-fetch with its checksum as the
+    /// sha256 pin, and kept in the store and in cargo's cache.
     pub fn crate_bytes(&self, package: &Package) -> anyhow::Result<(Vec<u8>, From)> {
-        let key = parse_checksum(&package.checksum)
+        let pin = crate::pinned::crate_pin(&package.checksum)
             .with_context(|| format!("`{}` is not a sha256 checksum", package.checksum))?;
-        let store = self.context().store;
-        let matches = |bytes: &[u8]| blaze_sha256::digest(bytes) == key;
-        let keep = |bytes: &[u8]| -> anyhow::Result<()> {
-            let Some(store) = store else { return Ok(()) };
-            let put = store.put(crate_key(&key), blaze_cas::Kind::Output, bytes);
-            put.map(drop).map_err(|it| {
-                anyhow::anyhow!("the store keeps other bytes than `{package}`'s under its sha256 ({:x})", it.kept)
-            })
-        };
+        let context = self.context();
+        let objects = context.store.map(Objects::new);
         let cache_file = self.crate_file(&package.name, &package.version);
-        let kept = match store {
-            Some(store) => store
-                // alloc: the `.crate` the caller is given, once a package
-                .read(&crate_key(&key), |it| it.bytes.to_vec())
-                // alloc: error path
-                .map_err(|e| anyhow::anyhow!("the store's `.crate` of `{package}`: {e}"))?,
-            None => None,
+        // cargo's words for a `.crate` that is not its checksum's, over blaze-fetch's (which
+        // name both digests) as its cause.
+        let checked = |e: FetchError| match e {
+            FetchError::Mismatch { .. } => anyhow::Error::new(e)
+                .context(format!("failed to verify the checksum of `{package}`")),
+            e => anyhow::Error::new(e),
         };
-        if let Some(bytes) = kept {
-            if !matches(&bytes) {
-                bail!("the store's `.crate` of `{package}` is not of its sha256 `{}`", package.checksum);
-            }
-            if !self.is_local() && self.context().keep_crate_files {
+        if let Some(objects) = objects
+            && let Some(object) = objects.lookup(Origin::Pinned { pin: &pin, form: Form::Blob })?
+        {
+            // alloc: the `.crate` the caller is given, once a package
+            let bytes = objects.read(&object)?;
+            if !self.is_local() && context.keep_crate_files {
                 keep_crate_file(&cache_file, &bytes)?;
             }
             return Ok((bytes, From::Store));
         }
+        // alloc: once a package read from cargo's cache
+        let cached = Producer::Given(cache_file.display().to_string());
         match std::fs::read(&cache_file) {
-            Ok(bytes) if !bytes.is_empty() && matches(&bytes) => {
-                keep(&bytes)?;
-                return Ok((bytes, From::CargoCache));
-            }
-            Ok(bytes) if !bytes.is_empty() && self.is_local() => {
-                bail!("failed to verify the checksum of `{package}`")
+            Ok(bytes) if !bytes.is_empty() => {
+                // Checked against the pin and, with a store, kept in it.
+                let kept = match objects {
+                    Some(objects) => objects.keep_pinned(&pin, cached, &bytes).map(drop),
+                    None => blaze_fetch::verify(cached, &pin, &bytes).map(drop),
+                };
+                match kept {
+                    Ok(()) => return Ok((bytes, From::CargoCache)),
+                    Err(e @ FetchError::Mismatch { .. }) if self.is_local() => {
+                        return Err(checked(e));
+                    }
+                    // Not what the index says: downloaded again in its place.
+                    Err(FetchError::Mismatch { .. }) => _ = std::fs::remove_file(&cache_file),
+                    Err(e) => return Err(e.into()),
+                }
             }
             _ if self.is_local() => bail!("failed to read `{}`", cache_file.display()),
-            // Not what the index says, or cut short: downloaded again in its place.
+            // Cut short: downloaded again in its place.
             Ok(_) => _ = std::fs::remove_file(&cache_file),
             Err(_) => {}
         }
-        if self.context().net.offline {
+        if context.net.offline {
             bail!(
                 "attempting to make an HTTP request, but --offline was specified \
                  (`{package}` is not on disk)"
@@ -175,22 +171,71 @@ impl Registry {
         };
         let headers: Vec<(&str, &str)> =
             token.as_deref().map(|it| ("authorization", it)).into_iter().collect();
-        let http = &self.context().http;
-        let bytes = self.context().net.retry.run(|| {
-            let answer = http.get(&url, &headers)?;
-            if answer.status != 200 {
-                return Err(HttpNotSuccessful::new(&url, &answer).into());
+        // The download's temporary file goes in cargo's cache directory when that cache is
+        // kept; with none kept, cargo's directory is never made, and the file goes to a
+        // directory of this download's own in the system's temporary directory, made new and
+        // private (see `PrivateDir`), removed when the download ends.
+        let private;
+        let scratch = match context.keep_crate_files {
+            true => cache_file.parent().context("a `.crate` file has a directory")?.to_owned(), // alloc: once a download
+            false => {
+                private = PrivateDir::new()?;
+                private.0.clone() // clone: once a download
             }
-            Ok(answer.body)
-        })?;
-        if !matches(&bytes) {
-            bail!("failed to verify the checksum of `{package}`");
-        }
-        keep(&bytes)?;
-        if self.context().keep_crate_files {
+        };
+        let store = match context.store {
+            Some(store) => StoreOf::Given(store),
+            None => StoreOf::Unkept,
+        };
+        let net = Arc::new(crate::pinned::Net::new(Arc::clone(&context.http)));
+        let fetcher = Fetcher::new(store, net, scratch)
+            .with_policy(crate::pinned::policy(&context.net.retry));
+        let bytes = match objects {
+            Some(objects) => {
+                let source = Source::Url { url, digest: pin };
+                let object = fetcher.get_with(&source, &headers).map_err(checked)?;
+                // alloc: the `.crate` the caller is given, once a package
+                objects.read(&object)?
+            }
+            None => fetcher.download_verified(&url, &pin, &headers).map_err(checked)?.bytes,
+        };
+        if context.keep_crate_files {
             keep_crate_file(&cache_file, &bytes)?;
         }
         Ok((bytes, From::Network))
+    }
+}
+
+/// A download's scratch directory in the shared temporary directory: made with `create` (never
+/// one that is already there, which may be another user's) and, on unix, mode 0700, so no one
+/// else can place or swap a file in it; removed, with whatever is left in it, when it drops.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn new() -> anyhow::Result<PrivateDir> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // The name only has to be new: a name already taken is refused, not shared, and the
+        // nanoseconds make one hard to take ahead of time.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |it| it.subsec_nanos());
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // alloc: once a download
+        let dir =
+            std::env::temp_dir().join(format!("blaze-fetch-{}-{n}-{nanos}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).with_context(|| {
+            format!("failed to make {}, a download's private scratch directory (a name already taken is never shared)", dir.display())
+        })?;
+        Ok(PrivateDir(dir))
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -223,7 +268,21 @@ fn is_unpacked(dst: &Path) -> anyhow::Result<bool> {
                 .with_context(|| format!("failed to remove `{}`", dst.display()))?;
             Ok(false)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        // No `.cargo-ok`: either nothing is there, or an unpacking that stopped (a Ctrl-C, a
+        // crash, a refused archive, a cargo killed mid-unpack in a shared registry) left files,
+        // which are removed so the unpacking, whose files are each created new, starts clean.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(dst) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(dst),
+                Ok(_) => std::fs::remove_file(dst),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+            .with_context(|| {
+                format!("failed to remove `{}`, an unpacking that did not finish", dst.display())
+            })?;
+            Ok(false)
+        }
         Err(e) => bail!("unable to read .cargo-ok file at {ok:?}: {e}"),
     }
 }
@@ -269,49 +328,58 @@ fn set_generated_mtimes(dst: &Path) {
 }
 
 /// Unpacks a tarball whose every entry is under `<name>-<version>/`, files and directories
-/// only, into the directory above `dst`, with no more than cargo lets one unpack to, but for
-/// the entries `include` leaves out.
+/// only, into `dst`, `<name>-<version>` itself, with no more than cargo lets one unpack to, but
+/// for the entries `include` leaves out: through blaze-fetch's one checked unpacker
+/// ([`blaze_fetch::unpack`]) with cargo's rules (tar's modes under the umask, each file's
+/// time the entry's, a file listed again replacing the first, `.cargo-ok` dropped). Unlike
+/// tar, an entry with a `..` or an absolute path is refused, not skipped.
 fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<u64> {
     let limit = MAX_UNPACK_SIZE.max(tarball.len() as u64 * MAX_COMPRESSION_RATIO);
     let gz = flate2::read::GzDecoder::new(tarball);
-    let mut tar = Archive::new(LimitErrorReader { inner: gz, left: limit });
+    let prefix = dst
+        .file_name()
+        .and_then(|it| it.to_str())
+        .context("a package directory has a UTF-8 name")?;
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create `{}`", dst.display()))?;
     #[cfg(unix)]
-    tar.set_mask(umask());
-    let prefix = dst.file_name().context("a package directory has a name")?;
-    let parent = dst.parent().context("a package directory has a parent")?;
-    let mut written = 0;
-    for entry in tar.entries()? {
-        let mut entry = entry.context("failed to iterate over archive")?;
-        let entry_path = entry.path().context("failed to read entry path")?.into_owned();
-        match entry_path.strip_prefix(prefix) {
-            Ok(inside) if !include(inside) => continue,
-            Ok(_) => {}
-            Err(_) => bail!(
-                "invalid tarball downloaded, contains a file at {entry_path:?} which isn't under {prefix:?}"
-            ),
-        }
-        match entry.header().entry_type() {
-            EntryType::Regular | EntryType::Directory => {}
-            kind => bail!(
-                "invalid tarball downloaded, contains an entry at {entry_path:?} with invalid type {kind:?}"
-            ),
-        }
-        if entry_path.file_name().is_some_and(|it| it == PACKAGE_SOURCE_LOCK) {
-            continue;
-        }
-        written += entry.size();
-        let mut result = entry.unpack_in(parent).map_err(anyhow::Error::from);
-        if cfg!(windows) && is_windows_reserved_path(&entry_path) {
-            result = result.with_context(|| {
-                format!(
+    let mask = umask();
+    #[cfg(not(unix))]
+    let mask = 0;
+    let rules = blaze_fetch::unpack::Rules {
+        names: blaze_fetch::unpack::NameRules {
+            top: Some(prefix),
+            fold: false,
+            twice: blaze_fetch::unpack::Twice::Replace,
+            reserved: &[],
+            most_path: usize::MAX,
+        },
+        links: false,
+        modes: blaze_fetch::unpack::Modes::Cargo { mask },
+        skip: &[PACKAGE_SOURCE_LOCK],
+        include: &include,
+        sync: false,
+        most_entries: u64::MAX,
+        most_bytes: u64::MAX,
+    };
+    match blaze_fetch::unpack::unpack(LimitErrorReader { inner: gz, left: limit }, dst, &rules) {
+        Ok(unpacked) => Ok(unpacked.bytes),
+        Err(refused) => {
+            let reserved = cfg!(windows)
+                && refused
+                    .path
+                    .as_deref()
+                    .is_some_and(|it| is_windows_reserved_path(Path::new(it)));
+            let error = anyhow::anyhow!("invalid tarball downloaded for {prefix}: {refused}");
+            match reserved {
+                true => Err(error.context(format!(
                     "`{}` appears to contain a reserved Windows path, it cannot be extracted on Windows",
-                    entry_path.display()
-                )
-            });
+                    refused.path.unwrap_or_default()
+                ))),
+                false => Err(error),
+            }
         }
-        result.with_context(|| format!("failed to unpack entry at `{}`", entry_path.display()))?;
     }
-    Ok(written)
 }
 
 /// A reader that fails once more than `left` bytes are read from it, as cargo's
@@ -390,7 +458,8 @@ mod tests {
 
     #[test]
     fn a_reserved_path_is_one_on_either_copy() {
-        let parts = ["a", "con", "CON.txt", "nul.tar.gz", "com1", "com10", "lpt9.rs", ".", "", "x.con"];
+        let parts =
+            ["a", "con", "CON.txt", "nul.tar.gz", "com1", "com10", "lpt9.rs", ".", "", "x.con"];
         let mut paths = vec![String::new()];
         for first in parts {
             for second in parts {

@@ -329,7 +329,7 @@ fn diverging_expression_2() {
         &expect![[r#"
             11..84 '{     ..." }; }': !
             54..55 'x': u32
-            63..81 '{ loop...foo" }': u32
+            63..81 '{ loop...foo" }': {unknown}
             65..72 'loop {}': !
             70..72 '{}': ()
             74..79 '"foo"': &'static str
@@ -369,13 +369,13 @@ fn diverging_expression_3_break() {
             11..85 '{     ...} }; }': ()
             54..55 'x': u32
             63..82 '{ loop...k; } }': u32
-            65..80 'loop { break; }': u32
+            65..80 'loop { break; }': {unknown}
             70..80 '{ break; }': !
             72..77 'break': !
             72..77: expected u32, got ()
             97..343 '{     ...; }; }': ()
             140..141 'x': u32
-            149..175 '{ for ...; }; }': u32
+            149..175 '{ for ...; }; }': {unknown}
             151..172 'for a ...eak; }': !
             151..172 'for a ...eak; }': ()
             151..172 'for a ...eak; }': ()
@@ -392,7 +392,7 @@ fn diverging_expression_3_break() {
             162..172 '{ break; }': !
             164..169 'break': !
             226..227 'x': u32
-            235..253 '{ for ... {}; }': u32
+            235..253 '{ for ... {}; }': {unknown}
             237..250 'for a in b {}': !
             237..250 'for a in b {}': ()
             237..250 'for a in b {}': ()
@@ -408,7 +408,7 @@ fn diverging_expression_3_break() {
             246..247 'b': Option<<{unknown} as Iterator>::Item>
             248..250 '{}': ()
             304..305 'x': u32
-            313..340 '{ for ...; }; }': u32
+            313..340 '{ for ...; }; }': {unknown}
             315..337 'for a ...urn; }': !
             315..337 'for a ...urn; }': ()
             315..337 'for a ...urn; }': ()
@@ -429,7 +429,7 @@ fn diverging_expression_3_break() {
             313..340: expected u32, got ()
             355..654 '{     ...; }; }': ()
             398..399 'x': u32
-            407..433 '{ whil...; }; }': u32
+            407..433 '{ whil...; }; }': {unknown}
             409..430 'while ...eak; }': !
             409..430 'while ...eak; }': ()
             409..430 'while ...eak; }': ()
@@ -437,14 +437,14 @@ fn diverging_expression_3_break() {
             420..430 '{ break; }': !
             422..427 'break': !
             537..538 'x': u32
-            546..564 '{ whil... {}; }': u32
+            546..564 '{ whil... {}; }': {unknown}
             548..561 'while true {}': !
             548..561 'while true {}': ()
             548..561 'while true {}': ()
             554..558 'true': bool
             559..561 '{}': ()
             615..616 'x': u32
-            624..651 '{ whil...; }; }': u32
+            624..651 '{ whil...; }; }': {unknown}
             626..648 'while ...urn; }': !
             626..648 'while ...urn; }': ()
             626..648 'while ...urn; }': ()
@@ -569,7 +569,7 @@ fn not_a_read() -> ! {
 "#,
         &expect![[r#"
             21..100 '{     ...   } }': !
-            27..98 'unsafe...     }': !
+            27..98 'unsafe...     }': {unknown}
             48..49 'x': *const !
             62..63 '0': i32
             62..68 '0 as _': *const !
@@ -595,7 +595,7 @@ fn not_a_read_implicit() -> ! {
 "#,
         &expect![[r#"
             30..106 '{     ...   } }': !
-            36..104 'unsafe...     }': !
+            36..104 'unsafe...     }': {unknown}
             57..58 'x': *const !
             71..72 '0': i32
             71..77 '0 as _': *const !
@@ -621,7 +621,7 @@ fn not_a_read_guide_coercion() -> ! {
 "#,
         &expect![[r#"
             36..116 '{     ...   } }': !
-            42..114 'unsafe...     }': !
+            42..114 'unsafe...     }': {unknown}
             63..64 'x': *const !
             77..78 '0': i32
             77..83 '0 as _': *const !
@@ -648,7 +648,7 @@ fn empty_match() -> ! {
 "#,
         &expect![[r#"
             22..108 '{     ...   } }': !
-            28..106 'unsafe...     }': !
+            28..106 'unsafe...     }': {unknown}
             49..50 'x': *const !
             63..64 '0': i32
             63..69 '0 as _': *const !
@@ -676,7 +676,7 @@ fn field_projection() -> ! {
 "#,
         &expect![[r#"
             27..113 '{     ...   } }': !
-            33..111 'unsafe...     }': !
+            33..111 'unsafe...     }': {unknown}
             54..55 'x': *const (!, ())
             74..75 '0': i32
             74..80 '0 as _': *const (!, ())
@@ -703,7 +703,7 @@ fn covered_arm() -> ! {
 "#,
         &expect![[r#"
             22..107 '{     ...   } }': !
-            28..105 'unsafe...     }': !
+            28..105 'unsafe...     }': {unknown}
             49..50 'x': *const !
             63..64 '0': i32
             63..69 '0 as _': *const !
@@ -733,7 +733,7 @@ fn uncovered_arm() -> ! {
 "#,
         &expect![[r#"
             24..109 '{     ...   } }': !
-            30..107 'unsafe...     }': !
+            30..107 'unsafe...     }': {unknown}
             51..52 'x': *const !
             65..66 '0': i32
             65..71 '0 as _': *const !
@@ -862,7 +862,7 @@ fn make_up_a_pointer<T>() -> *const T {
 "#,
         &expect![[r#"
             38..116 '{     ...   } }': *const T
-            44..114 'unsafe...     }': *const T
+            44..114 'unsafe...     }': {unknown}
             65..66 'x': *const !
             79..80 '0': i32
             79..85 '0 as _': *const !

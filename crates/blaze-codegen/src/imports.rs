@@ -17,8 +17,8 @@ use std::collections::VecDeque;
 
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::bits::BitSet;
+use std::alloc::Global;
 
 use crate::{
     InstanceKey,
@@ -103,7 +103,10 @@ impl std::error::Error for ImportError {}
 /// backend reaches. A summary is made external ([`Summary::external`] is a fact of the build,
 /// not of the function), so a build that does not close its summaries gets no whole-program
 /// facts, never wrong ones.
-pub fn close(summaries: &mut HashMap<InstanceKey, Summary, Global>, outside: &HashSet<InstanceKey, Global>) {
+pub fn close(
+    summaries: &mut HashMap<InstanceKey, Summary, Global>,
+    outside: &HashSet<InstanceKey, Global>,
+) {
     for (key, summary) in summaries {
         summary.external = outside.contains(key);
     }
@@ -130,7 +133,9 @@ pub fn decide(
     // alloc: one exact-size column per build
     let decided: Vec<Imports> = par::map(0..graph.len() as usize, |node| {
         // `node < graph.len()`, a `u32`.
-        SCRATCH.with_borrow_mut(|scratch| graph.imports(node as u32, limits, &attrs, &constants, scratch))
+        SCRATCH.with_borrow_mut(|scratch| {
+            graph.imports(node as u32, limits, &attrs, &constants, scratch)
+        })
     });
     // alloc: the build's answer, once per build
     Ok(graph.keys.iter().copied().zip(decided).collect())
@@ -239,7 +244,12 @@ impl<'a> Graph<'a> {
                     let params = params[callee as usize];
                     let args = u32::try_from(call.args.len()).unwrap_or(u32::MAX);
                     if args > params {
-                        return Err(ImportError::Args { caller: *at, callee: call.callee, args, params });
+                        return Err(ImportError::Args {
+                            caller: *at,
+                            callee: call.callee,
+                            args,
+                            params,
+                        });
                     }
                 }
                 graph.to.push(callee);
@@ -290,18 +300,24 @@ impl<'a> Graph<'a> {
         let mut total = 0u32;
         for (node, summary) in self.summaries.iter().enumerate() {
             if self.closed.contains(node as u32) {
-                total = total.checked_add(summary.params).expect("fewer than 2^32 parameters in all");
+                total =
+                    total.checked_add(summary.params).expect("fewer than 2^32 parameters in all");
             }
             start.push(total);
         }
         // alloc: one column sized once per build
-        let mut passed = Passed { start, slots: vec![None; total as usize], reached: BitSet::new(self.keys.len()) };
+        let mut passed = Passed {
+            start,
+            slots: vec![None; total as usize],
+            reached: BitSet::new(self.keys.len()),
+        };
         for (caller, summary) in self.summaries.iter().enumerate() {
             for (call, &callee) in std::iter::zip(&summary.calls, self.calls(caller as u32)) {
                 if callee == NONE || !self.closed.contains(callee) || call.count == 0 {
                     continue;
                 }
-                let range = passed.start[callee as usize] as usize..passed.start[callee as usize + 1] as usize;
+                let range = passed.start[callee as usize] as usize
+                    ..passed.start[callee as usize + 1] as usize;
                 let slots = &mut passed.slots[range];
                 if !passed.reached.contains(callee) {
                     passed.reached.insert(callee);
@@ -347,7 +363,8 @@ impl<'a> Graph<'a> {
         let mut component_of = vec![NONE; len];
         // alloc: one column sized once per build
         let mut known = vec![0u8; len];
-        let read = |bits: u8| if bits & Attrs::READNONE != 0 { bits | Attrs::READONLY } else { bits };
+        let read =
+            |bits: u8| if bits & Attrs::READNONE != 0 { bits | Attrs::READONLY } else { bits };
         for (component, bound) in bounds.windows(2).enumerate() {
             let members = &order[bound[0] as usize..bound[1] as usize];
             for &member in members {
@@ -693,8 +710,12 @@ mod tests {
     #[test]
     fn imports_stop_at_the_depth() {
         let limits = Limits { depth: 2, ..Limits::default() };
-        let summaries =
-            build(vec![function(1, 1, &[2]), function(2, 1, &[3]), function(3, 1, &[4]), function(4, 1, &[])]);
+        let summaries = build(vec![
+            function(1, 1, &[2]),
+            function(2, 1, &[3]),
+            function(3, 1, &[4]),
+            function(4, 1, &[]),
+        ]);
         let imports = decide(&summaries, &limits).unwrap();
         assert_eq!(imports[&key(1)].imported, vec![key(2), key(3)]);
     }
@@ -760,7 +781,8 @@ mod tests {
             call(4, args.clone()),
             call(5, vec![int(8), Arg::Unknown, int(1)]),
         ];
-        let imports = decided(vec![first, second, internal, external, addressed, disagreeing, taker]);
+        let imports =
+            decided(vec![first, second, internal, external, addressed, disagreeing, taker]);
         assert_eq!(imports[&key(2)].constants, vec![(0, int(7))]);
         assert_eq!(imports[&key(3)].constants, vec![]);
         assert_eq!(imports[&key(4)].constants, vec![]);
@@ -776,7 +798,10 @@ mod tests {
         let mut caller = function(1, 1_000, &[]);
         caller.calls = vec![Call { callee: key(2), count: 1, args: vec![int(4)] }];
         let mut summaries = build(vec![caller, callee]);
-        assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![(0, int(4))]);
+        assert_eq!(
+            decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants,
+            vec![(0, int(4))]
+        );
         close(&mut summaries, &HashSet::from_iter_in([key(2)], Global));
         assert!(summaries[&key(2)].external && !summaries[&key(1)].external);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![]);
@@ -785,8 +810,12 @@ mod tests {
     #[test]
     fn attributes_are_met_through_a_cycle() {
         // 1 calls 2; 2 and 3 call each other; 3 calls 4. Every body is everything.
-        let mut summaries =
-            vec![function(1, 1_000, &[2]), function(2, 1_000, &[3]), function(3, 1_000, &[2, 4]), function(4, 1_000, &[])];
+        let mut summaries = vec![
+            function(1, 1_000, &[2]),
+            function(2, 1_000, &[3]),
+            function(3, 1_000, &[2, 4]),
+            function(4, 1_000, &[]),
+        ];
         for it in &mut summaries {
             it.body = all();
         }
@@ -884,10 +913,11 @@ mod tests {
     fn the_same_whatever_the_order_of_insertion() {
         let mut summaries = Vec::new();
         for n in 1..40u8 {
-            let calls: Vec<u8> = [n.wrapping_mul(7) % 40 + 1, n.wrapping_mul(13) % 40 + 1, n % 5 + 1]
-                .into_iter()
-                .filter(|it| *it < 40)
-                .collect();
+            let calls: Vec<u8> =
+                [n.wrapping_mul(7) % 40 + 1, n.wrapping_mul(13) % 40 + 1, n % 5 + 1]
+                    .into_iter()
+                    .filter(|it| *it < 40)
+                    .collect();
             let mut it = function(n, u32::from(n) * 3, &calls);
             it.params = 2;
             it.unused = vec![u32::from(n % 2)];
@@ -962,7 +992,10 @@ mod tests {
 
     #[test]
     fn nothing_to_decide() {
-        assert_eq!(decide(&HashMap::new_in(Global), &Limits::default()), Ok(HashMap::new_in(Global)));
+        assert_eq!(
+            decide(&HashMap::new_in(Global), &Limits::default()),
+            Ok(HashMap::new_in(Global))
+        );
     }
 
     /// A random build of summaries: keys of which some share their first 8 bytes, calls of
@@ -1017,7 +1050,8 @@ mod tests {
                     true => seeded.below(50_000) as u32,
                     false => seeded.below(400) as u32,
                 },
-                hint: [Hint::None, Hint::Inline, Hint::Always, Hint::Never][seeded.below(4) as usize],
+                hint: [Hint::None, Hint::Inline, Hint::Always, Hint::Never]
+                    [seeded.below(4) as usize],
                 calls,
                 addressed,
                 params: params[at],
@@ -1078,7 +1112,9 @@ mod tests {
             let (order, bounds) = components(&start, &edges);
             let flat: Vec<Vec<usize>> = bounds
                 .windows(2)
-                .map(|it| order[it[0] as usize..it[1] as usize].iter().map(|&it| it as usize).collect())
+                .map(|it| {
+                    order[it[0] as usize..it[1] as usize].iter().map(|&it| it as usize).collect()
+                })
                 .collect();
             assert_eq!(flat, model::components(&lists));
         }
@@ -1112,7 +1148,8 @@ mod tests {
                 let imported = imported(summaries, summary, limits);
                 let mut callees = BTreeMap::new();
                 let mut dead = BTreeMap::new();
-                let callers = std::iter::once(summary).chain(imported.iter().map(|it| &summaries[it]));
+                let callers =
+                    std::iter::once(summary).chain(imported.iter().map(|it| &summaries[it]));
                 for caller in callers {
                     for call in &caller.calls {
                         let Some(callee) = summaries.get(&call.callee) else { continue };
@@ -1145,7 +1182,11 @@ mod tests {
                     return Err(ImportError::Key { at: *at, says: summary.key });
                 }
                 if let Some(&param) = summary.unused.iter().find(|it| **it >= summary.params) {
-                    return Err(ImportError::Unused { function: *at, param, params: summary.params });
+                    return Err(ImportError::Unused {
+                        function: *at,
+                        param,
+                        params: summary.params,
+                    });
                 }
                 for call in &summary.calls {
                     let Some(callee) = summaries.get(&call.callee) else { continue };
@@ -1257,8 +1298,11 @@ mod tests {
             let edges: Vec<Vec<usize>> = nodes
                 .iter()
                 .map(|key| {
-                    let mut to: Vec<usize> =
-                        summaries[key].calls.iter().filter_map(|it| at.get(&it.callee).copied()).collect();
+                    let mut to: Vec<usize> = summaries[key]
+                        .calls
+                        .iter()
+                        .filter_map(|it| at.get(&it.callee).copied())
+                        .collect();
                     to.sort_unstable();
                     to.dedup();
                     to
@@ -1313,7 +1357,11 @@ mod tests {
                     });
                 }
             }
-            nodes.into_iter().zip(known).map(|(key, it)| (key, it.expect("every node is in a component"))).collect()
+            nodes
+                .into_iter()
+                .zip(known)
+                .map(|(key, it)| (key, it.expect("every node is in a component")))
+                .collect()
         }
 
         /// The strongly connected components of `edges`, each sorted, callees before callers

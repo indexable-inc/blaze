@@ -54,6 +54,19 @@ pub(crate) struct Asked {
     pub locked: bool,
     pub offline: bool,
     pub frozen: bool,
+    /// `--no-locked`: this build may change the lock files whatever `CI` or the workspace says
+    /// ([`crate::lock::policy`]).
+    pub no_locked: bool,
+    /// The environment says this runs on CI ([`crate::lock::ci_says`]): `--locked` is the
+    /// default. Read here, not kept in [`Asked::env`]: `CI` is no variable cargo's load reads.
+    pub ci: bool,
+    /// `BLAZE_LOCK=write` ([`crate::lock::LockAsk::env_writes`]), read here like `CI`.
+    pub lock_env_writes: bool,
+    /// `BLAZE_IGNORE_PIN_FOR`: the root manifest a blaze above this one was told
+    /// `--ignore-pin` for, where this blaze is not the one the workspace pins.
+    pub ignore_pin_for: Option<String>,
+    /// [`crate::query::BuildConfig::blaze`]: the version of the blaze that serves the build.
+    pub blaze: String,
     /// `--config`, in order.
     pub config: Vec<String>,
     /// `-Z`, in order.
@@ -95,6 +108,11 @@ impl Asked {
             _ => None,
         }
     }
+
+    /// What the command line and the environment say of the lock files.
+    pub fn lock_ask(&self) -> crate::lock::LockAsk {
+        crate::lock::LockAsk { flag: self.locked_flag(), no_locked: self.no_locked, ci: self.ci, env_writes: self.lock_env_writes }
+    }
 }
 
 /// The view's configuration as the load reads it.
@@ -105,11 +123,11 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 6");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 8");
 }
 
 impl Versioned for Asked {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 4");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 6");
 }
 
 /// Reads `Cx::config`: the [`BuildConfig`] narrowed.
@@ -118,7 +136,7 @@ pub(crate) struct Invocation;
 impl Query for Invocation {
     const KIND: QueryKind = QueryKind(0x6010);
     const NAME: &'static str = "cargo invocation";
-    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 4");
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 6");
     type Key = ();
     type Value = Cbor<Configured>;
 
@@ -138,7 +156,7 @@ pub(crate) struct Asking;
 impl Query for Asking {
     const KIND: QueryKind = QueryKind(0x6011);
     const NAME: &'static str = "cargo asked";
-    const PRODUCER: ContentId = producer("blaze v2 cargo asked 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo asked 4");
     type Key = ();
     type Value = Cbor<Result<Asked, LoadError>>;
 
@@ -152,7 +170,7 @@ impl Query for Asking {
 }
 
 impl Versioned for Result<Asked, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 3");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 5");
 }
 
 fn configure(bytes: &[u8]) -> Configured {
@@ -162,21 +180,34 @@ fn configure(bytes: &[u8]) -> Configured {
         Err(what) => return Configured { asked: Err(LoadError { what, at: None }), mounts: empty },
     };
     let invocation = config.invocation;
+    let whole = |name: &str| crate::query::env_var(&invocation.env, name);
+    let ci = crate::lock::ci_says(whole("CI"), whole("TF_BUILD"));
+    let lock_env_writes = match crate::lock::env_writes(whole(crate::lock::LOCK_ENV)) {
+        Ok(it) => it,
+        Err(what) => return Configured { asked: Err(LoadError { what, at: None }), mounts: empty },
+    };
+    let ignore_pin_for = whole("BLAZE_IGNORE_PIN_FOR").filter(|it| !it.is_empty()).map(str::to_owned);
     let env: Vec<(String, String)> =
         invocation.env.into_iter().filter(|(name, _)| read_by_cargo(name)).collect();
     let mut known: Vec<String> = Vec::new();
-    for dir in ancestors(&format!("{}/x", invocation.root)).into_iter().chain(ancestors(&format!("{}/x", invocation.cwd))) {
+    for dir in ancestors(&format!("{}/x", invocation.root))
+        .into_iter()
+        .chain(ancestors(&format!("{}/x", invocation.cwd)))
+    {
         if !known.contains(&dir) {
             known.push(dir);
         }
     }
-    let lookup = |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    let lookup =
+        |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
     let home = match lookup("CARGO_HOME") {
         Some(home) if home.starts_with('/') => Some(home.to_owned()),
         Some(home) => Some(format!("{}/{home}", invocation.cwd)),
         None => lookup("HOME").filter(|it| !it.is_empty()).map(|home| format!("{home}/.cargo")),
     };
-    if let Some(home) = home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it))) {
+    if let Some(home) =
+        home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it)))
+    {
         if !known.contains(&home) {
             known.push(home);
         }
@@ -196,10 +227,15 @@ fn configure(bytes: &[u8]) -> Configured {
         std: config.std,
         builds: config.builds,
         sources: config.sources,
+        ci,
+        lock_env_writes,
+        ignore_pin_for,
+        blaze: config.blaze,
         ..Asked::default()
     };
     asked.command = Some(invocation.command);
-    let asked = parse(invocation.command, &invocation.args, asked).map_err(|what| LoadError { what, at: None });
+    let asked = parse(invocation.command, &invocation.args, asked)
+        .map_err(|what| LoadError { what, at: None });
     Configured { asked, mounts }
 }
 
@@ -230,7 +266,9 @@ enum Takes {
 /// cargo's arguments of the building commands, by long name; `short` is its letter.
 fn argument(command: Command, name: &str) -> Option<Takes> {
     // `cargo doc` selects with `arg_targets_lib_bins_examples` alone.
-    if command == Command::Doc && matches!(name, "test" | "tests" | "bench" | "benches" | "all-targets") {
+    if command == Command::Doc
+        && matches!(name, "test" | "tests" | "bench" | "benches" | "all-targets")
+    {
         return None;
     }
     let common: Option<Takes> = match name {
@@ -291,6 +329,7 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
         "locked" => Some(Takes::Flag(|a| a.locked = true)),
         "offline" => Some(Takes::Flag(|a| a.offline = true)),
         "frozen" => Some(Takes::Flag(|a| a.frozen = true)),
+        "no-locked" => Some(Takes::Flag(|a| a.no_locked = true)),
         "config" => Some(Takes::Value(|a, v| {
             a.config.push(v);
             Ok(())
@@ -307,10 +346,15 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
         })),
         "ignore-rust-version" => Some(Takes::Flag(|a| a.ignore_rust_version = true)),
         // What changes only what is printed or how the build runs, not what is built: the CLI's.
-        "verbose" | "quiet" | "keep-going" | "fail-fast" | "future-incompat-report" | "unit-graph" => {
-            Some(Takes::Flag(|_| {}))
+        "verbose"
+        | "quiet"
+        | "keep-going"
+        | "fail-fast"
+        | "future-incompat-report"
+        | "unit-graph" => Some(Takes::Flag(|_| {})),
+        "color" | "message-format" | "lockfile-path" | "artifact-dir" => {
+            Some(Takes::Value(|_, _| Ok(())))
         }
-        "color" | "message-format" | "lockfile-path" | "artifact-dir" => Some(Takes::Value(|_, _| Ok(()))),
         _ => None,
     };
     if common.is_some() {
@@ -392,14 +436,18 @@ fn parse(command: Command, args: &[String], mut asked: Asked) -> Result<Asked, S
         match argument(command, &name) {
             Some(Takes::Flag(set)) => {
                 if inline.is_some() {
-                    return Err(format!("unexpected value for '--{name}' found; no more were expected"));
+                    return Err(format!(
+                        "unexpected value for '--{name}' found; no more were expected"
+                    ));
                 }
                 set(&mut asked);
             }
             Some(Takes::Value(set)) => {
                 let value = match inline {
                     Some(value) => value,
-                    None => args.next().cloned().ok_or_else(|| missing(&format!("--{name} <VALUE>")))?,
+                    None => {
+                        args.next().cloned().ok_or_else(|| missing(&format!("--{name} <VALUE>")))?
+                    }
                 };
                 set(&mut asked, value)?;
             }
@@ -430,7 +478,19 @@ mod tests {
     fn cargos_flags_are_read() {
         let it = asked(
             Command::Build,
-            &["-p", "a", "--package=b", "-Fx,y", "--features", "z w", "-rv", "--target", "wasm32-wasip1", "-j4", "-Zbuild-std"],
+            &[
+                "-p",
+                "a",
+                "--package=b",
+                "-Fx,y",
+                "--features",
+                "z w",
+                "-rv",
+                "--target",
+                "wasm32-wasip1",
+                "-j4",
+                "-Zbuild-std",
+            ],
         )
         .unwrap();
         assert_eq!(it.packages, ["a", "b"]);
@@ -445,18 +505,33 @@ mod tests {
     fn a_test_takes_one_filter_and_run_its_programs_arguments() {
         let it = asked(Command::Test, &["foo", "--lib", "--doc"]).unwrap();
         assert!(it.lib && it.doc);
-        assert_eq!(asked(Command::Test, &["foo", "bar"]).unwrap_err(), "unexpected argument 'bar' found");
+        assert_eq!(
+            asked(Command::Test, &["foo", "bar"]).unwrap_err(),
+            "unexpected argument 'bar' found"
+        );
         let run = asked(Command::Run, &["--bin", "x", "arg", "--release"]).unwrap();
         assert_eq!(run.bins, ["x"]);
         assert!(!run.release, "what follows the program's first argument is its own");
-        assert_eq!(asked(Command::Build, &["--nope"]).unwrap_err(), "unexpected argument '--nope' found");
-        assert_eq!(asked(Command::Build, &["--doc"]).unwrap_err(), "unexpected argument '--doc' found");
-        assert!(asked(Command::Build, &["--target"]).unwrap_err().starts_with("a value is required"));
+        assert_eq!(
+            asked(Command::Build, &["--nope"]).unwrap_err(),
+            "unexpected argument '--nope' found"
+        );
+        assert_eq!(
+            asked(Command::Build, &["--doc"]).unwrap_err(),
+            "unexpected argument '--doc' found"
+        );
+        assert!(
+            asked(Command::Build, &["--target"]).unwrap_err().starts_with("a value is required")
+        );
     }
 
     #[test]
     fn doc_takes_its_own_flags_and_cargo_docs_targets_alone() {
-        let it = asked(Command::Doc, &["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib", "--bin", "x"]).unwrap();
+        let it = asked(
+            Command::Doc,
+            &["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib", "--bin", "x"],
+        )
+        .unwrap();
         assert_eq!(it.packages, ["a"]);
         assert!(it.lib);
         assert_eq!(it.bins, ["x"]);
@@ -464,10 +539,19 @@ mod tests {
         assert!(!asked(Command::Doc, &["--no-deps"]).unwrap().open);
         assert!(asked(Command::Doc, &["--examples", "--example", "e", "--release"]).is_ok());
         for refused in ["--tests", "--benches", "--all-targets", "--doc"] {
-            assert_eq!(asked(Command::Doc, &[refused]).unwrap_err(), format!("unexpected argument '{refused}' found"));
+            assert_eq!(
+                asked(Command::Doc, &[refused]).unwrap_err(),
+                format!("unexpected argument '{refused}' found")
+            );
         }
-        assert_eq!(asked(Command::Doc, &["--test", "t"]).unwrap_err(), "unexpected argument '--test' found");
-        assert_eq!(asked(Command::Check, &["--no-deps"]).unwrap_err(), "unexpected argument '--no-deps' found");
+        assert_eq!(
+            asked(Command::Doc, &["--test", "t"]).unwrap_err(),
+            "unexpected argument '--test' found"
+        );
+        assert_eq!(
+            asked(Command::Check, &["--no-deps"]).unwrap_err(),
+            "unexpected argument '--no-deps' found"
+        );
         assert_eq!(Command::named("d"), Some(Command::Doc));
         assert_eq!(Command::Doc.profile(), "dev");
     }
@@ -477,8 +561,14 @@ mod tests {
     fn clippy_is_no_command_and_check_takes_no_drivers_flags() {
         assert_eq!(Command::named("clippy"), None);
         assert_eq!(Command::named("fix"), None);
-        assert_eq!(asked(Command::Check, &["--", "-D"]).unwrap_err(), "unexpected argument '--' found");
-        assert_eq!(asked(Command::Check, &["--no-deps"]).unwrap_err(), "unexpected argument '--no-deps' found");
+        assert_eq!(
+            asked(Command::Check, &["--", "-D"]).unwrap_err(),
+            "unexpected argument '--' found"
+        );
+        assert_eq!(
+            asked(Command::Check, &["--no-deps"]).unwrap_err(),
+            "unexpected argument '--no-deps' found"
+        );
         assert_eq!(asked(Command::Check, &["-p", "a", "--all-targets"]).unwrap().packages, ["a"]);
     }
 
@@ -505,6 +595,7 @@ mod tests {
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
             sources: "/s/sources".to_owned(),
+            blaze: String::new(),
         };
         let configured = configure(&config.encode());
         let asked = configured.asked.unwrap();

@@ -58,11 +58,15 @@ impl Env {
 
 /// What `fill_env` sets of a package for every command of it: `CARGO_MANIFEST_DIR`,
 /// `CARGO_MANIFEST_PATH`, `CARGO_PKG_*` (the metadata's of `ManifestMetadata::env_vars` too).
-pub(super) fn package_env(id: PackageId, manifest: &Manifest, manifest_path: &Path) -> Result<Vec<(String, String)>, LoadError> {
+pub(super) fn package_env(
+    id: PackageId,
+    manifest: &Manifest,
+    manifest_path: &Path,
+) -> Result<Vec<(String, String)>, LoadError> {
     let error = |what: String| LoadError { what, at: Some(manifest_path.display().to_string()) };
-    let root = manifest_path
-        .parent()
-        .ok_or_else(|| error(format!("the manifest `{}` is in no directory", manifest_path.display())))?;
+    let root = manifest_path.parent().ok_or_else(|| {
+        error(format!("the manifest `{}` is in no directory", manifest_path.display()))
+    })?;
     let version = id.version();
     let meta = &manifest.metadata;
     let text = |it: &Option<String>| it.clone().unwrap_or_default();
@@ -81,7 +85,10 @@ pub(super) fn package_env(id: PackageId, manifest: &Manifest, manifest_path: &Pa
         ("CARGO_PKG_LICENSE", text(&meta.license)),
         ("CARGO_PKG_LICENSE_FILE", text(&meta.license_file)),
         ("CARGO_PKG_AUTHORS", meta.authors.join(":")),
-        ("CARGO_PKG_RUST_VERSION", meta.rust_version.as_ref().map(ToString::to_string).unwrap_or_default()),
+        (
+            "CARGO_PKG_RUST_VERSION",
+            meta.rust_version.as_ref().map(ToString::to_string).unwrap_or_default(),
+        ),
         ("CARGO_PKG_README", text(&meta.readme)),
     ];
     Ok(pairs.into_iter().map(|(name, value)| (name.to_owned(), value)).collect())
@@ -106,7 +113,10 @@ pub(super) struct CompileEnv<'a> {
     pub bin_exes: Vec<(String, String)>,
 }
 
-pub(super) fn compile_env(it: CompileEnv<'_>, config_env: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn compile_env(
+    it: CompileEnv<'_>,
+    config_env: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut env = Env::default();
     if let Some(name) = it.bin_name {
         env.set("CARGO_BIN_NAME", name);

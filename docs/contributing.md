@@ -174,17 +174,19 @@ installs the nightly with rustup. Each step names itself when it fails.
 What it leaves to a person, and prints at the end:
 
 1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, since
-   the target specs depend on the host rustc was built for; commit
-   `crates/blaze-units/src/stdlib/rustc.json`.
-2. `cargo build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
+   the target specs depend on the host rustc was built for; then
+   `uv run --frozen python tools/cpus.py '{"write": true}'` for the CPU table
+   (`crates/target-features/src/cpus/table.rs`); commit both.
+2. `blaze build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
    ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
    symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM (in `nix develop`,
-   with a blaze built there, which has LLVM as every native blaze does: the profile picks the
-   backend, and the harnesses that cover LLVM build the release profile). It builds blaze and runs, in parallel,
+3. `uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'` in an
+   ix VM, with a blaze that builds the tree as stage 0, which has LLVM as every native blaze
+   does: the profile picks the backend, and the harnesses that cover LLVM build the release
+   profile. It builds blaze with that blaze (never cargo) and runs, in parallel,
    `toolchain_pins.py` and the gate's quick parts.
 4. The full tier re-measured at the new commit: the train and the crates' own test suites.
 5. One commit for the bump, landed like any other change.
@@ -213,14 +215,22 @@ dependencies without a reason, small focused changes. Comments say what the code
 why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
 
+When a build is slow, reruns what it should reuse, holds too much memory or a cycle will not
+settle, find out from the profile, not by guessing: the `debugging` skill
+([.agents/skills/debugging/SKILL.md](../.agents/skills/debugging/SKILL.md)) says where its
+files are, what they hold, the DuckDB queries that answer each question and the method.
+
 ## What a change needs
 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
   it, a unit test beside the code for one small enough to state, a step in the relevant edit
   harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
+- For concurrent, durable, crash-recovering, billing or data-deleting code: a Hegel
+  deterministic simulation test whose oracle checks the invariant, with a planted bug it
+  catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
-  you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
-  `blaze check --workspace` with the released blaze on Linux x86-64 and macOS, with astlog's
+  you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
+  `blaze check --workspace` with the released blaze on Linux AArch64 and macOS, with astlog's
   rules after it (`tools/astlog/README.md`), and the lint baselines held by the blaze the
   change builds ([cargo.md](cargo.md#lints)); every
   harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,
@@ -230,7 +240,7 @@ did about it in one line.
   change through is not the harnesses passing on it.
 - blaze builds in the flake's dev shell, against the LLVM it pins:
   `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
-- `cargo fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
+- `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
@@ -243,17 +253,15 @@ did about it in one line.
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
 
-### Property tests
+### Tests
 
-A property test (a rule over generated inputs, with the failing case shrunk) uses Hegel:
-`hegeltest.workspace = true` under `[dev-dependencies]`, imported as `hegel`, and
-`#[hegel::test]` on a `fn(tc: hegel::TestCase)` that draws from `hegel::generators`. The
-engine is linked as a Rust crate ([vendor/hegeltest/SOURCE.md](../vendor/hegeltest/SOURCE.md)).
-Keep the default case count to seconds per crate (`#[hegel::test(test_cases = N)]`, 256 by
-default from `hegel.toml`) and run longer with `HEGEL_TEST_CASES`. Hegel applies that only
-to tests that set no count, so a test with its own count that is worth a long run reads it
-itself (`run_cases` in `crates/blaze-cas/src/tests/model_check.rs`). Fuzzing (`crates/blaze-fuzz`, `fuzz/`) is for parsers of hostile bytes.
-Never proptest, quickcheck, arbitrary or bolero.
+How blaze tests its own code is the `testing` skill
+([.agents/skills/testing/SKILL.md](../.agents/skills/testing/SKILL.md)), the one home for it:
+which tests to write and how few, property tests with Hegel (vendor/hegeltest, imported as
+`hegel`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation tests on
+`blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
+crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
+not by a code review (rule `dst-not-review`).
 
 ## Documents
 
@@ -333,24 +341,21 @@ remove the worktree and the local branch
 
 ## The build that ships
 
-`cargo build --release` is the build to work with: the harnesses, the gate and CI use it, and
-it rebuilds quickly after a change. What users get is one other build: the `dist` profile
-(thin LTO) optimized with the PGO profile `tools/pgo/profiles.json` pins, built by
-`.github/scripts/build_release.py`. The release workflow runs that script, and the flake's
-`dist` runs it inside its derivation with the same profile fetched by its sha256.
-`cargo install --profile dist` builds the same profile without PGO, from the release after 0.1.0.
-[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers.
+`blaze build --release` is the build to work with: the harnesses, the gate and CI use it, and
+it rebuilds quickly after a change. What users get is one other build: the `dist` profile,
+built by the stage-0 blaze `.github/blaze-version` names, through
+`.github/scripts/build_release.py` (one JSON input, `{"target": ..., "out": ...}`). The release
+workflow and install.yaml run that script; blaze builds blaze, never cargo or rustc. `dist`'s
+`lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
+per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2-codegen.md)).
+[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers of the older cargo build.
 
-The PGO profiles are trained by the `pgo` workflow, one per target on the runner its release
-is built on; it uploads them to the `pgo-profiles` release and commits their names and hashes
-to `tools/pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
-changes on main: a profile finds each function by its symbol, which carries a hash of the
-whole graph of crates, so after such a change the old one finds almost nothing (the build
-warns, and a release refuses). A profile trained on older code of the same crates still
-applies to every function that has not changed since, and `build_release.py` ends by saying
-how many have: 24 after a one-line edit, about 1,600 for code 23 commits and 6,700 lines older
-(of the 187,000 functions a profile has). Run the workflow by hand when that count passes a
-few thousand and before a release after large changes to the daemon.
+PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with
+`tools/pgo/pgo.py`, which builds blaze instrumented with the stage-0 blaze, and `"pgo": "pinned"`
+builds with the profile `tools/pgo/profiles.json` pins, only one trained on blaze's own build
+(`"builder": "blaze"`). Neither works yet: blaze refuses `-C profile-generate`, since its linker
+writes no profile sections (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `pgo`), and the
+profiles pinned today are cargo's, which the script refuses with that error.
 
 ## LLVM
 
@@ -359,16 +364,21 @@ and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codege
 Every native build of blaze links it (blaze-engine's default `native` feature, through
 hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
 build script has it make the stencils. Only the seed (`--no-default-features --features seed`)
-has none. The flake's dev shell fetches it (the flake's `blaze-llvm`) and sets
-`LLVM_SYS_231_PREFIX` to it:
+has none. blaze fetches it itself: the root `Cargo.toml` declares it a pinned native input
+(`[workspace.metadata.blaze.native.llvm]`, [cargo.md](cargo.md#pinned-native-inputs)), so the
+first build downloads the archive `llvm.json` names for the target, checks its sha256, keeps it
+in blaze's store and unpacks it read-only under `~/.blaze/native/` (`BLAZE_HOME/native/`), and
+sets `LLVM_SYS_231_PREFIX` to it for llvm-sys's and blaze-stencil's build scripts. A plain
+build on a clean Mac or Linux machine needs no Nix and no variable:
 
-    nix develop -c cargo build -p blaze-engine --release
+    blaze build -p blaze-engine --release
 
-Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
-(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
-prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
-directory of libraries (`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), so `blaze
-build` refuses a prefix in your home directory.
+The variable blaze sets wins over one your shell has (`nix develop` still sets it to the
+flake's `blaze-llvm`, the same bytes), so a build always links what the pin names. A stage 0
+older than the table (`.github/blaze-version` before this change) ignores it and still needs the
+variable, with the archive somewhere its sandbox lets llvm-sys search, below `/usr/local/lib`
+(`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), as CI's merge gate does
+(`.github/actions/blaze`):
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
     python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
@@ -393,7 +403,10 @@ no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for a
 macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
 archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
-summary prints (`llvm.py pin`). LLVM's own release archives do not do: the macOS ones hold
+summary prints (`llvm.py pin`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
+`-C target-cpu` takes and `rustc --print target-cpus` leaves out) with
+`uv run --frozen python tools/cpus.py '{"write": true, "fetch_llvm": true}'`, which writes
+crates/target-features/llvm_cpus.json and the CPU table (`target_features::cpus`) from it. LLVM's own release archives do not do: the macOS ones hold
 bitcode, and the Linux ones need zlib, zstd and libxml2.
 
 ### The stencil pin

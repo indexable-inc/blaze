@@ -13,7 +13,6 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir::{HasVisibility as _, InFile, ItemInNs};
 use hir_def::{
     AdtId, HasModule as _, ItemContainerId, Lookup as _,
@@ -32,6 +31,7 @@ use hir_ty::{
     next_solver::{Ty, TyKind},
 };
 use rustc_type_ir::inherent::IntoKind as _;
+use std::alloc::Global;
 use syntax::{
     SmolStr, SyntaxNodePtr, TextRange, ToSmolStr as _,
     view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
@@ -67,8 +67,11 @@ pub(super) struct Source {
 impl Source {
     pub(super) fn new(b: &BodyCx<'_, '_, '_>) -> Source {
         let store = b.store();
-        let mut source =
-            Source { decls: HashMap::new_in(Global), assigns: HashMap::new_in(Global), assigned_by_value: HashMap::new_in(Global) };
+        let mut source = Source {
+            decls: HashMap::new_in(Global),
+            assigns: HashMap::new_in(Global),
+            assigned_by_value: HashMap::new_in(Global),
+        };
         for param in b.body.params.iter() {
             source.matched(b, param.formal, MirSpan::PatId(param.formal));
             source.matched(b, param.user_written, MirSpan::PatId(param.user_written));
@@ -77,7 +80,9 @@ impl Source {
             match expr {
                 Expr::Block { statements, .. } => {
                     for statement in statements {
-                        let Statement::Let { pat, initializer: Some(init), else_branch, .. } = statement else {
+                        let Statement::Let { pat, initializer: Some(init), else_branch, .. } =
+                            statement
+                        else {
                             continue;
                         };
                         match store.pat(pat) {
@@ -99,7 +104,9 @@ impl Source {
                         source.matched(b, arm.pat, MirSpan::ExprId(scrutinee));
                     }
                 }
-                Expr::Let { pat, expr: scrutinee } => source.matched(b, pat, MirSpan::ExprId(scrutinee)),
+                Expr::Let { pat, expr: scrutinee } => {
+                    source.matched(b, pat, MirSpan::ExprId(scrutinee))
+                }
                 Expr::Closure { args, .. } => {
                     for &arg in args {
                         source.matched(b, arg, MirSpan::PatId(arg));
@@ -162,7 +169,11 @@ impl Var {
     pub(super) fn introductions(&self, b: &BodyCx<'_, '_, '_>) -> Vec<(Span, bool)> {
         let patterns = b.source_map.patterns_for_binding(self.binding);
         // alloc: a lint's spans, made only once the binding is reported
-        patterns.iter().filter_map(|&pat| b.pat_node(pat)).map(|node| introduction(b, node)).collect()
+        patterns
+            .iter()
+            .filter_map(|&pat| b.pat_node(pat))
+            .map(|node| introduction(b, node))
+            .collect()
     }
 }
 
@@ -173,7 +184,8 @@ pub(super) fn var(b: &BodyCx<'_, '_, '_>, binding: BindingId) -> Option<Var> {
     if data.name.is_missing() || data.name.is_generated() {
         return None;
     }
-    let node = b.source_map.patterns_for_binding(binding).iter().find_map(|&pat| b.pat_node(pat))?;
+    let node =
+        b.source_map.patterns_for_binding(binding).iter().find_map(|&pat| b.pat_node(pat))?;
     Some(Var { name: data.name.display(b.db(), b.cx.edition).to_smolstr(), node, binding })
 }
 
@@ -195,7 +207,10 @@ fn introduction(b: &BodyCx<'_, '_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, b
 /// The span rustc's MIR has for `span` and the node its lint level is decided at: of a
 /// binding's pattern, where its name ends ([`introduction`]); of an expression, with the
 /// parentheses around it.
-pub(super) fn mir_span(b: &BodyCx<'_, '_, '_>, span: MirSpan) -> Option<(Span, InFile<SyntaxNodePtr>)> {
+pub(super) fn mir_span(
+    b: &BodyCx<'_, '_, '_>,
+    span: MirSpan,
+) -> Option<(Span, InFile<SyntaxNodePtr>)> {
     match span {
         MirSpan::ExprId(expr) => Some((util::span(b, expr)?, b.expr_node(expr)?)),
         MirSpan::PatId(pat) if matches!(b.store().pat(pat), Pat::Bind { .. }) => {
@@ -226,7 +241,11 @@ pub(super) fn assignment_span(
 /// a field goes after the variable's name.
 pub(super) fn capture_underscored(b: &BodyCx<'_, '_, '_>, capture: &CapturedPlace) -> bool {
     !capture.place.projections.iter().any(|it| matches!(it.kind, ProjectionKind::Deref))
-        && b.store()[capture.captured_local()].name.display(b.db(), b.cx.edition).to_smolstr().starts_with('_')
+        && b.store()[capture.captured_local()]
+            .name
+            .display(b.db(), b.cx.edition)
+            .to_smolstr()
+            .starts_with('_')
 }
 
 /// rustc's `CapturedPlace::to_string`: the captured variable with what the capture
@@ -260,7 +279,9 @@ pub(super) fn capture_name(b: &BodyCx<'_, '_, '_>, capture: &CapturedPlace) -> S
                     _ => name = format!("{name}.{field_idx}"),
                 }
             }
-            ProjectionKind::Index | ProjectionKind::Subslice | ProjectionKind::UnwrapUnsafeBinder => {}
+            ProjectionKind::Index
+            | ProjectionKind::Subslice
+            | ProjectionKind::UnwrapUnsafeBinder => {}
         }
     }
     name
@@ -339,14 +360,20 @@ pub(super) fn pattern_typo<'db>(
                 .variants_iter(db)
                 .filter(|it| it.kind(db) == hir::StructKind::Unit)
                 // alloc: for a lint's suggestion, once a lint is found
-                .map(|it| (it.name(db).as_str().to_owned(), "variant", hir::ModuleDef::EnumVariant(it)))
+                .map(|it| {
+                    (it.name(db).as_str().to_owned(), "variant", hir::ModuleDef::EnumVariant(it))
+                })
                 // alloc: for a lint's suggestion, once a lint is found
                 .collect(),
             AdtId::StructId(it) => {
                 let it = hir::Struct::from(it);
                 match it.kind(db) == hir::StructKind::Unit {
                     // alloc: for a lint's suggestion, once a lint is found
-                    true => vec![(it.name(db).as_str().to_owned(), "struct", hir::ModuleDef::Adt(hir::Adt::Struct(it)))],
+                    true => vec![(
+                        it.name(db).as_str().to_owned(),
+                        "struct",
+                        hir::ModuleDef::Adt(hir::Adt::Struct(it)),
+                    )],
                     // alloc: for a lint's suggestion, once a lint is found
                     false => Vec::new(),
                 }
@@ -356,7 +383,8 @@ pub(super) fn pattern_typo<'db>(
         };
         // alloc: for a lint's suggestion, once a lint is found
         let names: Vec<&str> = units.iter().map(|(name, ..)| name.as_str()).collect();
-        if let Some(found) = stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()
+        if let Some(found) =
+            stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()
             && let Some((item, kind, def)) = units.iter().find(|(it, ..)| it == found)
             && let Some(path) = untrimmed_path(b, *def)
         {
@@ -365,7 +393,8 @@ pub(super) fn pattern_typo<'db>(
         }
     }
     // alloc: for a lint's suggestion, once a lint is found
-    let same: Vec<&(String, Ty<'db>, String)> = consts.iter().filter(|(_, it, _)| *it == ty).collect();
+    let same: Vec<&(String, Ty<'db>, String)> =
+        consts.iter().filter(|(_, it, _)| *it == ty).collect();
     // alloc: for a lint's suggestion, once a lint is found
     let names: Vec<&str> = same.iter().map(|(name, ..)| name.as_str()).collect();
     let found = stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()?;
@@ -425,9 +454,15 @@ pub(super) fn mut_reference_param(
         return None;
     }
     let pat = ast::IdentPat::cast(b.cx.syntax_view(b.pat_node(param)?).value)?;
-    let ast::Type::RefType(ty) = ast::Param::cast(pat.syntax().parent()?)?.ty()? else { return None };
+    let ast::Type::RefType(ty) = ast::Param::cast(pat.syntax().parent()?)?.ty()? else {
+        return None;
+    };
     let Expr::Assignment { target, value } = store.expr(assign) else { return None };
-    let Expr::Ref { expr: inner, rawness: hir_def::hir::type_ref::Rawness::Ref, .. } = store.expr(value) else { return None };
+    let Expr::Ref { expr: inner, rawness: hir_def::hir::type_ref::Rawness::Ref, .. } =
+        store.expr(value)
+    else {
+        return None;
+    };
     let node = b.pat_node(param)?;
     let at = |range: TextRange| b.cx.span(InFile::new(node.file_id, range));
     // alloc: for a lint's suggestion, once a lint is found
@@ -440,7 +475,8 @@ pub(super) fn mut_reference_param(
     }
     let name = pat.name()?.syntax().text_range();
     // alloc: for a lint's suggestion, once a lint is found
-    parts.push((at(TextRange::new(pat.syntax().text_range().start(), name.start())), String::new()));
+    parts
+        .push((at(TextRange::new(pat.syntax().text_range().start(), name.start())), String::new()));
     let lhs = b.pat_span(target)?;
     // alloc: for a lint's suggestion, once a lint is found
     parts.push((lhs.shrink_to_lo(), "*".to_owned()));

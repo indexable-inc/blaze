@@ -12,8 +12,8 @@ use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, ModuleId, nameres::crate_def_map,
     resolver::HasResolver,
 };
-use hir_expand::name::Name;
 use hir_expand::fixture;
+use hir_expand::name::Name;
 
 use super::{
     Answer,
@@ -192,7 +192,8 @@ fn generated(seed: u64) -> String {
     writeln!(text, "    impl super::S0 {{ fn secret(&self) -> u32 {{ 8 }} }}").unwrap();
     writeln!(text, "    pub trait Far {{ fn m0(&self) -> u32 {{ 9 }} }}").unwrap();
     writeln!(text, "    impl Far for super::S1 {{}}").unwrap();
-    writeln!(text, "    fn inside(s: &super::S0, t: &super::S1) -> u32 {{ s.secret() + t.m0() }}").unwrap();
+    writeln!(text, "    fn inside(s: &super::S0, t: &super::S1) -> u32 {{ s.secret() + t.m0() }}")
+        .unwrap();
     writeln!(text, "}}").unwrap();
     writeln!(text, "pub struct W(pub S0);").unwrap();
     writeln!(
@@ -210,7 +211,9 @@ fn generated(seed: u64) -> String {
             match rng.index(7) {
                 0 => writeln!(text, "    let mut s = S{ty}(1); let _ = s.m{m}();").unwrap(),
                 1 => writeln!(text, "    let s = S{ty}(1); let r = &s; let _ = r.m{m}();").unwrap(),
-                2 => writeln!(text, "    let s = S{ty}(1); let r = &&s; let _ = r.m{m}();").unwrap(),
+                2 => {
+                    writeln!(text, "    let s = S{ty}(1); let r = &&s; let _ = r.m{m}();").unwrap()
+                }
                 3 => writeln!(text, "    let _ = S{ty}::m{m};").unwrap(),
                 4 => writeln!(text, "    let w = W(S0(1)); let _ = w.m{m}();").unwrap(),
                 5 => writeln!(text, "    let g = G(S{ty}(1)); let _ = g.m{m}();").unwrap(),
@@ -277,18 +280,17 @@ fn scope_buckets_are_the_traits_in_scope_named() {
     for module in modules(&db) {
         for &name in &names {
             // The assembly the bucket replaces: every trait in scope, asked of by name.
-            let mut old: Vec<ScopeItem> =
-                blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
-                    let mut values = TraitValueItems::new_in(frame);
-                    module
-                        .resolver(&db)
-                        .traits_in_scope(&db)
-                        .into_iter()
-                        .filter_map(|trait_| {
-                            values.get(&db, trait_, name).map(|item| ScopeItem { trait_, item })
-                        })
-                        .collect()
-                });
+            let mut old: Vec<ScopeItem> = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                let mut values = TraitValueItems::new_in(frame);
+                module
+                    .resolver(&db)
+                    .traits_in_scope(&db)
+                    .into_iter()
+                    .filter_map(|trait_| {
+                        values.get(&db, trait_, name).map(|item| ScopeItem { trait_, item })
+                    })
+                    .collect()
+            });
             old.sort_by_key(|it| it.trait_);
             let new = module_items_named(&db, module, name).items();
             assert_eq!(new, old.as_slice(), "{module:?}, {}", name.as_str());

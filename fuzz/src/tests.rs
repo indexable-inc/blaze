@@ -38,7 +38,21 @@ impl Recent for OneRecent {
 
 #[test]
 fn buckets_are_afls() {
-    let expected = [(1, 0), (2, 1), (3, 2), (4, 3), (7, 3), (8, 4), (15, 4), (16, 5), (31, 5), (32, 6), (127, 6), (128, 7), (255, 7)];
+    let expected = [
+        (1, 0),
+        (2, 1),
+        (3, 2),
+        (4, 3),
+        (7, 3),
+        (8, 4),
+        (15, 4),
+        (16, 5),
+        (31, 5),
+        (32, 6),
+        (127, 6),
+        (128, 7),
+        (255, 7),
+    ];
     for (count, want) in expected {
         assert_eq!(bucket(count), want, "count {count}");
     }
@@ -80,7 +94,9 @@ fn drain_agrees_with_a_byte_at_a_time() {
     for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 127, 128, 200, 1000, 4096 + 3] {
         for density in [0usize, 1, 8, 64] {
             let mut counters: Vec<u8> = (0..len)
-                .map(|_| if density > 0 && random.below(64) < density { random.next() as u8 } else { 0 })
+                .map(|_| {
+                    if density > 0 && random.below(64) < density { random.next() as u8 } else { 0 }
+                })
                 .collect();
             let ignored: Vec<usize> = (0..len).filter(|_| random.below(16) == 0).collect();
             let mut want: Vec<u32> = counters
@@ -134,7 +150,8 @@ fn a_run_that_keeps_nothing_allocates_nothing() {
 fn run_clears_whole_lines_and_the_tail() {
     for len in [0usize, 5, 64, 70, 130] {
         let mut random = Random::new(len as u64);
-        let mut counters: Vec<u8> = (0..len).map(|_| if random.below(4) == 0 { 1 } else { 0 }).collect();
+        let mut counters: Vec<u8> =
+            (0..len).map(|_| if random.below(4) == 0 { 1 } else { 0 }).collect();
         let coverage = Coverage::of(&mut counters, &[]);
         assert!(coverage.run(|_| {}, b"", 0));
         drop(coverage);
@@ -157,7 +174,10 @@ fn run_clears_first_and_reports_a_panic() {
 #[test]
 fn a_build_without_coverage_says_which_flags() {
     match Coverage::new(&[]) {
-        Err(e) => assert!(e.contains("-Zsanitizer-coverage=inline-8bit-counters,pc-table,trace-cmp"), "{e}"),
+        Err(e) => assert!(
+            e.contains("-Zsanitizer-coverage=inline-8bit-counters,pc-table,trace-cmp"),
+            "{e}"
+        ),
         Ok(coverage) => assert!(coverage.total() > 0),
     }
 }
@@ -231,13 +251,18 @@ fn finding_an_operand_agrees_with_a_search_at_every_offset() {
     for _ in 0..20_000 {
         // Two letters, so words are found often, and found again before where the search starts.
         let data: Vec<u8> = (0..random.below(48)).map(|_| b'a' + random.below(2) as u8).collect();
-        let from: Vec<u8> = (0..1 + random.below(6)).map(|_| b'a' + random.below(2) as u8).collect();
+        let from: Vec<u8> =
+            (0..1 + random.below(6)).map(|_| b'a' + random.below(2) as u8).collect();
         if data.len() < from.len() {
             continue;
         }
         let start = random.below(data.len() - from.len() + 1);
         let want = linear(&data, &from, start);
-        assert_eq!(mutate::find_from(&data, &from, start), want, "{from:?} in {data:?} from {start}");
+        assert_eq!(
+            mutate::find_from(&data, &from, start),
+            want,
+            "{from:?} in {data:?} from {start}"
+        );
         found += usize::from(want.is_some_and(|at| at < start));
     }
     assert!(found > 1000, "words found before the start only {found} times");
@@ -248,7 +273,13 @@ fn a_byte_comparison_that_differs_is_kept_for_the_dictionary() {
     let a: [u8; raw::WORD] = std::array::from_fn(|i| 0x40 + i as u8);
     let mut b = a;
     b[raw::WORD - 1] ^= 0xff;
-    raw::__sanitizer_weak_hook_memcmp(std::ptr::null(), a.as_ptr().cast(), b.as_ptr().cast(), raw::WORD, -1);
+    raw::__sanitizer_weak_hook_memcmp(
+        std::ptr::null(),
+        a.as_ptr().cast(),
+        b.as_ptr().cast(),
+        raw::WORD,
+        -1,
+    );
     assert!(
         (0..raw::TORC_WORDS).any(|slot| raw::recent_bytes(slot) == (a, b, raw::WORD)),
         "the operands' first {} bytes are in a slot",
@@ -333,7 +364,9 @@ fn options_parse() {
     let fuzz = parse(&["fuzz", "--seconds", "5", "--seed", "3", "--no-value-profile"]).unwrap();
     assert!(matches!(fuzz.command, Command::Fuzz));
     assert_eq!((fuzz.seconds, fuzz.seed, fuzz.value_profile), (Some(5), Some(3), false));
-    assert!(matches!(parse(&["run", "a.hex", "b.hex"]).unwrap().command, Command::Run(files) if files.len() == 2));
+    assert!(
+        matches!(parse(&["run", "a.hex", "b.hex"]).unwrap().command, Command::Run(files) if files.len() == 2)
+    );
     assert!(matches!(parse(&["minimize", "a.hex"]).unwrap().command, Command::Minimize(_)));
     assert!(parse(&[]).is_err());
     assert!(parse(&["run"]).is_err());
@@ -356,7 +389,10 @@ fn kept_files_appear_whole_and_listings_skip_the_partial() {
     let path = corpus::write(&dir, "", b"input").unwrap();
     std::fs::write(dir.join(".1234-being-written.hex"), "00").unwrap();
     let names = corpus::names(&dir).unwrap();
-    assert_eq!(names, vec![std::ffi::OsString::from(format!("{:016x}.hex", corpus::hash(b"input")))]);
+    assert_eq!(
+        names,
+        vec![std::ffi::OsString::from(format!("{:016x}.hex", corpus::hash(b"input")))]
+    );
     assert_eq!(path, dir.join(&names[0]));
     assert_eq!(corpus::key(&names[0]), corpus::hash(b"input"));
     assert_eq!(corpus::key("other.hex".as_ref()), corpus::hash(b"other.hex"));
@@ -386,6 +422,9 @@ fn keeping_an_input_allocates_nothing() {
         assert_eq!(largest, 0, "keep {keep} allocated (largest {largest} bytes)");
     }
     assert_eq!((corpus.len(), corpus.bytes(), corpus.last()), (100, 20_000, &input[..]));
-    assert_eq!(corpus::read(&dir.join(format!("{:016x}.hex", corpus::hash(&input)))).unwrap(), input);
+    assert_eq!(
+        corpus::read(&dir.join(format!("{:016x}.hex", corpus::hash(&input)))).unwrap(),
+        input
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

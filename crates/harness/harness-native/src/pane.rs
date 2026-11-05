@@ -9,7 +9,7 @@
 //! - [`TermGrid`]: where the grid sits and how many cells it has (written by the sync, read by hit tests and drawing)
 //! - [`TermCursor`] and [`TermInput`]: the cursor, modes and sizes from the last snapshot (written by drawing, read by input)
 //! - [`TermSelection`]: the selection and the drag making it
-//! - [`TermScroll`]: smooth scrolling and the wheel's remainder; the whole rows back stay on the object's `Term`
+//! - [`TermScroll`]: row-snapped scrolling and the wheel's remainder; the whole rows back stay on the object's `Term`
 //! - [`TermMouse`]: the program's mouse button held down and the cell last reported
 //! - [`MarkedText`]: an input method's uncommitted text (only on the focused terminal)
 //! - [`TermFocus`]: the terminal keys go to (the focused pane's)
@@ -53,7 +53,11 @@ impl TermGrid {
     /// Whether `(x, y)` is on the grid, `slack` points around it counted in.
     #[must_use]
     pub fn holds(&self, x: f32, y: f32, slack: f32) -> bool {
-        self.w > 0.0 && x >= self.x - slack && y >= self.y - slack && x <= self.x + self.w + slack && y <= self.y + self.h + slack
+        self.w > 0.0
+            && x >= self.x - slack
+            && y >= self.y - slack
+            && x <= self.x + self.w + slack
+            && y <= self.y + self.h + slack
     }
 }
 
@@ -82,7 +86,16 @@ impl TermInput {
     #[must_use]
     pub fn pack(i: &Input) -> Self {
         let m = &i.modes;
-        let bits = [m.app_cursor, m.app_keypad, m.bracketed_paste, m.focus_events, m.alt_scroll, m.alt_screen, m.sync_output, m.cursor_visible];
+        let bits = [
+            m.app_cursor,
+            m.app_keypad,
+            m.bracketed_paste,
+            m.focus_events,
+            m.alt_scroll,
+            m.alt_screen,
+            m.sync_output,
+            m.cursor_visible,
+        ];
         let flags = bits.iter().enumerate().fold(0u8, |f, (k, &b)| f | (u8::from(b) << k));
         let mouse = match m.mouse {
             MouseTracking::None => 0,
@@ -98,7 +111,15 @@ impl TermInput {
             MouseFormat::Urxvt => 3,
             MouseFormat::SgrPixels => 4,
         };
-        Self { flags, mouse, format, kitty: m.kitty_flags, cols: i.size.0, rows: i.size.1, history: i.history }
+        Self {
+            flags,
+            mouse,
+            format,
+            kitty: m.kitty_flags,
+            cols: i.size.0,
+            rows: i.size.1,
+            history: i.history,
+        }
     }
 
     /// The [`Input`] with `cursor`.
@@ -130,7 +151,12 @@ impl TermInput {
             },
             kitty_flags: self.kitty,
         };
-        Input { modes, cursor: (cursor.row, cursor.col), size: (self.cols, self.rows), history: self.history }
+        Input {
+            modes,
+            cursor: (cursor.row, cursor.col),
+            size: (self.cols, self.rows),
+            history: self.history,
+        }
     }
 }
 
@@ -165,15 +191,19 @@ impl TermSelection {
     }
 }
 
-/// Smooth scrolling: the fraction of a row scrolled back past the object's whole rows, wheel lines not yet sent as keys
-/// or reports, and where the last frame drew the grid's first row (above the grid when a fraction is scrolled) and how
-/// many rows back that viewport was.
+/// Row-snapped scrolling: the wheel's fraction of a row not yet scrolled (the grid only moves by whole rows), wheel
+/// lines not yet sent as keys or reports, and where the last frame drew the grid's first row and how many rows back
+/// that viewport was. `total` and `len` are the rows in all and in view as the last frame fed them to the node's overlay
+/// scroller (0: nothing to scroll, as on the alternate screen), and `row` how many of the scroller's points a row was.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TermScroll {
     pub frac: f32,
     pub wheel: f32,
     pub top: f32,
     pub shift: i64,
+    pub total: u64,
+    pub len: u64,
+    pub row: f32,
 }
 
 /// The program's mouse button held down (its mouse mode is on), and the cell last reported.
@@ -213,7 +243,10 @@ pub fn register(world: &World) {
     // The scene puts these tags on hn.Pane and hn.Terminal.
     world.component::<PaneNode>().writable();
     world.component::<PaneFocus>();
-    world.component::<Back>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
+    world
+        .component::<Back>()
+        .add_trait::<flecs::Exclusive>()
+        .on_delete_target(flecs::Cleanup::Remove);
     world.component::<TermNode>().writable();
     world.component::<TermFocus>();
     world.component::<TermGrid>();

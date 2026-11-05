@@ -1,0 +1,90 @@
+// The launch video's tokens: the names the prims read (harness-native-ui-prims/scene/prims.flecs: tones, radii, sizes,
+// springs, and the Strong, Ink, Muted, Accent, Wash and Plate prefabs a prim says it is), then the video's own. The look is
+// the README's: GitHub's dark ground under the fire logo (docs/brand/fire/gen.py's dark theme). Colours are sRGB 0..1,
+// straight; a video draws only the dark half, so each Fill's light half repeats it.
+
+// ---- what the prims read ----
+export const size_caption = 11
+export const size_body = 13
+export const size_code = 11.5
+export const table_row = 24
+export const table_gap = 14
+export const table_pad = 6
+export const size_table = 12.5
+export const result_snippet_h = 36
+export const textarea_max_h = 132
+export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {1, 1, 1, 0.08}}
+export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.580, 0.600, 1.0, 0.32}}
+export const radius_control = 6
+export const radius_card = 12
+export const spring_transition_omega = 20
+export const spring_transition_zeta = 0.9
+export const spring_matched_omega = 26
+export const spring_matched_zeta = 0.84
+export const spring_layout_omega = 18
+export const spring_layout_zeta = 1
+// ui.Scroller (the app's values, harness-native/scene/00-tokens.flecs).
+export const scroller_thin = 6
+export const scroller_wide = 10
+export const scroller_inset = 2
+export const scroller_min = 24
+export const scroller_grab = 16
+export const scroller_hold = 0.7
+export const scroller_keep = 24
+export const scroller_show_omega = 40
+export const scroller_show_zeta = 1
+export const scroller_hide_omega = 13
+export const scroller_hide_zeta = 1
+export const scroller_wide_omega = 32
+export const scroller_wide_zeta = 1
+export const scroller_page_omega = 20
+export const scroller_page_zeta = 1
+export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.42}, light: {1, 1, 1, 0.42}}
+export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.07}, light: {1, 1, 1, 0.07}}
+
+export const tone_ground: Fill = {dark: {0.051, 0.067, 0.090, 1}, light: {0.051, 0.067, 0.090, 1}}
+export const tone_ink_1: Fill = {dark: {0.941, 0.965, 0.988, 1}, light: {0.941, 0.965, 0.988, 1}}
+export const tone_ink_2: Fill = {dark: {0.941, 0.965, 0.988, 0.86}, light: {0.941, 0.965, 0.988, 0.86}}
+export const tone_ink_3: Fill = {dark: {0.941, 0.965, 0.988, 0.52}, light: {0.941, 0.965, 0.988, 0.52}}
+export const tone_accent: Fill = {dark: {1.0, 0.561, 0.122, 1}, light: {1.0, 0.561, 0.122, 1}}
+export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {1, 1, 1, 0.06}}
+export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {1, 1, 1, 0.045}}
+export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {1, 1, 1, 0.10}}
+export const tone_plate: Fill = {dark: {0.086, 0.106, 0.133, 1}, light: {0.086, 0.106, 0.133, 1}}
+export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.10}, light: {1, 1, 1, 0.10}}
+export const tone_switch_on: Fill = {dark: {1.0, 0.561, 0.122, 1}, light: {1.0, 0.561, 0.122, 1}}
+
+prefab Strong {
+  Fill: $tone_ink_1
+}
+prefab Ink {
+  Fill: $tone_ink_2
+}
+prefab Muted {
+  Fill: $tone_ink_3
+}
+prefab Accent {
+  Fill: $tone_accent
+}
+prefab Wash {
+  Fill: $tone_wash
+}
+prefab Plate {
+  Fill: $tone_plate
+  Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+  Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
+}
+
+// ---- the video's own ----
+// Type, in points of a 960 by 540 frame drawn at 2x (1920 by 1080). Big: most people watch it on a phone, a 1080p
+// frame shrunk to a fifth of its width.
+// The one line of words, in the code face, as the mark's own home (a terminal) sets it.
+export const size_lead = 22
+export const line_lead = 30
+
+// The fire mark: 43 by 23 cells (harness-native-blaze), each this many points.
+export const mark_cell = 12
+
+// The fire's hottest colour but one (docs/brand/fire/gen.py's dark theme).
+export const fire_3: Rgba = {1.0, 0.831, 0.231, 1}

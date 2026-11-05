@@ -225,6 +225,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
+]
+
+[[package]]
 name = "compact_str"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -722,6 +749,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "crossterm",
+ "harness-chat",
  "harness-vt",
  "libc",
  "parquet",
@@ -731,6 +759,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "harness-chat"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -750,6 +785,7 @@ dependencies = [
  "harness-native-ecs",
  "harness-native-flecs",
  "harness-native-model",
+ "harness-native-render",
  "harness-native-scroll-physics",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
@@ -800,6 +836,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-native-blaze"
+version = "0.1.0"
+
+[[package]]
 name = "harness-native-ecs"
 version = "0.1.0"
 dependencies = [
@@ -838,10 +878,54 @@ dependencies = [
 name = "harness-native-model"
 version = "0.1.0"
 dependencies = [
+ "harness-chat",
  "harness-native-api",
  "harness-native-flecs",
  "harness-vt",
  "serde_json",
+]
+
+[[package]]
+name = "harness-native-render"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "bytemuck",
+ "dispatch2",
+ "harfrust",
+ "harness-native-api",
+ "harness-native-blaze",
+ "harness-native-flecs",
+ "harness-native-ui-draw",
+ "harness-native-ui-draw-api",
+ "harness-native-ui-layout",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-look-api",
+ "harness-native-ui-motion-api",
+ "harness-native-ui-node-api",
+ "harness-native-ui-text-api",
+ "harness-native-ui-timeline-api",
+ "icu_properties",
+ "icu_segmenter",
+ "libc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-text",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
+ "png",
+ "read-fonts",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-highlight",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -878,7 +962,10 @@ dependencies = [
  "harness-native-api",
  "harness-native-flecs",
  "harness-native-ui-input-api",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
+ "harness-native-ui-spring-api",
 ]
 
 [[package]]
@@ -906,6 +993,7 @@ name = "harness-native-ui-layout-api"
 version = "0.1.0"
 dependencies = [
  "harness-native-flecs",
+ "harness-native-ui-spring-api",
  "hyperion-api-layouts",
 ]
 
@@ -985,6 +1073,26 @@ name = "harness-native-ui-text-api"
 version = "0.1.0"
 dependencies = [
  "harness-native-flecs",
+ "harness-native-ui-look-api",
+ "hyperion-api-layouts",
+]
+
+[[package]]
+name = "harness-native-ui-timeline"
+version = "0.1.0"
+dependencies = [
+ "harness-native-flecs",
+ "harness-native-ui-node-api",
+ "harness-native-ui-timeline-api",
+ "hyperion-ecs",
+]
+
+[[package]]
+name = "harness-native-ui-timeline-api"
+version = "0.1.0"
+dependencies = [
+ "harness-native-flecs",
+ "harness-native-ui-look-api",
  "hyperion-api-layouts",
 ]
 
@@ -992,12 +1100,51 @@ dependencies = [
 name = "harness-native-ui-view"
 version = "0.1.0"
 dependencies = [
+ "harness-native-api",
  "harness-native-flecs",
  "harness-native-ui-input-api",
  "harness-native-ui-layout-api",
+ "harness-native-ui-look-api",
  "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
  "harness-native-ui-text-api",
+]
+
+[[package]]
+name = "harness-proto"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harness-video"
+version = "0.1.0"
+dependencies = [
+ "harness-native-api",
+ "harness-native-blaze",
+ "harness-native-ecs",
+ "harness-native-flecs",
+ "harness-native-render",
+ "harness-native-ui-draw",
+ "harness-native-ui-draw-api",
+ "harness-native-ui-input",
+ "harness-native-ui-input-api",
+ "harness-native-ui-layout",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-motion",
+ "harness-native-ui-node-api",
+ "harness-native-ui-prims",
+ "harness-native-ui-text-api",
+ "harness-native-ui-timeline",
+ "harness-native-ui-timeline-api",
+ "hyperion-ecs",
+ "hyperion-flecs-c",
+ "objc2-metal",
+ "png",
 ]
 
 [[package]]
@@ -1254,6 +1401,16 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
+]
 
 [[package]]
 name = "indoc"
@@ -2399,6 +2556,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2551,6 +2710,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "strsim"
@@ -2806,6 +2971,98 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tree-sitter"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78f873475d258561b06f1c595d93308a7ed124d9977cb26b148c2084a4a3cc87"
+dependencies = [
+ "cc",
+ "regex",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bash"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-highlight"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adc5f880ad8d8f94e88cb81c3557024cf1a8b75e3b504c50481ed4f5a6006ff3"
+dependencies = [
+ "regex",
+ "streaming-iterator",
+ "thiserror 2.0.21",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-json"
+version = "0.24.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

@@ -48,7 +48,7 @@ impl<T> Wheel<T> {
             occupied: [0; LEVELS],
             // alloc: the old wheel, kept only as the differential test's oracle.
             slots: Box::new([EMPTY; LEVELS * SLOTS]), // alloc: the test oracle's.
-            links: Vec::new(), // alloc: the test oracle's.
+            links: Vec::new(),                        // alloc: the test oracle's.
             values: Vec::new(),
             free: NIL,
             len: 0,

@@ -203,7 +203,10 @@ unable to verify that `{0}` is the same as when the lockfile was generated
     }
 
     /// The packages `pkg` depends on, replacements applied.
-    pub fn deps(&self, pkg: PackageId) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
+    pub fn deps(
+        &self,
+        pkg: PackageId,
+    ) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
         self.deps_not_replaced(pkg)
             .map(move |(id, deps)| (self.replacement(id).unwrap_or(id), deps))
     }

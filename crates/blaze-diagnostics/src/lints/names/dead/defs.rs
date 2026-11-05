@@ -13,16 +13,16 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{bits::BitSet, radix};
 use hir::{HirFileId, InFile, ModuleSourceView, Name};
-use hir_expand::builtin::BuiltinDeriveExpander;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
     StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
 };
+use hir_expand::builtin::BuiltinDeriveExpander;
 use intern::sym;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, T,
     view::{self as ast, AstNode as _, HasModuleItem as _},
@@ -202,12 +202,12 @@ impl Defs {
             cx,
             defs: Vec::new(), // alloc: setup, the crate's tables, once per crate
             ids: HashMap::new_in(Global),
-            edges: Vec::new(), // alloc: setup, once per crate
-            modules: Vec::new(), // alloc: setup, once per crate
-            module_of: Vec::new(), // alloc: setup, once per crate
-            trait_items: Vec::new(), // alloc: setup, once per crate
-            impl_items: Vec::new(), // alloc: setup, once per crate
-            free_owners: Vec::new(), // alloc: setup, once per crate
+            edges: Vec::new(),          // alloc: setup, once per crate
+            modules: Vec::new(),        // alloc: setup, once per crate
+            module_of: Vec::new(),      // alloc: setup, once per crate
+            trait_items: Vec::new(),    // alloc: setup, once per crate
+            impl_items: Vec::new(),     // alloc: setup, once per crate
+            free_owners: Vec::new(),    // alloc: setup, once per crate
             foreign_owners: Vec::new(), // alloc: setup, once per crate
             derives: HashMap::new_in(Global),
             scopes: HashSet::new_in(Global),
@@ -223,11 +223,14 @@ impl Defs {
             let root = cx.vsema.parse_or_expand(file);
             let items = match source.value {
                 ModuleSourceView::SourceFile(it) => {
-                    ast::SourceFile::cast(ast::to_node(ast::ptr(it.syntax()), root)).map(|it| it.items())
+                    ast::SourceFile::cast(ast::to_node(ast::ptr(it.syntax()), root))
+                        .map(|it| it.items())
                 }
-                ModuleSourceView::Module(it) => ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
-                    .and_then(|it| it.item_list())
-                    .map(|it| it.items()),
+                ModuleSourceView::Module(it) => {
+                    ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
+                        .and_then(|it| it.item_list())
+                        .map(|it| it.items())
+                }
                 ModuleSourceView::BlockExpr(_) => continue,
             };
             for item in items.into_iter().flatten() {
@@ -270,8 +273,12 @@ impl Defs {
                     ImplOf {
                         def,
                         trait_: impl_.trait_(db).and_then(|it| self.get(Id::Trait(it.into()))),
-                        self_adt: self_ty.as_adt().and_then(|it| self.get(Id::Adt(AdtId::from(it)))),
-                        self_dyn: self_ty.as_dyn_trait().and_then(|it| self.get(Id::Trait(it.into()))),
+                        self_adt: self_ty
+                            .as_adt()
+                            .and_then(|it| self.get(Id::Adt(AdtId::from(it)))),
+                        self_dyn: self_ty
+                            .as_dyn_trait()
+                            .and_then(|it| self.get(Id::Trait(it.into()))),
                     }
                 }
                 Id::Derive(id) => ImplOf {
@@ -398,9 +405,15 @@ impl<'db> Walk<'_, '_, 'db> {
         let (list_container, list_kind) = match (&item.value, def) {
             (ast::Item::Module(_) | ast::Item::MacroRules(_) | ast::Item::MacroDef(_), _)
             | (ast::Item::Trait(_) | ast::Item::Impl(_), None) => return,
-            (ast::Item::Trait(_), Some(def)) => (Some(Container::Trait(def)), SyntaxKind::ASSOC_ITEM_LIST),
-            (ast::Item::Impl(_), Some(def)) => (Some(Container::Impl(def)), SyntaxKind::ASSOC_ITEM_LIST),
-            (ast::Item::ExternBlock(_), _) => (Some(Container::Extern), SyntaxKind::EXTERN_ITEM_LIST),
+            (ast::Item::Trait(_), Some(def)) => {
+                (Some(Container::Trait(def)), SyntaxKind::ASSOC_ITEM_LIST)
+            }
+            (ast::Item::Impl(_), Some(def)) => {
+                (Some(Container::Impl(def)), SyntaxKind::ASSOC_ITEM_LIST)
+            }
+            (ast::Item::ExternBlock(_), _) => {
+                (Some(Container::Extern), SyntaxKind::EXTERN_ITEM_LIST)
+            }
             _ => (None, SyntaxKind::ASSOC_ITEM_LIST),
         };
         let inner = match def {
@@ -474,7 +487,9 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     fn global_asm(&mut self, node: ast::Node<'_>) {
-        let names = node.descendants().any(|it| matches!(it.kind(), SyntaxKind::ASM_SYM | SyntaxKind::ASM_CONST));
+        let names = node
+            .descendants()
+            .any(|it| matches!(it.kind(), SyntaxKind::ASM_SYM | SyntaxKind::ASM_CONST));
         self.unported |= names;
     }
 
@@ -485,7 +500,8 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     fn push(&mut self, def: Def) -> DefIdx {
-        let index = DefIdx::try_from(self.defs.len()).expect("fewer than 2^32 definitions in a crate");
+        let index =
+            DefIdx::try_from(self.defs.len()).expect("fewer than 2^32 definitions in a crate");
         self.ids.insert(def.id, index);
         self.defs.push(def);
         self.module_of.push((self.modules.len() - 1) as u32);
@@ -493,7 +509,12 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 
     /// Records `item` as a definition with its variants, fields and derives.
-    fn define(&mut self, item: InFile<ast::Item<'db>>, container: Container, parent: Parent) -> Option<DefIdx> {
+    fn define(
+        &mut self,
+        item: InFile<ast::Item<'db>>,
+        container: Container,
+        parent: Parent,
+    ) -> Option<DefIdx> {
         let cx = self.cx;
         let db = cx.db;
         let node = Some(item.map(|it| ast::ptr(it.syntax())));
@@ -598,7 +619,8 @@ impl<'db> Walk<'_, '_, 'db> {
         let db = cx.db;
         let Some(owner) = ast::AnyHasAttrs::cast(item.value.syntax()) else { return };
         let cfg = cx.krate.cfg(db);
-        for (meta, _) in hir_expand::attrs::cfg_attrs_view(ast::attrs_including_inner(&owner), cfg) {
+        for (meta, _) in hir_expand::attrs::cfg_attrs_view(ast::attrs_including_inner(&owner), cfg)
+        {
             let is_derive = matches!(meta, ast::Meta::TokenTreeMeta(it)
                 if it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "derive"));
             if !is_derive {
@@ -609,8 +631,12 @@ impl<'db> Walk<'_, '_, 'db> {
                 let file = cx.vsema.hir_file_for(root.value);
                 let Some(call) = file.macro_file() else { continue };
                 let trivial = match call.loc(db).def.kind {
-                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Clone) => Some("Clone"),
-                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Debug) => Some("Debug"),
+                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Clone) => {
+                        Some("Clone")
+                    }
+                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Debug) => {
+                        Some("Debug")
+                    }
                     _ => None,
                 };
                 let first = self.defs.len();
@@ -680,7 +706,13 @@ impl<'db> Walk<'_, '_, 'db> {
         }
     }
 
-    fn field(&mut self, file: HirFileId, node: ast::Node<'_>, field: Option<hir::Field>, owner: DefIdx) {
+    fn field(
+        &mut self,
+        file: HirFileId,
+        node: ast::Node<'_>,
+        field: Option<hir::Field>,
+        owner: DefIdx,
+    ) {
         let Some(field) = field else { return };
         let index = self.push(Def {
             id: Id::Field(FieldId::from(field)),
@@ -723,7 +755,9 @@ impl<'db> Walk<'_, '_, 'db> {
             if let Some(method) = trait_.all_methods().first() {
                 let method = self.push(Def {
                     id: Id::DeriveMethod(derive),
-                    kind: Kind::AssocFn { method: !matches!(trait_, BuiltinDeriveImplTrait::Default) },
+                    kind: Kind::AssocFn {
+                        method: !matches!(trait_, BuiltinDeriveImplTrait::Default),
+                    },
                     node: None,
                     name: Some(Name::new_symbol_root(method.name())),
                     parent: Parent::Def(index),
@@ -755,16 +789,19 @@ fn is_item(node: ast::Node<'_>) -> bool {
 pub(super) fn is_anon(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
-        SyntaxKind::BLOCK_EXPR => {
-            node.children_with_tokens().any(|it| matches!(it.kind(), T![const] | T![async] | T![gen]))
-        }
+        SyntaxKind::BLOCK_EXPR => node
+            .children_with_tokens()
+            .any(|it| matches!(it.kind(), T![const] | T![async] | T![gen])),
         kind if !ast::Expr::can_cast(kind) => false,
         _ => match node.parent() {
             Some(parent) => match parent.kind() {
                 SyntaxKind::CONST_ARG | SyntaxKind::VARIANT => true,
                 SyntaxKind::ARRAY_EXPR => {
-                    let has_semi = parent.children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
-                    has_semi && parent.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1) == Some(node)
+                    let has_semi =
+                        parent.children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
+                    has_semi
+                        && parent.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1)
+                            == Some(node)
                 }
                 _ => false,
             },

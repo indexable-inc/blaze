@@ -1,7 +1,7 @@
 //! harnessd: owns every agent PTY, mirrors each into a libghostty terminal (harness-vt) (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{archive, db, messages, paths, profiles, proto, queries, runs};
+use crate::{archive, chat, db, messages, paths, profiles, proto, queries, runs};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -42,11 +42,13 @@ pub struct Session {
     pub cwd: String,
     pub argv: Vec<String>,
     pub created_ms: u64,
-    /// The agent process (for `signal`).
-    pub pid: Option<u32>,
+    /// The agent process (for `signal`); a chat's changes when it is resumed, and is None while its agent is not running.
+    pid: Mutex<Option<u32>>,
     pub term: Mutex<harness_vt::Term>,
+    /// The PTY's input, or a chat child's stdin.
     writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// None for a chat session (no PTY).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pub tx: broadcast::Sender<Ev>,
     pub exit: Mutex<Option<i32>>,
@@ -58,9 +60,60 @@ pub struct Session {
     /// When its program last wrote output (ms since the epoch), and whether `list` last said it was busy.
     last_out: AtomicU64,
     busy: AtomicBool,
+    /// A chat session's conversation (chat/mod.rs): it has no PTY, and its terminal mirror stays blank.
+    pub chat: Option<Arc<chat::Chat>>,
+    /// Held while a chat's agent is being resumed, so two messages at once start it once.
+    resuming: Mutex<()>,
 }
 
+/// The stand-in for a chat's agent while none runs (a chat restored from its log, before a resume): writing to it is an
+/// error naming why, and there is nothing to kill.
+#[derive(Debug, Clone, Copy)]
+struct NoAgent;
+
+impl Write for NoAgent {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("this chat's agent is not running (a message resumes it)"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChildKiller for NoAgent {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(*self)
+    }
+}
+
+/// When this daemon started (ms since the epoch): a session that ended before it is past (`list`'s `past`).
+static STARTED_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 impl Session {
+    /// A chat session around `chat`, its agent not running yet (a new chat starts it next; a restored one when resumed).
+    #[allow(clippy::too_many_arguments)]
+    fn chat(
+        id: u64, kind: &str, name: Option<String>, parent: Option<u64>, cwd: String, argv: Vec<String>, created_ms: u64,
+        chat: Arc<chat::Chat>, ended: Option<(&'static str, u64)>, exit: Option<i32>,
+    ) -> Self {
+        let (tx, _) = broadcast::channel(16384);
+        Self {
+            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Mutex::new(None),
+            term: Mutex::new(harness_vt::Term::new(80, 24, 0)),
+            writer: Mutex::new(Box::new(NoAgent)), master: Mutex::new(None), killer: Mutex::new(Box::new(NoAgent)),
+            tx, exit: Mutex::new(exit), ended: Mutex::new(ended), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
+            last_out: AtomicU64::new(0), busy: AtomicBool::new(chat.busy.load(Ordering::Relaxed)), chat: Some(chat),
+            resuming: Mutex::new(()),
+        }
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        *self.pid.lock().unwrap()
+    }
+
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
         let mut w = self.writer.lock().unwrap();
         w.write_all(bytes)?;
@@ -72,7 +125,9 @@ impl Session {
         if cols == 0 || rows == 0 {
             return Ok(());
         }
-        self.master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
+        let master = self.master.lock().unwrap();
+        let Some(master) = master.as_ref() else { return Ok(()) };
+        master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
         self.term.lock().unwrap().resize(cols, rows);
         Ok(())
     }
@@ -86,6 +141,9 @@ impl Session {
     }
 
     pub fn screen_text(&self) -> String {
+        if let Some(c) = &self.chat {
+            return c.screen();
+        }
         self.term.lock().unwrap().text()
     }
 
@@ -95,7 +153,10 @@ impl Session {
 
     pub fn info(&self) -> Value {
         let (cols, rows) = self.size();
-        let title = self.term.lock().unwrap().title();
+        let title = match &self.chat {
+            Some(c) => c.title(),
+            None => self.term.lock().unwrap().title(),
+        };
         let ended = *self.ended.lock().unwrap();
         json!({
             "id": self.id, "object": format!("s{}", self.id), "kind": self.kind, "name": self.name, "parent": self.parent, "title": title, "cwd": self.cwd,
@@ -103,6 +164,8 @@ impl Session {
             "status": ended.map_or("running", |(s, _)| s), "ended_ms": ended.map(|(_, ms)| ms),
             "attached": self.attached.load(Ordering::Relaxed), "cols": cols, "rows": rows,
             "busy": self.busy.load(Ordering::Relaxed),
+            "mode": if self.chat.is_some() { "chat" } else { "tui" },
+            "model": self.chat.as_ref().map(|c| c.model()),
         })
     }
 
@@ -116,9 +179,37 @@ impl Session {
 
     /// No output for [`BUSY_MS`]: not busy any more (a change when it was).
     fn settle(&self, now: u64) {
-        if self.busy.load(Ordering::Relaxed) && now.saturating_sub(self.last_out.load(Ordering::Relaxed)) >= BUSY_MS && self.busy.swap(false, Ordering::Relaxed) {
+        if self.chat.is_none() && self.busy.load(Ordering::Relaxed) && now.saturating_sub(self.last_out.load(Ordering::Relaxed)) >= BUSY_MS && self.busy.swap(false, Ordering::Relaxed) {
             changed();
         }
+    }
+
+    /// A chat session's message: its user lines to the agent (Err: not a chat session).
+    pub fn chat_send(&self, text: &str) -> Result<()> {
+        let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
+        let untitled = c.title().is_empty();
+        let lines = c.user_lines(text, &self.tx);
+        if untitled && !c.title().is_empty() {
+            // The index keeps the title, so `list` names a past chat without reading its log.
+            db::set_meta(&format!("s{}", self.id), "title", &json!(c.title()));
+        }
+        self.busy.store(true, Ordering::Relaxed);
+        changed();
+        self.write_lines(&lines)
+    }
+
+    /// Stop a chat session's turn in flight.
+    pub fn chat_interrupt(&self) -> Result<()> {
+        let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
+        self.write_lines(&c.interrupt_lines())
+    }
+
+    /// Protocol lines to a chat child's stdin, each with its newline.
+    fn write_lines(&self, lines: &[String]) -> Result<()> {
+        for l in lines {
+            self.write(format!("{l}\n").as_bytes())?;
+        }
+        Ok(())
     }
 
     pub fn kill(&self) {
@@ -136,10 +227,13 @@ pub struct Daemon {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
-    /// Live sessions; with all: true also past ones from the index (status exited | lost).
+    /// Live sessions; with all: true also past ones from the index (status exited | lost), with chats: true every past
+    /// chat. Each row says `past`: it ended before this daemon started.
     List {
         #[serde(default)]
         all: bool,
+        #[serde(default)]
+        chats: bool,
     },
     Info,
     Last,
@@ -153,8 +247,17 @@ pub enum Req {
         name: Option<String>,
         cols: Option<u16>,
         rows: Option<u16>,
+        /// `chat` (Claude's and Codex's default) or `tui` (a PTY).
+        mode: Option<String>,
     },
-    Attach { id: u64, cols: Option<u16>, rows: Option<u16> },
+    /// `events`: a chat session's events as NDJSON (chat/mod.rs) instead of the conversation as text.
+    Attach {
+        id: u64,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        #[serde(default)]
+        events: bool,
+    },
     /// The change feed: an ok, then `{"ev":"changed","gen":N}` each time `list` or `runs` would answer differently
     /// (sessions or runs come, go, or change status, title or busy), coalesced to at most 20 a second. Like `attach`
     /// it holds the connection; any frame from the client ends it.
@@ -200,8 +303,38 @@ fn now_ms() -> u64 {
 }
 
 impl Daemon {
+    /// Session `id`: a live one, else a chat from before this daemon started, restored from its log (chat/mod.rs) and kept
+    /// from then on as a session whose agent is not running.
     pub fn get(&self, id: u64) -> Result<Arc<Session>> {
-        self.sessions.lock().unwrap().get(&id).cloned().ok_or_else(|| anyhow!("no session {id}"))
+        if let Some(s) = self.sessions.lock().unwrap().get(&id).cloned() {
+            return Ok(s);
+        }
+        let row = db::session(id).ok_or_else(|| anyhow!("no session {id}"))?;
+        if row["mode"] != "chat" {
+            anyhow::bail!("no session {id}: it ended before this daemon started, and only a chat can be opened again");
+        }
+        let s = Arc::new(Self::restore_chat(id, &row)?);
+        Ok(self.sessions.lock().unwrap().entry(id).or_insert(s).clone())
+    }
+
+    /// A past chat (`row` its index row) as a session: its conversation folded back from its log.
+    fn restore_chat(id: u64, row: &Value) -> Result<Session> {
+        let oid = format!("s{id}");
+        let dir = db::object_dir(&oid);
+        let c = chat::Chat::open(&oid, &dir, Box::new(chat::NoAdapter))
+            .with_context(|| format!("restoring chat {oid} from {}", dir.join("chat").display()))?;
+        let kind = row["kind"].as_str().unwrap_or("");
+        let status: &'static str = match row["status"].as_str() {
+            Some("killed") => "killed",
+            Some("exited") => "exited",
+            _ => "lost",
+        };
+        let ended = row["ended_ms"].as_u64().or(row["created_ms"].as_u64()).unwrap_or(0);
+        let argv = row["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_owned)).collect();
+        Ok(Session::chat(
+            id, kind, row["name"].as_str().map(str::to_owned), row["parent"].as_u64(), row["cwd"].as_str().unwrap_or("/").to_owned(),
+            argv, row["created_ms"].as_u64().unwrap_or(0), Arc::new(c), Some((status, ended)), row["exit"].as_i64().map(|c| c as i32),
+        ))
     }
 
     pub fn list(&self) -> Vec<Value> {
@@ -230,13 +363,27 @@ impl Daemon {
         // A known Claude session id ties this object to its transcript (the messages stream).
         let mut args = args.to_vec();
         let mut meta = json!({ "session": id, "cwd": cwd, "created_ms": created_ms });
+        // Claude and Codex run as a chat (stream-json, app-server; drawn by the app) unless `--tui` asks for their
+        // terminal UI.
+        let tui = args.iter().position(|a| a == "--tui").map(|i| args.remove(i)).is_some();
+        let chat = matches!(kind, "claude" | "codex") && !tui;
+        if chat {
+            meta["mode"] = json!("chat");
+            // What the person asked for (a model, flags): a resume launches with them again.
+            meta["user_args"] = json!(args);
+        }
         let resumes = args.iter().any(|a| matches!(a.as_str(), "-r" | "--resume" | "-c" | "--continue" | "--session-id"));
         if kind == "claude" && !resumes {
             let uuid = uuid_v4();
             args.splice(0..0, ["--session-id".to_string(), uuid.clone()]);
             meta["claude_session"] = json!(uuid);
         }
-        let launch = profiles::launch(kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt })?;
+        let launch = profiles::launch(
+            kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt: if chat { None } else { prompt }, chat },
+        )?;
+        if chat {
+            return self.spawn_chat(id, kind, launch, parent, cwd, prompt, name, env, meta, created_ms);
+        }
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
         cmd.cwd(&cwd);
@@ -270,14 +417,14 @@ impl Daemon {
         std::fs::create_dir_all(raw_path.parent().unwrap())?;
         let mut raw = std::fs::OpenOptions::new().create(true).append(true).open(&raw_path)?;
         db::session_start(&db::SessionRow {
-            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta,
+            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "pty",
         });
         let session = Arc::new(Session {
-            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid,
+            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Mutex::new(pid),
             term: Mutex::new(harness_vt::Term::new(if cols == 0 { 80 } else { cols }, if rows == 0 { 24 } else { rows }, 10_000)),
-            writer: Mutex::new(writer), master: Mutex::new(pair.master), killer: Mutex::new(killer),
+            writer: Mutex::new(writer), master: Mutex::new(Some(pair.master)), killer: Mutex::new(killer),
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
-            last_out: AtomicU64::new(0), busy: AtomicBool::new(false),
+            last_out: AtomicU64::new(0), busy: AtomicBool::new(false), chat: None, resuming: Mutex::new(()),
         });
         self.sessions.lock().unwrap().insert(id, session.clone());
         changed();
@@ -333,19 +480,216 @@ impl Daemon {
         Ok(id)
     }
 
+    /// A chat session (chat/mod.rs): its log opened, its agent started ([`Daemon::start_agent`]); `prompt`, if any, sent
+    /// as its first message.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_chat(
+        self: &Arc<Self>, id: u64, kind: &str, launch: profiles::Launch, parent: Option<u64>, cwd: String,
+        prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
+    ) -> Result<u64> {
+        let adapter: Box<dyn chat::Adapter> = match kind {
+            "claude" => Box::new(chat::claude::Claude::default()),
+            "codex" => Box::new(chat::codex::Codex::new(&cwd)),
+            other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
+        };
+        let oid = format!("s{id}");
+        let mut argv = vec![launch.program.clone()];
+        argv.extend(launch.args.iter().cloned());
+        db::session_start(&db::SessionRow {
+            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "chat",
+        });
+        let c = Arc::new(chat::Chat::open(&oid, &db::object_dir(&oid), Box::new(chat::NoAdapter))?);
+        let session = Arc::new(Session::chat(id, kind, name, parent, cwd, argv, created_ms, c, None, None));
+        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.start_agent(&session, &launch, adapter, env)?;
+        changed();
+        if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
+            session.chat_send(p)?;
+        }
+        eprintln!("spawned chat session {id}: {kind} (parent {parent:?})");
+        Ok(id)
+    }
+
+    /// Start chat `s`'s agent: `launch` run with stdin and stdout piped, each line it writes recorded through `adapter`
+    /// (chat/claude.rs, chat/codex.rs) into the chat's log, until it exits. The same for a new chat and a resumed one.
+    fn start_agent(
+        &self, s: &Arc<Session>, launch: &profiles::Launch, adapter: Box<dyn chat::Adapter>, env: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        use std::io::BufRead;
+        let c = s.chat.clone().ok_or_else(|| anyhow!("session {} is not a chat session", s.id))?;
+        let (id, oid) = (s.id, format!("s{}", s.id));
+        let dir = db::object_dir(&oid);
+        db::index_stream(&oid, "chat", &dir.join("chat"));
+        db::index_stream(&oid, "messages", &dir.join("messages"));
+        let mut cmd = std::process::Command::new(&launch.program);
+        cmd.args(&launch.args).current_dir(&s.cwd);
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy();
+            if k == "CLAUDECODE" || k == "AI_AGENT" || k.starts_with("CLAUDE_CODE_") || k.starts_with("CODEX_") {
+                cmd.env_remove(k.as_ref());
+            }
+        }
+        cmd.envs(launch.env.iter().chain(env));
+        if let Some(p) = s.parent {
+            cmd.env("HARNESS_PARENT", p.to_string());
+        }
+        let stderr = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("stderr"))?;
+        cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(stderr);
+        let mut child = cmd.spawn().with_context(|| format!("{oid}: spawn {}", launch.program))?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("{oid}: no stdin pipe"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("{oid}: no stdout pipe"))?;
+        let pid = child.id();
+        c.set_adapter(&dir, adapter)?;
+        *s.writer.lock().unwrap() = Box::new(stdin);
+        *s.killer.lock().unwrap() = Box::new(chat::PidKiller(pid));
+        *s.pid.lock().unwrap() = Some(pid);
+        s.killed.store(false, Ordering::Relaxed);
+        *s.exit.lock().unwrap() = None;
+        *s.ended.lock().unwrap() = None;
+        let reader = {
+            let (s, c) = (s.clone(), c.clone());
+            std::thread::Builder::new().name(format!("chat-read-{id}")).spawn(move || {
+                let mut r = std::io::BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let (flipped, replies) = c.agent_line(&line, &s.tx);
+                    if flipped {
+                        s.busy.store(c.busy.load(Ordering::Relaxed), Ordering::Relaxed);
+                        changed();
+                    }
+                    if let Err(e) = s.write_lines(&replies) {
+                        eprintln!("chat session {id}: writing to the agent: {e}");
+                    }
+                }
+            })?
+        };
+        let s2 = s.clone();
+        std::thread::Builder::new().name(format!("chat-wait-{id}")).spawn(move || {
+            let s = s2;
+            let st = child.wait();
+            // Every line it wrote is recorded before the chat says it ended (and before a resume can start another).
+            let _ = reader.join();
+            let code = st.as_ref().ok().and_then(std::process::ExitStatus::code).unwrap_or(-1);
+            let signalled = st.as_ref().is_ok_and(|st| std::os::unix::process::ExitStatusExt::signal(st).is_some());
+            let status = if signalled || s.killed.load(Ordering::Relaxed) { "killed" } else { "exited" };
+            let ended = now_ms();
+            if let Some(c) = &s.chat {
+                c.ended(&s.tx);
+            }
+            *s.writer.lock().unwrap() = Box::new(NoAgent);
+            *s.killer.lock().unwrap() = Box::new(NoAgent);
+            *s.pid.lock().unwrap() = None;
+            s.busy.store(false, Ordering::Relaxed);
+            *s.ended.lock().unwrap() = Some((status, ended));
+            *s.exit.lock().unwrap() = Some(code);
+            changed();
+            let _ = s.tx.send(Ev::Exit(code));
+            db::session_end(s.id, code, status, ended);
+        })?;
+        s.write_lines(&c.start_lines())?;
+        Ok(())
+    }
+
+    /// A message to chat `s`: sent to its agent, which is resumed first when it is not running.
+    fn chat_send(self: &Arc<Self>, s: &Arc<Session>, text: &str) -> Result<()> {
+        {
+            let _one = s.resuming.lock().unwrap();
+            if s.ended.lock().unwrap().is_some() {
+                if let Err(e) = self.resume(s) {
+                    if let Some(c) = &s.chat {
+                        let why = format!("Can't resume this chat: {e:#}. The message was not sent.");
+                        c.record(json!({"ev": "error", "text": why}), &s.tx);
+                    }
+                    return Err(e.context(format!("resuming chat s{}", s.id)));
+                }
+            }
+        }
+        s.chat_send(text)
+    }
+
+    /// Start chat `s`'s agent again on its log, continuing its conversation by the agent's own id for it (from the log):
+    /// Claude with `--resume`, Codex with `thread/resume`. An error names why it cannot; it never starts a fresh one.
+    fn resume(self: &Arc<Self>, s: &Arc<Session>) -> Result<()> {
+        let c = s.chat.clone().ok_or_else(|| anyhow!("session {} is not a chat session", s.id))?;
+        let oid = format!("s{}", s.id);
+        let meta = db::object_kind_meta(&oid).map(|(_, m)| m).unwrap_or_else(|| json!({}));
+        // A Claude chat recorded before `session` events carried its id was started with `--session-id` set to the id
+        // the index keeps (spawn_named): the same id, from where it was written then.
+        let session = c.session_id().or_else(|| (s.kind == "claude").then(|| meta["claude_session"].as_str().map(str::to_owned)).flatten());
+        let Some(session) = session else {
+            anyhow::bail!("its log never named {}'s id for the conversation (it predates harness recording it), so there is nothing to resume", s.kind);
+        };
+        // The person's own args from the first launch (a model, flags), less any that chose a conversation.
+        let mut args = Vec::new();
+        let mut user = meta["user_args"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        while let Some(a) = user.next() {
+            match a {
+                "-r" | "--resume" | "--session-id" => {
+                    let _ = user.next();
+                }
+                "-c" | "--continue" => {}
+                a => args.push(a.to_owned()),
+            }
+        }
+        let adapter: Box<dyn chat::Adapter> = match s.kind.as_str() {
+            "claude" => {
+                args.extend(["--resume".to_owned(), session.clone()]);
+                Box::new(chat::claude::Claude::default())
+            }
+            "codex" => Box::new(chat::codex::Codex::resume(&s.cwd, &session)),
+            other => anyhow::bail!("{other} has no chat adapter to resume with"),
+        };
+        if let Some(n) = &s.name {
+            db::check_name(n)?;
+        }
+        let launch = profiles::launch(
+            &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
+        )?;
+        let mut argv = vec![launch.program.clone()];
+        argv.extend(launch.args.iter().cloned());
+        db::session_start(&db::SessionRow {
+            id: s.id, kind: &s.kind, name: s.name.as_deref(), parent: s.parent, cwd: &s.cwd, argv: &argv, created_ms: s.created_ms,
+            meta, stream: "chat",
+        });
+        self.start_agent(s, &launch, adapter, &BTreeMap::new())?;
+        changed();
+        eprintln!("resumed chat session {}: {} {session}", s.id, s.kind);
+        Ok(())
+    }
+
     fn handle(self: &Arc<Self>, req: Req) -> Result<Value> {
         Ok(match req {
-            Req::List { all } => {
+            Req::List { all, chats } => {
                 let mut v = self.list();
-                if all {
+                if all || chats {
                     let live: std::collections::HashSet<u64> = v.iter().filter_map(|s| s["id"].as_u64()).collect();
-                    v.extend(db::sessions().into_iter().filter(|s| s["id"].as_u64().is_some_and(|i| !live.contains(&i))));
+                    v.extend(
+                        db::sessions()
+                            .into_iter()
+                            .filter(|s| s["id"].as_u64().is_some_and(|i| !live.contains(&i)) && (all || s["mode"] == "chat")),
+                    );
                     v.sort_by_key(|s| s["id"].as_u64());
+                }
+                let started = STARTED_MS.get().copied().unwrap_or(0);
+                for s in &mut v {
+                    s["past"] = json!(s["ended_ms"].as_u64().is_some_and(|e| e < started));
                 }
                 json!({ "sessions": v })
             }
             Req::ReplTask { task } => {
                 db::repl_task(&task)?;
+                // A cell a chat session's tool call ran: that call's card (chat/mod.rs `tool_detail`).
+                if let (Some(call), Some(sid)) = (task["call"].as_str(), task["session"].as_u64())
+                    && let Ok(s) = self.get(sid)
+                    && let Some(c) = &s.chat
+                {
+                    c.record(chat::tool_detail(call, &task), &s.tx);
+                }
                 changed();
                 json!({ "ok": true })
             }
@@ -358,7 +702,10 @@ impl Daemon {
             Req::SpawnObject { opts } => crate::object::spawn(self, &opts)?,
             Req::Object { id } => crate::object::info(self, &id)?,
             Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
-            Req::Spawn { kind, args, parent, cwd, prompt, name, cols, rows } => {
+            Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode } => {
+                if mode.as_deref() == Some("tui") {
+                    args.push("--tui".into());
+                }
                 let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40))?;
                 json!({ "id": id })
             }
@@ -366,6 +713,8 @@ impl Daemon {
                 let s = self.get(id)?;
                 if raw {
                     s.write(text.as_bytes())?;
+                } else if s.chat.is_some() {
+                    self.chat_send(&s, &text)?;
                 } else {
                     crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
@@ -415,11 +764,13 @@ pub async fn run() -> Result<()> {
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     // The object index: session ids continue after the last one ever used; sessions the last daemon
     // left running are lost; older runs get indexed, finished objects compacted, transcripts mirrored.
+    STARTED_MS.get_or_init(now_ms);
     db::mark_lost_sessions();
     let next = db::max_session_id() + 1;
     std::thread::spawn(|| {
         runs::backfill();
         archive::compact_pending();
+        chat::backfill_titles();
     });
     std::thread::spawn(messages::poll);
     let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(next), last: Mutex::new(None) });
@@ -471,11 +822,15 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
-        if let Req::Attach { id, cols, rows } = req {
-            let s = match d.get(id) {
+        if let Req::Attach { id, cols, rows, events } = req {
+            let got = {
+                let d = d.clone();
+                tokio::task::spawn_blocking(move || d.get(id)).await?
+            };
+            let s = match got {
                 Ok(s) => s,
                 Err(e) => {
-                    proto::write_json(&mut w, &json!({ "error": e.to_string() })).await?;
+                    proto::write_json(&mut w, &json!({ "error": format!("{e:#}") })).await?;
                     continue;
                 }
             };
@@ -484,6 +839,9 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             }
             *d.last.lock().unwrap() = Some(id);
             proto::write_json(&mut w, &json!({ "ok": true, "info": s.info() })).await?;
+            if let Some(c) = s.chat.clone() {
+                return attach_chat(s, c, events, r, w).await;
+            }
             return attach(s, r, w).await;
         }
         if let Req::Watch = req {
@@ -573,6 +931,99 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
     out.abort();
     s.attached.fetch_sub(1, Ordering::Relaxed);
     res
+}
+
+/// A chat session's attach: its history, then its events live; as event lines (`events`, the app) or as the
+/// conversation's text (the terminal client). Its agent's exit is a T_EXIT: the terminal client's stream ends there, the
+/// app's stays open (the chat outlives its agent, and a resume's events come on it). Detached by any JSON frame; a
+/// client that falls behind the broadcast is dropped, and attaches again for a fresh history.
+async fn attach_chat(
+    s: Arc<Session>, c: Arc<chat::Chat>, events: bool, mut r: tokio::net::unix::OwnedReadHalf,
+    mut w: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    s.attached.fetch_add(1, Ordering::Relaxed);
+    let (history, mut rx) = c.history_and_subscribe(&s.tx);
+    let exited = *s.exit.lock().unwrap();
+    let sid = s.id;
+    let render = chat_render(events);
+    let mut out = tokio::spawn(async move {
+        send_history(&mut w, &history, &render).await?;
+        if let Some(code) = exited {
+            proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+            if !events {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+        loop {
+            match rx.recv().await {
+                Ok(Ev::Data(b)) => {
+                    let bytes = render(&b);
+                    if !bytes.is_empty() {
+                        proto::write_frame(&mut w, proto::T_DATA, &bytes).await?;
+                    }
+                }
+                Ok(Ev::Exit(code)) => {
+                    proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+                    if !events {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    return Err(anyhow!("chat attach to s{sid} fell {n} events behind; attach again"));
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    });
+    let input = async {
+        while let Some((t, _)) = proto::read_frame(&mut r).await? {
+            if t == proto::T_JSON {
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let res = tokio::select! {
+        r = input => r,
+        r = &mut out => r.map_err(anyhow::Error::from).and_then(|x| x),
+    };
+    out.abort();
+    s.attached.fetch_sub(1, Ordering::Relaxed);
+    res
+}
+
+/// How a chat attach sends event lines: as they are (`events`, the app), or as the conversation's text (the terminal
+/// client).
+fn chat_render(events: bool) -> impl Fn(&[u8]) -> Vec<u8> + Send + 'static {
+    move |lines: &[u8]| -> Vec<u8> {
+        if events {
+            return lines.to_vec();
+        }
+        let mut out = String::new();
+        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
+        }
+        out.replace('\n', "\r\n").into_bytes()
+    }
+}
+
+/// A chat's history to an attach, in T_DATA frames of whole lines, about 256 KB each.
+async fn send_history(
+    w: &mut tokio::net::unix::OwnedWriteHalf, history: &[impl AsRef<str>], render: impl Fn(&[u8]) -> Vec<u8>,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    for l in history {
+        buf.extend_from_slice(l.as_ref().as_bytes());
+        buf.push(b'\n');
+        if buf.len() >= 256 * 1024 {
+            proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+    }
+    Ok(())
 }
 
 /// Random RFC 4122 v4 UUID (for Claude's --session-id).

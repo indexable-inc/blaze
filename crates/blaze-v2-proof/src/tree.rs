@@ -122,13 +122,17 @@ fn list(dir: &Path, rel: &str, skip: &[String]) -> io::Result<Listed> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             // alloc: an error
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: a name that is not UTF-8", path.display())));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: a name that is not UTF-8", path.display()),
+            ));
         };
         let kind = entry.file_type().map_err(|e| named(&path, &e))?;
         // `os.walk` lists a link to a directory with the directories, so `skip` takes it too.
         if rel.is_empty()
             && skip.iter().any(|it| it == name)
-            && (kind.is_dir() || (kind.is_symlink() && fs::metadata(&path).is_ok_and(|it| it.is_dir())))
+            && (kind.is_dir()
+                || (kind.is_symlink() && fs::metadata(&path).is_ok_and(|it| it.is_dir())))
         {
             continue;
         }
@@ -138,7 +142,10 @@ fn list(dir: &Path, rel: &str, skip: &[String]) -> io::Result<Listed> {
             let to = fs::read_link(&path).map_err(|e| named(&path, &e))?;
             let Some(to) = to.to_str() else {
                 // alloc: an error
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: a link target that is not UTF-8", path.display())));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: a link target that is not UTF-8", path.display()),
+                ));
             };
             // alloc: per link, its target
             listed.links.push(Entry::Link { rel: child, to: to.to_owned() });
@@ -196,9 +203,9 @@ fn executable(_: &Path, meta: &fs::Metadata) -> bool {
 /// What Python's `lstat` says of a file on Windows: executable by its extension.
 #[cfg(not(unix))]
 fn executable(path: &Path, _: &fs::Metadata) -> bool {
-    path.extension()
-        .and_then(|it| it.to_str())
-        .is_some_and(|it| ["exe", "bat", "cmd", "com"].iter().any(|ext| it.eq_ignore_ascii_case(ext)))
+    path.extension().and_then(|it| it.to_str()).is_some_and(|it| {
+        ["exe", "bat", "cmd", "com"].iter().any(|ext| it.eq_ignore_ascii_case(ext))
+    })
 }
 
 fn named(path: &Path, error: &io::Error) -> io::Error {

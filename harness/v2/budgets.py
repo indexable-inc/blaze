@@ -90,6 +90,13 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate);
                    unmeasured on v1, which has none of v2's components
 
+The timed budgets (body, big-crate, noop) also count the instructions and cycles the daemon's
+processes retired over each timed build, from quiet to quiet (counters.py: Linux's counters in
+user mode on every thread of the daemon and what it starts, macOS's totals; the `blaze` command
+itself is not counted here): `instructions` and `cycles` are their medians, `instructions_samples`
+every sample, and where they cannot be counted `counts_gap` says why. warm-start's daemon is new
+each run, so it is not counted.
+
 Each project's checkout has a blaze home and store of its own and a cargo target directory
 outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
 or that fails is a fail. The program after the first of every edit's runs, and after a warm
@@ -126,7 +133,9 @@ import report
 import bench
 import bounds
 import blaze_cli
+import counters
 import memory
+import storelib
 
 SCRIPT = "budgets.py"
 Budget = Literal[
@@ -141,8 +150,6 @@ RUN_SECS = 600
 # docs/v2/plan/design/restore.md: Linux's one batched statx sweep, about 50 ms for 100k files.
 STATX_US_PER_FILE = 0.5
 GONE_SECS = 60.0
-# `blaze status`: v2's first line (blaze_cargo::cli::daemon::status_lines), v1's `daemon:` line.
-DAEMON_PID = re.compile(r"^(?:pid: |daemon: pid )(\d+)\b", re.M)
 
 PROJECTS: dict[str, dict[str, Any]] = getattr(bench, "PROJECTS")
 LET: str = getattr(bench, "LET")
@@ -784,16 +791,29 @@ def served(eng: engine.Engine, step: str, ran: engine.Ran) -> engine.Ran:
     return ran
 
 
+def count_numbers(counted: Sequence[counters.Counts]) -> dict[str, report.Number]:
+    """counters.summary of a budget's samples, as numbers of its outcome."""
+    out: dict[str, report.Number] = {}
+    for key, value in counters.summary(counted).items():
+        if isinstance(value, list):
+            out[key] = " ".join(str(v) for v in cast(list[int], value))
+        elif value is None or isinstance(value, (int, float, str, bool)):
+            out[key] = value
+    return out
+
+
 @dataclass(frozen=True)
 class Edits:
     seconds: tuple[float, ...]
     compiled: tuple[int, ...]
     places: int
+    counted: tuple[counters.Counts, ...] = ()
 
     def numbers(self) -> dict[str, report.Number]:
         ms = [s * 1000 for s in self.seconds]
         return dict(median_ms=round(statistics.median(ms), 3), samples_ms=samples(ms), places=self.places,
-                    compiled_each=" ".join(map(str, self.compiled)) or None, **spread(ms, "ms"))
+                    compiled_each=" ".join(map(str, self.compiled)) or None, **spread(ms, "ms"),
+                    **count_numbers(self.counted))
 
 
 @dataclass(frozen=True)
@@ -825,6 +845,22 @@ class Lane:
         self.cargo_env = engine.reference_env(self.ref, extra)
         self.build_args: list[str] = list(self.spec.get("build") or [])
         self.run_args: list[str] | None = None if self.spec.get("run") is None else list(self.spec["run"])
+        # The daemon's processes, counted from its cold build on (`count_daemon`).
+        self.meter = counters.Meter()
+
+    def count_daemon(self) -> None:
+        """Counts the daemon serving this checkout, and what it starts, from now on."""
+        try:
+            self.meter.follow(daemon_pid(self.home))
+        except engine.Failed as e:
+            # The budgets stand without counts; each count says why it is missing.
+            self.meter.gap = f"no daemon to count: {e}"
+
+    def counted_build(self, step: str, count: bool) -> tuple[float, engine.Work | None, counters.Counts]:
+        """`build`, with what the daemon's processes retired from quiet before it to quiet after."""
+        before = self.meter.settle()
+        took, work = self.build(step, count)
+        return took, work, self.meter.since(before, self.meter.settle())
 
     def anchor(self) -> tuple[str, str]:
         """The file and the opening line of bench.py's `body` edit."""
@@ -902,14 +938,16 @@ class Lane:
         first, the program is checked against blaze's build of it from nothing (`wrong`)."""
         seconds: list[float] = []
         compiled: list[int] = []
+        counted: list[counters.Counts] = []
         places = 0
         n = 0
         while (len(seconds) < self.args.runs if limit_ms is None
                else not enough([s * 1000 for s in seconds], limit_ms, self.args)):
             places = apply(n)
             try:
-                took, work = self.build(f"{step} {n + 1}", count)
+                took, work, used = self.counted_build(f"{step} {n + 1}", count)
                 seconds.append(took)
+                counted.append(used)
                 if work is not None:
                     if work.compiled is None:
                         raise engine.Unmeasurable(f"{self.eng.kind} did not say how many functions the {step} compiled")
@@ -920,7 +958,7 @@ class Lane:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
             n += 1
-        return Edits(tuple(seconds), tuple(compiled), places)
+        return Edits(tuple(seconds), tuple(compiled), places, tuple(counted))
 
     def text_edit(self, file: str, make: Callable[[str, int], str]) -> tuple[Apply, Revert]:
         path = self.ws / file
@@ -948,7 +986,7 @@ class Lane:
 
     def timed_edit(self, step: str, limit_ms: float) -> Measured:
         e = self.edits(step, *self.bench_edit("body"), False, limit_ms)
-        return timed([s * 1000 for s in e.seconds], "ms", places=e.places)
+        return timed([s * 1000 for s in e.seconds], "ms", places=e.places, **count_numbers(e.counted))
 
     def nothing_compiled(self, step: str, make: Callable[[str, int], str]) -> Measured:
         file, _ = self.anchor()
@@ -963,9 +1001,12 @@ class Lane:
     def noop(self, limit_ms: float) -> Measured:
         self.build("the no-op build that warms up", False)
         ms: list[float] = []
+        counted: list[counters.Counts] = []
         while not enough(ms, limit_ms, self.args):
-            ms.append(self.build(f"no-op build {len(ms) + 1}", False)[0] * 1000)
-        return timed(ms, "ms", harness_floor_ms=round(harness_floor_ms(self.ws, self.env), 3))
+            took, _, used = self.counted_build(f"no-op build {len(ms) + 1}", False)
+            ms.append(took * 1000)
+            counted.append(used)
+        return timed(ms, "ms", harness_floor_ms=round(harness_floor_ms(self.ws, self.env), 3), **count_numbers(counted))
 
     def warm_start(self, limit_ms: float) -> Measured:
         ms: list[float] = []
@@ -1091,6 +1132,7 @@ class Lane:
             rep.add(f"{self.name}: the function and its call taken out", "error", f"{type(e).__name__}: {e}")
 
     def stop(self, rep: report.Report) -> None:
+        self.meter.close()
         try:
             self.eng.stop(self.ws, self.env)
         except engine.Failed as e:
@@ -1109,6 +1151,7 @@ def third_party(eng: engine.Engine, rep: report.Report, args: Input, work: Path,
             cold = lane.cold()
             if bad := lane.wrong("the cold build"):
                 raise Wrong(bad)
+            lane.count_daemon()
         except SETUP_ERRORS as e:
             setup_failed(rep, rows.values(), e)
             return
@@ -1250,12 +1293,14 @@ def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], limit_s: 
     return timed(seconds, "s", tests_run=ran_tests, edited=edit.file)
 
 
-def daemon_pid(status: str) -> int:
-    """The daemon's process in what `blaze status` printed."""
-    found = DAEMON_PID.findall(status)
-    if len(found) != 1:
-        raise engine.Failed(f"`blaze status` names {len(found)} daemon processes, not one:\n{status[-1000:]}")
-    return int(found[0])
+def daemon_pid(home: Path) -> int:
+    """The daemon running on `home`, from its lock (`storelib.daemon_pid`): `blaze status` says
+    its pid for people only, with no machine format."""
+    pid = storelib.daemon_pid(str(home))
+    if pid is None:
+        raise engine.Failed(f"no daemon runs on {home}: {Path(storelib.state_of(str(home))) / 'serve.lock'} "
+                            "names none that runs")
+    return pid
 
 
 def restart_limit(warm_ms: float, files: int, slack_ms: float, sweeps: bool) -> float:
@@ -1337,8 +1382,7 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
                                       args):
             n = len(first)
             warm.append(check(f"warm no-op check {n + 1}"))
-            status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
-            pid = daemon_pid(status.stdout)
+            pid = daemon_pid(Path(env["BLAZE_HOME"]))
             if how == "clean":
                 eng.stop(ws, env)
                 until_gone(f"the daemon {pid} after `blaze stop`", lambda: alive(pid))
@@ -1542,15 +1586,19 @@ def selftest() -> None:
     expect("median_low_ms" not in timed([1.0, 2, 3], "ms").numbers, "no interval is reported from 3 runs")
     expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
                                     "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
-    v2_status = "pid: 41\nrequests: 2 (7, 9)\nviews: 1\nmemory: 1.5 GiB of 8.0 GiB\n"
-    v1_status = "daemon: pid 123, version 0.1, exits never, no limit\n  worker: pid 456, ready, log /h/w/1/log\n"
-    expect(daemon_pid(v2_status) == 41 and daemon_pid(v1_status) == 123, "the daemon's pid in v2's and v1's status")
-    for status in ("no daemon is running\n", "requests: 0\n  pid: 9\n", v2_status + "pid: 42\n"):
-        try:
-            daemon_pid(status)
-            expect(False, f"a status naming no one daemon is refused: {status!r}")
-        except engine.Failed:
-            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        lock = Path(storelib.state_of(tmp)) / "serve.lock"
+        lock.parent.mkdir()
+        lock.write_text(str(os.getpid()))
+        expect(daemon_pid(home) == os.getpid(), "the daemon's pid from its lock")
+        for said in (f"{os.getpid()} stopped", "", "not a pid"):
+            lock.write_text(said)
+            try:
+                daemon_pid(home)
+                expect(False, f"a lock naming no daemon that runs is refused: {said!r}")
+            except engine.Failed:
+                pass
     expect(restart_limit(12.0, 100_000, 5.0, True) == 67.0, "the restart budget with Linux's statx sweep")
     expect(restart_limit(12.0, 100_000, 5.0, False) == 17.0, "the restart budget where a journal survives")
     restarts = {row.key: row for row in ROWS if row.budget == "restart"}

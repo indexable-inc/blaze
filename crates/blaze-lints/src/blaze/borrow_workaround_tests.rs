@@ -26,7 +26,10 @@ impl<K, V> core::ops::Index<&K> for HashMap<K, V> {
 const FLAGS: &str = "-A clippy::all --warn=blaze::borrow_workaround --warn=blaze::nll_workaround";
 
 fn fixture(main: &str) -> String {
-    format!("{MINICORE}{MAP}//- /src/lib.rs crate:main deps:hashbrown\n{}", main.trim_start_matches('\n'))
+    format!(
+        "{MINICORE}{MAP}//- /src/lib.rs crate:main deps:hashbrown\n{}",
+        main.trim_start_matches('\n')
+    )
 }
 
 fn run(main: &str, given: fn(&mut Fixture)) -> String {

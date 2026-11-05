@@ -1,6 +1,6 @@
 //! The four hashes and the keys: what an edit changes and what it keeps.
 
-use hir_def::{AdtId, DefWithBodyId, expr_store::Body, hir::Expr};
+use hir_def::{AdtId, DefWithBodyId, ItemContainerId, Lookup, expr_store::Body, hir::Expr};
 use hir_expand::fixture;
 use hir_ty::db::{InternedClosure, InternedClosureId};
 
@@ -439,6 +439,59 @@ fn f() -> &'static str { intrinsics::type_name::<T>() }
     assert_ne!(of(&db, "f").code, f.code, "`type_name` spells the name");
 }
 
+/// A body reading `<T as Tr>::K` holds the value `K` has for `T`, which the impl `T` selects
+/// gives: the alias spells `T` by its interface, which two types alike but for their name
+/// share, so two impls one macro writes for two such types (hir-def's `query_ids!` over its
+/// ids, reading `<$ty as Relocate>::KIND`) were one code with two compiled bodies. Bodies
+/// alike that read one value, of one type or of two types alike, still share their code.
+#[test]
+fn a_trait_constant_is_spelled_by_its_value() {
+    let (db, _) = single(
+        r#"
+trait Kind { const KIND: u8; }
+macro_rules! ids {
+    ($($ty:ident = $kind:literal),*) => {$(
+        pub struct $ty(u32);
+        impl Kind for $ty { const KIND: u8 = $kind; }
+    )*};
+}
+ids!(A = 13, B = 0, C = 13);
+trait Get { fn get() -> u8; }
+macro_rules! get {
+    ($($ty:ty),*) => {$(
+        impl Get for $ty { fn get() -> u8 { <$ty as Kind>::KIND } }
+    )*};
+}
+get!(A, B);
+fn a() -> u8 { <A as Kind>::KIND }
+fn a_again() -> u8 { <A as Kind>::KIND }
+fn b() -> u8 { <B as Kind>::KIND }
+fn c() -> u8 { <C as Kind>::KIND }
+"#,
+    );
+    let code = |id: ItemId| {
+        hash::code_hash(&db, id)
+            .unwrap_or_else(|err| panic!("{}", err.describe(&db)))
+            .expect("a body")
+    };
+    let gets: Vec<_> = super::items(&db)
+        .into_iter()
+        .filter(|&id| match id {
+            ItemId::Function(it) => {
+                matches!(it.lookup(&db).container, ItemContainerId::ImplId(_))
+                    && key::path(&db, id).ends_with("::get")
+            }
+            _ => false,
+        })
+        .collect();
+    assert_eq!(gets.len(), 2, "the two `get`s `get!` writes: {gets:?}");
+    assert_ne!(code(gets[0]), code(gets[1]), "`KIND` is 13 for `A` and 0 for `B`");
+    let (a, b, c) = (of(&db, "a").code, of(&db, "b").code, of(&db, "c").code);
+    assert_ne!(a, b, "`A` and `B` are alike but for their name and `KIND`");
+    assert_eq!(of(&db, "a_again").code, a, "one body written twice is one code");
+    assert_eq!(c, a, "one value of two types alike is one code");
+}
+
 #[test]
 fn callers_of_two_intrinsics_of_one_signature_differ_in_code() {
     let (db, _) = single(
@@ -636,15 +689,20 @@ fn a_crate_with_other_dependencies_has_another_key() {
             .iter()
             .copied()
             .find(|&it| {
-                it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.canonical_name().as_str() == "a")
+                it.extra_data(&db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.canonical_name().as_str() == "a")
             })
             .expect("crate `a`");
         key::crate_key(&db, a)
     };
     let alone = key_of_a("//- /a.rs crate:a\npub struct S;\n//- /d.rs crate:d\npub struct D;\n");
-    let with_d = key_of_a("//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d\npub struct D;\n");
-    let with_other_d =
-        key_of_a("//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d cfg:x\npub struct D;\n");
+    let with_d =
+        key_of_a("//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d\npub struct D;\n");
+    let with_other_d = key_of_a(
+        "//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d cfg:x\npub struct D;\n",
+    );
     assert_ne!(alone, with_d, "a dependency more");
     assert_ne!(with_d, with_other_d, "the dependency's own key");
 }
@@ -653,7 +711,9 @@ fn a_crate_with_other_dependencies_has_another_key() {
 /// version, origin, kind, edition, cfg and no dependencies), stops with an error naming both.
 #[test]
 fn two_crates_of_one_key_stop_the_build_naming_both() {
-    let mut db = fixture::db("//- /a.rs crate:a\npub struct S;\n//- /b.rs crate:b\npub struct S;\n").into_db();
+    let mut db =
+        fixture::db("//- /a.rs crate:a\npub struct S;\n//- /b.rs crate:b\npub struct S;\n")
+            .into_db();
     let krates: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
     let a = krates[0];
     let (data, workspace) = (a.data(&db).clone(), a.workspace_data(&db).clone());
@@ -693,7 +753,9 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
     use blaze_query::db::Durability;
     // (what the crate is built as, the manifest target's kind)
     let graph = |kinds: &[(base_db::TargetKind, base_db::TargetKind)]| {
-        let fixture: String = (0..kinds.len()).map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n")).collect();
+        let fixture: String = (0..kinds.len())
+            .map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n"))
+            .collect();
         let mut db = fixture::db(&fixture).into_db();
         let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
         let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
@@ -702,7 +764,10 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
             let data = base_db::BuiltCrateData {
                 root_file_id: it.data(&db).root_file_id,
                 dependencies: Vec::new(),
-                origin: base_db::CrateOrigin::Local { repo: None, name: Some(intern::Symbol::intern("blaze-registry")) },
+                origin: base_db::CrateOrigin::Local {
+                    repo: None,
+                    name: Some(intern::Symbol::intern("blaze-registry")),
+                },
                 target_kind,
                 manifest_kind,
                 ..data.clone()
@@ -712,11 +777,18 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
                 display_name: Some(base_db::CrateDisplayName::from_canonical_name("fetch")),
                 potential_cfg_options: None,
                 built_for: base_db::BuiltFor::default(),
-                build_script_runs: Box::new([]),
             };
             let cfg = cfg::CfgOptions::default();
             let env = base_db::Env::default();
-            krates.push(base_db::Crate::create(&mut db, data, extra, workspace.clone(), cfg, env, Durability::LOW));
+            krates.push(base_db::Crate::create(
+                &mut db,
+                data,
+                extra,
+                workspace.clone(),
+                cfg,
+                env,
+                Durability::LOW,
+            ));
         }
         base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
         (db, krates)
@@ -739,11 +811,15 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
     }
 
     let (db, _) = graph(&[(Test, Test), (Test, Test)]);
-    let clash = key::check_crate_keys(&db).expect_err("a test and a test of one name are one crate");
+    let clash =
+        key::check_crate_keys(&db).expect_err("a test and a test of one name are one crate");
     assert!(clash.same_key, "{clash}");
     let (db, _) = graph(&[(Test, Example), (Test, Example)]);
     let message = key::check_crate_keys(&db).expect_err("two examples of one name").to_string();
-    assert!(message.contains("test of the example target"), "the error names the target's kind: {message}");
+    assert!(
+        message.contains("test of the example target"),
+        "the error names the target's kind: {message}"
+    );
 }
 
 /// One package built for the host, for `--target` of the host's own triple, for
@@ -761,7 +837,9 @@ fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_ea
         macro_wasm,
     };
     let graph = |kinds: &[base_db::BuiltFor]| {
-        let fixture: String = (0..kinds.len()).map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n")).collect();
+        let fixture: String = (0..kinds.len())
+            .map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n"))
+            .collect();
         let mut db = fixture::db(&fixture).into_db();
         let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
         let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
@@ -778,15 +856,27 @@ fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_ea
                 display_name: Some(base_db::CrateDisplayName::from_canonical_name("proc_macro")),
                 potential_cfg_options: None,
                 built_for: built_for.clone(),
-                build_script_runs: Box::new([]),
             };
             let (cfg, env) = (cfg::CfgOptions::default(), base_db::Env::default());
-            krates.push(base_db::Crate::create(&mut db, data, extra, workspace.clone(), cfg, env, Durability::LOW));
+            krates.push(base_db::Crate::create(
+                &mut db,
+                data,
+                extra,
+                workspace.clone(),
+                cfg,
+                env,
+                Durability::LOW,
+            ));
         }
         base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
         (db, krates)
     };
-    let kinds = [built_for(None, false), built_for(Some(host), false), built_for(Some(wasm), false), built_for(Some(wasm), true)];
+    let kinds = [
+        built_for(None, false),
+        built_for(Some(host), false),
+        built_for(Some(wasm), false),
+        built_for(Some(wasm), true),
+    ];
     let (db, krates) = graph(&kinds);
     key::check_crate_keys(&db).unwrap_or_else(|clash| panic!("{clash}"));
     let keys: Vec<_> = krates.iter().map(|&krate| key::crate_key(&db, krate)).collect();
@@ -1046,13 +1136,17 @@ fn mir_that_fails_to_lower_is_named_in_the_error() {
     assert_eq!(err.what, "MIR that failed to lower", "{}", err.describe(&db));
     let ItemId::Function(func) = id else { panic!("`f` is {id:?}") };
     let owner = hir_ty::InferBodyId::DefWithBodyId(DefWithBodyId::from(func));
-    let lowering = hir_ty::db::HirDatabase::mir_body(&db, owner).expect_err("`f`'s MIR fails to lower");
+    let lowering =
+        hir_ty::db::HirDatabase::mir_body(&db, owner).expect_err("`f`'s MIR fails to lower");
     assert!(
         matches!(lowering, hir_ty::mir::MirLowerError::MissingFunctionDefinition(..)),
         "a call of a name that does not resolve has no function: {lowering:?}"
     );
     let said = err.describe(&db);
-    assert!(said.contains("MIR that failed to lower (the call of `g` at "), "the callee is named as written: {said}");
+    assert!(
+        said.contains("MIR that failed to lower (the call of `g` at "),
+        "the callee is named as written: {said}"
+    );
     assert!(said.contains(":1:17 has no function: "), "the call's place is given: {said}");
     assert!(said.ends_with("its name resolves to nothing)"), "inference's reason is given: {said}");
 }
@@ -1063,11 +1157,18 @@ fn mir_that_fails_to_lower_is_named_in_the_error() {
 #[test]
 fn mir_that_fails_to_lower_in_a_closure_names_the_closure_and_its_place() {
     let (db, _) = single("fn f() -> u32 {\n    let c = || -> u32 { g() };\n    0\n}\n");
-    let err = hashes(&db, item(&db, "f")).expect_err("`f`'s closure calls a name that does not resolve");
+    let err =
+        hashes(&db, item(&db, "f")).expect_err("`f`'s closure calls a name that does not resolve");
     assert_eq!(err.what, "MIR that failed to lower", "{}", err.describe(&db));
     let said = err.describe(&db);
-    assert!(said.contains("MIR that failed to lower (the closure at "), "the closure is named: {said}");
-    assert!(said.contains(":2:13: the call of `g` at "), "the closure's place, then the call: {said}");
+    assert!(
+        said.contains("MIR that failed to lower (the closure at "),
+        "the closure is named: {said}"
+    );
+    assert!(
+        said.contains(":2:13: the call of `g` at "),
+        "the closure's place, then the call: {said}"
+    );
 }
 
 /// selfbuild2's T1 at its cause: `rustc_type_ir::binder::BoundVarIndexKind` had an error type
@@ -1089,34 +1190,53 @@ fn an_error_type_left_by_an_unbuilt_proc_macro_names_the_field_and_the_macro() {
     );
     let mut db = fx.into_db();
     let k = item(&db, "K");
-    signature_hash(&db, k).unwrap_or_else(|err| panic!("with its proc macro built: {}", err.describe(&db)));
-    let pm = all_crates(&db).iter().copied().find(|it| it.loads_only_macros(&db)).expect("the proc macros' crate");
-    let built = ProcMacros::get_for_crate(&db, pm).and_then(|it| it.macros()).expect("its macros").to_vec();
+    signature_hash(&db, k)
+        .unwrap_or_else(|err| panic!("with its proc macro built: {}", err.describe(&db)));
+    let pm = all_crates(&db)
+        .iter()
+        .copied()
+        .find(|it| it.loads_only_macros(&db))
+        .expect("the proc macros' crate");
+    let built =
+        ProcMacros::get_for_crate(&db, pm).and_then(|it| it.macros()).expect("its macros").to_vec();
 
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::NotYetBuilt))]);
-    let pending = signature_hash(&db, k).expect_err("no item of `lib` hashes while `mirror!` is not built");
+    let pending =
+        signature_hash(&db, k).expect_err("no item of `lib` hashes while `mirror!` is not built");
     let (err, said) = (pending, pending.describe(&db));
     assert_eq!(err.what, "an item of a crate whose proc macros are not built yet", "{said}");
     assert!(said.contains("Enum `lib::K` has no hash"), "the item is named: {said}");
-    assert!(said.contains("`lib` was read before the proc macros of `proc_macros` were built"), "{said}");
+    assert!(
+        said.contains("`lib` was read before the proc macros of `proc_macros` were built"),
+        "{said}"
+    );
 
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::FailedToBuild))]);
-    let err = signature_hash(&db, k).expect_err("`Idx` does not resolve while `mirror!` has no expander");
+    let err =
+        signature_hash(&db, k).expect_err("`Idx` does not resolve while `mirror!` has no expander");
     let said = err.describe(&db);
     assert_eq!(err.what, "a type with an error", "{said}");
     assert!(said.contains("Enum `lib::K` has no hash"), "the item is named: {said}");
     assert!(said.contains("field `A.0`"), "the field is named: {said}");
-    assert!(said.contains("`proc_macros` (proc-macro failed to build)"), "the proc macro and why: {said}");
+    assert!(
+        said.contains("`proc_macros` (proc-macro failed to build)"),
+        "the proc macro and why: {said}"
+    );
 
     ProcMacros::give(&mut db, [(pm, Ok(built))]);
-    signature_hash(&db, k).unwrap_or_else(|err| panic!("with its proc macro given back: {}", err.describe(&db)));
+    signature_hash(&db, k)
+        .unwrap_or_else(|err| panic!("with its proc macro given back: {}", err.describe(&db)));
     // The refusal keeps the proc macro it found pending: said once it is built, it still names it.
     let said = pending.describe(&db);
-    assert!(said.contains("`lib` was read before the proc macros of `proc_macros` were built"), "{said}");
+    assert!(
+        said.contains("`lib` was read before the proc macros of `proc_macros` were built"),
+        "{said}"
+    );
 }
 
 /// An iterator for the RPITIT fixtures below: minicore has no adapter that borrows.
-const RPITIT_PRELUDE: &str = "//- minicore: iterator, option, sized, unsize, coerce_unsized, dispatch_from_dyn
+const RPITIT_PRELUDE: &str =
+    "//- minicore: iterator, option, sized, unsize, coerce_unsized, dispatch_from_dyn
 struct It<'a>(&'a [u32]);
 impl Iterator for It<'_> { type Item = u32; fn next(&mut self) -> Option<u32> { None } }
 struct Once(u32);
@@ -1297,7 +1417,11 @@ fn an_error_type_names_its_site_in_a_function() {
             "T::f",
             "(the bounds of `impl Trait` 0 of the return type)",
         ),
-        ("fn f<X>(x: X) -> X where X: Iterator<Item = Missing> { x }", "f", "(a bound or where clause)"),
+        (
+            "fn f<X>(x: X) -> X where X: Iterator<Item = Missing> { x }",
+            "f",
+            "(a bound or where clause)",
+        ),
         (
             "fn f() -> impl Sized { let x: Option<Missing> = None; x }",
             "f",
@@ -1314,7 +1438,6 @@ fn an_error_type_names_its_site_in_a_function() {
         assert!(said.contains(&format!("`ra_test_fixture::{path}`")), "`{body}`: {said}");
     }
 }
-
 
 /// rustc's tests/ui/hygiene/auxiliary/variants.rs: a `macro` writes an enum with a variant it
 /// names and one it is handed, both `Variant`. They are two variants and two keys, each of

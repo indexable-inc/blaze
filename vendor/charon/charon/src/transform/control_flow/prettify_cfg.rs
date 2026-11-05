@@ -31,10 +31,7 @@ impl Transform {
             return Vec::new();
         }
         if let [
-            Statement {
-                kind: StatementKind::Call { dest, .. },
-                ..
-            },
+            Statement { kind: StatementKind::Call { dest, .. }, .. },
             Statement {
                 kind:
                     second_abort @ (StatementKind::Panic { .. }
@@ -57,7 +54,6 @@ impl Transform {
 
 impl LlbcPass for Transform {
     fn transform_body(&self, _ctx: &mut TransformCtx, b: &mut ExprBody) {
-        b.body
-            .transform_sequences(|seq| Transform::update_statements(&b.locals, seq))
+        b.body.transform_sequences(|seq| Transform::update_statements(&b.locals, seq))
     }
 }

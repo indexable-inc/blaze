@@ -146,7 +146,8 @@ mod x86 {
             unsafe { _mm_stream_si128(to_at.cast(), v) };
             at += 16;
         }
-        _mm_sfence();
+        // SAFETY: SSE (which `_mm_sfence` needs) is baseline on x86_64.
+        unsafe { _mm_sfence() };
         // SAFETY: `at <= from.len()`, so both offsets are inside (or one past) their buffers.
         let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
         // SAFETY: the `from.len() - at` bytes from each are in `from` and `to` (the caller's
@@ -247,12 +248,7 @@ mod tests {
         let mut got = Vec::with_capacity(prefix.len() + src.len() + spare);
         got.extend_from_slice(prefix);
         copy(&mut got, src);
-        assert!(
-            got == expected,
-            "{name}: {} onto {} with {spare} spare",
-            src.len(),
-            prefix.len()
-        );
+        assert!(got == expected, "{name}: {} onto {} with {spare} spare", src.len(), prefix.len());
     }
 
     #[test]

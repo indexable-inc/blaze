@@ -97,8 +97,10 @@ pub fn executables(artifacts: &[Artifact]) -> (Vec<&Artifact>, Vec<&Artifact>) {
         .iter()
         .filter(|it| it.executable.is_some() && it.profile.test && it.kind != ArtifactKind::Doctest)
         .collect();
-    let mut docs: Vec<&Artifact> =
-        artifacts.iter().filter(|it| it.kind == ArtifactKind::Doctest && it.executable.is_some()).collect();
+    let mut docs: Vec<&Artifact> = artifacts
+        .iter()
+        .filter(|it| it.kind == ArtifactKind::Doctest && it.executable.is_some())
+        .collect();
     tests.sort_by_cached_key(|it| order(it));
     docs.sort_by_cached_key(|it| order(it));
     (tests, docs)
@@ -108,7 +110,13 @@ pub fn executables(artifacts: &[Artifact]) -> (Vec<&Artifact>, Vec<&Artifact>) {
 /// package id read once per executable, not once per comparison.
 fn order(artifact: &Artifact) -> (&str, &str, &str, u8, &str) {
     let id = artifact.package.as_str();
-    (say::package_name(id), say::package_version(id), id, rank(artifact), artifact.target.name.as_str())
+    (
+        say::package_name(id),
+        say::package_version(id),
+        id,
+        rank(artifact),
+        artifact.target.name.as_str(),
+    )
 }
 
 /// The package's directory: cargo runs a test there.
@@ -180,7 +188,14 @@ impl Speaking<'_> {
     /// `Running` or `Executable` and what runs: cargo's `exe_display` (`concise`), or under `-v`
     /// the command itself (`verbose`).
     // dyn: the CLI's output writer, a few writes per test executable run.
-    fn running(&self, err: &mut dyn Write, word: &str, artifact: &Artifact, kind: Kind, shown: &str) -> io::Result<()> {
+    fn running(
+        &self,
+        err: &mut dyn Write,
+        word: &str,
+        artifact: &Artifact,
+        kind: Kind,
+        shown: &str,
+    ) -> io::Result<()> {
         match self.verbose {
             0 => self.status(err, word, &running(artifact, self.cwd, kind)),
             _ => self.status(err, word, shown),
@@ -230,7 +245,9 @@ pub fn run(
         let exec = exec_of(test, asked, speaking);
         let shown = exec.shown_at(speaking.verbose);
         speaking.running(err, "Running", test, unit_kind, &shown)?;
-        if let Some(failure) = ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
+        if let Some(failure) =
+            ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs)?
+        {
             failed.push(failure);
             if asked.flags.fail_fast {
                 return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
@@ -245,7 +262,9 @@ pub fn run(
             if speaking.verbose > 0 {
                 speaking.status(err, "Running", &shown)?;
             }
-            if let Some(failure) = ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
+            if let Some(failure) =
+                ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs)?
+            {
                 failed.push(failure);
                 if asked.flags.fail_fast {
                     return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
@@ -307,7 +326,10 @@ fn exec_of(artifact: &Artifact, asked: &Invocation, speaking: Speaking<'_>) -> E
 }
 
 /// Runs one, `shown` as the command; what failed, said as cargo's `report_test_error` says it.
-#[expect(clippy::too_many_arguments, reason = "one run of a test, and everything cargo's report of it names")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run of a test, and everything cargo's report of it names"
+)]
 fn ran(
     artifact: &Artifact,
     kind: Kind,
@@ -321,7 +343,13 @@ fn ran(
 ) -> io::Result<Option<Failed>> {
     let rerun = rerun(artifact, kind, spec_flag);
     let what = format!("{}, to rerun pass `{rerun}`", kind.failed());
-    let never = |error: String| caused(&what, &[format!("could not execute process {shown} (never executed)"), error], speaking.color);
+    let never = |error: String| {
+        caused(
+            &what,
+            &[format!("could not execute process {shown} (never executed)"), error],
+            speaking.color,
+        )
+    };
     // A doctest's programs run under its runner, each a process of its own, never on the
     // daemon's code memory; a test executable starts as the daemon launches it.
     let started = match kind {
@@ -356,7 +384,11 @@ fn ran(
     let nocapture = asked.program.iter().any(|it| it == "--nocapture" || it == "--no-capture");
     if code.is_some() && artifact.harness && !nocapture && !speaking.quiet {
         let mut said = String::new();
-        say::note_into(&mut said, "test exited abnormally; to see the full output pass --no-capture to the harness.", speaking.color);
+        say::note_into(
+            &mut said,
+            "test exited abnormally; to see the full output pass --no-capture to the harness.",
+            speaking.color,
+        );
         err.write_all(said.as_bytes())?;
     }
     Ok(Some(Failed { rerun, code }))
@@ -370,15 +402,42 @@ const EXECUTABLES: u32 = 1 << 20;
 const UNSEEN: u32 = u32::MAX;
 
 /// `blaze test --reached`: the results the daemon sent, by test executable in the order they
-/// came, as libtest's pretty format prints them; whether every one that ran passed. A test the
+/// came, as libtest's pretty format prints them (with a JSON `--message-format`, a
+/// `blaze-test-result` line each); whether every one that ran passed. A test the
 /// edit did not reach is not run, and is named as such (blaze's word, not libtest's). Last, on
 /// stderr, the tests that ran outside the sandbox (docs/cargo.md: their passes are never kept).
 // dyn: the CLI's output writers, written once per test result printed.
-pub fn reached(results: &[TestResult], speaking: Speaking<'_>, out: &mut dyn Write, err: &mut dyn Write) -> io::Result<bool> {
+pub fn reached(
+    results: &[TestResult],
+    speaking: Speaking<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<bool> {
     let Some(any) = results.first() else {
         out.flush()?;
         return Ok(true);
     };
+    // A JSON `--message-format`: each result whole, as the daemon sent it, a
+    // `blaze-test-result` line on stdout among the build's messages (`json::test_result`).
+    if speaking.json {
+        // alloc: one line's buffer, reused, once a request
+        let mut text = String::new();
+        let mut passed_all = true;
+        for result in results {
+            passed_all &= result.outcome != TestOutcome::Failed;
+            text.clear();
+            super::json::test_result(&mut text, result);
+            text.push('\n');
+            out.write_all(text.as_bytes())?;
+        }
+        out.flush()?;
+        if !speaking.quiet {
+            text.clear();
+            outside(&mut text, results, speaking.color);
+            err.write_all(text.as_bytes())?;
+        }
+        return Ok(passed_all);
+    }
     // Each executable's place in the order executables first came, found by the daemon's dense
     // index (`TestResult::executable`) with no hash.
     // alloc: these, `starts`, `next`, `grouped` and `text`, once a request.
@@ -424,7 +483,11 @@ pub fn reached(results: &[TestResult], speaking: Speaking<'_>, out: &mut dyn Wri
     for (b, binary) in binaries.iter().enumerate() {
         speaking.status(err, "Running", &say::shown(Path::new(binary), speaking.cwd))?;
         text.clear();
-        passed_all &= libtest(&mut text, &grouped[starts[b] as usize..starts[b + 1] as usize], speaking.color);
+        passed_all &= libtest(
+            &mut text,
+            &grouped[starts[b] as usize..starts[b + 1] as usize],
+            speaking.color,
+        );
         out.write_all(text.as_bytes())?;
     }
     out.flush()?;
@@ -447,8 +510,14 @@ pub fn outside(text: &mut String, results: &[TestResult], color: bool) {
     say::leveled_with(text, say::GOOD, "note", color, |text| {
         // Writing to a String cannot fail.
         let _ = match count {
-            1 => write!(text, "1 test ran outside the sandbox, so it runs every time and its pass is never kept: "),
-            n => write!(text, "{n} tests ran outside the sandbox, so they run every time and their passes are never kept: "),
+            1 => write!(
+                text,
+                "1 test ran outside the sandbox, so it runs every time and its pass is never kept: "
+            ),
+            n => write!(
+                text,
+                "{n} tests ran outside the sandbox, so they run every time and their passes are never kept: "
+            ),
         };
         for (at, result) in results.iter().filter(|it| it.outside).enumerate() {
             if at > 0 {
@@ -471,7 +540,8 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
             text.push_str("\x1b[0m");
         }
     };
-    let (mut passed, mut failed, mut ignored, mut unreached, mut millis) = (0usize, 0usize, 0usize, 0usize, 0u64);
+    let (mut passed, mut failed, mut ignored, mut unreached, mut millis) =
+        (0usize, 0usize, 0usize, 0usize, 0u64);
     let mut names = 0;
     for result in results {
         match result.outcome {
@@ -531,7 +601,10 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
         true => paint(&mut *text, "\x1b[32m", "ok"),
         false => paint(&mut *text, "\x1b[31m", "FAILED"),
     }
-    let _ = write!(text, ". {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 0 filtered out");
+    let _ = write!(
+        text,
+        ". {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 0 filtered out"
+    );
     if unreached > 0 {
         let _ = write!(text, "; {unreached} unreached");
     }

@@ -70,9 +70,9 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, Sender};
+use std::alloc::Global;
 use windows_sys::Win32::{
     Foundation::{
         ERROR_BROKEN_PIPE, ERROR_CONNECTION_ABORTED, ERROR_HANDLE_EOF, ERROR_NETNAME_DELETED,
@@ -140,29 +140,74 @@ enum Op {
     /// `want` bytes from `at` into the spare room of `bytes`, which the kernel writes and the
     /// completion carries as it is: all of them, or fewer at the end of the file. On `file`,
     /// whose handle `raw` is open while the request is on it.
-    Read { file: FileId, raw: HANDLE, bytes: Vec<u8>, at: u64, want: usize },
+    Read {
+        file: FileId,
+        raw: HANDLE,
+        bytes: Vec<u8>,
+        at: u64,
+        want: usize,
+    },
     /// `bytes` written at `at`, or at the end where `None` (an append).
-    Write { file: FileId, raw: HANDLE, bytes: Vec<u8>, at: Option<u64>, put: usize },
+    Write {
+        file: FileId,
+        raw: HANDLE,
+        bytes: Vec<u8>,
+        at: Option<u64>,
+        put: usize,
+    },
     Watch(watch::Watching),
     /// A read of the USN journal.
     Journal(Box<usn::Journal>),
     /// A process's output, `err` its standard error, read into `buffer`.
-    Output { spawn: SpawnId, err: bool, pipe: OwnedHandle, buffer: Buffer },
-    Input { spawn: SpawnId, pipe: OwnedHandle, bytes: Vec<u8>, put: usize },
+    Output {
+        spawn: SpawnId,
+        err: bool,
+        pipe: OwnedHandle,
+        buffer: Buffer,
+    },
+    Input {
+        spawn: SpawnId,
+        pipe: OwnedHandle,
+        bytes: Vec<u8>,
+        put: usize,
+    },
     /// The frames of the runs handed to the warm launcher `warm`, written to its control pipe
     /// one at a time in the order of their spawns: `frame` from `put`. The pipe is the
     /// request's while it is in flight and the launcher's between frames.
-    Frames { warm: WarmId, pipe: OwnedHandle, frame: Vec<u8>, put: usize },
+    Frames {
+        warm: WarmId,
+        pipe: OwnedHandle,
+        frame: Vec<u8>,
+        put: usize,
+    },
     /// The warm launcher's answers, read into `buffer`: one read always in flight while it runs.
-    Answers { warm: WarmId, pipe: OwnedHandle, buffer: Buffer },
+    Answers {
+        warm: WarmId,
+        pipe: OwnedHandle,
+        buffer: Buffer,
+    },
     Accept(net::Accepting),
-    Connect { connecting: net::Connecting, at: Address },
+    Connect {
+        connecting: net::Connecting,
+        at: Address,
+    },
     /// Into `most` bytes of the spare room of `bytes` after its length (reserved as it is
     /// asked for), which the kernel writes and the completion appends; `flags` are Winsock's
     /// to write as it completes. On the socket of `conn`, which stays open while the request
     /// is on it.
-    Recv { conn: ConnId, socket: SOCKET, bytes: Vec<u8>, most: usize, flags: UnsafeCell<u32> },
-    Send { conn: ConnId, socket: SOCKET, bytes: Vec<u8>, put: usize },
+    Recv {
+        conn: ConnId,
+        socket: SOCKET,
+        bytes: Vec<u8>,
+        most: usize,
+        flags: UnsafeCell<u32>,
+    },
+    Send {
+        conn: ConnId,
+        socket: SOCKET,
+        bytes: Vec<u8>,
+        put: usize,
+    },
 }
 
 impl Op {
@@ -172,9 +217,10 @@ impl Op {
             Op::Read { raw, .. } | Op::Write { raw, .. } => *raw,
             Op::Watch(watching) => watching.raw(),
             Op::Journal(journal) => journal.raw(),
-            Op::Output { pipe, .. } | Op::Input { pipe, .. } | Op::Frames { pipe, .. } | Op::Answers { pipe, .. } => {
-                pipe.as_raw_handle()
-            }
+            Op::Output { pipe, .. }
+            | Op::Input { pipe, .. }
+            | Op::Frames { pipe, .. }
+            | Op::Answers { pipe, .. } => pipe.as_raw_handle(),
             Op::Accept(accepting) => net::raw(&accepting.listener.socket) as HANDLE,
             Op::Connect { connecting, .. } => connecting.raw() as HANDLE,
             Op::Recv { socket, .. } | Op::Send { socket, .. } => *socket as HANDLE,
@@ -209,7 +255,9 @@ impl Request {
                 // writes, and an `OVERLAPPED`, both in the request's entry, which is kept until
                 // the completion is taken, or, ended at once, until it is ended here (see
                 // `Request`).
-                return sys::started(unsafe { ReadFile(*raw, into, len(rest), std::ptr::null_mut(), overlapped) });
+                return sys::started(unsafe {
+                    ReadFile(*raw, into, len(rest), std::ptr::null_mut(), overlapped)
+                });
             }
             Op::Write { raw, bytes, at, put, .. } => {
                 let rest = &bytes[*put..];
@@ -217,7 +265,13 @@ impl Request {
                 let overlapped = head.reset(at.map_or(u64::MAX, |at| at + *put as u64));
                 // SAFETY: as for a read; the bytes are only read.
                 return sys::started(unsafe {
-                    WriteFile(*raw, rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped)
+                    WriteFile(
+                        *raw,
+                        rest.as_ptr(),
+                        len(rest.len()),
+                        std::ptr::null_mut(),
+                        overlapped,
+                    )
                 });
             }
             // SAFETY: the head made ready for this step, and the watch with its buffer in the
@@ -229,7 +283,13 @@ impl Request {
                 let overlapped = head.reset(0);
                 // SAFETY: as for a read; the buffer is the request's until it ends (`let_go`).
                 sys::pending(unsafe {
-                    ReadFile(pipe.as_raw_handle(), buffer.ptr(), BUFFER as u32, std::ptr::null_mut(), overlapped)
+                    ReadFile(
+                        pipe.as_raw_handle(),
+                        buffer.ptr(),
+                        BUFFER as u32,
+                        std::ptr::null_mut(),
+                        overlapped,
+                    )
                 })
             }
             Op::Input { pipe, bytes, put, .. } | Op::Frames { pipe, frame: bytes, put, .. } => {
@@ -237,7 +297,13 @@ impl Request {
                 let overlapped = head.reset(0);
                 // SAFETY: as for a write.
                 sys::pending(unsafe {
-                    WriteFile(pipe.as_raw_handle(), rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped)
+                    WriteFile(
+                        pipe.as_raw_handle(),
+                        rest.as_ptr(),
+                        len(rest.len()),
+                        std::ptr::null_mut(),
+                        overlapped,
+                    )
                 })
             }
             // SAFETY: as above, the `Accepting` with its address buffer.
@@ -251,7 +317,9 @@ impl Request {
                 unsafe { net::recv(*socket, into, len, flags.get(), head.reset(0)) }
             }
             // SAFETY: as for a receive; the bytes are the op's, unwritten until it ends.
-            Op::Send { socket, bytes, put, .. } => unsafe { net::send(*socket, &bytes[*put..], head.reset(0)) },
+            Op::Send { socket, bytes, put, .. } => unsafe {
+                net::send(*socket, &bytes[*put..], head.reset(0))
+            },
             Op::Connect { .. } => unreachable!("a connect is asked for once, as it is made"),
         };
         pending.map(|()| false)
@@ -326,24 +394,51 @@ fn unname(files: &mut Slab<Cached>, id: FileId) {
 enum Back {
     Done(Completion),
     /// A Unix socket's connect, made with a blocking call (see `net`).
-    Connected { tag: Tag, at: Address, made: io::Result<OwnedSocket> },
+    Connected {
+        tag: Tag,
+        at: Address,
+        made: io::Result<OwnedSocket>,
+    },
     /// A journal opened, or a read of it named: the journal to read on with, unless it ended.
-    Journal { tag: Tag, journal: Option<Box<usn::Journal>>, taken: usn::Taken },
+    Journal {
+        tag: Tag,
+        journal: Option<Box<usn::Journal>>,
+        taken: usn::Taken,
+    },
     /// Where the volume of the journal `journal` ended as the flush `flush` was marked.
-    Marked { journal: Tag, flush: Tag, mark: io::Result<At> },
+    Marked {
+        journal: Tag,
+        flush: Tag,
+        mark: io::Result<At>,
+    },
 }
 
 /// What the driver's threads are given.
 enum Work {
     File(Effect),
-    Connect { tag: Tag, at: Address },
+    Connect {
+        tag: Tag,
+        at: Address,
+    },
     /// A journal to open, its volume to be put on the port.
-    Open { tag: Tag, dir: FileName, since: Cursor },
+    Open {
+        tag: Tag,
+        dir: FileName,
+        since: Cursor,
+    },
     /// What a read of a journal ended with, to be named.
-    Took { tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32> },
+    Took {
+        tag: Tag,
+        journal: Box<usn::Journal>,
+        result: io::Result<u32>,
+    },
     /// The flush `flush` of the journal `journal`, marked with where its volume's journal ends
     /// now, through the volume's synchronous handle.
-    Mark { journal: Tag, flush: Tag, querier: Arc<OwnedHandle> },
+    Mark {
+        journal: Tag,
+        flush: Tag,
+        querier: Arc<OwnedHandle>,
+    },
 }
 
 /// A journal's watch: whether its read is in flight (its request) or its journal is on the
@@ -491,6 +586,8 @@ pub struct Iocp {
     spawning: HashMap<Tag, SpawnId, Global>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
     /// What the threads allocated doing their file effects.
     #[cfg(test)]
@@ -526,7 +623,8 @@ impl Iocp {
         let thread_allocations = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let workers = (0..threads.max(1))
             .map(|n| {
-                let (root, queue, port, sender) = (root.clone(), queue.clone(), port.clone(), sender.clone()); // clone: setup.
+                let (root, queue, port, sender) =
+                    (root.clone(), queue.clone(), port.clone(), sender.clone()); // clone: setup.
                 let woken = woken.clone(); // clone: setup, what each thread is given.
                 #[cfg(test)]
                 let counted = thread_allocations.clone();
@@ -586,6 +684,7 @@ impl Iocp {
             conns: Slab::new(CONNS, MemTag::Io).map_err(mem)?,
             // SAFETY: all zeros is an entry of nothing, written over before it is read.
             entries: unsafe { std::mem::zeroed() },
+            locks: crate::locks::Locks::new(),
             in_flight: 0,
             #[cfg(test)]
             thread_allocations,
@@ -638,7 +737,8 @@ impl Iocp {
         match request.ask() {
             Ok(false) => {}
             Ok(true) => {
-                let result = request.head.result().map_err(|code| io::Error::from_raw_os_error(code as i32));
+                let result =
+                    request.head.result().map_err(|code| io::Error::from_raw_os_error(code as i32));
                 self.ended(id, result);
             }
             Err(error) => self.ended(id, Err(error)),
@@ -691,7 +791,10 @@ impl Iocp {
         let wide = self.paths.of(file)?;
         files::open(wide, access).map_err(|error| {
             // alloc: an error path.
-            io::Error::new(error.kind(), format!("{}: {error}", self.root.join(file.as_str()).display()))
+            io::Error::new(
+                error.kind(),
+                format!("{}: {error}", self.root.join(file.as_str()).display()),
+            )
         })
     }
 
@@ -735,7 +838,8 @@ impl Iocp {
                     self.ready.push(Completion { tag, done: Done::Appended });
                     return Ok(());
                 }
-                let request = self.request(tag, Op::Write { file: id, raw, bytes, at: None, put: 0 });
+                let request =
+                    self.request(tag, Op::Write { file: id, raw, bytes, at: None, put: 0 });
                 self.put(request);
                 Ok(())
             }
@@ -748,19 +852,36 @@ impl Iocp {
                 self.port.associate_skipping(handle.as_raw_handle())?;
                 let raw = handle.as_raw_handle();
                 let id = self.files.insert(Cached { handle, users: 1, named: false });
-                let request = self.request(tag, Op::Write { file: id, raw, bytes, at: Some(at), put: 0 });
+                let request =
+                    self.request(tag, Op::Write { file: id, raw, bytes, at: Some(at), put: 0 });
                 self.put(request);
                 Ok(())
             }
             // On this thread, as the port's files are opened: its path made in the driver's
             // buffers, where a thread's `sys::path` would allocate one per call.
             Effect::Times { file, modified_ns, tag } => {
-                let set = self.paths.of(&file).and_then(|wide| files::set_times_of(wide, modified_ns));
+                let set =
+                    self.paths.of(&file).and_then(|wide| files::set_times_of(wide, modified_ns));
                 set.map_err(|error| {
                     // alloc: an error path.
-                    io::Error::new(error.kind(), format!("{}: {error}", self.root.join(file.as_str()).display()))
+                    io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", self.root.join(file.as_str()).display()),
+                    )
                 })?;
                 self.ready.push(Completion { tag, done: Done::Timed });
+                Ok(())
+            }
+            // `LockFileEx` without waiting is one call that never blocks: here, as a file's
+            // times are set.
+            Effect::Lock { file, mode, tag } => {
+                let done = self.locks.lock(&self.root, &file, mode, tag)?;
+                self.ready.push(Completion { tag, done });
+                Ok(())
+            }
+            Effect::Unlock { lock, tag } => {
+                let done = self.locks.unlock(lock)?;
+                self.ready.push(Completion { tag, done });
                 Ok(())
             }
             effect @ (Effect::Write { .. }
@@ -833,7 +954,9 @@ impl Iocp {
                 if let Some(journaling) = self.journals.get_mut(&watch) {
                     if journaling.stopping {
                         // alloc: an error path.
-                        return Err(io::Error::other(format!("flushing the watch {watch:?}: it is being stopped")));
+                        return Err(io::Error::other(format!(
+                            "flushing the watch {watch:?}: it is being stopped"
+                        )));
                     }
                     let Some(querier) = journaling.querier.as_ref().map(Arc::clone) else {
                         // alloc: grown once to the flushes asked before the journal opened.
@@ -855,7 +978,9 @@ impl Iocp {
                     ));
                 }
                 // alloc: an error path.
-                Err(io::Error::other(format!("flushing the watch {watch:?}: nothing is watched as it")))
+                Err(io::Error::other(format!(
+                    "flushing the watch {watch:?}: nothing is watched as it"
+                )))
             }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(at, tag),
@@ -945,7 +1070,13 @@ impl Iocp {
     }
 
     /// A spawn's entry: its process (none of a handed run) and job, its output not yet read.
-    fn spawned(&mut self, tag: Tag, process: Option<OwnedHandle>, job: OwnedHandle, finish: process::Finish) -> SpawnId {
+    fn spawned(
+        &mut self,
+        tag: Tag,
+        process: Option<OwnedHandle>,
+        job: OwnedHandle,
+        finish: process::Finish,
+    ) -> SpawnId {
         let port = &self.port;
         self.spawns.insert_with(|id| Spawned {
             tag,
@@ -968,7 +1099,12 @@ impl Iocp {
 
     /// The process of `command` started and followed, its standard output and error read into
     /// `buffers` (theirs from here, unless it fails).
-    fn start_spawn(&mut self, command: Box<Command>, tag: Tag, buffers: [Buffer; 2]) -> io::Result<()> {
+    fn start_spawn(
+        &mut self,
+        command: Box<Command>,
+        tag: Tag,
+        buffers: [Buffer; 2],
+    ) -> io::Result<()> {
         let started = process::start(&mut self.dirs, command, self.confine.as_ref())?;
         let process::Started { process, thread, job, stdin, stdout, stderr, mut finish } = started;
         let port = &self.port;
@@ -985,12 +1121,13 @@ impl Iocp {
         let input = std::mem::take(&mut finish.command.stdin);
         let spawn = self.spawned(tag, Some(process), job, finish);
         let spawned = self.spawns.get_mut(spawn).expect("just made");
-        let followed = process::follow(&spawned.job, &self.port, spawn.to_bits() as usize).and_then(|()| {
-            let process = spawned.process.as_ref().expect("a started process");
-            // SAFETY: the waiter is in the spawn's entry of the slab, which never moves while it
-            // is there; `waiting` is dropped before the spawn leaves it (`end_wait`).
-            unsafe { process::Waiting::new(process, &spawned.waiter) }
-        });
+        let followed = process::follow(&spawned.job, &self.port, spawn.to_bits() as usize)
+            .and_then(|()| {
+                let process = spawned.process.as_ref().expect("a started process");
+                // SAFETY: the waiter is in the spawn's entry of the slab, which never moves while it
+                // is there; `waiting` is dropped before the spawn leaves it (`end_wait`).
+                unsafe { process::Waiting::new(process, &spawned.waiter) }
+            });
         let resumed = followed.and_then(|waiting| {
             spawned.waiting = Some(waiting);
             process::resume(thread, &spawned.job)
@@ -1034,7 +1171,12 @@ impl Iocp {
     /// The run of `command` handed to the warm launcher, started first if none runs: its job
     /// and pipes made and followed as a started process's are, its handles given the launcher,
     /// and its frame queued. Its end is its answer.
-    fn hand_spawn(&mut self, command: Box<Command>, tag: Tag, buffers: [Buffer; 2]) -> io::Result<()> {
+    fn hand_spawn(
+        &mut self,
+        command: Box<Command>,
+        tag: Tag,
+        buffers: [Buffer; 2],
+    ) -> io::Result<()> {
         let launcher = match self.launcher() {
             Ok(launcher) => launcher,
             Err(error) => {
@@ -1092,7 +1234,10 @@ impl Iocp {
     /// nothing, and the next spawn tries again.
     fn launcher(&mut self) -> io::Result<WarmId> {
         if let Some(id) = self.warm_now {
-            let running = self.warms.get(id).map(|it| !it.exited && it.unanswered.is_none() && !warm::ended(&it.process));
+            let running = self
+                .warms
+                .get(id)
+                .map(|it| !it.exited && it.unanswered.is_none() && !warm::ended(&it.process));
             match running {
                 Some(true) => return Ok(id),
                 Some(false) => self.end_warm(id, None),
@@ -1100,7 +1245,8 @@ impl Iocp {
             }
         }
         let confined = self.warm.as_ref().expect("asked only with a warm launcher");
-        let warm::Launched { process, pid, control, answers } = warm::launch(confined, process::serial())?;
+        let warm::Launched { process, pid, control, answers } =
+            warm::launch(confined, process::serial())?;
         self.port.associate(control.as_raw_handle())?;
         self.port.associate(answers.as_raw_handle())?;
         let buffer = self.buffers.take()?;
@@ -1165,7 +1311,10 @@ impl Iocp {
             let Some(answer) = warm.cut.next(&mut bytes) else { return Ok(()) };
             let Some(spawn) = self.runs.remove(&answer.run) else {
                 // alloc: an error path.
-                return Err(io::Error::other(format!("it answered run {}, which is not in flight in it", answer.run)));
+                return Err(io::Error::other(format!(
+                    "it answered run {}, which is not in flight in it",
+                    answer.run
+                )));
             };
             if let Some(spawned) = self.spawns.get_mut(spawn) {
                 spawned.exited = true;
@@ -1303,7 +1452,9 @@ impl Iocp {
             return Err(io::Error::other(format!("something listens as {tag:?} already")));
         }
         // alloc: an error path.
-        let context = |error: io::Error| io::Error::new(error.kind(), format!("listening at {at:?}: {error}"));
+        let context = |error: io::Error| {
+            io::Error::new(error.kind(), format!("listening at {at:?}: {error}"))
+        };
         let listener = net::listen(&self.root, &at).map_err(context)?;
         self.port.associate(net::raw(&listener.socket) as HANDLE).map_err(context)?;
         let request = self.request(tag, Op::Accept(net::Accepting::new(listener)));
@@ -1318,8 +1469,11 @@ impl Iocp {
             return Ok(());
         }
         // alloc: an error path.
-        let context = |at: &Address, error: io::Error| io::Error::new(error.kind(), format!("connecting to {at:?}: {error}"));
-        let connecting = net::Connecting::new(&self.root, &at).map_err(|error| context(&at, error))?;
+        let context = |at: &Address, error: io::Error| {
+            io::Error::new(error.kind(), format!("connecting to {at:?}: {error}"))
+        };
+        let connecting =
+            net::Connecting::new(&self.root, &at).map_err(|error| context(&at, error))?;
         let id = self.request(tag, Op::Connect { connecting, at });
         let port = &self.port;
         let Request { head, op, .. } = self.requests.get_mut(id).expect("just made");
@@ -1434,7 +1588,8 @@ impl Iocp {
             self.ready.push(Completion { tag: recv, done: Done::Read(into) });
         }
         for (send, bytes) in connection.sends.drain(..) {
-            let done = Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
+            let done =
+                Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
             self.ready.push(Completion { tag: send, done });
         }
         self.close_if_idle(id);
@@ -1487,7 +1642,9 @@ impl Iocp {
                 }
                 Op::Write { bytes, at, put, .. } => {
                     let done = match result {
-                        Ok(0) if *put < bytes.len() => Done::Failed(IoError("the file took no more bytes".into())),
+                        Ok(0) if *put < bytes.len() => {
+                            Done::Failed(IoError("the file took no more bytes".into()))
+                        }
                         Ok(got) => {
                             *put += got as usize;
                             if *put < bytes.len() {
@@ -1510,7 +1667,8 @@ impl Iocp {
                         Ok(got) => {
                             // A buffer of nothing while stopping is the cancel, not a loss.
                             if !(stopping && got == 0) {
-                                let changed = watching.take(got as usize, &mut self.paths, &mut self.scratch);
+                                let changed =
+                                    watching.take(got as usize, &mut self.paths, &mut self.scratch);
                                 self.ready.push(Completion { tag, done: changed });
                             }
                             if !stopping {
@@ -1518,7 +1676,10 @@ impl Iocp {
                             }
                         }
                         Err(_) if code == Some(ERROR_NOTIFY_ENUM_DIR) && !stopping => {
-                            self.ready.push(Completion { tag, done: Done::Changed { files: Vec::new(), lost: true } }); // alloc: none, an empty `Vec`.
+                            self.ready.push(Completion {
+                                tag,
+                                done: Done::Changed { files: Vec::new(), lost: true },
+                            }); // alloc: none, an empty `Vec`.
                             break 'step After::Again;
                         }
                         Err(_) if stopping => {}
@@ -1534,12 +1695,16 @@ impl Iocp {
                 }
                 Op::Output { spawn, err, buffer, .. } => {
                     let spawn = *spawn;
-                    let Some(spawned) = self.spawns.get_mut(spawn) else { break 'step After::Over(Then::Nothing) };
+                    let Some(spawned) = self.spawns.get_mut(spawn) else {
+                        break 'step After::Over(Then::Nothing);
+                    };
                     match result {
                         Ok(got) => {
                             // SAFETY: the read's completion was taken, so the kernel writes the
                             // buffer no more; it wrote `got` bytes of it.
-                            let read = unsafe { std::slice::from_raw_parts(buffer.ptr(), (got as usize).min(BUFFER)) };
+                            let read = unsafe {
+                                std::slice::from_raw_parts(buffer.ptr(), (got as usize).min(BUFFER))
+                            };
                             let into = if *err { &mut spawned.err } else { &mut spawned.out };
                             // alloc: the process's output, `Exit`'s payload, grown as it comes.
                             into.extend_from_slice(read);
@@ -1556,7 +1721,9 @@ impl Iocp {
                     After::Over(Then::Spawn(spawn))
                 }
                 Op::Input { spawn, bytes, put, .. } => {
-                    let Some(spawned) = self.spawns.get_mut(*spawn) else { break 'step After::Over(Then::Nothing) };
+                    let Some(spawned) = self.spawns.get_mut(*spawn) else {
+                        break 'step After::Over(Then::Nothing);
+                    };
                     match result {
                         Ok(got) => {
                             *put += got as usize;
@@ -1565,7 +1732,11 @@ impl Iocp {
                             }
                         }
                         // It stopped reading: what is left of its input is not wanted.
-                        Err(_) if matches!(code, Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_OPERATION_ABORTED)) => {}
+                        Err(_)
+                            if matches!(
+                                code,
+                                Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_OPERATION_ABORTED)
+                            ) => {}
                         Err(error) => {
                             process::terminate(&spawned.job, process::KILLED);
                             spawned.failed.get_or_insert(error);
@@ -1599,10 +1770,16 @@ impl Iocp {
                             }
                         }
                         // alloc: an error path.
-                        Ok(_) => After::Over(Then::Unwarm(warm, io::Error::other("its input took no more of a frame"))),
+                        Ok(_) => After::Over(Then::Unwarm(
+                            warm,
+                            io::Error::other("its input took no more of a frame"),
+                        )),
                         Err(error) => {
                             // alloc: an error path.
-                            let error = io::Error::new(error.kind(), format!("writing a frame to its input: {error}"));
+                            let error = io::Error::new(
+                                error.kind(),
+                                format!("writing a frame to its input: {error}"),
+                            );
                             After::Over(Then::Unwarm(warm, error))
                         }
                     }
@@ -1613,7 +1790,11 @@ impl Iocp {
                         break 'step After::Over(Then::Nothing);
                     }
                     match result {
-                        Ok(got) => After::Answers { warm, buffer: *buffer, got: (got as usize).min(BUFFER) },
+                        Ok(got) => After::Answers {
+                            warm,
+                            buffer: *buffer,
+                            got: (got as usize).min(BUFFER),
+                        },
                         // End of file (`ERROR_BROKEN_PIPE`) or an error: no more answers come.
                         Err(error) => After::Over(Then::Unanswered(warm, error)),
                     }
@@ -1635,22 +1816,29 @@ impl Iocp {
                             match taken {
                                 Ok(socket) => {
                                     let conn = adopt(&mut self.conns, socket);
-                                    self.ready.push(Completion { tag, done: Done::Accepted { conn } });
+                                    self.ready
+                                        .push(Completion { tag, done: Done::Accepted { conn } });
                                 }
                                 Err(error) => {
                                     self.listens.remove(&tag);
-                                    self.ready.push(failed(tag, format_args!("accepting a connection: {error}")));
+                                    self.ready.push(failed(
+                                        tag,
+                                        format_args!("accepting a connection: {error}"),
+                                    ));
                                     break 'step After::Over(Then::Nothing);
                                 }
                             }
                         }
                         // The peer went before it was accepted.
                         Err(_)
-                            if matches!(code, Some(ERROR_NETNAME_DELETED | ERROR_CONNECTION_ABORTED))
-                                || code == Some(WSAECONNRESET as u32) => {}
+                            if matches!(
+                                code,
+                                Some(ERROR_NETNAME_DELETED | ERROR_CONNECTION_ABORTED)
+                            ) || code == Some(WSAECONNRESET as u32) => {}
                         Err(error) => {
                             self.listens.remove(&tag);
-                            self.ready.push(failed(tag, format_args!("accepting a connection: {error}")));
+                            self.ready
+                                .push(failed(tag, format_args!("accepting a connection: {error}")));
                             break 'step After::Over(Then::Nothing);
                         }
                     }
@@ -1671,7 +1859,11 @@ impl Iocp {
                         Err(_)
                             if matches!(
                                 code,
-                                Some(ERROR_OPERATION_ABORTED | ERROR_NETNAME_DELETED | ERROR_CONNECTION_ABORTED)
+                                Some(
+                                    ERROR_OPERATION_ABORTED
+                                        | ERROR_NETNAME_DELETED
+                                        | ERROR_CONNECTION_ABORTED
+                                )
                             ) || code == Some(WSAECONNRESET as u32) =>
                         {
                             Done::Read(std::mem::take(bytes))
@@ -1699,12 +1891,16 @@ impl Iocp {
                                     bytes.clear();
                                     Done::Sent(std::mem::take(bytes))
                                 }
-                                false => Done::unsent(std::mem::take(bytes), format_args!("{shown:?} took no more bytes")),
+                                false => Done::unsent(
+                                    std::mem::take(bytes),
+                                    format_args!("{shown:?} took no more bytes"),
+                                ),
                             }
                         }
-                        Err(_) if code == Some(ERROR_OPERATION_ABORTED) => {
-                            Done::unsent(std::mem::take(bytes), format_args!("{shown:?} hung up before all of it was sent"))
-                        }
+                        Err(_) if code == Some(ERROR_OPERATION_ABORTED) => Done::unsent(
+                            std::mem::take(bytes),
+                            format_args!("{shown:?} hung up before all of it was sent"),
+                        ),
                         Err(error) => Done::unsent(std::mem::take(bytes), error),
                     };
                     self.ready.push(Completion { tag, done });
@@ -1798,7 +1994,10 @@ impl Iocp {
                         self.packets += 1;
                     }
                     let request = self.requests.get(id).expect("the packet's owner");
-                    let result = request.head.result().map_err(|code| io::Error::from_raw_os_error(code as i32));
+                    let result = request
+                        .head
+                        .result()
+                        .map_err(|code| io::Error::from_raw_os_error(code as i32));
                     self.ended(id, result);
                 }
                 KEY_WAKE => {}
@@ -1819,7 +2018,9 @@ impl Iocp {
                     }
                 }
                 key if key >= KEY_JOB => {
-                    let Some(spawned) = self.spawns.get(SpawnId::from_bits(key as u64)) else { continue };
+                    let Some(spawned) = self.spawns.get(SpawnId::from_bits(key as u64)) else {
+                        continue;
+                    };
                     // Past its memory: the commit the job is refused is the backstop, and the
                     // kill makes it the end.
                     if entry.dwNumberOfBytesTransferred == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT {
@@ -1901,7 +2102,8 @@ impl Iocp {
         }
         let hurry = journaling.barrier.hurried();
         self.decide(tag);
-        let mut journal = journal.expect("a journal handed back without an end is handed back with it");
+        let mut journal =
+            journal.expect("a journal handed back without an end is handed back with it");
         journal.set_hurry(hurry);
         let request = self.request(tag, Op::Journal(journal));
         if let Some(journaling) = self.journals.get_mut(&tag) {
@@ -1941,7 +2143,12 @@ impl Iocp {
     /// reach the mark.
     fn marked(&mut self, tag: Tag, flush: Tag, mark: io::Result<At>) {
         let Some(journaling) = self.journals.get_mut(&tag) else {
-            return self.fail(flush, format_args!("flushing the watch {tag:?}: the watch ended before the flush was marked"));
+            return self.fail(
+                flush,
+                format_args!(
+                    "flushing the watch {tag:?}: the watch ended before the flush was marked"
+                ),
+            );
         };
         match mark {
             Ok(mark) => journaling.barrier.mark(flush, mark),
@@ -1964,9 +2171,14 @@ impl Iocp {
         let mut hurry = false;
         for decision in journaling.barrier.take_decisions() {
             match decision {
-                Decision::Told(flush) => self.ready.push(Completion { tag: flush, done: Done::Flushed }),
+                Decision::Told(flush) => {
+                    self.ready.push(Completion { tag: flush, done: Done::Flushed })
+                }
                 Decision::Failed { tag: flush, why } => {
-                    self.ready.push(failed(flush, format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown)));
+                    self.ready.push(failed(
+                        flush,
+                        format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown),
+                    ));
                 }
                 Decision::Hurry => hurry = true,
             }
@@ -1988,11 +2200,17 @@ impl Iocp {
         journaling.barrier.end(why);
         for decision in journaling.barrier.take_decisions() {
             if let Decision::Failed { tag: flush, why } = decision {
-                self.ready.push(failed(flush, format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown)));
+                self.ready.push(failed(
+                    flush,
+                    format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown),
+                ));
             }
         }
         for flush in journaling.unmarked {
-            self.ready.push(failed(flush, format_args!("flushing the watch {tag:?}: the watch ended before it opened: {why}")));
+            self.ready.push(failed(
+                flush,
+                format_args!("flushing the watch {tag:?}: the watch ended before it opened: {why}"),
+            ));
         }
     }
 }
@@ -2048,7 +2266,9 @@ impl Drop for Iocp {
         // the launcher, which writes in them, has exited.
         for (_, warm) in self.warms.iter_mut() {
             // SAFETY: an open process; it exits once its input has ended, which it has.
-            unsafe { WaitForSingleObject(warm.process.as_raw_handle(), GIVE_BACK.as_millis() as u32) };
+            unsafe {
+                WaitForSingleObject(warm.process.as_raw_handle(), GIVE_BACK.as_millis() as u32)
+            };
             drop(warm.waiting.take());
         }
         for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_none()) {
@@ -2067,7 +2287,9 @@ impl Driver for Iocp {
             let tag = effect.tag();
             match effect {
                 Effect::Kill { tag } => {
-                    if let Some(spawned) = self.spawning.get(&tag).and_then(|id| self.spawns.get_mut(*id)) {
+                    if let Some(spawned) =
+                        self.spawning.get(&tag).and_then(|id| self.spawns.get_mut(*id))
+                    {
                         // A handed run's program may not have started: its job takes no process
                         // from here, so it never can. Either way its answer ends it.
                         if spawned.process.is_none()
@@ -2088,30 +2310,34 @@ impl Driver for Iocp {
                         request.cancel();
                     }
                 }
-                Effect::Unwatch { tag } => match self.watches.get(&tag).and_then(|id| self.requests.get_mut(*id)) {
-                    Some(request) => {
-                        if let Op::Watch(watching) = &mut request.op {
-                            watching.stopping = true;
+                Effect::Unwatch { tag } => {
+                    match self.watches.get(&tag).and_then(|id| self.requests.get_mut(*id)) {
+                        Some(request) => {
+                            if let Op::Watch(watching) = &mut request.op {
+                                watching.stopping = true;
+                            }
+                            request.cancel();
                         }
-                        request.cancel();
-                    }
-                    None => {
-                        self.in_flight += 1;
-                        self.fail(tag, format_args!("nothing is watched as {tag:?}"));
-                    }
-                },
-                Effect::Unlisten { tag } => match self.listens.get(&tag).and_then(|id| self.requests.get_mut(*id)) {
-                    Some(request) => {
-                        if let Op::Accept(accepting) = &mut request.op {
-                            accepting.stopping = true;
+                        None => {
+                            self.in_flight += 1;
+                            self.fail(tag, format_args!("nothing is watched as {tag:?}"));
                         }
-                        request.cancel();
                     }
-                    None => {
-                        self.in_flight += 1;
-                        self.fail(tag, format_args!("nothing listens as {tag:?}"));
+                }
+                Effect::Unlisten { tag } => {
+                    match self.listens.get(&tag).and_then(|id| self.requests.get_mut(*id)) {
+                        Some(request) => {
+                            if let Op::Accept(accepting) = &mut request.op {
+                                accepting.stopping = true;
+                            }
+                            request.cancel();
+                        }
+                        None => {
+                            self.in_flight += 1;
+                            self.fail(tag, format_args!("nothing listens as {tag:?}"));
+                        }
                     }
-                },
+                }
                 effect => {
                     self.in_flight += 1;
                     if let Err(error) = self.begin(effect) {
@@ -2144,7 +2370,12 @@ impl Driver for Iocp {
         }
         let ended = out[before..]
             .iter()
-            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }))
+            .filter(|it| {
+                !matches!(
+                    it.done,
+                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                )
+            })
             .count();
         self.in_flight -= ended;
         out.len() - before
@@ -2233,7 +2464,9 @@ fn work_on(
                         (Some(journal), usn::Taken { batch, end: None, read })
                     }
                     // alloc: an error path.
-                    Err(error) => (None, usn::Taken { batch: None, end: Some(error.to_string()), read: None }),
+                    Err(error) => {
+                        (None, usn::Taken { batch: None, end: Some(error.to_string()), read: None })
+                    }
                 };
                 back.send(Back::Journal { tag, journal, taken })
             }
@@ -2284,8 +2517,12 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
         Effect::Rename { from, to: into, .. } => {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
         }
-        Effect::Mode { file, mode, .. } => files::set_mode(joined(at, root, &file), mode).map(|()| Done::Moded),
-        Effect::Seal { file, mode, .. } => files::seal(joined(at, root, &file), mode).map(|()| Done::Moded),
+        Effect::Mode { file, mode, .. } => {
+            files::set_mode(joined(at, root, &file), mode).map(|()| Done::Moded)
+        }
+        Effect::Seal { file, mode, .. } => {
+            files::seal(joined(at, root, &file), mode).map(|()| Done::Moded)
+        }
         Effect::Clone { from, to: into, .. } => {
             files::clone(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Cloned)
         }
@@ -2296,7 +2533,12 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
 
 /// A run the driver no longer follows: killed, its process (of one it started) waited for, and
 /// its run directory removed.
-fn abandon(process: Option<&OwnedHandle>, job: &OwnedHandle, finish: &mut process::Finish, dirs: &mut RunDirs) {
+fn abandon(
+    process: Option<&OwnedHandle>,
+    job: &OwnedHandle,
+    finish: &mut process::Finish,
+    dirs: &mut RunDirs,
+) {
     process::terminate(job, process::KILLED);
     if let Some(process) = process {
         // SAFETY: an open process handle; a kill of its job ends it promptly.
@@ -2379,37 +2621,68 @@ mod tests {
         let root = dir("spawn");
         let mut driver = Iocp::new(&root, 1).unwrap();
         // More than a pipe holds each way, read back while it is written.
-        let big: Vec<u8> = (0..40_000).flat_map(|n| format!("line {n:05}\r\n").into_bytes()).collect();
+        let big: Vec<u8> =
+            (0..40_000).flat_map(|n| format!("line {n:05}\r\n").into_bytes()).collect();
         let limit = 256 << 20;
         let hog = Box::new(Command {
             memory: Some(limit),
             ..*command(
                 r"WindowsPowerShell\v1.0\powershell.exe",
-                &["-NoProfile", "-NonInteractive", "-Command", "$a = New-Object byte[] 1GB; $a.Length"],
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$a = New-Object byte[] 1GB; $a.Length",
+                ],
                 b"",
             )
         });
         let mut on = command("cmd.exe", &["/d", "/c", "echo hi"], b"");
-        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
-        let seen = run(&mut driver, vec![
-            Effect::Spawn { command: command("findstr.exe", &["/r", "^"], b"hello\r\n"), tag: Tag(1) },
-            Effect::Spawn { command: command("cmd.exe", &["/d", "/c", "echo err>&2& exit /b 7"], b""), tag: Tag(2) },
-            Effect::Spawn { command: command("PING.EXE", &["-n", "60", "127.0.0.1"], b""), tag: Tag(3) },
-            Effect::Kill { tag: Tag(3) },
-            Effect::Spawn { command: on, tag: Tag(4) },
-            Effect::Spawn { command: hog, tag: Tag(5) },
-            Effect::Spawn { command: command("findstr.exe", &["/r", "^"], &big), tag: Tag(6) },
-            Effect::Kill { tag: Tag(99) },
-        ]);
+        on.sandbox = Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        };
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Spawn {
+                    command: command("findstr.exe", &["/r", "^"], b"hello\r\n"),
+                    tag: Tag(1),
+                },
+                Effect::Spawn {
+                    command: command("cmd.exe", &["/d", "/c", "echo err>&2& exit /b 7"], b""),
+                    tag: Tag(2),
+                },
+                Effect::Spawn {
+                    command: command("PING.EXE", &["-n", "60", "127.0.0.1"], b""),
+                    tag: Tag(3),
+                },
+                Effect::Kill { tag: Tag(3) },
+                Effect::Spawn { command: on, tag: Tag(4) },
+                Effect::Spawn { command: hog, tag: Tag(5) },
+                Effect::Spawn { command: command("findstr.exe", &["/r", "^"], &big), tag: Tag(6) },
+                Effect::Kill { tag: Tag(99) },
+            ],
+        );
         let one = exit(&seen[&1]);
         assert_eq!((one.code, one.signal), (Some(0), None));
         assert_eq!((one.stdout.as_slice(), one.stderr.as_slice()), (&b"hello\r\n"[..], &b""[..]));
         assert!(one.peak_memory > 0);
         let two = exit(&seen[&2]);
-        assert_eq!((two.code, two.stdout.as_slice(), two.stderr.as_slice()), (Some(7), &b""[..], &b"err\r\n"[..]));
+        assert_eq!(
+            (two.code, two.stdout.as_slice(), two.stderr.as_slice()),
+            (Some(7), &b""[..], &b"err\r\n"[..])
+        );
         let three = exit(&seen[&3]);
         assert_eq!((three.code, three.signal), (Some(process::KILLED as i32), None));
-        assert!(matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")), "{:?}", seen[&4]);
+        assert!(
+            matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")),
+            "{:?}",
+            seen[&4]
+        );
         // Refused its commit past the limit, or killed going past it: never all of it.
         let five = exit(&seen[&5]);
         assert_ne!(five.code, Some(0), "{five:?}");
@@ -2456,11 +2729,20 @@ mod tests {
         let root = dir("confine");
         let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Recording));
         let mut traced = command("cmd.exe", &["/d", "/c", "echo hi"], b"");
-        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() };
+        traced.sandbox = Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: true,
+            services: Vec::new(),
+        };
         let seen = run(&mut driver, vec![Effect::Spawn { command: traced, tag: Tag(1) }]);
         let exit = exit(&seen[&1]);
         assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"hi\r\n"[..]));
-        let wanted = Traced { files: vec![(PathBuf::from(r"C:\Windows\win.ini"), None)], ..Traced::default() };
+        let wanted = Traced {
+            files: vec![(PathBuf::from(r"C:\Windows\win.ini"), None)],
+            ..Traced::default()
+        };
         assert_eq!(exit.traced, Some(wanted));
         let left = std::fs::read_dir(root.join(".blaze-spawn")).unwrap().count();
         assert_eq!(left, 0);
@@ -2488,7 +2770,10 @@ mod tests {
 
     impl Confine for Tiny {
         fn confine(&self, command: &Command, _: &Path) -> Result<Confined, String> {
-            Err(format!("{}: confine asked of a sandbox with a warm launcher", command.program.display()))
+            Err(format!(
+                "{}: confine asked of a sandbox with a warm launcher",
+                command.program.display()
+            ))
         }
 
         fn traced(&self, _: &Command, _: &Path) -> Result<Traced, String> {
@@ -2499,14 +2784,22 @@ mod tests {
             Some(Confined {
                 program: std::env::current_exe().unwrap(),
                 args: Vec::new(),
-                env: vec![(TINY.into(), "1".into()), ("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap())],
+                env: vec![
+                    (TINY.into(), "1".into()),
+                    ("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap()),
+                ],
                 dir: std::env::temp_dir(),
             })
         }
 
         fn hand(&self, command: &Command, _: &Path, handed: &Handed) -> Result<Vec<u8>, String> {
             let arg = |at: usize| {
-                command.args.get(at).and_then(|it| it.to_str()).and_then(|it| it.parse::<i64>().ok()).unwrap_or(0)
+                command
+                    .args
+                    .get(at)
+                    .and_then(|it| it.to_str())
+                    .and_then(|it| it.parse::<i64>().ok())
+                    .unwrap_or(0)
             };
             let mut frame = Vec::with_capacity(TINY_FRAME);
             frame.extend_from_slice(&((TINY_FRAME - 4) as u32).to_le_bytes());
@@ -2542,8 +2835,9 @@ mod tests {
             }
             // SAFETY: the driver duplicated each into this process for this run alone, and named
             // it in this frame only, so each is adopted once.
-            let [stdin, stdout, stderr, job] =
-                handles.map(|it| (it != 0).then(|| unsafe { OwnedHandle::from_raw_handle(it as usize as RawHandle) }));
+            let [stdin, stdout, stderr, job] = handles.map(|it| {
+                (it != 0).then(|| unsafe { OwnedHandle::from_raw_handle(it as usize as RawHandle) })
+            });
             std::thread::spawn(move || {
                 drop((stdin, stderr));
                 blaze_spin::busy(Duration::from_millis(wait.into()));
@@ -2562,7 +2856,9 @@ mod tests {
                 };
                 drop(job);
                 let mut answers = std::io::stdout().lock();
-                let written = answers.write_all(&Answer { run: answered, code }.to_bytes()).and_then(|()| answers.flush());
+                let written = answers
+                    .write_all(&Answer { run: answered, code }.to_bytes())
+                    .and_then(|()| answers.flush());
                 if written.is_err() {
                     std::process::exit(2);
                 }
@@ -2606,7 +2902,13 @@ mod tests {
             env: Vec::new(),
             dir: std::env::temp_dir(),
             stdin: stdin.to_vec(),
-            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() },
+            sandbox: Sandbox::On {
+                read: Vec::new(),
+                write: Vec::new(),
+                network: false,
+                trace: false,
+                services: Vec::new(),
+            },
             memory: None,
         })
     }
@@ -2623,7 +2925,10 @@ mod tests {
         let mut effects = vec![
             Effect::Spawn { command: tiny(7, 400, b""), tag: Tag(1) },
             Effect::Spawn { command: tiny(9, 0, b"some input"), tag: Tag(2) },
-            Effect::Spawn { command: command("cmd.exe", &["/d", "/c", "echo plain"], b""), tag: Tag(3) },
+            Effect::Spawn {
+                command: command("cmd.exe", &["/d", "/c", "echo plain"], b""),
+                tag: Tag(3),
+            },
         ];
         let (mut order, mut seen) = (Vec::new(), BTreeMap::new());
         run_until_idle(&mut driver, &mut effects, |done, _| {
@@ -2664,7 +2969,10 @@ mod tests {
         let killed = exit(&seen[&1]);
         // Ended as it ran (the kill's code), or refused its start (the launcher's could-not).
         let could_not = crate::exit::Exit::CouldNot.code();
-        assert!([Some(process::KILLED as i32), Some(could_not)].contains(&killed.code), "{killed:?}");
+        assert!(
+            [Some(process::KILLED as i32), Some(could_not)].contains(&killed.code),
+            "{killed:?}"
+        );
         let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(4, 0, b""), tag: Tag(2) }]);
         assert_eq!(exit(&seen[&2]).code, Some(4));
         assert_eq!(driver.warms.len(), 1);
@@ -2679,7 +2987,8 @@ mod tests {
         let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(0, 0, b""), tag: Tag(1) }]);
         assert_eq!(exit(&seen[&1]).code, Some(0));
         let first = driver.warm_now.expect("a launcher runs");
-        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(LEAVE, 0, b""), tag: Tag(2) }]);
+        let seen =
+            run(&mut driver, vec![Effect::Spawn { command: tiny(LEAVE, 0, b""), tag: Tag(2) }]);
         let program = std::env::current_exe().unwrap().display().to_string();
         match &seen[&2] {
             Done::Failed(why) => {
@@ -2697,8 +3006,12 @@ mod tests {
         let second = driver.warm_now.expect("another launcher");
         assert_ne!(second, first);
         // An answer for a run not in flight is the launcher's fault: it ends, failing the run.
-        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(ASTRAY, 0, b""), tag: Tag(4) }]);
-        assert!(matches!(&seen[&4], Done::Failed(why) if why.0.contains("which is not in flight in it")), "{seen:?}");
+        let seen =
+            run(&mut driver, vec![Effect::Spawn { command: tiny(ASTRAY, 0, b""), tag: Tag(4) }]);
+        assert!(
+            matches!(&seen[&4], Done::Failed(why) if why.0.contains("which is not in flight in it")),
+            "{seen:?}"
+        );
         assert!(!driver.warms.contains(second));
         let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(6, 0, b""), tag: Tag(5) }]);
         assert_eq!(exit(&seen[&5]).code, Some(6));
@@ -2743,7 +3056,10 @@ mod tests {
     /// Listens, connects, sends each way, hangs up each end and stops listening.
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Iocp::new(root, 1).unwrap();
-        let mut effects = vec![Effect::Listen { at: at.clone(), tag: Tag(1) }, Effect::Connect { at, tag: Tag(2) }];
+        let mut effects = vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
@@ -2759,12 +3075,22 @@ mod tests {
                 assert_eq!(bytes, b"ping");
                 let (server, client) = (server.unwrap(), client.unwrap());
                 effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(5) });
-                effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(6) });
+                effects.push(Effect::Recv {
+                    conn: client,
+                    most: 64,
+                    into: Vec::new(),
+                    tag: Tag(6),
+                });
             }
             (6, Done::Read(bytes)) => {
                 assert_eq!(bytes, b"pong");
                 effects.push(Effect::Hangup { conn: client.unwrap(), tag: Tag(7) });
-                effects.push(Effect::Recv { conn: server.unwrap(), most: 64, into: b"kept".to_vec(), tag: Tag(8) });
+                effects.push(Effect::Recv {
+                    conn: server.unwrap(),
+                    most: 64,
+                    into: b"kept".to_vec(),
+                    tag: Tag(8),
+                });
             }
             (8, Done::Read(bytes)) => {
                 assert_eq!(bytes, b"kept", "nothing appended once the peer hung up");
@@ -2797,10 +3123,13 @@ mod tests {
         driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), tag: Tag(1) }]);
         driver.poll(&mut out, Duration::ZERO);
         assert!(out.is_empty(), "{out:?}");
-        let seen = run(&mut driver, vec![
-            Effect::Listen { at: Address::Unix(name("s")), tag: Tag(2) },
-            Effect::Unlisten { tag: Tag(1) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Listen { at: Address::Unix(name("s")), tag: Tag(2) },
+                Effect::Unlisten { tag: Tag(1) },
+            ],
+        );
         assert!(matches!(&seen[&2], Done::Failed(why) if why.0.contains("listens")), "{seen:?}");
         assert_eq!(seen[&1], Done::Unlistened);
         drop(driver);
@@ -2821,17 +3150,23 @@ mod tests {
     fn what_names_nothing_fails() {
         let root = dir("nothing");
         let mut driver = Iocp::new(&root, 1).unwrap();
-        let seen = run(&mut driver, vec![
-            Effect::Unwatch { tag: Tag(1) },
-            Effect::Unlisten { tag: Tag(2) },
-            Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
-            Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-            Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
-            Effect::Kill { tag: Tag(6) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Unwatch { tag: Tag(1) },
+                Effect::Unlisten { tag: Tag(2) },
+                Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
+                Effect::Hangup { conn: Conn(77), tag: Tag(4) },
+                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Kill { tag: Tag(6) },
+            ],
+        );
         assert_eq!(seen.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
         assert!(matches!(&seen[&3], Done::Broken { buffer, .. } if buffer == b"kept"), "{seen:?}");
-        assert!(seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))), "{seen:?}");
+        assert!(
+            seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))),
+            "{seen:?}"
+        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2859,7 +3194,10 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(driver.poll(&mut out, Duration::from_millis(20)), 0);
         let waited = began.elapsed();
-        assert!(waited >= Duration::from_millis(19) && waited < Duration::from_secs(5), "{waited:?}");
+        assert!(
+            waited >= Duration::from_millis(19) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
         assert_eq!(driver.in_flight(), 1);
     }
 
@@ -2868,12 +3206,18 @@ mod tests {
         let root = dir("map");
         let mut driver = Iocp::new(&root, 2).unwrap();
         let file = name("store/pack");
-        let seen = run(&mut driver, vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), tag: Tag(1) }]);
+        let seen = run(
+            &mut driver,
+            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), tag: Tag(1) }],
+        );
         assert_eq!(seen[&1], Done::Written);
-        let seen = run(&mut driver, vec![
-            Effect::Map { file, tag: Tag(2) },
-            Effect::Map { file: name("missing"), tag: Tag(3) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Map { file, tag: Tag(2) },
+                Effect::Map { file: name("missing"), tag: Tag(3) },
+            ],
+        );
         match &seen[&2] {
             Done::Mapped(mapping) => assert_eq!(mapping.bytes(), b"packed"),
             other => panic!("{other:?}"),
@@ -2890,14 +3234,17 @@ mod tests {
     fn files_end_as_on_threads() {
         let file = name("vfs/journal");
         fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {
-            let mut effects = vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+            let mut effects =
+                vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
             let mut seen = Vec::new();
             run_until_idle(driver, &mut effects, |done, effects| {
                 seen.push(match done.done {
                     Done::Stat(Some(meta)) => format!("stat {} {}", meta.len, meta.dir),
                     Done::Listed(entries) => {
-                        let entries: Vec<_> =
-                            entries.iter().map(|(name, meta)| (name.as_str(), meta.len, meta.dir)).collect();
+                        let entries: Vec<_> = entries
+                            .iter()
+                            .map(|(name, meta)| (name.as_str(), meta.len, meta.dir))
+                            .collect();
                         format!("listed {entries:?}")
                     }
                     Done::Failed(_) => "failed".to_owned(),
@@ -2918,13 +3265,25 @@ mod tests {
                     12 => Effect::Stat { file: name("out/l"), tag: Tag(13) },
                     13 => Effect::ReadAll { file: name("missing"), tag: Tag(14) },
                     14 => Effect::Read { file: name("missing"), at: 0, len: 1, tag: Tag(15) },
-                    15 => Effect::WriteAt { file: file.clone(), at: 6, bytes: b"!".to_vec(), tag: Tag(16) },
+                    15 => Effect::WriteAt {
+                        file: file.clone(),
+                        at: 6,
+                        bytes: b"!".to_vec(),
+                        tag: Tag(16),
+                    },
                     16 => Effect::ReadAll { file: file.clone(), tag: Tag(17) },
                     17 => Effect::Mode { file: file.clone(), mode: 0o600, tag: Tag(18) },
-                    18 => Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) },
+                    18 => {
+                        Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) }
+                    }
                     19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
                     20 => Effect::List { dir: name("missing"), tag: Tag(21) },
-                    21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
+                    21 => Effect::WriteAt {
+                        file: name("missing"),
+                        at: 0,
+                        bytes: vec![1],
+                        tag: Tag(22),
+                    },
                     _ => return,
                 };
                 effects.push(next);
@@ -2951,10 +3310,13 @@ mod tests {
         assert!(!ran[19].contains("journal"), "{}", ran[19]);
         assert_eq!((ran[20].as_str(), ran[21].as_str()), ("failed", "failed"));
         let moved = name("vfs/moved");
-        let seen = run(&mut iocp, vec![
-            Effect::Mode { file: moved.clone(), mode: 0o555, tag: Tag(1) },
-            Effect::Stat { file: moved.clone(), tag: Tag(2) },
-        ]);
+        let seen = run(
+            &mut iocp,
+            vec![
+                Effect::Mode { file: moved.clone(), mode: 0o555, tag: Tag(1) },
+                Effect::Stat { file: moved.clone(), tag: Tag(2) },
+            ],
+        );
         assert_eq!(seen[&1], Done::Moded);
         assert!(std::fs::metadata(ours.join("vfs/moved")).unwrap().permissions().readonly());
         let seen = run(&mut iocp, vec![Effect::Mode { file: moved, mode: 0o755, tag: Tag(3) }]);
@@ -2970,7 +3332,10 @@ mod tests {
     fn a_watch_hears_a_file_written_under_it_and_nothing_outside_then_ends() {
         let root = dir("watch");
         let mut driver = Iocp::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut heard = Vec::new();
         let mut asked_end = false;
@@ -3014,7 +3379,12 @@ mod tests {
 
     /// The batches of a journal of `dir` from `since` until `enough` says so of them (or 20
     /// seconds pass), then its unwatch.
-    fn journal(driver: &mut Iocp, dir: &str, since: Cursor, enough: impl Fn(&[Journaled]) -> bool) -> Vec<Journaled> {
+    fn journal(
+        driver: &mut Iocp,
+        dir: &str,
+        since: Cursor,
+        enough: impl Fn(&[Journaled]) -> bool,
+    ) -> Vec<Journaled> {
         driver.submit(&mut vec![Effect::Journal { dir: name(dir), since, tag: Tag(7) }]);
         let mut batches = Vec::new();
         let mut out = Vec::new();
@@ -3037,7 +3407,10 @@ mod tests {
                 asked_end = true;
                 driver.submit(&mut vec![Effect::Unwatch { tag: Tag(7) }]);
             }
-            assert!(Instant::now() < deadline + Duration::from_secs(10), "the journal never ended: {batches:?}");
+            assert!(
+                Instant::now() < deadline + Duration::from_secs(10),
+                "the journal never ended: {batches:?}"
+            );
         }
     }
 
@@ -3056,7 +3429,10 @@ mod tests {
         let mut driver = Iocp::new(&root, 2).unwrap();
         let first = journal(&mut driver, "src", Cursor::None, |it| !it.is_empty());
         assert_eq!(first.len(), 1, "{first:?}");
-        assert!(first[0].caught_up && first[0].files.is_empty() && first[0].lost.is_empty(), "{first:?}");
+        assert!(
+            first[0].caught_up && first[0].files.is_empty() && first[0].lost.is_empty(),
+            "{first:?}"
+        );
         let saved = first[0].cursor;
         let (volume, id, at) = usn(saved);
         std::fs::write(src.join("a.rs"), b"fn a() {}").unwrap();
@@ -3071,7 +3447,8 @@ mod tests {
         let batches = journal(&mut driver, "src", saved, |it| it.iter().any(|it| it.caught_up));
         let caught = batches.iter().position(|it| it.caught_up).expect("caught up");
         assert!(batches[..caught].iter().all(|it| !it.caught_up));
-        let files: Vec<&str> = batches.iter().flat_map(|it| &it.files).map(FileName::as_str).collect();
+        let files: Vec<&str> =
+            batches.iter().flat_map(|it| &it.files).map(FileName::as_str).collect();
         for wanted in ["src/b.rs", "src/moved", "src/moved/f.rs"] {
             assert!(files.contains(&wanted), "{wanted} in {files:?}");
         }
@@ -3124,7 +3501,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(made.status.success(), "{made:?}");
-        let symlink = std::os::windows::fs::symlink_file(root.join("a").join("f"), root.join("a").join("s")).is_ok();
+        let symlink =
+            std::os::windows::fs::symlink_file(root.join("a").join("f"), root.join("a").join("s"))
+                .is_ok();
         let mut names = Names::default();
         for it in ["a/f", "a/d", "a/missing", "a/missing/deeper", "a/j", "a/s"] {
             assert!(names.push_str(it));
@@ -3132,22 +3511,31 @@ mod tests {
         let stamps = stamps(&root, &names).unwrap();
         let (file, dir_, missing, deeper, junction, link) =
             (stamps[0], stamps[1], stamps[2], stamps[3], stamps[4], stamps[5]);
-        assert!(file.is_file() && file.size == 5 && file.ino != 0 && file.mtime_ns != 0, "{file:?}");
+        assert!(
+            file.is_file() && file.size == 5 && file.ino != 0 && file.mtime_ns != 0,
+            "{file:?}"
+        );
         assert_eq!(file.mode, 0o100644);
         assert!(dir_.is_dir() && dir_.mode == 0o040755, "{dir_:?}");
         assert_eq!((missing, deeper), (Stamp::GONE, Stamp::GONE));
-        assert!(junction.is_link() && junction.mode == 0o120777 && junction.ino != dir_.ino, "{junction:?}");
+        assert!(
+            junction.is_link() && junction.mode == 0o120777 && junction.ino != dir_.ino,
+            "{junction:?}"
+        );
         match symlink {
             true => assert!(link.is_link() && link.ino != file.ino, "{link:?}"),
             false => assert_eq!(link, Stamp::GONE),
         }
         let mut driver = Iocp::new(&root, 2).unwrap();
-        let seen = run(&mut driver, vec![
-            Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(1) },
-            Effect::Entries { dir: name("a"), tag: Tag(2) },
-            Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
-            Effect::Entries { dir: name("a/f"), tag: Tag(4) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(1) },
+                Effect::Entries { dir: name("a"), tag: Tag(2) },
+                Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
+                Effect::Entries { dir: name("a/f"), tag: Tag(4) },
+            ],
+        );
         assert_eq!(seen[&1], Done::Stamped(stamps.clone()));
         // The listing's stamps are the ones a handle of each gives.
         let mut wanted = vec![(name("a/d"), dir_), (name("a/f"), file), (name("a/j"), junction)];
@@ -3155,7 +3543,10 @@ mod tests {
             wanted.push((name("a/s"), link));
         }
         assert_eq!(seen[&2], Done::Entries(wanted));
-        assert!(matches!(seen[&3], Done::Failed(_)) && matches!(seen[&4], Done::Failed(_)), "{seen:?}");
+        assert!(
+            matches!(seen[&3], Done::Failed(_)) && matches!(seen[&4], Done::Failed(_)),
+            "{seen:?}"
+        );
         // A write moves the file's stamp and no other.
         std::fs::write(root.join("a/f"), b"hello, again").unwrap();
         let again = super::stamps(&root, &names).unwrap();
@@ -3173,9 +3564,13 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let mut driver = Iocp::new(&root, 1).unwrap();
         let seen = run(&mut driver, vec![Effect::Flush { watch: Tag(7), tag: Tag(8) }]);
-        assert!(matches!(&seen[&8], Done::Failed(why) if why.0.contains("nothing is watched")), "{seen:?}");
+        assert!(
+            matches!(&seen[&8], Done::Failed(why) if why.0.contains("nothing is watched")),
+            "{seen:?}"
+        );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
-        let mut effects = vec![Effect::Flush { watch: Tag(7), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+        let mut effects =
+            vec![Effect::Flush { watch: Tag(7), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
         let (mut refused, mut ended) = (false, false);
         run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag.0, it.done) {
             (9, Done::Failed(why)) => refused = why.0.contains("no barrier"),
@@ -3202,7 +3597,10 @@ mod tests {
         let mut until = |driver: &mut Iocp, flush: Tag, heard: &mut Vec<FileName>| {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
-                assert!(Instant::now() < deadline, "the flush {flush:?} was never told; heard {heard:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "the flush {flush:?} was never told; heard {heard:?}"
+                );
                 driver.poll(&mut out, Duration::from_millis(50));
                 let mut told = false;
                 for it in out.drain(..) {
@@ -3237,7 +3635,8 @@ mod tests {
             driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: quiet }]);
             until(&mut driver, quiet, &mut heard);
         }
-        let mut names: Vec<_> = std::fs::read_dir(&src).unwrap().map(|it| it.unwrap().file_name()).collect();
+        let mut names: Vec<_> =
+            std::fs::read_dir(&src).unwrap().map(|it| it.unwrap().file_name()).collect();
         names.sort();
         assert_eq!(names, ["deep"], "a flush writes nothing into the watched directory");
         let mut effects = vec![Effect::Unwatch { tag: Tag(7) }];
@@ -3269,7 +3668,8 @@ mod tests {
                 match rng.below(4) {
                     0 | 1 if live.len() < 1000 => {
                         let tag = Tag(rng.next_u64());
-                        let handle = slab.insert_with(|handle| Model { tag, head: Head::new(handle.to_bits()) });
+                        let handle = slab
+                            .insert_with(|handle| Model { tag, head: Head::new(handle.to_bits()) });
                         assert!(map.insert(next, tag).is_none());
                         live.push((next, handle));
                         next += 1;
@@ -3398,8 +3798,9 @@ mod tests {
             std::fs::write(root.join(format!("f{n}")), patterned(size, 0)).unwrap();
         }
         let mut driver = Iocp::new(&root, 2).unwrap();
-        let mut asked: Vec<_> =
-            (0..sizes.len()).map(|n| Effect::ReadAll { file: name(&format!("f{n}")), tag: Tag(n as u64) }).collect();
+        let mut asked: Vec<_> = (0..sizes.len())
+            .map(|n| Effect::ReadAll { file: name(&format!("f{n}")), tag: Tag(n as u64) })
+            .collect();
         asked.push(Effect::ReadAll { file: name("missing"), tag: Tag(99) });
         let seen = run(&mut driver, asked);
         for (n, &size) in sizes.iter().enumerate() {
@@ -3407,7 +3808,8 @@ mod tests {
         }
         assert_eq!(seen[&99], Done::Read(Vec::new()));
         let last = name(&format!("f{}", sizes.len() - 1));
-        let seen = run(&mut driver, vec![Effect::Read { file: last.clone(), at: 1, len: 2, tag: Tag(1) }]);
+        let seen =
+            run(&mut driver, vec![Effect::Read { file: last.clone(), at: 1, len: 2, tag: Tag(1) }]);
         assert_eq!(seen[&1], Done::Read(patterned(3, 0)[1..].to_vec()));
         assert!(driver.readers.contains_key(&last), "a read at an offset keeps its handle by name");
         std::fs::write(root.join("new"), patterned(5000, 7)).unwrap();
@@ -3444,13 +3846,17 @@ mod tests {
                 driver.submit(&mut effects);
                 until(&mut driver, &mut out, FILES);
             });
-            let threads = driver.thread_allocations.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let threads =
+                driver.thread_allocations.load(std::sync::atomic::Ordering::Relaxed) - before;
             for done in &out {
                 assert_eq!(done.done, Done::Read(patterned(20 << 10, done.tag.0 as u8)));
             }
             if round > 0 {
                 assert_eq!(used.allocations, 0, "the polling thread, for {FILES} whole reads");
-                assert!(threads <= FILES as u64, "the threads made {threads} allocations for {FILES} whole reads");
+                assert!(
+                    threads <= FILES as u64,
+                    "the threads made {threads} allocations for {FILES} whole reads"
+                );
             }
         }
         drop(driver);
@@ -3467,7 +3873,9 @@ mod tests {
         let mut driver = Iocp::new(&root, 1).unwrap();
         let file = name("f");
         const READS: u64 = 64;
-        let asked = (0..READS).map(|n| Effect::Read { file: file.clone(), at: n * 61, len: 16, tag: Tag(n) }).collect();
+        let asked = (0..READS)
+            .map(|n| Effect::Read { file: file.clone(), at: n * 61, len: 16, tag: Tag(n) })
+            .collect();
         let packets = driver.packets;
         let seen = run(&mut driver, asked);
         for n in 0..READS {
@@ -3476,7 +3884,10 @@ mod tests {
         }
         let posted = driver.packets - packets;
         assert!(posted < READS / 2, "{posted} of {READS} cached reads posted a packet");
-        let at_end = run(&mut driver, vec![Effect::Read { file: file.clone(), at: 4090, len: 16, tag: Tag(0) }]);
+        let at_end = run(
+            &mut driver,
+            vec![Effect::Read { file: file.clone(), at: 4090, len: 16, tag: Tag(0) }],
+        );
         assert_eq!(at_end[&0], Done::Read(whole[4090..].to_vec()));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
@@ -3523,7 +3934,8 @@ mod tests {
         let mut out = Vec::with_capacity(64);
         let wanted = name("src/f.rs");
         for round in 0..4u64 {
-            let (watch, unwatch) = (Effect::Watch { dir: name("src"), tag: Tag(1) }, Effect::Unwatch { tag: Tag(1) });
+            let (watch, unwatch) =
+                (Effect::Watch { dir: name("src"), tag: Tag(1) }, Effect::Unwatch { tag: Tag(1) });
             out.clear();
             let ((), added) = blaze_alloc_count::measure(|| {
                 effects.push(watch);
@@ -3534,11 +3946,14 @@ mod tests {
             let mut used = added.allocations;
             let deadline = Instant::now() + Duration::from_secs(10);
             let heard = |out: &[Completion]| {
-                out.iter().any(|it| matches!(&it.done, Done::Changed { files, .. } if files.contains(&wanted)))
+                out.iter().any(
+                    |it| matches!(&it.done, Done::Changed { files, .. } if files.contains(&wanted)),
+                )
             };
             while !heard(&out) {
                 assert!(Instant::now() < deadline, "{out:?}");
-                let (_, polled) = blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+                let (_, polled) =
+                    blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
                 used += polled.allocations;
             }
             let ((), removed) = blaze_alloc_count::measure(|| {
@@ -3550,10 +3965,16 @@ mod tests {
                 }
             });
             used += removed.allocations;
-            assert!(out.iter().all(|it| matches!(it.done, Done::Changed { .. } | Done::Unwatched)), "{out:?}");
+            assert!(
+                out.iter().all(|it| matches!(it.done, Done::Changed { .. } | Done::Unwatched)),
+                "{out:?}"
+            );
             if round > 0 {
                 let payload = changes(&out);
-                assert!(used <= payload, "a warm watch made {used} allocations; its changes carry {payload}");
+                assert!(
+                    used <= payload,
+                    "a warm watch made {used} allocations; its changes carry {payload}"
+                );
             }
         }
         drop(driver);
@@ -3567,7 +3988,10 @@ mod tests {
         let root = dir("budget-conn");
         let mut driver = Iocp::new(&root, 1).unwrap();
         let mut out = Vec::with_capacity(16);
-        driver.submit(&mut vec![Effect::Listen { at: Address::Tcp("127.0.0.1:0".parse().unwrap()), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Listen {
+            at: Address::Tcp("127.0.0.1:0".parse().unwrap()),
+            tag: Tag(1),
+        }]);
         let at = driver.local_addr(Tag(1)).unwrap();
         driver.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
         until(&mut driver, &mut out, 2);
@@ -3594,7 +4018,10 @@ mod tests {
                 until(&mut driver, &mut out, 2);
             });
             if round > 0 {
-                assert_eq!(used.allocations, 0, "round {round}: a warm send and receive, their buffers reused");
+                assert_eq!(
+                    used.allocations, 0,
+                    "round {round}: a warm send and receive, their buffers reused"
+                );
             }
             out.sort_by_key(|it| it.tag);
             match &mut out[..] {
@@ -3607,13 +4034,22 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        assert!(sending.capacity() >= 4 && receiving.capacity() >= 64, "the buffers keep their room");
-        let seen = run(&mut driver, vec![
-            Effect::Hangup { conn: client, tag: Tag(5) },
-            Effect::Hangup { conn: server, tag: Tag(6) },
-            Effect::Unlisten { tag: Tag(1) },
-        ]);
-        assert_eq!((&seen[&5], &seen[&6], &seen[&1]), (&Done::HungUp, &Done::HungUp, &Done::Unlistened));
+        assert!(
+            sending.capacity() >= 4 && receiving.capacity() >= 64,
+            "the buffers keep their room"
+        );
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Hangup { conn: client, tag: Tag(5) },
+                Effect::Hangup { conn: server, tag: Tag(6) },
+                Effect::Unlisten { tag: Tag(1) },
+            ],
+        );
+        assert_eq!(
+            (&seen[&5], &seen[&6], &seen[&1]),
+            (&Done::HungUp, &Done::HungUp, &Done::Unlistened)
+        );
         assert!(driver.conns.is_empty(), "a hung-up connection is closed once nothing is on it");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();

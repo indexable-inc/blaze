@@ -6,8 +6,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::Config;
-use blaze_manifest::files::Disk;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
+use blaze_manifest::files::Disk;
 use cargo_platform::Cfg;
 
 struct Tree {

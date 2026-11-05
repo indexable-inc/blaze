@@ -10,12 +10,31 @@ use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 
 use super::{
-    Full, KeptImage, Laid, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow, codegen_backend,
-    function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
+    Full, KeptImage, Laid, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow,
+    codegen_backend, function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
 };
 use blaze_codegen::InstanceKey;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
+
+#[test]
+fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
+    let target = blaze_lower::target_data(HOST).unwrap();
+    let mut workspace = base_db::CrateWorkspaceData {
+        target: Ok(target), toolchain: None, const_eval: Default::default(),
+    };
+    assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
+    let original = workspace.target.clone(); // clone: restore the layout after each control
+    workspace.target.as_mut().unwrap().data_layout = "e-p:32:32".into();
+    let error = super::verify_target_data(HOST, &workspace).unwrap_err();
+    assert!(error.contains(HOST) && error.contains("e-p:32:32") && error.contains("toolchain key"), "{error}");
+    workspace.target = original;
+    assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
+    workspace.target.as_mut().unwrap().has_thumb_interworking = true;
+    assert!(super::verify_target_data(HOST, &workspace).is_err(), "the target's other layout facts count too");
+    workspace.target = Err("the crate's target could not be loaded".into());
+    assert_eq!(super::verify_target_data(HOST, &workspace).unwrap_err(), "the crate's target could not be loaded");
+}
 
 fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
     Profile {
@@ -54,14 +73,25 @@ fn cranelift_is_taken_where_the_level_compiles_with_stencils() {
     assert_eq!(codegen_backend(&dev, "app", OptLevel::O1), Ok(false));
     let release = profile("release", "3", Some("cranelift"));
     let why = codegen_backend(&release, "app", OptLevel::O3).unwrap_err();
-    assert!(why.contains("`release` of `app`") && why.contains("never Cranelift's") && why.contains("`stencil`"), "{why}");
+    assert!(
+        why.contains("`release` of `app`")
+            && why.contains("never Cranelift's")
+            && why.contains("`stencil`"),
+        "{why}"
+    );
 }
 
 /// The seed's builds: `stencil` asks for stencils at every level, LLVM's too.
 #[test]
 fn stencil_asks_for_stencils_at_every_level() {
-    assert_eq!(codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0), Ok(true));
-    assert_eq!(codegen_backend(&profile("release", "3", Some("stencil")), "app", OptLevel::O3), Ok(true));
+    assert_eq!(
+        codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0),
+        Ok(true)
+    );
+    assert_eq!(
+        codegen_backend(&profile("release", "3", Some("stencil")), "app", OptLevel::O3),
+        Ok(true)
+    );
 }
 
 #[test]
@@ -77,7 +107,10 @@ fn a_backend_blaze_has_no_setting_for_is_an_error_naming_it() {
 #[test]
 fn a_plain_build_is_not_sanitized() {
     let words = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
-    assert_eq!(sanitize(&words(&["-Ctarget-cpu=native", "-Zthreads=8"]), HOST), Ok(Sanitize::default()));
+    assert_eq!(
+        sanitize(&words(&["-Ctarget-cpu=native", "-Zthreads=8"]), HOST),
+        Ok(Sanitize::default())
+    );
     // SanitizerCoverage without its level instruments nothing, so nothing is to link.
     assert_eq!(sanitize(&words(&["-Cpasses=sancov-module"]), HOST), Ok(Sanitize::default()));
 }
@@ -149,7 +182,8 @@ fn a_profile_read_is_named_by_its_content_and_given() {
     let dir = tempfile::tempdir().unwrap();
     let bytes = b"an indexed profile's bytes".to_vec();
     std::fs::write(dir.path().join("merged.profdata"), &bytes).unwrap();
-    let read = read_profile(dir.path().to_str().unwrap(), "merged.profdata").unwrap_or_else(|what| panic!("{what}"));
+    let read = read_profile(dir.path().to_str().unwrap(), "merged.profdata")
+        .unwrap_or_else(|what| panic!("{what}"));
     assert_eq!(read.id, hir_ty_codegen::v2::profile_id(&bytes));
     assert_eq!(read._given.id(), read.id);
     assert_eq!(read.unstored.lock().as_deref(), Some(&bytes[..]));
@@ -161,7 +195,10 @@ fn a_profile_to_use_without_llvm_stops_naming_the_feature() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("merged.profdata"), b"profile").unwrap();
     let refused = read_profile(dir.path().to_str().unwrap(), "merged.profdata").err().unwrap();
-    assert!(refused.contains("`-C profile-use=merged.profdata`") && refused.contains("`llvm`"), "{refused}");
+    assert!(
+        refused.contains("`-C profile-use=merged.profdata`") && refused.contains("`llvm`"),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -197,7 +234,8 @@ fn a_static_linked_again_unchanged_is_neither_gone_nor_new() {
     assert_eq!(same, first);
     assert!(gone.is_empty() && new.is_empty(), "{gone:?} {new:?}");
 
-    let (next, gone, new) = static_rows(&first, &[a_static(2, 0xbb), a_static(1, 0xcc), a_static(3, 0)]).unwrap();
+    let (next, gone, new) =
+        static_rows(&first, &[a_static(2, 0xbb), a_static(1, 0xcc), a_static(3, 0)]).unwrap();
     assert_eq!(items(&next), [1, 2, 3]);
     assert_eq!(items(&gone), [1], "the old value of the static whose bytes changed");
     assert_eq!(items(&new), [1, 3]);
@@ -251,18 +289,22 @@ fn an_edit_to_a_callee_relinks_its_unchanged_callers() {
     assert_eq!(new, [key(1), key(2), key(3)]);
 
     let (same, gone, new) =
-        function_rows(&first, &[calling(1, &[]), calling(2, &[1]), calling(3, &[2])], &names).unwrap();
+        function_rows(&first, &[calling(1, &[]), calling(2, &[1]), calling(3, &[2])], &names)
+            .unwrap();
     assert_eq!(same, first);
     assert!(gone.is_empty() && new.is_empty(), "linked again unchanged: {gone:?} {new:?}");
 
     let (_, gone, new) =
-        function_rows(&first, &[calling(3, &[2]), calling(2, &[4]), calling(4, &[])], &names).unwrap();
+        function_rows(&first, &[calling(3, &[2]), calling(2, &[4]), calling(4, &[])], &names)
+            .unwrap();
     assert_eq!(gone, [key(1), key(2)], "the old `log`, and `call` as it was filled against it");
     assert_eq!(new, [key(2), key(4)], "`call` filled against the new `log`, and the new `log`");
 
     let twice = function_rows(&[], &[calling(2, &[1]), calling(2, &[4])], &names).unwrap_err();
     assert!(
-        twice.contains("filled two ways") && twice.contains("`call`") && twice.contains(&format!("{:?}", key(2))),
+        twice.contains("filled two ways")
+            && twice.contains("`call`")
+            && twice.contains(&format!("{:?}", key(2))),
         "{twice}"
     );
 }
@@ -288,6 +330,7 @@ fn shared(exports: &[&str]) -> blaze_link::Output {
         exec_log: false,
         sanitize: Sanitize::default(),
         rpaths: Vec::new(),
+        link: blaze_link::LinkArgs::default(),
     }
 }
 
@@ -317,7 +360,8 @@ fn an_output_that_changed_names_the_fields_that_differ() {
     assert!(OutputFields::between(&old, &old).is_empty());
     let new = shared(&["f", "g"]);
     assert_eq!(OutputFields::between(&old, &new).to_string(), "exports");
-    let new = blaze_link::Output { debug: blaze_link::Debug::Lines, exec_log: true, ..shared(&["g"]) };
+    let new =
+        blaze_link::Output { debug: blaze_link::Debug::Lines, exec_log: true, ..shared(&["g"]) };
     assert_eq!(OutputFields::between(&old, &new).to_string(), "exports, debug, exec_log");
     let renamed = blaze_link::Output {
         kind: blaze_link::OutputKind::Shared { name: "libn.so".into(), exports: vec!["f".into()] },
@@ -332,10 +376,20 @@ fn how_a_link_went_is_first_only_with_nothing_kept() {
     assert_eq!(linking(None, Laid::Whole, true), Linking::First);
     assert_eq!(linking(Some(OutputFields::default()), Laid::Patched, true), Linking::Spliced);
     assert_eq!(linking(Some(OutputFields::default()), Laid::Nothing, true), Linking::Unchanged);
-    assert_eq!(linking(Some(OutputFields::default()), Laid::Whole, true), Linking::First, "a kept image never laid out");
-    assert_eq!(linking(Some(OutputFields::default()), Laid::Whole, false), Linking::Full(Full::NotIncremental));
+    assert_eq!(
+        linking(Some(OutputFields::default()), Laid::Whole, true),
+        Linking::First,
+        "a kept image never laid out"
+    );
+    assert_eq!(
+        linking(Some(OutputFields::default()), Laid::Whole, false),
+        Linking::Full(Full::NotIncremental)
+    );
     assert_eq!(linking(Some(exports), Laid::Whole, true), Linking::Full(Full::Output(exports)));
-    assert_eq!(Linking::Full(Full::Output(exports)).to_string(), "not spliced: the output changed: exports");
+    assert_eq!(
+        Linking::Full(Full::Output(exports)).to_string(),
+        "not spliced: the output changed: exports"
+    );
     assert!(Linking::First.placed() && !Linking::Spliced.placed() && !Linking::Unchanged.placed());
 }
 
@@ -347,13 +401,19 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let (path, output) = ("/w/target/debug/libm.so", shared(&["f"]));
     let mut images = vec![kept(path, &output)];
     let (linked, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
-    assert_eq!((linked.functions.len(), changed, relaid), (1, Some(OutputFields::default()), false));
+    assert_eq!(
+        (linked.functions.len(), changed, relaid),
+        (1, Some(OutputFields::default()), false)
+    );
     assert!(images.is_empty(), "taken out for the link");
 
     images.push(KeptImage { path: path.to_owned(), kept: linked });
     let heat = Some(ContentId([3; 32]));
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, heat).unwrap();
-    assert!(fresh.functions.is_empty() && fresh.layout == heat && relaid, "another profile: laid out again");
+    assert!(
+        fresh.functions.is_empty() && fresh.layout == heat && relaid,
+        "another profile: laid out again"
+    );
     assert_eq!(changed, Some(OutputFields::default()));
     assert!(images.is_empty(), "the image of the old layout is let go");
 
@@ -365,13 +425,24 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     assert!(images.is_empty(), "the image of the old output is let go");
 
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
-    assert!(fresh.functions.is_empty() && changed.is_none() && !relaid, "nothing kept: a first link");
+    assert!(
+        fresh.functions.is_empty() && changed.is_none() && !relaid,
+        "nothing kept: a first link"
+    );
 
     let unnamed = "/w/../libm.so";
-    let mut images = vec![kept("/w/target/debug/libm.so", &output), KeptImage { path: unnamed.into(), ..kept(path, &output) }];
-    let error = kept_image(&mut images, unnamed, &other, None).err().expect("a path the linker can't name");
+    let mut images = vec![
+        kept("/w/target/debug/libm.so", &output),
+        KeptImage { path: unnamed.into(), ..kept(path, &output) },
+    ];
+    let error =
+        kept_image(&mut images, unnamed, &other, None).err().expect("a path the linker can't name");
     assert!(matches!(error, LinkCause::Unnamed), "{error}");
-    assert_eq!(images.len(), 2, "a link that fails before staging leaves the kept images as they were");
+    assert_eq!(
+        images.len(),
+        2,
+        "a link that fails before staging leaves the kept images as they were"
+    );
 }
 
 /// A link blaze-link refused for want of room names the image, what overflowed and the command
@@ -380,16 +451,22 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
 fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
     let refused = |refusal| blaze_link::LinkError {
         function: None,
-        what: "Patch needs 70000000 bytes and has room for 67108864: link the image from scratch".to_owned(),
+        what: "Patch needs 70000000 bytes and has room for 67108864: link the image from scratch"
+            .to_owned(),
         refusal,
     };
-    let failed = |refusal| super::LinkFailed {
-        image: "/w/target/debug/app".to_owned(),
-        cause: LinkCause::Linker { step: super::LinkStep::Stage, error: refused(refusal) },
-    }
-    .to_string();
+    let failed = |refusal| {
+        super::LinkFailed {
+            image: "/w/target/debug/app".to_owned(),
+            cause: LinkCause::Linker { step: super::LinkStep::Stage, error: refused(refusal) },
+        }
+        .to_string()
+    };
     let no_room = failed(Some(blaze_link::Refusal::NoRoom { need: 70_000_000, room: 67_108_864 }));
-    assert!(no_room.starts_with("linking `/w/target/debug/app`: staging the change: "), "{no_room}");
+    assert!(
+        no_room.starts_with("linking `/w/target/debug/app`: staging the change: "),
+        "{no_room}"
+    );
     assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
     assert!(no_room.contains("`blaze stop`"), "{no_room}");
     assert!(!failed(None).contains("`blaze stop`"));

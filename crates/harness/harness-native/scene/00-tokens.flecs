@@ -16,10 +16,10 @@ export const size_code = 11.5
 export const weight_row = 500
 export const weight_label = 600
 
-// Rows: a session 28 tall, a run 24, the fold 22; children indented 16 a level; icons 14 in a 16 box.
-export const row_h = 28
-export const run_h = 24
-export const more_h = 22
+// Rows: a session 24 tall, a run 20, the fold 20 (packed: the tree has no gap between rows); children indented 16 a level; icons 14 in a 16 box.
+export const row_h = 24
+export const run_h = 20
+export const more_h = 20
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
@@ -58,15 +58,34 @@ export const pill_zeta = 0.86
 // From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
 export const pill_jump_rows = 3
 export const sidebar_omega = 24
-// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
+// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade.
 export const tree_glide_omega = 22
 export const tree_fold_omega = 26
 export const tree_fold_zeta = 1
 export const tree_glide_zeta = 1
 export const tree_reveal_margin = 8
 export const tree_fade_len = 22
-export const knob_width = 6
 export const sidebar_zeta = 1
+// Overlay scrollers (prims.flecs ui.Scroller, on every ui.Scroll; macOS's overlay NSScroller): the knob scroller_thin
+// across at rest and scroller_wide over its track while the pointer is within scroller_grab of the edge, scroller_inset
+// off the edge, never shorter than scroller_min (but shortened under a rubber band). It shows as the content scrolls,
+// stays scroller_hold seconds after it stops, then fades; it comes in on the show spring, goes on the hide spring, widens
+// on the wide spring. A press on the track pages toward it on the page spring, keeping scroller_keep points in view.
+export const scroller_thin = 6
+export const scroller_wide = 10
+export const scroller_inset = 2
+export const scroller_min = 24
+export const scroller_grab = 16
+export const scroller_hold = 0.7
+export const scroller_keep = 24
+export const scroller_show_omega = 40
+export const scroller_show_zeta = 1
+export const scroller_hide_omega = 13
+export const scroller_hide_zeta = 1
+export const scroller_wide_omega = 32
+export const scroller_wide_zeta = 1
+export const scroller_page_omega = 20
+export const scroller_page_zeta = 1
 // The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
 export const lights_omega = 26
 export const lights_zeta = 1
@@ -101,8 +120,41 @@ export const arch_time_w = 84
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
 
+// Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
+// (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs). They come in on a spring (the scrim fades in, the card
+// grows from overlay_scale) and go out the same way, never in a step.
+export const overlay_omega = 30
+export const overlay_zeta = 0.92
+export const overlay_scale = 0.96
+export const overlay_radius = 12
+export const overlay_pad = 6
+export const overlay_lift_blur = 24
+export const overlay_lift_alpha = 0.5
+export const overlay_lift_dy = 8
+// The palette: a wide card near the window's top, its query line, its entries.
+export const palette_w = 560
+export const palette_top = 96
+export const palette_query_h = 38
+export const palette_row_h = 32
+// The picker: a narrow card a little above the window's middle (picker_rise lifts it), a quiet label over one row a
+// kind (its mark in a picker_mark box, its name, its shortcut, the key that picks it in a keycap).
+export const picker_w = 300
+export const picker_rise = 80
+export const picker_head_h = 24
+export const picker_row_h = 34
+export const picker_mark = 18
+export const keycap_min = 18
+export const keycap_h = 18
+export const keycap_pad = 5
+export const keycap_radius = 4
+export const size_keycap = 11
+export const line_keycap = 13
+
 export const radius_control = 6
 export const radius_card = 12
+// ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
+export const radius_bubble = 12
+export const bubble_max_w = 480
 
 // Vibrant labels: primary, secondary, tertiary, quaternary.
 export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
@@ -114,8 +166,11 @@ export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
+// black over a light one (a scroll on the terminal's ground follows its Scheme).
+export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
+export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_knob: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
@@ -191,3 +246,61 @@ export const tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0
 export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
 export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
 export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
+
+// Text being edited (ui.TextArea): the selection's wash and the caret. Inline code's chip (MarkdownText).
+export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.369, 0.384, 0.902, 0.24}}
+export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
+export const textarea_max_h = 132
+// ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
+export const table_row = 24
+export const table_gap = 14
+export const table_pad = 6
+export const size_table = 12.5
+export const result_snippet_h = 36
+
+// The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
+// well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
+export const chat_w = 720
+export const chat_pad = 24
+export const size_chat = 14
+export const line_chat = 21
+export const size_chat_h1 = 19
+export const size_chat_h2 = 16.5
+export const size_chat_h3 = 14.5
+export const line_chat_code = 17
+export const chat_bubble_radius = 12
+// The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
+export const chat_bubble_max_w = 540
+export const chat_input_radius = 12
+export const chat_row_estimate = 44
+export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
+export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
+export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
+// A cell's own UI in the chat (scene/widgets/genui.flecs, src/app/chat/genui.rs): the space between its elements, and
+// a Stat's value, set large.
+export const gen_gap = 8
+export const size_gen_stat = 22
+export const line_gen_stat = 28
+
+// Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
+// `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and
+// `function.macro`); a capture none names keeps the words' own ink. These are for an appearance the Ghostty config does
+// not theme; with a theme, src/app/ghostty.rs (CODE_ANSI) sets each from the theme's ANSI colour, so code reads as it
+// would in the terminal.
+@tree ChildOf
+code_ink {
+  keyword { Fill: {dark: {0.776, 0.471, 0.867, 1}, light: {0.812, 0.133, 0.180, 1}} }
+  function { Fill: {dark: {0.380, 0.686, 0.937, 1}, light: {0.510, 0.314, 0.875, 1}} }
+  type { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  constructor { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  attribute { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  string { Fill: {dark: {0.596, 0.765, 0.475, 1}, light: {0.039, 0.188, 0.412, 1}} }
+  escape { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  number { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  constant { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  property { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  label { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  operator { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.812, 0.133, 0.180, 1}} }
+  comment { Fill: {dark: {0.498, 0.518, 0.557, 1}, light: {0.431, 0.467, 0.506, 1}} }
+  variable { builtin { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.812, 0.133, 0.180, 1}} } }
+}

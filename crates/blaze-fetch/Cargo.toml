@@ -1,0 +1,39 @@
+[package]
+name = "blaze-fetch"
+description = "blaze's one way to get bytes by their hash: a digest (sha256, sha512, blake3) looked up in blaze's store, downloaded only when the store lacks it, checked in one streaming pass, kept by BLAKE3 with a side index from the digest"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Where objects and the side index live: blaze's content-addressed store, keyed by BLAKE3.
+blaze-cas.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-sha256.workspace = true
+crossbeam-channel.workspace = true
+papaya.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# The one checked unpacker of a tar stream (`unpack`), and the times cargo's rules give its files.
+tar.workspace = true
+filetime.workspace = true
+# SHA-512 only; SHA-256 is blaze-sha256's.
+sha2.workspace = true
+tracing.workspace = true
+# A tree's paths compared as a case- and normalization-insensitive disk (APFS) compares them.
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

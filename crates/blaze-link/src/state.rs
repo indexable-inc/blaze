@@ -17,11 +17,11 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use blaze_codegen::{InstanceKey, Line};
+use blaze_codegen::{InstanceKey, Line, Made};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::cow::{CowBytes, CowList, CowVec, ListRef};
 use crate::model::{Class, Fixup, NativeFile, Region, Special, Sym, Tls};
@@ -45,7 +45,10 @@ pub(crate) struct ClassId(pub u16);
 pub(crate) enum Def {
     None,
     /// At `offset` in a piece.
-    Piece { piece: PieceId, offset: u64 },
+    Piece {
+        piece: PieceId,
+        offset: u64,
+    },
     /// The image's import of this index.
     Import(u32),
     /// A value, not an address of the image: never slid. A weak symbol nothing defines is 0.
@@ -118,15 +121,33 @@ pub(crate) enum What {
     /// a panic location, a file name, a CIE. [`State::users`] counts the pieces whose fixups
     /// refer to it, each once, but for the linker's cells ([`What::is_linkers_cell`]).
     Shared,
-    Static { thread_local: bool },
-    Native { obj: Obj, section: u32, unwind: bool },
+    Static {
+        thread_local: bool,
+    },
+    Native {
+        obj: Obj,
+        section: u32,
+        unwind: bool,
+    },
     /// A native call frame record; `fde` for an FDE (gone with what it describes).
-    NativeFrame { obj: Obj, section: u32, fde: bool },
+    NativeFrame {
+        obj: Obj,
+        section: u32,
+        fde: bool,
+    },
     Common,
-    Got { kind: GotKind, target: Sym },
-    Plt { target: Sym },
+    Got {
+        kind: GotKind,
+        target: Sym,
+    },
+    Plt {
+        target: Sym,
+    },
     /// An AArch64 range-extension thunk to `target` in island `island` ([`crate::thunk`]).
-    Thunk { target: Sym, island: u32 },
+    Thunk {
+        target: Sym,
+        island: u32,
+    },
     Fde,
     WinInfo,
     /// A Mach-O TLV descriptor of a thread-local static.
@@ -190,7 +211,14 @@ pub(crate) struct FunctionInfo {
     pub windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
     /// [`State::lines`] of it.
     pub lines: ListRef,
+    /// How it was made ([`crate::Change::made`]), as its index in [`State::makes`]; [`NO_MADE`]
+    /// when the change said nothing of it. What the image's shape sums its code by. An index,
+    /// not the [`Made`] (24 bytes), so the struct stays within its size.
+    pub made: u32,
 }
+
+/// [`FunctionInfo::made`] of a function the change said nothing of.
+pub(crate) const NO_MADE: u32 = u32::MAX;
 
 /// Of each symbol, besides its definition: the pieces referring to it (a list with room to
 /// grow), the first jump-table slot running it, and whether resolution looks at it.
@@ -320,7 +348,9 @@ impl<'s> PieceRef<'s> {
 
     /// The bytes it has now in its region (none when zeroed or unplaced).
     pub fn bytes(self) -> Cow<'s, [u8]> {
-        let Some(space) = self.state.spaces.get(self.hot.region as usize) else { return Cow::Borrowed(&[]) };
+        let Some(space) = self.state.spaces.get(self.hot.region as usize) else {
+            return Cow::Borrowed(&[]);
+        };
         if space.zero || self.hot.zero() {
             return Cow::Borrowed(&[]);
         }
@@ -504,6 +534,10 @@ pub(crate) struct State {
     /// One past the last thunk island index given ([`crate::thunk`]): a full link's segments,
     /// then one per incremental stage whose new code needed a thunk.
     pub islands: u32,
+    /// Each distinct way the image's functions were made, once: what
+    /// [`FunctionInfo::made`] indexes. A few hundred at most (crates by backends); a stage
+    /// adds with `Arc::make_mut` only the new ones.
+    pub makes: Arc<Vec<Made>>,
 
     hot: CowVec<Hot>,
     what: CowVec<What>,
@@ -565,6 +599,7 @@ impl State {
             lineage: [0; 16],
             laid_out: false,
             islands: 0,
+            makes: Arc::default(),
             hot: CowVec::default(),
             what: CowVec::default(),
             sort: CowVec::default(),
@@ -741,7 +776,8 @@ impl State {
     /// what is live, bytes what is held, garbage and removed pieces included, without the
     /// chunk tables or the room left in a last chunk.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
-        let [pieces, relocations, symbol_bytes, loader, functions, lines, slots, file] = self.table_bytes();
+        let [pieces, relocations, symbol_bytes, loader, functions, lines, slots, file] =
+            self.table_bytes();
         let live = self.hot.iter().filter(|it| it.live()).count() as u64;
         let symbols = self.defs.iter().map(|it| it.len() as u64).sum::<u64>();
         // alloc: a report of eight rows, off any link's path
@@ -789,7 +825,16 @@ impl State {
         let loader = vec(&self.loader) + list(&self.rebase) + list(&self.binds);
         let slots = vec(&self.slot_syms) + vec(&self.cells) + vec(&self.slot_next);
         let file = self.parts.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>();
-        [pieces, list(&self.fixups), symbol_bytes, loader, vec(&self.functions), list(&self.lines), slots, file]
+        [
+            pieces,
+            list(&self.fixups),
+            symbol_bytes,
+            loader,
+            vec(&self.functions),
+            list(&self.lines),
+            slots,
+            file,
+        ]
     }
 
     /// A live piece.
@@ -810,13 +855,19 @@ impl State {
     }
 
     pub fn live_pieces(&self) -> impl Iterator<Item = PieceRef<'_>> + '_ {
-        self.hot.iter().enumerate().filter(|(_, it)| it.live()).map(|(id, hot)| PieceRef { id: id as PieceId, hot, state: self })
+        self.hot.iter().enumerate().filter(|(_, it)| it.live()).map(|(id, hot)| PieceRef {
+            id: id as PieceId,
+            hot,
+            state: self,
+        })
     }
 
     /// The symbols a piece's fixups refer to, once each: inline up to eight.
     pub fn targets(piece: PieceRef<'_>) -> SmallVec<[Sym; 8]> {
         let fixups = piece.fixups();
-        let mut out: SmallVec<[Sym; 8]> = SmallVec::with_capacity(fixups.len() + fixups.iter().filter(|it| it.minus.is_some()).count());
+        let mut out: SmallVec<[Sym; 8]> = SmallVec::with_capacity(
+            fixups.len() + fixups.iter().filter(|it| it.minus.is_some()).count(),
+        );
         for fixup in fixups {
             out.push(fixup.target);
             out.extend(fixup.minus);
@@ -880,7 +931,8 @@ impl State {
         for at in 0..lists.wasm.len() {
             let name = NameId(self.wasm_names.get(lists.wasm)[at]);
             let (shard, at) = name_split(name);
-            let declarers = self.wasm_declarers[shard].get_mut(at).expect("a declared name's count");
+            let declarers =
+                self.wasm_declarers[shard].get_mut(at).expect("a declared name's count");
             *declarers -= 1;
             if *declarers == 0 {
                 Arc::make_mut(&mut self.wasm_imports).remove(&name);
@@ -1005,7 +1057,8 @@ impl State {
             for at in 0..len {
                 let it = shard.get(at).copied().expect("in range");
                 if it.room > 0 {
-                    *shard.get_mut(at).expect("in range") = SymCold { refs: ListRef::EMPTY, room: 0, ..it };
+                    *shard.get_mut(at).expect("in range") =
+                        SymCold { refs: ListRef::EMPTY, room: 0, ..it };
                 }
             }
         }
@@ -1018,7 +1071,10 @@ impl State {
                     defines: self.syms.push(piece.defines()),
                     wasm: self.wasm_names.push(piece.wasm_names()),
                 };
-                let loader = Loader { rebase: self.rebase.push(piece.rebase()), binds: self.binds.push(piece.binds()) };
+                let loader = Loader {
+                    rebase: self.rebase.push(piece.rebase()),
+                    binds: self.binds.push(piece.binds()),
+                };
                 (lists, loader)
             } else {
                 (Lists::default(), Loader::default())
@@ -1065,9 +1121,10 @@ impl State {
         fde: Option<Sym>,
         windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
         lines: &[Line],
+        made: u32,
     ) -> FuncId {
         let lines = self.lines.push(lines);
-        self.functions.push(FunctionInfo { key, id, fde, windows, lines }) as FuncId
+        self.functions.push(FunctionInfo { key, id, fde, windows, lines, made }) as FuncId
     }
 
     /// The image's id, its build id in the file: of its lineage and generation.
@@ -1083,6 +1140,11 @@ impl State {
 
     pub fn function(&self, id: FuncId) -> &FunctionInfo {
         self.functions.get(id as usize).expect("a function")
+    }
+
+    /// How `function` was made, when its change said.
+    pub fn made(&self, function: &FunctionInfo) -> Option<Made> {
+        self.makes.get(function.made as usize).copied()
     }
 
     pub fn lines(&self, info: &FunctionInfo) -> &[Line] {
@@ -1155,7 +1217,9 @@ impl State {
     pub fn same_bytes(&self, other: &State, id: PieceId) -> bool {
         match (self.located(id), other.located(id)) {
             (None, None) => true,
-            (Some((a, at, len)), Some((b, other_at, other_len))) => len == other_len && a.same(at, b, other_at, len),
+            (Some((a, at, len)), Some((b, other_at, other_len))) => {
+                len == other_len && a.same(at, b, other_at, len)
+            }
             (Some(_), None) | (None, Some(_)) => false,
         }
     }
@@ -1200,7 +1264,8 @@ impl State {
                 }
             }
         }
-        *self.cells.get_mut(slot as usize).expect("a slot") = body.unwrap_or(crate::symbols::NO_SYM);
+        *self.cells.get_mut(slot as usize).expect("a slot") =
+            body.unwrap_or(crate::symbols::NO_SYM);
         let next = match body {
             Some(body) => {
                 let cold = self.cold_mut(body);
@@ -1279,15 +1344,21 @@ mod tests {
     fn image(pieces: u32) -> State {
         let mut state = State::new();
         let class = state.class_id(&Class::Text);
-        let fixups: Vec<Fixup> = (0..64).map(|it| fixup(Symbols::join(it % SHARDS, it), None)).collect();
+        let fixups: Vec<Fixup> =
+            (0..64).map(|it| fixup(Symbols::join(it % SHARDS, it), None)).collect();
         for n in 0..pieces {
             let sym = Symbols::join(n as usize % SHARDS, 100 + n as usize);
-            let id = state.add(&piece(sym, class, &fixups[(n % 57) as usize..(n % 57 + n % 8) as usize]));
+            let id = state.add(&piece(
+                sym,
+                class,
+                &fixups[(n % 57) as usize..(n % 57 + n % 8) as usize],
+            ));
             state.set_def(sym, Def::Piece { piece: id, offset: 0 });
         }
         let spaces = Arc::make_mut(&mut state.spaces);
         spaces.push(space(Class::Text, 0x1000, vec![0x90; 3 * CowBytes::PAGE]));
-        let named = Class::Named { name: SectionName::new("linkme_ITEMS"), write: false, exec: false };
+        let named =
+            Class::Named { name: SectionName::new("linkme_ITEMS"), write: false, exec: false };
         spaces.push(space(named, 0x10000, vec![0; 64]));
         Arc::make_mut(&mut state.specials).push(Special::Absolute(1));
         state
@@ -1315,9 +1386,11 @@ mod tests {
         assert!(blaze_alloc_count::installed());
         let old = image(3);
         let mut new = old.clone();
-        let (_, used) = blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 8);
+        let (_, used) =
+            blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 8);
         assert_eq!(used.allocations, 2, "{used:?}");
-        let (_, used) = blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 9);
+        let (_, used) =
+            blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 9);
         assert_eq!(used.allocations, 0, "{used:?}");
         Arc::make_mut(&mut new.spaces)[1].region.size = 8;
         Arc::make_mut(&mut new.spaces)[0].bytes.write(0, &[1, 2]);
@@ -1331,15 +1404,19 @@ mod tests {
     fn lookups_allocate_nothing() {
         let state = image(5000);
         let sym = Symbols::join(7, 107);
-        blaze_alloc_count::assert_at_most(0, "a symbol's definition, home, piece and lists", || {
-            let (piece, _) = state.home(sym).expect("defined");
-            assert_eq!(state.def(sym), Def::Piece { piece, offset: 0 });
-            let piece = state.piece(piece).expect("live");
-            assert_eq!(piece.sym, sym);
-            assert_eq!(piece.fixups().len(), 7);
-            assert!(state.refs(Symbols::join(10, 10)).next().is_some());
-            assert!(state.same_bytes(&state, piece.id));
-        });
+        blaze_alloc_count::assert_at_most(
+            0,
+            "a symbol's definition, home, piece and lists",
+            || {
+                let (piece, _) = state.home(sym).expect("defined");
+                assert_eq!(state.def(sym), Def::Piece { piece, offset: 0 });
+                let piece = state.piece(piece).expect("live");
+                assert_eq!(piece.sym, sym);
+                assert_eq!(piece.fixups().len(), 7);
+                assert!(state.refs(Symbols::join(10, 10)).next().is_some());
+                assert!(state.same_bytes(&state, piece.id));
+            },
+        );
     }
 
     /// A piece naming a symbol twice (and as the subtracted one) is its referrer once, and
@@ -1349,7 +1426,11 @@ mod tests {
         let mut state = State::new();
         let class = state.class_id(&Class::Text);
         let (a, b, c) = (Symbols::join(1, 0), Symbols::join(2, 0), Symbols::join(3, 0));
-        let first = state.add(&piece(Symbols::join(4, 0), class, &[fixup(a, Some(b)), fixup(b, None), fixup(a, Some(a))]));
+        let first = state.add(&piece(
+            Symbols::join(4, 0),
+            class,
+            &[fixup(a, Some(b)), fixup(b, None), fixup(a, Some(a))],
+        ));
         let second = state.add(&piece(Symbols::join(4, 1), class, &[fixup(a, None)]));
         let refs = |state: &State, sym: Sym| state.refs(sym).collect::<Vec<_>>();
         assert_eq!(refs(&state, a), vec![first, second]);

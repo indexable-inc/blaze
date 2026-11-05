@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::radix;
+use std::alloc::Global;
 use url::Url;
 
 use crate::files::{Disk, Files};
@@ -198,11 +198,14 @@ impl ConfigValue {
                     match old.get_mut(&key) {
                         Some(entry) => {
                             let new_def = value.definition().clone();
-                            // cargo 1.99 pushes and never pops, so the path a list is checked
-                            // against `NON_MERGEABLE_LISTS` with holds every key merged before
-                            // it, in the iteration order of `HashMap`.
+                            // The path of the value merged, popped once it is: cargo 1.99 pushes
+                            // and never pops, so its path holds every key merged before it, in
+                            // its `HashMap`'s order, and whether `target.<triple>.runner` or
+                            // `registry.credential-provider` replaces (as cargo documents) or
+                            // appends turns on that order. Here it always replaces.
                             parts.push(key.clone());
                             let result = entry.merge_helper(value, force, parts);
+                            parts.pop();
                             result.with_context(|| {
                                 format!(
                                     "failed to merge key `{key}` between {} and {new_def}",
@@ -260,15 +263,27 @@ pub struct Config<F: Files> {
     cli: Vec<String>,
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
-    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the configuration's parts, each read the first time it is asked for: per config, not global"
+    )]
     values: std::cell::OnceCell<HashMap<String, ConfigValue, Global>>,
     /// `$CARGO_HOME/credentials.toml`, once [`Config::load_credentials`] read it: kept apart
     /// from the files' values, as cargo keeps it, for [`Config::credentials_token`] only.
-    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the configuration's parts, each read the first time it is asked for: per config, not global"
+    )]
     credentials: std::cell::OnceCell<HashMap<String, ConfigValue, Global>>,
-    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the configuration's parts, each read the first time it is asked for: per config, not global"
+    )]
     build_config: std::cell::OnceCell<CargoBuildConfig>,
-    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the configuration's parts, each read the first time it is asked for: per config, not global"
+    )]
     target_cfgs: std::cell::OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     unstable: CliUnstable,
     warnings: RefCell<Vec<String>>,
@@ -633,9 +648,10 @@ impl<F: Files> Config<F> {
         for arg in &self.cli {
             let arg_as_path = self.cwd.join(arg);
             let table = if !arg.is_empty() && self.files.exists(&arg_as_path) {
-                self.load_file(&arg_as_path, &mut HashSet::new_in(Global), true, true).with_context(
-                    || format!("failed to load config from `{}`", arg_as_path.display()),
-                )?
+                self.load_file(&arg_as_path, &mut HashSet::new_in(Global), true, true)
+                    .with_context(|| {
+                        format!("failed to load config from `{}`", arg_as_path.display())
+                    })?
             } else {
                 let doc = cli_dotted_keys(arg)?;
                 if doc.get("registry").and_then(|v| v.get("token")).is_some() {
@@ -1078,16 +1094,19 @@ impl Config<Disk> {
             Some(token) => {
                 let def = Definition::Path(path.clone());
                 let table = CV::Table(
-                    HashMap::from_iter_in([(
-                        "token".to_owned(),
-                        CV::String(token.to_owned(), def.clone()),
-                    )], Global),
+                    HashMap::from_iter_in(
+                        [("token".to_owned(), CV::String(token.to_owned(), def.clone()))],
+                        Global,
+                    ),
                     def.clone(),
                 );
                 let (key, mut value) = match registry {
                     Some(registry) => (
                         "registries",
-                        CV::Table(HashMap::from_iter_in([(registry.to_owned(), table)], Global), def.clone()),
+                        CV::Table(
+                            HashMap::from_iter_in([(registry.to_owned(), table)], Global),
+                            def.clone(),
+                        ),
                     ),
                     None => ("registry", table),
                 };

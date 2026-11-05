@@ -12,10 +12,26 @@ repository.workspace = true
 
 # The source is the standard library's crate (library/blaze_inproc_rt): one source, two builds.
 # This one is the daemon's (`blaze-inproc` names its modules as its own) and runs the tests.
+# Its root, src/lib.rs, mounts library/blaze_inproc_rt/src/lib.rs with `#[path]` and re-exports
+# it: a `[lib] path` outside the package (`../../library/...`) is a target the stage 0 blaze's
+# `blaze check --workspace` refuses as one "the workspace was not loaded with" (src/lib.rs says
+# why).
 [lib]
 name = "blaze_inproc_rt"
-path = "../../library/blaze_inproc_rt/src/lib.rs"
 doctest = false
+
+# For the stage 0 blaze's `blaze check` alone: its old front end loads a package's directory and
+# the directory of each target root outside it, and resolves a `#[path]` only among those files.
+# This target puts library/blaze_inproc_rt/src among blaze-inproc-rt's files, so src/lib.rs's
+# `#[path]` resolves. It is never built by `blaze build`, `check`, `test` or `bench` (`test` and
+# `bench` off; only `--all-targets` or `--bench` pick it), and never checked by the stage 0, which
+# would refuse its `..` root as it refused `[lib] path`. Remove it once `.github/blaze-version`
+# and `[workspace.metadata.blaze] version` name a release whose check is the v2 front end.
+[[bench]]
+name = "stage0-sees-library"
+path = "../../library/blaze_inproc_rt/src/lib.rs"
+test = false
+bench = false
 
 [features]
 # The image tests' helpers (`image::testing`), for `blaze-inproc`'s tests; only its dev

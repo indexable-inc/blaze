@@ -106,7 +106,10 @@ fn orphan(puts: impl IntoIterator<Item = Put>) {
 /// (`super::Keeping::put`), as the module's docs say why.
 pub fn put(put: Put) {
     if matches!(put.keep, Keep::Durable { .. }) {
-        panic!("{}: a durable put goes through its daemon's `Keeping::put`, not a thread's puts", put.what);
+        panic!(
+            "{}: a durable put goes through its daemon's `Keeping::put`, not a thread's puts",
+            put.what
+        );
     }
     let mut put = Some(put);
     _ = PUTS.try_with(|it| it.0.borrow_mut().extend(put.take()));
@@ -152,7 +155,10 @@ pub(crate) fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
             Keep::Run { run, traced } | Keep::Durable { run, traced } => {
                 index::keep_into(store, Unit::SHARED, &run, &traced, &value, &mut tickets)
             }
-            Keep::Machine(key) => store.put(key, Kind::Machine, &value).map(|ticket| tickets.push(ticket)).map_err(KeepError::Mismatch),
+            Keep::Machine(key) => store
+                .put(key, Kind::Machine, &value)
+                .map(|ticket| tickets.push(ticket))
+                .map_err(KeepError::Mismatch),
         };
         if durable {
             for ticket in &tickets {
@@ -181,13 +187,20 @@ fn refused(what: &str, error: &KeepError) -> String {
              so the key misses an input or what made it is not deterministic: {mismatch:?}"
         ),
         // alloc: error path
-        KeepError::NotACopy { key, why } => format!("{what}: the store's {key:?}, another checkout's copy of it: {why}"),
-        // alloc: error path
-        KeepError::TooManyShapes { run } => {
-            format!("{what}: run {run:?} has more than {} shapes, so this one's is not kept", index::MOST_SHAPES)
+        KeepError::NotACopy { key, why } => {
+            format!("{what}: the store's {key:?}, another checkout's copy of it: {why}")
         }
         // alloc: error path
-        KeepError::Scan { run, why } => format!("{what}: run {run:?}: scanning what it wrote for its roots: {why}"),
+        KeepError::TooManyShapes { run } => {
+            format!(
+                "{what}: run {run:?} has more than {} shapes, so this one's is not kept",
+                index::MOST_SHAPES
+            )
+        }
+        // alloc: error path
+        KeepError::Scan { run, why } => {
+            format!("{what}: run {run:?}: scanning what it wrote for its roots: {why}")
+        }
     }
 }
 
@@ -207,7 +220,8 @@ mod tests {
 
     fn opened(sim: &mut Sim) -> Store {
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let config =
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -217,12 +231,21 @@ mod tests {
     }
 
     fn run() -> RunKey {
-        RunKey { code: ContentId::of(super::super::LIBRARY, b"lib"), given: ContentId::of("test", b"call") }
+        RunKey {
+            code: ContentId::of(super::super::LIBRARY, b"lib"),
+            given: ContentId::of("test", b"call"),
+        }
     }
 
     fn one(value: &[u8], what: &str) -> Put {
         Put {
-            keep: Keep::Run { run: run(), traced: Traced { files: vec![(PathBuf::from("/a"), Some([1; 32]))], ..Traced::default() } },
+            keep: Keep::Run {
+                run: run(),
+                traced: Traced {
+                    files: vec![(PathBuf::from("/a"), Some([1; 32]))],
+                    ..Traced::default()
+                },
+            },
             value: value.to_vec(),
             what: what.to_owned(),
         }
@@ -248,7 +271,10 @@ mod tests {
         struct Same;
         impl blaze_usercode::trace::Inputs for Same {
             type Error = String;
-            fn entry(&mut self, _: &std::path::Path) -> Result<blaze_usercode::trace::Entry, String> {
+            fn entry(
+                &mut self,
+                _: &std::path::Path,
+            ) -> Result<blaze_usercode::trace::Entry, String> {
                 Ok(blaze_usercode::trace::Entry::Missing)
             }
             fn file(&mut self, _: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
@@ -257,7 +283,11 @@ mod tests {
             fn dir(&mut self, _: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
                 Ok(None)
             }
-            fn names(&mut self, _: &std::path::Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {
+            fn names(
+                &mut self,
+                _: &std::path::Path,
+                _: &mut blaze_usercode::trace::Names<'_>,
+            ) -> Result<bool, String> {
                 Ok(false)
             }
             fn env(&mut self, _: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
@@ -275,7 +305,10 @@ mod tests {
         drop(guard);
         let published = publish(&mut store, vec![one(b"other", "the expansion of `M` of /lib.so")]);
         assert_eq!(published.refused.len(), 1);
-        assert!(published.refused[0].starts_with("the expansion of `M` of /lib.so: the store has another"));
+        assert!(
+            published.refused[0]
+                .starts_with("the expansion of `M` of /lib.so: the store has another")
+        );
         assert!(super::super::server_failed().is_some());
     }
 
@@ -292,16 +325,30 @@ mod tests {
         assert!(record.durable, "a retraction is a record that must be durable");
         let here = verify::Put {
             run: run(),
-            traced: Traced { files: vec![(PathBuf::from("/a"), Some([1; 32]))], ..Traced::default() },
+            traced: Traced {
+                files: vec![(PathBuf::from("/a"), Some([1; 32]))],
+                ..Traced::default()
+            },
             value: b"out".to_vec(),
             durable: false,
         };
-        let puts = vec![Put::of(record, "the record of `M`".to_owned()), Put::of(here, "the expansion of `M`".to_owned())];
-        assert!(matches!(puts[0].keep, Keep::Durable { .. }) && matches!(puts[1].keep, Keep::Run { .. }));
+        let puts = vec![
+            Put::of(record, "the record of `M`".to_owned()),
+            Put::of(here, "the expansion of `M`".to_owned()),
+        ];
+        assert!(
+            matches!(puts[0].keep, Keep::Durable { .. })
+                && matches!(puts[1].keep, Keep::Run { .. })
+        );
         let published = publish(&mut store, puts);
         assert!(published.refused.is_empty(), "{:?}", published.refused);
-        let ticket = published.durable.iter().next().expect("the record's ticket is what the job waits for");
-        assert_eq!(published.tickets.first(), Some(&ticket), "the record's own ticket, not the expansion's");
+        let ticket =
+            published.durable.iter().next().expect("the record's ticket is what the job waits for");
+        assert_eq!(
+            published.tickets.first(),
+            Some(&ticket),
+            "the record's own ticket, not the expansion's"
+        );
     }
 
     /// C3 (round 4): a retraction's ticket is handed back for the job to wait on, and once the

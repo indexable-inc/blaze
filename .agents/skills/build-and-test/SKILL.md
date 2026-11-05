@@ -1,6 +1,6 @@
 ---
 name: build-and-test
-description: "How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up, measuring the exact tree and testing a causal claim. Load before any build, check, test, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane."
+description: "How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up and measuring the exact tree. How tests are written (Hegel property tests, deterministic simulation, testing a causal claim) is the `testing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane."
 ---
 
 # Building, testing and measuring blaze
@@ -49,20 +49,14 @@ A measurement, bisect or checkpoint names the exact tree it ran on (a content di
 and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and
 committing. A result you can't tie to a tree is not evidence.
 
-## test-the-cause (rule 22)
-
-A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
-fast) is tested by removing the cause and watching the effect go, not by checking that its premises
-hold. Pin a load-bearing one with a test named for the property.
-
-## work-in-ix-vms (rule 32)
+## work-in-ix-vms (rule 33)
 
 Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix
 rm`), never on AWS. Where neither can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
-## fan-out-write-only (rule 33)
+## fan-out-write-only (rule 34)
 
 Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
 run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
@@ -72,12 +66,12 @@ It hands each failure back to a fresh subagent for the code that broke, with the
 command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
 show its test fails (test-the-cause), are also run by the main agent, as patches.
 
-## worktree-per-lane (rule 34)
+## worktree-per-lane (rule 35)
 
 One uniquely named worktree per lane; its build directory is its own under blaze's root, never in
 the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 
-## clean-up-lane (rule 37)
+## clean-up-lane (rule 38)
 
 When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
 

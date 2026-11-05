@@ -38,16 +38,19 @@ blaze's own cold build, so the check runs nothing of rustc's, and it asserts no 
 """
 
 import asyncio
-import json
 import os
 import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import Literal, get_args
 
 from typed_input import fail, parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import Failed, artifact, worked
 
 SCRIPT = "storerevisions.py"
 Case = Literal[
@@ -57,8 +60,16 @@ BUILD_SECS = 900
 RUN_SECS = 60
 IDLE_SECS = 120
 # Read by blaze or cargo from the caller's environment; set here alone.
-SCRUBBED = ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
-            "BLAZE_HOME", "XDG_RUNTIME_DIR")
+SCRUBBED = (
+    "CARGO_TARGET_DIR",
+    "CARGO_INCREMENTAL",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "BLAZE_HOME",
+    "XDG_RUNTIME_DIR",
+)
 
 
 @dataclass(frozen=True)
@@ -186,15 +197,15 @@ CASES: dict[Case, tuple[str, str, str]] = {
     # cache_folder, by the contents of the constant table it returns.
     "table": ("lib/src/tables.rs", "&['k', 'K']", "&['k', 'Å']"),
     # cache_folder, by the layout of the struct it builds.
-    "table-layout": ("lib/src/tables.rs", "#[repr(C)]\npub struct Folder", "#[repr(Rust)]\npub struct Folder"),
+    "table-layout": (
+        "lib/src/tables.rs",
+        "#[repr(C)]\npub struct Folder",
+        "#[repr(Rust)]\npub struct Folder",
+    ),
     # cache_folder, by the discriminant it writes.
     "table-tag": ("lib/src/tables.rs", "Idle = 1, Other = 7", "Idle = 7, Other = 1"),
 }
 assert all(FILES[file].count(old) == 1 for file, old, _ in CASES.values())
-
-
-class Failed(Exception):
-    """A step that went wrong, said whole."""
 
 
 @dataclass(frozen=True)
@@ -211,8 +222,9 @@ class Env:
 async def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], secs: float) -> str:
     """What `argv` printed on stdout, then stderr; a Failed naming the step, the command, its
     exit status and the end of what it said when it fails or takes longer than `secs`."""
-    proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.PIPE)
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
     try:
         async with asyncio.timeout(secs):
             out, err = await proc.communicate()
@@ -220,7 +232,9 @@ async def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], secs: 
         proc.kill()
         out, err = await proc.communicate()
         said = (out + err).decode(errors="replace")
-        raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} took more than {secs:.0f} s:\n{said[-3000:]}") from None
+        raise Failed(
+            f"{step}: `{' '.join(argv)}` in {cwd} took more than {secs:.0f} s:\n{said[-3000:]}"
+        ) from None
     said = out.decode(errors="replace") + err.decode(errors="replace")
     if proc.returncode != 0:
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} exited {proc.returncode}:\n{said[-3000:]}")
@@ -248,23 +262,6 @@ def edit(ws: Path, file: str, old: str, new: str) -> None:
     path.write_text(text.replace(old, new))
 
 
-def messages(said: str, reason: str) -> list[dict[str, object]]:
-    """The `--message-format=json` lines of `reason` in what a build printed."""
-    out: list[dict[str, object]] = []
-    for line in said.splitlines():
-        if line.startswith("{") and reason in line:
-            try:
-                parsed: object = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            message = cast(dict[str, object], parsed)
-            if message.get("reason") == reason:
-                out.append(message)
-    return out
-
-
 @dataclass(frozen=True)
 class Built:
     printed: tuple[str, str]
@@ -287,30 +284,31 @@ async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> 
     variables = env.of(home)
     blaze = str(env.blaze)
     try:
-        said = await run(f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS)
-        programs = [m["executable"] for m in messages(said, "compiler-artifact")
-                    if m.get("executable") and isinstance(target := m.get("target"), dict)
-                    and cast(dict[str, object], target).get("name") == exe]
-        if not programs:
+        said = await run(
+            f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS
+        )
+        program = artifact(said, exe)
+        if program is None:
             raise Failed(f"{label}: the build names no executable of {exe}:\n{said[-3000:]}")
-        program = str(programs[-1])
-        printed = (await run(f"{label}: the program", [program], ws, variables, RUN_SECS),
-                   await run(f"{label}: the program with an argument", [program, "second"], ws, variables, RUN_SECS))
-        worked = messages(said, "blaze-work")
-        if len(worked) != 1:
-            raise Failed(f"{label}: {len(worked)} `blaze-work` lines; a build says what it did once:\n{said[-3000:]}")
+        printed = (
+            await run(f"{label}: the program", [program], ws, variables, RUN_SECS),
+            await run(f"{label}: the program with an argument", [program, "second"], ws, variables, RUN_SECS),
+        )
+        work = worked(said)
+        if len(work) != 1:
+            raise Failed(
+                f"{label}: {len(work)} `blaze-work` lines; a build says what it did once:\n{said[-3000:]}"
+            )
     finally:
         # `blaze stop` makes what the daemon keeps durable before it ends, so a copy of the
         # store taken after it holds all of this build.
         await run(f"{label}: stopping the daemon", [blaze, "stop"], ws, variables, IDLE_SECS)
-    found, compiled = worked[0].get("found"), worked[0].get("compiled")
-    if not isinstance(found, int) or not isinstance(compiled, int):
-        raise Failed(f"{label}: the `blaze-work` line has no counts: {worked[0]}")
-    return Built(printed, found, compiled, store)
+    return Built(printed, work[0].found, work[0].compiled, store)
 
 
-async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, original: Built,
-               jobs: asyncio.Semaphore) -> list[str]:
+async def case(
+    env: Env, name: Case, a: Path, only_a: Path, std_only: Path, original: Built, jobs: asyncio.Semaphore
+) -> list[str]:
     """What is wrong in case `name`, if anything; a line of what it found either way."""
     file, old, new = CASES[name]
     at = env.root / name
@@ -323,19 +321,30 @@ async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, orig
             reference = group.create_task(build(env, cold, std_only, f"{name}: B cold", "store_app"))
         undo = checkout(cold, at / "undo")
         edit(undo, file, new, old)
-        restored = await build(env, undo, reference.result().store, f"{name}: the undo from B's store", "store_app")
+        restored = await build(
+            env, undo, reference.result().store, f"{name}: the undo from B's store", "store_app"
+        )
     wrong: list[str] = []
     if reference.result().printed == original.printed:
-        wrong.append(f"{name}: the edit changes nothing the program prints, {original.printed!r}: the case tests nothing")
+        wrong.append(
+            f"{name}: the edit changes nothing the program prints, {original.printed!r}: the case tests nothing"
+        )
     if forward.result().printed != reference.result().printed:
-        wrong.append(f"{name}: B from A's store printed {forward.result().printed!r}, "
-                     f"B cold {reference.result().printed!r}: code of A was reused for B")
+        wrong.append(
+            f"{name}: B from A's store printed {forward.result().printed!r}, "
+            f"B cold {reference.result().printed!r}: code of A was reused for B"
+        )
     if restored.printed != original.printed:
-        wrong.append(f"{name}: the undo from B's store printed {restored.printed!r}, "
-                     f"A {original.printed!r}: code of B was reused for A")
+        wrong.append(
+            f"{name}: the undo from B's store printed {restored.printed!r}, "
+            f"A {original.printed!r}: code of B was reused for A"
+        )
     verdict = "WRONG" if wrong else "ok"
-    print(f"{name:13} {verdict:5} B from A: {forward.result().found} found, {forward.result().compiled} compiled; "
-          f"undo from B: {restored.found} found, {restored.compiled} compiled", flush=True)
+    print(
+        f"{name:13} {verdict:5} B from A: {forward.result().found} found, {forward.result().compiled} compiled; "
+        f"undo from B: {restored.found} found, {restored.compiled} compiled",
+        flush=True,
+    )
     return wrong
 
 
@@ -352,7 +361,9 @@ async def main(args: Input) -> None:
     env = Env(blaze, Path(tempfile.mkdtemp(prefix="bz-revs-", dir="/tmp")).resolve())
     print(f"work: {env.root}", flush=True)
     try:
-        seeded = await build(env, write(env.root / "seed" / "ws", SEED), None, "the standard library's store", "std_seed")
+        seeded = await build(
+            env, write(env.root / "seed" / "ws", SEED), None, "the standard library's store", "std_seed"
+        )
         std_only = seeded.store
         a = write(env.root / "a" / "ws", FILES)
         original = await build(env, a, std_only, "A", "store_app")
@@ -360,8 +371,10 @@ async def main(args: Input) -> None:
         print(f"A printed {original.printed!r}", flush=True)
         jobs = asyncio.Semaphore(args.jobs)
         async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(case(env, name, a, only_a, std_only, original, jobs))
-                     for name in dict.fromkeys(args.cases)]
+            tasks = [
+                group.create_task(case(env, name, a, only_a, std_only, original, jobs))
+                for name in dict.fromkeys(args.cases)
+            ]
     except* Failed as failed:
         for error in failed.exceptions:
             print(error, flush=True)

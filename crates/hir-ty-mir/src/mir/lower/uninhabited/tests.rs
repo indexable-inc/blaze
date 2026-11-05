@@ -91,7 +91,11 @@ fn block<'f>(
     }
 }
 
-fn walk(blocks: &[FrameBlock<'_>], frame: &Frame, from: BasicBlockId) -> Option<(MirSpan, &'static str)> {
+fn walk(
+    blocks: &[FrameBlock<'_>],
+    frame: &Frame,
+    from: BasicBlockId,
+) -> Option<(MirSpan, &'static str)> {
     let units = framed::set_in(frame);
     let preds = predecessors(blocks, frame);
     let found = first_user_code(blocks, &units, &preds, from);
@@ -121,7 +125,12 @@ fn skips_storage_markers_and_stops_at_the_first_statement() {
 fn follows_a_goto_into_a_block_only_it_leads_to() {
     frame::task(Tag::Mir, |frame| {
         let blocks = [
-            block(frame, &[StatementKind::StorageDead(local(1))], Some(TerminatorKind::Goto { target: bb(1) }), 0),
+            block(
+                frame,
+                &[StatementKind::StorageDead(local(1))],
+                Some(TerminatorKind::Goto { target: bb(1) }),
+                0,
+            ),
             block(frame, &[], Some(TerminatorKind::Unreachable), 100),
         ];
         assert_eq!(walk(&blocks, frame, bb(0)), Some((span(1099), "expression")));
@@ -187,7 +196,12 @@ fn a_cycle_reached_from_nowhere_ends() {
     frame::task(Tag::Mir, |frame| {
         let blocks = [
             block(frame, &[], Some(TerminatorKind::Goto { target: bb(1) }), 0),
-            block(frame, &[StatementKind::StorageDead(local(1))], Some(TerminatorKind::Goto { target: bb(0) }), 100),
+            block(
+                frame,
+                &[StatementKind::StorageDead(local(1))],
+                Some(TerminatorKind::Goto { target: bb(0) }),
+                100,
+            ),
         ];
         assert_eq!(walk(&blocks, frame, bb(0)), None);
     });

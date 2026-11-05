@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_manifest::config::schema::{
     CargoResolverConfig, FeatureUnification, IncompatibleRustVersions,
 };
@@ -26,6 +25,7 @@ use blaze_resolve::{
     DepKind, Dependency, GitReference, InternedString, PackageIdSpec, PartialVersion, RustVersion,
     SourceId, Summary,
 };
+use std::alloc::Global;
 use url::Url;
 
 /// What the resolve and its graph read of one package.
@@ -103,7 +103,11 @@ pub fn dependency(dep: &SerializedDependency<'_>) -> Result<Dependency> {
 /// `package`, as `cargo metadata` prints it, read.
 pub fn read(package: &SerializedPackage<'_>) -> Result<Read> {
     // clone: the id owns its version, once per package per load
-    let id = blaze_resolve::PackageId::new(InternedString::new(package.name), package.version.clone(), package_source(package)?);
+    let id = blaze_resolve::PackageId::new(
+        InternedString::new(package.name),
+        package.version.clone(),
+        package_source(package)?,
+    );
     // alloc: the summary's dependencies, once per package per load
     let deps = package.dependencies.iter().map(dependency).collect::<Result<Vec<_>>>()?;
     let features: BTreeMap<InternedString, Vec<InternedString>> = package
@@ -141,12 +145,20 @@ pub struct Root<'a> {
 impl<'a> Root<'a> {
     pub fn new(dir: &'a Path, text: &str) -> Result<Root<'a>> {
         // alloc: the root manifest's table, once per load; the path only on the error path
-        Ok(Root { dir, table: toml::from_str(text).with_context(|| dir.join("Cargo.toml").display().to_string())? })
+        Ok(Root {
+            dir,
+            table: toml::from_str(text)
+                .with_context(|| dir.join("Cargo.toml").display().to_string())?,
+        })
     }
 }
 
 /// One entry of a `[patch]` table of the root manifest.
-pub fn patch_dependency(root: &Path, name: &str, entry: &toml::Value) -> Result<Option<Dependency>> {
+pub fn patch_dependency(
+    root: &Path,
+    name: &str,
+    entry: &toml::Value,
+) -> Result<Option<Dependency>> {
     let get = |key: &str| entry.get(key).and_then(|v| v.as_str());
     let (version, source) = match entry {
         toml::Value::String(version) => (Some(version.as_str()), SourceId::crates_io()),
@@ -158,7 +170,7 @@ pub fn patch_dependency(root: &Path, name: &str, entry: &toml::Value) -> Result<
                 // alloc: a `[patch]` entry's git reference, once per entry per load
                 let reference = match (get("branch"), get("tag"), get("rev")) {
                     (Some(b), _, _) => GitReference::Branch(b.to_owned()), // alloc: as above
-                    (_, Some(t), _) => GitReference::Tag(t.to_owned()), // alloc: as above
+                    (_, Some(t), _) => GitReference::Tag(t.to_owned()),    // alloc: as above
                     (_, _, Some(r)) => GitReference::Rev(r.to_owned()),
                     _ => GitReference::DefaultBranch,
                 };
@@ -247,7 +259,8 @@ pub fn replace_table(root: &Root<'_>) -> Result<Vec<(PackageIdSpec, Dependency)>
             // alloc: as above
             it.insert("version".to_owned(), toml::Value::String(format!("={version}")));
         }
-        let dep = patch_dependency(root.dir, spec.name(), &entry)?.context("a `[replace]` entry")?;
+        let dep =
+            patch_dependency(root.dir, spec.name(), &entry)?.context("a `[replace]` entry")?;
         replace.push((spec, dep));
     }
     Ok(replace)
@@ -281,7 +294,8 @@ pub fn path_packages<F: Files>(
     ctx: &Context<F>,
 ) -> Result<Vec<Package>> {
     // alloc: the directories seen, once per load
-    let mut seen: HashSet<PathBuf, Global> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
+    let mut seen: HashSet<PathBuf, Global> =
+        ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = patch_paths(root);
     queue.extend(replace_paths(replace));
     for (path, m) in ws.members() {
@@ -289,7 +303,8 @@ pub fn path_packages<F: Files>(
     }
     let mut read = Vec::new(); // alloc: the path packages, once per load
     while let Some(dir) = queue.pop() {
-        if !seen.insert(dir.clone()) { // clone: `seen` and the read each keep the directory, once per package
+        if !seen.insert(dir.clone()) {
+            // clone: `seen` and the read each keep the directory, once per package
             continue;
         }
         let manifest_path = dir.join("Cargo.toml");
@@ -307,7 +322,9 @@ pub fn path_packages<F: Files>(
 pub fn manifest_source<F: Files>(source: &str, config: &Config<F>) -> Result<SourceId> {
     let (kind, rest) = source.split_once('+').context("a source with no kind")?;
     match kind {
-        "registry" if rest == blaze_manifest::source::CRATES_IO_INDEX => blaze_manifest::source::crates_io(config),
+        "registry" if rest == blaze_manifest::source::CRATES_IO_INDEX => {
+            blaze_manifest::source::crates_io(config)
+        }
         "registry" => SourceId::for_registry(&rest.parse()?),
         "sparse" => SourceId::for_registry(&source.parse()?),
         "git" => {
@@ -410,7 +427,10 @@ mod tests {
         assert!(err("\"foo:0.1.0\" = \"0.1\"").starts_with("replacements cannot"));
         let both = "[workspace]\n[patch.crates-io]\nfoo = { path = \"foo\" }\n[replace]\n\"foo:0.1.0\" = { path = \"foo\" }";
         let root = Root::new(Path::new("/w"), both).unwrap();
-        assert_eq!(replace_table(&root).unwrap_err().to_string(), "cannot specify both [replace] and [patch]");
+        assert_eq!(
+            replace_table(&root).unwrap_err().to_string(),
+            "cannot specify both [replace] and [patch]"
+        );
     }
 
     #[test]
@@ -419,7 +439,12 @@ mod tests {
         assert!(replace_table(&root).unwrap().is_empty());
     }
 
-    fn target<'a>(kind: &'a TargetKind, name: &'a str, src: &'a PathBuf, required: Option<&'a [String]>) -> SerializedTarget<'a> {
+    fn target<'a>(
+        kind: &'a TargetKind,
+        name: &'a str,
+        src: &'a PathBuf,
+        required: Option<&'a [String]>,
+    ) -> SerializedTarget<'a> {
         SerializedTarget {
             kind,
             crate_types: Vec::new(),
@@ -510,19 +535,29 @@ mod tests {
         };
         let read = read(&package).unwrap();
         let id = read.summary.package_id();
-        assert_eq!((id.name().as_str(), id.version().to_string()), ("my-macros", "0.1.0".to_owned()));
+        assert_eq!(
+            (id.name().as_str(), id.version().to_string()),
+            ("my-macros", "0.1.0".to_owned())
+        );
         assert_eq!(id.source_id().local_path(), Some(PathBuf::from("/w/m")));
         assert_eq!(read.lib.as_deref(), Some("my_macros"));
         assert!(read.proc_macro_lib && read.any_proc_macro && read.build_script);
         assert_eq!(read.bins, [vec!["cli".to_owned()], Vec::new()]);
-        assert_eq!((read.license.as_deref(), read.repository.as_deref()), (Some("MIT"), Some("https://example.com/m")));
+        assert_eq!(
+            (read.license.as_deref(), read.repository.as_deref()),
+            (Some("MIT"), Some("https://example.com/m"))
+        );
         assert_eq!(read.summary.links().map(|it| it.as_str()), Some("m"));
         assert!(read.summary.features().contains_key(&InternedString::new("default")));
         let deps = read.summary.dependencies();
         let [helper, json, cc] = deps else { panic!("{} dependencies", deps.len()) };
         assert!(helper.source_id().is_path());
         assert_eq!((json.name_in_toml().as_str(), json.kind()), ("json", DepKind::Normal));
-        assert!(json.is_optional() && !json.uses_default_features() && json.platform() == Some(&platform));
+        assert!(
+            json.is_optional()
+                && !json.uses_default_features()
+                && json.platform() == Some(&platform)
+        );
         assert_eq!(json.features().iter().map(|it| it.as_str()).collect::<Vec<_>>(), ["serde"]);
         assert!(json.source_id().is_registry());
         assert_eq!(cc.kind(), DepKind::Build);
@@ -531,7 +566,11 @@ mod tests {
 
     #[test]
     fn patch_paths_are_the_roots() {
-        let root = Root::new(Path::new("/w"), "[patch.crates-io]\na = { path = \"vendor/a\" }\nb = \"1\"\n").unwrap();
+        let root = Root::new(
+            Path::new("/w"),
+            "[patch.crates-io]\na = { path = \"vendor/a\" }\nb = \"1\"\n",
+        )
+        .unwrap();
         assert_eq!(patch_paths(&root), vec![PathBuf::from("/w/vendor/a")]);
         assert_eq!(patch_tables(&root).unwrap()[0].1.len(), 2);
     }
@@ -539,8 +578,11 @@ mod tests {
     /// A `[patch]` of a registry named, not given by URL, is refused naming it, never left out.
     #[test]
     fn a_patch_of_a_named_registry_is_an_error() {
-        let root = Root::new(Path::new("/w"), "[patch.my-registry]\na = { path = \"vendor/a\" }\n").unwrap();
-        let Err(error) = patch_tables(&root) else { panic!("a named registry's patch is not left out") };
+        let root = Root::new(Path::new("/w"), "[patch.my-registry]\na = { path = \"vendor/a\" }\n")
+            .unwrap();
+        let Err(error) = patch_tables(&root) else {
+            panic!("a named registry's patch is not left out")
+        };
         let error = error.to_string();
         assert!(error.contains("[patch.my-registry]"), "{error}");
     }
@@ -548,9 +590,15 @@ mod tests {
     #[test]
     fn feature_unification_is_read_only_when_unstable_allows_it() {
         let unification = |env: &[(&str, &str)]| {
-            let mut env: Vec<(String, String)> = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            let mut env: Vec<(String, String)> =
+                env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
             env.push(("CARGO_HOME".to_owned(), "/blaze-no-such-home".to_owned()));
-            let config = Config::load_with(Path::new("/blaze-no-such-dir"), env, blaze_manifest::files::Disk).unwrap();
+            let config = Config::load_with(
+                Path::new("/blaze-no-such-dir"),
+                env,
+                blaze_manifest::files::Disk,
+            )
+            .unwrap();
             feature_unification(&config).unwrap()
         };
         let asked = ("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace");

@@ -206,7 +206,8 @@ where
     use FeatureValue::*;
     // Each name in `[dependencies]` and whether any entry of that name is optional.
     let mut dep_map: HashMap<InternedString, bool, Global> = HashMap::new_in(Global);
-    for dep in dependencies.clone() { // clone: an iterator over borrowed dependencies
+    for dep in dependencies.clone() {
+        // clone: an iterator over borrowed dependencies
         *dep_map.entry(dep.name_in_toml).or_insert(false) |= dep.optional;
     }
 
@@ -219,7 +220,8 @@ where
     // the same name replaces.
     let explicitly_listed: HashSet<_, Global> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).collect(); // alloc: once per package
-    for dep in dependencies.clone() { // clone: an iterator over borrowed dependencies
+    for dep in dependencies.clone() {
+        // clone: an iterator over borrowed dependencies
         if !dep.optional {
             continue;
         }
@@ -289,7 +291,8 @@ where
                         let extra_help = if *weak || has_other_dep || !is_optional {
                             String::new() // alloc: error path
                         } else {
-                            format!( // alloc: error path
+                            format!(
+                                // alloc: error path
                                 "\nIf the intent is to avoid creating an implicit feature \
                                  `{stripped_dep}` for an optional dependency, \
                                  then consider replacing this with two values:\n    \
@@ -330,9 +333,8 @@ where
             _ => None,
         })
         .collect(); // alloc: once per package
-    if let Some(dep) = dependencies
-        .map(|d| d.name_in_toml)
-        .find(|dep| dep_map[dep] && !used.contains(dep))
+    if let Some(dep) =
+        dependencies.map(|d| d.name_in_toml).find(|dep| dep_map[dep] && !used.contains(dep))
     {
         bail!(
             "optional dependency `{dep}` is not included in any feature\n\

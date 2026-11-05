@@ -2,12 +2,13 @@
 
 use std::mem::offset_of;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_format::{FormatError, Placed, Slice, Writer};
 use hir_def::{
-    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId, StaticId,
+    ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
+    StaticId,
     expr_store::{ExpressionStore, HygieneId, path::Path},
-    hir::{Expr, ExprId, Literal},
+    hir::{Expr, ExprId, Literal, UnaryOp},
     resolver::{Resolver, ValueNs},
     signatures::ImplSignature,
 };
@@ -18,14 +19,15 @@ use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
-    ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
+    ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, Span,
+    StaticMemory,
     db::{AnonConstId, AnonConstLoc, HirDatabase},
     generics::Generics,
     lower::LoweringMode,
     mir::{IsSigned, MirEvalError, MirLowerError, pad16},
     next_solver::{
-        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstExt,
-        ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
+        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const,
+        ConstExt, ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
         InherentAssocConstId, IsRigid, ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder,
         StoredGenericArgs, StoredTy, TraitAssocConstId, Ty, TyKind, ValTreeKind, default_types,
         persist::{TyTableReader, TyTableWriter},
@@ -69,7 +71,8 @@ fn intern_const_ref<'db>(
     // As rustc's `lit_to_const`: an integer literal is truncated to its type's width (the
     // `overflowing_literals` lint is what refuses one too large).
     let trunc = |size: Size, bits: u128| {
-        ScalarInt::try_from_uint(size.truncate(bits), size).expect("a truncated value fits its size")
+        ScalarInt::try_from_uint(size.truncate(bits), size)
+            .expect("a truncated value fits its size")
     };
     let valtree = match (ty.kind(), value) {
         (TyKind::Uint(uint), Literal::Uint(value, _)) => {
@@ -216,10 +219,7 @@ pub fn allocation_as_usize(ec: Allocation<'_>) -> u128 {
 /// The alias kind of a MIR constant naming `konst` with its own (impl-form) args. A const in a
 /// trait impl has none: MIR names the trait's const (a projection) and `lookup_impl_const`
 /// resolves it at eval time, so meeting one here is a bug.
-pub fn mir_const_alias_kind<'db>(
-    db: &'db Db,
-    konst: ConstId,
-) -> AliasConstKind<'db> {
+pub fn mir_const_alias_kind<'db>(db: &'db Db, konst: ConstId) -> AliasConstKind<'db> {
     match konst.lookup(db).container {
         ItemContainerId::TraitId(_) => {
             AliasConstKind::Projection { def_id: TraitAssocConstId(konst) }
@@ -236,10 +236,7 @@ pub fn mir_const_alias_kind<'db>(
 
 /// The value of `unevaluated`, read from the cached result by reference: an array length asks
 /// this on every check, and one that fails to evaluate clones no error.
-fn evaluated<'db>(
-    db: &'db Db,
-    unevaluated: AliasConst<'db>,
-) -> Option<Allocation<'db>> {
+fn evaluated<'db>(db: &'db Db, unevaluated: AliasConst<'db>) -> Option<Allocation<'db>> {
     let result = match unevaluated.kind {
         AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
         | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
@@ -418,21 +415,19 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
             None => Err(CreateConstError::UnderscoreExpr),
         },
         Expr::Path(path)
-            if let konst =
-                path_to_const(
-                    interner.db,
-                    resolver,
-                    generics,
-                    forbid_params_after,
-                    path,
-                    store.expr_path_hygiene(path_expr),
-                )
-                && !matches!(
-                    konst,
-                    Err(CreateConstError::DoesNotResolve
-                        | CreateConstError::ConstHasGenerics
-                        | CreateConstError::NeedsAnonConst)
-                ) =>
+            if let konst = path_to_const(
+                interner.db,
+                resolver,
+                generics,
+                forbid_params_after,
+                path,
+                store.expr_path_hygiene(path_expr),
+            ) && !matches!(
+                konst,
+                Err(CreateConstError::DoesNotResolve
+                    | CreateConstError::ConstHasGenerics
+                    | CreateConstError::NeedsAnonConst)
+            ) =>
         {
             konst
         }
@@ -493,8 +488,112 @@ pub(crate) fn const_eval<'db>(
 }
 
 /// The value of the body `owner` for `subst`, evaluated in `trait_env` (its own environment when
-/// `None`): its MIR, monomorphized and run by the MIR evaluator, the one evaluator of constants.
+/// `None`): a trivial body's value read off its literal ([`trivial_value`]), any other's from
+/// [`evaluate_by_mir`].
 pub(crate) fn evaluate<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    subst: GenericArgs<'db>,
+    trait_env: Option<ParamEnvAndCrate<'db>>,
+) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+    if let Some(value) = trivial_value(db, owner) {
+        return Ok(value);
+    }
+    evaluate_by_mir(db, owner, subst, trait_env)
+}
+
+/// rustc's `trivial_const` (rust-lang/rust#165112's form, decided before any MIR is built): the
+/// value of a `const` or `static` whose body is one scalar literal of a primitive type (`1`,
+/// `0x7f_u8`, `2.5`, `true`, `'a'`) or a negated integer literal of a signed one (`-1`), with
+/// no macro call in it, no adjustment on it and a type check with no error, no mismatch and no
+/// diagnostic. Its value is the literal's little-endian bytes at its type's size, which building
+/// its MIR (`_0 = const <literal>; return`, lowering's `lower_literal_to_operand` and its `-lit`
+/// case) and running it gives byte for byte, with no memory map: the consteval test `trivial`
+/// runs both. Its type is the literal's as inferred, a primitive with no generic parameter, so
+/// the value is the same for every `subst` and `trait_env`, and every input it reads (the body,
+/// its inference, the crate's data layout) is one `evaluate_by_mir` reads too.
+///
+/// `None` for every other body, which [`evaluate_by_mir`] builds and runs: a body with an error
+/// gets that path's error, and its diagnostics come from type checking and the lints, which run
+/// whichever path gives the value.
+pub fn trivial_value<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<Allocation<'db>> {
+    use rustc_type_ir::{IntTy, UintTy};
+    let InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_)) = owner
+    else {
+        return None;
+    };
+    let infer = InferenceResult::of(db, owner);
+    if infer.has_errors || infer.has_type_mismatches() || !infer.diagnostics().is_empty() {
+        return None;
+    }
+    let (store, root) = owner.store_and_root_expr(db);
+    if !store.macro_calls().is_empty() {
+        return None;
+    }
+    let unadjusted = |expr: ExprId| infer.expr_adjustment(expr).is_none_or(|it| it.is_empty());
+    if !unadjusted(root) {
+        return None;
+    }
+    let ty = infer.expr_ty(root);
+    let (literal, negated) = match store.expr(root) {
+        Expr::Literal(literal) => (literal, false),
+        // Lowering's `-lit`: the negated literal, of the literal's type.
+        Expr::UnaryOp { expr, op: UnaryOp::Neg }
+            if unadjusted(expr) && infer.expr_ty(expr) == ty =>
+        {
+            match store.expr(expr) {
+                Expr::Literal(literal) if matches!(literal, Literal::Int(..)) => (literal, true),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let word = || db.target_data_layout(owner.krate(db)).ok().map(|it| it.pointer_size());
+    let int_size = |bits: Option<u64>| match bits {
+        Some(bits) => Some(Size::from_bits(bits)),
+        None => word(),
+    };
+    // As `lower_literal_to_operand` encodes the literal, and the evaluator keeps the first
+    // `size` bytes of it (`write_allocation`).
+    let (bytes, size): ([u8; 16], Size) = match (ty.kind(), literal) {
+        (TyKind::Int(int), &Literal::Int(value, _)) if !matches!(int, IntTy::Bits(_)) => {
+            let value = if negated { value.wrapping_neg() } else { value };
+            (value.to_le_bytes(), int_size(int.bit_width())?)
+        }
+        (TyKind::Uint(uint), &Literal::Int(value, _))
+            if !negated && !matches!(uint, UintTy::Bits(_)) =>
+        {
+            (value.to_le_bytes(), int_size(uint.bit_width())?)
+        }
+        (TyKind::Uint(uint), &Literal::Uint(value, _)) if !matches!(uint, UintTy::Bits(_)) => {
+            (value.to_le_bytes(), int_size(uint.bit_width())?)
+        }
+        (TyKind::Float(float), Literal::Float(value, _)) => {
+            let bits = match float {
+                rustc_ast_ir::FloatTy::F16 => value.to_f16().to_bits(),
+                rustc_ast_ir::FloatTy::F32 => value.to_f32().to_bits(),
+                rustc_ast_ir::FloatTy::F64 => value.to_f64().to_bits(),
+                rustc_ast_ir::FloatTy::F128 => value.to_f128().to_bits(),
+            };
+            (bits.to_le_bytes(), Size::from_bits(float.bit_width()))
+        }
+        (TyKind::Bool, &Literal::Bool(value)) => {
+            (u128::from(value).to_le_bytes(), Size::from_bytes(1))
+        }
+        (TyKind::Char, &Literal::Char(value)) => {
+            (u128::from(u32::from(value)).to_le_bytes(), Size::from_bytes(4))
+        }
+        _ => return None,
+    };
+    let memory = bytes.get(..size.bytes_usize())?;
+    let _span = tracing::info_span!(target: "blaze", "trivial const", body = ?owner).entered();
+    Some(Allocation::of_bytes(ty, memory))
+}
+
+/// The value of the body `owner` for `subst`, evaluated in `trait_env` (its own environment when
+/// `None`): its MIR, monomorphized and run by the MIR evaluator, the one evaluator of constants.
+/// `evaluate` without the [`trivial_value`] fast path; public for the test that compares them.
+pub fn evaluate_by_mir<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
     subst: GenericArgs<'db>,
@@ -808,11 +907,8 @@ fn write_memory_map<'db>(
                     id: crate::check_cache::id_bits(it.id),
                 }),
             );
-            columns.vtable = Placed::push_each(
-                out,
-                map.vtable.tys().len(),
-                map.vtable.tys().map(&mut *ty),
-            );
+            columns.vtable =
+                Placed::push_each(out, map.vtable.tys().len(), map.vtable.tys().map(&mut *ty));
             columns.vtable_dyns = Placed::push_each(
                 out,
                 map.vtable.tys().len(),

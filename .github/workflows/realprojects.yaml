@@ -31,7 +31,7 @@ env:
 
 jobs:
   plan:
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       projects: ${{ steps.plan.outputs.projects }}
@@ -65,7 +65,7 @@ jobs:
   project:
     needs: plan
     name: ${{ matrix.project }}
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-32, blaze-realprojects]
     # A hosted runner's limit; bevy, polars and wasmtime may need a larger runner. A job killed
     # here sends no result, which `report` names as an error (`expected`).
     timeout-minutes: 360
@@ -100,11 +100,14 @@ jobs:
           name: result-${{ matrix.project }}
           path: ${{ runner.temp }}/out
           if-no-files-found: ignore
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   report:
     needs: [plan, project]
     if: always() && needs.project.result != 'skipped'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7

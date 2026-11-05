@@ -1,0 +1,15 @@
+# actionlint's configuration (blaze.yaml's `workflows` job runs it). Each ignore says why.
+# ix's runner labels (docs/harness.md "ix runners"): `ix`, a size `ix-cpu-N`, and a label of the
+# job's own (`blaze-<job>`) that gives it a snapshot lineage of its own, and `ix-mode-cold` for
+# a runner booted from the base image and never snapshotted.
+self-hosted-runner:
+  labels:
+    - ix
+    - ix-mode-cold
+    - ix-cpu-*
+    - blaze-*
+paths:
+  .github/workflows/release.yaml:
+    ignore:
+      # The crates.io job is off on purpose until the rename (#270); `if: false` is how.
+      - 'constant expression "false" in condition'

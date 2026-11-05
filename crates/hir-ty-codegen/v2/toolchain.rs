@@ -100,9 +100,6 @@ const AARCH64_IMPLIES: &[(&str, &[&str])] = &[
 ];
 
 const X86_64: &[&str] = &["fxsr", "sse", "sse2", "x87"];
-const X86_64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse3", "sse4.1", "sse4.2", "ssse3"];
-const X86_64_V3: &[&str] = &["avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
-const X86_64_V4: &[&str] = &["avx512bw", "avx512cd", "avx512dq", "avx512f", "avx512vl"];
 const AARCH64: &[&str] = &["fp-armv8", "neon"];
 const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
 
@@ -116,8 +113,9 @@ const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Runs {
     /// On the machine that builds it: a dev build or a test that runs where it is built.
-    /// With no `-C target-cpu`, its code may use every feature of this machine that
-    /// Cranelift can, as `-C target-cpu=native` gives them, on the baseline CPU's name.
+    /// With no `-C target-cpu`, its code may use every feature this machine is found to have
+    /// of those the code generator picks instructions by (`host_features`), on the baseline
+    /// CPU's name: of the features `-C target-cpu=native` gives, without its CPU's name.
     Here,
     /// On another machine: a `--target`, remote or output build. With no `-C target-cpu`,
     /// the target's baseline.
@@ -129,7 +127,12 @@ pub enum Runs {
 /// `-C target-feature` in the flags wins over where it runs. `target_data` is what the front end
 /// lays the unit's types out by (its crates' `TargetData`, the data layout from blaze-units'
 /// recorded spec): part of the id, as code made under one layout is not code for another.
-pub fn toolchain(target: &str, target_data: &TargetData, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
+pub fn toolchain(
+    target: &str,
+    target_data: &TargetData,
+    rustflags: &[String],
+    runs: Runs,
+) -> Result<Toolchain, String> {
     toolchain_for(&code()?, target, target_data, rustflags, runs)
 }
 
@@ -174,19 +177,8 @@ pub fn toolchain_for(
             (emitted.cpu().to_owned(), on_host(&emitted, baseline))
         }
         Some("native") => native(&emitted, baseline)?,
-        Some(named) => match levels(&emitted, named) {
-            // alloc: per toolchain made, a few names
-            Some(levels) => (named.to_owned(), set(&levels)),
-            None => {
-                // alloc: an error
-                return Err(format!(
-                    "-C target-cpu={named}: blaze knows the features of `native`, of {target}'s \
-                     baseline `{}` and, on x86-64, of `x86-64-v2` to `x86-64-v4`, not of \
-                     `{named}`",
-                    emitted.cpu()
-                ));
-            }
-        },
+        // alloc: per toolchain made, a few names
+        Some(named) => (named.to_owned(), of_cpu(&emitted, named)?),
     };
     let implies = implications(&emitted);
     for (enable, name) in &flags.features {
@@ -212,7 +204,11 @@ pub fn toolchain_for(
         // alloc: per toolchain made, its features
         .collect();
     features.sort_unstable();
-    let frame_pointers = flags.frame_pointers.unwrap_or(false) || keeps_frame_pointers(&emitted);
+    // Only what the flags force: the frame records the target's ABI wants of every function
+    // that calls are its code's own, whatever this says (`Target::requires_frame_pointers`,
+    // `Target::llvm_frame_pointer`), as rustc's `-C force-frame-pointers=no` cannot take
+    // Apple's away.
+    let frame_pointers = flags.frame_pointers.unwrap_or(false);
     let relocation = match flags.relocation.as_deref() {
         None | Some("default") => default_relocation(&emitted),
         Some("pic" | "pie") => Relocation::Pic,
@@ -255,7 +251,7 @@ pub fn toolchain_for(
 /// unit's own, read where its code is made (`v2::Function::frame_pointers`).
 pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     let target = Target::of(&toolchain.target)?;
-    target.features_of(&toolchain.features)?;
+    target.features_of(&toolchain.cpu, &toolchain.features)?;
     Ok(())
 }
 
@@ -279,7 +275,11 @@ pub struct CodegenCode(pub ContentId);
 impl CodegenCode {
     /// Of the 64 hex digits `blaze_codegen_code::emit` sets `BLAZE_CODEGEN_CODE` to.
     pub fn from_hex(hex: &str) -> Result<CodegenCode, String> {
-        let refused = || format!("the code generator's code identity `{hex}` is not 64 hex digits (`BLAZE_CODEGEN_CODE`)");
+        let refused = || {
+            format!(
+                "the code generator's code identity `{hex}` is not 64 hex digits (`BLAZE_CODEGEN_CODE`)"
+            )
+        };
         if hex.len() != 64 {
             return Err(refused());
         }
@@ -332,7 +332,8 @@ pub fn code() -> Result<CodegenCode, String> {
 pub(crate) fn fixture_target_data(tuple: &str) -> TargetData {
     TargetData {
         tuple: intern::Symbol::intern(tuple),
-        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128".into(),
+        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+            .into(),
         arch: base_db::target::Arch::Other,
         has_thumb_interworking: false,
     }
@@ -383,27 +384,41 @@ pub(super) fn baseline(target: &Target) -> &'static [&'static str] {
     }
 }
 
-/// The features of a CPU named by `-C target-cpu` other than `native`: the baseline's, or an
-/// x86-64 microarchitecture level's. `None` for another name.
-fn levels(target: &Target, named: &str) -> Option<Vec<&'static str>> {
+/// The features of CPU `named` of `target` (`-C target-cpu`, any CPU rustc takes, LLVM's
+/// aliases among them): the baseline's, with what the CPU has past the target's baseline CPU
+/// turned on and what it lacks of it turned off, each with what it implies. What a CPU has is
+/// the CPU table's (`target_features::cpus`, rustc's features of each CPU, the one home of
+/// what blaze knows of CPUs); a name it does not know is an error naming it and the target.
+/// Only the difference between the two CPUs is read, so the baseline's own names (`fp-armv8`,
+/// which rustc folds into `neon`) stay as Cranelift and LLVM know them.
+fn of_cpu(target: &Target, named: &str) -> Result<BTreeSet<String>, String> {
+    let baseline = baseline(target);
     if named == target.cpu() {
-        // alloc: per toolchain made, a few names
-        return Some(baseline(target).to_vec());
+        return Ok(set(baseline));
     }
-    if target.arch != crate::Arch::X86_64 {
-        return None;
+    // alloc: an error, naming the target and the CPU
+    let has = target_features::cpus::features(target.triple(), named).map_err(|e| e.to_string())?;
+    let base = target_features::cpus::features(target.triple(), target.cpu()).map_err(|e| {
+        // alloc: an error
+        format!("{e}: the target's baseline CPU, which `-C target-cpu={named}` is read against")
+    })?;
+    let implies = implications(target);
+    let mut on = set(baseline);
+    for &feature in has.iter().filter(|it| !base.contains(it)) {
+        turn_on(&mut on, implies, feature);
     }
-    let levels: &[&[&str]] = match named {
-        "x86-64-v2" => &[X86_64, X86_64_V2],
-        "x86-64-v3" => &[X86_64, X86_64_V2, X86_64_V3],
-        "x86-64-v4" => &[X86_64, X86_64_V2, X86_64_V3, X86_64_V4],
-        _ => return None,
-    };
-    Some(levels.concat())
+    for &feature in base.iter().filter(|it| !has.contains(it)) {
+        turn_off(&mut on, implies, feature);
+    }
+    Ok(on)
 }
 
-/// `-C target-cpu=native`: the host's CPU by LLVM's name (the baseline's without LLVM), with
-/// the features the host has that Cranelift's code may use.
+/// `-C target-cpu=native`: the host's CPU by LLVM's name (`apple-m4`, `znver4`; the key
+/// records it, never `native`) with its features as [`of_cpu`] gives them, less those LLVM
+/// finds the host without (a VM that hides AVX-512 from a CPU that has it), and with every
+/// feature the host is found to have. Without LLVM (the seed, whose native code is stencils
+/// only) the host has no name to read: the baseline's name with what the host is found to
+/// have ([`on_host`]).
 fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String>), String> {
     if target.triple() != Target::host() {
         // alloc: an error
@@ -413,16 +428,36 @@ fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String
             Target::host()
         ));
     }
-    let name = match crate::host_cpu() {
-        Some((name, _)) => name,
+    let Some((name, told)) = crate::host_cpu() else {
         // alloc: per toolchain made, a few names
-        None => target.cpu().to_owned(),
+        return Ok((target.cpu().to_owned(), on_host(target, baseline)));
     };
-    Ok((name, on_host(target, baseline)))
+    let mut on = of_cpu(target, &name).map_err(|e| {
+        // alloc: an error
+        format!("-C target-cpu=native: LLVM names the host's CPU `{name}`, and {e}")
+    })?;
+    let implies = implications(target);
+    // alloc: per toolchain made, a few names
+    let lacks: Vec<&str> = told.split(',').filter_map(|it| it.strip_prefix('-')).collect();
+    // alloc: per toolchain made, a few names
+    let named: Vec<String> = on.iter().cloned().collect();
+    for feature in &named {
+        let llvm = crate::target::renamed_for_llvm(target.arch, feature, true);
+        let own = feature.as_str();
+        let llvm = llvm.unwrap_or(std::slice::from_ref(&own));
+        if llvm.iter().any(|it| lacks.contains(it)) {
+            turn_off(&mut on, implies, feature);
+        }
+    }
+    for feature in host_features(target) {
+        turn_on(&mut on, implies, feature);
+    }
+    Ok((name, on))
 }
 
-/// The baseline with every feature the host has that Cranelift's code may use, and what
-/// each implies: `-C target-cpu=native`'s, and a build's that runs where it is built.
+/// The baseline with every feature the host is found to have of those the code generator
+/// picks instructions by, and what each implies: a build's that runs where it is built
+/// ([`Runs::Here`]), and `-C target-cpu=native`'s in a blaze without LLVM.
 fn on_host(target: &Target, baseline: &[&str]) -> BTreeSet<String> {
     let mut on = set(baseline);
     for feature in host_features(target) {
@@ -454,9 +489,26 @@ fn host_features(target: &Target) -> Vec<&'static str> {
             };
         }
         detect!(
-            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
-            "bmi2", "lzcnt", "avx512f", "avx512vl", "avx512dq", "avx512bw", "avx512cd",
-            "avx512bitalg", "avx512vbmi", "avx512vnni"
+            "sse3",
+            "ssse3",
+            "sse4.1",
+            "sse4.2",
+            "popcnt",
+            "avx",
+            "avx2",
+            "fma",
+            "f16c",
+            "bmi1",
+            "bmi2",
+            "lzcnt",
+            "avx512f",
+            "avx512vl",
+            "avx512dq",
+            "avx512bw",
+            "avx512cd",
+            "avx512bitalg",
+            "avx512vbmi",
+            "avx512vnni"
         );
     }
     #[cfg(target_arch = "aarch64")]
@@ -468,7 +520,9 @@ fn host_features(target: &Target) -> Vec<&'static str> {
         }
         detect!("lse", "fp16", "dotprod", "i8mm");
         // rustc has them on or off together.
-        if std::arch::is_aarch64_feature_detected!("paca") && std::arch::is_aarch64_feature_detected!("pacg") {
+        if std::arch::is_aarch64_feature_detected!("paca")
+            && std::arch::is_aarch64_feature_detected!("pacg")
+        {
             found.extend(["paca", "pacg"]);
         }
     }
@@ -515,11 +569,6 @@ fn turn_off(on: &mut BTreeSet<String>, implies: &[(&str, &[&str])], name: &str) 
     }
 }
 
-/// Whether the target keeps frame pointers whatever the flags say: Apple's ABIs require them.
-fn keeps_frame_pointers(target: &Target) -> bool {
-    target.triple().contains("-apple-")
-}
-
 /// rustc's relocation model of the target: PE images are reached relative to the
 /// instruction without a table, everything else is position-independent.
 fn default_relocation(target: &Target) -> Relocation {
@@ -543,21 +592,92 @@ struct Flags {
 /// The flags of rustc that take the next word as their value, when not given it after `=`
 /// or joined: their value is not a flag.
 const TAKES_VALUE: &[&str] = &[
-    "--cfg", "--check-cfg", "-L", "-l", "--extern", "--cap-lints", "-A", "-W", "-D", "-F",
-    "--allow", "--warn", "--deny", "--forbid", "--force-warn", "--edition", "--crate-type",
-    "--crate-name", "--emit", "--print", "-o", "--out-dir", "--target", "--sysroot",
-    "--error-format", "--json", "--color", "--explain", "--diagnostic-width", "--env-set",
-    "-Z", "--remap-path-scope",
+    "--cfg",
+    "--check-cfg",
+    "-L",
+    "-l",
+    "--extern",
+    "--cap-lints",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+    "--allow",
+    "--warn",
+    "--deny",
+    "--forbid",
+    "--force-warn",
+    "--edition",
+    "--crate-type",
+    "--crate-name",
+    "--emit",
+    "--print",
+    "-o",
+    "--out-dir",
+    "--target",
+    "--sysroot",
+    "--error-format",
+    "--json",
+    "--color",
+    "--explain",
+    "--diagnostic-width",
+    "--env-set",
+    "-Z",
+    "--remap-path-scope",
 ];
 
-/// The `-C` options that change only the link, the output's names or what is reported:
-/// the link's and cargo's, not the code's.
+/// The `-C` options that are the link's: `blaze_link::args::rustflags` reads each and the link
+/// takes or refuses it for the image it makes (docs/cargo.md, "Link arguments"), so a unit that
+/// links nothing (a library) is not refused for one, as rustc does not use it there either.
+/// `-l` and `-L` are the link's too ([`TAKES_VALUE`]).
+const LINK: &[&str] = &[
+    "default-linker-libraries",
+    "link-arg",
+    "link-args",
+    "link-dead-code",
+    "link-self-contained",
+    "linker",
+    "linker-flavor",
+    "prefer-dynamic",
+    "relro-level",
+    "rpath",
+    "strip",
+];
+
+/// The `-C` options that change nothing blaze makes, each with why.
 const NOT_CODE: &[&str] = &[
-    "ar", "codegen-units", "default-linker-libraries", "dlltool", "embed-bitcode",
-    "extra-filename", "incremental", "inline-threshold", "link-arg", "link-args",
-    "link-dead-code", "link-self-contained", "linker", "linker-flavor", "metadata",
-    "no-stack-check", "prefer-dynamic", "relro-level", "remark", "rpath", "save-temps",
-    "split-debuginfo", "strip", "unsafe-allow-abi-mismatch",
+    // rustc's own: deprecated, and does nothing.
+    "ar",
+    // How many pieces rustc splits a crate into: blaze partitions code its own way, and the
+    // program is the same.
+    "codegen-units",
+    // The program run to make a Windows import library: blaze runs none.
+    "dlltool",
+    // Whether an rlib carries LLVM bitcode: blaze's rlibs carry no code.
+    "embed-bitcode",
+    // cargo's file names: blaze names its outputs as cargo's plan says.
+    "extra-filename",
+    // rustc's incremental directory: blaze keeps its own store.
+    "incremental",
+    // rustc's own: deprecated, and does nothing.
+    "inline-threshold",
+    // cargo's crate disambiguator: blaze tells crates apart by their unit.
+    "metadata",
+    // rustc's own: deprecated, and does nothing.
+    "no-stack-check",
+    // How debug info is split into files: the profile's `split-debuginfo`, which cargo gives
+    // as this flag.
+    "split-debuginfo",
+    // Lifts rustc's check that crates agree on flags that change the ABI: blaze compiles
+    // every crate of a program with one toolchain, so they always agree.
+    "unsafe-allow-abi-mismatch",
+];
+
+/// The `-C` options that ask for something blaze does not make and are off unless asked:
+/// only an off value is taken, and an on one is refused with why.
+const OFF_REPORTS: &[(&str, &str)] = &[
+    ("remark", "blaze reports no LLVM optimization remarks"),
+    ("save-temps", "blaze keeps none of rustc's intermediate files; its own are in its store"),
 ];
 
 /// The `-C` options the profile says: blaze compiles with the profile's.
@@ -572,8 +692,14 @@ const PROFILE: &[(&str, &str)] = &[
 /// The `-C` options that change code and are off unless asked: blaze's code is as with
 /// them off, so only an off value is taken.
 const OFF: &[&str] = &[
-    "control-flow-guard", "instrument-coverage", "linker-plugin-lto", "lto",
-    "no-prepopulate-passes", "no-redzone", "no-vectorize-loops", "no-vectorize-slp",
+    "control-flow-guard",
+    "instrument-coverage",
+    "linker-plugin-lto",
+    "lto",
+    "no-prepopulate-passes",
+    "no-redzone",
+    "no-vectorize-loops",
+    "no-vectorize-slp",
     "soft-float",
 ];
 
@@ -634,7 +760,8 @@ impl Flags {
             "target-cpu" => {
                 let cpu = value.filter(|it| !it.is_empty());
                 // alloc: an error
-                self.cpu = Some(cpu.ok_or_else(|| format!("{}: no CPU named", shown()))?.to_owned());
+                self.cpu =
+                    Some(cpu.ok_or_else(|| format!("{}: no CPU named", shown()))?.to_owned());
             }
             "target-feature" => {
                 for feature in value.unwrap_or_default().split(',').filter(|it| !it.is_empty()) {
@@ -648,7 +775,8 @@ impl Flags {
                             ));
                         }
                     };
-                    // The C runtime linked statically: the link's, not the code's.
+                    // The C runtime linked statically: the link's, not the code's
+                    // (`blaze_link::args::rustflags`, which takes or refuses it).
                     if feature_name != "crt-static" {
                         // alloc: per toolchain made, a few names
                         self.features.push((enable, feature_name.to_owned()));
@@ -672,7 +800,8 @@ impl Flags {
                     Some(model.ok_or_else(|| format!("{}: no model named", shown()))?.to_owned());
             }
             "passes" => {
-                let passes = value.unwrap_or_default().split([' ', ',']).filter(|it| !it.is_empty());
+                let passes =
+                    value.unwrap_or_default().split([' ', ',']).filter(|it| !it.is_empty());
                 for pass in passes {
                     if pass != "sancov-module" {
                         // alloc: an error
@@ -697,8 +826,17 @@ impl Flags {
                 }
             }
             "jump-tables" if is_yes(value) => {}
+            _ if LINK.contains(&name.as_str()) => {}
             _ if NOT_CODE.contains(&name.as_str()) => {}
             _ if OFF.contains(&name.as_str()) && is_no(value) => {}
+            // `-C remark=` with no pass named asks for none.
+            "remark" if value.is_none_or(str::is_empty) => {}
+            "save-temps" if is_no(value) => {}
+            "remark" | "save-temps" => {
+                let why = OFF_REPORTS.iter().find(|(it, _)| *it == name).map_or("", |it| it.1);
+                // alloc: an error
+                return Err(format!("{}: {why}", shown()));
+            }
             _ => {
                 if let Some((_, key)) = PROFILE.iter().find(|(it, _)| *it == name) {
                     return Err(profile_error(&shown(), key));

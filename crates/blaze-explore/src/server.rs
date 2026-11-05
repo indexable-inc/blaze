@@ -10,6 +10,9 @@
 //! reset) is dropped where it waits and its DuckDB process killed (`sql::run_with`); the rest
 //! of its work on the blocking pool (the tiles, Arrow encoding) ends with that and is thrown
 //! away.
+//!
+//! The transport is blaze-http's HTTP/3 core (`blaze_http::h3`) under its tokio driver, which
+//! owns the UDP socket and the timers.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -18,15 +21,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use blaze_http::h3::{
+    self, Identity, ServerConfig, Transport,
+    tokio_driver::{Driver, RecvStream, Request as Incoming, SendStream, Session},
+};
 use blaze_profile::{clock, live, schema};
 use serde_json::{Map, Value};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     time::MissedTickBehavior,
-};
-use wtransport::{
-    Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt,
-    endpoint::{IncomingSession, endpoint_side::Server},
 };
 
 use crate::{
@@ -126,18 +129,26 @@ pub enum StartError {
     Runtime(std::io::Error),
     Bind(std::io::Error),
     Thread(std::io::Error),
-    Config(wtransport::config::InvalidIdleTimeout),
+    Config(h3::Error),
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::Clock(why) => write!(f, "the wall clock is before 1970, so no certificate can be dated: {why}"),
+            StartError::Clock(why) => {
+                write!(f, "the wall clock is before 1970, so no certificate can be dated: {why}")
+            }
             StartError::Cert(why) => write!(f, "{why}"),
-            StartError::Runtime(why) => write!(f, "the explorer's tokio runtime did not start: {why}"),
-            StartError::Bind(why) => write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}"),
+            StartError::Runtime(why) => {
+                write!(f, "the explorer's tokio runtime did not start: {why}")
+            }
+            StartError::Bind(why) => {
+                write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}")
+            }
             StartError::Thread(why) => write!(f, "the explorer's thread did not start: {why}"),
-            StartError::Config(why) => write!(f, "the explorer's QUIC idle timeout was refused: {why}"),
+            StartError::Config(why) => {
+                write!(f, "the explorer's HTTP/3 endpoint refused its config: {why}")
+            }
         }
     }
 }
@@ -162,13 +173,18 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
                 }
             };
             runtime.block_on(async move {
-                let bound = server_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), identity)
-                    .and_then(|it| Endpoint::server(it).map_err(StartError::Bind))
-                    .and_then(|endpoint| {
-                        let port = endpoint.local_addr().map_err(StartError::Bind)?.port();
-                        Ok((endpoint, port))
+                let bound = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .map_err(StartError::Bind)
+                    .and_then(|socket| {
+                        let runtime = tokio::runtime::Handle::current();
+                        Driver::spawn(&runtime, socket, Some(server_config(identity)), None)
+                            .map_err(StartError::Config)
+                    })
+                    .map(|(driver, incoming)| {
+                        let port = driver.local_addr().port();
+                        ((driver, incoming), port)
                     });
-                let (endpoint, port) = match bound {
+                let (transport, port) = match bound {
                     Ok(it) => it,
                     Err(why) => {
                         _ = ready_to.send(Err(why));
@@ -187,7 +203,7 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
                 if ready_to.send(Ok(Arc::clone(&shared))).is_err() {
                     return;
                 }
-                serve(endpoint, shared, rotation, stopped).await;
+                serve(transport, shared, rotation, stopped).await;
             });
             runtime.shutdown_timeout(SHUTDOWN);
         })
@@ -201,7 +217,9 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
         }
         Err(_) => {
             _ = thread.join();
-            Err(StartError::Thread(std::io::Error::other("the explorer's thread ended before it listened")))
+            Err(StartError::Thread(std::io::Error::other(
+                "the explorer's thread ended before it listened",
+            )))
         }
     }
 }
@@ -210,18 +228,12 @@ fn unix_now_s() -> Result<u64, StartError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH).map_err(StartError::Clock)?.as_secs())
 }
 
-fn server_config(at: SocketAddr, identity: Identity) -> Result<ServerConfig, StartError> {
-    Ok(ServerConfig::builder()
-        .with_bind_address(at)
-        .with_identity(identity)
-        .keep_alive_interval(Some(KEEP_ALIVE))
-        .max_idle_timeout(Some(IDLE))
-        .map_err(StartError::Config)?
-        .build())
+fn server_config(identity: Identity) -> ServerConfig {
+    ServerConfig { identity, transport: Transport { idle: IDLE, keep_alive: Some(KEEP_ALIVE) } }
 }
 
 async fn serve(
-    endpoint: Endpoint<Server>,
+    (driver, mut incoming): (Driver, mpsc::UnboundedReceiver<Incoming>),
     shared: Arc<Shared>,
     mut rotation: Rotation,
     mut stop: oneshot::Receiver<()>,
@@ -230,20 +242,25 @@ async fn serve(
     check.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            incoming = endpoint.accept() => {
-                tokio::spawn(session(Arc::clone(&shared), incoming));
-            }
-            _ = check.tick() => rotate(&endpoint, &shared, &mut rotation),
+            request = incoming.recv() => match request {
+                Some(request) => {
+                    tokio::spawn(session(Arc::clone(&shared), request));
+                }
+                None => break,
+            },
+            _ = check.tick() => rotate(&driver, &shared, &mut rotation).await,
             _ = &mut stop => break,
         }
     }
-    endpoint.close(VarInt::from_u32(CLOSE_STOPPED), b"blaze explore stopped");
+    // Each session is told the code; a page that does not acknowledge in LINGER is closed
+    // anyway, and SHUTDOWN bounds the whole of it.
+    _ = tokio::time::timeout(SHUTDOWN, driver.close(CLOSE_STOPPED, "blaze explore stopped")).await;
 }
 
 /// Makes and serves a new certificate when [`Rotation`] says it is due. One not made is said
 /// on the daemon's log and tried again at the next check; the one served keeps being served
 /// until then, and until it expires.
-fn rotate(endpoint: &Endpoint<Server>, shared: &Shared, rotation: &mut Rotation) {
+async fn rotate(driver: &Driver, shared: &Shared, rotation: &mut Rotation) {
     let now = match unix_now_s() {
         Ok(it) => it,
         Err(why) => {
@@ -252,16 +269,19 @@ fn rotate(endpoint: &Endpoint<Server>, shared: &Shared, rotation: &mut Rotation)
         }
     };
     let Some(validity) = rotation.due(now) else { return };
-    let served = Cert::make(validity).map_err(StartError::Cert).and_then(|cert| {
-        let identity = cert.identity().map_err(StartError::Cert)?;
-        let config = server_config(SocketAddr::from((Ipv4Addr::LOCALHOST, shared.port)), identity)?;
-        endpoint.reload_config(config, false).map_err(StartError::Bind)?;
-        Ok(cert)
-    });
+    let served = match Cert::make(validity).and_then(|cert| Ok((cert.identity()?, cert))) {
+        Ok((identity, cert)) => {
+            driver.set_identity(identity).await.map(|()| cert).map_err(StartError::Config)
+        }
+        Err(why) => Err(StartError::Cert(why)),
+    };
     match served {
         Ok(cert) => {
             rotation.rotated(validity);
-            shared.cert.send_replace(Arc::new(Current { hash: cert.hash, not_after_s: validity.not_after_s }));
+            shared.cert.send_replace(Arc::new(Current {
+                hash: cert.hash,
+                not_after_s: validity.not_after_s,
+            }));
         }
         Err(why) => eprintln!(
             "blaze explore: the certificate was not made anew ({why}); the one served expires at {} (Unix \
@@ -272,14 +292,13 @@ fn rotate(endpoint: &Endpoint<Server>, shared: &Shared, rotation: &mut Rotation)
     }
 }
 
-async fn session(shared: Arc<Shared>, incoming: IncomingSession) {
-    let Ok(request) = incoming.await else { return };
+async fn session(shared: Arc<Shared>, request: Incoming) {
     if request.path() != link::PATH {
-        request.not_found().await;
+        request.refuse(404);
         return;
     }
     if !shared.origins.allows(request.origin()) {
-        request.forbidden().await;
+        request.refuse(403);
         return;
     }
     let Ok(connection) = request.accept().await else { return };
@@ -305,12 +324,17 @@ async fn session(shared: Arc<Shared>, incoming: IncomingSession) {
 
 /// Answers the session's requests, one at a time, until a good `hello`; `false` when the
 /// session is over.
-async fn hello(shared: &Shared, connection: &Connection) -> bool {
+async fn hello(shared: &Shared, connection: &Session) -> bool {
     loop {
         let Ok((mut send, mut recv)) = connection.accept_bi().await else { return false };
         let refused = match read(&mut recv).await {
-            Ok(Request::Hello { token }) => return said_hello(shared, connection, &mut send, &token).await,
-            Ok(_) => WireError::new(Kind::Unauthenticated, "the first request of a session is hello with the link's token"),
+            Ok(Request::Hello { token }) => {
+                return said_hello(shared, connection, &mut send, &token).await;
+            }
+            Ok(_) => WireError::new(
+                Kind::Unauthenticated,
+                "the first request of a session is hello with the link's token",
+            ),
             Err(why) => why,
         };
         send_bytes(&mut send, &error_bytes(&refused)).await;
@@ -318,14 +342,22 @@ async fn hello(shared: &Shared, connection: &Connection) -> bool {
 }
 
 /// Answers `hello` with `token`: `true` when it was the token.
-async fn said_hello(shared: &Shared, connection: &Connection, send: &mut SendStream, token: &str) -> bool {
+async fn said_hello(
+    shared: &Shared,
+    connection: &Session,
+    send: &mut SendStream,
+    token: &str,
+) -> bool {
     if shared.token.matches(token) {
         send_bytes(send, &hello_bytes(shared)).await;
         return true;
     }
-    let refused = WireError::new(Kind::BadToken, "the token is not this daemon's: run `blaze explore` for its link");
+    let refused = WireError::new(
+        Kind::BadToken,
+        "the token is not this daemon's: run `blaze explore` for its link",
+    );
     send_bytes(send, &error_bytes(&refused)).await;
-    connection.close(VarInt::from_u32(CLOSE_BAD_TOKEN), b"bad_token");
+    connection.close(CLOSE_BAD_TOKEN, "bad_token");
     false
 }
 
@@ -343,7 +375,8 @@ fn hello_bytes(shared: &Shared) -> Vec<u8> {
         ("source", source_descriptor()),
     ];
     // alloc: once a session
-    let header: Map<String, Value> = header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+    let header: Map<String, Value> =
+        header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
     let mut out = Vec::new();
     encode_head(&mut out, &header);
     out
@@ -366,7 +399,7 @@ fn source_descriptor() -> Value {
 /// A request's stream: read, answered on the blocking pool unless the page stops it, written.
 async fn stream(
     shared: Arc<Shared>,
-    connection: Connection,
+    connection: Session,
     mut send: SendStream,
     mut recv: RecvStream,
     _permit: OwnedSemaphorePermit,
@@ -387,7 +420,8 @@ async fn stream(
     // Dropped as the stream ends however it ends (answered, stopped by the page, the session
     // gone, the server stopping): the sender gone kills a DuckDB query still under way.
     let (_stop, stopping) = crossbeam_channel::bounded::<()>(0);
-    let work = tokio::task::spawn_blocking(move || encode(ops::answer(&cx, request, &stopping), started));
+    let work =
+        tokio::task::spawn_blocking(move || encode(ops::answer(&cx, request, &stopping), started));
     let bytes = tokio::select! {
         done = work => match done {
             Ok(bytes) => bytes,
@@ -398,9 +432,10 @@ async fn stream(
     send_bytes(&mut send, &bytes).await;
 }
 
-async fn refuse(mut send: SendStream, recv: RecvStream) {
-    recv.stop(VarInt::from_u32(0));
-    let message = format!("the session has {MAX_IN_FLIGHT} requests in flight: wait for one to end");
+async fn refuse(mut send: SendStream, mut recv: RecvStream) {
+    recv.stop(0);
+    let message =
+        format!("the session has {MAX_IN_FLIGHT} requests in flight: wait for one to end");
     let refused = WireError::new(Kind::Overloaded, message).with("in_flight", MAX_IN_FLIGHT);
     send_bytes(&mut send, &error_bytes(&refused)).await;
 }
@@ -419,7 +454,12 @@ async fn read(recv: &mut RecvStream) -> Result<Request, WireError> {
                 // alloc: a request, at most MAX_REQUEST
                 Ok(Some(n)) => bytes.extend_from_slice(&chunk[..n]),
                 Ok(None) => return Ok(()),
-                Err(why) => return Err(WireError::new(Kind::BadArgs, format!("the request was not read whole: {why}"))),
+                Err(why) => {
+                    return Err(WireError::new(
+                        Kind::BadArgs,
+                        format!("the request was not read whole: {why}"),
+                    ));
+                }
             }
         }
     };
@@ -428,14 +468,17 @@ async fn read(recv: &mut RecvStream) -> Result<Request, WireError> {
         Ok(Err(why)) => Err(why),
         Err(_) => Err(WireError::new(
             Kind::BadArgs,
-            format!("no whole request in {} s: write one JSON object, then close the stream's side", REQUEST_WAIT.as_secs()),
+            format!(
+                "no whole request in {} s: write one JSON object, then close the stream's side",
+                REQUEST_WAIT.as_secs()
+            ),
         )),
     }
 }
 
 async fn send_bytes(send: &mut SendStream, bytes: &[u8]) {
     if send.write_all(bytes).await.is_ok() {
-        _ = send.finish().await;
+        send.finish();
     }
 }
 
@@ -452,8 +495,9 @@ fn encode(answer: Result<ops::Answer, WireError>, started: Instant) -> Vec<u8> {
         answer.header.insert("elapsed_ns".to_owned(), (started.elapsed().as_nanos() as u64).into());
         encode_head(&mut out, &answer.header);
         if let Some(table) = &answer.table {
-            frame::ipc(&mut out, &table.schema, &table.batches)
-                .map_err(|why| WireError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}")))?;
+            frame::ipc(&mut out, &table.schema, &table.batches).map_err(|why| {
+                WireError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}"))
+            })?;
         }
         Ok(())
     });
@@ -483,9 +527,8 @@ fn encode_head(out: &mut Vec<u8>, header: &Map<String, Value>) {
 /// A page that reads slower than the frames come falls behind by at most one frame: while a
 /// write waits on the page, ticks are skipped, not queued, and the next read takes everything
 /// since this session's last one. What the rings dropped meanwhile is counted in `skipped`.
-async fn live(connection: Connection, mut cert: watch::Receiver<Arc<Current>>) {
-    let Ok(opening) = connection.open_uni().await else { return };
-    let Ok(mut send) = opening.await else { return };
+async fn live(connection: Session, mut cert: watch::Receiver<Arc<Current>>) {
+    let Ok(mut send) = connection.open_uni().await else { return };
     let mut every = tokio::time::interval(live::EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // alloc: once a session, the feed moved to and from the blocking pool each tick
@@ -557,7 +600,12 @@ fn sends(table: &str, rows: usize, open_shown: bool) -> Emit {
 
 /// Writes a frame of each of `frame`'s tables that has rows, and of `open` once when it
 /// empties (`open_shown`: the page shows a non-empty set); `false` when the page is gone.
-async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Frame, open_shown: &mut bool) -> bool {
+async fn live_tables(
+    send: &mut SendStream,
+    out: &mut Vec<u8>,
+    frame: &live::Frame,
+    open_shown: &mut bool,
+) -> bool {
     let tables = [
         ("spans", frame.spans_rows, &frame.spans),
         ("counters", frame.counters_rows, &frame.counters),
@@ -578,7 +626,8 @@ async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Fra
             ("lost", frame.lost.into()),
         ];
         // alloc: a live frame's header, at most 12 a second
-        let header: Map<String, Value> = header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+        let header: Map<String, Value> =
+            header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
         if !live_frame(send, out, &header, ipc).await {
             return false;
         }
@@ -589,7 +638,12 @@ async fn live_tables(send: &mut SendStream, out: &mut Vec<u8>, frame: &live::Fra
     true
 }
 
-async fn live_frame(send: &mut SendStream, out: &mut Vec<u8>, header: &Map<String, Value>, ipc: &[u8]) -> bool {
+async fn live_frame(
+    send: &mut SendStream,
+    out: &mut Vec<u8>,
+    header: &Map<String, Value>,
+    ipc: &[u8],
+) -> bool {
     out.clear();
     frame::live_head(out, header, ipc.len()).expect("a JSON map always serializes");
     send.write_all(out).await.is_ok() && send.write_all(ipc).await.is_ok()
@@ -600,43 +654,47 @@ mod tests {
     use std::path::PathBuf;
 
     use base64::Engine as _;
-    use wtransport::{
-        ClientConfig,
-        endpoint::{ConnectOptions, endpoint_side::Client},
-        error::ConnectingError,
-        tls::Sha256Digest,
-    };
+    use blaze_http::h3::{ClientConfig, Closed};
 
     use super::*;
 
     fn explorer() -> Explorer {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
+        let history = History {
+            duckdb: None,
+            dir: PathBuf::from("/nowhere"),
+            flush: crate::ops::Flush::new(|| Ok(0)),
+        };
         start(Config { history, world: None, dev_origin: false, daemon: "test" }).unwrap()
     }
 
-    fn client(explorer: &Explorer) -> Endpoint<Client> {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
-        let digest = Sha256Digest::new(raw.try_into().unwrap());
-        let config = ClientConfig::builder()
-            .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .with_server_certificate_hashes([digest])
-            .build();
-        Endpoint::client(config).unwrap()
+    /// A client pinning the explorer's certificate, as the page does; on the runtime it is
+    /// called on.
+    fn client(explorer: &Explorer) -> Driver {
+        let raw =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
+        let config =
+            ClientConfig { pins: vec![raw.try_into().unwrap()], transport: Transport::default() };
+        let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        Driver::spawn(&tokio::runtime::Handle::current(), socket, None, Some(config)).unwrap().0
     }
 
-    async fn connect(client: &Endpoint<Client>, explorer: &Explorer, path: &str, origin: Option<&str>) -> Result<Connection, ConnectingError> {
-        let mut options = ConnectOptions::builder(format!("https://127.0.0.1:{}{path}", explorer.port()));
-        if let Some(origin) = origin {
-            options = options.add_header("origin", origin);
-        }
-        client.connect(options.build()).await
+    async fn connect(
+        client: &Driver,
+        explorer: &Explorer,
+        path: &str,
+        origin: Option<&str>,
+    ) -> Result<Session, Closed> {
+        let url = format!("https://127.0.0.1:{}{path}", explorer.port());
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, explorer.port()));
+        let headers: Vec<(&str, &str)> = origin.map(|it| ("origin", it)).into_iter().collect();
+        client.connect(to, &url, &headers).await
     }
 
     /// The header and the IPC of the answer to `request`.
-    async fn ask(connection: &Connection, request: &str) -> (Value, Vec<u8>) {
-        let (mut send, mut recv) = connection.open_bi().await.unwrap().await.unwrap();
+    async fn ask(connection: &Session, request: &str) -> (Value, Vec<u8>) {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
         send.write_all(request.as_bytes()).await.unwrap();
-        send.finish().await.unwrap();
+        send.finish();
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
         while let Some(n) = recv.read(&mut chunk).await.unwrap() {
@@ -660,28 +718,33 @@ mod tests {
         blaze_profile::plot(blaze_profile::Plot::Queued, 7);
         let explorer = explorer();
         let link = explorer.link();
-        assert!(link.starts_with(&format!("https://ix.dev/explore#127.0.0.1:{}/", explorer.port())), "{link}");
+        assert!(
+            link.starts_with(&format!("https://ix.dev/explore#127.0.0.1:{}/", explorer.port())),
+            "{link}"
+        );
         assert!(link.ends_with(&format!("/{}", explorer.certhash())), "{link}");
         let token = token_of(&link);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let client = client(&explorer);
-            for (path, origin) in [
-                (link::PATH, Some("https://evil.example")),
-                (link::PATH, Some(link::DEV_ORIGIN)),
-                (link::PATH, None),
-                ("/elsewhere", Some(link::ORIGIN)),
+            for (path, origin, status) in [
+                (link::PATH, Some("https://evil.example"), 403),
+                (link::PATH, Some(link::DEV_ORIGIN), 403),
+                (link::PATH, None, 403),
+                ("/elsewhere", Some(link::ORIGIN), 404),
             ] {
-                let refused = connect(&client, &explorer, path, origin).await;
-                assert!(matches!(refused, Err(ConnectingError::SessionRejected)), "{path} {origin:?}: {refused:?}");
+                let refused = connect(&client, &explorer, path, origin).await.map(|it| it.id());
+                assert_eq!(refused, Err(Closed::Refused { status }), "{path} {origin:?}");
             }
 
-            let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
+            let connection =
+                connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
             let (header, ipc) = ask(&connection, r#"{"op":"views"}"#).await;
             assert_eq!(header["error"]["kind"], "unauthenticated", "{header}");
             assert!(ipc.is_empty());
 
-            let (header, _) = ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#)).await;
+            let (header, _) =
+                ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#)).await;
             assert_eq!(header["op"], "hello", "{header}");
             assert_eq!(header["schema"], schema::VERSION);
             assert_eq!(header["certhash"], explorer.certhash().as_str());
@@ -692,7 +755,10 @@ mod tests {
             assert_eq!(header["op"], "views", "{header}");
             assert_eq!(header["rows"], blaze_profile::views::VIEWS.len());
             let batches = live::decode(&ipc).unwrap();
-            assert_eq!(batches.iter().map(|it| it.num_rows()).sum::<usize>(), blaze_profile::views::VIEWS.len());
+            assert_eq!(
+                batches.iter().map(|it| it.num_rows()).sum::<usize>(),
+                blaze_profile::views::VIEWS.len()
+            );
 
             let (header, _) = ask(&connection, r#"{"op":"frobnicate"}"#).await;
             assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
@@ -706,27 +772,45 @@ mod tests {
                 loop {
                     let n = live.read(&mut chunk).await.unwrap().unwrap();
                     first.extend_from_slice(&chunk[..n]);
-                    if first.len() >= 4 && first.len() >= 4 + u32::from_le_bytes(first[..4].try_into().unwrap()) as usize {
+                    if first.len() >= 4
+                        && first.len()
+                            >= 4 + u32::from_le_bytes(first[..4].try_into().unwrap()) as usize
+                    {
                         break;
                     }
                 }
             };
-            tokio::time::timeout(Duration::from_secs(5), read).await.expect("a live frame within 5 s");
+            tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .expect("a live frame within 5 s");
             let body_len = u32::from_le_bytes(first[..4].try_into().unwrap()) as usize;
             let body = &first[4..4 + body_len];
             let head_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-            assert_eq!((4 + head_len) % frame::ALIGN, 0, "a live frame's IPC is 8-aligned in its body");
+            assert_eq!(
+                (4 + head_len) % frame::ALIGN,
+                0,
+                "a live frame's IPC is 8-aligned in its body"
+            );
             let header: Value = serde_json::from_slice(&body[4..4 + head_len]).unwrap();
             assert_eq!(header["op"], "live", "{header}");
             assert!(header["rows"].as_u64().unwrap() > 0, "{header}");
             let batches = live::decode(&body[4 + head_len..]).unwrap();
-            assert_eq!(batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(), header["rows"].as_u64().unwrap());
+            assert_eq!(
+                batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(),
+                header["rows"].as_u64().unwrap()
+            );
 
             let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
-            let wrong = if token.starts_with('0') { token.replacen('0', "1", 1) } else { format!("0{}", &token[1..]) };
+            let wrong = if token.starts_with('0') {
+                token.replacen('0', "1", 1)
+            } else {
+                format!("0{}", &token[1..])
+            };
             let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#)).await;
             assert_eq!(header["error"]["kind"], "bad_token", "{header}");
-            tokio::time::timeout(Duration::from_secs(5), other.closed()).await.expect("bad_token closes the session");
+            tokio::time::timeout(Duration::from_secs(5), other.closed())
+                .await
+                .expect("bad_token closes the session");
             let (header, _) = ask(&connection, r#"{"op":"views"}"#).await;
             assert_eq!(header["op"], "views", "another session's bad token leaves this one open");
         });
@@ -734,8 +818,13 @@ mod tests {
 
     #[test]
     fn a_session_from_the_dev_server_is_taken_only_when_asked() {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
-        let explorer = start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
+        let history = History {
+            duckdb: None,
+            dir: PathBuf::from("/nowhere"),
+            flush: crate::ops::Flush::new(|| Ok(0)),
+        };
+        let explorer =
+            start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let client = client(&explorer);

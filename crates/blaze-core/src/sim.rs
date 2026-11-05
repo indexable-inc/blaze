@@ -10,6 +10,17 @@
 //! ends, and [`Sim::dial`] is a peer from outside (an agent's client, a webhook) that the test
 //! plays with [`Sim::peer_send`], [`Sim::peer_received`] and [`Sim::peer_hangup`].
 //!
+//! File locks ([`Effect::Lock`]) are a table of who holds each file's lock, by `flock`'s
+//! rules: shared locks share, an exclusive one is alone, and a lock another excludes is
+//! [`Done::Contended`], never waited for. [`Sim::hold_lock`] is another process holding one. A
+//! lock follows its file as a rename moves it; a file removed or replaced takes its locks with
+//! it, so a lock of the name made again is another's. A crash lets every lock go.
+//!
+//! Targeted faults, each until a crash: [`Sim::fail_syncs`] (a disk gone bad),
+//! [`Sim::hold_syncs`] (a disk that stopped answering), [`Sim::slow_writes`],
+//! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], and [`Sim::fill`] (a disk
+//! out of room: what does not fit fails with ENOSPC, an append keeping the part that fits).
+//!
 //! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
 //! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
 //! slabs named by the asker's tag, and the ends of connections in a [`Slab`] whose handle bits
@@ -26,13 +37,13 @@ mod journal;
 use std::{mem, path::PathBuf, time::Duration};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Slab, Tag as MemTag};
+use std::alloc::Global;
 
 pub use self::journal::Journal;
 use crate::{
     Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
-    Meta, RECV_MOST, Tag,
+    LockMode, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -89,7 +100,8 @@ struct End {
 /// The simulation's random numbers: blaze's one seeded SplitMix64.
 pub use blaze_rng::SplitMix64 as Rng;
 
-/// How unkind the simulated machine is.
+/// How unkind the simulated machine is, at random. The faults a test aims at one place
+/// ([`Sim::fail_syncs`], [`Sim::fill`] and the rest in the module's docs) are the [`Sim`]'s.
 #[derive(Clone, Debug)]
 pub struct Faults {
     /// An effect fails once in this many (0: never). A failed append writes a random part of
@@ -193,7 +205,8 @@ impl Op {
     /// The change cut short, as a power cut leaves a write it was in the middle of.
     fn torn(&self, rng: &mut Rng) -> Option<Op> {
         // alloc: a crash, not an op: the part of the change that landed.
-        let part = |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
+        let part =
+            |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
         match self {
             Op::Append(more) => Some(Op::Append(part(more, rng))),
             Op::At(at, more) => Some(Op::At(*at, part(more, rng))),
@@ -312,6 +325,17 @@ pub struct Sim {
     /// with the clock then ([`Sim::record`]).
     recording: Vec<FileName>,
     recorded: Vec<(Duration, FileName, bool)>,
+    /// Appends and writes of files under this directory take their bytes from what is left of
+    /// its room ([`Sim::fill`]): a disk filling up.
+    room: Option<(FileName, u64)>,
+    /// Who holds each file's lock ([`Effect::Lock`]), by the tag that took it, in the order
+    /// taken; a file no one holds has no entry.
+    locks: HashMap<FileName, Vec<(Tag, LockMode)>, Global>,
+    /// Locks held of files removed or replaced since: still held, so an unlock lets them go,
+    /// but of a file no name leads to, so they exclude no one.
+    unlinked: Vec<Tag>,
+    /// The locks another process holds ([`Sim::hold_lock`]).
+    outside: HashMap<FileName, LockMode, Global>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -322,13 +346,20 @@ fn latency(rng: &mut Rng, faults: &Faults) -> Duration {
 /// `at`, or later: after everything told of `a` or `b`.
 fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
     told.iter()
-        .filter(|it| it.completion.tag == a || it.completion.tag == b || matches!(it.of, Of::Flush(watch) if watch == a))
+        .filter(|it| {
+            it.completion.tag == a
+                || it.completion.tag == b
+                || matches!(it.of, Of::Flush(watch) if watch == a)
+        })
         .map(|it| it.at)
         .fold(at, Duration::max)
 }
 
 /// The file `name` of the simulated disk, made empty if it is not there.
-fn file_mut<'a>(files: &'a mut HashMap<FileName, SimFile, Global>, name: &FileName) -> &'a mut SimFile {
+fn file_mut<'a>(
+    files: &'a mut HashMap<FileName, SimFile, Global>,
+    name: &FileName,
+) -> &'a mut SimFile {
     if !files.contains_key(name) {
         // clone: once per file new to the simulated disk, its key.
         files.insert(name.clone(), SimFile::default());
@@ -374,6 +405,11 @@ impl Sim {
             slow: None,
             recording: Vec::new(),
             recorded: Vec::new(),
+            room: None,
+            locks: HashMap::new_in(Global),
+            // alloc: none until a locked file is removed.
+            unlinked: Vec::new(),
+            outside: HashMap::new_in(Global),
         }
     }
 
@@ -454,12 +490,19 @@ impl Sim {
     /// a random prefix of the changes after (appends, writes at an offset, truncations), the
     /// last of which may be torn. A whole-file write or rename that completed is kept whole;
     /// one in flight is not there.
+    ///
+    /// Every lock goes with the processes that held them, another process's too
+    /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
         self.pending.drain(|_, _| {});
         self.held.clear();
         self.held_sends.clear();
         self.hold_syncs = None;
         self.fail_syncs = None;
+        self.room = None;
+        self.locks.clear();
+        self.unlinked.clear();
+        self.outside.clear();
         self.hold_lists = None;
         self.held_lists.clear();
         self.fail_lists = None;
@@ -539,6 +582,28 @@ impl Sim {
         self.fail_syncs = Some(dir);
     }
 
+    /// From now on, appends, whole-file writes and writes at an offset of files under `dir`
+    /// take their bytes from `room`, until a crash: a disk filling up. One that does not fit
+    /// fails with ENOSPC, naming the file: an append keeps the part that fits, unsynced (a
+    /// short write), as does a write at an offset, and a whole-file write leaves the file as it
+    /// was. For a test of a store or a journal on a full disk.
+    pub fn fill(&mut self, dir: FileName, room: u64) {
+        self.room = Some((dir, room));
+    }
+
+    /// Another process holds `file`'s lock in `mode`, until [`Sim::release_lock`] or a crash:
+    /// a lock asked of it that `mode` excludes is [`Done::Contended`]. Whatever the simulation's
+    /// own locks of it are, as a test plays another process that got there first.
+    pub fn hold_lock(&mut self, file: &FileName, mode: LockMode) {
+        // clone: the world changed by the test, not an op.
+        self.outside.insert(file.clone(), mode);
+    }
+
+    /// Another process lets go of `file`'s lock ([`Sim::hold_lock`]).
+    pub fn release_lock(&mut self, file: &FileName) {
+        self.outside.remove(file);
+    }
+
     /// From now on, each write, truncate and sync of a file under `dir` completes `by` after it
     /// is submitted, until a crash: a slow disk that still moves. For a test that a store's
     /// commit taking long, step by step, is waited for.
@@ -607,7 +672,8 @@ impl Sim {
     /// machine (a checkout): watches of it hear of it.
     pub fn symlink(&mut self, file: &FileName, target: &str) {
         // alloc: the world changed by the test, not an op.
-        *file_mut(&mut self.files, file) = SimFile { mode: 0o777, link: true, ..SimFile::whole(target.into()) };
+        *file_mut(&mut self.files, file) =
+            SimFile { mode: 0o777, link: true, ..SimFile::whole(target.into()) };
         self.changed(file);
     }
 
@@ -640,7 +706,8 @@ impl Sim {
             };
             let target = String::from_utf8_lossy(&sim.contents()).into_owned();
             // alloc: the name a link leads to.
-            let mut parts: Vec<&str> = at.as_str().rsplit_once('/').map_or(vec![], |(dir, _)| dir.split('/').collect());
+            let mut parts: Vec<&str> =
+                at.as_str().rsplit_once('/').map_or(vec![], |(dir, _)| dir.split('/').collect());
             for part in target.split('/') {
                 match part {
                     "" if parts.is_empty() && target.starts_with('/') => {
@@ -651,7 +718,9 @@ impl Sim {
                     ".." => {
                         if parts.pop().is_none() {
                             // alloc: an error's message.
-                            return Err(IoError(format!("{file}: a link out of the simulated root")));
+                            return Err(IoError(format!(
+                                "{file}: a link out of the simulated root"
+                            )));
                         }
                     }
                     part => parts.push(part),
@@ -674,7 +743,9 @@ impl Sim {
             // alloc: an error's message.
             Some(_) => Done::Failed(IoError(format!("{file}: Invalid argument (os error 22)"))),
             // alloc: an error's message.
-            None => Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)"))),
+            None => {
+                Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)")))
+            }
         }
     }
 
@@ -742,7 +813,11 @@ impl Sim {
             return Done::Private(Some((dir.clone(), access)));
         }
         // What a test set of a file comes before what its mode says.
-        let given = self.access.iter().filter(|(it, _)| it.is_under(dir)).map(|(it, &access)| (it, 0, access));
+        let given = self
+            .access
+            .iter()
+            .filter(|(it, _)| it.is_under(dir))
+            .map(|(it, &access)| (it, 0, access));
         let moded = self
             .files
             .iter()
@@ -756,6 +831,7 @@ impl Sim {
     /// The file removed by something outside the state machine.
     pub fn delete(&mut self, file: &FileName) {
         self.files.remove(file);
+        self.unlink_locks(file);
         self.changed(file);
     }
 
@@ -803,7 +879,11 @@ impl Sim {
                 let at = after_told(&self.told, at, tag, tag);
                 // alloc: the batch's payload.
                 let done = Done::Journaled(Box::new(batch));
-                self.told.push(Told { at, completion: Completion { tag, done }, of: Of::Change(id) });
+                self.told.push(Told {
+                    at,
+                    completion: Completion { tag, done },
+                    of: Of::Change(id),
+                });
             }
         }
     }
@@ -864,9 +944,143 @@ impl Sim {
             // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
             self.disk.renamed(from, to);
+            self.move_locks(from, to);
             self.changed(from);
             self.changed(to);
         }
+    }
+
+    /// Whether `tag` holds a lock, of a file there or of one gone.
+    fn holds_lock(&self, tag: Tag) -> bool {
+        self.unlinked.contains(&tag)
+            || self.locks.values().any(|holders| holders.iter().any(|&(it, _)| it == tag))
+    }
+
+    /// [`Effect::Lock`] of `file` in `mode` under `tag`, decided as it completes.
+    fn lock(&mut self, file: &FileName, mode: LockMode, tag: Tag) -> Done {
+        if self.holds_lock(tag) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!(
+                "{file}: lock {} asked under a tag that holds a lock already",
+                tag.0
+            )));
+        }
+        // Opened to read and write, made if missing, whether or not the lock is taken, as a
+        // real driver opens it.
+        if !self.files.contains_key(file) {
+            file_mut(&mut self.files, file);
+            self.changed(file);
+        }
+        let holders = self.locks.get(file).map_or(&[][..], Vec::as_slice);
+        let outside = self.outside.get(file).copied();
+        let free = match mode {
+            LockMode::Exclusive => holders.is_empty() && outside.is_none(),
+            LockMode::Shared => {
+                holders.iter().all(|&(_, it)| it == LockMode::Shared)
+                    && outside != Some(LockMode::Exclusive)
+            }
+        };
+        if !free {
+            return Done::Contended;
+        }
+        match self.locks.get_mut(file) {
+            Some(holders) => holders.push((tag, mode)),
+            None => {
+                // clone: once per file locked while no one held it, its key.
+                // alloc: the file's holders, kept while any hold it.
+                self.locks.insert(file.clone(), vec![(tag, mode)]);
+            }
+        }
+        Done::Locked
+    }
+
+    /// The lock `lock` took let go of: whether it held one.
+    fn unlock(&mut self, lock: Tag) -> bool {
+        if let Some(at) = self.unlinked.iter().position(|&it| it == lock) {
+            self.unlinked.swap_remove(at);
+            return true;
+        }
+        let Some(file) = self
+            .locks
+            .iter()
+            .find(|(_, holders)| holders.iter().any(|&(it, _)| it == lock))
+            // clone: the name of the file let go of, a refcount.
+            .map(|(file, _)| file.clone())
+        else {
+            return false;
+        };
+        let holders = self.locks.get_mut(&file).expect("found above");
+        holders.retain(|&(it, _)| it != lock);
+        if holders.is_empty() {
+            self.locks.remove(&file);
+        }
+        true
+    }
+
+    /// The locks of `file` stay held but exclude no one: their file is removed or replaced, so
+    /// the name, made again, is another file.
+    fn unlink_locks(&mut self, file: &FileName) {
+        if let Some(holders) = self.locks.remove(file) {
+            self.unlinked.extend(holders.into_iter().map(|(tag, _)| tag));
+        }
+    }
+
+    /// The locks of `from` follow their file to `to`, as a rename moves it; `to`'s own go with
+    /// the file the rename replaced.
+    fn move_locks(&mut self, from: &FileName, to: &FileName) {
+        self.unlink_locks(to);
+        if let Some(holders) = self.locks.remove(from) {
+            // clone: the name the locked file has now, a refcount.
+            self.locks.insert(to.clone(), holders);
+        }
+    }
+
+    /// `effect` on a disk filling up ([`Sim::fill`]): handed back to be done, its bytes taken
+    /// from the room, when it fits; else what it ends with, an append or a write at an offset
+    /// having kept the part that fit.
+    fn take_room(&mut self, effect: Effect) -> Result<Effect, Done> {
+        let Some((dir, room)) = &mut self.room else {
+            return Ok(effect);
+        };
+        let (file, len) = match &effect {
+            Effect::Append { file, bytes, .. } | Effect::Write { file, bytes, .. } => {
+                (file, bytes.len() as u64)
+            }
+            // One of a file not there fails as it would have, taking no room.
+            Effect::WriteAt { file, bytes, .. } if self.files.contains_key(file) => {
+                (file, bytes.len() as u64)
+            }
+            _ => return Ok(effect),
+        };
+        if !file.is_under(dir) {
+            return Ok(effect);
+        }
+        if len <= *room {
+            *room -= len;
+            return Ok(effect);
+        }
+        let fits = *room as usize;
+        *room = 0;
+        // alloc: an error's message.
+        let full = Done::Failed(IoError(format!("{file}: No space left on device (os error 28)")));
+        match effect {
+            Effect::Append { file, mut bytes, .. } => {
+                bytes.truncate(fits);
+                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
+                if fits > 0 {
+                    self.changed(&file);
+                }
+            }
+            Effect::WriteAt { file, at, mut bytes, .. } if fits > 0 => {
+                bytes.truncate(fits);
+                let sim = self.files.get_mut(&file).expect("looked up above");
+                sim.ops.push(Op::At(at, bytes));
+                self.changed(&file);
+            }
+            // A whole-file write leaves the file as it was.
+            _ => {}
+        }
+        Err(full)
     }
 
     fn fail(&mut self, tag: Tag) -> Completion {
@@ -906,7 +1120,8 @@ impl Sim {
                 continue;
             }
             let (_, tag, bytes) = self.held_sends.remove(at);
-            let done = Done::unsent(bytes, format_args!("{conn:?}: hung up with the send in flight"));
+            let done =
+                Done::unsent(bytes, format_args!("{conn:?}: hung up with the send in flight"));
             self.tell(tag, done, Of::Op);
         }
     }
@@ -917,7 +1132,10 @@ impl Sim {
         let mut at = 0;
         while at < self.receiving.len() {
             let Receiving { end, most, .. } = self.receiving[at];
-            let ready = self.ends.get(end).is_none_or(|it| !it.inbox.is_empty() || it.closed || it.peer_closed);
+            let ready = self
+                .ends
+                .get(end)
+                .is_none_or(|it| !it.inbox.is_empty() || it.closed || it.peer_closed);
             if !ready {
                 at += 1;
                 continue;
@@ -965,7 +1183,9 @@ impl Sim {
     fn complete(&mut self, pending: Pending) -> Completion {
         let Pending { effect, covers, spawn } = pending;
         let tag = effect.tag();
-        if !matches!(effect, Effect::Timer { .. }) && self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+        if !matches!(effect, Effect::Timer { .. })
+            && self.rng.one_in(u64::from(self.faults.fail_one_in))
+        {
             if let Some(spawn) = spawn {
                 self.spawns.remove_id(spawn);
             }
@@ -979,9 +1199,17 @@ impl Sim {
             }
             return self.fail(tag);
         }
+        let effect = match self.take_room(effect) {
+            Ok(effect) => effect,
+            Err(done) => return Completion { tag, done },
+        };
         let done = match effect {
-            Effect::ReadAll { file, .. } => self.read(&file, 0, usize::MAX).map_or_else(Done::Failed, Done::Read),
-            Effect::Read { file, at, len, .. } => self.read(&file, at, len).map_or_else(Done::Failed, Done::Read),
+            Effect::ReadAll { file, .. } => {
+                self.read(&file, 0, usize::MAX).map_or_else(Done::Failed, Done::Read)
+            }
+            Effect::Read { file, at, len, .. } => {
+                self.read(&file, at, len).map_or_else(Done::Failed, Done::Read)
+            }
             Effect::ReadLink { file, .. } => self.read_link(&file),
             Effect::Append { file, bytes, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
@@ -997,8 +1225,10 @@ impl Sim {
                 self.changed(&file);
                 Done::Truncated
             }
+            // Made beside it and renamed over it: a lock of the file it replaced is of that one.
             Effect::Write { file, bytes, .. } => {
                 *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
+                self.unlink_locks(&file);
                 self.changed(&file);
                 Done::Written
             }
@@ -1015,6 +1245,7 @@ impl Sim {
                 Some(sim) => {
                     *file_mut(&mut self.files, &to) = sim;
                     self.disk.renamed(&from, &to);
+                    self.move_locks(&from, &to);
                     self.changed(&from);
                     self.changed(&to);
                     Done::Renamed
@@ -1026,24 +1257,28 @@ impl Sim {
                 // alloc: an error's message.
                 Done::Failed(IoError(format!("{file} {}", crate::SEAL_THROUGH_A_LINK)))
             }
-            Effect::Mode { file, mode, .. } | Effect::Seal { file, mode, .. } => match self.files.get_mut(&file) {
-                Some(sim) => {
-                    sim.mode = mode;
-                    self.disk.attributes(&file);
-                    self.tell_journals();
-                    Done::Moded
+            Effect::Mode { file, mode, .. } | Effect::Seal { file, mode, .. } => {
+                match self.files.get_mut(&file) {
+                    Some(sim) => {
+                        sim.mode = mode;
+                        self.disk.attributes(&file);
+                        self.tell_journals();
+                        Done::Moded
+                    }
+                    // alloc: an error's message.
+                    None => Done::Failed(IoError(format!("{file}: no such file"))),
                 }
-                // alloc: an error's message.
-                None => Done::Failed(IoError(format!("{file}: no such file"))),
-            },
-            Effect::Times { file, modified_ns, .. } => match self.disk.times(&file, modified_ns, &self.files) {
-                true => {
-                    self.tell_journals();
-                    Done::Timed
+            }
+            Effect::Times { file, modified_ns, .. } => {
+                match self.disk.times(&file, modified_ns, &self.files) {
+                    true => {
+                        self.tell_journals();
+                        Done::Timed
+                    }
+                    // alloc: an error's message.
+                    false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
                 }
-                // alloc: an error's message.
-                false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
-            },
+            }
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }
                 if !self.files.contains_key(&from) =>
             {
@@ -1057,8 +1292,7 @@ impl Sim {
             }
             Effect::Clone { .. } if self.faults.no_clone => Done::Failed(IoError(
                 // alloc: an error's message.
-                "the simulated file system cannot share blocks; blaze does not copy instead"
-                    .into(),
+                "the simulated file system cannot share blocks; blaze does not copy instead".into(),
             )),
             Effect::Clone { to, .. } | Effect::Link { to, .. } if self.files.contains_key(&to) => {
                 // alloc: an error's message.
@@ -1105,10 +1339,12 @@ impl Sim {
             },
             Effect::Remove { file, .. } => {
                 if self.files.remove(&file).is_some() {
+                    self.unlink_locks(&file);
                     self.changed(&file);
                 }
                 Done::Removed
             }
+            Effect::Lock { file, mode, tag } => self.lock(&file, mode, tag),
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
                 // alloc: the mapping, which the completion carries.
@@ -1129,8 +1365,9 @@ impl Sim {
             | Effect::Connect { .. }
             | Effect::Recv { .. }
             | Effect::Send { .. }
-            | Effect::Hangup { .. } => {
-                unreachable!("watches, kills and sockets are not pending effects")
+            | Effect::Hangup { .. }
+            | Effect::Unlock { .. } => {
+                unreachable!("watches, kills, sockets and unlocks are not pending effects")
             }
         };
         Completion { tag, done }
@@ -1161,7 +1398,9 @@ impl Sim {
                 }
                 Some(completion)
             }
-            Of::Recv { end, .. } if self.ends.get(end).is_some_and(|it| !it.closed) => Some(completion),
+            Of::Recv { end, .. } if self.ends.get(end).is_some_and(|it| !it.closed) => {
+                Some(completion)
+            }
             Of::Recv { kept, .. } => match completion.done {
                 Done::Read(mut bytes) if bytes.len() > kept => {
                     self.stale += 1;
@@ -1206,7 +1445,10 @@ impl Driver for Sim {
                             (Done::Unwatched, Of::End(id))
                         }
                         // alloc: an error's message.
-                        _ => (Done::Failed(IoError(format!("nothing is watched as {tag:?}"))), Of::Op),
+                        _ => (
+                            Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
+                            Of::Op,
+                        ),
                     };
                     // A change told before the end is heard before it.
                     self.tell_after(tag, tag, done, of);
@@ -1216,11 +1458,26 @@ impl Driver for Sim {
                     let done = match self.watches.get(watch).is_some_and(|it| !it.ending) {
                         // alloc: an error path.
                         false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
-                        true if self.rng.one_in(u64::from(self.faults.fail_one_in)) => self.fail(tag).done,
+                        true if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
+                            self.fail(tag).done
+                        }
                         true => Done::Flushed,
                     };
                     // Every change of the watch told by now is heard first.
                     self.tell_after(watch, tag, done, Of::Flush(watch));
+                    continue;
+                }
+                // A real unlock cannot fail, so none is injected to.
+                Effect::Unlock { lock, tag } => {
+                    let done = match self.unlock(lock) {
+                        true => Done::Unlocked,
+                        // alloc: an error's message.
+                        false => Done::Failed(IoError(format!(
+                            "unlock of lock {}: it holds no lock",
+                            lock.0
+                        ))),
+                    };
+                    self.tell(tag, done, Of::Op);
                     continue;
                 }
                 Effect::Kill { tag } => {
@@ -1270,7 +1527,9 @@ impl Driver for Sim {
                 }
                 Effect::Connect { at, tag } => {
                     let done = match self.listening_at(&at) {
-                        _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => self.fail(tag).done,
+                        _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
+                            self.fail(tag).done
+                        }
                         // alloc: an error's message.
                         None => Done::Failed(IoError(format!(
                             "{at:?}: nothing listens there: connection refused"
@@ -1278,7 +1537,8 @@ impl Driver for Sim {
                         Some(listen) => {
                             let mine = self.new_end(None);
                             let theirs = self.new_end(Some(end_of(mine)));
-                            self.ends.get_mut(end_of(mine)).expect("just made").peer = Some(end_of(theirs));
+                            self.ends.get_mut(end_of(mine)).expect("just made").peer =
+                                Some(end_of(theirs));
                             self.tell(listen, Done::Accepted { conn: theirs }, Of::Op);
                             Done::Connected { conn: mine }
                         }
@@ -1293,35 +1553,47 @@ impl Driver for Sim {
                             self.receiving.push(Receiving { tag, end, most, into });
                             self.wake();
                         }
-                        false => self.tell(tag, Done::unread(into, format_args!("no connection {conn:?}")), Of::Op),
+                        false => self.tell(
+                            tag,
+                            Done::unread(into, format_args!("no connection {conn:?}")),
+                            Of::Op,
+                        ),
                     }
                     continue;
                 }
                 Effect::Send { conn, mut bytes, tag } => {
                     let end = end_of(conn);
-                    if self.ends.get(end).is_some_and(|it| it.holds_sends && !it.closed && !it.peer_closed) {
+                    if self
+                        .ends
+                        .get(end)
+                        .is_some_and(|it| it.holds_sends && !it.closed && !it.peer_closed)
+                    {
                         self.held_sends.push((conn, tag, bytes));
                         continue;
                     }
-                    let done = match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
-                        None | Some((true, _, _)) => Done::unsent(bytes, format_args!("no connection {conn:?}")),
-                        Some((_, true, _)) => {
-                            Done::unsent(bytes, format_args!("{conn:?}: the connection is hung up: broken pipe"))
-                        }
-                        Some((_, _, None)) => {
-                            let it = self.ends.get_mut(end).expect("looked up");
-                            it.outbox.extend_from_slice(&bytes);
-                            bytes.clear();
-                            Done::Sent(bytes)
-                        }
-                        Some((_, _, Some(peer))) => {
-                            if let Some(peer) = self.ends.get_mut(peer) {
-                                peer.inbox.extend_from_slice(&bytes);
+                    let done =
+                        match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
+                            None | Some((true, _, _)) => {
+                                Done::unsent(bytes, format_args!("no connection {conn:?}"))
                             }
-                            bytes.clear();
-                            Done::Sent(bytes)
-                        }
-                    };
+                            Some((_, true, _)) => Done::unsent(
+                                bytes,
+                                format_args!("{conn:?}: the connection is hung up: broken pipe"),
+                            ),
+                            Some((_, _, None)) => {
+                                let it = self.ends.get_mut(end).expect("looked up");
+                                it.outbox.extend_from_slice(&bytes);
+                                bytes.clear();
+                                Done::Sent(bytes)
+                            }
+                            Some((_, _, Some(peer))) => {
+                                if let Some(peer) = self.ends.get_mut(peer) {
+                                    peer.inbox.extend_from_slice(&bytes);
+                                }
+                                bytes.clear();
+                                Done::Sent(bytes)
+                            }
+                        };
                     self.tell(tag, done, Of::Op);
                     self.wake();
                     continue;
@@ -1360,9 +1632,11 @@ impl Driver for Sim {
                     Ok(ran) => {
                         let after = ran.takes.saturating_add(self.delay());
                         let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
-                        let (id, _) = self.spawns.insert(tag, Spawning { exit: ran.exit, pending: None });
-                        let pending =
-                            self.pending.insert(ready, Pending { effect, covers: 0, spawn: Some(id) });
+                        let (id, _) =
+                            self.spawns.insert(tag, Spawning { exit: ran.exit, pending: None });
+                        let pending = self
+                            .pending
+                            .insert(ready, Pending { effect, covers: 0, spawn: Some(id) });
                         if let Some((_, spawning)) = self.spawns.by_id_mut(id) {
                             spawning.pending = Some(pending);
                         }
@@ -1400,7 +1674,8 @@ impl Driver for Sim {
                 self.held_lists.push((dir.clone(), *tag));
                 continue;
             }
-            if let (Effect::List { dir, tag }, Some((failing, left))) = (&effect, &mut self.fail_lists)
+            if let (Effect::List { dir, tag }, Some((failing, left))) =
+                (&effect, &mut self.fail_lists)
                 && dir == failing
                 && *left > 0
             {
@@ -1415,7 +1690,8 @@ impl Driver for Sim {
                 && file.is_under(dir)
             {
                 // alloc: an error's message.
-                let done = Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
+                let done =
+                    Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
                 let tag = *tag;
                 self.tell(tag, done, Of::Op);
                 continue;
@@ -1444,7 +1720,9 @@ impl Driver for Sim {
             if !self.recording.is_empty() {
                 let file = match &pending.effect {
                     Effect::Sync { file, .. } => Some((file, true)),
-                    Effect::Write { file, .. } | Effect::WriteAt { file, .. } => Some((file, false)),
+                    Effect::Write { file, .. } | Effect::WriteAt { file, .. } => {
+                        Some((file, false))
+                    }
                     _ => None,
                 };
                 if let Some((file, sync)) = file
@@ -1579,7 +1857,11 @@ mod tests {
                 assert_eq!(sim.files[&file].len(), whole.len() as u64, "seed {seed}");
                 let (at, len) = (sim.rng.below(25), sim.rng.below(25) as usize);
                 let from = (at as usize).min(whole.len());
-                assert_eq!(sim.read(&file, at, len).unwrap(), whole[from..(from + len).min(whole.len())], "seed {seed}");
+                assert_eq!(
+                    sim.read(&file, at, len).unwrap(),
+                    whole[from..(from + len).min(whole.len())],
+                    "seed {seed}"
+                );
             }
         }
     }
@@ -1591,11 +1873,8 @@ mod tests {
         let file = FileName::new("out/app").unwrap();
         for seed in 0..300 {
             let mut sim = Sim::new(seed, Faults::default());
-            let mut effects = vec![Effect::Write {
-                file: file.clone(),
-                bytes: b"aaaa".to_vec(),
-                tag: Tag(0),
-            }];
+            let mut effects =
+                vec![Effect::Write { file: file.clone(), bytes: b"aaaa".to_vec(), tag: Tag(0) }];
             run_until_idle(&mut sim, &mut effects, |_, _| {});
             let synced = seed % 2 == 0;
             let mut effects = vec![Effect::WriteAt {
@@ -1624,7 +1903,8 @@ mod tests {
         }
         let mut sim = Sim::new(1, Faults::default());
         let to = FileName::new("out/app.new").unwrap();
-        let mut effects = vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), tag: Tag(0) }];
+        let mut effects =
+            vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), tag: Tag(0) }];
         run_until_idle(&mut sim, &mut effects, |_, _| {});
         let mut effects = vec![Effect::Mode { file: to.clone(), mode: 0o755, tag: Tag(1) }];
         run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Moded));
@@ -1690,10 +1970,15 @@ mod tests {
             let before = sim.stamp(&file);
             let at = 1_700_000_000_123_456_789 + seed;
             let mut done = None;
-            let mut effects = vec![Effect::Times { file: file.clone(), modified_ns: at, tag: Tag(1) }];
+            let mut effects =
+                vec![Effect::Times { file: file.clone(), modified_ns: at, tag: Tag(1) }];
             run_until_idle(&mut sim, &mut effects, |it, _| done = Some(it.done));
             let after = sim.stamp(&file);
-            assert_eq!((after.ino, after.size, after.mode), (before.ino, before.size, before.mode), "seed {seed}");
+            assert_eq!(
+                (after.ino, after.size, after.mode),
+                (before.ino, before.size, before.mode),
+                "seed {seed}"
+            );
             match done.expect("completed") {
                 Done::Timed => {
                     assert_eq!(after.mtime_ns, at, "seed {seed}");
@@ -1714,11 +1999,22 @@ mod tests {
                 Effect::List { dir: name("target"), tag: Tag(3) },
             ];
             run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done));
-            assert_eq!(seen[&2], Done::Stat(Some(Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
+            assert_eq!(
+                seen[&2],
+                Done::Stat(Some(Meta { len: 33, dir: false, modified_ns: at })),
+                "seed {seed}"
+            );
             let Done::Listed(listed) = &seen[&3] else { panic!("seed {seed}: {:?}", seen[&3]) };
-            assert!(listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
+            assert!(
+                listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })),
+                "seed {seed}"
+            );
             sim.crash();
-            assert_eq!(sim.stamp(&file).mtime_ns, at, "seed {seed}: the time is the inode's, which a crash keeps");
+            assert_eq!(
+                sim.stamp(&file).mtime_ns,
+                at,
+                "seed {seed}: the time is the inode's, which a crash keeps"
+            );
             let mut seen = BTreeMap::new();
             let mut effects = vec![
                 Effect::Times { file: name("target/never-written"), modified_ns: at, tag: Tag(4) },
@@ -1742,9 +2038,16 @@ mod tests {
                 seen[&6]
             );
             assert_eq!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a rename keeps the time");
-            assert_eq!(sim.stamp(&file), crate::Stamp::GONE, "seed {seed}: a failed set makes nothing");
-            let mut effects = vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
-            run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written, "seed {seed}"));
+            assert_eq!(
+                sim.stamp(&file),
+                crate::Stamp::GONE,
+                "seed {seed}: a failed set makes nothing"
+            );
+            let mut effects =
+                vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
+            run_until_idle(&mut sim, &mut effects, |it, _| {
+                assert_eq!(it.done, Done::Written, "seed {seed}")
+            });
             assert_ne!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a write moves the mtime on");
         }
     }
@@ -1883,7 +2186,8 @@ mod tests {
             effects.push(Effect::Flush { watch: Tag(9), tag: Tag(10) });
             effects.push(Effect::Flush { watch: Tag(8), tag: Tag(11) });
             effects.push(Effect::Unwatch { tag: Tag(9) });
-            let (mut heard, mut at_flush, mut refused, mut ended) = (Vec::new(), None, false, false);
+            let (mut heard, mut at_flush, mut refused, mut ended) =
+                (Vec::new(), None, false, false);
             run_until_idle(&mut sim, &mut effects, |done, _| match (done.tag.0, done.done) {
                 (9, Done::Changed { files, .. }) => {
                     assert!(!ended, "seed {seed}: a change after the end");
@@ -2033,7 +2337,9 @@ mod tests {
         let mut out = Vec::new();
         sim.poll(&mut out, Duration::ZERO);
         assert!(sim.now() < Duration::from_millis(5), "{:?}", sim.now());
-        assert!(matches!(&out[..], [Completion { done: Done::Exited(it), .. }] if it.signal == Some(KILLED)));
+        assert!(
+            matches!(&out[..], [Completion { done: Done::Exited(it), .. }] if it.signal == Some(KILLED))
+        );
     }
 
     /// A client and a server in one simulation, and a peer from outside, trade bytes and hang
@@ -2063,7 +2369,12 @@ mod tests {
                         Done::Accepted { conn } => {
                             heard.insert(conn, (Vec::new(), false));
                             receiving.insert(Tag(next), conn);
-                            effects.push(Effect::Recv { conn, most: 4, into: Vec::new(), tag: Tag(next) });
+                            effects.push(Effect::Recv {
+                                conn,
+                                most: 4,
+                                into: Vec::new(),
+                                tag: Tag(next),
+                            });
                             if conn == outside {
                                 let bytes = b"reply".to_vec();
                                 effects.push(Effect::Send { conn, bytes, tag: Tag(5) });
@@ -2075,7 +2386,10 @@ mod tests {
                             effects.push(Effect::Send { conn, bytes, tag: Tag(3) });
                         }
                         Done::Sent(bytes) if done.tag == Tag(3) => {
-                            assert!(bytes.is_empty() && bytes.capacity() >= 5, "seed {seed}: {bytes:?}");
+                            assert!(
+                                bytes.is_empty() && bytes.capacity() >= 5,
+                                "seed {seed}: {bytes:?}"
+                            );
                             let conn = client.expect("connected");
                             effects.push(Effect::Hangup { conn, tag: Tag(4) });
                         }
@@ -2090,7 +2404,12 @@ mod tests {
                                     // The buffer handed back is the next receive's.
                                     bytes.clear();
                                     receiving.insert(Tag(next), conn);
-                                    effects.push(Effect::Recv { conn, most: 4, into: bytes, tag: Tag(next) });
+                                    effects.push(Effect::Recv {
+                                        conn,
+                                        most: 4,
+                                        into: bytes,
+                                        tag: Tag(next),
+                                    });
                                 }
                             }
                         }
@@ -2136,7 +2455,12 @@ mod tests {
                 seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
             }
             sim.peer_send(conn, b"bytes");
-            sim.submit(&mut vec![Effect::Recv { conn, most: 16, into: b"kept:".to_vec(), tag: Tag(2) }]);
+            sim.submit(&mut vec![Effect::Recv {
+                conn,
+                most: 16,
+                into: b"kept:".to_vec(),
+                tag: Tag(2),
+            }]);
             if sim.rng().one_in(2) {
                 while !seen.contains_key(&Tag(2)) {
                     sim.poll(&mut out, Duration::ZERO);
@@ -2160,7 +2484,11 @@ mod tests {
                 Done::Read(bytes) if bytes == b"kept:" => raced += 1,
                 other => panic!("seed {seed}: {other:?}"),
             }
-            assert_eq!(sim.stale(), u64::from(seen[&Tag(2)] == Done::Read(b"kept:".to_vec())), "seed {seed}");
+            assert_eq!(
+                sim.stale(),
+                u64::from(seen[&Tag(2)] == Done::Read(b"kept:".to_vec())),
+                "seed {seed}"
+            );
             assert!(sim.peer_hung_up_on(conn));
             sim.peer_hangup(conn);
             assert_eq!(sim.in_flight(), 0, "seed {seed}");
@@ -2209,7 +2537,10 @@ mod tests {
                     }
                     (1, Some(at)) => {
                         let tag = Tag(1000 + step);
-                        let done = until(&mut sim, Effect::Send { conn: conns[at], bytes: vec![step as u8], tag });
+                        let done = until(
+                            &mut sim,
+                            Effect::Send { conn: conns[at], bytes: vec![step as u8], tag },
+                        );
                         let want = match model.get_mut(&(at as u64)) {
                             Some(old) if !old.closed && !old.peer_closed => {
                                 old.outbox.push(step as u8);
@@ -2221,10 +2552,16 @@ mod tests {
                         let (Done::Sent(buffer) | Done::Broken { buffer, .. }) = &done else {
                             panic!("seed {seed} step {step}: {done:?}")
                         };
-                        assert!(buffer.is_empty() && buffer.capacity() >= 1, "a send's buffer comes back cleared");
+                        assert!(
+                            buffer.is_empty() && buffer.capacity() >= 1,
+                            "a send's buffer comes back cleared"
+                        );
                     }
                     (2, Some(at)) => {
-                        let done = until(&mut sim, Effect::Hangup { conn: conns[at], tag: Tag(1000 + step) });
+                        let done = until(
+                            &mut sim,
+                            Effect::Hangup { conn: conns[at], tag: Tag(1000 + step) },
+                        );
                         let want = match model.get_mut(&(at as u64)) {
                             Some(old) if !old.closed => {
                                 old.closed = true;
@@ -2247,8 +2584,13 @@ mod tests {
                         }
                     }
                     (_, Some(at)) => {
-                        let want = model.get_mut(&(at as u64)).map(|old| mem::take(&mut old.outbox));
-                        assert_eq!(sim.peer_received(conns[at]), want.unwrap_or_default(), "seed {seed} step {step}");
+                        let want =
+                            model.get_mut(&(at as u64)).map(|old| mem::take(&mut old.outbox));
+                        assert_eq!(
+                            sim.peer_received(conns[at]),
+                            want.unwrap_or_default(),
+                            "seed {seed} step {step}"
+                        );
                         let gone = model.get(&(at as u64)).is_none_or(|old| old.closed);
                         assert_eq!(sim.peer_hung_up_on(conns[at]), gone, "seed {seed} step {step}");
                     }
@@ -2280,5 +2622,82 @@ mod tests {
         assert!(matches!(&seen[&Tag(3)], Done::Failed(_)));
         assert!(matches!(&seen[&Tag(4)], Done::Failed(_)));
         assert!(sim.dial(&at).is_err());
+    }
+
+    /// Runs `effects` on `sim` until idle: each one's end by its tag.
+    fn ran(sim: &mut Sim, mut effects: Vec<Effect>) -> BTreeMap<Tag, Done> {
+        let mut seen = BTreeMap::new();
+        run_until_idle(sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        seen
+    }
+
+    /// Two exclusive locks of a file contend and an unlock lets the next take it; shared locks
+    /// share and exclude an exclusive one, as another process's lock does; a lock asked under a
+    /// tag that holds one, and an unlock of a tag that holds none, fail; a crash lets every lock
+    /// go, another process's too.
+    #[test]
+    fn locks_exclude_as_flock_does_until_unlocked_or_a_crash() {
+        use LockMode::{Exclusive, Shared};
+        let mut sim = Sim::new(3, Faults::default());
+        let lock = name("history/lock");
+        let take = |mode, tag| Effect::Lock { file: lock.clone(), mode, tag: Tag(tag) };
+        let free = |lock, tag| Effect::Unlock { lock: Tag(lock), tag: Tag(tag) };
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 1)])[&Tag(1)], Done::Locked);
+        assert!(sim.exists(&lock), "a lock makes its file");
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 2)])[&Tag(2)], Done::Contended);
+        assert_eq!(ran(&mut sim, vec![take(Shared, 3)])[&Tag(3)], Done::Contended);
+        assert!(matches!(&ran(&mut sim, vec![take(Shared, 1)])[&Tag(1)], Done::Failed(_)));
+        assert_eq!(ran(&mut sim, vec![free(1, 4)])[&Tag(4)], Done::Unlocked);
+        assert!(matches!(&ran(&mut sim, vec![free(1, 5)])[&Tag(5)], Done::Failed(_)));
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 2)])[&Tag(2)], Done::Locked);
+        assert_eq!(ran(&mut sim, vec![free(2, 6)])[&Tag(6)], Done::Unlocked);
+        let seen = ran(&mut sim, vec![take(Shared, 7), take(Shared, 8)]);
+        assert_eq!((&seen[&Tag(7)], &seen[&Tag(8)]), (&Done::Locked, &Done::Locked));
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 9)])[&Tag(9)], Done::Contended);
+        sim.crash();
+        sim.hold_lock(&lock, Exclusive);
+        assert_eq!(ran(&mut sim, vec![take(Shared, 9)])[&Tag(9)], Done::Contended);
+        sim.release_lock(&lock);
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 9)])[&Tag(9)], Done::Locked);
+        sim.hold_lock(&lock, Shared);
+        sim.crash();
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 10)])[&Tag(10)], Done::Locked);
+    }
+
+    /// On a disk filled up, an append past the room keeps the part that fits, unsynced, and
+    /// fails naming ENOSPC; a whole-file write that does not fit leaves the file as it was; a
+    /// file outside the directory has room, and a crash gives the room back.
+    #[test]
+    fn a_full_disk_cuts_an_append_short_and_leaves_a_write_as_it_was() {
+        let mut sim = Sim::new(4, Faults::default());
+        let (log, head) = (name("history/log"), name("history/head"));
+        let write = |bytes: &[u8], tag| Effect::Write {
+            file: head.clone(),
+            bytes: bytes.to_vec(),
+            tag: Tag(tag),
+        };
+        let append = |bytes: &[u8], tag| Effect::Append {
+            file: log.clone(),
+            bytes: bytes.to_vec(),
+            tag: Tag(tag),
+        };
+        assert_eq!(ran(&mut sim, vec![write(b"old", 0)])[&Tag(0)], Done::Written);
+        sim.fill(name("history"), 5);
+        assert_eq!(ran(&mut sim, vec![append(b"abc", 1)])[&Tag(1)], Done::Appended);
+        let full = ran(&mut sim, vec![append(b"defg", 2)]);
+        assert!(
+            matches!(&full[&Tag(2)], Done::Failed(why)
+                if why.0 == "history/log: No space left on device (os error 28)"),
+            "{full:?}"
+        );
+        assert_eq!(sim.contents(&log), b"abcde");
+        assert!(matches!(&ran(&mut sim, vec![write(b"new", 3)])[&Tag(3)], Done::Failed(_)));
+        assert_eq!(sim.contents(&head), b"old");
+        let elsewhere =
+            Effect::Append { file: name("elsewhere"), bytes: b"fits".to_vec(), tag: Tag(4) };
+        assert_eq!(ran(&mut sim, vec![elsewhere])[&Tag(4)], Done::Appended);
+        sim.crash();
+        assert_eq!(ran(&mut sim, vec![write(b"new", 5)])[&Tag(5)], Done::Written);
+        assert_eq!(sim.contents(&head), b"new");
     }
 }

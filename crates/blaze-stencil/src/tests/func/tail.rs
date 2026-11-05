@@ -195,13 +195,18 @@ fn native_tail_calls_the_backend_cannot_make_are_errors_naming_the_call() {
             let s = AbiParam::special(I64, ArgumentPurpose::StructArgument(16));
             refusals.push((
                 "not the caller's own StructArgument",
-                tail_from(&mk, mk.sig(&[p(), s], &ret), mk.sig(&[s, p()], &ret), |v| vec![v[0], v[0]]),
+                tail_from(&mk, mk.sig(&[p(), s], &ret), mk.sig(&[s, p()], &ret), |v| {
+                    vec![v[0], v[0]]
+                }),
             ));
         }
         for (says, func) in &refusals {
             let triple = host::triple(&target);
             match crate::compile(func, &target) {
-                Ok(_) => panic!("{triple}: compiled, where it is refused for {says:?}\n{}", func.display()),
+                Ok(_) => panic!(
+                    "{triple}: compiled, where it is refused for {says:?}\n{}",
+                    func.display()
+                ),
                 Err(e) => {
                     assert_eq!(e.inst, Some(return_call_in(func)), "{triple}: {e}");
                     assert!(e.what.contains(says), "{triple}: {e}, not {says:?}");
@@ -261,8 +266,11 @@ mod run {
                     .unwrap_or_else(|e| panic!("u0:{i}: {e}\n{}", func.display()))
             })
             .collect();
-        let units: Vec<Unit<'_>> =
-            codes.iter().zip(funcs).map(|(code, func)| Unit::Stencil(code, &func.signature)).collect();
+        let units: Vec<Unit<'_>> = codes
+            .iter()
+            .zip(funcs)
+            .map(|(code, func)| Unit::Stencil(code, &func.signature))
+            .collect();
         let isa = exec::host_isa();
         Exec::link(&Link { isa: &*isa, units: &units, data, host: &[] })
     }
@@ -285,7 +293,8 @@ mod run {
     fn native_tail_calls_run_in_constant_stack() {
         let Some(mk) = host_mk() else { return };
         let exec = link(&mk, &[hop(&mk, 0), hop(&mk, 1)], &[]);
-        let carried = [1i64, -2, 3, -4, 5, -6, 7, -8].map(|x| x.wrapping_mul(0x9e37_79b9_7f4a_7c15u64 as i64));
+        let carried = [1i64, -2, 3, -4, 5, -6, 7, -8]
+            .map(|x| x.wrapping_mul(0x9e37_79b9_7f4a_7c15u64 as i64));
         for n in [1 << 20, (1 << 20) + 1] {
             assert_eq!(run_hops(&exec, n, 17, carried), (hops(n, 17, carried), 0), "{n} hops");
         }

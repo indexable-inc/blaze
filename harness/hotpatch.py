@@ -26,8 +26,10 @@ timed from just before the file is written to the program running the new number
 The program is the same source and the same dependencies for all three (dioxus-devtools and
 subsecond do nothing when no dx started it). The first edit of each tool is a warm-up and not
 counted. An edit that dx answered by building and starting the program again (another pid) is
-counted as a restart. The medians, p90 and max of each tool go to stdout, every time to --out
-(default hotpatch.json), with the machine.
+counted as a restart. blaze's builds run with `--message-format=json`, and how each linked the
+program (`built`: first, spliced, unchanged or full) is its `blaze-work` line's (storelib.links).
+The medians, p90 and max of each tool go to stdout, every time to --out (default hotpatch.json),
+with the machine.
 """
 import json, os, platform, re, shutil, signal, statistics, subprocess, sys, tempfile, time
 
@@ -35,6 +37,9 @@ import blaze_cli
 from bench import machine, blaze_commit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import links, worked  # noqa: E402
+
 STEP_SECS = 300
 
 
@@ -70,11 +75,17 @@ class Tool:
         raise SystemExit(f"{self.name} {step}: the program did not run {value} in {STEP_SECS}s:\n" + "\n".join(self.lines()[-10:]))
 
     def build(self, step):
-        command = [*(["blaze"] if self.name == "blaze" else ["cargo"]), "build"]
+        """Builds the program; for blaze, how it linked it (its `blaze-work` line), else None."""
+        command = ["blaze", "build", "--message-format=json"] if self.name == "blaze" else ["cargo", "build"]
         ran = subprocess.run(command, cwd=self.ws, env=self.env, capture_output=True, text=True, timeout=STEP_SECS)
         if ran.returncode != 0:
             raise SystemExit(f"{self.name} {step}: {' '.join(command)} failed:\n{ran.stderr[-2000:]}")
-        return ran.stderr
+        if self.name != "blaze":
+            return None
+        if not worked(ran.stdout):
+            raise SystemExit(f"blaze {step}: the build printed no `blaze-work` line:\n{(ran.stdout + ran.stderr)[-2000:]}")
+        made = links(ran.stdout, "hotprobe")
+        return made[-1].how if made else "no link"
 
     def start(self):
         if self.name == "subsecond":
@@ -91,16 +102,9 @@ class Tool:
         self.process = None
 
     def first(self):
-        """Builds and starts the program, and for blaze waits until the daemon builds it."""
+        """Builds and starts the program (blaze's first build starts its daemon and is its)."""
         if self.name != "subsecond":
             self.build("first build")
-            if self.name == "blaze":
-                for _ in range(240):
-                    if "[blaze]" in self.build("wait for the daemon"):
-                        break
-                    time.sleep(0.5)
-                else:
-                    raise SystemExit("blaze: the daemon never built the program")
         self.start()
         _, self.pid = self.wait_answer(1, "start")
 
@@ -112,11 +116,10 @@ class Tool:
         if self.name != "subsecond":
             # As `cargo watch -x run` does: the program is stopped, then built and started.
             self.stop()
-            stderr = self.build(f"edit {self.value}")
+            how = self.build(f"edit {self.value}")
             if counted:
                 self.build_times.append(round((time.time_ns() // 1000 - t0) / 1000, 2))
-            if counted and self.name == "blaze":
-                how = blaze_cli.how_built(stderr)
+            if counted and how is not None:
                 self.built[how] = self.built.get(how, 0) + 1
             self.start()
         at, pid = self.wait_answer(self.value, f"edit {self.value}")

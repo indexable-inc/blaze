@@ -1,5 +1,5 @@
 //! This module resolves `mod foo;` declaration to file.
-use base_db::{Db, AnchoredPath, Crate};
+use base_db::{AnchoredPath, Crate, Db};
 use hir_expand::{EditionedFileId, name::Name};
 use intern::Symbol;
 
@@ -91,29 +91,46 @@ impl ModDir {
             }
         };
         let stem = buf.len();
-        for suffix in suffixes {
-            buf.truncate(stem);
-            buf.push_str(suffix);
-            if let Some(file_id) = db.resolve_path(AnchoredPath { anchor, path: buf.as_str() }) {
-                let is_mod_rs = buf.ends_with("/mod.rs");
+        // The files of the VFS first. When none of them is there, a file outside every source
+        // root, read from disk as rustc reads every module's file: a `#[path]` module outside
+        // the package, or a module of such a file (`Db::module_source`, an input the crate is
+        // noted as reading, so its edit reruns this).
+        for from_disk in [false, true] {
+            let mut in_vfs = false;
+            for suffix in suffixes {
+                buf.truncate(stem);
+                buf.push_str(suffix);
+                let path = AnchoredPath { anchor, path: buf.as_str() };
+                let found = match from_disk {
+                    false => db.resolve_path(path),
+                    true => db.module_source(krate, path),
+                };
+                if let Some(file_id) = found {
+                    in_vfs = !from_disk;
+                    let is_mod_rs = buf.ends_with("/mod.rs");
 
-                let root_dir_owner = is_mod_rs || attr_path.is_some();
-                if let Some(depth) = self.child_depth() {
-                    let dir_path = if root_dir_owner {
-                        DirPath::empty()
-                    } else {
-                        buf.clear();
-                        buf.push_str(name);
-                        buf.push('/');
-                        DirPath::new(buf)
-                    };
-                    return Ok((
-                        // FIXME: Edition, is this rightr?
-                        EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
-                        is_mod_rs,
-                        ModDir { dir_path, root_non_dir_owner: !root_dir_owner, depth },
-                    ));
+                    let root_dir_owner = is_mod_rs || attr_path.is_some();
+                    if let Some(depth) = self.child_depth() {
+                        let dir_path = if root_dir_owner {
+                            DirPath::empty()
+                        } else {
+                            buf.clear();
+                            buf.push_str(name);
+                            buf.push('/');
+                            DirPath::new(buf)
+                        };
+                        return Ok((
+                            // FIXME: Edition, is this rightr?
+                            EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
+                            is_mod_rs,
+                            ModDir { dir_path, root_non_dir_owner: !root_dir_owner, depth },
+                        ));
+                    }
                 }
+            }
+            // A file of the VFS too deep (circular modules) is not read again from disk.
+            if in_vfs {
+                break;
             }
         }
 
@@ -131,10 +148,6 @@ impl ModDir {
                 Box::new([format!("{dir}{name}.rs"), format!("{dir}{name}/mod.rs")])
             }
         };
-        // A `#[path]` can name a file outside the package, which its source root does not have.
-        for candidate in &candidate_files {
-            db.include_source(AnchoredPath { anchor, path: candidate.as_str() }, krate);
-        }
         Err(candidate_files)
     }
 }
@@ -158,7 +171,8 @@ impl DirPath {
         if path.is_empty() {
             return None;
         };
-        let idx = path[..path.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
+        let idx =
+            path[..path.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
         Some(&path[..idx])
     }
     /// So this is the case which doesn't really work I think if we try to be

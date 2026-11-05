@@ -16,7 +16,6 @@ use blaze_format::{
     cursor::{Put, Reader},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstId, DefWithBodyId, EnumId,
@@ -29,6 +28,7 @@ use hir_def::{
 };
 use hir_expand::attrs::AttrId;
 use la_arena::{Idx, RawIdx};
+use std::alloc::Global;
 
 use crate::{
     ImplTraitId, InferBodyId,
@@ -262,7 +262,9 @@ pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
         None => u64::from(id.as_u32()),
         Some(table) => {
             if table.locs && T::KIND.is_late() {
-                table.refused.get_or_insert("an anonymous constant's type names a closure, an opaque type or a constant");
+                table.refused.get_or_insert(
+                    "an anonymous constant's type names a closure, an opaque type or a constant",
+                );
             }
             u64::from(table.index(T::KIND, id)) + 1
         }
@@ -393,10 +395,28 @@ impl ItemSink for CrateItems<'_> {
 enum Loc {
     /// An index in the crate's portable table.
     Item(u32),
-    Derive { adt: u32, trait_: u8, attr: u32, index: u32 },
-    Opaque { alias: bool, def: u32, idx: u32 },
-    Closure { owner: (u8, u32), expr: u32, kind: [u8; 3] },
-    AnonConst { owner: (u8, u32), expr: u32, ty: u32, allow: bool },
+    Derive {
+        adt: u32,
+        trait_: u8,
+        attr: u32,
+        index: u32,
+    },
+    Opaque {
+        alias: bool,
+        def: u32,
+        idx: u32,
+    },
+    Closure {
+        owner: (u8, u32),
+        expr: u32,
+        kind: [u8; 3],
+    },
+    AnonConst {
+        owner: (u8, u32),
+        expr: u32,
+        ty: u32,
+        allow: bool,
+    },
 }
 
 /// The words of `table` in portable form, after the record was written into it: the locations
@@ -454,20 +474,18 @@ pub(crate) fn write_with<'db>(
                     index: derive_index,
                 }
             }
-            IdKind::OpaqueTy => {
-                match InternedOpaqueTyId::from_id(entry_id(bits)).loc(db) {
-                    ImplTraitId::ReturnTypeImplTrait(def, idx) => Loc::Opaque {
-                        alias: false,
-                        def: table.index(IdKind::Function, def.as_id()),
-                        idx: idx.into_raw().into_u32(),
-                    },
-                    ImplTraitId::TypeAliasImplTrait(def, idx) => Loc::Opaque {
-                        alias: true,
-                        def: table.index(IdKind::TypeAlias, def.as_id()),
-                        idx: idx.into_raw().into_u32(),
-                    },
-                }
-            }
+            IdKind::OpaqueTy => match InternedOpaqueTyId::from_id(entry_id(bits)).loc(db) {
+                ImplTraitId::ReturnTypeImplTrait(def, idx) => Loc::Opaque {
+                    alias: false,
+                    def: table.index(IdKind::Function, def.as_id()),
+                    idx: idx.into_raw().into_u32(),
+                },
+                ImplTraitId::TypeAliasImplTrait(def, idx) => Loc::Opaque {
+                    alias: true,
+                    def: table.index(IdKind::TypeAlias, def.as_id()),
+                    idx: idx.into_raw().into_u32(),
+                },
+            },
             IdKind::Closure | IdKind::Coroutine | IdKind::CoroutineClosure => {
                 let id = entry_id(bits);
                 let InternedClosure { owner, expr, kind: closure_kind } = match kind {
@@ -505,7 +523,8 @@ pub(crate) fn write_with<'db>(
     }
     // Checked alone first, so an item frozen's encoding refuses leaves this body out rather than
     // failing the crate's table.
-    let body_items = table.entries.iter().zip(&found).filter(|(_, loc)| matches!(loc, Loc::Item(_)));
+    let body_items =
+        table.entries.iter().zip(&found).filter(|(_, loc)| matches!(loc, Loc::Item(_)));
     items.admit(db, body_items.map(|(&entry, _)| entry))?;
 
     // alloc: the body's words, kept in its part
@@ -602,9 +621,7 @@ fn body_entry(table: &mut Table, def: DefWithBodyId) -> (u8, u32) {
         DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id())),
         DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id())),
         DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id())),
-        DefWithBodyId::VariantId(it) => {
-            (3, table.index(IdKind::EnumVariant, it.as_id()))
-        }
+        DefWithBodyId::VariantId(it) => (3, table.index(IdKind::EnumVariant, it.as_id())),
     }
 }
 
@@ -655,12 +672,14 @@ fn coroutine_kind_code(kind: CoroutineKind) -> u8 {
 fn closure_kind_code(kind: ClosureKind) -> [u8; 3] {
     match kind {
         ClosureKind::Closure => [0, 0, 0],
-        ClosureKind::OldCoroutine(movability) => {
-            [1, match movability {
+        ClosureKind::OldCoroutine(movability) => [
+            1,
+            match movability {
                 Movability::Static => 0,
                 Movability::Movable => 1,
-            }, 0]
-        }
+            },
+            0,
+        ],
         ClosureKind::Coroutine { kind, source } => [
             2,
             coroutine_kind_code(kind),
@@ -779,7 +798,11 @@ pub(crate) fn read<'db>(
             match items.get(index as usize) {
                 Some(&(found, bits)) if found == kind => table.entries[at].1 = bits,
                 // alloc: the reason of a refusal
-                _ => return Err(format!("an item of index {index} the crate's table has no {kind:?} at")),
+                _ => {
+                    return Err(format!(
+                        "an item of index {index} the crate's table has no {kind:?} at"
+                    ));
+                }
             }
         }
     }
@@ -838,12 +861,14 @@ pub(crate) fn read<'db>(
             let id_kind = table.entries[at].0;
             let expr = closure_expr(db, owner, expr, id_kind)?;
             let loc = InternedClosure { owner, expr, kind: closure_kind };
-            table.entries[at].1 = u64::from(match id_kind {
-                IdKind::Closure => InternedClosureId::new(db, loc).as_id(),
-                IdKind::Coroutine => InternedCoroutineId::new(db, loc).as_id(),
-                _ => InternedCoroutineClosureId::new(db, loc).as_id(),
-            }
-            .as_u32());
+            table.entries[at].1 = u64::from(
+                match id_kind {
+                    IdKind::Closure => InternedClosureId::new(db, loc).as_id(),
+                    IdKind::Coroutine => InternedCoroutineId::new(db, loc).as_id(),
+                    _ => InternedCoroutineClosureId::new(db, loc).as_id(),
+                }
+                .as_u32(),
+            );
         }
     }
     Ok(table)

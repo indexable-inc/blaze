@@ -42,7 +42,8 @@ pub(super) fn std_top(db: &Db, module: hir::Module) -> Option<hir::Name> {
 
 /// Whether `adt` is one of `names` in the module `top` of core, alloc or std.
 pub(super) fn std_adt(db: &Db, adt: hir::Adt, top: &str, names: &[&str]) -> bool {
-    names.contains(&adt.name(db).as_str()) && std_top(db, adt.module(db)).is_some_and(|it| it.as_str() == top)
+    names.contains(&adt.name(db).as_str())
+        && std_top(db, adt.module(db)).is_some_and(|it| it.as_str() == top)
 }
 
 /// Whether `adt` is one of `names` of the crate named `krate`.
@@ -63,14 +64,21 @@ pub(super) struct Callee<'db> {
 }
 
 /// What the call expression `call` of `analysis`'s body calls.
-pub(super) fn callee<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, call: ExprId) -> Option<Callee<'db>> {
+pub(super) fn callee<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    call: ExprId,
+) -> Option<Callee<'db>> {
     let (f, args) = written_callee(analysis.infer(), analysis.body(), call)?;
     let name = FunctionSignature::of(db, f).name.as_str();
-    let (self_adt, trait_) = match hir::Function::from(f).as_assoc_item(db).map(|it| it.container(db)) {
-        None => (None, None),
-        Some(hir::AssocItemContainer::Trait(it)) => (self_of(analysis, args), Some(it)),
-        Some(hir::AssocItemContainer::Impl(it)) => (it.self_ty(db).strip_references().as_adt(), it.trait_(db)),
-    };
+    let (self_adt, trait_) =
+        match hir::Function::from(f).as_assoc_item(db).map(|it| it.container(db)) {
+            None => (None, None),
+            Some(hir::AssocItemContainer::Trait(it)) => (self_of(analysis, args), Some(it)),
+            Some(hir::AssocItemContainer::Impl(it)) => {
+                (it.self_ty(db).strip_references().as_adt(), it.trait_(db))
+            }
+        };
     Some(Callee { f, name, self_adt, trait_ })
 }
 
@@ -88,7 +96,8 @@ impl Callee<'_> {
             && self.trait_.is_none()
             && hir::Function::from(self.f).as_assoc_item(db).is_none()
             && (names.is_empty() || names.contains(&self.name))
-            && std_top(db, hir::Function::from(self.f).module(db)).is_some_and(|it| it.as_str() == top)
+            && std_top(db, hir::Function::from(self.f).module(db))
+                .is_some_and(|it| it.as_str() == top)
     }
 
     /// Whether the function is defined in the module `top` of core, alloc or std (a trait's
@@ -119,18 +128,25 @@ impl AsyncIn {
 /// The `async` body `expr` runs in, if it runs in one: the innermost closure or coroutine above
 /// it is an `async` one. A plain closure in between ends the walk: what it runs is not polled
 /// by the executor (`spawn_blocking(|| ..)`'s closure runs on a blocking thread).
-pub(super) fn async_context(body: &Body, parents: &facts::Parents, expr: ExprId) -> Option<AsyncIn> {
+pub(super) fn async_context(
+    body: &Body,
+    parents: &facts::Parents,
+    expr: ExprId,
+) -> Option<AsyncIn> {
     for parent in parents.up(expr, UP) {
         let Expr::Closure { closure_kind, .. } = body.expr(parent) else { continue };
         return match closure_kind {
-            ClosureKind::Coroutine { kind: CoroutineKind::Async | CoroutineKind::AsyncGen, source } => {
-                Some(match source {
-                    CoroutineSource::Fn => AsyncIn::Fn,
-                    CoroutineSource::Block => AsyncIn::Block,
-                    CoroutineSource::Closure => AsyncIn::Closure,
-                })
+            ClosureKind::Coroutine {
+                kind: CoroutineKind::Async | CoroutineKind::AsyncGen,
+                source,
+            } => Some(match source {
+                CoroutineSource::Fn => AsyncIn::Fn,
+                CoroutineSource::Block => AsyncIn::Block,
+                CoroutineSource::Closure => AsyncIn::Closure,
+            }),
+            ClosureKind::CoroutineClosure(CoroutineKind::Async | CoroutineKind::AsyncGen) => {
+                Some(AsyncIn::Closure)
             }
-            ClosureKind::CoroutineClosure(CoroutineKind::Async | CoroutineKind::AsyncGen) => Some(AsyncIn::Closure),
             ClosureKind::Closure
             | ClosureKind::OldCoroutine(_)
             | ClosureKind::Coroutine { .. }
@@ -170,12 +186,21 @@ pub(super) fn walk(body: &Body, root: ExprId, mut f: impl FnMut(ExprId)) -> Walk
 pub(super) fn value_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<ValueNs> {
     let Expr::Path(path) = body.expr(expr) else { return None };
     let scope = ExprScopes::of(db, def).scope_for(expr);
-    resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(db, path, body.expr_path_hygiene(expr))
+    resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(
+        db,
+        path,
+        body.expr_path_hygiene(expr),
+    )
 }
 
 /// The variant of `core::sync::atomic::Ordering` the expression `expr` names (`"Relaxed"`,
 /// `"Release"`, ..), through renames and globs.
-pub(super) fn ordering<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'db>, expr: ExprId) -> Option<&'static str> {
+pub(super) fn ordering<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    analysis: &hir::BodyAnalysis<'db>,
+    expr: ExprId,
+) -> Option<&'static str> {
     let body = analysis.body();
     if !matches!(body.expr(expr), Expr::Path(_)) {
         return None;
@@ -189,19 +214,24 @@ pub(super) fn ordering<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::Bod
     };
     let enum_ = hir::Enum::from(variant.lookup(db).parent);
     let module = enum_.module(db);
-    if enum_.name(db).as_str() != "Ordering" || !module.name(db).is_some_and(|it| it.as_str() == "atomic") {
+    if enum_.name(db).as_str() != "Ordering"
+        || !module.name(db).is_some_and(|it| it.as_str() == "atomic")
+    {
         return None;
     }
     if !is_std_crate(db, module.krate(db)) {
         return None;
     }
     let name = hir::EnumVariant::from(variant).name(db);
-    ["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"].into_iter().find(|it| *it == name.as_str())
+    ["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"]
+        .into_iter()
+        .find(|it| *it == name.as_str())
 }
 
 /// Whether `adt` is one of core's atomics (`AtomicBool`, `AtomicPtr`, `AtomicU64`, ..).
 pub(super) fn is_atomic(db: &Db, adt: hir::Adt) -> bool {
-    adt.name(db).as_str().starts_with("Atomic") && std_top(db, adt.module(db)).is_some_and(|it| it.as_str() == "sync")
+    adt.name(db).as_str().starts_with("Atomic")
+        && std_top(db, adt.module(db)).is_some_and(|it| it.as_str() == "sync")
 }
 
 /// One place of a body that can panic.
@@ -225,8 +255,16 @@ pub(super) fn panic_sites<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>) -
     for (id, expr) in body.exprs() {
         let what = match expr {
             Expr::Index { .. } => Some("this index".to_owned()), // alloc: a message's part
-            Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::ArithOp(op @ (ArithOp::Div | ArithOp::Rem))) }
-            | Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::Assignment { op: Some(op @ (ArithOp::Div | ArithOp::Rem)) }) } => {
+            Expr::BinaryOp {
+                lhs,
+                rhs,
+                op: Some(BinaryOp::ArithOp(op @ (ArithOp::Div | ArithOp::Rem))),
+            }
+            | Expr::BinaryOp {
+                lhs,
+                rhs,
+                op: Some(BinaryOp::Assignment { op: Some(op @ (ArithOp::Div | ArithOp::Rem)) }),
+            } => {
                 let int = analysis.ty(infer.expr_ty(lhs)).strip_references().is_int_or_uint();
                 let nonzero = matches!(
                     body.expr(rhs),
@@ -235,7 +273,9 @@ pub(super) fn panic_sites<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>) -
                 let sign = if op == ArithOp::Div { "/" } else { "%" };
                 (int && !nonzero).then(|| format!("this `{sign}`, whose divisor may be zero"))
             }
-            Expr::Call { .. } | Expr::MethodCall { .. } => callee(db, analysis, id).and_then(|it| panics(db, &it)),
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
+                callee(db, analysis, id).and_then(|it| panics(db, &it))
+            }
             _ => None,
         };
         if let Some(what) = what {
@@ -267,8 +307,14 @@ fn panics(db: &Db, callee: &Callee<'_>) -> Option<String> {
 
 /// Whether the body calls the free function `top::name` of std anywhere (`panic::catch_unwind`,
 /// `thread::panicking`).
-pub(super) fn calls_std<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, top: &str, name: &str) -> bool {
+pub(super) fn calls_std<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    top: &str,
+    name: &str,
+) -> bool {
     analysis.body().exprs().any(|(id, expr)| {
-        matches!(expr, Expr::Call { .. }) && callee(db, analysis, id).is_some_and(|it| it.is_std_free(db, top, &[name]))
+        matches!(expr, Expr::Call { .. })
+            && callee(db, analysis, id).is_some_and(|it| it.is_std_free(db, top, &[name]))
     })
 }

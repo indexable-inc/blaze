@@ -46,7 +46,11 @@ fn function(db: &Db, name: &str) -> FunctionId {
         .iter()
         .copied()
         .find(|krate| {
-            krate.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "main")
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "main")
         })
         .expect("the fixture has a crate `main`");
     let root = crate_def_map(db, krate).root_module_id();

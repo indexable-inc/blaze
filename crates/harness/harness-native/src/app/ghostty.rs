@@ -8,9 +8,45 @@ use super::*;
 const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
 /// The prefabs whose Fill follows the theme, each with the scene's own Fill (kept for an appearance with no theme).
-const TINTED: [&str; 7] = ["Plate", "hn.Main", "hn.Palette.card", "hn.SideClip", "hn.TitleBar.title", "hn.TitleBar.back", "hn.TitleBar.sub"];
+const TINTED: [&str; 6] = [
+    "Plate",
+    "hn.Main",
+    "hn.Palette.card",
+    "hn.Picker.card",
+    "hn.SideClip",
+    "hn.TitleBar.back",
+];
 /// The `export mut` token (scene/00-tokens.flecs) each of [`TINTED`] reads its Fill from.
-const TOKENS: [&str; 7] = ["tone_plate", "tone_term_ground", "tone_card", "tone_side_tint", "tone_term_ink", "tone_term_muted", "tone_term_muted"];
+const TOKENS: [&str; 8] = [
+    "tone_plate",
+    "tone_term_ground",
+    "tone_card",
+    "tone_card",
+    "tone_side_tint",
+    "tone_term_ink",
+    "tone_term_muted",
+    "tone_term_muted",
+];
+
+/// Each `code_ink` capture (scene/00-tokens.flecs) and the ANSI colour a themed appearance colours it with, as editors
+/// that follow the terminal's palette do: keywords magenta, functions blue, types yellow, strings green, numbers and
+/// escapes cyan, fields red, comments bright black.
+const CODE_ANSI: [(&str, usize); 14] = [
+    ("keyword", 5),
+    ("function", 4),
+    ("type", 3),
+    ("constructor", 3),
+    ("attribute", 3),
+    ("string", 2),
+    ("escape", 6),
+    ("number", 6),
+    ("constant", 6),
+    ("property", 1),
+    ("label", 1),
+    ("operator", 6),
+    ("comment", 8),
+    ("variable::builtin", 1),
+];
 
 /// What the app takes from the config.
 pub(super) struct Look {
@@ -22,13 +58,22 @@ pub(super) struct Look {
     pub pad: [f32; 4],
     /// The scene's Fill of each of [`TINTED`], read before the first tint.
     scene: Option<Vec<Fill>>,
+    /// The scene's Fill of each of [`CODE_ANSI`]'s captures (None: the scene has none for it).
+    code: Option<Vec<Option<Fill>>>,
 }
 
 impl Look {
     /// Read the config, and wake the app whenever it changes after.
     pub fn new(wake: Wake) -> Self {
         harness_ghostty_config::watch(harness_ghostty_config::Sources::standard(), move || wake());
-        Self { live: harness_ghostty_config::Live::new(), themes: [term::Theme::builtin(), term::Theme::builtin()], size: TERM_SIZE, pad: DEFAULT_PAD, scene: None }
+        Self {
+            live: harness_ghostty_config::Live::new(),
+            themes: [term::Theme::builtin(), term::Theme::builtin()],
+            size: TERM_SIZE,
+            pad: DEFAULT_PAD,
+            scene: None,
+            code: None,
+        }
     }
 }
 
@@ -46,21 +91,25 @@ fn mix(a: term::Rgba, b: term::Rgba, t: f32) -> term::Rgba {
 }
 
 /// Each of [`TINTED`]'s colour from theme `t` in one appearance (`dark` picks the light or dark variant of the rule).
-fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 7] {
+fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 8] {
     let ground = t.bg;
-    // The palette's card a touch off the ground: toward the ink in the dark, toward white in the light.
+    // The overlays' cards (the palette's, the picker's) a touch off the ground: toward the ink in the dark, toward white in the light.
     let card = if dark { mix(t.bg, t.fg, 0.04) } else { mix(t.bg, [1.0; 4], 0.6) };
     let side = t.bg;
     let ink = alpha(t.fg, 0.92);
     let muted = alpha(t.fg, if dark { 0.5 } else { 0.55 });
-    [ground, ground, card, side, ink, muted, muted]
+    [ground, ground, card, card, side, ink, muted, muted]
 }
 
 /// Token `token` set to `f`: flecs re-runs what reads it (prefab `path`'s Fill, what instances made from now on copy), and
 /// the instances made from `path` so far, which copied the old Fill when they were made, take the new one.
 fn retint(w: WorldRef<'_>, token: &str, path: &str, f: Fill) {
-    let json = |c: Rgba| format!("{{\"r\": {}, \"g\": {}, \"b\": {}, \"a\": {}}}", c.r, c.g, c.b, c.a);
-    if !w.set_mut_var(token, &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light))) {
+    let json =
+        |c: Rgba| format!("{{\"r\": {}, \"g\": {}, \"b\": {}, \"a\": {}}}", c.r, c.g, c.b, c.a);
+    if !w.set_mut_var(
+        token,
+        &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light)),
+    ) {
         eprintln!("harness-native: no scene token {token} to tint");
         return;
     }
@@ -83,19 +132,32 @@ impl App {
     pub(super) fn apply_ghostty(&mut self) {
         let cfg = self.look.live.config().clone();
         let blink = cfg.cursor_blink.unwrap_or(false);
-        self.look.themes = [term::Theme::from_ghostty(&cfg.theme(false), blink), term::Theme::from_ghostty(&cfg.theme(true), blink)];
+        self.look.themes = [
+            term::Theme::from_ghostty(&cfg.theme(false), blink),
+            term::Theme::from_ghostty(&cfg.theme(true), blink),
+        ];
         let size = cfg.font_size.unwrap_or(TERM_SIZE);
         let (px, py) = (cfg.padding_x, cfg.padding_y);
-        let pad = [px.map_or(DEFAULT_PAD[0], |p| p.0), px.map_or(DEFAULT_PAD[1], |p| p.1), py.map_or(DEFAULT_PAD[2], |p| p.0), py.map_or(DEFAULT_PAD[3], |p| p.1)];
-        let families = crate::text::TermFamilies { regular: cfg.font_family.clone(), bold: cfg.font_family_bold.clone(), italic: cfg.font_family_italic.clone(), bold_italic: cfg.font_family_bold_italic.clone() };
-        let refont = self.fonts.set_term_families(families) || size != self.look.size;
+        let pad = [
+            px.map_or(DEFAULT_PAD[0], |p| p.0),
+            px.map_or(DEFAULT_PAD[1], |p| p.1),
+            py.map_or(DEFAULT_PAD[2], |p| p.0),
+            py.map_or(DEFAULT_PAD[3], |p| p.1),
+        ];
+        let families = crate::text::TermFamilies {
+            regular: cfg.font_family.clone(),
+            bold: cfg.font_family_bold.clone(),
+            italic: cfg.font_family_italic.clone(),
+            bold_italic: cfg.font_family_bold_italic.clone(),
+        };
+        let refont = self.paint.get_mut().fonts.set_term_families(families) || size != self.look.size;
         self.look.size = size;
         if pad != self.look.pad {
             self.look.pad = pad;
             self.chrome_laid = None;
         }
         if refont {
-            self.grid = Grid::new(&mut self.fonts, self.look.size, self.grid.scale);
+            self.grid = Grid::new(&mut self.paint.get_mut().fonts, self.look.size, self.grid.scale);
         }
         let themed = [cfg.light.background.is_some(), cfg.dark.background.is_some()];
         self.tint_tokens(themed);
@@ -117,14 +179,37 @@ impl App {
     /// foreground, the sidebar's tint its ground part see-through.
     fn tint_tokens(&mut self, themed: [bool; 2]) {
         let w = self.world.world_ref();
-        let scene = self.look.scene.get_or_insert_with(|| TINTED.map(|p| view::prefab(w, p).and_then(|e| e.try_cloned::<&Fill>()).unwrap_or_default()).to_vec());
+        let scene = self.look.scene.get_or_insert_with(|| {
+            TINTED
+                .map(|p| {
+                    view::prefab(w, p).and_then(|e| e.try_cloned::<&Fill>()).unwrap_or_default()
+                })
+                .to_vec()
+        });
         let [l, d] = &self.look.themes;
         let (dl, dd) = (derived(l, false), derived(d, true));
         for (i, path) in TINTED.iter().enumerate() {
             let s = scene[i];
-            let f = Fill { light: if themed[0] { rgba(dl[i]) } else { s.light }, dark: if themed[1] { rgba(dd[i]) } else { s.dark } };
+            let f = Fill {
+                light: if themed[0] { rgba(dl[i]) } else { s.light },
+                dark: if themed[1] { rgba(dd[i]) } else { s.dark },
+            };
             if view::prefab(w, path).and_then(|e| e.try_cloned::<&Fill>()) != Some(f) {
                 retint(w, TOKENS[i], path, f);
+            }
+        }
+        // Code's colours: the theme's ANSI colours where it themes the appearance, else the scene's.
+        let code = self.look.code.get_or_insert_with(|| {
+            CODE_ANSI.iter().map(|(c, _)| w.try_lookup(&format!("code_ink::{c}")).and_then(|e| e.try_cloned::<&Fill>())).collect()
+        });
+        for (k, (capture, ansi)) in CODE_ANSI.iter().enumerate() {
+            let (Some(e), Some(s)) = (w.try_lookup(&format!("code_ink::{capture}")), code[k]) else { continue };
+            let f = Fill {
+                light: if themed[0] { rgba(l.palette[*ansi]) } else { s.light },
+                dark: if themed[1] { rgba(d.palette[*ansi]) } else { s.dark },
+            };
+            if e.try_cloned::<&Fill>() != Some(f) {
+                e.set(f);
             }
         }
     }

@@ -1,0 +1,16 @@
+# blaze.lock: what blaze builds this workspace with besides the crates in Cargo.lock.
+# blaze writes it (`blaze lock`); commit it. docs/cargo.md, "Lock files".
+version = 1
+
+[blaze]
+release = "0.20261105.0"
+toolchain = "nightly-2026-10-27"
+
+[native.llvm]
+pin = "crates/hir-ty-codegen/llvm.json"
+
+[native.llvm.targets]
+aarch64-apple-darwin = "e95fc3b4bd332691ec96b022850b5e5b8684b4a2060c05c31b481c31f0f1a866"
+aarch64-unknown-linux-gnu = "918ef5bdb006b29b96d8f87dbbbac422593c6abf916cb7ad9afed17672648087"
+x86_64-pc-windows-msvc = "6f971a56baedd598eb1654462b5bd6d9a3ef5c3a53566472d3e72f021d5f1085"
+x86_64-unknown-linux-gnu = "11933c773079f2543f4735ddfa42f7e870231669a62eeb2012077083cab73f73"

@@ -23,12 +23,12 @@ use std::{
 
 use crossbeam_queue::SegQueue;
 
+use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
 use blaze_query::db::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
-use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
 
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
@@ -147,13 +147,14 @@ impl Db {
     pub fn for_tests() -> Db {
         let log = std::sync::Arc::new(EventLog::default()); // alloc: a test database's setup
         let mut db = Db::with(Run::Here, Some(log));
-        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
-        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
+        _ = LibraryRoots::new(&mut db, Durability::MEDIUM, Default::default());
+        _ = LocalRoots::new(&mut db, Durability::MEDIUM, Default::default());
         CrateGraphBuilder::default().set_in_db(&mut db);
         db
     }
 
     fn with(run: Run, log: Option<std::sync::Arc<EventLog>>) -> Db {
+        blaze_query::db::name_rows(name_row);
         let traced = executions::traced();
         let callback = (log.is_some() || traced).then(|| {
             let log = log.clone(); // clone: an `Arc` of the test log, once per database
@@ -367,7 +368,9 @@ impl Db {
         durability: Option<Durability>,
     ) {
         let files = Arc::clone(&self.files);
-        self.write_crates("Db::set_crate_attr_files", |db| files.set_crate_attr_files(db, krate, gone, durability));
+        self.write_crates("Db::set_crate_attr_files", |db| {
+            files.set_crate_attr_files(db, krate, gone, durability)
+        });
     }
 
     /// A new file with `of`'s path and text, whose appended root module is its own: see
@@ -390,7 +393,9 @@ impl Db {
         appended: Option<(&'static str, &str)>,
     ) -> Result<(), crate::AliasError> {
         let files = Arc::clone(&self.files);
-        self.write_file("Db::set_alias_appended", alias, |db| files.set_alias_appended(db, alias, appended))
+        self.write_file("Db::set_alias_appended", alias, |db| {
+            files.set_alias_appended(db, alias, appended)
+        })
     }
 
     /// Sets the inputs of one view's files, writing only those that changed: see
@@ -471,6 +476,23 @@ impl Db {
         Some(self.files.included_source(self, krate, &path, durability, root.is_library))
     }
 
+    /// The file outside the VFS that a module declaration (`mod m;`) in `krate` names at `path`
+    /// relative to its anchor, read from disk as rustc reads every module's file: a `#[path]`
+    /// module outside every loaded source root, or a module of such a file. Made as `include!`
+    /// makes its file ([`Db::included_source`]): the read is an input `krate` is noted as
+    /// having read ([`crate::Files::included_by`], which its keys cover) and the caller reads
+    /// it, so a file that appears, goes or is edited reruns it once whoever owns the database
+    /// reads the disk again ([`Db::reload_included_files`]). Its own one-file source root is
+    /// the anchor its own modules resolve from. `None` when there is no module file to parse
+    /// there: the anchor has no path on disk, the read fails (no file there), the bytes are not
+    /// UTF-8, or the file ID it would have is taken by a file of the view; the declaration is
+    /// then an unresolved module, an error naming the paths looked for.
+    pub fn module_source(&self, krate: Crate, path: AnchoredPath<'_>) -> Option<FileId> {
+        let (file, source) = self.included_source(krate, path)?;
+        std::str::from_utf8(file.bytes(self)?).ok()?;
+        source.ok()
+    }
+
     /// The path [`Db::included_file`] reads, as rustc writes it in an error: the anchor's
     /// directory joined with `path`, not normalized.
     pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<AbsPathBuf> {
@@ -480,10 +502,11 @@ impl Db {
         Some(anchor.parent()?.join(path.path))
     }
 
-    /// Notes that a module declaration in `krate` names a file [`Db::resolve_path`] has
-    /// nothing for: one outside its package, which the VFS does not load until it is asked to
-    /// (`include!` reads such a file itself: [`Db::included_source`]). An anchor with no
-    /// path on disk has no file next to it to load, so nothing is noted.
+    /// Notes that `krate` names a file [`Db::resolve_path`] has nothing for, for whoever owns
+    /// the VFS to load: a frozen def map's file that is not loaded. A module declaration reads
+    /// such a file itself ([`Db::module_source`]), as `include!` does
+    /// ([`Db::included_source`]). An anchor with no path on disk has no file next to it to
+    /// load, so nothing is noted.
     pub fn include_source(&self, path: AnchoredPath<'_>, krate: Crate) {
         let root_id = self.file_source_root(path.anchor).source_root_id(self);
         let root = self.source_root(root_id);
@@ -535,7 +558,9 @@ impl Db {
     /// caller's file and line in `function`, so a profile says whose tasks a stretch ran.
     #[track_caller]
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
-        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| frame::task(tag, |_| task(db, at)));
+        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| {
+            frame::task(tag, |_| task(db, at))
+        });
     }
 
     /// [`Db::run_all`] for a maintainer's reads, each task in its own frame: under
@@ -587,11 +612,18 @@ impl Db {
                     RunOrder::InOrder | RunOrder::LeftToReaders | RunOrder::OnPool => {
                         items.iter_mut().enumerate().for_each(|(at, item)| once(at, item));
                     }
-                    RunOrder::Reversed => items.iter_mut().enumerate().rev().for_each(|(at, item)| once(at, item)),
+                    RunOrder::Reversed => {
+                        items.iter_mut().enumerate().rev().for_each(|(at, item)| once(at, item))
+                    }
                     RunOrder::Strided(stride) => {
                         let stride = stride.max(1);
                         for first in 0..stride {
-                            items.iter_mut().enumerate().skip(first).step_by(stride).for_each(|(at, item)| once(at, item));
+                            items
+                                .iter_mut()
+                                .enumerate()
+                                .skip(first)
+                                .step_by(stride)
+                                .for_each(|(at, item)| once(at, item));
                         }
                     }
                 }
@@ -623,7 +655,8 @@ impl Db {
         // Each task with its database attached, as a query's run is: it runs between queries,
         // on whichever worker, and formats against the database it was given.
         let run = |db: &Db, at: usize| {
-            let span = tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
+            let span =
+                tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
             let _span = span.entered();
             blaze_query::db::attach(db, || task(db, at))
         };
@@ -672,7 +705,10 @@ impl Db {
     /// On a database not made by [`Db::for_tests`] or [`Db::logged`]: a build's keeps no
     /// events.
     pub fn log(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
-        let log = self.log.as_ref().expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        let log = self
+            .log
+            .as_ref()
+            .expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(f)
     }
 
@@ -680,7 +716,10 @@ impl Db {
     /// what the write-side maintainers ran in it.
     pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event> {
         // clone: one count of the log, tests only, so `f` can borrow the database.
-        let log = self.log.clone().expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
+        let log = self
+            .log
+            .clone()
+            .expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(|| f(self))
     }
 
@@ -709,9 +748,9 @@ impl Db {
         self.log(f)
             .into_iter()
             .filter_map(|event| match event.kind {
-                blaze_query::db::EventKind::WillExecute { database_key } => Some(
-                    self.storage.ingredient_name(database_key.ingredient_index()).to_owned(),
-                ),
+                blaze_query::db::EventKind::WillExecute { database_key } => {
+                    Some(self.storage.ingredient_name(database_key.ingredient_index()).to_owned())
+                }
                 _ => None,
             })
             .collect() // alloc: tests only
@@ -722,6 +761,34 @@ impl fmt::Debug for Db {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("base_db::Db").field("run", &self.run).finish_non_exhaustive()
     }
+}
+
+/// The profile's name of an input's row ([`blaze_query::db::RowNamer`]): a file's text by the
+/// path its source root has it at (its `FileId` where it has none), so the run log says which
+/// file's edit made a query run again. Called with the database the log is taken with
+/// attached; any other row is left to its ID.
+fn name_row(ingredient: &'static str, id: blaze_query::db::Id, out: &mut String) -> bool {
+    use std::fmt::Write as _;
+    blaze_query::db::with_attached_db::<Db, _>(|db| {
+        let Some(db) = db else { return false };
+        match ingredient {
+            "FileText" => {
+                let Some(text) = <FileText as blaze_query::db::FromIdIn>::from_id_in(
+                    blaze_query::db::Database::storage(db),
+                    id,
+                ) else {
+                    return false;
+                };
+                let file = text.file_id(db);
+                match db.path_for_file(*file) {
+                    Some(path) => _ = write!(out, "{path}"),
+                    None => _ = write!(out, "{file:?}"),
+                }
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 impl blaze_query::db::Database for Db {

@@ -13,8 +13,9 @@
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
-//!   ended or left the tree, an [`Orphan`] run, and a finished run on the device [`ArchiveAfter`] it ended. A running
-//!   object and a finished top-level session stay.
+//!   ended or left the tree, a finished [`Past`] session (one from before the daemon started), an [`Orphan`] run, and a
+//!   finished run on the device [`ArchiveAfter`] it ended. A running object and a finished top-level session of this
+//!   daemon's stay.
 //! - The Archive pane shows the [`ArchiveView`] entity ([`ARCHIVE`]); older runs come a page at a time ([`Paged`],
 //!   [`History`]) rather than all at once.
 //! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
@@ -22,11 +23,15 @@
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
-//! The daemon link (a thread in the app) sends [`Msg`]s; the `DaemonInbox` system applies them to the world each frame.
+//! The daemon link (a thread in the app) posts [`Msg`]s to a [`Mailbox`]; the `DaemonInbox` system applies them to the
+//! world each frame.
+pub use harness_chat as chat;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use harness_native_api::APP;
 use harness_native_flecs::prelude::*;
@@ -149,6 +154,11 @@ pub struct Closed;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Pinned;
 
+/// On a session: it ended before the daemon started (the daemon's `past`: a chat from before a restart, listed from its
+/// index). Finished, it lives in the Archive like any other past object; resumed, it runs in the tree again.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Past;
+
 /// On a run: it names a session (its own or its REPL's owner) that the daemon no longer lists.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Orphan;
@@ -157,6 +167,17 @@ pub struct Orphan;
 /// its running dot breathes. A live shell sitting at its prompt is not busy, and draws nothing.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Busy;
+
+/// On a session: it runs in chat mode (the daemon's `mode`): its agent speaks structured events, not a terminal, and a chat
+/// pane draws it from its [`Chats`] transcript.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ChatMode;
+
+/// On a chat session: the model its agent said it runs (the daemon's `model`).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct AgentModel {
+    pub s: ScriptString,
+}
 
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -208,6 +229,8 @@ pub enum PaneKind {
     Run,
     /// The Archive (ArchiveView).
     Archive,
+    /// A chat session's transcript and its input ([`ChatMode`]).
+    Chat,
 }
 
 /// The pane kind for `e`. A session whose kind the daemon named something unknown is `(Kind, Proc)` too, but it is a
@@ -218,6 +241,8 @@ pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     if k == *w.component_id::<ArchiveView>() {
         PaneKind::Archive
+    } else if e.has(ChatMode::id()) {
+        PaneKind::Chat
     } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
         PaneKind::Run
     } else {
@@ -244,6 +269,9 @@ pub struct Inbox {
 /// The terminals of attached objects, by session id.
 pub type Terms = Rc<RefCell<HashMap<u64, harness_vt::Term>>>;
 
+/// The transcripts of attached chat sessions, by session id.
+pub type Chats = Rc<RefCell<HashMap<u64, chat::Transcript>>>;
+
 /// Rows of scrollback a terminal keeps.
 pub const SCROLLBACK: usize = 10_000;
 
@@ -266,6 +294,60 @@ pub enum Msg {
     RunsFound(Vec<serde_json::Value>),
     /// Output of run `r{run}` (of its stage `stage`, or the caller-visible streams), as `run_read` returned it.
     RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
+}
+
+/// Where the daemon link's threads post [`Msg`]s for the `DaemonInbox` system to take, in the order posted, except that
+/// a [`Msg::List`] or [`Msg::Runs`] is the whole tree as the daemon tells it: a new one replaces the one still waiting
+/// (in its place), since applying the older first would change nothing the newer does not. So however long nothing
+/// takes (a window the display link stopped drawing), at most one of each waits, not one per change the daemon
+/// announced (up to 20 a second, each a copy of every session and the last 100 runs).
+#[derive(Clone, Default)]
+pub struct Mailbox(Arc<Mutex<Waiting>>);
+
+#[derive(Default)]
+struct Waiting {
+    msgs: VecDeque<Msg>,
+    /// Where in `msgs` the waiting `List` and `Runs` are.
+    list: Option<usize>,
+    runs: Option<usize>,
+}
+
+impl Mailbox {
+    pub fn send(&self, msg: Msg) {
+        let mut w = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = match msg {
+            Msg::List(_) => w.list,
+            Msg::Runs(_) => w.runs,
+            _ => None,
+        };
+        if let Some(i) = slot {
+            w.msgs[i] = msg;
+            return;
+        }
+        let i = w.msgs.len();
+        match msg {
+            Msg::List(_) => w.list = Some(i),
+            Msg::Runs(_) => w.runs = Some(i),
+            _ => {}
+        }
+        w.msgs.push_back(msg);
+    }
+
+    /// Every message waiting, oldest first.
+    pub fn take(&self) -> VecDeque<Msg> {
+        let mut w = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (w.list, w.runs) = (None, None);
+        std::mem::take(&mut w.msgs)
+    }
+
+    /// How many messages wait.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).msgs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +379,9 @@ pub fn register(world: &World) {
     world.component::<Pinned>();
     world.component::<Orphan>();
     world.component::<Busy>();
+    world.component::<Past>();
+    world.component::<ChatMode>();
+    world.component::<AgentModel>().writable();
     world.component::<Paged>();
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
@@ -349,16 +434,17 @@ pub fn nz(n: u16) -> std::num::NonZeroU16 {
 /// The local device: the one daemon on this machine.
 pub const LOCAL: &str = "devices::local";
 
-/// Make the local device and install the inbox: each frame it drains `rx` into the world. Returns the terminal parsers:
-/// the sessions' (by session id) and the runs' and stages' (by entity id).
-pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> (Terms, Terms) {
+/// Make the local device and install the inbox: each frame it drains `mail` into the world. Returns the terminal parsers:
+/// the sessions' (by session id) and the runs' and stages' (by entity id), and the chat sessions' transcripts.
+pub fn install(world: WorldRef<'_>, host: &str, sock: &str, mail: Mailbox) -> (Terms, Terms, Chats) {
     let dev = world.entity_named(LOCAL);
     dev.set(Device { host: host.into(), sock: sock.into() });
     dev.add((Link::id(), Connecting::id()));
     let dev = *dev.id();
     let terms: Terms = Rc::default();
     let run_terms: Terms = Rc::default();
-    let parsers = (terms.clone(), run_terms.clone());
+    let chats: Chats = Rc::default();
+    let parsers = (terms.clone(), run_terms.clone(), chats.clone());
     let view = world.entity_named(ARCHIVE);
     view.add((Kind::id(), *world.component_id::<ArchiveView>()));
     view.set(Name { s: "Archive".into() });
@@ -377,7 +463,7 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
                 apply(w, dev, idx, &parsers, Msg::Data { id, bytes });
             }
         };
-        for msg in rx.try_iter() {
+        for msg in mail.take() {
             match msg {
                 Msg::Data { id, bytes } => {
                     match &mut data {
@@ -414,11 +500,11 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
         }
         flush(&mut data, &mut idx, inbox);
     });
-    (terms, run_terms)
+    (terms, run_terms, chats)
 }
 
 /// The session fields [`reconcile`] reads.
-const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy"];
+const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model", "past"];
 /// The run fields [`reconcile_runs`] reads, and each stage's.
 const RUN_KEYS: &[&str] = &["id", "status", "exit_code", "cmd", "cwd", "start_ms", "end_ms", "session", "owner"];
 const STAGE_KEYS: &[&str] = &["status", "exit_code", "text", "start_ms", "end_ms"];
@@ -455,6 +541,7 @@ pub fn now_ms() -> u64 {
 /// - Running: kept.
 /// - Finished, under a session: archived once that session ended or left the tree (its runs go with it).
 /// - A finished run that is an [`Orphan`]: archived; one on the device: archived [`ArchiveAfter`] it ended.
+/// - A finished [`Past`] session (it ended before the daemon started): archived.
 /// - A finished top-level session: kept until it is closed.
 ///
 /// One level a frame: a session archived this frame takes its runs with it the next.
@@ -469,6 +556,8 @@ fn install_rule(world: WorldRef<'_>) {
             true
         } else if e.has(Pinned::id()) || is_running(e) {
             false
+        } else if e.has(Past::id()) {
+            true
         } else {
             match e.parent().filter(|p| p.has(Object::id())) {
                 Some(p) => p.has(Archived::id()) || !is_running(p),
@@ -498,7 +587,7 @@ struct Index {
     stages: HashMap<(u64, u32), u64>,
 }
 
-fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms, Terms), msg: Msg) {
+fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): &(Terms, Terms, Chats), msg: Msg) {
     let by_id = &mut idx.sessions;
     match msg {
         Msg::Link(s) => {
@@ -512,6 +601,10 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms
         Msg::List(sessions) => reconcile(w, dev, by_id, &sessions),
         Msg::Data { id, bytes } => {
             let Some(e) = by_id.get(&id).map(|&e| w.entity_from_id(e)).filter(|e| e.is_alive()) else { return };
+            if e.has(ChatMode::id()) {
+                chats.borrow_mut().entry(id).or_default().feed(&bytes);
+                return;
+            }
             let mut t = e.try_cloned::<&Term>().unwrap_or(Term { cols: 80, rows: 24, scroll: 0, seq: 0 });
             let mut map = terms.borrow_mut();
             let p = map.entry(id).or_insert_with(|| harness_vt::Term::new(t.cols, t.rows, SCROLLBACK));
@@ -777,6 +870,25 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         if e.try_cloned::<&Cwd>().is_none_or(|n| n.s.as_str() != cwd) {
             e.set(Cwd { s: cwd.into() });
         }
+        if (s["mode"] == "chat") != e.has(ChatMode::id()) {
+            if s["mode"] == "chat" {
+                e.add(ChatMode::id());
+            } else {
+                e.remove(ChatMode::id());
+            }
+        }
+        let model = s["model"].as_str().unwrap_or("");
+        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
+            e.set(AgentModel { s: model.into() });
+        }
+        let past = s["past"].as_bool().unwrap_or(false);
+        if e.has(Past::id()) != past {
+            if past {
+                e.add(Past::id());
+            } else {
+                e.remove(Past::id());
+            }
+        }
         let busy = s["busy"].as_bool().unwrap_or(true);
         if e.has(Busy::id()) != busy {
             if busy {
@@ -1029,3 +1141,4 @@ pub fn kind_name(e: EntityView<'_>) -> &'static str {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     [(*w.component_id::<Claude>(), "claude"), (*w.component_id::<Codex>(), "codex"), (*w.component_id::<CursorAgent>(), "cursor"), (*w.component_id::<Shell>(), "shell"), (*w.component_id::<Stage>(), "stage")].into_iter().find(|(id, _)| *id == k).map_or("proc", |(_, n)| n)
 }
+

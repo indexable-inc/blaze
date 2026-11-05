@@ -38,8 +38,7 @@ impl<'a> Shrinker<'a> {
 
             let simplest = kind.simplest()?;
             if simplest != current {
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(simplest))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(simplest))])).await?;
             }
 
             let captured = self.current_string(i).ok_or(PassExit::NodeGone)?;
@@ -48,9 +47,8 @@ impl<'a> Shrinker<'a> {
                 let mut search = BinSearchDown::new(kind.min_size as i128, cur_len as i128);
                 while let Some(sz) = search.probe() {
                     let cand: Vec<u32> = captured[..sz as usize].to_vec();
-                    let ok = self
-                        .replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))]))
-                        .await?;
+                    let ok =
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))])).await?;
                     search.record(ok);
                 }
             }
@@ -63,8 +61,7 @@ impl<'a> Shrinker<'a> {
                     break;
                 }
                 let cand: Vec<u32> = cur[..target_len].to_vec();
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))])).await?;
             }
 
             let cur = self.current_string(i).ok_or(PassExit::NodeGone)?;
@@ -77,8 +74,7 @@ impl<'a> Shrinker<'a> {
                 }
                 let mut cand = cur.clone();
                 cand.remove(j);
-                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))]))
-                    .await?;
+                self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))])).await?;
             }
 
             if kind.constraint.is_some() {
@@ -115,13 +111,11 @@ impl<'a> Shrinker<'a> {
                     }
                     let mut tail = cur[..cur.len() - k].to_vec();
                     tail.extend_from_slice(&simplest[simplest.len() - k..]);
-                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(tail))]))
-                        .await?;
+                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(tail))])).await?;
                     let cur = self.current_string(i).ok_or(PassExit::NodeGone)?;
                     let mut head = simplest[..k].to_vec();
                     head.extend_from_slice(cur.get(k..).unwrap_or_default());
-                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(head))]))
-                        .await?;
+                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(head))])).await?;
                 }
             }
 
@@ -131,11 +125,8 @@ impl<'a> Shrinker<'a> {
                 for &cp in &cur {
                     *counts.entry(cp).or_default() += 1;
                 }
-                let mut dups: Vec<u32> = counts
-                    .into_iter()
-                    .filter(|(_, n)| *n > 1)
-                    .map(|(cp, _)| cp)
-                    .collect();
+                let mut dups: Vec<u32> =
+                    counts.into_iter().filter(|(_, n)| *n > 1).map(|(cp, _)| cp).collect();
                 dups.sort_by_key(|&cp| kind.codepoint_key(cp));
                 dups
             };
@@ -156,9 +147,7 @@ impl<'a> Shrinker<'a> {
                 if !changed {
                     return Ok(false);
                 }
-                Ok(sh
-                    .replace(&HashMap::from_iter([(i, ChoiceValue::String(new_str))]))
-                    .await?)
+                Ok(sh.replace(&HashMap::from_iter([(i, ChoiceValue::String(new_str))])).await?)
             }
 
             for val in dup_codepoints {
@@ -208,8 +197,7 @@ impl<'a> Shrinker<'a> {
                         continue;
                     }
                     cand[j] = cand_cp;
-                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))]))
-                        .await?;
+                    self.replace(&HashMap::from_iter([(i, ChoiceValue::String(cand))])).await?;
                 }
 
                 let cur = self.current_string(i).ok_or(PassExit::NodeGone)?;
@@ -318,10 +306,7 @@ impl<'a> Shrinker<'a> {
         }
 
         let combined: Vec<u32> = s.iter().copied().chain(t.iter().copied()).collect();
-        if self
-            .try_redistribute(i, j, Vec::new(), combined, &kind_j)
-            .await?
-        {
+        if self.try_redistribute(i, j, Vec::new(), combined, &kind_j).await? {
             return Ok(());
         }
 
@@ -329,10 +314,7 @@ impl<'a> Shrinker<'a> {
         let mut t_prepended = Vec::with_capacity(t.len() + 1);
         t_prepended.push(*last);
         t_prepended.extend_from_slice(&t);
-        if !self
-            .try_redistribute(i, j, s_init.to_vec(), t_prepended, &kind_j)
-            .await?
-        {
+        if !self.try_redistribute(i, j, s_init.to_vec(), t_prepended, &kind_j).await? {
             return Ok(());
         }
 
@@ -403,14 +385,10 @@ impl<'a> Shrinker<'a> {
                             "shrink pass probed a key outside the alphabet"
                         );
                         hegel_internal_debug_assert_ne!(new_cp, ch);
-                        let new_i: Vec<u32> = val_i
-                            .iter()
-                            .map(|&c| if c == ch { new_cp } else { c })
-                            .collect();
-                        let new_j: Vec<u32> = val_j
-                            .iter()
-                            .map(|&c| if c == ch { new_cp } else { c })
-                            .collect();
+                        let new_i: Vec<u32> =
+                            val_i.iter().map(|&c| if c == ch { new_cp } else { c }).collect();
+                        let new_j: Vec<u32> =
+                            val_j.iter().map(|&c| if c == ch { new_cp } else { c }).collect();
                         let ok = if !kind_i.validate(&new_i) || !kind_j.validate(&new_j) {
                             false
                         } else {
@@ -458,10 +436,7 @@ impl<'a> Shrinker<'a> {
                 if !kind.validate(&new_value) {
                     continue;
                 }
-                if self
-                    .replace(&HashMap::from_iter([(i, ChoiceValue::String(new_value))]))
-                    .await?
-                {
+                if self.replace(&HashMap::from_iter([(i, ChoiceValue::String(new_value))])).await? {
                     break;
                 }
             }
@@ -474,12 +449,8 @@ impl<'a> Shrinker<'a> {
 /// regex is one: its candidates are cheap to check against the pattern); see
 /// [`Shrinker::string_at`].
 fn plain_string(data: &ChoiceData) -> Option<(&StringChoice, &[u32])> {
-    data.as_string().filter(|(sc, _)| {
-        sc.constraint
-            .as_ref()
-            .and_then(Constraint::grammar)
-            .is_none()
-    })
+    data.as_string()
+        .filter(|(sc, _)| sc.constraint.as_ref().and_then(Constraint::grammar).is_none())
 }
 
 /// Cross-string codepoint candidates from natural text transformations.

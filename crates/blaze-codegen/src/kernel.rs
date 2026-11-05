@@ -28,7 +28,7 @@ pub struct DevTemplate;
 /// What a dev template is of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TemplateOf {
-    /// What the driver keeps the instance's code as: `placed(stored(key, built_in), refs)`.
+    /// What the driver keeps the instance's code as: `placed(stored(key, built_in), refs, own)`.
     pub stored: InstanceKey,
     pub settings: Settings,
 }
@@ -58,5 +58,8 @@ pub fn code(toolchain: &ContentId) -> CodeId {
 /// The store key of the dev template of the instance kept as `stored`, at `settings`, compiled
 /// by the codegen of `toolchain` (`Spec::toolchain.id`).
 pub fn template(stored: &InstanceKey, settings: &Settings, toolchain: &ContentId) -> Key {
-    whole::key(&identity::<DevTemplate>(code(toolchain), &TemplateOf { stored: *stored, settings: *settings }))
+    whole::key(&identity::<DevTemplate>(
+        code(toolchain),
+        &TemplateOf { stored: *stored, settings: *settings },
+    ))
 }

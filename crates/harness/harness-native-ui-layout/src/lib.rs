@@ -2,14 +2,16 @@
 //! Node), gathers its subtree into the pure solver ([`solve`]), and writes `Laid` back where it changed; a root whose inputs
 //! are what they were when it was last solved is left as it is. It keeps nothing else: text sizes come from the `Intrinsic`
 //! component the host's typesetter writes ([`typeset`]), the room from the `Viewport` singleton. Overlays (`(AnchoredTo, node)`) are laid out as roots and placed against the anchor's `Laid` of the last
-//! frame (one frame of lag while the anchor moves).
+//! frame (one frame of lag while the anchor moves). Every scroll gets its content's `ScrollExtent`, and its overlay
+//! scroller's parts (`ScrollerPart`) are placed over it from that, its `ScrollState` and its `ScrollerState`
+//! ([`harness_native_ui_layout_api::scroller_axis`]).
 use std::collections::HashMap;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
     AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
-    LazyIndex, LazyRange, LayoutPriority, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollState, ShrinkFirst, Side, Size, Sizing, Viewport,
-    ViewThatFits,
+    LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
+    ScrollerPart, ScrollerState, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
 };
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed};
 
@@ -27,9 +29,10 @@ fn read(e: EntityView<'_>) -> Item {
     let fixed = e.try_cloned::<&FixedSize>().unwrap_or_default();
     let safe = e.try_cloned::<&SafeAreaInset>().unwrap_or_default();
     let safe_pad = e.try_cloned::<&SafeAreaPadding>().unwrap_or_default();
+    // A scroller's part lies over its scroll out of the flow; where, `place_scrollers` says after the solve.
     let role = if e.has(Background::id()) {
         Role::Background
-    } else if e.has(Overlay::id()) {
+    } else if e.has(Overlay::id()) || e.has(ScrollerPart::id()) {
         Role::Overlay
     } else {
         Role::Flow
@@ -78,7 +81,7 @@ fn read(e: EntityView<'_>) -> Item {
 /// Gather the Node subtree under `e` into `items`, returning its index. Child order is flecs's child order, which is
 /// layout order when the container carries `OrderedChildren`. A `Collapse` node (placed, so a root of its own) is a
 /// stand-in here: a fixed box its laid size, `k` of it along the main axis; `ghosts` gets its index and that size.
-fn gather<'a>(e: EntityView<'a>, items: &mut Vec<Item>, ghosts: &mut Vec<(usize, Laid)>) -> usize {
+fn gather<'a>(e: EntityView<'a>, items: &mut Vec<Item>, ghosts: &mut Vec<(usize, Laid)>, bars: &mut Vec<Bar>) -> usize {
     let at = items.len();
     items.push(read(e));
     let main = usize::from(items[at].flex.axis != FlexAxis::Row);
@@ -97,10 +100,97 @@ fn gather<'a>(e: EntityView<'a>, items: &mut Vec<Item>, ghosts: &mut Vec<(usize,
             items.push(Item { id: *c.id(), size, ..Item::default() });
             continue;
         }
-        let i = gather(c, items, ghosts);
+        let i = gather(c, items, ghosts, bars);
         items[at].children.push(i);
+        if let Some(part) = c.try_cloned::<&ScrollerPart>() {
+            bars.push(Bar::read(e, at, i, part));
+        }
     }
     at
+}
+
+/// A scroller's part (`ScrollerPart`) as layout places it: its item, its scroll's item, and what of the scroll it is placed
+/// from (read before the solve, so the root's inputs cover them).
+struct Bar {
+    item: usize,
+    scroll: usize,
+    part: ScrollerPart,
+    /// The scroll's `Scroller`; None (no Scroller, or `NoScroller`) keeps the part hidden.
+    look: Option<Scroller>,
+    /// How wide the knob is (0 thin, 1 wide), and whether the scroller shows at all.
+    wide: f32,
+    shown: bool,
+    /// The extent its host feeds (`ScrollFed`), instead of the one layout measures.
+    fed: Option<[f32; 2]>,
+}
+
+impl Bar {
+    fn read(scroll: EntityView<'_>, at: usize, item: usize, part: ScrollerPart) -> Self {
+        let st = scroll.try_cloned::<&ScrollerState>().unwrap_or_default();
+        let look = scroll.try_cloned::<&Scroller>().filter(|_| !scroll.has(NoScroller::id()));
+        let fed = scroll.has(ScrollFed::id()).then(|| scroll.try_cloned::<&ScrollExtent>().map_or([0.0; 2], |x| [x.w, x.h]));
+        Self { item, scroll: at, part, look, wide: st.wide(part.axis), shown: st.shown.x > 0.01, fed }
+    }
+
+    /// The words the root's inputs take from it.
+    fn words(&self) -> [u64; 9] {
+        let f = |v: f32| u64::from(v.to_bits());
+        let fed = self.fed.unwrap_or([-1.0; 2]);
+        let c = self.look.unwrap_or_default();
+        [
+            self.item as u64,
+            u64::from(self.look.is_some()) | u64::from(self.shown) << 1 | u64::from(self.part.track) << 2 | (self.part.axis as u64) << 3,
+            f(self.wide),
+            f(fed[0]),
+            f(fed[1]),
+            f(c.thin),
+            f(c.wide),
+            f(c.inset),
+            f(c.min),
+        ]
+    }
+}
+
+/// How far a scrolling item's content reaches (`[w, h]` points, its padding included, at least its own size): its flow
+/// children's laid rectangles from where its content starts unscrolled.
+fn extent(items: &[Item], i: usize) -> [f32; 2] {
+    let it = &items[i];
+    let (ox, oy) = (it.out.x - it.scroll[0], it.out.y - it.scroll[1]);
+    let mut r = [it.out.w, it.out.h];
+    for &c in &it.children {
+        let k = &items[c];
+        if k.role != Role::Flow || k.hidden {
+            continue;
+        }
+        r[0] = r[0].max(k.out.x + k.out.w - ox + it.pad[1]);
+        r[1] = r[1].max(k.out.y + k.out.h - oy + it.pad[3]);
+    }
+    r
+}
+
+/// After the solve: each scroll's extent, then its scroller's parts placed from it (`scroller_axis`), hidden while the
+/// scroller is or where the content does not move that way. Returns the measured extents (the item and `[w, h]`).
+fn place_scrollers(items: &mut [Item], bars: &[Bar]) -> Vec<(usize, [f32; 2])> {
+    let extents: Vec<(usize, [f32; 2])> = (0..items.len()).filter(|&i| items[i].scrolls).map(|i| (i, extent(items, i))).collect();
+    for b in bars {
+        let measured = extents.iter().find(|(i, _)| *i == b.scroll).map(|(_, x)| *x);
+        let s = &items[b.scroll];
+        let laid = [s.out.x, s.out.y, s.out.w, s.out.h];
+        let geom = match (b.look, b.fed.or(measured)) {
+            (Some(c), Some(ext)) => scroller_axis(&c, laid, ext, s.scroll, b.wide, b.part.axis),
+            _ => None,
+        };
+        let show = b.shown && (!b.part.track || b.wide > 0.01);
+        match geom.filter(|_| show) {
+            Some(g) => {
+                let [x, y, w, h] = if b.part.track { g.track } else { g.knob };
+                items[b.item].out = Laid { x, y, w, h };
+                items[b.item].hidden = false;
+            }
+            None => items[b.item].hidden = true,
+        }
+    }
+    extents
 }
 
 /// How long a collapsing node stands in its parent's flow: `k` (clamped to 0..1, a spring overshoots) of `len`.
@@ -165,7 +255,11 @@ pub fn install(world: WorldRef<'_>) {
     // Each root's inputs when it was last solved: a root whose inputs are the same keeps the places it has. Layout runs more
     // than once a frame (the host lays its views out again once it has synced them), and most roots are still.
     let mut solved: HashMap<u64, u64> = HashMap::new();
-    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).each_iter(move |it, row, _| {
+    // In its own phase, after everything that sizes nodes. It writes every node's Laid (and LazyRange; its Hidden tags go
+    // in the same merge) through the stage; `writes` makes flecs merge them before the systems after it in the same pass
+    // (hits, matched geometry, the draw pass), so none of them reads the last pass's places. Without it (and with flecs
+    // ordering a phase by recycled entity ids) a zoom drew a frame of the old layout and the selection pill chased it.
+    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Layout).reads(ScrollerState::id()).writes(Laid::id()).writes(LazyRange::id()).writes(ScrollExtent::id()).each_iter(move |it, row, _| {
         let e = it.entity(row);
         let placed = e.has(Placed::id());
         if !placed && e.parent().is_some_and(|p| p.has(Node::id())) {
@@ -175,7 +269,8 @@ pub fn install(world: WorldRef<'_>) {
         let room = w.try_get::<&Viewport>(|v| [v.w, v.h]).unwrap_or([0.0; 2]);
         let mut items = Vec::new();
         let mut ghosts = Vec::new();
-        let root = gather(e, &mut items, &mut ghosts);
+        let mut bars = Vec::new();
+        let root = gather(e, &mut items, &mut ghosts, &mut bars);
         let anchor = e.target(AnchoredTo::id(), 0).and_then(|a| a.try_cloned::<&Laid>());
         // A placed node with nothing to open against keeps the place and size it was given: its children go inside it.
         let given = e.try_cloned::<&Laid>().filter(|_| placed && anchor.is_none());
@@ -183,7 +278,7 @@ pub fn install(world: WorldRef<'_>) {
             items[root].size = [Sizing::fixed(l.w), Sizing::fixed(l.h)];
         }
         let side = anchor.map(|a| (a, e.try_cloned::<&Side>().unwrap_or_default()));
-        let key = inputs(&items, room, given, side);
+        let key = mix(inputs(&items, room, given, side), bars.iter().flat_map(Bar::words));
         if solved.get(&*e.id()) == Some(&key) {
             return;
         }
@@ -204,6 +299,13 @@ pub fn install(world: WorldRef<'_>) {
         for &(i, l) in &ghosts {
             let o = items[i].out;
             items[i].out = Laid { x: o.x, y: o.y, w: l.w, h: l.h };
+        }
+        for (i, [ew, eh]) in place_scrollers(&mut items, &bars) {
+            let ent = w.entity_from_id(items[i].id);
+            let x = ScrollExtent { w: ew, h: eh };
+            if !ent.has(ScrollFed::id()) && ent.try_cloned::<&ScrollExtent>() != Some(x) {
+                ent.set(x);
+            }
         }
         for item in &items {
             let ent = w.entity_from_id(item.id);

@@ -43,8 +43,8 @@ use hir_ty::{
 
 use crate::mir::{
     AggregateKind, AsmOperand, BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, Operand,
-    OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind,
-    StoredPlace, Terminator, TerminatorKind,
+    OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace,
+    Terminator, TerminatorKind,
     framed::{Bits, FrameMap, bits_in, block_index, local_index, map_in},
     return_slot,
 };
@@ -114,7 +114,8 @@ pub(super) fn check_qualifs<'db>(
         if !live.contains(block_index(block)) || data.is_cleanup {
             continue;
         }
-        if let Some(Terminator { kind: TerminatorKind::Drop { place, .. }, span }) = &data.terminator
+        if let Some(Terminator { kind: TerminatorKind::Drop { place, .. }, span }) =
+            &data.terminator
         {
             checker.check_drop(owner, block, data.statements.len(), place, *span, report);
         }
@@ -257,16 +258,7 @@ impl<'a, 'f, 'db> Cx<'a, 'f, 'db> {
             DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::non_body_analysis());
         // With what the body's `for const` loops assume of their binders, as inference had it.
         let param_env = hir_ty::comptime_env::owner_env(db, owner, &infcx, env.param_env);
-        Cx {
-            db,
-            body,
-            context,
-            infcx,
-            env: param_env,
-            frame,
-            types: map_in(frame),
-            store: None,
-        }
+        Cx { db, body, context, infcx, env: param_env, frame, types: map_in(frame), store: None }
     }
 
     fn local_ty(&self, local: LocalId) -> Ty<'db> {
@@ -291,7 +283,9 @@ impl<'a, 'f, 'db> Cx<'a, 'f, 'db> {
         }
         let value = match q {
             Qualif::HasMutInterior => !is_freeze(&self.infcx, ty, self.env),
-            Qualif::NeedsDrop => has_drop_glue_in(self.frame, &self.infcx, ty, self.env) != DropGlue::None,
+            Qualif::NeedsDrop => {
+                has_drop_glue_in(self.frame, &self.infcx, ty, self.env) != DropGlue::None
+            }
             Qualif::NeedsNonConstDrop => {
                 self.in_any_value_of_ty(Qualif::NeedsDrop, ty) && !self.is_const_destruct(ty)
             }
@@ -339,8 +333,9 @@ impl<'a, 'f, 'db> Cx<'a, 'f, 'db> {
     fn is_raw(&mut self, span: MirSpan) -> bool {
         let MirSpan::ExprId(expr) = span else { return false };
         let (db, owner) = (self.db, self.body.owner);
-        let store =
-            *self.store.get_or_insert_with(|| ExpressionStore::of(db, owner.expression_store_owner(db)));
+        let store = *self
+            .store
+            .get_or_insert_with(|| ExpressionStore::of(db, owner.expression_store_owner(db)));
         matches!(store.expr(expr), Expr::Ref { rawness: Rawness::RawPtr, .. })
     }
 }
@@ -509,7 +504,11 @@ fn flow_successors(kind: &TerminatorKind, mut f: impl FnMut(BasicBlockId)) {
 type Matrix<'f> = BitMatrix<usize, &'f mut [u64]>;
 
 fn matrix_in<'f>(rows: usize, columns: usize, frame: &'f Frame) -> Matrix<'f> {
-    BitMatrix::from_words(rows, columns, frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0))
+    BitMatrix::from_words(
+        rows,
+        columns,
+        frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0),
+    )
 }
 
 /// A forward dataflow to its fixpoint, joining by union: `entry` has each block's state on
@@ -638,7 +637,8 @@ fn statement_effect(
 ) {
     match &statement.kind {
         StatementKind::Assign(place, rvalue) => {
-            let value = in_rvalue(cx, q, &mut |_, local| state.contains(local_index(local)), rvalue, place);
+            let value =
+                in_rvalue(cx, q, &mut |_, local| state.contains(local_index(local)), rvalue, place);
             if !is_indirect(place.projection.as_slice()) {
                 assign_direct(cx, q, state, place, value);
             }
@@ -788,12 +788,7 @@ struct Checker<'a, 'f, 'db> {
 }
 
 impl<'a, 'f, 'db> Checker<'a, 'f, 'db> {
-    fn new(
-        db: &'db Db,
-        body: &'a MirBody<'db>,
-        context: ConstContext,
-        frame: &'f Frame,
-    ) -> Self {
+    fn new(db: &'db Db, body: &'a MirBody<'db>, context: ConstContext, frame: &'f Frame) -> Self {
         Checker {
             cx: Cx::new(db, body, context, frame),
             graph: Graph::new(body, frame),
@@ -940,4 +935,3 @@ fn local_qualif<'f>(
     flow.seek(cx, block, index);
     flow.state.contains(local_index(local))
 }
-

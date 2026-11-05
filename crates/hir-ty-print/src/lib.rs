@@ -38,7 +38,11 @@ pub fn rustc_type_name_or_refusal<'db>(db: &'db Db, ty: Ty<'db>) -> Result<Strin
 
 /// What the symbol of `func` with `args` demangles to, which is how a backtrace names it.
 /// `None` without the arguments of the impl or trait it is in.
-pub fn rustc_function_name<'db>(db: &'db Db, func: FunctionId, args: &[GenericArg<'db>]) -> Option<String> {
+pub fn rustc_function_name<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: &[GenericArg<'db>],
+) -> Option<String> {
     if args.len() < hir_ty::generics::generics(db, func.into()).len_parent() {
         return None;
     }

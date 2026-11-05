@@ -28,7 +28,10 @@ use blaze_codegen::Arch;
 use blaze_ids::radix;
 use parking_lot::Mutex;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer, zeroed};
+use crate::model::{
+    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special,
+    Writer, zeroed,
+};
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
@@ -61,7 +64,12 @@ pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
     }
     match output.arch {
         Arch::X86_64 | Arch::Aarch64 => {}
-        Arch::Wasm32 | Arch::Wasm64 => return Err(error(format!("an ELF image for {:?}: wasm is linked as wasm", output.arch))),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(error(format!(
+                "an ELF image for {:?}: wasm is linked as wasm",
+                output.arch
+            )));
+        }
     }
     let last = output.incremental.then(Mutex::default);
     // clone: once per link, the writer owns its `Output` (the public API's type)
@@ -101,7 +109,11 @@ impl Segment {
             Class::Synthetic(DYNAMIC) => Segment::Relro,
             Class::Synthetic(_) | Class::Rodata | Class::EhFrame => Segment::Read,
             Class::Text | Class::Patch | Class::Stubs | Class::Plt => Segment::Code,
-            Class::RelRo | Class::PreinitArray | Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
+            Class::RelRo
+            | Class::PreinitArray
+            | Class::InitArray
+            | Class::FiniArray
+            | Class::Got => Segment::Relro,
             Class::Table
             | Class::Data
             | Class::PatchData
@@ -205,7 +217,12 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
 /// input sections: `.init_array.N` before `.init_array`, `.ctors.N` as `.init_array` of
 /// priority `65535 - N`, `.text.*` in `.text`, and any other name an output section of its
 /// own (an orphan), kept whole for its `__start_`/`__stop_` symbols.
-pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+pub(crate) fn section(
+    name: &str,
+    write: bool,
+    exec: bool,
+    tls: bool,
+) -> Result<(Class, u32), String> {
     if name.is_empty() {
         return Err("a section with no name".into());
     }
@@ -217,7 +234,13 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
     };
     let suffix = |prefix: &str| name.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('.'));
     let priority = |prefix: &str, reversed: bool| match suffix(prefix).map(str::parse::<u32>) {
-        Some(Ok(n)) if n <= 65535 => if reversed { 65535 - n } else { n },
+        Some(Ok(n)) if n <= 65535 => {
+            if reversed {
+                65535 - n
+            } else {
+                n
+            }
+        }
         _ => 65536,
     };
     if tls || under(".tdata") || under(".tbss") {
@@ -326,6 +349,11 @@ impl Writer for Elf {
         self.output.arch
     }
 
+    fn section_name(&self, class: &Class) -> String {
+        // alloc: error path
+        image::section_name(class).to_owned()
+    }
+
     fn plan(&self) -> Plan {
         Plan {
             base: 0,
@@ -359,7 +387,13 @@ impl Writer for Elf {
         }
     }
 
-    fn section(&self, name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+    fn section(
+        &self,
+        name: &str,
+        write: bool,
+        exec: bool,
+        tls: bool,
+    ) -> Result<(Class, u32), String> {
         section(name, write, exec, tls)
     }
 
@@ -395,12 +429,14 @@ impl Writer for Elf {
             "_end" | "end" => placed(image_end),
             "etext" | "_etext" | "__etext" => placed(etext),
             _ => {
-                let (section, end) = match (name.strip_prefix("__start_"), name.strip_prefix("__stop_")) {
-                    (Some(section), _) => (section, false),
-                    (_, Some(section)) => (section, true),
-                    _ => return None,
-                };
-                c_identifier(section).then(|| Special::Section { name: SectionName::new(section), end })
+                let (section, end) =
+                    match (name.strip_prefix("__start_"), name.strip_prefix("__stop_")) {
+                        (Some(section), _) => (section, false),
+                        (_, Some(section)) => (section, true),
+                        _ => return None,
+                    };
+                c_identifier(section)
+                    .then(|| Special::Section { name: SectionName::new(section), end })
             }
         }
     }
@@ -413,11 +449,21 @@ impl Writer for Elf {
         dynamic::sizes(&self.output, counts)
     }
 
-    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
+    fn apply(
+        &self,
+        r_type: u32,
+        bytes: &mut [u8],
+        p: u64,
+        s: u64,
+        addend: i64,
+    ) -> Result<(), String> {
         native::apply(self.output.arch, r_type, bytes, p, s, addend)
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
+    fn synthesize(
+        &self,
+        placed: &Placed<'_>,
+    ) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
         Ok(dynamic::Tables::of(self, placed)?.regions(&self.output))
     }
 

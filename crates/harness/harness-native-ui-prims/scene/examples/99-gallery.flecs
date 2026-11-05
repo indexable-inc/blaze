@@ -1,8 +1,11 @@
 // The SwiftUI-vocabulary gallery (HARNESS_NATIVE_GALLERY=1 with HARNESS_NATIVE_SHOT): every example card in an adaptive
 // grid filling the window. The host writes the window's SafeAreaInset on it (the title-bar strip); its header pads
-// itself out of it.
+// itself out of it. The cards run taller than the window, so it scrolls (ScrollState, Clip): a column that does not
+// shrinks its Fit children to fit, and squeezed the header under its own title.
 
 swiftui_gallery : ui.Column {
+  Clip
+  ScrollState: {x: 0, y: 0}
   Fill: $tone_plate
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
@@ -21,9 +24,13 @@ swiftui_gallery : ui.Column {
     grid : ex.GridDemo {}
     adaptive : ex.AdaptiveDemo {}
     lazy : ex.LazyDemo {}
+    scroller : ex.ScrollerDemo {}
+    table : ex.TableDemo {}
+    stack : ex.StackDemo {}
     baseline : ex.BaselineDemo {}
     alignself : ex.AlignSelfDemo {}
     truncate : ex.TruncateDemo {}
+    bubble : ex.BubbleDemo {}
     compose : ex.ComposeDemo {}
     safearea : ex.SafeAreaDemo {}
     fits : ex.FitsDemo {}

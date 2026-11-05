@@ -16,10 +16,10 @@ use std::hash::Hash;
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{Domain, radix};
 use blaze_mem::{Frame, Tag, frame};
 use hir::check::bodies::Plan;
+use std::alloc::Global;
 
 use crate::{
     checks,
@@ -67,12 +67,7 @@ fn breaks_items(found: &Found) -> bool {
 
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
 /// closing ones ("aborting due to ...", "For more information about this error, ...").
-pub fn check_crate(
-    db: &Db,
-    krate: hir::Crate,
-    files: Files<'_>,
-    options: &Options,
-) -> Vec<Diag> {
+pub fn check_crate(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
     blaze_query::db::attach(db, || {
         let plan = Plan::new(db, &[krate], &hir::check::every_body);
         frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame).diags)
@@ -89,7 +84,9 @@ pub fn check_planned(
     files: Files<'_>,
     options: &Options,
 ) -> CrateCheck {
-    blaze_query::db::attach(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
+    blaze_query::db::attach(db, || {
+        frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame))
+    })
 }
 
 /// blaze: the check of a dependency of which nothing else is checked (only what the build's
@@ -102,7 +99,12 @@ pub fn check_planned(
 /// `--cap-lints` leaves a dependency's, and of expanding and lowering so is anything not an
 /// error. Empty for a crate
 /// whose expansion and lowering found nothing and with no sealed trait in its graph.
-pub fn check_reached_only(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
+pub fn check_reached_only(
+    db: &Db,
+    krate: hir::Crate,
+    files: Files<'_>,
+    options: &Options,
+) -> Vec<Diag> {
     blaze_query::db::attach(db, || {
         let expanded = hir::check::check_expansions(db, krate);
         let sealed = hir::check::check_sealed(db, krate);
@@ -142,11 +144,7 @@ pub fn check_reached_only(db: &Db, krate: hir::Crate, files: Files<'_>, options:
                 lowered.extend(lower::trait_impl_orphan::in_sealed_graph(&cx, foreign));
             }
             radix::sort_by_key(&mut lowered, |it| it.phase as u8);
-            let diags = lowered
-                .into_iter()
-                .map(|it| it.diag)
-                .filter(|it| !it.is_lint())
-                .collect(); // alloc: the error path, as above
+            let diags = lowered.into_iter().map(|it| it.diag).filter(|it| !it.is_lint()).collect(); // alloc: the error path, as above
             written(diags, options)
         })
     })
@@ -304,7 +302,9 @@ fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
 /// The note of the macro `diag` came from, as rustc's emitter writes it, unless it has one.
 fn note_origin(diag: &mut Diag) {
     if diag.span.primary.iter().any(|it| it.expansion.is_some())
-        && !diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"))
+        && !diag.children.iter().any(|it| {
+            it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)")
+        })
     {
         diag.originates_in();
     }
@@ -429,8 +429,14 @@ mod tests {
     fn the_dedup_key_is_the_content_and_nothing_else() {
         let a = Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(0));
         assert_eq!(key(&a), key(&a.clone()));
-        assert_ne!(key(&a), key(&Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(1))));
-        assert_ne!(key(&a), key(&Diag::error(Some("E0425"), "cannot find value `y` in this scope", at(0))));
+        assert_ne!(
+            key(&a),
+            key(&Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(1)))
+        );
+        assert_ne!(
+            key(&a),
+            key(&Diag::error(Some("E0425"), "cannot find value `y` in this scope", at(0)))
+        );
     }
 
     #[test]
@@ -446,16 +452,19 @@ mod tests {
 
     #[test]
     fn the_future_breakage_report_follows_the_closing_lines_with_the_allowed_too() {
-        let mut denied = Diag::lint("conflicting_repr_hints", "conflicting representation hints", at(0));
+        let mut denied =
+            Diag::lint("conflicting_repr_hints", "conflicting representation hints", at(0));
         denied.level = Level::Error;
         denied.breakage = Breakage::Written;
-        let mut allowed = Diag::lint("semicolon_in_expressions_from_macros", "trailing semicolon", at(5));
+        let mut allowed =
+            Diag::lint("semicolon_in_expressions_from_macros", "trailing semicolon", at(5));
         allowed.breakage = Breakage::Unwritten;
         let diags = vec![denied.clone(), allowed.clone()];
 
         let options = Options { future_breakage_report: true, ..Options::default() };
         let out = written(diags.clone(), &options);
-        let shown: Vec<(&str, Breakage)> = out.iter().map(|it| (it.message.as_str(), it.breakage)).collect();
+        let shown: Vec<(&str, Breakage)> =
+            out.iter().map(|it| (it.message.as_str(), it.breakage)).collect();
         assert_eq!(
             shown,
             [
@@ -481,14 +490,21 @@ mod tests {
              fn main() {\n    some_func(5i32);\n}\n",
         );
         assert!(
-            checked.diags.iter().any(|it| it.code.as_ref().is_some_and(|code| code.as_str() == "E0277")),
+            checked
+                .diags
+                .iter()
+                .any(|it| it.code.as_ref().is_some_and(|code| code.as_str() == "E0277")),
             "the fixture's call is an E0277: {:?}",
             checked.messages()
         );
         let db = &checked.db;
         let krate = blaze_query::db::attach(db, || hir::check::workspace_crates(db))
             .into_iter()
-            .find(|it| blaze_query::db::attach(db, || it.display_name(db).is_some_and(|name| name.to_string() == "main")))
+            .find(|it| {
+                blaze_query::db::attach(db, || {
+                    it.display_name(db).is_some_and(|name| name.to_string() == "main")
+                })
+            })
             .expect("the fixture has a crate `main`");
         let every: fn(hir::DefWithBody) -> bool = hir::check::every_body;
         let diags = std::thread::scope(|scope| {

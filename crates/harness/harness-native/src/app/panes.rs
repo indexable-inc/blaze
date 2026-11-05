@@ -2,8 +2,12 @@
 //! the focused one following the app's `(Selected, object)`; and every terminal's sync, drawing and input, which read
 //! and write the `hn.Terminal` node's components rather than any one terminal's fields on the App.
 use super::*;
-use crate::pane::{MarkedText, PaneNode, PaneFocus, TermCursor, TermFocus, TermGrid, TermInput, TermMouse, TermScroll, TermSelection, TermNode, Unit};
+use crate::pane::{
+    MarkedText, PaneFocus, PaneNode, TermCursor, TermFocus, TermGrid, TermInput, TermMouse,
+    TermNode, TermScroll, TermSelection, Unit,
+};
 use harness_native_flecs::ComponentId;
+use harness_native_ui_layout_api::{ScrollExtent, ScrollState, ScrollerGrip, ScrollerPart, scroll_quietly};
 use model::PaneKind;
 
 /// The prefab that draws a pane of `kind` (None: nothing shown).
@@ -11,6 +15,7 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
     match kind {
         Some(PaneKind::Run) => "hn.RunPane",
         Some(PaneKind::Archive) => "hn.ArchivePane",
+        Some(PaneKind::Chat) => "hn.ChatPane",
         _ => "hn.TermPane",
     }
 }
@@ -45,12 +50,19 @@ impl App {
 
     pub(super) fn focused_pane(&self) -> Option<u64> {
         let panes = self.panes();
-        panes.iter().copied().find(|&p| self.world.entity_from_id(p).has(PaneFocus::id())).or_else(|| panes.first().copied())
+        panes
+            .iter()
+            .copied()
+            .find(|&p| self.world.entity_from_id(p).has(PaneFocus::id()))
+            .or_else(|| panes.first().copied())
     }
 
     /// The pane's `hn.Terminal`, if its prefab has one.
     fn terminal_of(&self, pane: u64) -> Option<u64> {
-        View::of(self.world.entity_from_id(pane)).part("term").filter(|t| t.entity().has(TermNode::id())).map(View::id)
+        View::of(self.world.entity_from_id(pane))
+            .part("term")
+            .filter(|t| t.entity().has(TermNode::id()))
+            .map(View::id)
     }
 
     fn terminals(&self) -> Vec<u64> {
@@ -115,7 +127,12 @@ impl App {
             if let Some(t) = self.terminal_of(pane) {
                 let te = w.entity_from_id(t);
                 if !te.has(TermSelection::id()) {
-                    te.set(TermGrid::default()).set(TermCursor::default()).set(TermInput::default()).set(TermSelection::default()).set(TermScroll::default()).set(TermMouse::default());
+                    te.set(TermGrid::default())
+                        .set(TermCursor::default())
+                        .set(TermInput::default())
+                        .set(TermSelection::default())
+                        .set(TermScroll::default())
+                        .set(TermMouse::default());
                 }
                 if te.has(TermFocus::id()) != focused {
                     if focused {
@@ -129,6 +146,7 @@ impl App {
             match shown.map(|e| (e, model::pane_kind(w.entity_from_id(e)))) {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
+                Some((e, PaneKind::Chat)) => self.fill_chat_pane(pane, e),
                 _ => {}
             }
         }
@@ -159,7 +177,10 @@ impl App {
     /// A run's directory (a stage's is its run's).
     pub(super) fn run_cwd(&self, e: u64) -> String {
         let o = self.world.entity_from_id(e);
-        o.try_cloned::<&model::Cwd>().or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>())).map(|c| tilde(c.s.as_str())).unwrap_or_default()
+        o.try_cloned::<&model::Cwd>()
+            .or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>()))
+            .map(|c| tilde(c.s.as_str()))
+            .unwrap_or_default()
     }
 
     /// The run pane's stages (its run's, `e`'s lit); the title bar carries its id, command, state and directory.
@@ -178,12 +199,17 @@ impl App {
         }
         stages.sort_unstable();
         if let Some(list) = info.part("stages") {
-            for_each(list, "hn.PaneRow", stages.into_iter().map(|(_, c)| (format!("s{c}"), c)), |row, c, new| {
-                if new {
-                    row.set(HoverAmt::default());
-                }
-                self.fill_pane_row(row, c, c == e);
-            });
+            for_each(
+                list,
+                "hn.PaneRow",
+                stages.into_iter().map(|(_, c)| (format!("s{c}"), c)),
+                |row, c, new| {
+                    if new {
+                        row.set(HoverAmt::default());
+                    }
+                    self.fill_pane_row(row, c, c == e);
+                },
+            );
         }
     }
 
@@ -192,7 +218,8 @@ impl App {
     fn fill_pane_row(&self, row: View<'_>, e: u64, shown: bool) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
-        let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
+        let name =
+            o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
         let name = clip_text(&name.split_whitespace().collect::<Vec<_>>().join(" "), 110);
         let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
         let state = match self.status_of(e) {
@@ -203,7 +230,17 @@ impl App {
             _ => "exited",
         };
         let (id, meta) = (self.run_id(e), self.run_meta(e));
-        row.props("hn.PaneRow", &[("obj", Prop::Uint(e)), ("name", Prop::Str(&name)), ("selected", Prop::Bool(shown)), ("id", Prop::Str(&id)), ("state", Prop::Str(state)), ("meta", Prop::Str(&meta))]);
+        row.props(
+            "hn.PaneRow",
+            &[
+                ("obj", Prop::Uint(e)),
+                ("name", Prop::Str(&name)),
+                ("selected", Prop::Bool(shown)),
+                ("id", Prop::Str(&id)),
+                ("state", Prop::Str(state)),
+                ("meta", Prop::Str(&meta)),
+            ],
+        );
     }
 
     /// Focus pane `p`: the selection follows what it shows.
@@ -227,7 +264,9 @@ impl App {
     /// The pane under the pointer.
     fn pane_at(&self) -> Option<u64> {
         let (x, y) = (self.pointer.x, self.pointer.y);
-        self.panes().into_iter().find(|&p| self.world.entity_from_id(p).try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)))
+        self.panes().into_iter().find(|&p| {
+            self.world.entity_from_id(p).try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y))
+        })
     }
 
     /// The terminal under the pointer (a few points around its grid count).
@@ -268,7 +307,10 @@ impl App {
             let (cols, rows) = self.grid.fit(l.w - pl - pr, l.h - pt - pb);
             let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
             let snap = |v: f32| (v * self.grid.scale).round() / self.grid.scale;
-            self.put(t, TermGrid { x: snap(l.x + pl), y: snap(l.y + pt), w: gw, h: gh, cols, rows });
+            self.put(
+                t,
+                TermGrid { x: snap(l.x + pl), y: snap(l.y + pt), w: gw, h: gh, cols, rows },
+            );
             let o = w.entity_from_id(e);
             if let Some((n, stage)) = run {
                 // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
@@ -279,7 +321,9 @@ impl App {
                     self.link.watch_run(n, stage);
                     continue;
                 }
-                if let Some(mut tm) = o.try_cloned::<&model::Term>().filter(|tm| (tm.cols, tm.rows) != (cols, rows)) {
+                if let Some(mut tm) =
+                    o.try_cloned::<&model::Term>().filter(|tm| (tm.cols, tm.rows) != (cols, rows))
+                {
                     tm.cols = cols;
                     tm.rows = rows;
                     o.set(tm);
@@ -293,13 +337,14 @@ impl App {
             let running = self.status_of(e) == "running";
             // Attach when it is not: a running object again a second after its last try, an ended one once (its last screen).
             let last = self.tried.get(&sid).copied();
-            let due = if running { last.is_none_or(|t| self.time - t > 1.0) } else { last.is_none() };
+            let due =
+                if running { last.is_none_or(|t| self.time - t > 1.0) } else { last.is_none() };
             if !self.link.attached(sid) && due {
                 self.tried.insert(sid, self.time);
                 // A fresh parser for the snapshot the attach starts with.
                 self.terms.borrow_mut().remove(&sid);
                 o.set(model::Term { cols, rows, scroll: 0, seq: 0 });
-                self.link.attach(sid, cols, rows);
+                self.link.attach(sid, cols, rows, false);
                 continue;
             }
             let Some(mut tm) = o.try_cloned::<&model::Term>() else { continue };
@@ -313,7 +358,12 @@ impl App {
                 self.link.resize(sid, cols, rows);
             }
         }
-        let gone: Vec<(u64, (u64, Option<u32>))> = self.watching.iter().filter(|(e, _)| !shown_runs.contains_key(e)).map(|(&e, &r)| (e, r)).collect();
+        let gone: Vec<(u64, (u64, Option<u32>))> = self
+            .watching
+            .iter()
+            .filter(|(e, _)| !shown_runs.contains_key(e))
+            .map(|(&e, &r)| (e, r))
+            .collect();
         for (e, (n, stage)) in gone {
             self.watching.remove(&e);
             self.link.unwatch_run(n, stage);
@@ -338,7 +388,9 @@ impl App {
 
     /// Whole rows terminal `t` is scrolled back (on its object's `Term`).
     fn scroll(&self, t: u64) -> usize {
-        self.shown_by(t).and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Term>()).map_or(0, |tm| tm.scroll as usize)
+        self.shown_by(t)
+            .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Term>())
+            .map_or(0, |tm| tm.scroll as usize)
     }
 
     fn set_scroll(&mut self, t: u64, s: usize) {
@@ -355,35 +407,47 @@ impl App {
     }
 
     /// Draw terminal `t`: snapshot its parser (the one reader) at its scroll, and write back what input reads.
-    pub(super) fn emit_term(&mut self, t: u64, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
+    pub(super) fn emit_term(
+        &mut self,
+        t: u64,
+        d: &mut Draw,
+        sc: f32,
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) {
         let g = self.get::<TermGrid>(t);
         if g.w <= 0.0 {
             return;
         }
         let Some((terms, key)) = self.parser_of(t) else { return };
         let mut st = self.get::<TermScroll>(t);
-        // A fraction of a row back: the viewport one row further back, lifted by what is left of that row.
-        let want = self.scroll(t) + usize::from(st.frac > 0.0);
+        let gripped = self.term_scroller_grip(t, st);
+        // Whole rows only: the grid snaps to its cells, and a wheel's fraction of a row waits in `frac`.
+        let want = self.scroll(t);
         let mut map = terms.borrow_mut();
         let Some(parser) = map.get_mut(&key) else { return };
         parser.set_scrollback(want);
         let shown = parser.scrollback();
+        let bar = parser.scrollbar().filter(|_| !parser.alternate_screen());
         let history = if self.stats_shown() { parser.history() } else { 0 };
         let snap = term::snapshot(parser, &self.look.themes[usize::from(self.dark)]);
         parser.set_scrollback(0);
         drop(map);
         self.stats_history(t, history);
-        let lift = if st.frac > 0.0 && shown == want { (1.0 - st.frac) * self.grid.ch } else { 0.0 };
-        st.top = g.y - lift;
+        let moved = shown as i64 != st.shift;
+        st.top = g.y;
         st.shift = shown as i64;
+        (st.total, st.len) = bar.map_or((0, 0), |b| (b.total, b.len));
+        st.row = self.feed_term_scroller(t, bar, moved, gripped);
         self.put(t, st);
         self.put(t, TermInput::pack(&snap.input));
         self.put(t, TermCursor { row: snap.input.cursor.0, col: snap.input.cursor.1 });
         let te = self.world.entity_from_id(t);
         let focus = te.has(TermFocus::id());
-        let marked = te.try_cloned::<&MarkedText>().map(|m| m.s.as_str().to_owned()).filter(|s| focus && !s.is_empty());
+        let marked = te
+            .try_cloned::<&MarkedText>()
+            .map(|m| m.s.as_str().to_owned())
+            .filter(|s| focus && !s.is_empty());
         let sel = self.get::<TermSelection>(t).get();
-        let (np, ng) = (d.panels.len(), d.glyphs.len());
         let paint = term::Paint {
             origin: (g.x, st.top),
             scale: sc,
@@ -394,20 +458,73 @@ impl App {
             time: self.time,
             marked: marked.as_deref(),
         };
-        term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
-        if lift > 0.0 {
-            let band = [g.y, g.y + g.h];
-            for p in &mut d.panels[np..] {
-                p.clip[..2].copy_from_slice(&band);
-            }
-            for gl in &mut d.glyphs[ng..] {
-                gl.clip[..2].copy_from_slice(&band);
-            }
-        }
+        let paint_ = self.paint.get_mut();
+        term::draw(
+            d,
+            &mut self.grid,
+            &mut paint_.fonts,
+            &mut paint_.cache,
+            &snap,
+            &paint,
+            upload,
+        );
         if self.grid.animating {
             // The cursor fades on the app clock: keep drawing.
             self.poke_why("cursor blink");
         }
+    }
+
+    /// A drag or a page on terminal `t`'s overlay scroller (ui.Scroller, which wrote its `ScrollState`): the rows back it
+    /// points at become the terminal's scroll. Whether the scroller holds the scroll this frame (then its `ScrollState` is
+    /// its own, not fed).
+    fn term_scroller_grip(&mut self, t: u64, st: TermScroll) -> bool {
+        let te = self.world.entity_from_id(t);
+        if !te.try_cloned::<&ScrollerGrip>().is_some_and(|g| g.drag != 0 || g.page != 0) {
+            return false;
+        }
+        let Some(s) = te.try_cloned::<&ScrollState>().filter(|_| st.row > 0.0 && st.total > st.len) else { return true };
+        let top = st.total - st.len;
+        let offset = ((s.y / st.row).round().max(0.0) as u64).min(top);
+        let back = usize::try_from(top - offset).unwrap_or(0);
+        if back != self.scroll(t) {
+            self.set_scroll(t, back);
+        }
+        true
+    }
+
+    /// Feed terminal `t`'s overlay scroller from where its viewport sits in its history (`bar`, rows; None on the
+    /// alternate screen, which has no history): its extent and its scroll in points, a row being the node's height over
+    /// the rows shown. A scroll through the history (`moved`) shows the scroller; output arriving on the live screen moves
+    /// it quietly. While the scroller holds the scroll (`gripped`) its `ScrollState` is left to it. Returns the points a
+    /// row is.
+    fn feed_term_scroller(&self, t: u64, bar: Option<harness_vt::Scrollbar>, moved: bool, gripped: bool) -> f32 {
+        let te = self.world.entity_from_id(t);
+        let Some(l) = te.try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { return 0.0 };
+        let (h, y, row) = match bar.filter(|b| b.len > 0 && b.total > b.len) {
+            Some(b) => {
+                let row = l.h / b.len as f32;
+                (b.total as f32 * row, b.offset as f32 * row, row)
+            }
+            None => (l.h, 0.0, 0.0),
+        };
+        let x = ScrollExtent { w: l.w, h };
+        if te.try_cloned::<&ScrollExtent>() != Some(x) {
+            te.set(x);
+        }
+        let s = ScrollState { x: 0.0, y };
+        if !gripped && te.try_cloned::<&ScrollState>() != Some(s) {
+            if moved {
+                te.set(s);
+            } else {
+                scroll_quietly(te, s);
+            }
+        }
+        // Drawn in the terminal ground's appearance, as a chat's transcript is.
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        if te.try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme) {
+            te.set(scheme);
+        }
+        row
     }
 
     // ---- input ----
@@ -467,6 +584,30 @@ impl App {
         }
     }
 
+    /// The pointer's shape a terminal's drag holds (src/app/pointer.rs): a selection, the I-beam; a press reported to its
+    /// program, the arrow.
+    pub(super) fn term_drag_pointer(&self) -> Option<(Pointer, &'static str)> {
+        if self.term_with(|a, t| a.get::<TermSelection>(t).selecting).is_some() {
+            Some((Pointer::Text, "drag: terminal selection"))
+        } else if self.term_with(|a, t| a.get::<TermMouse>(t).report.is_some()).is_some() {
+            Some((Pointer::Arrow, "drag: reported to the program"))
+        } else {
+            None
+        }
+    }
+
+    /// The pointer's shape over a terminal's grid (src/app/pointer.rs), where `pointer_down` takes a press: the I-beam, or
+    /// the arrow while a press there goes to the program (it turned a mouse mode on and Shift is not held).
+    pub(super) fn term_zone_pointer(&self) -> Option<(Pointer, &'static str)> {
+        let t = self.term_at()?;
+        self.pointer_cell(t, false)?;
+        Some(if self.reporting(t, self.mods) {
+            (Pointer::Arrow, "terminal, mouse reported to the program")
+        } else {
+            (Pointer::Text, "terminal")
+        })
+    }
+
     /// The terminal holding a mouse report or a drag, if any.
     fn term_with(&self, f: impl Fn(&Self, u64) -> bool) -> Option<u64> {
         self.terminals().into_iter().find(|&t| f(self, t))
@@ -475,6 +616,7 @@ impl App {
     /// The pointer moved to `(x, y)` (window points).
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         if self.resizing {
             if let Some(side) = self.sidebar() {
                 let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
@@ -483,6 +625,9 @@ impl App {
                 self.side_w = Some(v);
             }
             self.poke();
+            return;
+        }
+        if self.chat_pointer_drag() {
             return;
         }
         if let Some(t) = self.term_with(|a, t| a.get::<TermMouse>(t).report.is_some()) {
@@ -495,7 +640,14 @@ impl App {
                 let at = (vr - self.get::<TermScroll>(t).shift, col);
                 let span = self.unit_span(t, at, ts.unit);
                 let (a0, a1) = ts.anchor;
-                self.set_sel(t, Some(if span.0 < a0 { Sel { a: a1, b: span.0 } } else { Sel { a: a0, b: span.1 } }));
+                self.set_sel(
+                    t,
+                    Some(if span.0 < a0 {
+                        Sel { a: a1, b: span.0 }
+                    } else {
+                        Sel { a: a0, b: span.1 }
+                    }),
+                );
             }
         } else if let Some(t) = self.term_at()
             && self.input_of(t).modes.mouse == MouseTracking::Any
@@ -510,14 +662,13 @@ impl App {
     /// A button went down at `(x, y)`: the `clicks`th in a row.
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         self.poke();
         self.press = (clicks, m);
         // On the sidebar's right edge: drag it wider or narrower.
-        if b == Button::Left && self.palette.is_none() && self.side_open && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
-            if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
-                self.resizing = true;
-                return;
-            }
+        if b == Button::Left && self.on_side_edge() {
+            self.resizing = true;
+            return;
         }
         if b == Button::Left {
             self.pointer.down = true;
@@ -526,10 +677,18 @@ impl App {
         if self.palette.is_some() {
             return;
         }
+        // A press on a scroll's overlay scroller is the scroller's (ui.Scroller: the UI layer drags or pages it), not the
+        // pane's, its transcript's or its terminal's.
+        if self.world.lookup(APP).target(Hovered::id(), 0).is_some_and(|h| h.has(ScrollerPart::id())) {
+            return;
+        }
         // A press in another pane focuses it (the selection follows what it shows), and takes the keyboard from the tree.
         if let Some(p) = self.pane_at() {
             self.tree_focus = false;
             self.focus_pane(p);
+        }
+        if b == Button::Left && self.chat_pointer_down(clicks) {
+            return;
         }
         let Some(t) = self.term_at() else { return };
         let Some((vr, col)) = self.pointer_cell(t, false) else { return };
@@ -558,9 +717,13 @@ impl App {
 
     pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         if self.resizing {
             self.resizing = false;
-            if let Some(v) = self.side_w {
+            // Kept for the next launch, but not from an offscreen shot's drag (`persist` off).
+            if self.persist
+                && let Some(v) = self.side_w
+            {
                 crate::prefs::set("sidebar_width", serde_json::json!(v));
             }
             self.poke();
@@ -569,6 +732,9 @@ impl App {
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
+        }
+        if b == Button::Left && self.chat_pointer_up() {
+            return;
         }
         let code = TermMouse::code(b);
         if let Some(t) = self.term_with(|a, t| a.get::<TermMouse>(t).report == Some(code)) {
@@ -599,7 +765,9 @@ impl App {
         let cols = i64::from(input.size.0);
         let col = i64::from(col);
         let mut out = Vec::new();
-        let mut step = |code: u16, n: i64, keys: &mut term::Keys| out.extend(keys.press(code, &modes).repeat(n.unsigned_abs() as usize));
+        let mut step = |code: u16, n: i64, keys: &mut term::Keys| {
+            out.extend(keys.press(code, &modes).repeat(n.unsigned_abs() as usize))
+        };
         if modes.alt_screen {
             step(if row > crow { term::DOWN } else { term::UP }, row - crow, &mut self.keys);
             step(if col > ccol { term::RIGHT } else { term::LEFT }, col - ccol, &mut self.keys);
@@ -656,6 +824,9 @@ impl App {
 
     /// Command-A: everything in the focused terminal, history and screen.
     pub(super) fn select_all(&mut self) {
+        if self.chat_select_all() {
+            return;
+        }
         let Some(t) = self.focused_term() else { return };
         let input = self.input_of(t);
         let (cols, rows) = input.size;
@@ -663,11 +834,15 @@ impl App {
             return;
         }
         let all = ((-(input.history as i64), 0), (i64::from(rows) - 1, cols.saturating_sub(1)));
-        self.put(t, TermSelection { sel: Some(all), selecting: false, unit: Unit::Cell, anchor: all });
+        self.put(
+            t,
+            TermSelection { sel: Some(all), selecting: false, unit: Unit::Cell, anchor: all },
+        );
     }
 
     /// A scroll of `dy` (points when `precise`, else lines; positive: back into the history) on the terminal under the
-    /// pointer (else the focused one). The primary screen scrolls its history by the pixel; a program with a mouse mode
+    /// pointer (else the focused one). The primary screen scrolls its history a whole row at a time (a trackpad's points
+    /// add up in `frac` until they make a row); a program with a mouse mode
     /// gets wheel reports, a full-screen one arrows.
     pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
         let Some(t) = self.term_at().or_else(|| self.focused_term()) else { return };
@@ -688,7 +863,15 @@ impl App {
             let count = n.abs() as usize;
             let bytes = if report {
                 let (col, row) = self.report_cell(t).unwrap_or((0, 0));
-                term::mouse(if n > 0.0 { Button::WheelUp } else { Button::WheelDown }, MouseAct::Press, col, row, m, &modes).repeat(count)
+                term::mouse(
+                    if n > 0.0 { Button::WheelUp } else { Button::WheelDown },
+                    MouseAct::Press,
+                    col,
+                    row,
+                    m,
+                    &modes,
+                )
+                .repeat(count)
             } else {
                 self.keys.press(if n > 0.0 { term::UP } else { term::DOWN }, &modes).repeat(count)
             };
@@ -752,7 +935,13 @@ impl App {
             if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
                 self.tree_focus = false;
             }
-        } else if self.palette.is_some() {
+            if self.chat_focused() {
+                if !k.mods.cmd && !k.mods.ctrl {
+                    self.chat_type(k.text);
+                }
+                return;
+            }
+        } else if self.palette.is_some() || self.chat_focused() {
             return;
         }
         let Some(t) = self.focused_term() else { return };
@@ -781,11 +970,13 @@ impl App {
     pub fn commit_text(&mut self, text: &str) {
         self.set_marked(None);
         if let Some(p) = self.palette.as_mut() {
-            p.query.push_str(text);
-            p.at = 0;
+            if p.mode == super::Mode::Commands {
+                p.query.push_str(text);
+                p.at = 0;
+            }
             return;
         }
-        if self.archive_text(text) {
+        if self.archive_text(text) || self.chat_type(text) {
             return;
         }
         self.typed();
@@ -794,6 +985,9 @@ impl App {
 
     /// An input method's uncommitted text on the focused terminal (None: none).
     pub fn set_marked(&mut self, text: Option<String>) {
+        if self.chat_set_marked(text.as_deref()) {
+            return;
+        }
         if let Some(t) = self.focused_term() {
             let te = self.world.entity_from_id(t);
             match text.filter(|s| !s.is_empty()) {
@@ -808,13 +1002,23 @@ impl App {
     }
 
     pub fn marked(&self) -> Option<String> {
+        if let Some(m) = self.chat_marked() {
+            return m;
+        }
         let t = self.focused_term()?;
-        self.world.entity_from_id(t).try_cloned::<&MarkedText>().map(|m| m.s.as_str().to_owned()).filter(|s| !s.is_empty())
+        self.world
+            .entity_from_id(t)
+            .try_cloned::<&MarkedText>()
+            .map(|m| m.s.as_str().to_owned())
+            .filter(|s| !s.is_empty())
     }
 
     /// Where typed text goes (window points): the cell after the focused terminal's cursor and any marked text, for the
     /// input method's candidate window.
-    pub fn caret_rect(&self) -> Option<[f32; 4]> {
+    pub fn caret_rect(&mut self) -> Option<[f32; 4]> {
+        if let Some(r) = self.chat_caret_rect() {
+            return r;
+        }
         let t = self.focused_term()?;
         let g = self.get::<TermGrid>(t);
         if g.w <= 0.0 {
@@ -831,6 +1035,9 @@ impl App {
 
     /// The text of the focused terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
     pub fn copy(&self) -> Option<String> {
+        if let Some(c) = self.chat_copy() {
+            return c;
+        }
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
         self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
@@ -838,13 +1045,13 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         if self.palette.is_some() {
-            if let Some(p) = self.palette.as_mut() {
+            if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
                 p.query.push_str(text.lines().next().unwrap_or(""));
             }
             self.poke();
             return;
         }
-        if self.archive_text(text) {
+        if self.archive_text(text) || self.chat_type(text) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

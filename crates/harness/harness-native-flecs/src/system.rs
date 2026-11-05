@@ -85,10 +85,28 @@ impl Event {
     }
 }
 
+/// The pipeline phase a system runs in. flecs orders the systems of one phase by entity id, which is not the order they
+/// were made in once ids are recycled (a scene load deletes entities), so a system that must see another's results in the
+/// same `progress` goes in a later phase, and declares what it [`reads`](SystemBuilder::reads) so flecs merges first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// flecs's OnUpdate, the default: the model, scripts and views writing what layout reads.
+    Update,
+    /// OnValidate: the layout pass, after everything that sizes nodes.
+    Layout,
+    /// PostUpdate: what reads this pass's places (hit testing, matched geometry).
+    AfterLayout,
+    /// PreStore: what reads those (the pointer's topmost hit, from this pass's hits).
+    Resolve,
+    /// OnStore: the draw pass, last.
+    Draw,
+}
+
 pub struct SystemBuilder<'a, Q> {
     w: hyperion_ecs::World,
     name: String,
     manual: bool,
+    phase: Phase,
     filters: Filters,
     _q: crate::Marker<'a, Q>,
 }
@@ -97,16 +115,43 @@ type EachIter<Q> = dyn FnMut(&TableIter<'_, '_>, usize, <Q as QueryTuple>::Out<'
 
 impl<'a, Q: QueryTuple + 'static> SystemBuilder<'a, Q> {
     pub(crate) fn new(w: hyperion_ecs::World, name: &str) -> Self {
-        Self { w, name: name.to_owned(), manual: false, filters: Filters::default(), _q: PhantomData }
+        Self { w, name: name.to_owned(), manual: false, phase: Phase::Update, filters: Filters::default(), _q: PhantomData }
     }
 
     filter_methods!();
+
+    /// Run in `phase` instead of the default ([`Phase::Update`]).
+    #[must_use]
+    pub fn phase(mut self, phase: Phase) -> Self {
+        self.phase = phase;
+        self
+    }
 
     /// In no phase: `progress` never runs it, its owner does with [`WorldRef::run_system`](crate::WorldRef::run_system),
     /// at a rate of its own (den-sound's control rate, which goes on while the window draws nothing).
     #[must_use]
     pub fn manual(mut self) -> Self {
         self.manual = true;
+        self
+    }
+
+    /// Tell flecs's scheduler this system writes `id` on entities it does not match (through the stage, landing at its
+    /// end): a later system in the same `progress` that [`reads`](Self::reads) it, or matches it on its own entities, runs
+    /// after a merge and sees this pass's values, not the last pass's. A no-source `[out] T()` term: it matches nothing.
+    #[must_use]
+    pub fn writes(mut self, id: impl IntoId) -> Self {
+        let id = id.into_id(self.w);
+        self.filters.must(crate::query::Term::from(id, sys::EcsIsEntity).write());
+        self
+    }
+
+    /// Tell flecs's scheduler this system reads `id` from entities it does not match (`try_cloned` on a parent, an owner,
+    /// a node found by id): it runs after a merge of any earlier system's [`writes`](Self::writes) of it in the same
+    /// `progress`. A no-source `[in] T()` term: it matches nothing.
+    #[must_use]
+    pub fn reads(mut self, id: impl IntoId) -> Self {
+        let id = id.into_id(self.w);
+        self.filters.must(crate::query::Term::from(id, sys::EcsIsEntity).read());
         self
     }
 
@@ -123,7 +168,17 @@ impl<'a, Q: QueryTuple + 'static> SystemBuilder<'a, Q> {
         };
         let boxed: Box<Box<EachIter<Q>>> = Box::new(Box::new(f));
         let b = self.w.system(&self.name);
-        let b = if self.manual { b.phase(0) } else { b };
+        // SAFETY: immutable flecs globals.
+        let phase = unsafe {
+            match self.phase {
+                Phase::Update => sys::EcsOnUpdate,
+                Phase::Layout => sys::EcsOnValidate,
+                Phase::AfterLayout => sys::EcsPostUpdate,
+                Phase::Resolve => sys::EcsPreStore,
+                Phase::Draw => sys::EcsOnStore,
+            }
+        };
+        let b = b.phase(if self.manual { 0 } else { phase });
         let b = terms.into_iter().chain(self.filters.terms).fold(b, |b, t| b.term(t));
         b.user_owned(Box::into_raw(boxed).cast(), free::<Q>).build(run::<Q>).unwrap_or_else(|e| panic!("{e}"))
     }

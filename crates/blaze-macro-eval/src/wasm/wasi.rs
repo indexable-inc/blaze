@@ -76,7 +76,8 @@ fn os_fd(fd: u32) -> i64 {
 /// [`Os`]: crate::os::Os
 fn wasi_fd(fd: i64) -> Result<u32, Stop> {
     // alloc: error path
-    u32::try_from(fd - FIRST_FD + i64::from(ROOT_FD) + 1).map_err(|_| Stop(format!("opened descriptor {fd}, past WASI's")))
+    u32::try_from(fd - FIRST_FD + i64::from(ROOT_FD) + 1)
+        .map_err(|_| Stop(format!("opened descriptor {fd}, past WASI's")))
 }
 
 /// WASI's `filetype`.
@@ -153,7 +154,10 @@ impl Guest for Linear<'_> {
 
     fn alloc(&mut self, bytes: &[u8], _align: usize) -> Result<u64, Stop> {
         // alloc: error path
-        Err(Stop(format!("reached a shim that allocates {} bytes in its memory, which the wasm host does not", bytes.len())))
+        Err(Stop(format!(
+            "reached a shim that allocates {} bytes in its memory, which the wasm host does not",
+            bytes.len()
+        )))
     }
 }
 
@@ -189,7 +193,9 @@ impl System for Cx<'_> {
             // MONOTONIC, PROCESS_CPUTIME_ID, THREAD_CPUTIME_ID
             1..=3 => match fuel_left {
                 Some(left) => FUEL.saturating_sub(left),
-                None => return Err(Stop("read a clock on an engine that counts no fuel".to_owned())), // alloc: error path
+                None => {
+                    return Err(Stop("read a clock on an engine that counts no fuel".to_owned()));
+                } // alloc: error path
             },
             _ => return Ok(Err(Errno::INVAL)),
         }))
@@ -270,7 +276,9 @@ impl System for Cx<'_> {
     fn fd_stat(&mut self, fd: u32) -> Answer<Filestat> {
         match fd {
             // alloc: error path
-            0..=2 => Err(Stop(format!("looks at its standard stream {fd} (`fd_filestat_get`), which the wasm host does not serve"))),
+            0..=2 => Err(Stop(format!(
+                "looks at its standard stream {fd} (`fd_filestat_get`), which the wasm host does not serve"
+            ))),
             ROOT_FD => Err(self.os.refuse_root()),
             _ => Ok(self.os.stat_fd(os_fd(fd)).map(|stat| filestat(&stat)).map_err(wasi_errno)),
         }
@@ -312,7 +320,11 @@ impl System for Cx<'_> {
             Ok(at) => at,
             Err(errno) => return Ok(Err(errno)),
         };
-        Ok(self.os.link_target((at, path))?.map(|target| target.into_os_string().into_encoded_bytes()).map_err(wasi_errno))
+        Ok(self
+            .os
+            .link_target((at, path))?
+            .map(|target| target.into_os_string().into_encoded_bytes())
+            .map_err(wasi_errno))
     }
 
     /// The entries of a directory the macro opened. Listing `/` stops the expansion.
@@ -323,17 +335,26 @@ impl System for Cx<'_> {
             _ => os_fd(fd),
         };
         Ok(match self.os.dir_entry(fd, cookie) {
-            Ok(entry) => Ok(entry.map(|entry| Dirent { ino: entry.ino, filetype: filetype(entry.kind), name: entry.name })),
+            Ok(entry) => Ok(entry.map(|entry| Dirent {
+                ino: entry.ino,
+                filetype: filetype(entry.kind),
+                name: entry.name,
+            })),
             Err(errno) => Err(wasi_errno(errno)),
         })
     }
 
     fn poll_oneoff(&mut self) -> Stop {
-        Stop("waits (`poll_oneoff`, as `thread::sleep` does), which a macro's expansion may not".to_owned()) // alloc: error path
+        Stop(
+            "waits (`poll_oneoff`, as `thread::sleep` does), which a macro's expansion may not"
+                .to_owned(),
+        ) // alloc: error path
     }
 
     fn exit(&mut self, code: u32) -> Stop {
         // alloc: error path
-        Stop(format!("exits the process with code {code} (`std::process::exit`), which a macro's expansion may not"))
+        Stop(format!(
+            "exits the process with code {code} (`std::process::exit`), which a macro's expansion may not"
+        ))
     }
 }

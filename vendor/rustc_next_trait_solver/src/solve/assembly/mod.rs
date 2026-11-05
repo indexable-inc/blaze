@@ -1381,10 +1381,7 @@ where
 
                     // We still need to prefer where-bounds over alias-bounds however.
                     // See `tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs`.
-                    if candidates
-                        .iter()
-                        .any(|c| matches!(c.source, CandidateSource::ParamEnv(_)))
-                    {
+                    if candidates.iter().any(|c| matches!(c.source, CandidateSource::ParamEnv(_))) {
                         candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_)));
                     }
 

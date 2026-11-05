@@ -1,7 +1,7 @@
 # hegeltest, hegeltest-macros, hegeltest-c
 
-Hegel, the property-based testing library blaze's property tests use (docs/contributing.md,
-"Property tests"): Hypothesis's engine ported to Rust, with a Rust frontend.
+Hegel, the property-based testing library blaze's property tests and deterministic simulation
+tests use (the `testing` skill, .agents/skills/testing/SKILL.md): Hypothesis's engine ported to Rust, with a Rust frontend.
 
 - Upstream: our fork https://github.com/indexable-inc/hegel (of hegeldev/hegel), commit
   `cae7cfa19251314351738a31234a3b576f2c5421` ("Merge pull request #3 from
@@ -17,9 +17,13 @@ Hegel, the property-based testing library blaze's property tests use (docs/contr
 - The three directories are excluded from blaze's workspace (root `Cargo.toml`), so their own
   tests are not blaze's to run; they are built only as dependencies of blaze's tests.
 
-Kept from `tests/`: the files under `tests/embedded/` that the `#[cfg(test)] #[path = ...]`
-modules name, unchanged, because `cargo fmt --all` (fmt.yaml) resolves those modules and stops
-on a missing file. Left out: the rest of every `tests/` directory (the integration tests and
+Kept from `tests/`: every file under `tests/embedded/` (subdirectories too) that a
+`#[cfg(test)] #[path = ...]` module names, and the data files those include with `include!`
+(`native/statistics_oracle_data.rs`, `native/unicodedata_python_reference_data.rs`,
+`native/unicodedata_python_reference_deltas.rs`), unchanged from the commit above, because
+`blaze fmt --all` (fmt.yaml) resolves those modules and fails on a missing file. Until
+2026-11-04 only the top-level ones were kept, and the 91 under `ffi/`, `generators/` and
+`native/` were missing. Left out: the rest of every `tests/` directory (the integration tests and
 libhegel's other embedded tests), `examples/`, `benches/`,
 `scripts/`, `include/` (the C header), the justfiles, AGENTS.md, CHANGELOG.md, RELEASE.md, the
 `[[bin]]` fixtures and the dev-dependencies they need, and the hegel workspace's own
@@ -40,3 +44,8 @@ Changes, each marked `blaze:`:
 5. `hegeltest-c` asks for `miniz_oxide` 0.9.1 (upstream 0.8), the one `flate2` uses in blaze's
    lock; `compress_to_vec_zlib` and `decompress_to_vec_zlib_with_limit` are the same in 0.9.
    Blobs it compressed before still decode (zlib), though the bytes it writes may differ.
+6. The `Generator` impl of `BoxedGenerator` and the `PrintableGenerator` impl of
+   `BoxedPrintableGenerator` name the outer lifetime explicitly. Stage-0 blaze 0.20261030.1
+   rejects their `boxed` methods' `Self: 'b` bound when that lifetime is anonymous (#1678),
+   blocking the test dependencies. This keeps the same lifetime-generic impls and gives the
+   bootstrap compiler names it can check; the general compiler bug remains open.

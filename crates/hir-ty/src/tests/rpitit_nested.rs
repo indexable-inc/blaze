@@ -2,7 +2,9 @@
 //! Sized>`, a tuple, a reference, a `Box`), with and without a body: neither the method nor a
 //! caller has a type left to infer (sb-printer: rustc_type_ir's `Interner::item_bounds`).
 
-use hir_def::{AssocItemId, DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
+use hir_def::{
+    AssocItemId, DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+};
 use hir_expand::fixture;
 
 use crate::{InferBodyId, InferenceDiagnostic, InferenceResult};
@@ -16,12 +18,12 @@ fn diagnostics(fixture: &str) -> Vec<(String, InferenceDiagnostic)> {
             for def in module.scope(&db).declarations() {
                 match def {
                     ModuleDefId::FunctionId(it) => functions.push(it),
-                    ModuleDefId::TraitId(it) => functions.extend(it.trait_items(&db).items.iter().filter_map(
-                        |(_, item)| match item {
+                    ModuleDefId::TraitId(it) => functions.extend(
+                        it.trait_items(&db).items.iter().filter_map(|(_, item)| match item {
                             AssocItemId::FunctionId(it) => Some(*it),
                             _ => None,
-                        },
-                    )),
+                        }),
+                    ),
                     _ => {}
                 }
             }
@@ -29,7 +31,10 @@ fn diagnostics(fixture: &str) -> Vec<(String, InferenceDiagnostic)> {
         let mut found = Vec::new(); // alloc: test
         for function in functions {
             let name = FunctionSignature::of(&db, function).name.as_str().to_owned(); // alloc: test
-            let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)));
+            let infer = InferenceResult::of(
+                &db,
+                InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)),
+            );
             found.extend(infer.diagnostics().iter().cloned().map(|it| (name.clone(), it)));
         }
         found
@@ -46,7 +51,8 @@ fn a_nested_impl_trait_in_a_trait_method_leaves_nothing_to_infer() {
         ("Box<impl Sized>", "Box(0u8)"),
         ("Option<(impl Sized, Box<impl Sized>)>", "Some((0u8, Box(0u8)))"),
     ] {
-        for body in [";".to_owned(), format!(" {{ {value} }}")] { // alloc: test
+        for body in [";".to_owned(), format!(" {{ {value} }}")] {
+            // alloc: test
             let found = diagnostics(&format!(
                 "//- minicore: sized, option\n\
                  pub struct Box<T>(T);\n\

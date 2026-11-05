@@ -5,13 +5,15 @@
 # `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
 # so nothing is cross-compiled or emulated.
 #
-# With `ix-cpu`, the build and the unit tests run on ix's GitHub Actions runners
-# (https://ix.dev/docs/runners) in place of `os`: a VM of that many vCPUs whose memory grows on
-# demand up to 256 GiB, forked from a snapshot of the last green job on main with the same labels,
-# its disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has
-# its own label set (`blaze-build`, `blaze-tests`), so each forks its own job's snapshot; main's
-# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. ix serves AArch64
-# alone today, so `ix-cpu` goes with `linux-arm64`.
+# Linux AArch64 (`linux-arm64`) runs every job on ix's GitHub Actions runners
+# (https://ix.dev/docs/runners, docs/harness.md "ix runners"): a VM whose memory grows on demand
+# up to 256 GiB, forked from a snapshot of the last green job on main with the same labels, its
+# disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has a
+# label of its own (`blaze-build`, `blaze-tests`, ...), so each forks its own job's snapshot;
+# main's runs make the snapshots and the pull requests' runs fork them. The build, the unit
+# tests and the larger projects take 64 vCPUs and the other jobs 16, where a hosted runner has 4.
+# macOS and Windows run on `os`, GitHub's hosted runners, which ix does not offer. No caller asks
+# for Linux x86-64: ix has no x86-64 capacity today (TODO(x86-64), docs/harness.md "ix runners").
 name: blaze platform
 on:
   workflow_call:
@@ -21,13 +23,9 @@ on:
         type: string
         required: true
       os:
-        description: the hosted runner
+        description: the hosted runner, for every platform but linux-arm64 (which runs on ix)
         type: string
         required: true
-      ix-cpu:
-        description: "vCPUs of the ix runner the build and the unit tests run on (8, 16, 32, 64 or 128), or empty for `os`"
-        type: string
-        default: ""
       tier:
         description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
@@ -63,13 +61,11 @@ env:
   BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
   PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
-  # The build and the unit tests on an ix runner (.github/actions/blaze keeps the store under
-  # $HOME there, for the snapshot, and makes no swap).
-  BLAZE_CI_IX: ${{ inputs.ix-cpu != '' }}
   # blaze builds and tests blaze (AGENTS.md rule blaze-builds-blaze): the latest release is the
   # compiler and its store the one cache, pulled from the shared remote main's runs push to
-  # (.github/actions/blaze). Windows builds with cargo, and no cache, since release.yaml makes
-  # no release of blaze for Windows yet, so there is no blaze there to build with.
+  # (.github/actions/blaze). On Windows the build and the tests stop with an error: release.yaml
+  # makes no release of blaze for Windows yet, so there is no blaze there to build with, and
+  # cargo is no stand-in (rule no-fallback).
   BLAZE: ${{ !startsWith(inputs.os, 'windows') }}
 
 defaults:
@@ -85,7 +81,7 @@ jobs:
     # (harness/unittests.py), and hands over what it compiled, so only the crates built with
     # `cfg(test)` are compiled here.
     needs: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-tests"]') || inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
@@ -104,17 +100,14 @@ jobs:
       # it, and says of each that passed before whether it passed again.
       BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
     steps:
-      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
-      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
-      - if: runner.os == 'Windows'
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
         run: |
-          git config --global core.autocrlf false
-          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
+          echo "::error::blaze's unit tests on Windows need a release of blaze for Windows to build them with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
+          exit 1
       - uses: actions/checkout@v7
       # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
-      # the C compiler and linker are the runner's. cargo's on Windows, with rustup's nightly.
-      - if: env.BLAZE != 'true'
-        uses: ./.github/actions/toolchain
+      # the C compiler and linker are the runner's.
       # With the build job's project too, and LLVM: the tests are built with the features the
       # build ships (harness/unittests.py, FEATURES).
       - if: env.BLAZE == 'true'
@@ -123,7 +116,6 @@ jobs:
         with:
           job: tests
           llvm: true
-          also: build
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
@@ -148,70 +140,41 @@ jobs:
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
       # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
-      # ix's image may carry no package lists, which a hosted image has.
+      # The ix runner image ships no package lists, which a hosted image has.
       - if: env.BLAZE == 'true' && runner.os == 'Linux'
         run: |
-          if [ "$BLAZE_CI_IX" = true ]; then sudo apt-get update -qq > /dev/null; fi
+          if [ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages' -print -quit)" ]; then sudo apt-get update -qq > /dev/null; fi
           sudo apt-get install -y -qq gdb > /dev/null
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: |
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
-      - if: env.BLAZE != 'true'
-        run: |
-          $PYTHON harness/unittests.py '{"cargo": true}'
-      # What was compiled, and each test that passed, for the runs after this one; a run whose
-      # tests failed pushes too, since what it compiled is no less right. The daemons end
-      # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        run: blaze stop
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        uses: ./.github/actions/blaze-remote
-        with:
-          mode: push
-          project: ${{ steps.blaze.outputs.project }}
-          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
-          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   build:
     name: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-build"]') || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
     # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
-    env:
-      # The `fast` and `full` tiers (the train) build with cargo, as release.yaml does: their
-      # harnesses and benches time and test the blaze users get, and the code blaze compiles
-      # for itself runs about ten times slower than rustc's, since it inlines no function into
-      # another yet (https://github.com/indexable-inc/blaze/issues/899; the smoke corpus took
-      # 15 min instead of 74 s, unit tests 60 s instead of 5). The merge gate and main build
-      # with blaze.
-      # Named harness runs are a new route: bootstrap them with blaze too.
-      BLAZE: ${{ !startsWith(inputs.os, 'windows') && (inputs.harnesses != '' || (inputs.tier != 'fast' && inputs.tier != 'full')) }}
+    # Every tier builds with blaze, the train's `fast` and `full` too, as release.yaml does: their
+    # harnesses and benches time and test the blaze users get, which blaze builds. That blaze's
+    # code runs slower than rustc's while it inlines too little
+    # (https://github.com/indexable-inc/blaze/issues/899) is the work, not a reason for cargo.
     outputs:
       parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
     steps:
-      - name: blaze bootstrap for named harnesses
-        if: runner.os == 'Windows' && inputs.harnesses != ''
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
         run: |
-          echo 'Named harness builds on Windows need a released Windows blaze to bootstrap with; none is shipped yet.' >&2
+          echo "::error::building blaze on Windows needs a release of blaze for Windows to build it with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
           exit 1
-      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
-      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
-      - if: runner.os == 'Windows'
-        run: |
-          git config --global core.autocrlf false
-          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      # cargo's build (the train's tiers, Windows): rustup's nightly, and the flake's dev shell
-      # with the pinned LLVM.
-      - if: env.BLAZE != 'true'
-        uses: ./.github/actions/toolchain
-        with:
-          llvm: build
-      # blaze's build (the gate, main): no rustup and no Nix. blaze brings its own Rust and the
+      # blaze's build (every tier): no rustup and no Nix. blaze brings its own Rust and the
       # pinned LLVM (LLVM_SYS_231_PREFIX, fetched by its sha256), and the C compiler, linker and
       # libc are the runner's.
       - if: env.BLAZE == 'true'
@@ -226,26 +189,38 @@ jobs:
       # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
       # with their features and profile (harness/unittests.py), so that its libraries are the
       # ones the tests job's programs are built on. Every one of them is a dependency of
-      # blaze-engine, and each has the features it has in blaze-engine's build alone. On
-      # Windows, which has no Nix, the build is against the static C runtime, and names
-      # libraries of the SDK that the linker is not otherwise shown.
+      # blaze-engine, and each has the features it has in blaze-engine's build alone.
+      # The profile history's files the build writes are told from those the runner had (an ix
+      # runner's snapshot keeps earlier runs') by being newer than this file.
+      - if: env.BLAZE == 'true' && inputs.harnesses == ''
+        run: touch "$RUNNER_TEMP/profile-since"
       - name: blaze build --release, of what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
-      - name: cargo build -p blaze-engine --release
-        if: env.BLAZE != 'true'
-        run: |
-          if [ "$RUNNER_OS" = Windows ]; then
-            sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
-            export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-            cargo build -p blaze-engine --release --locked
-          else
-            nix develop --command cargo build -p blaze-engine --release --locked
-          fi
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
         run: blaze stop
+      # The self-build's profile history (blaze's root, docs/profiling.md), for the profile-gate
+      # job. After the stop, which flushes and merges the last of it. A build that wrote none
+      # hands over its list alone, and the gate says it found no build.
+      - id: profile
+        if: always() && env.BLAZE == 'true' && inputs.harnesses == '' && steps.blaze.outcome == 'success'
+        run: |
+          src="${BLAZE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/blaze}/v2/profile"
+          dir="$RUNNER_TEMP/profile"
+          mkdir -p "$dir"
+          find "$src" -maxdepth 1 -name '*.parquet' ! -name 'schema.*' -newer "$RUNNER_TEMP/profile-since" -exec cp -p {} "$dir/" \; || true
+          ls "$dir" > "$dir/copied.txt"
+          echo "$(($(wc -l < "$dir/copied.txt") - 1)) profile history files, $(du -sh "$dir" | cut -f1), for the profile gate" | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always() && steps.profile.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
       # What the build added to the store, for the tests job (`needs: build`), which pulls the
       # same keys; a hard link each, since the store and the runner's temporary directory are
       # one disk. packs.txt lists them, so that a build that added none still hands over a list.
@@ -267,13 +242,6 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        uses: ./.github/actions/blaze-remote
-        with:
-          mode: push
-          project: ${{ steps.blaze.outputs.project }}
-          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
-          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
       # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
@@ -306,12 +274,79 @@ jobs:
         run: |
           parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+
+  # The profile's gate (crates/blaze-profile/src/gate.rs, docs/profiling.md "The gate") over the
+  # history the build job's self-build wrote, run by the blaze this tree built and held to
+  # harness/profile-gate-known.toml, and each of its fixtures failing its own check
+  # (harness/profile_gate.py). It uploads the build's per-build summary, named by platform,
+  # runner class, commit, tree and blaze, for profile-nightly.yaml. No secret and no
+  # environment: a fork's pull request runs it as it is.
+  profile-gate:
+    name: profile gate
+    needs: build
+    if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-profile-gate"]') || inputs.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The class of machine the self-build ran on: a summary compares only with its own class's.
+      RUNNER_CLASS: ${{ inputs.platform == 'linux-arm64' && 'ix-arm64-64' || inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned DuckDB (flake.nix), which `blaze debug gate` runs: blaze never links one.
+      - uses: ./.github/actions/nix
+      - id: duckdb
+        run: echo "path=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/blaze
+      - uses: actions/download-artifact@v8
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+      - working-directory: ${{ runner.temp }}/blaze
+        run: tar -xf blaze.tar
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: blaze debug gate, over the self-build and the fixtures
+        env:
+          DUCKDB: ${{ steps.duckdb.outputs.path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg duckdb "$DUCKDB" --arg history "$RUNNER_TEMP/profile" \
+            --arg platform "$PLATFORM" --arg runner "$RUNNER_CLASS" --arg commit "$GITHUB_SHA" --arg out "$RUNNER_TEMP/profile-gate" \
+            '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
+            > "$RUNNER_TEMP/profile-gate.json"
+          uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      - id: summary
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/profile-gate"
+          if [ -f "$out/report.md" ]; then cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f "$out/artifact" ] && [ -f "$out/summary.parquet" ]; then echo "name=$(cat "$out/artifact")" >> "$GITHUB_OUTPUT"; fi
+      - if: always() && steps.summary.outputs.name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.summary.outputs.name }}
+          path: |
+            ${{ runner.temp }}/profile-gate/summary.parquet
+            ${{ runner.temp }}/profile-gate/identity.json
+            ${{ runner.temp }}/profile-gate/verdict.json
+          retention-days: 90
+          if-no-files-found: error
 
   harness:
     name: harness (${{ matrix.part }})
     if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-harness"]') || inputs.os }}
     # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
     timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
@@ -365,12 +400,13 @@ jobs:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
           uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
-      # What the daemons said when a harness failed (each harness keeps its daemon's log in a
-      # temporary directory of its own), and the report of a process that crashed on macOS.
+      # What the daemons said when a harness failed (each harness's daemon logs in a temporary
+      # home of its own: `serve.log` there or in its `v2/`), and the report of a process that
+      # crashed on macOS.
       - name: Daemon logs
         if: failure()
         run: |
-          find "${TMPDIR:-/tmp}" /tmp -maxdepth 2 -name daemon.log 2>/dev/null | sort -u | while read -r log; do
+          find "${TMPDIR:-/tmp}" /tmp -maxdepth 5 -name serve.log 2>/dev/null | sort -u | while read -r log; do
             echo "::group::$log"; tail -n 60 "$log"; echo "::endgroup::"
           done
           for report in "$HOME"/Library/Logs/DiagnosticReports/blaze-engine*; do
@@ -390,7 +426,7 @@ jobs:
     # merge, and promote.yaml runs the whole corpus on every release before it is stable.
     if: inputs.smoke && inputs.tier != 'gate'
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-smoke"]') || inputs.os }}
     timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
     steps:
       - uses: actions/checkout@v7
@@ -417,7 +453,7 @@ jobs:
     name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-blaze-cli"]') || inputs.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -454,14 +490,14 @@ jobs:
             /tmp/blaze-cargo-*/home-*/*/*/log
           if-no-files-found: ignore
 
-  # The larger projects as they are published, natively on AArch64: what the programs print and
-  # what every test says has to be what cargo gives. The ten after these take more than a hosted
-  # runner's three hours, and it was shut down loading rust-analyzer.
+  # The larger projects as they are published, natively on AArch64 (on ix, 64 vCPUs): what the
+  # programs print and what every test says has to be what cargo gives. The ten after these took
+  # more than a hosted runner's three hours, and it was shut down loading rust-analyzer.
   projects:
     name: projects (${{ matrix.projects }})
     if: inputs.projects
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-projects"]') || inputs.os }}
     timeout-minutes: 120
     # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
     # axum's example-testing crashes in the test binary the daemon builds. nushell's cold build
@@ -499,7 +535,7 @@ jobs:
     name: bench (ripgrep)
     if: inputs.bench
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-bench"]') || inputs.os }}
     timeout-minutes: 60
     continue-on-error: true
     steps:

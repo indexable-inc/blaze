@@ -9,7 +9,10 @@
 use base_db::Db;
 use either::Either;
 use hir::InFile;
-use hir_def::{AdtId, AttrDefId, HasModule as _, ItemContainerId, Lookup as _, hir::ExprId, src::HasSource as _};
+use hir_def::{
+    AdtId, AttrDefId, HasModule as _, ItemContainerId, Lookup as _, hir::ExprId,
+    src::HasSource as _,
+};
 use hir_ty::{
     Adjust, ParamEnvAndCrate,
     db::HirDatabase,
@@ -24,7 +27,7 @@ use syntax::{
 use crate::{
     cx::def_range_view,
     lints::bodies::{
-        BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set,
+        BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set,
         types::util::{self, diagnostic_item, fn_item, from_expansion},
     },
     lower::{Found, Phase},
@@ -54,7 +57,9 @@ impl LatePass for NoopMethodCall {
 }
 
 fn noop_method_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
-    let hir_def::hir::Expr::MethodCall { receiver, method_name, .. } = b.store().expr(expr) else { return None };
+    let hir_def::hir::Expr::MethodCall { receiver, method_name, .. } = b.store().expr(expr) else {
+        return None;
+    };
     let db = b.db();
     let (method, args) = b.infer.method_resolution(expr)?;
     let ItemContainerId::TraitId(trait_id) = method.lookup(db).container else { return None };
@@ -134,7 +139,9 @@ fn noop_method_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
             Noop::Borrow => return None,
             Noop::Clone => {
                 // alloc: the lint's diagnostic
-                format!("using `.clone()` on a double reference, which returns `{ty}` instead of cloning the inner type")
+                format!(
+                    "using `.clone()` on a double reference, which returns `{ty}` instead of cloning the inner type"
+                )
             }
             // alloc: the lint's diagnostic
             Noop::Deref => format!(
@@ -142,7 +149,15 @@ fn noop_method_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
             ),
         };
         let mut diag = Diag::lint("suspicious_double_ref_op", message, span);
-        facts(b, &mut diag, receiver, method_name, trait_id, trait_name.as_str(), expr_ty.strip_references());
+        facts(
+            b,
+            &mut diag,
+            receiver,
+            method_name,
+            trait_id,
+            trait_name.as_str(),
+            expr_ty.strip_references(),
+        );
         diag
     };
     Some(b.lint(diag, Phase::Late, at))
@@ -175,7 +190,9 @@ fn facts<'db>(
     trait_name: &str,
     inner: Ty<'db>,
 ) {
-    let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value)) else { return };
+    let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value)) else {
+        return;
+    };
     let Some(receiver_ty) = b.cx.vsema.type_of_expr(written) else { return };
     let receiver_ty = receiver_ty.original;
     let printed = b.cx.ty(&receiver_ty);

@@ -28,8 +28,8 @@ use hir_expand::{AstId, HirFileId, name::Name};
 use span::{AstIdNode, ErasedFileAstId};
 
 use crate::{
-    AdtId, AssocItemId, BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId,
-    HasModule, ItemContainerId, ItemLoc, Lookup, ModuleId, ModuleIdLt, VariantId,
+    AdtId, AssocItemId, BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule,
+    ItemContainerId, ItemLoc, Lookup, ModuleId, ModuleIdLt, VariantId,
     hir::ExprId,
     item_tree::{ItemTree, SpanItem, block_item_tree_query, file_item_tree},
 };

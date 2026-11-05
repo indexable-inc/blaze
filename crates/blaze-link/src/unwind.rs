@@ -5,16 +5,20 @@
 //! their records, each kept as long as the code it describes is. Records are 4-aligned and a
 //! multiple of 4 long, so placed one after another they leave no gap an unwinder would read
 //! as the terminator.
+//!
+//! An FDE's addresses are written as the platform's compilers write them ([`Pointers`]): 4
+//! bytes on ELF, 8 on Mach-O, so a Mach-O FDE reaches its function and LSDA wherever they are.
 
 use std::ops::Range;
 
 use blaze_format::cursor::{self, Put, Reader};
 use blaze_graph::par;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
-use crate::model::View;
+use crate::Format;
+use crate::model::{Apply, View};
 
 /// A record's bytes and the places in it the core relocates.
 #[cfg(test)]
@@ -55,9 +59,10 @@ pub(crate) enum Field {
     /// An FDE's CIE pointer: from the field back to its CIE (`Delta32` of the record's own
     /// address + 4, minus the CIE's).
     CiePointer,
-    /// An FDE's first address, PC-relative (`Rel32`) to the function.
+    /// An FDE's first address, PC-relative to the function, as wide as its CIE's [`Pointers`]
+    /// say ([`Pointers::apply`]).
     Function,
-    /// An FDE's LSDA, PC-relative to the function's data.
+    /// An FDE's LSDA, PC-relative to the function's data, as wide as [`Field::Function`].
     Lsda,
     /// A CIE's personality: PC-relative to a GOT cell holding the routine's address
     /// (`DW_EH_PE_indirect`).
@@ -65,7 +70,62 @@ pub(crate) enum Field {
 }
 
 const PCREL_SDATA4: u8 = 0x1b;
+const PCREL_ABSPTR: u8 = 0x10;
 const INDIRECT_PCREL_SDATA4: u8 = 0x9b;
+
+/// How the core's CIEs say an FDE's addresses (its first address, its length and its LSDA)
+/// are encoded: the `R` and `L` augmentations. Both PC-relative; they differ in width, so in
+/// reach. A CIE's personality is `DW_EH_PE_indirect | pcrel | sdata4` (0x9b) in both, as
+/// LLVM writes it: it reaches a GOT cell next to the code, never across it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Pointers {
+    /// `DW_EH_PE_pcrel | DW_EH_PE_sdata4` (0x1b), 4 bytes: what GCC and LLVM write on ELF,
+    /// and what `.eh_frame_hdr`'s 32-bit table can index anyway. Reaches ±2 GiB, which the
+    /// core checks before it writes ([`crate::place`]'s `check_reach`).
+    Sdata4,
+    /// `DW_EH_PE_pcrel | DW_EH_PE_absptr` (0x10), 8 bytes on the 64-bit targets blaze links:
+    /// what LLVM writes on Darwin (`MCObjectFileInfo::initMachOMCObjectFileInfo`'s
+    /// `FDECFIEncoding = DW_EH_PE_pcrel`, `TargetLoweringObjectFileMachO`'s `LSDAEncoding`),
+    /// which libunwind reads (`CFI_Parser::decodeFDE`: the first address in the CIE's
+    /// encoding, the length in its low nibble) and lld-macho takes (`pointerEncodingToSize`:
+    /// `absptr` is the word size). Reaches the whole address space.
+    Absptr8,
+}
+
+impl Pointers {
+    /// The pointers of `format`'s FDEs: 8 bytes on Mach-O, whose patch region and code may be
+    /// more than 2 GiB from `__eh_frame`; 4 elsewhere.
+    pub(crate) fn of(format: Format) -> Pointers {
+        match format {
+            Format::MachO => Pointers::Absptr8,
+            Format::Elf | Format::Pe | Format::Wasm => Pointers::Sdata4,
+        }
+    }
+
+    /// The `DW_EH_PE_*` byte of the `R` and `L` augmentations.
+    pub(crate) fn encoding(self) -> u8 {
+        match self {
+            Pointers::Sdata4 => PCREL_SDATA4,
+            Pointers::Absptr8 => PCREL_ABSPTR,
+        }
+    }
+
+    /// The bytes of each address field.
+    pub(crate) fn width(self) -> usize {
+        match self {
+            Pointers::Sdata4 => 4,
+            Pointers::Absptr8 => 8,
+        }
+    }
+
+    /// The fixup that fills an FDE's first address and LSDA.
+    pub(crate) fn apply(self) -> Apply {
+        match self {
+            Pointers::Sdata4 => Apply::Rel32,
+            Pointers::Absptr8 => Apply::Rel64,
+        }
+    }
+}
 
 /// A CIE: version 1, augmentation `zR`, or `zPLR` for one with a personality.
 #[cfg(test)]
@@ -75,33 +135,52 @@ pub(crate) fn cie(
     return_address: u16,
     instructions: &[u8],
     personality: bool,
+    pointers: Pointers,
 ) -> Result<Record, String> {
     let mut bytes = Vec::with_capacity(64);
-    let fixups = cie_into(code_align, data_align, return_address, instructions, personality, &mut bytes)?;
+    let fixups = cie_into(
+        code_align,
+        data_align,
+        return_address,
+        instructions,
+        personality,
+        pointers,
+        &mut bytes,
+    )?;
     Ok(Record { bytes, fixups })
 }
 
 /// An FDE, as [`fde_into`] writes it.
 #[cfg(test)]
-pub(crate) fn fde(size: u64, instructions: &[u8], lsda: bool, has_lsda: bool) -> Result<Record, String> {
+pub(crate) fn fde(
+    size: u64,
+    instructions: &[u8],
+    lsda: bool,
+    has_lsda: bool,
+    pointers: Pointers,
+) -> Result<Record, String> {
     let mut bytes = Vec::with_capacity(64);
-    let fixups = fde_into(size, instructions, lsda, has_lsda, &mut bytes)?;
+    let fixups = fde_into(size, instructions, lsda, has_lsda, pointers, &mut bytes)?;
     Ok(Record { bytes, fixups })
 }
 
 /// Writes a CIE over `bytes` (version 1, augmentation `zR`, or `zPLR` for one with a
-/// personality): its fields to relocate. A reused buffer allocates nothing.
+/// personality), its FDEs' addresses in `pointers`: its fields to relocate. A reused buffer
+/// allocates nothing.
 pub(crate) fn cie_into(
     code_align: u32,
     data_align: i32,
     return_address: u16,
     instructions: &[u8],
     personality: bool,
+    pointers: Pointers,
     bytes: &mut Vec<u8>,
 ) -> Result<Fields, String> {
     let ra = u8::try_from(return_address)
         // alloc: error path
-        .map_err(|_| format!("return address register {return_address} past CIE version 1's 255"))?;
+        .map_err(|_| {
+            format!("return address register {return_address} past CIE version 1's 255")
+        })?;
     // Header 8, version 1, augmentation 6, alignments 5 + 10, register 1, augmentation data
     // 9, then the instructions and at most 7 of padding.
     bytes.clear();
@@ -113,47 +192,58 @@ pub(crate) fn cie_into(
     sleb(bytes, i64::from(data_align));
     bytes.push(ra);
     let mut fixups = Fields::NONE;
+    // The augmentation data: `P` (its encoding and 4 bytes), `L`, `R`; or `R` alone.
     if personality {
         uleb(bytes, 7);
         bytes.push(INDIRECT_PCREL_SDATA4);
         fixups.push(bytes.len() as u64, Field::Personality);
         bytes.extend_from_slice(&[0; 4]);
-        bytes.push(PCREL_SDATA4);
-        bytes.push(PCREL_SDATA4);
+        bytes.push(pointers.encoding());
+        bytes.push(pointers.encoding());
     } else {
         uleb(bytes, 1);
-        bytes.push(PCREL_SDATA4);
+        bytes.push(pointers.encoding());
     }
     bytes.extend_from_slice(instructions);
     finish(bytes)?;
     Ok(fixups)
 }
 
-/// Writes over `bytes` an FDE of a function `size` bytes long, its CIE pointer and
-/// addresses left to fixups: its fields to relocate. `lsda` says whether its CIE has an `L`
-/// augmentation (one with a personality does): then the field is there, relocated when
-/// `has_lsda`, 0 (none) otherwise. A reused buffer allocates nothing.
+/// Writes over `bytes` an FDE of a function `size` bytes long, its addresses in `pointers`
+/// (as its CIE's [`cie_into`] says), its CIE pointer and addresses left to fixups: its fields
+/// to relocate. `lsda` says whether its CIE has an `L` augmentation (one with a personality
+/// does): then the field is there, relocated when `has_lsda`, 0 (none) otherwise. A reused
+/// buffer allocates nothing.
 pub(crate) fn fde_into(
     size: u64,
     instructions: &[u8],
     lsda: bool,
     has_lsda: bool,
+    pointers: Pointers,
     bytes: &mut Vec<u8>,
 ) -> Result<Fields, String> {
-    let range = u32::try_from(size).map_err(|_| "a function past 4 GiB in an FDE")?;
+    let width = pointers.width();
+    // Length 4, CIE pointer 4, first address and length, augmentation data (1 and an LSDA),
+    // then the instructions and at most 7 of padding.
     bytes.clear();
-    bytes.reserve(16 + 1 + 4 + instructions.len() + 7);
-    bytes.extend_from_slice(&[0; 12]);
-    bytes.put_u32(range);
+    bytes.reserve(8 + 3 * width + 1 + instructions.len() + 7);
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.resize(8 + width, 0);
+    match pointers {
+        Pointers::Sdata4 => {
+            bytes.put_u32(u32::try_from(size).map_err(|_| "a function past 4 GiB in an FDE")?)
+        }
+        Pointers::Absptr8 => bytes.put_u64(size),
+    }
     let mut fixups = Fields::NONE;
     fixups.push(4, Field::CiePointer);
     fixups.push(8, Field::Function);
     if lsda {
-        uleb(bytes, 4);
+        uleb(bytes, width as u64);
         if has_lsda {
             fixups.push(bytes.len() as u64, Field::Lsda);
         }
-        bytes.extend_from_slice(&[0; 4]);
+        bytes.resize(bytes.len() + width, 0);
     } else {
         uleb(bytes, 0);
     }
@@ -210,7 +300,9 @@ pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
             0 => None,
             back => Some(
                 // alloc: error path
-                (at + 4).checked_sub(back).ok_or_else(|| format!("an FDE at {at:#x} before its CIE"))?,
+                (at + 4)
+                    .checked_sub(back)
+                    .ok_or_else(|| format!("an FDE at {at:#x} before its CIE"))?,
             ),
         };
         if let Some(cie) = cie {
@@ -305,7 +397,11 @@ pub(crate) fn eh_value(reader: &mut Reader<'_>, encoding: u8) -> Result<u64, &'s
 
 /// A pointer in `encoding` with only the section's address (`section`) known: absolute or
 /// relative to where it is.
-pub(crate) fn eh_pointer(reader: &mut Reader<'_>, encoding: u8, section: u64) -> Result<u64, &'static str> {
+pub(crate) fn eh_pointer(
+    reader: &mut Reader<'_>,
+    encoding: u8,
+    section: u64,
+) -> Result<u64, &'static str> {
     if encoding == DW_EH_PE_OMIT {
         return Err("a pointer whose encoding says it is omitted");
     }
@@ -320,7 +416,12 @@ pub(crate) fn eh_pointer(reader: &mut Reader<'_>, encoding: u8, section: u64) ->
 /// The offsets in an image's `.eh_frame` (at `section`, `len` bytes) of every `every`th FDE
 /// the core placed, sorted: record starts a walk of the section can begin at, so its pieces are
 /// walked in parallel. None below two pieces' worth of functions.
-pub(crate) fn fde_splits(placed: &crate::model::Placed<'_>, section: u64, len: usize, every: usize) -> Vec<usize> {
+pub(crate) fn fde_splits(
+    placed: &crate::model::Placed<'_>,
+    section: u64,
+    len: usize,
+    every: usize,
+) -> Vec<usize> {
     if placed.functions.len() < 2 * every {
         // alloc: empty, which allocates nothing
         return Vec::new();
@@ -402,7 +503,12 @@ pub(crate) fn frame(
 /// The FDE pointer encoding of the CIE at `at`, which a walk of another piece met; `across`
 /// holds it where it crosses a page. Any error is the FDE's naming no CIE: a CIE there that
 /// reads wrong is an error of the piece holding it, which comes first.
-fn cie_at(bytes: View<'_>, at: usize, section: u64, across: &mut Vec<u8>) -> Result<u8, &'static str> {
+fn cie_at(
+    bytes: View<'_>,
+    at: usize,
+    section: u64,
+    across: &mut Vec<u8>,
+) -> Result<u8, &'static str> {
     let (body, end) = entry(bytes, at).ok().flatten().ok_or(NO_CIE)?;
     let held = bytes.read(at, end - at, across).ok_or(NO_CIE)?;
     let mut reader = Reader::starting_at(held, body - at).map_err(|_| NO_CIE)?;
@@ -471,7 +577,9 @@ fn walk<T, F: Fn(usize, Frame, &mut Vec<T>) -> Result<(), String>>(
         };
         if found.1 > end {
             // alloc: error path
-            walked.stop = Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
+            walked.stop = Err(format!(
+                "the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"
+            ));
             return walked;
         }
         at = found.1;
@@ -561,11 +669,17 @@ pub(crate) fn scan<T: Copy + Default + Send + Sync>(
     // The pieces the one walk reaches: up to the first that ends the section or fails. A piece's
     // first FDE naming no CIE met before is its first error: the walk went on past it.
     // alloc: once per image, the CIEs
-    let mut cies: Vec<(usize, u8)> = Vec::with_capacity(pieces.iter().map(|it| it.1.cies.len()).sum());
+    let mut cies: Vec<(usize, u8)> =
+        Vec::with_capacity(pieces.iter().map(|it| it.1.cies.len()).sum());
     let (mut kept, mut end) = (pieces.len(), bytes.len());
     for (nth, (_, walked)) in pieces.iter_mut().enumerate() {
         let met = |named: &usize| cies.binary_search_by_key(named, |it| it.0).is_ok();
-        let unmet = walked.foreign.iter().filter(|(named, _)| !met(named)).map(|(_, &(_, record))| record).min();
+        let unmet = walked
+            .foreign
+            .iter()
+            .filter(|(named, _)| !met(named))
+            .map(|(_, &(_, record))| record)
+            .min();
         if let Some(record) = unmet {
             // alloc: error path
             return Err(format!("the entry at offset {record:#x}: {NO_CIE}"));
@@ -623,10 +737,10 @@ mod tests {
 
     #[test]
     fn records_are_padded_and_split_back() {
-        let cie = cie(1, -8, 16, &[0x0c, 7, 8, 0x90, 1], true).unwrap();
+        let cie = cie(1, -8, 16, &[0x0c, 7, 8, 0x90, 1], true, Pointers::Sdata4).unwrap();
         assert_eq!(cie.bytes.len() % 8, 0);
         assert_eq!(&cie.bytes[8..14], b"\x01zPLR\0");
-        let fde = fde(0x40, &[0x41, 0x0e, 0x10], true, false).unwrap();
+        let fde = fde(0x40, &[0x41, 0x0e, 0x10], true, false, Pointers::Sdata4).unwrap();
         assert_eq!(fde.bytes.len() % 8, 0);
         assert_eq!(u32::from_le_bytes(fde.bytes[12..16].try_into().unwrap()), 0x40);
         assert!(!fde.fixups.iter().any(|it| it.1 == Field::Lsda));
@@ -645,7 +759,7 @@ mod tests {
 
     #[test]
     fn an_fde_without_its_cie_is_refused() {
-        let mut fde = fde(4, &[], false, false).unwrap().bytes;
+        let mut fde = fde(4, &[], false, false, Pointers::Sdata4).unwrap().bytes;
         fde[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert!(split(&fde).is_err());
     }
@@ -658,10 +772,10 @@ mod tests {
         let mut want = Vec::new();
         for n in 0..50u64 {
             let start = section.len();
-            section.extend_from_slice(&cie(1, -8, 16, &[], false).unwrap().bytes);
+            section.extend_from_slice(&cie(1, -8, 16, &[], false, Pointers::Sdata4).unwrap().bytes);
             want.push(None);
             for _ in 0..3 {
-                let mut record = fde(n + 1, &[], false, false).unwrap();
+                let mut record = fde(n + 1, &[], false, false, Pointers::Sdata4).unwrap();
                 assert_eq!(record.fixups.len(), 2);
                 let back = (section.len() + 4 - start) as u32;
                 record.bytes[4..8].copy_from_slice(&back.to_le_bytes());
@@ -672,14 +786,131 @@ mod tests {
         let records = split(&section).unwrap();
         assert_eq!(records.iter().map(|it| it.cie).collect::<Vec<_>>(), want);
 
-        let mut bad = cie(1, -8, 16, &[], false).unwrap().bytes;
+        let mut bad = cie(1, -8, 16, &[], false, Pointers::Sdata4).unwrap().bytes;
         let first = bad.len();
-        let mut fde_one = fde(4, &[], false, false).unwrap().bytes;
+        let mut fde_one = fde(4, &[], false, false, Pointers::Sdata4).unwrap().bytes;
         fde_one[4..8].copy_from_slice(&((first + 4) as u32).to_le_bytes());
         bad.extend_from_slice(&fde_one);
-        let mut fde_two = fde(4, &[], false, false).unwrap().bytes;
+        let mut fde_two = fde(4, &[], false, false, Pointers::Sdata4).unwrap().bytes;
         fde_two[4..8].copy_from_slice(&((bad.len() + 4 - first) as u32).to_le_bytes());
         bad.extend_from_slice(&fde_two);
         assert!(split(&bad).unwrap_err().contains("no CIE"));
+    }
+
+    /// A Mach-O image laid out as a big debug build is: `__text` at the image's start, then
+    /// more than 2 GiB of code and read-only data before `__eh_frame`. Only the addresses are
+    /// made, not the bytes between them. The FDE's 8-byte fields reach back over all of it,
+    /// and the readers (`frame`, as `__unwind_info`'s builder and `.eh_frame_hdr`'s read
+    /// it, and `split`) find the function and the LSDA again; the 4-byte encoding is refused
+    /// at the same distance.
+    #[test]
+    fn mach_o_fdes_reach_past_2_gib() {
+        use crate::model::View;
+        use crate::reloc::{Ctx, apply};
+
+        let base = 0x1_0000_0000u64;
+        let function = base + 0x4000;
+        let size = 0x48u64;
+        let lsda = base + 0x1000_0000;
+        // `__eh_frame` 3 GiB past the function: text, rodata and `__unwind_info` between.
+        let section = function + (3 << 30);
+        let pointers = Pointers::of(Format::MachO);
+        assert_eq!(pointers, Pointers::Absptr8);
+
+        let cie = cie(4, -8, 30, &[0x0c, 31, 0], true, pointers).unwrap();
+        assert_eq!(&cie.bytes[8..14], b"\x01zPLR\0");
+        // `P` 0x9b and its 4 bytes, then `L` and `R` 0x10, as LLVM writes them on Darwin.
+        let data = 14 + 1 + 1 + 1;
+        assert_eq!(cie.bytes[data], 7, "the augmentation data's length");
+        assert_eq!(cie.bytes[data + 1], 0x9b);
+        assert_eq!(&cie.bytes[data + 6..data + 8], &[0x10, 0x10]);
+
+        let mut fde = fde(size, &[0x44, 0x0e, 0x10], true, true, pointers).unwrap();
+        assert_eq!(fde.bytes.len() % 8, 0);
+        let fields: Vec<_> = fde.fixups.iter().copied().collect();
+        assert_eq!(fields, [(4, Field::CiePointer), (8, Field::Function), (25, Field::Lsda)]);
+        assert_eq!(
+            u64::from_le_bytes(fde.bytes[16..24].try_into().unwrap()),
+            size,
+            "pc-range, 8 bytes"
+        );
+        assert_eq!(fde.bytes[24], 8, "the augmentation data: an 8-byte LSDA");
+
+        // The section: the CIE, then the FDE, then the terminator.
+        let at = cie.bytes.len();
+        let back = (at + 4) as u32;
+        fde.bytes[4..8].copy_from_slice(&back.to_le_bytes());
+        let ctx = |s: u64, p: u64| Ctx {
+            arch: blaze_codegen::Arch::Aarch64,
+            format: Format::MachO,
+            s,
+            a: 0,
+            p,
+            g: 0,
+            m: 0,
+            base,
+            tls: None,
+            tp: None,
+        };
+        for (offset, target) in [(8usize, function), (25, lsda)] {
+            let p = section + (at + offset) as u64;
+            apply(pointers.apply(), &ctx(target, p), &mut fde.bytes[offset..]).unwrap();
+            let mut narrow = [0u8; 4];
+            assert!(
+                apply(Pointers::Sdata4.apply(), &ctx(target, p), &mut narrow).is_err(),
+                "4 bytes don't reach {:#x} back",
+                p - target
+            );
+        }
+        let mut bytes = cie.bytes.clone();
+        bytes.extend_from_slice(&fde.bytes);
+        bytes.extend_from_slice(&[0; 4]);
+
+        let records = split(&bytes).unwrap();
+        assert_eq!(records.iter().map(|it| it.cie).collect::<Vec<_>>(), [None, Some(0)]);
+        let view = View::Slice(&bytes);
+        let found = |at: usize, cies: &[(usize, u8)]| {
+            let mut across = Vec::new();
+            let bounds = entry(view, at).unwrap().unwrap();
+            frame(view, at, bounds, section, &mut across, |named| {
+                cies.iter().find(|it| it.0 == named).map(|it| it.1).ok_or("no CIE")
+            })
+            .unwrap()
+        };
+        assert_eq!(found(0, &[]), Frame::Cie(0x10));
+        assert_eq!(found(at, &[(0, 0x10)]), Frame::Fde { pc: function, len: size });
+        let scanned = scan(view, section, &[], |at, frame, out: &mut Vec<(usize, u64, u64)>| {
+            if let Frame::Fde { pc, len } = frame {
+                out.push((at, pc, len));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scanned.items, [(at, function, size)]);
+        assert_eq!(scanned.cies, [(0, 0x10)]);
+
+        // The LSDA reads back through the same encoding.
+        let mut reader = Reader::starting_at(&bytes[at..], 25).unwrap();
+        assert_eq!(eh_pointer(&mut reader, 0x10, section + at as u64), Ok(lsda));
+    }
+
+    /// ELF keeps `pcrel|sdata4`, as GCC and LLVM write it there: a 4-byte length and LSDA.
+    #[test]
+    fn elf_fdes_keep_sdata4() {
+        let pointers = Pointers::of(Format::Elf);
+        assert_eq!(
+            (pointers, pointers.encoding(), pointers.apply()),
+            (Pointers::Sdata4, 0x1b, Apply::Rel32)
+        );
+        let cie = cie(1, -8, 16, &[], true, pointers).unwrap();
+        assert_eq!(&cie.bytes[14 + 3 + 6..14 + 3 + 8], &[0x1b, 0x1b]);
+        let fde = fde(0x40, &[], true, true, pointers).unwrap();
+        assert_eq!(
+            fde.fixups.iter().copied().collect::<Vec<_>>(),
+            [(4, Field::CiePointer), (8, Field::Function), (17, Field::Lsda)]
+        );
+        assert_eq!(fde.bytes[16], 4);
+        assert!(super::fde(1 << 32, &[], false, false, pointers).is_err(), "a function past 4 GiB");
+        assert!(super::fde(1 << 32, &[], false, false, Pointers::Absptr8).is_ok());
     }
 }

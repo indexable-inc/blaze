@@ -5,17 +5,17 @@ use blaze_query::QueryKey;
 use hir_def::{
     AdtId, DefWithBodyId, ModuleId, TraitId, expr_store::Body, hir::Expr, nameres::crate_def_map,
 };
+use hir_expand::fixture;
 use hir_ty::{
     db::{InternedClosure, InternedClosureId},
     next_solver::SimplifiedType as HirSimplifiedType,
 };
-use hir_expand::fixture;
 
 use super::{TestDB, edit, item, single};
 use crate::{
-    Fact, ItemId, ItemKey, ScopeEntry, ScopeIndexKey, captures, code, const_value, const_value_of_static,
-    discriminant, drop_check, hidden_types, implements, item_key, key, method, name, scope,
-    signature, value, vtable,
+    Fact, ItemId, ItemKey, ScopeEntry, ScopeIndexKey, captures, code, const_value,
+    const_value_of_static, discriminant, drop_check, hidden_types, implements, item_key, key,
+    method, name, scope, signature, value, vtable,
 };
 
 #[track_caller]

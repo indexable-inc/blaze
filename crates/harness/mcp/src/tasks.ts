@@ -3,6 +3,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { nuon } from "./nuon.ts";
 import { table } from "./table.ts";
+import type { Effect } from "./effects.ts";
 
 export type TaskStatus = "running" | "done" | "error";
 
@@ -15,9 +16,17 @@ export class Task {
   /** Formatted result: NUON, raw string, or the error stack. */
   result = "";
   readonly logs: string[] = [];
+  /** What the cell did outside the REPL, in order (effects.ts), and how many steps past the cap were not kept. */
+  readonly effects: Effect[] = [];
+  effectsDropped = 0;
+  /** Bytes of shown values its steps carry (effects.ts bounds it). */
+  valueBytes = 0;
+  /** The UI it draws (ui/index.ts): the latest `{type, props, children}` tree (or a list of them) its markup rendered. */
+  ui: unknown = undefined;
   readonly done: Promise<Task>;
   #resolve!: (t: Task) => void;
-  constructor(readonly id: string, readonly code: string) {
+  /** call: the agent's id for the tool call that ran this cell (Claude's tool_use id), when the client said it. */
+  constructor(readonly id: string, readonly code: string, readonly call: string | null = null) {
     this.done = new Promise((r) => (this.#resolve = r));
   }
   get elapsed_ms() { return (this.ended ?? new Date()).getTime() - this.started.getTime(); }
@@ -25,6 +34,8 @@ export class Task {
     Object.assign(this, { status: ok ? "done" : "error", value, result, ended: new Date() });
     this.#resolve(this);
   }
+  /** Something about the task changed (a step began or ended): tell whoever watches (repl.ts posts it to harnessd). */
+  touch() { onChange(this); }
   /** Plain record for printing. */
   view() {
     const { id, status, code, started, elapsed_ms, logs, result } = this;
@@ -35,9 +46,15 @@ export class Task {
 const registry = new Map<string, Task>();
 let seq = 0;
 const als = new AsyncLocalStorage<Task>();
+let onChange: (t: Task) => void = () => {};
+/** Watch every task's changes (one watcher: the REPL). */
+export function watchTasks(fn: (t: Task) => void) { onChange = fn; }
 
-export function newTask(code: string): Task {
-  const t = new Task(`t${++seq}`, code);
+/** The task the running code belongs to, if any. */
+export const currentTask = (): Task | undefined => als.getStore();
+
+export function newTask(code: string, call: string | null = null): Task {
+  const t = new Task(`t${++seq}`, code, call);
   registry.set(t.id, t);
   return t;
 }
