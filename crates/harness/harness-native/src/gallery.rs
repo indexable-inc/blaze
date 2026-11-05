@@ -65,6 +65,7 @@ pub fn load(app: &App, strip: f32, prims: bool) -> Result<(), String> {
     w.system_named::<&mut GalleryStep>("GalleryDrive").each_iter(move |it, _, step| {
         let w = it.world();
         lazy_rows(w);
+        table_rows(w);
         stack_rows(w, &mut heights);
         let time = start.elapsed().as_secs_f32();
         label_chips(w);
@@ -92,6 +93,29 @@ fn lazy_rows(w: WorldRef<'_>) {
     if let Some(status) = at(w, "cards::lazy::status") {
         View::of(status).text(&format!("{live} of 10 000 exist (rows {}..{})", r.first, r.last));
     }
+}
+
+/// The table example: 1 000 rows of made-up search results, an index column and a number column at the end.
+fn table_rows(w: WorldRef<'_>) {
+    let Some(grid) = at(w, "cards::table::scroll::grid") else { return };
+    let sites = ["bun.com", "en.wikipedia.org", "sqlite.org", "docs.rs"];
+    let cols = [
+        view::TableColumn { name: "#", chars: 3, end: true },
+        view::TableColumn { name: "title", chars: 40, end: false },
+        view::TableColumn { name: "site", chars: 16, end: false },
+        view::TableColumn { name: "score", chars: 5, end: true },
+    ];
+    view::table(View::of(grid), &cols, 1_000, Some("ui.TableHead"), |_, _| "ui.TableCell", |v, i, c| {
+        let s = match c {
+            0 => i.to_string(),
+            1 => format!("Result {i}: a title long enough to be cut at the column's edge"),
+            2 => sites[i as usize % sites.len()].to_owned(),
+            _ => format!("{:.1}", f64::from((i * 37) % 100) / 10.0),
+        };
+        if let Some(t) = v.part("text") {
+            t.text(&s);
+        }
+    });
 }
 
 /// The inserted chips' words, once their parts exist (a chip made in a system is instantiated when the system ends).

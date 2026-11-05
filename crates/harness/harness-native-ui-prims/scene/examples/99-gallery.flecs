@@ -21,6 +21,7 @@ swiftui_gallery : ui.Column {
     grid : ex.GridDemo {}
     adaptive : ex.AdaptiveDemo {}
     lazy : ex.LazyDemo {}
+    table : ex.TableDemo {}
     stack : ex.StackDemo {}
     baseline : ex.BaselineDemo {}
     alignself : ex.AlignSelfDemo {}
