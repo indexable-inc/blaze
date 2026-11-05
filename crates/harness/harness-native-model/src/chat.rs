@@ -47,6 +47,9 @@ pub struct Detail {
     /// Steps past the kernel's cap, not kept.
     pub dropped: u64,
     pub value: Arc<Value>,
+    /// What the cell draws (Svelte markup in the kernel, `mcp/src/ui/`): a `{type, props, children}` tree or a list of
+    /// them, or null.
+    pub ui: Arc<Value>,
     pub logs: String,
 }
 
@@ -91,6 +94,7 @@ impl Detail {
             effects,
             dropped: v["effects_dropped"].as_u64().unwrap_or(0),
             value: Arc::new(v["value"].clone()),
+            ui: Arc::new(v["ui"].clone()),
             logs: s(v, "logs"),
         }
     }
