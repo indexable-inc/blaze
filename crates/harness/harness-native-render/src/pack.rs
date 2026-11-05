@@ -56,6 +56,9 @@ pub struct PanelInst {
     /// in from each (points; 0 a hard cut: a scroll's edge with more beyond it fades). What it keeps is drawn as it would
     /// be whole (a card going under the title bar keeps its sides, not a new rounded top).
     pub clip: [f32; 4],
+    /// The same across: the band's left and right edges (view points; a right of 0 is none), then how far it fades in from
+    /// each (points; 0 a hard cut). A sideways scroll (a table's) cuts its content here.
+    pub clipx: [f32; 4],
 }
 
 /// One piece of a stroked line: the segment `a` to `b` with round caps, drawn anti-aliased. A polyline is one instance per
@@ -150,6 +153,8 @@ pub struct ImageInst {
     pub size: [f32; 4],
     /// The band it shows in, as a panel's `clip` (top, foot), then how far it fades in from each (0: a hard cut).
     pub clip: [f32; 4],
+    /// The band across, as a panel's `clipx` (left, right, then the fades).
+    pub clipx: [f32; 4],
 }
 
 #[repr(C)]
@@ -183,4 +188,6 @@ pub struct GlyphInst {
     pub fx: [f32; 4],
     /// How far it fades in from its band's top and foot (points; 0: a hard cut), 0, 0.
     pub fade: [f32; 4],
+    /// The band across, as a panel's `clipx` (left, right, then the fades).
+    pub clipx: [f32; 4],
 }
