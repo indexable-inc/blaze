@@ -50,7 +50,9 @@ struct Top {
 pub fn install(world: WorldRef<'_>) {
     let hits: Rc<RefCell<Vec<Hit>>> = Rc::default();
     let sink = hits.clone();
-    world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).each_entity(move |e, (_, laid)| {
+    // After layout (this pass's places; its `(&Node, &Laid)` terms make flecs merge layout's writes first), then the
+    // pointer's resolve after every hit is in.
+    world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).phase(Phase::AfterLayout).each_entity(move |e, (_, laid)| {
         let (mut depth, mut root) = (0u32, e);
         let mut clip: Option<Laid> = None;
         let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
@@ -91,7 +93,7 @@ pub fn install(world: WorldRef<'_>) {
     let app = *world.lookup(APP).id();
     // The shape a press holds until its release (None: the press was on no node), while the button is down.
     let held: Cell<Option<Option<Pointer>>> = Cell::new(None);
-    world.system_named::<&PointerState>("UiPointer").each_iter(move |it, _, p| {
+    world.system_named::<&PointerState>("UiPointer").phase(Phase::Resolve).each_iter(move |it, _, p| {
         let mut hits = hits.borrow_mut();
         hits.sort_by(|a, b| a.key.0.cmp(&b.key.0).then(a.key.1.total_cmp(&b.key.1)).then(a.key.2.cmp(&b.key.2)).then(a.key.3.cmp(&b.key.3)));
         let top = hits

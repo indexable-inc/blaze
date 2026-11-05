@@ -93,6 +93,25 @@ fn code_ink(w: WorldRef<'_>, dark: bool) -> Vec<(String, [f32; 4])> {
     out
 }
 
+/// `rect` (points: x, y, w, h) with its edges on the device pixel grid at `sc` pixels a point, as glyphs and the terminal's
+/// cells already are: at a zoom whose scale is not a whole number (1.1 on a Retina display is 2.2 pixels a point) a plate
+/// would otherwise straddle pixels, its edges soft and up to half a pixel off the snapped words it sits behind. Edges, not
+/// sizes, are rounded, so plates that meet still meet; a side that has any length keeps at least a pixel.
+#[must_use]
+pub fn snap_rect(rect: [f32; 4], sc: f32) -> [f32; 4] {
+    if sc <= 0.0 {
+        return rect;
+    }
+    let side = |at: f32, len: f32| {
+        let (a, b) = ((at * sc).round(), ((at + len) * sc).round());
+        let b = if len > 0.0 { b.max(a + 1.0) } else { b };
+        (a / sc, (b - a) / sc)
+    };
+    let (x, w) = side(rect[0], rect[2]);
+    let (y, h) = side(rect[1], rect[3]);
+    [x, y, w, h]
+}
+
 /// den's `panel_from`: a plate of `fill` with `edge` and `shape` at `alpha`.
 #[must_use]
 pub fn panel_from(
@@ -305,6 +324,16 @@ impl Painter {
             .map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
         match p.kind {
             PaintKind::Plate => {
+                // At rest, on whole device pixels at this frame's scale (the zoom's): crisp, and lined up with the words
+                // on it. One still moving (mid-slide, posed, in a transition) is drawn where it is, as moving glyphs are.
+                // (Within a thousandth of a point: a settled spring is only that close to its target.)
+                let near = |a: f32, b: f32| (a - b).abs() <= 1e-3;
+                let rest = near(p.scale, 1.0)
+                    && e.try_cloned::<&Laid>().is_some_and(|l| {
+                        near(l.x, laid.x) && near(l.y, laid.y) && near(l.w, laid.w) && near(l.h, laid.h)
+                    });
+                let grid = |r: [f32; 4]| if rest { snap_rect(r, sc) } else { r };
+                let rect = grid(rect);
                 let fill = e.try_cloned::<&Fill>().unwrap_or_default();
                 let edge = e.try_cloned::<&Edge>().unwrap_or_default();
                 let mut shape = e.try_cloned::<&Shape>().unwrap_or_default();
@@ -333,12 +362,12 @@ impl Painter {
                     .try_cloned::<&HoverLook>()
                     .zip(e.try_cloned::<&HoverAmt>().map(|h| h.spring.x.clamp(0.0, 1.0)));
                 if let Some((l, h)) = hover.filter(|(_, h)| *h > 0.004) {
-                    let r = [
+                    let r = grid([
                         rect[0] - l.pad,
                         rect[1] - l.pad,
                         rect[2] + 2.0 * l.pad,
                         rect[3] + 2.0 * l.pad,
-                    ];
+                    ]);
                     d.panel(wash(
                         if dark { l.dark } else { l.light },
                         r,
@@ -759,4 +788,25 @@ pub fn caret_blink(since: f32) -> f32 {
     let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
     let k = (v + 0.5).clamp(0.0, 1.0);
     k * k * (3.0 - 2.0 * k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snap_rect;
+
+    /// At 2 pixels a point a half-point plate is already on the grid and stays; at a zoom of 1.1 (2.2) a selection pill
+    /// on a row at 137.5 lands on whole pixels, a plate under it still meets it, and a thin hairline keeps a pixel.
+    #[test]
+    fn plates_snap_to_device_pixels_at_any_zoom() {
+        assert_eq!(snap_rect([10.5, 137.5, 228.0, 24.0], 2.0), [10.5, 137.5, 228.0, 24.0]);
+        let sc = 2.2;
+        let pill = snap_rect([10.5, 137.5, 228.0, 24.0], sc);
+        for v in pill {
+            assert!(((v * sc) - (v * sc).round()).abs() < 1e-3, "{pill:?} off the grid");
+        }
+        let under = snap_rect([10.5, 161.5, 228.0, 24.0], sc);
+        assert!((pill[1] + pill[3] - under[1]).abs() < 1e-4, "{pill:?} and {under:?} no longer meet");
+        let hair = snap_rect([0.0, 100.3, 50.0, 0.3], 1.34);
+        assert!(hair[3] * 1.34 >= 1.0 - 1e-4, "a hairline vanished: {hair:?}");
+    }
 }
