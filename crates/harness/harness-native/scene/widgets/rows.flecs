@@ -120,17 +120,17 @@ hn {
     }
   }
 
-  // The archive row at the sidebar's bottom (`selected`: lit while the Archive, or an object opened from it, is
-  // selected): an archive box that rises and grows on the row's hover (its HoverAmt spring) and bounces when an object is
+  // The archive row at the sidebar's bottom (`selected`: its glyph in the accent while the Archive, or an object opened
+  // from it, is selected): an archive box that rises and grows on the row's hover (its HoverAmt spring) and bounces when an object is
   // archived (its Bump, kicked by the host). Clicked, the Archive pane (hn.ArchivePane) takes the main card.
   @tree ChildOf
   template ArchiveRow : Row {
     (IsA, ui.IconButton)
     Tooltip: {text: "Archive"}
     if $selected {
-      Fill: $tone_select
+      Inks: {rest: $tone_icon_on, hover: $tone_icon_on}
     } else {
-      Fill: $tone_clear
+      Inks: {rest: $tone_icon_rest, hover: $tone_icon_hover}
     }
     icon : ui.Symbol {
       Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}

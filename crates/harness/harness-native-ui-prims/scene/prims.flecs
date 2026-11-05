@@ -102,9 +102,10 @@ ui {
     PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
   }
 
-  // An icon button: a square that hugs its one symbol, its hover and press wash on the square only (never the row it
-  // sits in), with an optional Tooltip. Children: `icon : ui.Symbol`.
-  prefab IconButton : ui.Row, Wash {
+  // An icon button, the borderless way (a macOS toolbar or sidebar button): no plate, at rest or under the pointer. Its
+  // glyph is in muted ink, easing to strong ink on hover (Inks, on the hover spring); held, it gives (PressGive: scaled a
+  // little and dimmed) and springs back. Its square is the hit area, with an optional Tooltip. Children: `icon : ui.Symbol`.
+  prefab IconButton : ui.Row {
     Pressable
     Action: {name: ""}
     Cursor: {shape: Arrow}
@@ -112,9 +113,9 @@ ui {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 0, b: 0}
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Fill: $tone_clear
+    Inks: {rest: $tone_icon_rest, hover: $tone_icon_hover}
+    PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
   }
 
   // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.

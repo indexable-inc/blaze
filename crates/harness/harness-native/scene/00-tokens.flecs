@@ -188,6 +188,16 @@ export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// An icon button (ui.IconButton) has no plate: its glyph rests in tone_icon_rest and eases to tone_icon_hover under the
+// pointer (tone_icon_on while what it opens is open); held, it scales to icon_press_scale and dims to icon_press_dim, and
+// springs back on the press spring (a little under-damped, so the release has a touch of give).
+export const tone_icon_rest: Fill = $tone_ink_3
+export const tone_icon_hover: Fill = $tone_ink_1
+export const tone_icon_on: Fill = $tone_accent
+export const icon_press_scale = 0.92
+export const icon_press_dim = 0.7
+export const spring_press_omega = 38
+export const spring_press_zeta = 0.62
 // An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
 // black over a light one (a scroll on the terminal's ground follows its Scheme).
 export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
