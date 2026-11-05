@@ -93,7 +93,8 @@ pub struct TextStyle {
     /// The line height of code blocks in markdown text (0: the text's own `line`).
     pub code_line: f32,
     /// Which surface the style was written for (0 transcript, 1 composer, 2 title, 3 rail names, 4 permission, 5
-    /// palette, 6 chips and digits, 7 the Settings page). Nothing reads it: the scene keeps it as a note, and the text is the same whatever it says.
+    /// palette, 6 chips and digits, 7 the Settings page), a note the text ignores, but for two that pick its face: 9 is
+    /// code (the monospace face), 10 tabular figures (the text face, every digit as wide: a column of numbers).
     pub role: i32,
     pub bold: i32,
     /// The weight the sidebar's labels set their text in: 0 as `bold` says, 500 medium (the open row's label).

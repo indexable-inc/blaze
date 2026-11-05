@@ -32,14 +32,16 @@ const ELEMENTS: [(&str, &str); 11] = [
 const UNKNOWN: &str = "hn.GenUnknown";
 
 /// What is left of the caps as a tree is built, and whether it was cut.
-struct Budget {
+struct Budget<'a, 'm> {
     left: usize,
     cut: bool,
+    /// How tables measure their words (see [`view::table::table`]).
+    measure: &'a mut Measure<'m>,
 }
 
 /// Fill a `hn.ChatUi` row with the tree `ui`.
-pub(super) fn fill(row: View<'_>, ui: &Value) {
-    let mut b = Budget { left: MAX_ELEMENTS, cut: false };
+pub(super) fn fill(row: View<'_>, ui: &Value, measure: &mut Measure<'_>) {
+    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
             Value::Array(a) => a.iter().collect(),
@@ -80,7 +82,7 @@ fn points(node: &Value, name: &str) -> Option<f32> {
 }
 
 /// Keep `parent`'s children in step with `nodes`: child `i` keyed `g<i>` and made from its type's prefab.
-fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget) {
+fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let mut kept = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         if b.left == 0 || depth >= MAX_DEPTH {
@@ -94,7 +96,7 @@ fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget) {
 }
 
 /// Set one element's props on its entity, and build its children.
-fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget) {
+fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
     let kind = node["type"].as_str().unwrap_or("");
     let kids: Vec<&Value> = node["children"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     match kind {
@@ -118,11 +120,16 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget) {
         }
         "Markdown" => {
             let mut rows = Vec::new();
-            super::blocks(&words(node, "text"), &mut rows);
-            view::for_each_of(v, rows.iter().enumerate().map(|(i, r)| (format!("m{i}"), r.prefab(), r)), |row, r, _| super::fill_row(row, r));
+            super::blocks(&words(node, "text"), false, &mut rows);
+            view::for_each_of(v, rows.iter().enumerate().map(|(i, r)| (format!("m{i}"), r.prefab(), r)), |row, r, _| {
+                super::fill_row(row, r, &RowCtx::NOWHERE, &mut *b.measure);
+            });
         }
-        "Code" => super::fill_row(v, &Row::Code { lang: words(node, "lang"), text: words(node, "text") }),
-        "Table" => table(v, node),
+        "Code" => {
+            let code = Row::Code { lang: words(node, "lang"), text: words(node, "text") };
+            super::fill_row(v, &code, &RowCtx::NOWHERE, &mut *b.measure);
+        }
+        "Table" => table(v, node, b),
         "Badge" => {
             if let Some(t) = v.part("text") {
                 toned(t, &words(node, "text"), &words(node, "tone"));
@@ -207,8 +214,8 @@ fn toned(v: View<'_>, s: &str, tone: &str) {
 
 /// A `Table`: `rows` of records (columns their keys; the kernel sends their order as `columns`) or of lists, `columns` naming them (a title,
 /// or `{title, key}`: the record field it shows). Drawn as the transcript's grids are (super::fill_grid), without an index:
-/// a header, numbers at the end, nulls dim, a cut cell whole on hover, a foot saying how many rows.
-fn table(v: View<'_>, node: &Value) {
+/// a `ui.Table` with a header, cells typed by their values, a foot saying how many rows when not all show.
+fn table(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) {
     let rows: &[Value] = prop(node, "rows").as_array().map_or(&[], Vec::as_slice);
     // (title, record key) of each column.
     let mut cols: Vec<(String, String)> = prop(node, "columns")
@@ -254,35 +261,17 @@ fn table(v: View<'_>, node: &Value) {
         }
     };
     let shown = rows.len().min(MAX_ROWS);
-    let texts: Vec<Vec<String>> = (0..shown).map(|r| (0..cols.len()).map(|c| super::cell_text(cell(r, c))).collect()).collect();
-    let columns: Vec<view::TableColumn<'_>> = cols
-        .iter()
-        .enumerate()
-        .map(|(c, (title, _))| view::TableColumn {
-            name: title,
-            chars: texts.iter().map(|r| r[c].chars().count()).max().unwrap_or(0).max(title.chars().count()),
-            end: (0..shown).all(|r| cell(r, c).is_number() || cell(r, c).is_null()) && (0..shown).any(|r| cell(r, c).is_number()),
-        })
-        .collect();
+    let data = view::table::Table {
+        cols: cols.iter().map(|(title, _)| view::table::Column { name: title.clone(), align: view::table::Align::Auto }).collect(),
+        rows: (0..shown).map(|r| (0..cols.len()).map(|c| super::value_cell(cell(r, c), "")).collect()).collect(),
+        head: true,
+    };
     if let Some(grid) = v.part("card").and_then(|c| c.part("grid")) {
-        let prefab = |r: u32, c: usize| if cell(r as usize, c).is_null() { "hn.ChatCellDim" } else { "hn.ChatCell" };
-        view::table(grid, &columns, shown as u32, Some("hn.ChatHead"), prefab, |e, r, c| {
-            let s = &texts[r as usize][c];
-            if let Some(t) = e.part("text") {
-                t.text(s);
-            }
-            let cut = s.chars().count() > columns[c].chars.min(view::TABLE_MAX_CHARS);
-            let tip = e.entity().try_cloned::<&Tooltip>();
-            if cut && tip.as_ref().is_none_or(|t| t.text.as_str() != s) {
-                e.set(Tooltip { text: s.as_str().into() });
-            } else if !cut && tip.is_some() {
-                e.entity().remove(Tooltip::id());
-            }
-        });
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: None, open: None };
+        view::table(grid, &data, opts, &mut *b.measure);
     }
     if let Some(f) = v.part("foot") {
         let total = rows.len();
-        let s = if total == 1 { "" } else { "s" };
-        f.text(&if shown < total { format!("{shown} of {total} rows") } else { format!("{total} row{s}") });
+        super::foot(f, &if shown < total { format!("{shown} of {total} rows") } else { String::new() });
     }
 }

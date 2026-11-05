@@ -17,7 +17,7 @@ export type SearchResult = {
 export function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<Table<SearchResult>> {
   const q = JSON.stringify(oneLine(query, 60));
   return effect("search", `Searching Google for ${q}`, `Searched Google for ${q}`, query, () => search(query, opts), (r) => ({
-    detail: `${r.length} result${r.length === 1 ? "" : "s"}`, show: r,
+    detail: `${r.length} result${r.length === 1 ? "" : "s"}`, show: r, kind: "search",
   }));
 }
 

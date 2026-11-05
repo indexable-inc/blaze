@@ -95,7 +95,7 @@ impl App {
             self.poke();
             return;
         }
-        if self.chat_wheel(&ev, z) {
+        if self.table_wheel(&ev, z) || self.chat_wheel(&ev, z) {
             return;
         }
         if self.archive_wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise) {

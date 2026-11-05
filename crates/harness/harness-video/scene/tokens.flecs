@@ -7,8 +7,15 @@
 export const size_caption = 11
 export const size_body = 13
 export const size_code = 11.5
-export const table_row = 22
+export const table_row = 24
 export const table_gap = 14
+export const table_pad = 6
+export const size_table = 12.5
+export const result_snippet_h = 36
+export const textarea_max_h = 132
+export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {1, 1, 1, 0.08}}
+export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.580, 0.600, 1.0, 0.32}}
 export const radius_control = 6
 export const radius_card = 12
 export const spring_transition_omega = 20

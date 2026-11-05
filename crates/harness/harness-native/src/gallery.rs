@@ -95,27 +95,31 @@ fn lazy_rows(w: WorldRef<'_>) {
     }
 }
 
-/// The table example: 1 000 rows of made-up search results, an index column and a number column at the end.
+/// The table example: 1 000 rows of made-up search results, an index column, a url column shown as its host, a bool
+/// column as marks and a number column at the end (measured by the monospace estimate: a gallery has no typesetter).
 fn table_rows(w: WorldRef<'_>) {
+    use harness_native_ui_layout::typeset::{Estimate, Measure};
+    use view::table::{Align, Cell, Column, Kind, Opts, Table};
     let Some(grid) = at(w, "cards::table::scroll::grid") else { return };
-    let sites = ["bun.com", "en.wikipedia.org", "sqlite.org", "docs.rs"];
-    let cols = [
-        view::TableColumn { name: "#", chars: 3, end: true },
-        view::TableColumn { name: "title", chars: 40, end: false },
-        view::TableColumn { name: "site", chars: 16, end: false },
-        view::TableColumn { name: "score", chars: 5, end: true },
-    ];
-    view::table(View::of(grid), &cols, 1_000, Some("ui.TableHead"), |_, _| "ui.TableCell", |v, i, c| {
-        let s = match c {
-            0 => i.to_string(),
-            1 => format!("Result {i}: a title long enough to be cut at the column's edge"),
-            2 => sites[i as usize % sites.len()].to_owned(),
-            _ => format!("{:.1}", f64::from((i * 37) % 100) / 10.0),
-        };
-        if let Some(t) = v.part("text") {
-            t.text(&s);
-        }
-    });
+    let sites = ["https://bun.com/docs", "https://en.wikipedia.org/wiki/Rust", "https://sqlite.org/lang.html", "https://docs.rs/flecs"];
+    let col = |name: &str, align| Column { name: name.into(), align };
+    let data = Table {
+        cols: vec![col("#", Align::End), col("title", Align::Auto), col("url", Align::Auto), col("resolved", Align::Auto), col("score", Align::Auto)],
+        rows: (0..1_000u32)
+            .map(|i| {
+                vec![
+                    Cell::new(Kind::Dim, i.to_string()),
+                    Cell::new(Kind::Text, format!("Result {i}: a title long enough to be cut at the column's edge")),
+                    Cell::new(Kind::Url, sites[i as usize % sites.len()]),
+                    Cell::new(Kind::Bool, if i % 3 == 0 { "false" } else { "true" }),
+                    Cell::new(Kind::Number, format!("{:.1}", f64::from((i * 37) % 100) / 10.0)),
+                ]
+            })
+            .collect(),
+        head: true,
+    };
+    let opts = Opts { look: "ui.Table", shown: data.rows.len(), action: None, open: Some(2) };
+    view::table(View::of(grid), &data, opts, &mut |s, st, _| Estimate.width(0, s, st));
 }
 
 /// The inserted chips' words, once their parts exist (a chip made in a system is instantiated when the system ends).

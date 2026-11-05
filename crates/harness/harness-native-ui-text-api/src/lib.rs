@@ -8,12 +8,14 @@ pub struct Text {
 }
 
 /// The `Text` beside it is inline markdown (a paragraph, a heading or a list item of a transcript): `**bold**`, `*italic*`,
-/// `` `code` `` in the code face on a chip in `chip` (dark, light), `[links](url)` as their words. The markers are not
-/// shown; blocks (fences, lists) are the host's rows, not this.
+/// `` `code` `` in the code face on a chip in `chip` (dark, light), `[links](url)` as their words in `link` (dark, light;
+/// unset, the text's own ink). The markers are not shown; blocks (fences, lists) are the host's rows, not this.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct MarkdownText {
     pub chip_dark: harness_native_ui_look_api::Rgba,
     pub chip_light: harness_native_ui_look_api::Rgba,
+    pub link_dark: harness_native_ui_look_api::Rgba,
+    pub link_light: harness_native_ui_look_api::Rgba,
 }
 
 /// Where a truncated line loses its words for the ellipsis.

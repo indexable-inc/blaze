@@ -452,11 +452,12 @@ impl App {
             time: self.time,
             marked: marked.as_deref(),
         };
+        let paint_ = self.paint.get_mut();
         term::draw(
             d,
             &mut self.grid,
-            &mut self.paint.fonts,
-            &mut self.paint.cache,
+            &mut paint_.fonts,
+            &mut paint_.cache,
             &snap,
             &paint,
             upload,

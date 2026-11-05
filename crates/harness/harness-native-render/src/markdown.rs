@@ -1,15 +1,18 @@
 //! Inline markdown (`MarkdownText`): a paragraph's, heading's or list item's words with their markers taken out and the
 //! faces they asked for as runs: `**bold**` / `__bold__`, `*italic*` / `_italic_`, `***both***`, `` `code` `` (and
-//! ``` ``code with ` in it`` ```), `[words](url)` as its words, `\*` as a plain star. Blocks (fences, lists, quotes) are
-//! the host's rows, not this. Ranges are UTF-16 units of the plain text, as layouts count.
+//! ``` ``code with ` in it`` ```), `[words](url)` as its words (in the link ink), `\*` as a plain star. Blocks (fences,
+//! lists, quotes) are the host's rows, not this; [`table`] reads a GitHub table's lines into its cells for the host's
+//! table row. Ranges are UTF-16 units of the plain text, as layouts count.
 use crate::text::{Face, Run};
 
-/// Inline markdown set: the words shown, the faces over them, and the code spans (each drawn on a chip).
+/// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip) and the links (their
+/// words' range and where they go).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Inline {
     pub text: String,
     pub runs: Vec<Run>,
     pub code: Vec<(usize, usize)>,
+    pub links: Vec<(usize, usize, String)>,
 }
 
 /// `src` read as inline markdown.
@@ -117,6 +120,7 @@ pub fn inline(src: &str) -> Inline {
                             for (a, b) in inner.code {
                                 out.code.push((a + base, b + base));
                             }
+                            out.links.push((base, at, chars[j + 2..j + 2 + k].iter().collect()));
                             i = j + 2 + k + 1;
                         }
                         None => {
@@ -191,9 +195,175 @@ fn has_closer(chars: &[char], from: usize, c: char, want: usize) -> bool {
     false
 }
 
+/// A table column's alignment, from its delimiter cell: `:--` left, `:-:` centre, `--:` right, `---` unsaid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A GitHub table: its header's cells, each column's alignment, and its rows, each as many cells as the header (a short
+/// row padded with empty cells, a long one cut, as GitHub does). Cells are inline markdown, trimmed, as written: an
+/// escaped `\|` stays escaped outside code ([`inline`] shows it as `|`) and is a plain `|` inside a code span.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Table {
+    pub head: Vec<String>,
+    pub align: Vec<Align>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// The cells of one table line: split at its pipes, never at an escaped `\|` or one inside a code span; the leading and
+/// trailing pipes are optional.
+#[must_use]
+pub fn cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let chars: Vec<char> = t.chars().collect();
+    let mut out = vec![String::new()];
+    let mut ended = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        ended = false;
+        let cur = out.last_mut().expect("one cell at least");
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(&n) = chars.get(i + 1) {
+                    cur.push(n);
+                }
+                i += 2;
+            }
+            '`' => {
+                let n = chars[i..].iter().take_while(|&&t| t == '`').count();
+                let close = (i + n..chars.len())
+                    .find(|&j| chars[j - 1] != '`' && chars[j..].iter().take_while(|&&t| t == '`').count() == n);
+                let ticks = "`".repeat(n);
+                match close {
+                    Some(j) => {
+                        let inner: String = chars[i + n..j].iter().collect();
+                        cur.push_str(&ticks);
+                        cur.push_str(&inner.replace("\\|", "|"));
+                        cur.push_str(&ticks);
+                        i = j + n;
+                    }
+                    None => {
+                        cur.push_str(&ticks);
+                        i += n;
+                    }
+                }
+            }
+            '|' => {
+                out.push(String::new());
+                ended = true;
+                i += 1;
+            }
+            _ => {
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    if t.starts_with('|') {
+        out.remove(0);
+    }
+    if ended && !out.is_empty() {
+        out.pop();
+    }
+    out.into_iter().map(|c| c.trim().to_owned()).collect()
+}
+
+/// A table's delimiter line (`| :--- | ---: |`) as its columns' alignments; None for any other line.
+#[must_use]
+pub fn delimiter(line: &str) -> Option<Vec<Align>> {
+    if !line.contains('-') || !line.contains('|') {
+        return None;
+    }
+    let cs = cells(line);
+    if cs.is_empty() {
+        return None;
+    }
+    cs.iter()
+        .map(|c| {
+            let (l, r) = (c.starts_with(':'), c.len() > 1 && c.ends_with(':'));
+            let mid = c.trim_start_matches(':').trim_end_matches(':');
+            (!mid.is_empty() && mid.chars().all(|ch| ch == '-')).then_some(match (l, r) {
+                (true, true) => Align::Center,
+                (true, false) => Align::Left,
+                (false, true) => Align::Right,
+                (false, false) => Align::None,
+            })
+        })
+        .collect()
+}
+
+/// The GitHub table `lines` start with, and how many lines it takes: a header line with a pipe, a delimiter line of as
+/// many cells, then rows while lines have a pipe in them (a blank line or one without ends it). None when they do not
+/// start one.
+#[must_use]
+pub fn table(lines: &[&str]) -> Option<(Table, usize)> {
+    let (head, delim) = (lines.first()?, lines.get(1)?);
+    if !head.contains('|') {
+        return None;
+    }
+    let head = cells(head);
+    let align = delimiter(delim)?;
+    if align.len() != head.len() {
+        return None;
+    }
+    let n = head.len();
+    let mut rows = Vec::new();
+    let mut used = 2;
+    for l in &lines[2..] {
+        if l.trim().is_empty() || !l.contains('|') {
+            break;
+        }
+        let mut r = cells(l);
+        r.resize(n, String::new());
+        rows.push(r);
+        used += 1;
+    }
+    Some((Table { head, align, rows }, used))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_ranged() {
+        let m = inline("see [the **docs**](https://x.dev/a) now");
+        assert_eq!(m.text, "see the docs now");
+        assert_eq!(m.links, vec![(4, 12, "https://x.dev/a".to_owned())]);
+    }
+
+    /// A GitHub table's cells: pipes in code spans and escaped pipes do not split, ragged rows are evened to the header,
+    /// alignment comes from the delimiter line.
+    #[test]
+    fn tables_split_into_cells() {
+        assert_eq!(cells(r"| a | `x|y` | b \| c |"), ["a", "`x|y`", r"b \| c"]);
+        assert_eq!(cells("a | b"), ["a", "b"]);
+        assert_eq!(cells(r"| `a\|b` | ``c ` | d`` |"), ["`a|b`", "``c ` | d``"]);
+        assert_eq!(cells("| unclosed `tick | x |"), ["unclosed `tick", "x"]);
+        assert_eq!(cells("| a | |"), ["a", ""]);
+        assert_eq!(delimiter("| :--- | :-: | --: | --- |"), Some(vec![Align::Left, Align::Center, Align::Right, Align::None]));
+        assert_eq!(delimiter("|---|---|"), Some(vec![Align::None, Align::None]));
+        assert_eq!(delimiter("| a | --- |"), None);
+        assert_eq!(delimiter("- item"), None);
+        let lines = ["| name | n |", "|:--|--:|", "| **a** | 1 |", "| b |", "| c | 3 | extra |", "", "after"];
+        let (t, used) = table(&lines).unwrap();
+        assert_eq!(used, 5);
+        assert_eq!(t.head, ["name", "n"]);
+        assert_eq!(t.align, [Align::Left, Align::Right]);
+        assert_eq!(t.rows, [vec!["**a**", "1"], vec!["b", ""], vec!["c", "3"]]);
+        // A header whose delimiter has another count is no table; nor is a line with no delimiter under it.
+        assert!(table(&["| a | b |", "|---|"]).is_none());
+        assert!(table(&["| a | b |", "| c | d |"]).is_none());
+        // An escaped pipe shows as a pipe.
+        assert_eq!(inline(&cells(r"| a \| b |")[0]).text, "a | b");
+    }
 
     #[test]
     fn markers_go_and_faces_come() {

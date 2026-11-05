@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-api = { path = "../harness-native-api" }
 harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }

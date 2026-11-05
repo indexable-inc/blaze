@@ -1061,6 +1061,7 @@ dependencies = [
 name = "harness-native-ui-view"
 version = "0.1.0"
 dependencies = [
+ "harness-native-api",
  "harness-native-flecs",
  "harness-native-ui-input-api",
  "harness-native-ui-layout-api",
