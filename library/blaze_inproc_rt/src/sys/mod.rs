@@ -69,7 +69,9 @@
 //!   executable, at its linked address plus `slide`, with the mapping of its object, at once
 //!   (one `mmap` or `mach_vm_map` each; Windows asks the daemon, OVERLAY). The caller proved
 //!   every overlay is a code segment of the image, with the bytes it replaces, or inside a
-//!   reservation ([`crate::handshake::Grant::check`]).
+//!   reservation ([`crate::handshake::Grant::check`]). On Linux the code memory's
+//!   arena (object 0, `Access::Execute`, in a reservation) is then sealed (`mseal`): never
+//!   unmapped, remapped or reprotected after. The code segments stay unsealed.
 //! - `struct Scope` (start hook): the run process's global scope, as the system loader filled
 //!   it from the executable's libraries. `fn new() -> Scope`, `fn find(&mut self, name: &str)
 //!   -> Result<Option<u64>, Error>`: the address of the C name `name`, none when nothing loaded

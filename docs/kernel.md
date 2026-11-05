@@ -71,7 +71,7 @@ not built), **next** (an opportunity found, unowned).
 | `openat2` `OPENAT2_REGULAR` | 7.2 | every read of a file no request keeps (`Effect::ReadAll`, `Read`, `Map`: store packs and indexes, journals, the daemon's image, source files) opens only a regular file; a directory, FIFO, socket or device is refused with `EFTYPE`, named (`READ_OF_NO_FILE`). io_uring's `IORING_OP_OPENAT2` (`uring/files.rs`), the threads driver's `openat2` (`raw::openat2_read_regular`) | blaze-core | in use |
 | file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path learns of a write the file system lost | blaze-core, blaze-cas | in use (this lane) |
 | `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon stay out of the page cache, on a file system that takes it | blaze-core | in use (this lane) |
-| `mseal` | 6.10 | sealing the loader's code mappings that are never changed | blaze-live | in use (this lane) |
+| `mseal` | 6.10 | the dev run's start hook seals the code memory's arena it lays: never unmapped, remapped or made writable after (`seal` in `library/blaze_inproc_rt/src/sys/linux.rs`). The executable's code segments stay unsealed, since blaze-live windows exec named sections there (`map_twice` in `crates/blaze-live/src/slots/linux.rs`) | blaze_inproc_rt | in use |
 | `cachestat` | 6.5 | which store entries are warm (resident in the page cache) | blaze-cas | in use (this lane) |
 
 ### Planned (owned elsewhere, not built here)

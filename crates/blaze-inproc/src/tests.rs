@@ -994,7 +994,8 @@ mod linux {
     impl Drop for FileLike {
         fn drop(&mut self) {
             // SAFETY: the pages this made (or the overlay that replaced them), which no thread
-            // runs any more: the test joined its thread.
+            // runs any more: the test joined its thread. An arena overlay is sealed (`mseal`),
+            // which munmap refuses with EPERM, leaving it mapped for the rest of the process.
             unsafe { libc::munmap(self.at as *mut libc::c_void, self.len) };
         }
     }
@@ -1078,6 +1079,51 @@ mod linux {
         }
         let (sevens, eights) = runner.join().unwrap();
         assert!(sevens > 0 && eights > 0);
+    }
+
+    /// The start hook seals the code memory's arena it lays in a reservation: the kernel
+    /// refuses to make it writable or to unmap it. A code segment's overlay stays unsealed,
+    /// for blaze-live's windows over exec named sections.
+    #[test]
+    fn the_arena_overlay_is_sealed_and_a_code_segment_overlay_is_not() {
+        let mut memory = CodeMemory::new("seal", 1, 0).unwrap();
+        let page = memory.page();
+        memory.write(0, &returning(9)).unwrap();
+        memory.publish(CodeRange { offset: 0, len: page }).unwrap();
+        let (arena, code) = (FileLike::new(page as usize), FileLike::new(page as usize));
+        let (mut channel, _, _) = connected();
+        let granted = [sys::granted(memory.object(), Rights::Code).unwrap()];
+        let over = |place: Place| Overlay {
+            object: 0,
+            offset: 0,
+            len: page,
+            at: 0x1000_0000,
+            access: Access::Execute,
+            place,
+            image: false,
+        };
+        for (pages, place) in [(&arena, Place::Reserved), (&code, Place::Code)] {
+            let slide = pages.at.wrapping_sub(0x1000_0000);
+            sys::overlay(&mut channel, &granted, &[over(place)], slide).unwrap();
+            assert_eq!(pages.bytes(), memory.bytes(CodeRange { offset: 0, len: page }).unwrap());
+            assert_eq!(call(pages.at), 9, "{place:?}");
+        }
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        let start = arena.at as *mut libc::c_void;
+        let protected =
+            // SAFETY: the arena overlay's pages, which no thread runs; a refused mprotect
+            // changes nothing.
+            unsafe { libc::mprotect(start, arena.len, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!((protected, errno()), (-1, Some(libc::EPERM)), "mprotect of the sealed arena");
+        // SAFETY: as above; a refused munmap leaves the pages mapped.
+        let unmapped = unsafe { libc::munmap(start, arena.len) };
+        assert_eq!((unmapped, errno()), (-1, Some(libc::EPERM)), "munmap of the sealed arena");
+        assert_eq!(call(arena.at), 9, "the sealed arena still runs");
+        let (at, len) = (code.at as *mut libc::c_void, code.len);
+        // SAFETY: the code segment overlay's pages, which no thread runs, made read and execute,
+        // as they are; unmapped only by `code`'s drop.
+        let reprotected = unsafe { libc::mprotect(at, len, libc::PROT_READ | libc::PROT_EXEC) };
+        assert_eq!(reprotected, 0, "a code segment overlay is not sealed: {:?}", errno());
     }
 
     fn connected() -> (Channel, Channel, u32) {
