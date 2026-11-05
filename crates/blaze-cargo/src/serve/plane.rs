@@ -1965,7 +1965,10 @@ mod tests {
         let mib = 1u64 << 20;
         let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
         let history = blaze_history::History::new(blaze_history::Config::default());
-        let plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        // No task runs: the batch's type only names one.
+        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
         // 4 MiB of source at PER_SOURCE_KIB: 4 GiB, though the kind was never seen.
         assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 4096 * mib);
         // A small unit stays at the floor.
@@ -1975,7 +1978,8 @@ mod tests {
         let mut history = blaze_history::History::new(blaze_history::Config::default());
         history.observe(kinds::COMPILE, None, 1_000, 512 * mib);
         let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
-        let plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
         assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 512 * mib);
     }
 
