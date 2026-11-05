@@ -67,7 +67,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "mseal",
         since: v(6, 10),
-        used_for: "sealing the code a dev run's start hook lays over the executable",
+        used_for: "sealing the code memory's arena a dev run's start hook lays",
     },
     Feature { name: "cachestat", since: v(6, 5), used_for: "the store's choice of warm entries" },
 ];

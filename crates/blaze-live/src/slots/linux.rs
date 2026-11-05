@@ -2,8 +2,7 @@
 //!
 //! The patch code region is the daemon's code memory (blaze-inproc), mapped by the start hook
 //! before `main`: the commit writes the code there, and nothing here maps over the region or
-//! writes it. The hook seals every overlay of code it lays (`mseal`, in the code segment the
-//! region is in), so the kernel refuses a window over it too. The image's mappings and their protections are read from /proc/self/maps once,
+//! writes it. The image's mappings and their protections are read from /proc/self/maps once,
 //! at start. Read-only pages are written through a second mapping: the first write into one
 //! moves a window of its mapping ([`WINDOW`], within the mapping) onto a memory file mapped
 //! twice, with the protection it had ([`Aliases`]), so that write and every later one into the
@@ -45,7 +44,6 @@ const MAP_SHARED: i32 = 1;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 const MREMAP_MAYMOVE: i32 = 1;
 const MREMAP_FIXED: i32 = 2;
-const EPERM: i32 = 1;
 #[cfg(test)]
 const SC_PAGESIZE: i32 = 30;
 const MFD_CLOEXEC: u32 = 1;
@@ -231,13 +229,7 @@ fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
         // meanwhile: it is read-only pages of the image.
         let moved = unsafe { mremap(view, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, to) };
         if moved != to {
-            let sealed = std::io::Error::last_os_error().raw_os_error() == Some(EPERM);
-            let error = error(if sealed {
-                "moving a memory file over the region, code the start hook sealed (mseal): a \
-                 link restarts, never patches, an executable section outside the patch code region"
-            } else {
-                "moving a memory file over the region"
-            });
+            let error = error("moving a memory file over the region");
             // SAFETY: this function's mapping, which nothing refers to.
             unsafe { munmap(view, len) };
             // SAFETY: as above.

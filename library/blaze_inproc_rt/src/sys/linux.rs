@@ -6,10 +6,10 @@
 //!
 //! The start hook lays an overlay over its executable with one `mmap` of `MAP_FIXED`, which
 //! the kernel does under the process's `mmap_lock`: a thread running in the range fetches its
-//! next instruction from the old page or the new one, and the bytes are equal. Each overlay of
-//! code it then seals (`mseal`, Linux 6.10): that mapping stays as laid for the life of the
-//! process and its forks, since patches are writes through the daemon's view of the object and
-//! atomic word stores, never a remap ([`seal`]).
+//! next instruction from the old page or the new one, and the bytes are equal. The code
+//! memory's arena it then seals (`mseal`, Linux 6.10): that mapping stays as laid for the life
+//! of the process and its forks ([`seal`]). The code segments stay unsealed: blaze-live
+//! windows pages of them for a patch to an executable named section.
 
 use std::ffi::{CString, c_int, c_void};
 use std::ops::Range;
@@ -26,7 +26,7 @@ pub use super::unix::{
 };
 use crate::channel::Channel;
 use crate::frame::{self, kinds};
-use crate::handshake::Overlay;
+use crate::handshake::{Overlay, Place};
 use crate::{Access, Error};
 
 fn os(what: &str) -> Error {
@@ -646,24 +646,31 @@ pub fn overlay(
                 overlay.object
             )));
         }
-        if overlay.access == Access::Execute {
+        if overlay.object == 0
+            && overlay.place == Place::Reserved
+            && overlay.access == Access::Execute
+        {
             seal(mapped as u64, len, overlay.object)?;
         }
     }
     Ok(())
 }
 
-/// Seals `len` bytes of code at `at`, the mapping of object `object` that [`overlay`] just
-/// laid (`mseal`, Linux 6.10; blaze's floor is 7.3): from here on the kernel refuses
-/// `munmap`, `mmap` over it, `mremap`, `mprotect` and `pkey_mprotect` of it with EPERM, in
-/// this process and in every fork of it, so nothing can make the program's code writable or
-/// put other code in its place. Nothing needs to: the daemon changes code by writing its own
-/// view of the object and by atomic word stores (blaze-inproc), the runtime never unmaps an
-/// overlay, and blaze-live's windows never reach code: its data writes are of data classes only,
-/// since blaze-link restarts a run whose change is in an executable section outside the patch
-/// code region (`Class::Named { exec: true }`, the one data class in the code segment). A refusal (ENOSYS from
-/// a seccomp profile, EPERM, EINVAL) stops the start, naming the range: the code is never left
-/// unsealed.
+/// Seals `len` bytes of code at `at`, the arena of the code memory (object `object`) that
+/// [`overlay`] just laid in a reservation (`mseal`, Linux 6.10; blaze's floor is 7.3): from
+/// here on the kernel refuses `munmap`, `mmap` over it, `mremap`, `mprotect` and
+/// `pkey_mprotect` of it with EPERM, in this process and in every fork of it. Nothing needs
+/// to: the daemon places code there by writing its own view of the object and by atomic word
+/// stores (blaze-inproc), the runtime never unmaps an overlay, and blaze-live writes no data
+/// into a reservation, so it cuts no window there.
+///
+/// Only the arena: the code segments stay unsealed, since a live patch's change to an
+/// executable named section (`Class::Named { exec: true }`, which blaze-link sends as data and
+/// lays in the code segment) is written through a window blaze-live moves over those pages
+/// (`map_twice` in crates/blaze-live/src/slots/linux.rs).
+///
+/// A refusal (ENOSYS from a seccomp profile, EPERM, EINVAL) stops the start, naming the range:
+/// the arena is never left unsealed.
 fn seal(at: u64, len: usize, object: u32) -> Result<(), Error> {
     // SAFETY: mseal takes an address range and flags and reads and writes no memory;
     // `at..at + len` is the mapping `overlay` just laid with MAP_FIXED, so it is mapped whole
@@ -679,8 +686,9 @@ fn seal(at: u64, len: usize, object: u32) -> Result<(), Error> {
             ""
         };
         return Err(Error::new(format!(
-            "mseal of {len:#x} bytes of object {object}'s code at {at:#x}: {error}{hint}: the start \
-             hook seals the code it lays (Linux 6.10, docs/kernel.md) and runs none it could not seal"
+            "mseal of {len:#x} bytes of object {object}'s arena at {at:#x}: {error}{hint}: the \
+             start hook seals the code memory's arena (Linux 6.10, docs/kernel.md) and runs none \
+             it could not seal"
         )));
     }
     Ok(())
