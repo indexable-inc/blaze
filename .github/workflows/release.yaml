@@ -56,12 +56,14 @@ jobs:
           if-no-files-found: error
       # library/, which a blaze with no checkout of its commit downloads once and checks
       # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
-      # BLAKE3, by b3sum, which the ix runner image does not carry.
+      # BLAKE3, by the uv workspace's `blake3` (the Rust crate through PyO3): no system package.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
       - run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends b3sum
-      - run: |
-          python3 -I harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
       - uses: actions/upload-artifact@v7
         with:
           name: library
@@ -212,12 +214,16 @@ jobs:
         with:
           path: out
           merge-multiple: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      # SHA256SUMS and B3SUMS, `<hex>  <name>` a line as sha256sum and b3sum write them; BLAKE3 is
+      # the uv workspace's `blake3`, so the runner needs no system package for it.
       - name: Checksums
-        working-directory: out
-        run: |
-          sudo apt-get install -y --no-install-recommends b3sum
-          sha256sum blaze-*.tar.gz | tee SHA256SUMS
-          b3sum blaze-*.tar.gz | tee B3SUMS
+        run: uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
+
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

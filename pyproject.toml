@@ -28,6 +28,7 @@ target-version = "py313"
 line-length = 110
 include = [
   ".github/scripts/bench_commit.py",
+  ".github/scripts/checksums.py",
   ".github/scripts/build_release.py",
   ".github/scripts/downstream.py",
   ".github/scripts/downstream_build.py",
@@ -74,6 +75,7 @@ include = [
 [tool.pyright]
 include = [
   ".github/scripts/bench_commit.py",
+  ".github/scripts/checksums.py",
   ".github/scripts/build_release.py",
   ".github/scripts/downstream.py",
   ".github/scripts/downstream_build.py",
