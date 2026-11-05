@@ -237,12 +237,11 @@ impl Session {
     /// of its agent when it runs (else its resume starts with it).
     pub fn chat_choose(&self, model: Option<&str>, effort: Option<&str>) -> Result<()> {
         let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session, so it has no model to set", self.id))?;
-        let lines = c.choose(model, effort, &self.tx)?;
+        // An ended chat only records the choice (nothing runs to tell); its resume starts the agent with it.
+        let live = self.ended.lock().is_none();
+        let lines = c.choose(&self.kind, model, effort, live, &self.tx)?;
         changed();
-        if self.ended.lock().is_none() {
-            self.write_lines(&lines)?;
-        }
-        Ok(())
+        self.write_lines(&lines)
     }
 
     /// Stop a chat session's turn in flight.
@@ -675,7 +674,7 @@ impl Daemon {
                 for s in &mut v {
                     s.past = s.ended_ms.is_some_and(|e| e < started);
                 }
-                Reply::Sessions { sessions: v }
+                Reply::Sessions { sessions: v, models: (*chat::models::snapshot()).clone() }
             }
             Req::ReplTask { task } => {
                 db::repl_task(&task)?;
@@ -771,6 +770,8 @@ pub async fn run() -> Result<()> {
     }
     // Old chat logs move to this schema before anyone can attach to one (chat/mod.rs `migrate_logs`).
     chat::migrate_logs();
+    // The models each agent kind last listed (chat/models.rs): what a chat with none of its own picks from.
+    chat::models::restore();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     // The object index: session ids continue after the last one ever used; sessions the last daemon

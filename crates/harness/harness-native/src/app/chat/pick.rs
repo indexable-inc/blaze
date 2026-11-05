@@ -4,8 +4,11 @@
 //! eases toward the strong ink under the pointer. A press opens the menu above it: the models (the name), the efforts
 //! (the word) or both (the chevron), the current row ticked. A pick sends `Request::SetModel` (link.rs `chat_choose`);
 //! the daemon has the agent switch (claude's `set_model` and `apply_flag_settings` control requests, codex's next
-//! `turn/start`) and logs the choice, so a resumed chat keeps it. An agent that listed no models (no `models` event), or
-//! a model with no efforts, shows that part of the menu fixed, saying why. A press anywhere else, or Escape, closes it.
+//! `turn/start`) and logs the choice, so a resumed chat keeps it. A chat whose own log has no `models` event (one from
+//! before chats listed them, or one whose agent is not running) picks from the list its agent kind last gave the daemon
+//! (`list`'s `models`, link.rs `agent_models`); an ended chat's pick is recorded and its resume starts with it. Until any
+//! agent of its kind has listed, or for a model with no efforts, that part of the menu says why in a short line. A press
+//! anywhere else, or Escape, closes it.
 //!
 //! After them, the context meter: a ring filling as the conversation fills its model's window, and the percentage (den's:
 //! muted, the warning tone from [`WARN`], the failed tone from [`FULL`]), its tooltip the tokens.
@@ -13,6 +16,7 @@ use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
 use harness_proto::event::ModelChoice;
+use std::collections::BTreeMap;
 
 /// The share of the window from which the meter shows in the warning tone, and from which in the failed tone (den's).
 const WARN: f64 = 0.8;
@@ -48,9 +52,19 @@ impl Pick {
     }
 }
 
-/// The model the chat runs, among those its agent listed: what it runs as, else what was last chosen.
-fn current(t: &Transcript) -> Option<&ModelChoice> {
-    let by = |m: &str| if m.is_empty() { None } else { t.models.iter().find(|c| c.is(m)) };
+/// The models chat `t` (of agent kind `kind`) picks from: those its own log listed, else those its kind last listed to
+/// the daemon (`kept`).
+fn models_of<'a>(t: &'a Transcript, kind: &str, kept: &'a BTreeMap<String, Vec<ModelChoice>>) -> &'a [ModelChoice] {
+    if !t.models.is_empty() {
+        return &t.models;
+    }
+    let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
+    kept.get(kind).map_or(&[], Vec::as_slice)
+}
+
+/// The model the chat runs, among `models`: what it runs as, else what was last chosen.
+fn current<'a>(t: &Transcript, models: &'a [ModelChoice]) -> Option<&'a ModelChoice> {
+    let by = |m: &str| if m.is_empty() { None } else { models.iter().find(|c| c.is(m)) };
     by(&t.model).or_else(|| by(&t.chosen_model))
 }
 
@@ -103,11 +117,16 @@ fn set_fill(v: View<'_>, f: Fill) {
 }
 
 impl App {
-    /// The status line's picker and meter for chat `sid` (transcript `t`, running `model` at `effort` as the status line
-    /// has them), and its menu while `open`.
-    pub(super) fn fill_chat_pick(&self, status: View<'_>, sid: u64, t: &Transcript, open: Option<Pick>, model: &str, effort: &str) {
+    /// The status line's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, running `model` at
+    /// `effort` as the status line has them), and its menu while `open`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fill_chat_pick(
+        &self, status: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, model: &str, effort: &str,
+    ) {
         let w = self.world.world_ref();
-        let cur = current(t);
+        let kept = self.link.agent_models();
+        let models = models_of(t, kind, &kept);
+        let cur = current(t, models);
         let name = cur.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(model);
         let context = t.context.filter(|&(_, window)| window > 0);
         let Some(pick) = status.part("pick") else { return };
@@ -142,7 +161,8 @@ impl App {
         view::for_each_of(menu, trigger.map(|_| ("plate", "hn.ChatPickMenu", ())), |_, (), _| {});
         if let (Some(plate), Some(trigger), Some(page)) = (menu.part("plate"), trigger, open) {
             plate.anchored(trigger.id());
-            menu_rows(plate, sid, t, cur, page, name, effort);
+            let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
+            menu_rows(plate, sid, models, kind, cur, page, name, effort);
         }
     }
 
@@ -218,14 +238,16 @@ impl App {
     /// Command-/ (`pick_model`): the focused chat's models, open or closed. Shift-Command-/ (`effort_next`): its effort
     /// steps to the next its model takes (round to the first); a model with none opens the efforts' menu, which says so.
     pub(in crate::app) fn chat_pick_key(&mut self, op: &str) {
-        let Some((_, _, sid)) = self.focused_chat() else { return };
+        let Some((_, e, sid)) = self.focused_chat() else { return };
         if op == "pick_model" {
             return self.chat_pick_toggle(sid, Pick::Model);
         }
         let next = {
             let chats = self.chats.borrow();
+            let kept = self.link.agent_models();
+            let kind = model::kind_name(self.world.world_ref().entity_from_id(e));
             chats.get(&sid).and_then(|t| {
-                let efforts = &current(t)?.efforts;
+                let efforts = &current(t, models_of(t, kind, &kept))?.efforts;
                 let at = efforts.iter().position(|e| *e == t.effort).map_or(0, |i| (i + 1) % efforts.len().max(1));
                 efforts.get(at).cloned()
             })
@@ -304,22 +326,28 @@ enum Row {
     Head(&'static str),
     Sep,
     Choice { label: String, about: String, on: bool, action: String },
-    Fixed(String),
+    /// Why nothing can be chosen here, in a short line.
+    Note(String),
 }
 
-/// The open menu's rows on its plate: the models (`page` Model), the efforts of the current model (Effort), or both under
+/// The open menu's rows on its plate: `models` (`page` Model), the efforts of the current model (Effort), or both under
 /// heads (All); what cannot be chosen says why instead.
-fn menu_rows(plate: View<'_>, sid: u64, t: &Transcript, cur: Option<&ModelChoice>, page: Pick, name: &str, effort: &str) {
-    let mut rows: Vec<Row> = Vec::with_capacity(t.models.len() + 12); // alloc: the open menu's rows, once a frame
-    let agent = if t.agent.is_empty() { "this agent" } else { t.agent.as_str() };
-    if t.models.is_empty() {
-        rows.push(Row::Fixed(format!("Fixed: {agent} has not listed the models it can switch to, so its model and effort stay as it started.")));
+#[allow(clippy::too_many_arguments)]
+fn menu_rows(plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur: Option<&ModelChoice>, page: Pick, name: &str, effort: &str) {
+    let mut rows: Vec<Row> = Vec::with_capacity(models.len() + 12); // alloc: the open menu's rows, once a frame
+    if models.is_empty() {
+        let agent = match kind {
+            "codex" => "Codex",
+            "claude" | "" => "Claude",
+            other => other,
+        };
+        rows.push(Row::Note(format!("Model list arrives when a {agent} chat starts.")));
     } else {
         if page != Pick::Effort {
             if page == Pick::All {
                 rows.push(Row::Head("Model"));
             }
-            rows.extend(t.models.iter().map(|c| Row::Choice {
+            rows.extend(models.iter().map(|c| Row::Choice {
                 label: if c.name.is_empty() { c.id.clone() } else { c.name.clone() },
                 about: c.about.clone(),
                 on: cur.is_some_and(|x| x.id == c.id),
@@ -338,8 +366,8 @@ fn menu_rows(plate: View<'_>, sid: u64, t: &Transcript, cur: Option<&ModelChoice
                     on: e == effort,
                     action: format!("chat:set:{sid}:effort:{e}"),
                 })),
-                Some(_) => rows.push(Row::Fixed(format!("Fixed: {name} takes no reasoning effort."))),
-                None => rows.push(Row::Fixed(format!("Fixed: {agent} did not list the model it runs ({name}), so its efforts are unknown."))),
+                Some(_) => rows.push(Row::Note(format!("{name} has no effort levels."))),
+                None => rows.push(Row::Note(format!("{name} is not in the model list, so its efforts are unknown."))),
             }
         }
     }
@@ -349,7 +377,7 @@ fn menu_rows(plate: View<'_>, sid: u64, t: &Transcript, cur: Option<&ModelChoice
             Row::Sep => "hn.ChatPickSep",
             Row::Choice { on: true, .. } => "hn.ChatPickRowOn",
             Row::Choice { .. } => "hn.ChatPickRow",
-            Row::Fixed(_) => "hn.ChatPickFixed",
+            Row::Note(_) => "hn.ChatPickFixed",
         };
         (format!("r{i}"), prefab, r)
     });
@@ -359,7 +387,7 @@ fn menu_rows(plate: View<'_>, sid: u64, t: &Transcript, cur: Option<&ModelChoice
                 l.text(s);
             }
         }
-        Row::Fixed(s) => {
+        Row::Note(s) => {
             if let Some(l) = v.part("label") {
                 l.text(s);
             }

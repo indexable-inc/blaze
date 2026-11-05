@@ -41,7 +41,7 @@ impl Ctl {
     /// `list`'s sessions.
     pub async fn list(&mut self, all: bool, chats: bool) -> Result<Vec<SessionInfo>> {
         match self.req(Request::List { all, chats }).await? {
-            Reply::Sessions { sessions } => Ok(sessions),
+            Reply::Sessions { sessions, .. } => Ok(sessions),
             r => bail!("harnessd answered list with {r:?}"),
         }
     }

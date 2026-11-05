@@ -1371,7 +1371,7 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            self.fill_chat_pick(status, sid, t, st.pick, &model, &effort);
+            self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &model, &effort);
             let state = if self.status_of(e) != "running" {
                 "ended \u{00B7} a message resumes it"
             } else if t.busy {
