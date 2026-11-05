@@ -482,6 +482,13 @@ impl Daemon {
             }
             Req::ReplTask { task } => {
                 db::repl_task(&task)?;
+                // A cell a chat session's tool call ran: that call's card (chat/mod.rs `tool_detail`).
+                if let (Some(call), Some(sid)) = (task["call"].as_str(), task["session"].as_u64())
+                    && let Ok(s) = self.get(sid)
+                    && let Some(c) = &s.chat
+                {
+                    c.record(chat::tool_detail(call, &task), &s.tx);
+                }
                 changed();
                 json!({ "ok": true })
             }

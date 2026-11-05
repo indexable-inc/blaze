@@ -3,6 +3,7 @@
 import { table, type Table } from "./table.ts";
 import { req, daemonPresent, DaemonUnreachable } from "./daemon.ts";
 import { REPL_ID } from "./repl.ts";
+import { oneLine, quiet, step } from "./effects.ts";
 
 type Stream = "stdout" | "stderr";
 
@@ -156,8 +157,15 @@ let seq = 0;
 export function sh(cmd: string | string[], opts: ShOpts = {}): Proc {
   const text = typeof cmd === "string" ? cmd : cmd.map(shq).join(" ");
   const argv = typeof cmd === "string" ? ["/bin/sh", "-c", cmd] : cmd;
-  const p = new Proc(`p${++seq}`, text, opts.cwd ?? process.cwd(), argv, opts);
+  const short = oneLine(text);
+  const s = step("exec", `Running ${short}`, `Ran ${short}`, text);
+  const p = quiet(() => new Proc(`p${++seq}`, text, opts.cwd ?? process.cwd(), argv, opts));
   registry.set(p.id, p);
+  // The step's result is what it printed: stdout, then stderr, the tail of each that fits.
+  s && p.exited.then(
+    (r) => s.end(r.exit_code === 0, r.signal ? `killed (${r.signal})` : `exit ${r.exit_code}`, r, [r.stdout, r.stderr].filter(Boolean).join("\n").slice(-(16 << 10)) || undefined),
+    (e) => s.end(false, e instanceof Error ? e.message : String(e)),
+  );
   return p;
 }
 

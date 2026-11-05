@@ -20,9 +20,27 @@
 //! | `tool_delta` | `block`, `json` | more of its arguments' JSON text *(partial)* |
 //! | `tool_call` | `block`, `name`, `input` | the call, whole (replaces its partials) |
 //! | `tool_result` | `block`, `text`, `error` | what the call returned |
+//! | `tool_detail` | `block`, `cell`, `status`, `ms`, `code`, `effects`, `effects_dropped`, `value`, `logs` | what a harness REPL cell the call ran did, whole each time (see below) |
 //! | `note` | `text` | something the agent said that is not the assistant's words (an interrupt) |
 //! | `error` | `text` | the agent reported an error |
 //! | `turn_end` | `ok`, `stop` (`end_turn` \| `interrupted` \| `error` \| ...), `duration_ms`, `cost_usd`, `usage`, `text` | the turn is over; `text` its last assistant words |
+//!
+//! ## `tool_detail`: a REPL cell's steps and value
+//!
+//! The harness REPL (`mcp/src/repl.ts`) posts each cell to the daemon as it runs (`repl_task`), with the agent's id for
+//! the tool call that ran it when the agent gave one (Claude puts it in the MCP request's `_meta`). For a chat session
+//! the daemon records each post as a `tool_detail` for that call's `block`: the cell's whole state, so the latest one
+//! stands for all before it (a reattach replays only the latest). It may come before the call's `tool_call` or after its
+//! `tool_result` (a backgrounded cell ends later). Its fields, as the kernel writes them:
+//!
+//! - `cell`: `<repl>.<task>` (the `repl` object it is indexed as); `status`: `running` | `done` | `error`; `ms`.
+//! - `effects`: the steps the cell took outside the REPL, in order (`mcp/src/effects.ts`): `{n, kind (exec | read |
+//!   write | delete | net | search | spawn | sql), doing, done (its words while running and once done), target, status
+//!   (running | ok | error), started_ms, ms, detail ("exit 0", "5 results", "3.2 KB"), value}`; `effects_dropped`: how
+//!   many past the kernel's cap were not kept.
+//! - `value`: the cell's result as the app shows it (`mcp/src/shown.ts`), null while it runs or when it is one of its
+//!   steps' values: `{t: table | record | list, cols: [{name, type}], rows: [[cell]], total}`, `{t: scalar, type, v}`,
+//!   `{t: text, v, total}`, `{t: error, message, stack}`. A step's `value` has the same shape.
 //!
 //! # Storage and attach
 //!
@@ -79,6 +97,8 @@ struct Store {
     replay: Vec<Option<Arc<str>>>,
     /// Where each block's partials are in `replay`.
     partials: HashMap<String, Vec<usize>>,
+    /// Where each block's latest `tool_detail` is in `replay` (an earlier one is gone once a later came).
+    details: HashMap<String, usize>,
     /// Tool call (block) to tool name, for the messages rows of their results.
     tools: HashMap<String, String>,
     adapter: Box<dyn Adapter>,
@@ -113,6 +133,7 @@ impl Chat {
                 messages,
                 replay: Vec::new(),
                 partials: HashMap::new(),
+                details: HashMap::new(),
                 tools: HashMap::new(),
                 adapter,
             }),
@@ -185,6 +206,10 @@ impl Chat {
         if let Some(b) = &block {
             if partial(&kind) {
                 st.partials.entry(b.clone()).or_default().push(at);
+            } else if kind == "tool_detail" {
+                if let Some(i) = st.details.insert(b.clone(), at) {
+                    st.replay[i] = None;
+                }
             } else if matches!(kind.as_str(), "block" | "tool_call") {
                 for i in st.partials.remove(b).unwrap_or_default() {
                     st.replay[i] = None;
@@ -275,6 +300,21 @@ fn rows(ev: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
         "turn_end" => vec![row("system", "turn_end", None, s("text"))],
         _ => vec![],
     }
+}
+
+/// The `tool_detail` event of tool call `block` from a REPL cell's post (`repl_task`).
+#[must_use]
+pub fn tool_detail(block: &str, task: &Value) -> Value {
+    let ms = match (task["started_ms"].as_u64(), task["ended_ms"].as_u64()) {
+        (Some(a), Some(b)) => json!(b.saturating_sub(a)),
+        _ => Value::Null,
+    };
+    json!({
+        "ev": "tool_detail", "block": block,
+        "cell": format!("{}.{}", task["repl"].as_str().unwrap_or("repl"), task["id"].as_str().unwrap_or("t?")),
+        "status": task["status"], "ms": ms, "code": task["code"], "effects": task["effects"],
+        "effects_dropped": task["effects_dropped"], "value": task["value"], "logs": task["logs"],
+    })
 }
 
 /// A tool call's main argument: the first string field of its input, on one line.
