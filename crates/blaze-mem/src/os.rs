@@ -23,6 +23,9 @@
 
 use std::{io, ptr::NonNull, sync::atomic};
 
+#[cfg(unix)]
+use crate::syscalls::{Kind, timed};
+
 /// Alignment of every reservation: a huge page on Unix (so a huge region starts on one);
 /// Windows' allocation granularity, which `VirtualAlloc` always gives.
 #[cfg(unix)]
@@ -111,7 +114,7 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
         .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))?;
     // SAFETY: a fresh anonymous mapping at an address the kernel picks: it overlaps nothing the
     // program holds.
-    let base = unsafe {
+    let base = timed(Kind::Reserve, || unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             padded,
@@ -120,7 +123,7 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
             -1,
             0,
         )
-    };
+    });
     if base == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
@@ -131,11 +134,11 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
     if head != 0 {
         // SAFETY: `[base, aligned)` is the front of the mapping just made, which nothing else
         // knows of.
-        let _ = unsafe { libc::munmap(base.cast(), head) };
+        let _ = timed(Kind::Munmap, || unsafe { libc::munmap(base.cast(), head) });
     }
     if tail != 0 {
         // SAFETY: `[aligned + bytes, base + padded)` is the back of the same fresh mapping.
-        let _ = unsafe { libc::munmap(aligned.wrapping_add(bytes).cast(), tail) };
+        let _ = timed(Kind::Munmap, || unsafe { libc::munmap(aligned.wrapping_add(bytes).cast(), tail) });
     }
     #[cfg(target_os = "linux")]
     advise_pages(aligned, bytes, huge);
@@ -159,7 +162,7 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
 fn advise_pages(ptr: *mut u8, bytes: usize, huge: bool) {
     let advice = if huge { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
     // SAFETY: the caller's range is a mapping of its own; advice changes no contents.
-    let _ = unsafe { libc::madvise(ptr.cast(), bytes, advice) };
+    let _ = timed(Kind::Advise, || unsafe { libc::madvise(ptr.cast(), bytes, advice) });
 }
 
 /// Keeps `[ptr, ptr + bytes)`, a mapping its caller made outside a region (a fiber's stack),
@@ -424,7 +427,7 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     let maxnode = (MASK_WORDS * bits + 1) as libc::c_ulong;
     // SAFETY: `mbind` reads `MASK_WORDS` words of `mask`, a live array, and changes only the
     // policy of the range, which the caller says is a reservation of ours.
-    let status = unsafe {
+    let status = timed(Kind::Advise, || unsafe {
         libc::syscall(
             libc::SYS_mbind,
             ptr.as_ptr(),
@@ -434,7 +437,7 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
             maxnode,
             0,
         )
-    };
+    });
     if status == 0 {
         return Ok(());
     }
@@ -505,8 +508,9 @@ fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours, which nothing
     // else maps; changing its protection touches no other memory.
-    let rc =
-        unsafe { libc::mprotect(ptr.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE) };
+    let rc = timed(Kind::Mprotect, || unsafe {
+        libc::mprotect(ptr.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE)
+    });
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
@@ -606,7 +610,7 @@ pub(crate) unsafe fn commit_reserved(
     // SAFETY: the caller says the range is uncommitted space of a live reservation of ours
     // that nothing reaches; the fixed mapping replaces only it. `MAP_NORESERVE` defers the
     // pool's pages to the populate below, which reports their want as an error.
-    let got = unsafe {
+    let got = timed(Kind::MapFixed, || unsafe {
         libc::mmap(
             ptr.as_ptr().cast(),
             bytes,
@@ -620,13 +624,13 @@ pub(crate) unsafe fn commit_reserved(
             -1,
             0,
         )
-    };
+    });
     if got == libc::MAP_FAILED {
         return Err(on_reserved(bytes, "mapping", &io::Error::last_os_error()));
     }
     let made = (|| {
         // SAFETY: the range just mapped, ours alone; the advice changes what `fork` copies.
-        if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) } != 0 {
+        if timed(Kind::Advise, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) }) != 0 {
             return Err(on_reserved(bytes, "excluding from fork", &io::Error::last_os_error()));
         }
         if let Some(node) = node {
@@ -636,7 +640,7 @@ pub(crate) unsafe fn commit_reserved(
         }
         // SAFETY: the range just mapped, readable and writable; populating writes zero pages
         // that nothing has read.
-        if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE) } != 0 {
+        if timed(Kind::Populate, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE) }) != 0 {
             return Err(on_reserved(bytes, "making the pages of", &io::Error::last_os_error()));
         }
         Ok(())
@@ -692,7 +696,7 @@ pub(crate) unsafe fn collapse(ptr: NonNull<u8>, bytes: usize) {
     const MADV_COLLAPSE: libc::c_int = 25;
     // SAFETY: the caller says the range is committed memory of ours; collapsing copies its
     // pages into one, keeping every byte, while other threads may read and write it.
-    let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_COLLAPSE) };
+    let _ = timed(Kind::Advise, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_COLLAPSE) });
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -708,7 +712,7 @@ pub(crate) unsafe fn collapse(_ptr: NonNull<u8>, _bytes: usize) {}
 pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, huge: bool) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing uses;
     // a fixed mapping over it replaces only those pages.
-    let got = unsafe {
+    let got = timed(Kind::MapFixed, || unsafe {
         libc::mmap(
             ptr.as_ptr().cast(),
             bytes,
@@ -717,7 +721,7 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, huge: bool) -> io:
             -1,
             0,
         )
-    };
+    });
     if got == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
@@ -774,7 +778,7 @@ pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
     #[cfg(not(target_os = "macos"))]
     let advice = libc::MADV_DONTNEED;
     // SAFETY: the caller says the committed range holds nothing anyone reads.
-    unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, advice) == 0 }
+    timed(Kind::Purge, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, advice) }) == 0
 }
 
 #[cfg(windows)]
@@ -839,7 +843,7 @@ pub(crate) unsafe fn reuse(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
 #[cfg(unix)]
 pub(crate) unsafe fn release(ptr: NonNull<u8>, bytes: usize) {
     // SAFETY: the caller hands over the whole reservation, which nothing uses any more.
-    let _ = unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
+    let _ = timed(Kind::Munmap, || unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) });
 }
 
 #[cfg(windows)]

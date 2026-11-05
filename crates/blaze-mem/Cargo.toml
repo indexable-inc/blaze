@@ -34,6 +34,12 @@ hegeltest.workspace = true
 
 # Random reads over 1 GiB on base, transparent and reserved huge pages, in page walks per read
 # against the bound; prints a verdict.
+# Every thread's cold-build memory traffic at once (a shared node column, a row heap, frame
+# tasks with spans): wall, CPU, faults and every virtual-memory call, with its slowest.
+[[bench]]
+name = "mm"
+harness = false
+
 [[bench]]
 name = "huge"
 harness = false
