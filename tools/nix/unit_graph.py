@@ -80,6 +80,11 @@ CARGO_ENV = {"RUSTC_BOOTSTRAP": "1"}
 
 async def fetch_graphs(project_dir: Path, flags: list[str]) -> tuple[dict[str, dict], dict]:
     pre = toolchain_prefix()
+    if pre:
+        # The dev shell on its own, with its own bound: on a runner whose nix store does not
+        # have it yet (an ix label set whose last green job is old), it builds from source,
+        # which took longer than cargo fetch's 900 s on 2026-11-05.
+        await run_step("nix develop (the dev shell)", [*pre, "true"], 3600, project_dir)
     await run_step("cargo fetch", [*pre, "cargo", "fetch", "--locked"], 900, project_dir)
     async with asyncio.TaskGroup() as tg:
         graphs = {

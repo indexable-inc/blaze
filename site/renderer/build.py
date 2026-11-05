@@ -65,7 +65,10 @@ async def run(step: str, *cmd: str, bound: float = 1800) -> None:
 
 async def module(package: str, out: Path) -> None:
     # Its own cargo invocation: in one, site-render's features would unify and the worker's module would get Flecs.
-    await run(package, "cargo", "build", "--locked", "--profile", "wasm", "-p", package, "--target", WASM_TARGET)
+    # --target-dir: the module is read back from TARGET below, so cargo writes there whatever
+    # CARGO_TARGET_DIR says (the ix runner image sets it to a shared cache directory).
+    await run(package, "cargo", "build", "--locked", "--profile", "wasm", "-p", package, "--target", WASM_TARGET,
+              "--target-dir", str(TARGET))
     raw = TARGET / WASM_TARGET / "wasm" / f"{package.replace('-', '_')}.wasm"
     if wasm_opt := shutil.which("wasm-opt"):
         await run(f"wasm-opt {package}", wasm_opt, "-Oz", *FEATURES, "--strip-debug", "--strip-producers", str(raw), "-o", str(out))
