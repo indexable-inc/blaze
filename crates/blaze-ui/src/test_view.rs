@@ -1146,7 +1146,7 @@ impl TestView {
 }
 
 /// `left` then `right` at the end of a line `width` wide; `left` cut where they meet.
-fn right_aligned(
+pub(crate) fn right_aligned(
     left: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
     width: usize,
@@ -1175,7 +1175,7 @@ pub fn duration(it: Duration) -> String {
     }
 }
 
-fn text_width(text: &str) -> usize {
+pub(crate) fn text_width(text: &str) -> usize {
     text.chars().map(|it| it.width().unwrap_or(0)).sum()
 }
 
