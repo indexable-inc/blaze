@@ -199,9 +199,34 @@ and leaves at exit. A record whose process is gone, or whose start time differs,
 whoever takes the lock next. A daemon's **allowance** is the least of its ceiling and the
 machine budget less every other live daemon's charge. That allowance, not a fixed number, is the
 budget its plane admits against and its releases are decided on (`admission::set_budgets`,
-`Squeeze`). The arithmetic is a sans-IO core (`blaze_graph::machine`); the flock and the file
-are its driver. A daemon that cannot open or lock the ledger stops with an error naming the file
-(no fallback to a budget of its own).
+`Squeeze`). The arithmetic is a sans-IO core (`blaze_graph::ledger`); the flock and the file
+are its driver (`crates/blaze-cargo/src/serve/machine.rs`). A daemon that cannot open or lock the
+ledger stops with an error naming the file (no fallback to a budget of its own).
+
+As built (2026-11-05), where it differs from the above and why:
+- The core is `blaze_graph::ledger`, not `blaze_graph::machine`: that name is the build graph's.
+- Every ledger write is one turn under the lock: read, prune, compute the allowance, give it to
+  the plane (`PlaneInput::Allowance`), write the charge `max(held, granted)`, unlock. Between
+  turns the plane grants only up to its **room**, `min(allowance, max(granted, held))` as of the
+  last turn, so what it grants never passes the charge the others can read. A plane that has
+  never been given an allowance has no room limit, so the plane alone behaves as before.
+- Each record keeps the machine budget its daemon brought, and the budget is the least over the
+  live records. Daemons started at different times see different "not blaze's" memory, and
+  taking the least keeps the bound one number for all of them. At join, the other daemons'
+  held bytes are counted as blaze's, not as "not blaze's" (Linux only: macOS has no in-use
+  reading yet, so its budget is 3/4 of `hw.memsize` less the margin).
+- A task predicted at the whole ceiling (one with no record, which runs alone) starts alone
+  with its grant clamped to the allowance once the allowance is above zero. Without the clamp
+  it would wait forever for a machine the other daemons share.
+- Besides every 250 ms and moves past 1/64 of the budget, a daemon also turns 25 ms after its
+  plane held a task back for memory, so freed room reaches it quickly.
+- The file is fixed size (a 32-byte header, then 64 records of 128 bytes), checksummed, rewritten
+  whole and never synced: it describes live processes, so after a reboot nothing in it matters.
+  A file that fails to decode is an error naming it; it is removed by hand, never reset.
+- Start time is the kernel's own: clock ticks since boot on Linux (`/proc/<pid>/stat`), and
+  microseconds since the epoch on macOS (`proc_pidinfo`). It is only compared with itself.
+- Windows has no ledger yet, and neither does the seed without `native`: each keeps its own
+  ceiling as before.
 
 **The ceiling, enforced past admission.**
 - Soft, at the allowance: the plane admits nothing new, the daemon releases its front ends'
@@ -239,7 +264,8 @@ then again when it changes:
 /Users/a/.blaze), waiting on 3 tasks: codegen of hir-ty, ...`. It names what waits, on what,
 and who holds the rest.
 
-**Proof.** A Hegel DST of the ledger core and the plane's admission against it.
+**Proof.** A Hegel DST of the ledger core and the plane's admission against it
+(`crates/blaze-graph/src/ledger/tests.rs`).
 - The simulation runs several daemons, each with tasks whose grants and real use are drawn.
   Their steps interleave with crashes (a daemon gone without leaving), pid reuse and restarts.
 - The oracle:

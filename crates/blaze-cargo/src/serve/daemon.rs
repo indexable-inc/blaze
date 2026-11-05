@@ -327,7 +327,14 @@ pub struct Options {
     pub socket: Option<FileName>,
     /// Where HTTP is listened on, and the bearer token its clients send.
     pub http: Option<(SocketAddr, String)>,
+    /// The daemon's ceiling: the most its plane grants, never above the machine budget
+    /// ([`super::machine::Joined::ceiling`]).
     pub budget: Option<Budget>,
+    /// Its place in the machine's memory ledger, joined as its engine started
+    /// (docs/memory-budget.md, section 7): its plane admits against the allowance each turn of
+    /// it gives, under `budget`. `None` admits against `budget` alone: the simulation's daemons,
+    /// and where blaze keeps no ledger ([`super::Machine`]).
+    pub machine: Option<super::Machine>,
     /// Workers of the plane: the cores.
     pub threads: usize,
     /// IO tasks run at once (fetches).
@@ -463,6 +470,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     abandoned: Option<Abandoned>,
     settling: bool,
     failed: Option<Failed>,
+    /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
+    /// daemon drops, and turned only where there is a ledger (native unix).
+    #[cfg_attr(not(all(unix, feature = "native")), allow(dead_code))]
+    machine: Option<super::Machine>,
     pid: u32,
     /// Which blaze it is ([`Options::build`]), for [`blaze_api::Status::build`].
     build: blaze_api::Build,
@@ -988,12 +999,16 @@ pub enum Failed {
     Stalled(String),
     /// A store stopped (a file of it could not be read or written), named.
     Store(String),
+    /// The machine's memory ledger could not be locked, read or written, or no longer has this
+    /// daemon's record: admitting on would be admitting against no machine budget.
+    Ledger(String),
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failed::Server(why) | Failed::Stalled(why) | Failed::Store(why) => f.write_str(why),
+            Failed::Ledger(why) => write!(f, "the machine's memory ledger: {why}"),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             Failed::Settle(error) => {
                 write!(f, "the database could not settle onto its image: {error}")
@@ -1349,6 +1364,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut plane = Plane::new(plane_config, history, runner)
             .map_err(|error| format!("the plane: {error}"))?;
         plane.number_from(observe.first_build());
+        // The first turn of the machine's memory ledger, before any request: until one, the
+        // plane would grant up to its ceiling whatever the other daemons hold.
+        #[cfg_attr(not(all(unix, feature = "native")), allow(unused_mut))]
+        let mut machine = options.machine;
+        #[cfg(all(unix, feature = "native"))]
+        if let Some(machine) = &mut machine {
+            plane.poll(driver.now());
+            if let Some(bytes) =
+                machine.turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
+            {
+                blaze_graph::admission::set_budgets(bytes);
+            }
+        }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
             crate::serve::fetch::on_disk_mark(std::path::Path::new(at))
@@ -1429,6 +1457,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             abandoned: None,
             settling: false,
             failed: None,
+            machine,
             pid: std::process::id(),
             build: options.build,
             settings: options.settings,
@@ -2425,6 +2454,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
         loop {
             self.plane.poll(self.driver.now());
+            #[cfg(all(unix, feature = "native"))]
+            self.ledger_turn();
             self.plane.happened(&mut happened);
             if happened.is_empty() {
                 break;
@@ -2436,6 +2467,24 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.said(said);
         }
         self.spare.happened = happened;
+    }
+
+    /// A turn of the machine's memory ledger, when one is due ([`super::machine::Machine::due`]):
+    /// the plane told its allowance, which it admits against, and the subsystems' budgets set to
+    /// it when it moved ([`blaze_graph::admission::set_budgets`]: what a release is decided
+    /// against). A turn that fails stops the daemon.
+    #[cfg(all(unix, feature = "native"))]
+    fn ledger_turn(&mut self) {
+        let at = self.driver.now();
+        let Some(machine) = &mut self.machine else { return };
+        if !machine.due(at, &self.plane) {
+            return;
+        }
+        match machine.turn(at, &mut self.plane) {
+            Ok(Some(bytes)) => blaze_graph::admission::set_budgets(bytes),
+            Ok(None) => {}
+            Err(why) => self.fail(Failed::Ledger(format!("{why:#}"))),
+        }
     }
 
     /// Between requests: the collections, and after a cold build the image and the settle.

@@ -358,6 +358,9 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
+            // The machine's ledger is not modelled: the differential tests never give one, and
+            // a plane never told an allowance grants up to its budget alone.
+            PlaneInput::Allowance { .. } => {}
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
