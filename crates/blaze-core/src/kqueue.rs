@@ -506,6 +506,9 @@ impl Kqueue {
             }
             Effect::Watch { dir, tag } => self.watch(dir, None, tag),
             Effect::Journal { dir, since, tag } => self.watch(dir, Some(since), tag),
+            Effect::WatchFsErrors { .. } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, crate::no_fs_errors("macOS")))
+            }
             // Told through the watches' channel by the stream, after the changes it heard first.
             Effect::Flush { watch, tag } => {
                 match self.watch_tags.get(&watch).and_then(|&id| self.watches.get(id)) {

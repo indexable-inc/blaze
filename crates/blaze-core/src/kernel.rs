@@ -57,7 +57,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "file IO error reporting",
         since: v(7, 0),
-        used_for: "the store's durability path, which learns of a lost write",
+        used_for: "the store's durability path: a write the file system lost is committed again",
     },
     Feature {
         name: "RWF_DONTCACHE",

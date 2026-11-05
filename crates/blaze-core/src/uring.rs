@@ -1781,6 +1781,10 @@ pub struct Uring {
     offload: Offload,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
+    /// Each watch of a file system's IO errors ([`Effect::WatchFsErrors`]), by its tag: read
+    /// without waiting before the completions of each poll are told, so an error comes ahead
+    /// of a sync's completion that came with or after it.
+    fs_errors: Vec<(Tag, crate::fanotify::FsErrors)>,
     in_flight: usize,
 }
 
@@ -1842,6 +1846,7 @@ impl Uring {
             stampers: None,
             offload: Offload::new()?,
             locks: crate::locks::Locks::new(),
+            fs_errors: Vec::new(), // alloc: empty until a store watches its file system's errors.
             in_flight: 0,
         })
     }
@@ -2021,6 +2026,34 @@ impl Uring {
             self.offload.out -= 1;
             self.ready.push(completion);
         }
+    }
+
+    /// Every IO error the file systems watched ([`Effect::WatchFsErrors`]) have queued, read
+    /// without waiting into `out` ahead of the completions about to be told: an event the
+    /// kernel queued before a sync returned is told before the sync. Read only when there are
+    /// completions to tell, so a poll that tells none makes no call for it; an error with no
+    /// completion after it is heard with the next. A read that fails ends its watch with the
+    /// failure, which its asker hears as the watch lost.
+    fn hear_fs_errors(&mut self, out: &mut Vec<Completion>) {
+        if self.fs_errors.is_empty() || self.ready.is_empty() {
+            return;
+        }
+        let before = out.len();
+        let mut at = 0;
+        while at < self.fs_errors.len() {
+            let (tag, watch) = &mut self.fs_errors[at];
+            let tag = *tag;
+            match watch.read(|error| out.push(Completion { tag, done: Done::FsError(error) })) {
+                Ok(()) => at += 1,
+                Err(error) => {
+                    self.fs_errors.remove(at);
+                    // alloc: an error.
+                    let why = IoError(format!("reading the file system's error events: {error}"));
+                    out.push(Completion { tag, done: Done::Failed(why) });
+                }
+            }
+        }
+        self.in_flight += out.len() - before;
     }
 
     /// An effect that fails as it is submitted, with no request of its own to end.
@@ -2298,6 +2331,26 @@ impl Driver for Uring {
         for effect in effects.drain(..) {
             let tag = effect.tag();
             match effect {
+                // The mark is placed here, as a mode is set: two calls, once per store. Not
+                // counted in flight, but each completion it makes is until it is told.
+                Effect::WatchFsErrors { dir, .. } => {
+                    self.fs_errors.retain(|(it, _)| *it != tag);
+                    match crate::fanotify::FsErrors::new(&self.root, &dir) {
+                        Ok(watch) => {
+                            self.fs_errors.push((tag, watch));
+                            self.in_flight += 1;
+                            self.ready.push(Completion { tag, done: Done::FsErrorsWatched });
+                        }
+                        Err(why) => self.refuse(tag, why),
+                    }
+                    continue;
+                }
+                Effect::Unwatch { .. } if self.fs_errors.iter().any(|(it, _)| *it == tag) => {
+                    self.fs_errors.retain(|(it, _)| *it != tag);
+                    self.in_flight += 1;
+                    self.ready.push(Completion { tag, done: Done::Unwatched });
+                    continue;
+                }
                 Effect::Unwatch { .. } => {
                     match self.watches.get(&tag).copied() {
                         Some(id) => self.stop(id),
@@ -2379,7 +2432,10 @@ impl Driver for Uring {
                 Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
                 Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
-                Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
+                Effect::Unwatch { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Kill { .. }
+                | Effect::WatchFsErrors { .. } => {
                     unreachable!("taken above")
                 }
                 // Of a file kept for appending, through its descriptor, after what was asked
@@ -2515,6 +2571,7 @@ impl Driver for Uring {
         let before = out.len();
         self.reap();
         self.fire_timers();
+        self.hear_fs_errors(out);
         out.append(&mut self.ready);
         if out.len() == before && self.in_flight > 0 {
             let deadline = Instant::now() + wait;
@@ -2529,11 +2586,13 @@ impl Driver for Uring {
                     self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left))))
                 {
                     self.fail_unsubmitted(&error);
+                    self.hear_fs_errors(out);
                     out.append(&mut self.ready);
                     break;
                 }
                 self.reap();
                 self.fire_timers();
+                self.hear_fs_errors(out);
                 out.append(&mut self.ready);
                 if left.is_zero() {
                     break;

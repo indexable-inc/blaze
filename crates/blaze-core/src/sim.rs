@@ -16,6 +16,11 @@
 //! lock follows its file as a rename moves it; a file removed or replaced takes its locks with
 //! it, so a lock of the name made again is another's. A crash lets every lock go.
 //!
+//! A file system that reports a lost write ([`Sim::fs_error`], Linux 7.0's fserror as
+//! [`Effect::WatchFsErrors`] hears it) dooms each change not yet synced of the files under a
+//! directory: no sync makes it durable, and a crash drops it, though a sync of it still says
+//! it is done. [`Sim::refuse_fs_errors`] is a machine where the errors cannot be watched.
+//!
 //! Targeted faults, each until a crash: [`Sim::fail_syncs`] (a disk gone bad),
 //! [`Sim::hold_syncs`] (a disk that stopped answering), [`Sim::slow_writes`],
 //! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], and [`Sim::fill`] (a disk
@@ -140,6 +145,11 @@ struct SimFile {
     /// What changed it since the last sync that covered it, in order; read as part of the
     /// file, lost (in part) by a crash.
     ops: Vec<Op>,
+    /// Of `ops`, the first this many were lost as the file system reported an error
+    /// ([`Sim::fs_error`]): read as part of the file until a crash (the page cache keeps
+    /// them), but no sync makes them durable and a crash drops them. Always a prefix: an error
+    /// dooms every change not synced then, and a sync takes changes from the front.
+    doomed: usize,
     mode: u32,
     /// A symbolic link, its bytes its target.
     link: bool,
@@ -157,6 +167,7 @@ impl Default for SimFile {
         SimFile {
             durable: Vec::new(),
             ops: Vec::new(),
+            doomed: 0,
             mode: 0o644,
             link: false,
             cache: BTreeMap::new(),
@@ -188,12 +199,18 @@ impl SimFile {
         })
     }
 
-    /// The first `covers` of its changes made durable.
+    /// The first `covers` of its changes made durable, but those the file system lost
+    /// ([`SimFile::doomed`]), which the sync takes and drops: it says it is done all the same.
     fn sync(&mut self, covers: usize) {
-        let SimFile { durable, ops, .. } = self;
-        for op in ops.drain(..covers.min(ops.len())) {
-            op.apply(durable);
+        let SimFile { durable, ops, doomed, .. } = self;
+        let covers = covers.min(ops.len());
+        let lost = (*doomed).min(covers);
+        for (at, op) in ops.drain(..covers).enumerate() {
+            if at >= lost {
+                op.apply(durable);
+            }
         }
+        *doomed -= lost;
     }
 }
 
@@ -306,6 +323,14 @@ pub struct Sim {
     ending: usize,
     /// Inodes, change times and the journal of changes, which a crash keeps.
     disk: journal::Disk,
+    /// The tags of the watches of the file system's errors ([`Effect::WatchFsErrors`]): the
+    /// simulated disk is one file system, so each hears every error.
+    fs_watches: Vec<Tag>,
+    /// The errors told to them and not yet delivered, each told ahead of every completion at
+    /// the next poll ([`Sim::fs_error`]).
+    fs_told: Vec<Completion>,
+    /// Why a watch of the file system's errors is refused here ([`Sim::refuse_fs_errors`]).
+    fs_refused: Option<String>,
     /// Changes and ends of watches, accepts and ends of listens, and what sockets did, each
     /// ready at its time, in the order they were told.
     told: Vec<Told>,
@@ -402,6 +427,11 @@ impl Sim {
             watches: Tagged::new(RESERVE),
             ending: 0,
             disk: journal::Disk::default(),
+            // alloc: none until a store watches the file system's errors.
+            fs_watches: Vec::new(),
+            // alloc: none until the file system reports an error.
+            fs_told: Vec::new(),
+            fs_refused: None,
             told: Vec::with_capacity(RESERVE),
             later: Vec::with_capacity(RESERVE),
             programs: HashMap::new_in(Global),
@@ -536,12 +566,17 @@ impl Sim {
         self.listens.clear();
         self.ends.clear();
         self.receiving.clear();
+        self.fs_watches.clear();
+        self.fs_told.clear();
         // By name, so the seed's numbers go to the same files whatever the table's order.
         // alloc: a crash, not an op.
         let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (_, file) in files {
             file.cache.clear();
+            // What the file system lost is never kept.
+            file.ops.drain(..file.doomed);
+            file.doomed = 0;
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
             let torn = file.ops.get(kept).and_then(|op| op.torn(&mut self.rng));
             file.sync(kept);
@@ -597,6 +632,46 @@ impl Sim {
     /// crash. For a test of a look that is asked again, and of one that never succeeds.
     pub fn fail_lists(&mut self, dir: FileName, times: u32) {
         self.fail_lists = Some((dir, times));
+    }
+
+    /// The file system reports that it lost writes under `dir` with the errno `error`, as
+    /// Linux 7.0's fserror reports a failed writeback (`FAN_FS_ERROR`): each change of a file
+    /// under `dir` not yet synced is doomed. No sync makes it durable and a crash drops it,
+    /// though the file reads as it did until then (the page cache keeps it) and a sync that
+    /// covers it still says it is done: this is the error the event exists for, one the file's
+    /// own fsync does not report (a metadata or log write, a file system shut down, an error
+    /// another descriptor was told of first). A sync already asked, which covers the changes,
+    /// makes none of them durable either.
+    ///
+    /// Every watch of the file system's errors ([`Effect::WatchFsErrors`]) is told, ahead of
+    /// every completion at the next poll, as a driver tells it; a watch already told one that
+    /// is not yet delivered counts this one with it, as the kernel keeps the first error and
+    /// counts the rest.
+    pub fn fs_error(&mut self, dir: &FileName, error: i32) {
+        for (name, file) in self.files.iter_mut() {
+            if name.is_under(dir) {
+                file.doomed = file.ops.len();
+            }
+        }
+        for &tag in &self.fs_watches {
+            let told = self.fs_told.iter_mut().find(|it| it.tag == tag);
+            match told.map(|it| &mut it.done) {
+                Some(Done::FsError(it)) => it.count = it.count.saturating_add(1),
+                _ => {
+                    let done = Done::FsError(crate::FsError { error, count: 1 });
+                    self.fs_told.push(Completion { tag, done });
+                }
+            }
+        }
+    }
+
+    /// From now on, a watch of the file system's errors fails at once, saying
+    /// [`crate::FS_ERRORS_UNAVAILABLE`] and `why`: a machine where the daemon lacks
+    /// `CAP_SYS_ADMIN`, or whose file system reports no errors. A crash keeps it, as it keeps
+    /// the machine.
+    pub fn refuse_fs_errors(&mut self, why: &str) {
+        // alloc: a test's setting, once.
+        self.fs_refused = Some(format!("{}: {why}", crate::FS_ERRORS_UNAVAILABLE));
     }
 
     /// From now on, a sync of any file under `dir` fails, until a crash: what it covers stays
@@ -1445,6 +1520,7 @@ impl Sim {
             Effect::Watch { .. }
             | Effect::Journal { .. }
             | Effect::Unwatch { .. }
+            | Effect::WatchFsErrors { .. }
             | Effect::Flush { .. }
             | Effect::Kill { .. }
             | Effect::Listen { .. }
@@ -1523,6 +1599,25 @@ impl Driver for Sim {
                         // alloc: the batch's payload.
                         self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
                     }
+                    continue;
+                }
+                Effect::WatchFsErrors { tag, .. } => {
+                    let done = match &self.fs_refused {
+                        // clone: the refusal's message, which the completion carries.
+                        Some(why) => Done::Failed(IoError(why.clone())),
+                        None => {
+                            self.fs_watches.retain(|&it| it != tag);
+                            self.fs_watches.push(tag);
+                            Done::FsErrorsWatched
+                        }
+                    };
+                    self.tell(tag, done, Of::Op);
+                    continue;
+                }
+                Effect::Unwatch { tag } if self.fs_watches.contains(&tag) => {
+                    self.fs_watches.retain(|&it| it != tag);
+                    self.fs_told.retain(|it| it.tag != tag);
+                    self.tell(tag, Done::Unwatched, Of::Op);
                     continue;
                 }
                 Effect::Unwatch { tag } => {
@@ -1798,8 +1893,14 @@ impl Driver for Sim {
         }
     }
 
-    /// Never waits: time jumps to the first completion when none is ready.
+    /// Never waits: time jumps to the first completion when none is ready. The file system's
+    /// errors told since the last poll come first, ahead of everything else ready.
     fn poll(&mut self, out: &mut Vec<Completion>, _wait: Duration) -> usize {
+        if !self.fs_told.is_empty() {
+            let told = self.fs_told.len();
+            out.append(&mut self.fs_told);
+            return told;
+        }
         let first = self.pending.next_deadline().map(Duration::from_nanos);
         let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.at)).min() else {
             return 0;
@@ -1853,6 +1954,7 @@ impl Driver for Sim {
             )
         });
         self.pending.len()
+            + self.fs_told.len()
             + self.held_sends.len()
             + (self.watches.len() - self.ending)
             + self.listens.len()

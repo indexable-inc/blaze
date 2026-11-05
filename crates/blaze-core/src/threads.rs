@@ -1095,6 +1095,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Watch { .. }
         | Effect::Journal { .. }
         | Effect::Unwatch { .. }
+        | Effect::WatchFsErrors { .. }
         | Effect::Flush { .. }
         | Effect::Spawn { .. }
         | Effect::Kill { .. }
@@ -1813,6 +1814,15 @@ impl Driver for Threads {
                         // alloc: an error path.
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
+                }
+                // This driver is for tests and for what a native one hands off: it watches no
+                // file system's errors (Linux's io_uring driver does), so the asker states that.
+                Effect::WatchFsErrors { dir, tag } => {
+                    let why = crate::fs_errors_unavailable(format_args!(
+                        "the threads driver watches no file system's errors (of {dir}); \
+                         Linux's io_uring driver does, with fanotify FAN_FS_ERROR"
+                    ));
+                    self.tell(tag, Done::Failed(IoError(why)));
                 }
                 Effect::Unwatch { tag } => {
                     if !self.unwatch(tag) {
