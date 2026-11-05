@@ -19,6 +19,7 @@ mod float;
 mod layout;
 mod media;
 mod props;
+mod surface;
 
 pub use control::Live;
 
@@ -29,7 +30,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 46] = [
+const ELEMENTS: [(&str, &str); 48] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -76,6 +77,8 @@ const ELEMENTS: [(&str, &str); 46] = [
     ("Tile", "hn.GenTile"),
     ("FileRef", "hn.GenFileRef"),
     ("Kip", "hn.GenKip"),
+    ("Shader", "hn.GenShader"),
+    ("Video", "hn.GenVideo"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -100,6 +103,11 @@ struct Budget<'a, 'm> {
     /// The tree is drawn as it is made (its agent is at work): a Kip new to it plays its moods, where one drawn from
     /// history stands in its last.
     playing: bool,
+    /// What the cell's ids name as it is filled (a control's live value, a Video's or Shader's entity, an Image's file),
+    /// and the Shaders drawn: each is resolved against the ids once the whole cell is filled ([`surface::resolve`]), so
+    /// where an id sits in the tree does not matter.
+    ids: std::collections::BTreeMap<String, surface::Ref>,
+    shaders: Vec<u64>,
 }
 
 /// What an element sits in, when that changes how it is drawn or what a press on it sends.
@@ -130,7 +138,20 @@ pub(super) fn fill(
     let world = row.entity().world();
     let now = world.try_get::<&harness_native_api::Clock>(|c| c.time).unwrap_or(0.0);
     let pane = float::pane_of(row);
-    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut(), within: Within::Flow, next: Within::Flow, pane, now, playing };
+    let mut b = Budget {
+        left: MAX_ELEMENTS,
+        cut: false,
+        measure,
+        cell,
+        live: guard.as_deref_mut(),
+        within: Within::Flow,
+        next: Within::Flow,
+        pane,
+        now,
+        playing,
+        ids: std::collections::BTreeMap::new(),
+        shaders: Vec::new(),
+    };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
             Value::Array(a) => a.iter().collect(),
@@ -138,6 +159,7 @@ pub(super) fn fill(
         };
         children(body, &nodes, 0, &mut b);
     }
+    surface::resolve(&mut b);
     if let Some(n) = row.part("note") {
         let said = if b.cut { format!("Cut short: a cell draws at most {MAX_ELEMENTS} elements, {MAX_DEPTH} deep") } else { String::new() };
         n.text(&said);
@@ -172,9 +194,9 @@ fn prefab_of(kind: &str) -> &'static str {
 }
 
 /// The prefab `node` is drawn from: its type's, a pie's own, or [`UNKNOWN`] when it is refused ([`refusal`]).
-fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within) -> &'static str {
+fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&Live>) -> &'static str {
     let kind = node["type"].as_str().unwrap_or("");
-    if refusal(world, node, within).is_some() {
+    if refusal(world, node, within, live).is_some() {
         return UNKNOWN;
     }
     if let Some(p) = control::prefab(kind, node).or_else(|| props::prefab(kind, node)) {
@@ -187,11 +209,12 @@ fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within) -> &'static st
 }
 
 /// Why `node` is not drawn as its type, named for the agent and drawn in the failed tone in its place: an element the app
-/// does not know, or props it cannot draw (a Table's rows that are not a list, a Chart's data, a Canvas's shapes).
-fn refusal(world: WorldRef<'_>, node: &Value, within: &Within) -> Option<String> {
+/// does not know, or props it cannot draw (a Table's rows that are not a list, a Chart's data, a Canvas's shapes), or a
+/// Shader the GPU could not draw (`live`'s media said so: [`surface::failed`]).
+fn refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&Live>) -> Option<String> {
     let kind = node["type"].as_str().unwrap_or("");
     match kind {
-        k if props::TIER3.contains(&k) => props::check(node, within),
+        k if props::TIER3.contains(&k) => props::check(node, within).or_else(|| surface::failed(node, live)),
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
         k if CONTROLS.contains(&k) => control::check(node),
@@ -244,7 +267,7 @@ fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget<'_,
             break;
         }
         b.left -= 1;
-        kept.push((format!("g{i}"), prefab_for(parent.entity().world(), node, &within), *node));
+        kept.push((format!("g{i}"), prefab_for(parent.entity().world(), node, &within, b.live.as_deref()), *node));
     }
     view::for_each_of(parent, kept, |v, node, _| {
         b.within = within.clone();
@@ -255,7 +278,7 @@ fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget<'_,
 /// Set one element's props on its entity, and build its children.
 fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
     let within = std::mem::take(&mut b.within);
-    if let Some(why) = refusal(v.entity().world(), node, &within) {
+    if let Some(why) = refusal(v.entity().world(), node, &within, b.live.as_deref()) {
         v.text(&why);
         return;
     }
@@ -268,7 +291,9 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
         "Popover" | "Menu" | "Dialog" | "Sheet" | "Toast" => float::element(v, node, kind, &kids, depth, b),
         "Progress" | "Loading" | "Skeleton" | "Icon" | "Image" | "Chip" | "Tile" | "FileRef" | "Kip" => {
             media::element(v, node, kind, &kids, depth, b);
+            surface::record(v, node, kind, b);
         }
+        "Shader" | "Video" => surface::element(v, node, kind, b),
         "Column" | "Row" => {
             spacing(v, prefab_of(kind), node);
             children(v, &kids, depth + 1, b);
@@ -335,7 +360,10 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
                 eprintln!("harness-native: genui: {e}");
             }
         }
-        k if CONTROLS.contains(&k) => control::control(v, node, k, &within, b),
+        k if CONTROLS.contains(&k) => {
+            control::control(v, node, k, &within, b);
+            surface::record(v, node, k, b);
+        }
         "Divider" => {}
         "Spacer" => {
             let want = match points(node, "size") {
@@ -929,6 +957,94 @@ mod tests {
         assert_eq!(press(&mut frame, &calm, tab), [Some(one("h1", "\"a\""))], "a press on a tab sends its value");
         let head = laid(part(el(6), "g1.head"), "the shut head");
         assert_eq!(press(&mut frame, &calm, head), [Some(both.to_owned())], "a press on a shut head in an accordion sends both");
+    }
+
+    /// Property `shaders-and-videos-draw-and-resolve`: with no Media (a test, or before the window has a renderer) a cell's
+    /// Shader draws quietly as building and its Video with its controls, each box sized from its props (a shader's aspect,
+    /// a video's 16:9 until its own shape is known), each picture a Surface keyed by its element with a press that plays;
+    /// once the whole cell is filled a Shader's `@id` uniforms read the live values and its texture refs bind the elements
+    /// (an earlier one, a later one, itself) or an Image's file, wherever they sit in the tree; an id the cell does not
+    /// have is said over the shader, and a wire that is not the kernel's is refused in words.
+    #[test]
+    fn shaders_and_videos_draw_and_resolve() {
+        use harness_native_render::media::Input;
+        use harness_native_ui_input_api::Action;
+        use harness_native_ui_text_api::{Icon, Surface};
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 2600.0 });
+        let icon = format!("{}/../../../docs/brand/blaze-icon-dark-180.png", env!("CARGO_MANIFEST_DIR"));
+        let ui = serde_json::json!([
+            {"type": "Shader", "props": {"msl": "// msl", "key": "00000000000000ab", "uniforms": [
+                {"name": "gain", "lanes": 1, "value": [0, 0, 0, 0], "from": "gain"},
+                {"name": "tint", "lanes": 4, "value": [1, 0.5, 0.25, 1]}], "textures": [
+                {"name": "clip", "kind": "ref", "ref": "clip"},
+                {"name": "pic", "kind": "image", "src": icon},
+                {"name": "self", "kind": "ref", "ref": "fx"},
+                {"name": "photo", "kind": "ref", "ref": "logo"}],
+                "aspect": 2, "animate": true, "pointer": false, "id": "fx"}, "children": []},
+            {"type": "Video", "props": {"id": "clip", "src": "/nowhere/surf.mp4", "autoplay": true, "loop": true, "muted": true,
+                "controls": true, "fit": "contain", "onPlay": "h2", "onPause": "h3"}, "children": []},
+            {"type": "Slider", "props": {"id": "gain", "label": "Glow", "min": 0, "max": 4, "step": 0.01, "value": 1.5, "onChange": "h1"}, "children": []},
+            {"type": "Image", "props": {"id": "logo", "src": icon, "width": 32, "height": 32}, "children": []},
+            {"type": "Shader", "props": {"msl": "// msl", "key": "00000000000000ac", "uniforms": [
+                {"name": "g", "lanes": 1, "value": [0, 0, 0, 0], "from": "nope"}], "textures": [], "animate": false, "pointer": false}, "children": []},
+            {"type": "Shader", "props": {"msl": "// msl", "key": "zz", "uniforms": [], "textures": [], "animate": false, "pointer": false}, "children": []},
+            {"type": "Video", "props": {"autoplay": false, "loop": false, "muted": true, "controls": true, "fit": "contain"}, "children": []}
+        ]);
+        let live = std::cell::RefCell::new(Live::default());
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        for _ in 0..6 {
+            fill(row, &ui, "test.0", Some(&live), false, &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let is = |v: View<'_>, prefab: &str| {
+            let p = view::prefab(w, prefab).unwrap_or_else(|| panic!("no prefab {prefab}"));
+            v.entity().owns((flecs::IsA::ID, *p.id()))
+        };
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        let words_of = |v: View<'_>| v.entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).unwrap_or_default();
+        let (fx, clip) = (el(0), el(1));
+        assert!(is(fx, "hn.GenShader") && is(clip, "hn.GenVideo"));
+        assert_eq!(part(fx, "pic").entity().try_cloned::<&Surface>(), Some(Surface { key: fx.id(), cover: 0 }));
+        assert_eq!(part(clip, "pic").entity().try_cloned::<&Surface>(), Some(Surface { key: clip.id(), cover: 0 }));
+        let s = laid(fx, "the shader");
+        assert!(s.w > 400.0 && (s.h - s.w / 2.0).abs() < 1.0, "a shader of aspect 2 as wide as the column: {s:?}");
+        let v = laid(clip, "the video");
+        assert!(v.w > 400.0 && (v.h - v.w * 9.0 / 16.0).abs() < 1.0, "a video 16:9 until its shape is known: {v:?}");
+        assert_eq!(words_of(part(fx, "status.text")), "Building shader", "with no Media a shader is building");
+        let play = format!("media:play:{}", clip.id());
+        assert_eq!(part(clip, "pic").entity().try_cloned::<&Action>().map(|a| a.name.as_str().to_owned()), Some(play.clone()));
+        assert_eq!(part(clip, "bar.plate.play").entity().try_cloned::<&Action>().map(|a| a.name.as_str().to_owned()), Some(play));
+        let glyph = part(clip, "bar.plate.play.icon").entity().try_cloned::<&Icon>().map(|i| i.glyph.as_str().to_owned());
+        assert_eq!(glyph.as_deref(), Some("\u{EAD1}"), "an autoplaying video shows pause");
+        assert_eq!(words_of(part(clip, "bar.plate.elapsed")), "0:00");
+        let (slots, inputs, problem) = surface::resolved(&live.borrow(), fx.id()).expect("the shader's state");
+        assert_eq!(slots, [[1.5, 0.0, 0.0, 0.0], [1.0, 0.5, 0.25, 1.0]], "@gain reads the slider below it");
+        assert_eq!(inputs, [Input::Surface(clip.id()), Input::Photo(icon.clone()), Input::Surface(fx.id()), Input::Photo(icon.clone())]);
+        assert_eq!(problem, None);
+        let lost = words_of(part(el(4), "status.text"));
+        assert!(lost.contains("@nope") && lost.contains("no element"), "an unknown id is said over the shader: {lost:?}");
+        for (i, says) in [(5, "<Shader> key"), (6, "<Video> src")] {
+            let t = words_of(el(i));
+            assert!(t.contains(says), "element {i} is refused in words: {t:?}");
+        }
     }
 }
 

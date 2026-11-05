@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { parse } from 'acorn';
-import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, WORDS_ONLY, article, BIND_ALIAS, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
+import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, TEXT_PROP, WORDS_ONLY, article, BIND_ALIAS, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
 import { SVG_SAID, attributeError, isSvgTag, svgSizeError, unknownTagError } from './draw.ts';
 import { svelteSpecifier } from './files.ts';
 
@@ -426,11 +426,11 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
         throw fail(unknownPropError(name as keyof typeof PROPS, 'children', undefined, at));
       }
     }
-    // A Button's (a Chip's, a Loading's, a Toast's) children are its words: text and {expressions}, never another element.
+    // A Button's (a Chip's, a Loading's, a Toast's) children are its words, a Shader's its source: text and {expressions}, never another element.
     if (WORDS_ONLY.has(name)) {
       const inner = ((node.fragment?.nodes ?? []) as Anything[]).find(kid => kid.type === 'RegularElement' || kid.type === 'Component' || kid.type === 'SvelteElement');
-      const prop = name === 'Toast' ? 'text' : 'label';
-      if (inner) throw fail(new TypeError(`<${name}> holds <${inner.name ?? 'svelte:element'}> (${at}): ${article(name)} ${name} holds only its words, <${name}>Save</${name}> or ${prop}="Save"`));
+      const holds = name === 'Shader' ? 'only its Slang source, <Shader>float4 main(ShaderInput in) { ... }</Shader>' : `only its words, <${name}>Save</${name}> or ${TEXT_PROP[name]}="Save"`;
+      if (inner) throw fail(new TypeError(`<${name}> holds <${inner.name ?? 'svelte:element'}> (${at}): ${article(name)} ${name} holds ${holds}`));
     }
     // The text values of its attributes, for the checks that read two together (a Chart's kind with its data).
     const known: Record<string, unknown> = {};
@@ -681,7 +681,7 @@ function withLifecycleImports(source: string, log: Splice[][]): string {
 }
 
 /** The elements whose children, written between their tags, are their code as written, and the prop that code becomes. */
-const RAW_TEXT: Partial<Record<string, string>> = { Code: 'text' };
+const RAW_TEXT: Partial<Record<string, string>> = { Code: 'text', Shader: 'source' };
 
 /** The index just past the `{...}` that opens at `at`, its strings, template literals and comments skipped; the end of `code` if it never closes. */
 function skipBraces(code: string, at: number): number {
@@ -743,13 +743,15 @@ function dedent(body: string): { text: string; dropped: number } {
 }
 
 /**
- * What is written between the tags of a `<Code>` is raw text, as a `<script>`'s is: its braces,
+ * What is written between the tags of a `<Code>` or a `<Shader>` is raw text, as a `<script>`'s is: its braces, `#define`s and
  * comments are the code's, never Svelte's. Each such body becomes the element's prop as a template literal
- * (`<Code text={\`...\`}>`), so no line moves. A body that is one `{expression}` (`<Code>{code}</Code>`) is left to Svelte, as is
- * an element that already has the prop.
+ * (`<Code text={\`...\`}>`), so no line moves. A Shader's is not dedented (its lines are the cell's) and gets `sourceLine`, the cell
+ * line its source's first line is on, which its compile errors name (shader.ts); a blank first line is dropped, so the shader's line 1
+ * is its first. A body that is one `{expression}` (`<Code>{code}</Code>`) is left to Svelte, as is an element that already has the
+ * prop. `shift` is how far the template's first line is below the cell's.
  */
-export function rawText(source: string): string {
-  if (!/<Code[\s>]/.test(source)) return source;
+export function rawText(source: string, shift = 0): string {
+  if (!/<(?:Code|Shader)[\s>]/.test(source)) return source;
   const splices: Splice[] = [];
   let i = 0;
   while (i < source.length) {
@@ -780,6 +782,12 @@ export function rawText(source: string): string {
     const start = i;
     i = found.index + found[0].length;
     if (!body.trim() || oneExpression(body) || new RegExp(`\\s${prop}\\s*=`).test(source.slice(start, end))) continue;
+    if (name === 'Shader') {
+      const blank = /^[ \t]*\n/.exec(body)?.[0] ?? '';
+      const line = lineOf(source, end + 1 + blank.length) + shift;
+      splices.push({ start: end, end: found.index, text: ` ${prop}={\`${asTemplate(body.slice(blank.length))}\`} sourceLine={${line}}${blank ? '\n' : ''}>` });
+      continue;
+    }
     const { text, dropped } = dedent(body);
     splices.push({ start: end, end: found.index, text: ` ${prop}={\`${asTemplate(text)}\`}${'\n'.repeat(dropped)}>` });
   }
@@ -799,7 +807,7 @@ export function compileComponent(original: string, options: { filename?: string;
   const edits: Splice[][] = [];
   let input = '';
   try {
-    source = rawText(original);
+    source = rawText(original, shift);
     const aliased = aliasDollar(checkElements(source, shift, edits), edits);
     dollar = aliased.aliased;
     input = withLifecycleImports(withBoundaryDefaults(aliased.source, edits), edits);

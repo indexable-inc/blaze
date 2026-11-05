@@ -217,6 +217,24 @@ pub struct ImageInst {
     pub clipx: [f32; 4],
 }
 
+/// A live picture from the host's Media (a Shader's or a Video's latest finished frame, media/): its texture, premultiplied,
+/// sampled smoothly at `uv` over `rect`, cut to the node's rounded (squircle) corners. One instance a draw, as an image's.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct SurfaceInst {
+    /// x, y, w, h in points.
+    pub rect: [f32; 4],
+    /// Corner radius (points), squircle exponent n, opacity, cover (1: cut to the box's shape about its middle; 0: the
+    /// whole texture stretched over the box).
+    pub shape: [f32; 4],
+    /// The band it shows in, as a panel's `clip` (top, foot), then how far it fades in from each (0: a hard cut).
+    pub clip: [f32; 4],
+    /// The band across, as a panel's `clipx` (left, right, then the fades).
+    pub clipx: [f32; 4],
+    /// The part of the texture shown: u0, v0, u1, v1. The renderer fills it from the texture's size (gpu.rs).
+    pub uv: [f32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GlyphInst {

@@ -2,7 +2,8 @@
 //! a GPU. Copied from den-native's draw.rs (github.com/andrewgazelka/den) and stripped to panels, glyphs and lines.
 use std::rc::Rc;
 
-use crate::pack::{Frame, GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst};
+use crate::media;
+use crate::pack::{Frame, GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst, SurfaceInst};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
@@ -21,6 +22,8 @@ pub enum SegKind {
     /// Indices into [`Draw::kips`]: Kip (harness-native-kip), each its own picture rendered before the frame and set in
     /// over its contact shadow (kip.rs).
     Kip,
+    /// One index into [`Draw::surfaces`]: a live picture from the host's Media, bound per draw like an image's.
+    Surface,
 }
 
 /// A run of consecutive instances of one kind, drawn in order.
@@ -48,6 +51,12 @@ pub struct Draw {
     pub texels: Vec<Rc<[u8]>>,
     /// The Kips this frame draws (kip.rs renders each picture before the frame, the pass sets them in by `segs`).
     pub kips: Vec<harness_native_kip::MascotQuad>,
+    /// Live pictures and the Media key each shows (`surface_keys[i]` for `surfaces[i]`).
+    pub surfaces: Vec<SurfaceInst>,
+    pub surface_keys: Vec<u64>,
+    /// What this frame asks of Media (shaders to render, videos to step): plain data, filled by the host after it paints;
+    /// `Renderer::render` hands it to `Media::prepare` before it encodes.
+    pub media: Vec<media::Spec>,
     /// Paint order: runs of instances by kind.
     pub segs: Vec<Seg>,
 }
@@ -57,6 +66,7 @@ impl Draw {
         if let Some(last) = self.segs.last_mut()
             && last.kind == kind
             && kind != SegKind::Image
+            && kind != SegKind::Surface
             && (last.first + last.count) as usize == index
         {
             last.count += 1;
@@ -102,5 +112,12 @@ impl Draw {
         self.images.push(img);
         self.texels.push(texels);
         self.push_seg(SegKind::Image, self.images.len() - 1);
+    }
+
+    /// A live picture: Media's latest frame for `key` over `inst.rect` (nothing is drawn while Media has none).
+    pub fn surface(&mut self, inst: SurfaceInst, key: u64) {
+        self.surfaces.push(inst);
+        self.surface_keys.push(key);
+        self.push_seg(SegKind::Surface, self.surfaces.len() - 1);
     }
 }

@@ -448,6 +448,23 @@ export const tone_gen_badge_accent: Fill = {dark: {0.922, 0.918, 0.902, 0.12}, l
 export const tone_gen_badge_success: Fill = {dark: {0.55, 0.80, 0.40, 0.18}, light: {0.25, 0.55, 0.18, 0.12}}
 export const tone_gen_badge_warning: Fill = {dark: {0.94, 0.86, 0.28, 0.18}, light: {0.58, 0.52, 0.04, 0.14}}
 export const tone_gen_badge_error: Fill = {dark: {0.980, 0.451, 0.427, 0.18}, light: {0.788, 0.204, 0.176, 0.12}}
+// A Shader's and a Video's box (genui/surface.rs, hn.GenShader and hn.GenVideo): a Shader with no height and no aspect is
+// gen_shader_h tall; both are rounded by radius_gen_media on a quiet ground (what shows before the first frame). A video's
+// controls ride a dark plate along its foot, gen_video_bar_pad in from its edges, in light inks over the picture whatever
+// the appearance (a picture is not the ground); its scrub rail is the slider's, thinner.
+export const gen_shader_h = 200
+export const radius_gen_media = 8
+export const tone_gen_media: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.045}}
+export const gen_video_bar_h = 32
+export const gen_video_bar_pad = 8
+export const gen_video_rail = 3
+export const gen_video_knob = 12
+export const radius_gen_video_bar = 8
+export const tone_gen_video_bar: Fill = {dark: {0.08, 0.08, 0.09, 0.72}, light: {0.08, 0.08, 0.09, 0.72}}
+export const tone_gen_video_ink: Fill = {dark: {1, 1, 1, 0.82}, light: {1, 1, 1, 0.82}}
+export const tone_gen_video_ink_hover: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_video_track: Fill = {dark: {1, 1, 1, 0.28}, light: {1, 1, 1, 0.28}}
+export const tone_gen_video_fill: Fill = {dark: {1, 1, 1, 0.92}, light: {1, 1, 1, 0.92}}
 // File kinds as the IntelliJ New UI colours them (den's scene/15-filetypes.flecs): an Icon's or a FileRef's kind.
 export const tone_file_rust: Fill = {dark: {0.878, 0.38, 0.298, 1}, light: {0.784, 0.263, 0.184, 1}}
 export const tone_file_typescript: Fill = {dark: {0.298, 0.604, 0.91, 1}, light: {0.165, 0.435, 0.753, 1}}

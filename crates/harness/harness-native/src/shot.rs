@@ -19,6 +19,7 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
     app.set_gpu_clock(renderer.gpu_clock());
+    app.set_media(renderer.media());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
     // `prims`: the primitives gallery.
     // `genui`: one generative-UI cell's tree (HARNESS_NATIVE_GENUI=<tree.json>), drawn as a chat card draws it.
@@ -140,6 +141,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
+        // AVFoundation says its players' status and first frames through the main queue, and a shot runs no run loop.
+        harness_native_render::media::Media::pump();
         if let Some((root, tree)) = &genui {
             app.fill_genui_gallery(*root, tree);
         }
@@ -206,9 +209,19 @@ pub fn run(path: &str) -> Result<(), String> {
             up_next = true;
         }
         let r = &renderer;
-        let draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| {
+        let mut draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| {
             r.upload_atlas(x, y, gw, gh, b)
         });
+        let shoot = seq.as_ref().is_some_and(|v| t >= v[0] && t <= v[1]) || t >= secs;
+        if shoot && !draw.media.is_empty() {
+            // Settled, then drawn again with no time passing, so what the cell says of its media (a shader's status, a
+            // video's time) is what the settled pictures show.
+            settle_media(&renderer, &draw);
+            draw = app.frame((w, h), backing, 0.0, &mut |x, y, gw, gh, b| r.upload_atlas(x, y, gw, gh, b));
+        } else if !shoot && !app.stats_shown() {
+            // As the window's every frame does: Media builds and steps between the frames a shot keeps.
+            renderer.media().borrow_mut().prepare(&draw.media);
+        }
         if seq.as_ref().is_some_and(|v| t >= v[0] && t <= v[1]) {
             renderer.render(&draw, Dest::Texture(tex.clone()));
             let px = renderer.read(&tex);
@@ -244,6 +257,17 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A frame drawn once shows the cells' Shaders and Videos as they settle, not as the first frame found them: Media pumps and
+/// prepares until each visible one has its picture, for at most [`SETTLE`]. The borrow ends before `render` takes it.
+fn settle_media(renderer: &Renderer, draw: &crate::draw::Draw) {
+    if !draw.media.is_empty() && !renderer.media().borrow_mut().settle(&draw.media, SETTLE) {
+        eprintln!("harness-native: shot: the cells' shaders and videos did not settle in {SETTLE:?}; drawn as they are");
+    }
+}
+
+/// How long a shot waits for its Shaders and Videos to settle.
+const SETTLE: Duration = Duration::from_secs(3);
 
 fn write_png(path: &str, app: &App, px: &[u8], w: u32, h: u32) -> Result<(), String> {
     let mut px = px.to_vec();

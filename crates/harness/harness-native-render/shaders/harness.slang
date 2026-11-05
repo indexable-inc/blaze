@@ -539,6 +539,57 @@ float4 image_fs(ImageV v, ConstantBuffer<Frame> frame, StructuredBuffer<ImageIns
     return float4(t.rgb * a, a);
 }
 
+// ---- live pictures (media/: a Shader's or a Video's latest finished frame) ------------------------------------------
+
+struct SurfaceInst
+{
+    float4 rect;     // x, y, w, h (points)
+    float4 shape;    // corner radius (points), squircle exponent n, opacity, cover (1: cut to the box's shape; the host's uv says how)
+    float4 clip;     // the band it shows in, as a panel's
+    float4 clipx;    // the band across, as a panel's
+    float4 uv;       // the part of the texture shown: u0, v0, u1, v1
+};
+
+struct SurfaceV
+{
+    float4 pos : SV_Position;
+    float2 local : TEXCOORD0;
+    float2 uv : TEXCOORD1;
+    float y : TEXCOORD2;
+    float x : TEXCOORD3;
+    nointerpolation uint inst : TEXCOORD4;
+};
+
+[shader("vertex")]
+SurfaceV surface_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<Frame> frame, StructuredBuffer<SurfaceInst> insts)
+{
+    SurfaceInst m = insts[iid];
+    float2 c = CORNERS[vid];
+    float2 pt = m.rect.xy + c * m.rect.zw;
+    SurfaceV o;
+    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.local = (c * 2.0 - 1.0) * m.rect.zw * 0.5;
+    o.uv = lerp(m.uv.xy, m.uv.zw, c);
+    o.y = pt.y;
+    o.x = pt.x;
+    o.inst = iid;
+    return o;
+}
+
+// The texture is premultiplied (a shader's picture, stored as its prelude premultiplied it) or opaque (a video frame), and
+// may be brighter than white (EDR): only the corners' coverage, the clip bands and the opacity scale it.
+[shader("fragment")]
+float4 surface_fs(SurfaceV v, ConstantBuffer<Frame> frame, StructuredBuffer<SurfaceInst> insts, Texture2D<float4> tex, SamplerState smp)
+{
+    SurfaceInst m = insts[v.inst];
+    float2 half_size = m.rect.zw * 0.5;
+    float r = min(m.shape.x, min(half_size.x, half_size.y));
+    float d = sd_squircle(v.local, half_size, max(r, 1e-3), max(m.shape.y, 2.0));
+    float cover = saturate(0.5 - d * frame.scale);
+    float a = cover * m.shape.z * in_band(v.y, m.clip, m.clip.zw, frame.scale) * in_band(v.x, m.clipx, m.clipx.zw, frame.scale);
+    return tex.SampleLevel(smp, v.uv, 0) * a;
+}
+
 struct SpriteInst
 {
     int4 rect;       // the cell: x, y, w, h (device pixels)

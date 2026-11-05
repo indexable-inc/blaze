@@ -1,6 +1,7 @@
 import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, elementWire, holdsError, placeError, wholeChartError, wireValue } from './element.ts';
 import type { ElementName } from './element.ts';
-import { resolveFile } from './media.ts';
+import { resolveFile, resolveMedia } from './media.ts';
+import { resolveRefs } from './shader.ts';
 import type { Attachment, Handler } from './element.ts';
 import { drawWire } from './draw.ts';
 import type { Paint } from './draw.ts';
@@ -17,8 +18,24 @@ import { placed, rooted, runtime } from './svelte.ts';
 /** One drawn element: what travels to the app. */
 export interface UiNode { type: string; props: Record<string, unknown>; children: UiNode[] }
 
-/** The prop of an element that names a file on disk, sent as its absolute path. */
-const FILE_PROP: Partial<Record<string, string>> = { Image: 'src', FileRef: 'path' };
+/**
+ * The props of an element that name a file, sent as its absolute path: `drawn` ones the app says it cannot open when it draws them,
+ * `there` ones must be there now (a Video's, a poster, a Shader's `.slang`), `web` ones may also be an http(s) URL (a Video's src).
+ */
+const FILE_PROPS: Partial<Record<string, Readonly<Record<string, 'drawn' | 'there' | 'web'>>>> = {
+  Image: { src: 'drawn' }, FileRef: { path: 'drawn' }, Video: { src: 'web', poster: 'there' }, Shader: { src: 'there' },
+};
+
+/** A file prop's value as its absolute path (or URL), by how FILE_PROPS takes it; `what` names it for the error. */
+function fileValue(how: 'drawn' | 'there' | 'web', value: unknown, what: string): string {
+  return how === 'drawn' ? resolveFile(value, what) : resolveMedia(value, what, how === 'web');
+}
+
+/** A Shader's textures with their files as absolute paths ('@id's and http(s) URLs as written), before JSON would make a Bun.file `{}`. */
+function textureFiles(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, typeof item === 'string' && item.startsWith('@') ? item : resolveMedia(item, `<Shader textures.${name}>`, true)]));
+}
 
 /** At most one render per this long. */
 export const RENDER_MS = 16;
@@ -71,6 +88,8 @@ export class UiTree implements Attachment {
   private dirty = false;
   private lastPass = -Infinity;
   private sent: string | undefined;
+  /** Where the cell writes each node of the last pass, for the errors of the checks over the whole tree (`resolveRefs`). */
+  private places = new WeakMap<UiNode, string | undefined>();
   private shown: UiNode | UiNode[] | undefined;
   private disposed = false;
   private mounting = false;
@@ -196,7 +215,11 @@ export class UiTree implements Attachment {
     this.timer = undefined;
     this.lastPass = Date.now();
     this.dirty = false;
+    this.places = new WeakMap();
     const nodes = this.children(this.container);
+    // A Shader's '@id's are checked over the whole tree, so an id may come after the Shader that names it.
+    const bad = resolveRefs(nodes, node => this.places.get(node as UiNode));
+    if (bad) throw placed(bad.error, this.places.get(bad.node as UiNode));
     const ui = nodes.length === 1 ? nodes[0]! : nodes;
     const json = JSON.stringify(ui);
     if (json === this.sent) return;
@@ -230,12 +253,22 @@ export class UiTree implements Attachment {
   }
 
   private node(node: ViewNode, paint?: Paint): UiNode {
+    const made = this.made(node, paint);
+    this.places.set(made, node.at);
+    return made;
+  }
+
+  private made(node: ViewNode, paint?: Paint): UiNode {
     const props: Record<string, unknown> = {};
     for (const [name, value] of Object.entries(node.props)) {
+      const file = FILE_PROPS[node.type]?.[name];
       if (node.ids.has(name)) props[name] = value;
-      // A picture's or a file chip's file goes as its absolute path (media.ts), resolved before JSON would make a Bun.file `{}`.
-      else if (FILE_PROP[node.type] === name && value !== undefined && value !== null) {
-        try { props[name] = resolveFile(value, `<${node.type} ${name}>`); }
+      // A picture's, a video's or a file chip's file goes as its absolute path (media.ts), resolved before JSON would make a Bun.file `{}`.
+      else if (file && value !== undefined && value !== null && value !== '') {
+        try { props[name] = fileValue(file, value, `<${node.type} ${name}>`); }
+        catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      } else if (node.type === 'Shader' && name === 'textures' && value !== undefined && value !== null) {
+        try { props[name] = textureFiles(value); }
         catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
       } else {
         const kept = plain(value);
@@ -272,7 +305,8 @@ export class UiTree implements Attachment {
       const where = node.at ? ` (${node.at})` : '';
       const leaf = WORDS_ONLY.has(node.type) || !PROPS[node.type as ElementName].includes('children');
       const inner = kids.find(child => child.isElement);
-      if (leaf && inner) throw placed(new TypeError(`<${node.type}> holds ${inner.type}${where}: ${WORDS_ONLY.has(node.type) ? `${article(node.type)} ${node.type} holds only its words, <${node.type}>${node.type === 'Button' ? 'Save' : 'Open'}</${node.type}>` : `${article(node.type)} ${node.type} holds nothing`}`), node.at);
+      const holds = node.type === 'Shader' ? 'only its Slang source' : `only its words, <${node.type}>${node.type === 'Button' ? 'Save' : 'Open'}</${node.type}>`;
+      if (leaf && inner) throw placed(new TypeError(`<${node.type}> holds ${inner.type}${where}: ${WORDS_ONLY.has(node.type) ? `${article(node.type)} ${node.type} holds ${holds}` : `${article(node.type)} ${node.type} holds nothing`}`), node.at);
       try {
         const error = placeError(node.type, node.parent?.type, node.at);
         if (error) throw error;

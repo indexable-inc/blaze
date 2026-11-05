@@ -1066,6 +1066,127 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $gen_image_h}}
     pic : ui.Image {}
   }
+
+  // A shader (genui/surface.rs): its box (`width`, else the column's; `height`, else width over `aspect`, else
+  // $gen_shader_h) on a quiet rounded ground, and in it parts genui/surface.rs makes: `pic` (the Surface Media renders the
+  // shader into) and, while it builds or is paused, `status` over it.
+  prefab GenShader : ui.ZStack {
+    Fill: $tone_gen_media
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_shader_h, min: 0, max: 0}}
+  }
+  // The shader's picture: the pointer over it is what the shader reads as in.pointer.
+  prefab GenShaderPic : ui.Node {
+    Hoverable
+    Surface: {key: 0, cover: 0}
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+  // Quiet words in the middle of the box ("Building shader", or an id the cell does not have, in the failed tone).
+  prefab GenShaderStatus : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+    text : ui.Words {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+  }
+  // A shader the GPU guard paused: why, on a plate a press runs it again (local action media:resume:<entity>).
+  prefab GenShaderPaused : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+    plate : ui.Column {
+      Fill: $tone_gen_plate
+      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+      Cursor: {shape: Arrow}
+      Flex: {axis: Column, gap: 4, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_field_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 12, r: 12, t: 8, b: 8}
+      text : ui.Words {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+      }
+      run : ui.Line {
+        Fill: $tone_term_ink
+        Text: {s: "Run again"}
+        TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
+      }
+    }
+  }
+
+  // A video (genui/surface.rs): its box (`width`, else the column's; `height`, else width over `aspect`, else the video's
+  // own shape once known, 16:9 until then) on a quiet rounded ground, and in it parts genui/surface.rs makes: `pic` (the
+  // Surface Media pulls the player's frames into; a press plays or pauses), `poster` (a still shown until the first play)
+  // and, with controls, `bar` along its foot (shown on hover and while paused).
+  prefab GenVideo : ui.ZStack {
+    Fill: $tone_gen_media
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenVideoPic : ui.Node {
+    Surface: {key: 0, cover: 0}
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Cursor: {shape: Arrow}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+  prefab GenVideoPoster : ui.Image {
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+  }
+  // The controls: play or pause, the scrub rail (dragged as a slider's: genui/control.rs Kind::Scrub), the elapsed time in tabular
+  // figures, mute.
+  prefab GenVideoBar : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: End, wrap: false}
+    Padding: {l: $gen_video_bar_pad, r: $gen_video_bar_pad, t: $gen_video_bar_pad, b: $gen_video_bar_pad}
+    plate : ui.Row {
+      Fill: $tone_gen_video_bar
+      Shape: {radius: $radius_gen_video_bar, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_video_bar_h, min: 0, max: 0}}
+      Padding: {l: 2, r: 2, t: 0, b: 0}
+      play : ui.IconButton {
+        AlignSelf: {align: Center}
+        Inks: {rest: $tone_gen_video_ink, hover: $tone_gen_video_ink_hover}
+        icon : ui.Symbol {}
+      }
+      rail : ui.Row {
+        Cursor: {shape: Arrow}
+        Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 20, min: 0, max: 0}}
+        fill : ui.Node {
+          Fill: $tone_gen_video_fill
+          Shape: {radius: 2, n: 2, border: 0, feather: 0}
+          Size: {w: {kind: Grow, value: 0.0001, min: 0, max: 0}, h: {kind: Fixed, value: $gen_video_rail, min: 0, max: 0}}
+        }
+        knob : ui.Node {
+          Fill: $tone_gen_knob
+          Shape: {radius: 6, n: 2, border: 0, feather: 0}
+          Lift: {blur: 2, alpha: 0.25, dy: 0.5}
+          Size: {w: {kind: Fixed, value: $gen_video_knob, min: 0, max: 0}, h: {kind: Fixed, value: $gen_video_knob, min: 0, max: 0}}
+        }
+        rest : ui.Node {
+          Fill: $tone_gen_video_track
+          Shape: {radius: 2, n: 2, border: 0, feather: 0}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_video_rail, min: 0, max: 0}}
+        }
+      }
+      elapsed : ui.Line {
+        Fill: $tone_gen_video_ink
+        TextStyle: {size: $size_gen_small, line: 16, role: 10, bold: 0}
+      }
+      mute : ui.IconButton {
+        AlignSelf: {align: Center}
+        Inks: {rest: $tone_gen_video_ink, hover: $tone_gen_video_ink_hover}
+        icon : ui.Symbol {}
+      }
+    }
+  }
   // A pill, brighter when selected.
   prefab GenChip : ui.Row {
     Fill: $tone_clear

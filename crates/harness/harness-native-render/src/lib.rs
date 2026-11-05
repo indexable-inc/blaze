@@ -11,6 +11,7 @@ pub mod icons;
 pub mod kip;
 pub mod kips;
 pub mod markdown;
+pub mod media;
 pub mod pack;
 pub mod paint;
 pub mod photo;

@@ -62,6 +62,15 @@ pub struct Picture {
     pub handle: ScriptString,
 }
 
+/// A live picture drawn from the host's Media by `key` (a Shader's or a Video's element entity id): its latest finished frame,
+/// covering the node's box (`cover` 1: cut to the box's shape about its middle; 0: stretched to the box, which layout gives the
+/// texture's own shape). Corners from the node's Shape. Nothing is drawn until Media has a frame for it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Surface {
+    pub key: u64,
+    pub cover: i32,
+}
+
 /// A `Picture` drawn as pixel art: each of its pixels a crisp cell of the node's size over its width and height, never
 /// smoothed (CSS's `image-rendering: pixelated`). A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -234,6 +243,7 @@ hyperion_api_layouts::api_layouts! {
     "Icon" => alias Icon,
     "Mark" => alias Mark,
     "Picture" => alias Picture,
+    "Surface" => alias Surface,
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
@@ -260,6 +270,7 @@ pub fn register(world: &World) {
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();
     world.component::<Picture>().writable();
+    world.component::<Surface>().writable();
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();

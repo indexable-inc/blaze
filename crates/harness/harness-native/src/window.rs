@@ -1192,6 +1192,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
 
     let mut app = App::new(wake_from_any_thread())?;
     app.set_gpu_clock(renderer.gpu_clock());
+    app.set_media(renderer.media());
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }

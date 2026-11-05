@@ -144,10 +144,11 @@ const components = new Map<string, CellComponent>();
 
 /**
  * Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. A bindable
- * element (element.ts `BINDABLE`) declares its bound prop `$bindable()` and always listens for the events that write it back (`change`,
- * or element.ts `BOUND_BY`: `toggle` for a fold or a float, `close` for a Dialog): the event's value (or the fixed one, `false` for a
- * close) is written back to the prop first (so `bind:open` follows the person, and a plain `open={x}` still moves under their hand),
- * then the cell's own handler runs. So a bound element always carries those handler ids. Copied from den's repl/src/ui/svelte.ts.
+ * element (element.ts `BINDABLE`) declares each bound prop `$bindable()` and always listens for the events that write them back
+ * (`change`, or element.ts `BOUND_BY`: `toggle` for a fold or a float, `close` for a Dialog, `timeupdate`, `play` and `pause` for a
+ * Video): the event's value (or the fixed one, `false` for a close) is written back to its prop first (so `bind:open` follows the
+ * person, and a plain `open={x}` still moves under their hand), then the cell's own handler runs. So a bound element always carries
+ * those handler ids. Copied from den's repl/src/ui/svelte.ts.
  */
 export function hostSource(name: string): string {
   const bound = BINDABLE[name];
@@ -156,12 +157,14 @@ export function hostSource(name: string): string {
   }
   const by = BOUND_BY[name] ?? [{ event: 'change' }];
   const handlers = by.map(({ event }) => `on${event}`);
-  const writes = by.map(({ event, value }, i) => `  const write${i} = (v) => { ${bound} = ${value === undefined ? 'v' : JSON.stringify(value)}; return on${event}?.(v); };`).join('\n');
+  // A write-back named for its prop (a Video's) is sent only while that prop is given or the cell handles the event, so a video
+  // nobody binds or listens to sends the kernel no events.
+  const writes = by.map(({ event, prop, value }, i) => `  const write${i} = (v) => { ${prop ?? bound[0]} = ${value === undefined ? 'v' : JSON.stringify(value)}; return on${event}?.(v); };`).join('\n');
   return `<script>
-  let { ${bound} = $bindable(), ${handlers.join(', ')}, children, ...rest } = $props();
+  let { ${bound.map(prop => `${prop} = $bindable()`).join(', ')}, ${handlers.join(', ')}, children, ...rest } = $props();
 ${writes}
 </script>
-<svelte:element this={${JSON.stringify(name)}} ${bound}={${bound}} ${handlers.map((h, i) => `${h}={write${i}}`).join(' ')} {...rest}>{@render children?.()}</svelte:element>`;
+<svelte:element this={${JSON.stringify(name)}} ${bound.map(prop => `${prop}={${prop}}`).join(' ')} ${by.map(({ prop }, i) => `${handlers[i]}={${prop === undefined ? '' : `${prop} === undefined && ${handlers[i]} === undefined ? undefined : `}write${i}}`).join(' ')} {...rest}>{@render children?.()}</svelte:element>`;
 }
 
 /** The component of a source Svelte compiled, as the preloaded runtime would evaluate it. */
