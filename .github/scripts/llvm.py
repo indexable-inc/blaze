@@ -3,8 +3,9 @@
 
 crates/hir-ty-codegen/llvm.json pins it: the source (a repository, a ref and its commit: our
 fork indexable-inc/llvm, branch ix/23.x, LLVM 23.1.4 with our fixes, at the commit wasm-host's
-ix-aot pins, so blaze and ix-aot run one LLVM), the release of this repository whose assets are
-the builds, and per target the asset's name and sha256.
+ix-aot pins, so blaze and ix-aot run one LLVM), where the builds are (`release`: blaze's R2
+bucket, https://blaze-releases.ix.dev/native, which llvm.yaml fills with .github/scripts/r2.py),
+and per target the archive's name and sha256.
 
   llvm.py build --target T --work DIR --out DIR [--from REPO]
                                                     # build the pinned commit, archive it into --out
@@ -220,7 +221,10 @@ def fetch(args):
         print(f"llvm.py: downloading {url}", file=sys.stderr, flush=True)
         for attempt in range(5):
             try:
-                with urllib.request.urlopen(url, timeout=300) as got, open(archive, "wb") as f:
+                # A User-Agent of its own: Cloudflare, in front of R2, answers Python's default
+                # (`Python-urllib/3.x`) with a 403.
+                ask = urllib.request.Request(url, headers={"User-Agent": "blaze-llvm.py (https://github.com/indexable-inc/blaze)"})
+                with urllib.request.urlopen(ask, timeout=300) as got, open(archive, "wb") as f:
                     shutil.copyfileobj(got, f, 1 << 20)
                 break
             except OSError as e:

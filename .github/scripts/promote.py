@@ -33,7 +33,7 @@
         "latest.json"): each channel's newest release that is not yanked, the first lines of its
         notes and its page, and every yanked release with its reason. The workflow that runs it
         puts it in the R2 bucket blaze-releases, which https://ix.dev/blaze/latest.json serves
-    promote.py metadata '{"out": "latest.json"}'
+    promote.py metadata '{"out": "latest.json", "channels": "channels"}'
         what release.yaml, promote.yaml and yank.yaml run, one at a time (the concurrency group
         release-metadata), after they changed a release: both channels' pointers set to each
         channel's newest release that is not yanked, then `latest`. Worked out from the releases
@@ -100,6 +100,9 @@ class Latest:
 @dataclass(frozen=True)
 class Metadata:
     out: str
+    # A directory the channels' pointers are written into too, as the files `stable` and
+    # `canary`, which the job puts into R2 beside latest.json (r2.py's `channels`).
+    channels: str
 
 
 @dataclass(frozen=True)
@@ -355,11 +358,15 @@ def yank(tag, reason):
     print(f"{tag} is yanked: {reason}" if reason else f"{tag} is no longer yanked")
 
 
-def metadata(out):
-    """Both channels' pointers and latest.json, from the releases as they are now."""
+def metadata(out, channels):
+    """Both channels' pointers and latest.json, from the releases as they are now; the pointers
+    also as files in `channels`, for R2."""
     found = dated_releases()
+    os.makedirs(channels, exist_ok=True)
     for channel, release in newest_live(found).items():
         pointer(channel, release["tag"])
+        with open(os.path.join(channels, channel), "w") as f:
+            f.write(release["tag"].removeprefix("v") + "\n")
     latest(out, found)
 
 
@@ -469,7 +476,8 @@ def main():
     elif step == "latest":
         latest(typed(Latest, given).out)
     elif step == "metadata":
-        metadata(typed(Metadata, given).out)
+        it = typed(Metadata, given)
+        metadata(it.out, it.channels)
     elif step == "yank":
         it = typed(Yank, given)
         yank(it.tag, it.reason)

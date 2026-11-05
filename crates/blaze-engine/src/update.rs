@@ -402,7 +402,7 @@ fn read_latest(etag: Option<&str>) -> anyhow::Result<(String, Read)> {
                 std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             return Ok((file.display().to_string(), Read::New { etag: None, body }));
         }
-        versions::Source::GitHub => LATEST.to_owned(),
+        versions::Source::Ours => LATEST.to_owned(),
         versions::Source::Mirror(base) => format!("{}/latest.json", base.trim_end_matches('/')),
     };
     let http = HyperHttp::new(PATIENCE)?;

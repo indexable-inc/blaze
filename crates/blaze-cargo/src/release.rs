@@ -2,6 +2,14 @@
 //! crates/blaze-engine/build.rs) and handed over by its `main` with [`set`] before any command
 //! runs, so that no release and no commit changes this crate.
 
+/// Where blaze's releases are: `<this>/v<version>/<asset>` for each asset of a release (its
+/// archives, `SHA256SUMS`, `B3SUMS`, the library's source), `<this>/channels/<channel>` for the
+/// channels' pointers and `<this>/latest.json`. The R2 bucket `blaze-releases` on its custom
+/// domain (docs/release.md, "Where the bytes are"), which release.yaml fills before it makes the
+/// GitHub release: the one place blaze fetches a release from, GitHub's copy is no fallback.
+/// `BLAZE_RELEASES` names another place laid out the same (blaze-engine's `versions.rs`).
+pub const RELEASES: &str = "https://blaze-releases.ix.dev";
+
 pub struct Release {
     /// A release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a build of the tree (`BLAZE_VERSION`).
     pub version: &'static str,

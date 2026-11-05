@@ -43,9 +43,6 @@ const BUILT_WITH: &str = include_str!("../../../../library/DIGEST");
 /// What the library this blaze was built with is a copy of (`library/UPSTREAM`).
 const UPSTREAM: &str = include_str!("../../../../library/UPSTREAM");
 
-/// Where the assets of the releases are.
-const RELEASES: &str = "https://github.com/indexable-inc/blaze/releases/download";
-
 /// How many times the archive is asked for before the download gives up.
 const TRIES: u32 = 4;
 
@@ -183,7 +180,7 @@ pub fn fetch() -> Result<Library, String> {
         (None, Some(_)) => checkout().to_string_lossy().into_owned(),
         // The release this blaze is: its version, which only the engine's build.rs knows
         // (`BLAZE_RELEASE`), so that no release changes this crate.
-        (None, None) => format!("{RELEASES}/v{}", crate::release::get().version),
+        (None, None) => format!("{}/v{}", crate::release::RELEASES, crate::release::get().version),
     };
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(

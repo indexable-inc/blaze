@@ -51,9 +51,9 @@ Canary is the newest release of either kind: every stable release was a canary f
 the newest canary is promoted the two channels name the same release.
 
 Each channel also has a pointer, for what reads a channel without GitHub's API (a workspace
-pinned to `"stable"` or `"canary"`): the assets `stable` and `canary` of the release `channels`,
-each the channel's version and a newline,
-`https://github.com/indexable-inc/blaze/releases/download/channels/stable`. Each channel's
+pinned to `"stable"` or `"canary"`, install.sh): `https://blaze-releases.ix.dev/channels/stable`
+and `.../canary` in R2 ([below](#where-the-bytes-are)), each the channel's version and a newline,
+also kept as the assets `stable` and `canary` of the GitHub release `channels`. Each channel's
 pointer names its newest release that is not yanked. The job `metadata` (`.github/scripts/promote.py
 metadata`) sets both pointers and writes latest.json (below) from the releases as they are: in
 release.yaml after it published a release, in promote.yaml after it made one stable, and in
@@ -84,7 +84,48 @@ the releases (the same bytes for the same releases), and `wrangler r2 object put
 `CLOUDFLARE_R2_API_TOKEN`, an R2 API token with Object Read & Write on the bucket
 `blaze-releases` alone, apart from the site's deploy token; it reaches wrangler-action only,
 never promote.py. A run without it fails that job, after the release and the pointers, so
-neither is held back. The archives stay on GitHub's releases.
+neither is held back.
+
+## Where the bytes are
+
+Everything blaze downloads from blaze's own releases comes from one place, the R2 bucket
+`blaze-releases` at its custom domain `https://blaze-releases.ix.dev`, served from Cloudflare's
+edge: a pinned release's archive and sums (`crates/blaze-engine/src/versions.rs`), the channels'
+pointers, the standard library's source (`crates/blaze-cargo/src/toolchain/library.rs`), install.sh's
+download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
+(`crates/hir-ty-codegen/llvm.json`'s `release`, which blaze's native inputs, `llvm.py fetch` and
+build_release.py read). GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a
+developer's Mac on 2026-11-05, minutes for a 155 MB archive. GitHub is no fallback: a key R2
+lacks is an error naming it (`BLAZE_RELEASES` names another place laid out the same). Every
+byte is still checked against its pinned hash before use (the release's `SHA256SUMS` and
+`B3SUMS`, the library's digest, the pin's sha256), so the bucket and the edge are trusted for
+availability, not for content.
+
+| key | what | `Cache-Control` |
+|---|---|---|
+| `v<version>/<asset>` | each asset of a release: `blaze-v<version>-<triple>.tar.gz` and its `.sha256`, `SHA256SUMS`, `B3SUMS`, `library-<digest>.tar.xz` | a year, `immutable` |
+| `channels/<channel>` | the version `stable` or `canary` names, and a newline | 60 s |
+| `latest.json` | [above](#latestjson) (also at `https://ix.dev/blaze/latest.json`, through the site's worker) | 60 s |
+| `native/<name>` | a pinned native input's archive (`llvm.json`'s targets), its name ending in its sha256's first 16 hex digits | a year, `immutable` |
+
+A version is one release for good, and a native archive's name carries its hash (a rebuild gets
+a new name), so the immutable keys never change bytes and are cached at the edge and by clients.
+
+`.github/scripts/r2.py` owns the layout: given a release's assets, a native build or the
+pointers, it prints the `wrangler r2 object put` commands, which the workflows hand to
+cloudflare/wrangler-action with `CLOUDFLARE_R2_API_TOKEN` (the token reaches wrangler alone).
+release.yaml puts a release's assets before it makes the GitHub release, so a release GitHub
+lists is one blaze can fetch, and fails without the token, making no release. The metadata jobs
+put the pointers beside latest.json; llvm.yaml puts each LLVM build under `native/` (GitHub has
+no copy of builds after 2026-11-05). By hand, logged in with `wrangler login`, `"run": true`
+puts them itself, which is how a release made outside release.yaml gets there:
+
+    gh release download v0.YYYYMMDD.N -R indexable-inc/blaze -D out
+    python3 -I .github/scripts/r2.py '{"kind": "release", "tag": "v0.YYYYMMDD.N", "dir": "out", "run": true}'
+
+R2 holds every release from v0.20261105.1 on, v0.20261027.0 (stable on 2026-11-05) and LLVM
+23.1.4 at e152d9fa2bc2. A pin to an
+older release fails until it is put there the same way.
 
 ## Yanking a release
 

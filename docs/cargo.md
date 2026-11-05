@@ -1196,7 +1196,8 @@ it). From then on the `blaze` anyone runs in that workspace runs that
 release, as Bazelisk runs the Bazel a `.bazelversion` names: when it is another release
 itself, it runs `~/.blaze/versions/<version>/blaze` (`$BLAZE_HOME/versions` with `BLAZE_HOME`)
 with the same arguments, and when that is not there it first downloads
-`blaze-v<version>-<host>.tar.xz` from the release on GitHub (the `.tar.gz`, three times the
+`blaze-v<version>-<host>.tar.xz` from blaze's releases (`https://blaze-releases.ix.dev/v<version>/`,
+[release.md](release.md#where-the-bytes-are); the `.tar.gz`, three times the
 size, for a release from before the `.tar.xz`), in ranges eight at once, saying how far it has
 come (on a terminal one line redrawn in place, off one a line every five seconds) and stopping
 with an error naming the address after 30 s without a byte, checks it against every list of
@@ -1209,7 +1210,7 @@ plain HTTP is refused) and at most 1 GiB per asset. A pinned release that can't 
 checked (offline, no such release, neither list, no build for this host, another hash in either
 list) is an error, and no other blaze builds in its place.
 `BLAZE_RELEASES` names a mirror laid out as
-`https://github.com/indexable-inc/blaze/releases/download` (`<mirror>/v<version>/<asset>`,
+`https://blaze-releases.ix.dev` (`<mirror>/v<version>/<asset>`,
 an `https://` address; `http://` is refused), or a directory of `v<version>` directories of
 the assets. `--manifest-path` picks the workspace a command is for, as it does for cargo.
 
@@ -1287,7 +1288,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 |---|---|---|
 | `BLAZE_HOME` | the daemon's socket and state directory, and blaze's toolchains and releases ([Files](#files), [Install](#install)) | see there |
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
-| `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | GitHub's |
+| `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | `https://blaze-releases.ix.dev` |
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
 | `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |

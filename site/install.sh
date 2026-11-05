@@ -7,7 +7,8 @@
 #   curl -fsSL https://ix.dev/blaze | sh -s -- --version 0.20261028.0
 #
 # It downloads the release built for this machine (macOS on Apple silicon, Linux on x86-64 or
-# ARM64), checks it against the checksums published with it, puts `blaze` and the programs
+# ARM64) from https://blaze-releases.ix.dev (docs/release.md, "Where the bytes are"), checks it
+# against the checksums published with it, puts `blaze` and the programs
 # it runs in ${CARGO_HOME:-~/.cargo}/bin, and has blaze download the Rust it builds
 # with, once (125 to 160 MB; none when rustup already has it). It never asks anything. Running it
 # again installs the newest release of the channel over the one there.
@@ -20,12 +21,19 @@
 #   --verbose          say each step
 #   --yes, -y          accepted; nothing is asked anyway
 #
-# BLAZE_REPO=owner/name installs from another repository's releases. BLAZE_ARCHIVE=file installs
+# BLAZE_RELEASES=https://... installs from another place laid out as blaze's (what blaze reads
+# too: <it>/v<version>/<asset>, <it>/channels/<channel>). BLAZE_ARCHIVE=file installs
 # that archive, a build of blaze laid out as a release's, instead of downloading one.
 
 set -eu
 
-REPO="${BLAZE_REPO:-indexable-inc/blaze}"
+REPO=indexable-inc/blaze
+RELEASES="${BLAZE_RELEASES:-https://blaze-releases.ix.dev}"
+RELEASES="${RELEASES%/}"
+case "$RELEASES" in
+    https://*) ;;
+    *) fail "BLAZE_RELEASES is $RELEASES, which is not an https:// address." "A release and its checksums come from there together, so they are fetched over HTTPS only." ;;
+esac
 # harness/toolchain; harness/toolchain_bump.py writes it
 TOOLCHAIN="nightly-2026-10-27"
 VERSION="${BLAZE_VERSION:-}"
@@ -129,11 +137,8 @@ esac
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1"; }
-    # Where a URL ends up after its redirects.
-    landing() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /dev/null -w '%{url_effective}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
     fetch() { wget -q -O "$2" "$1"; }
-    landing() { wget -q -S --spider "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r'; }
 else
     fail "downloading blaze needs curl or wget, and neither is installed."
 fi
@@ -159,44 +164,29 @@ if [ -n "$ARCHIVE" ]; then
     say "Installing blaze from $asset for $machine..."
     cp "$ARCHIVE" "$tmp/$asset"
 else
-    releases="https://github.com/$REPO/releases"
+    releases="$RELEASES"
 
-    # The release: the one asked for; else canary's, the newest dated release, prerelease or
-    # not; else stable's, GitHub's latest, which is never a prerelease, or the nightly build
-    # before the first. The release feed needs no API token and has no rate limit, but lists
-    # tags too, which have no release until release.yaml has built it: canary's is the newest
-    # whose checksums are there.
+    # The release: the one asked for, else the one the channel's pointer names
+    # (<releases>/channels/<channel>: its version and a newline, which release.yaml, promote.yaml
+    # and yank.yaml keep at the channel's newest release that is not yanked).
     if [ -n "$VERSION" ]; then
         tag="v${VERSION#v}"
-        [ "$VERSION" = nightly ] && tag=nightly
-    elif [ "$CHANNEL" = canary ]; then
-        fetch "$releases.atom" "$tmp/releases.atom" 2>"$tmp/error" ||
-            fail "the list of blaze's releases could not be read; is the network up?" \
-                "$(cat "$tmp/error")
-$releases.atom"
-        grep -o 'releases/tag/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' "$tmp/releases.atom" |
-            sed 's/^releases\/tag\/v//; s/"$//' | sort -t . -k 1,1nr -k 2,2nr -k 3,3nr > "$tmp/candidates" || true
-        tag=""
-        while read -r candidate; do
-            if fetch "$releases/download/v$candidate/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
-                tag="v$candidate"
-                break
-            fi
-            step "v$candidate has no release yet"
-        done < "$tmp/candidates"
-        [ -n "$tag" ] || fail "blaze has no canary release yet." "Releases: $releases"
     else
-        latest=$(landing "$releases/latest" 2>/dev/null || true)
-        case "$latest" in
-            */releases/tag/*) tag="${latest##*/releases/tag/}" ;;
-            *) tag=nightly ;;
+        fetch "$releases/channels/$CHANNEL" "$tmp/channel" 2>"$tmp/error" ||
+            fail "which release is blaze's $CHANNEL could not be read; is the network up?" \
+                "$(cat "$tmp/error")
+$releases/channels/$CHANNEL"
+        named=$(tr -d ' \r\n' < "$tmp/channel")
+        case "$named" in
+            [0-9]*.[0-9]*.[0-9]*) tag="v$named" ;;
+            *) fail "blaze's $CHANNEL channel names $named, which is not a version." "$releases/channels/$CHANNEL" ;;
         esac
     fi
-    step "release $tag of $REPO ($CHANNEL)"
+    step "release $tag from $releases ($CHANNEL)"
 
     if ! fetch "$releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>"$tmp/error"; then
         if [ -n "$VERSION" ]; then
-            fail "there is no blaze release $VERSION." "Releases: $releases"
+            fail "there is no blaze release $VERSION." "Releases: https://github.com/$REPO/releases"
         fi
         fail "the list of blaze's releases could not be read; is the network up?" \
             "$(cat "$tmp/error")
@@ -214,10 +204,10 @@ $releases/download/$tag/SHA256SUMS"
         fi
     fi
     awk -v n="$asset" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS" ||
-        fail "blaze release $tag has no build for $machine." "Its files: $releases/tag/$tag"
+        fail "blaze release $tag has no build for $machine." "Its files: https://github.com/$REPO/releases/tag/$tag"
     want=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1; exit }' "$tmp/SHA256SUMS")
 
-    if [ "$tag" = nightly ]; then shown="the nightly build"; else shown="blaze ${tag#v}"; fi
+    shown="blaze ${tag#v}"
     if [ -z "$VERSION" ] && [ "$CHANNEL" = canary ]; then shown="$shown (canary)"; fi
     say "Installing $shown for $machine..."
     step "downloading $asset"
@@ -380,7 +370,6 @@ esac
 say ""
 case "$tag" in
     "") say "blaze is installed." ;;
-    nightly) say "blaze (nightly build) is installed." ;;
     *) say "$shown is installed." ;;
 esac
 if [ -n "$linker_note" ]; then say ""; say "$linker_note"; fi
