@@ -3,7 +3,7 @@
 // so prefabs live in other files.
 using flecs.script
 
-// A tree row's left padding: in by its depth, its icon at the section label's edge at depth 0.
+// Where a tree row's chevron gutter starts: in by its depth (its icon is `disclose_w` past it).
 fn indent(depth: i32, pad: f64, step: f64) -> f64 {
   pad + depth * step
 }
@@ -15,34 +15,37 @@ hn {
   struct Row(obj: u64, name: string, selected: bool, depth: i32, kids: bool, open: bool)
 
 
-  // A tree row's hanging disclosure, Finder's: a layer over the whole row (out of its flow), padded so its slot ends at
-  // the row's icon (negative at depth 0, where the chevron hangs in the sidebar's margin). With rows under the row it is a
-  // chevron that folds them (turned open or not; on the row's hover, or always while folded), its hit target the full
-  // slot; else an empty slot, and no hit target (the row takes the press). Its click is script (flecs.script.input):
-  // `hn.act` hands the host the toggle, with Option for every sibling.
+  // A tree row's disclosure, Xcode's source list: a layer over the whole row (out of its flow) whose first slot is the
+  // row's chevron gutter, `disclose_w` wide at the row's indent, so the icon column never moves whether or not the row
+  // has rows under it, and a child's chevron sits under its parent's icon. With rows under the row it is a thin chevron
+  // (a vector mark, hn's own: icons/chevron.svg) in the faint ink, always shown so the tree reads as one, turned a
+  // quarter on the `turn` spring as it opens; its hit target is the whole gutter. Else an empty slot and no hit target
+  // (the row takes the press). Its click is script (flecs.script.input): `hn.act` hands the host the toggle, with Option
+  // for every sibling.
   @tree ChildOf
   template Hang : Row {
     (IsA, ui.Row)
     Overlay
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-    Padding: {l: indent($depth, $row_pad, $indent_step) - $disclose_w, r: 0, t: 0, b: 0}
+    Padding: {l: indent($depth, $tree_pad, $indent_step), r: 0, t: 0, b: 0}
     disclose : ui.Row {
       Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-      Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+      Size: {w: {kind: Fixed, value: $tree_gutter, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
       Padding: {l: 0, r: 0, t: 0, b: 0}
       if $kids {
         Pressable
         Hoverable
         Focusable
       }
-      icon : ui.Symbol, Faint {
-        Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+      icon : ui.Icon {
+        Size: {w: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}}
+        Mark: {name: "chevron"}
+        Disclose: {open: $open}
+        // Clear with nothing under the row (a re-run sets components, it never removes them: so both arms set the Fill).
         if $kids {
-          Icon: {glyph: ""}
-          Disclose: {open: $open}
-          HoverShow: {row: 0, keep: !$open}
+          Fill: $tone_chevron
         } else {
-          Icon: {glyph: ""}
+          Fill: $tone_clear
         }
       }
       async {

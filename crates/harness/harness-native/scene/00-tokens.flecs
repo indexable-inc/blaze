@@ -12,25 +12,51 @@ export const size_row = 13
 export const size_run = 12
 export const size_label = 11
 export const size_code = 11.5
-// Weights (CSS numbers): a session's name medium, a section label semibold.
+// Weights (CSS numbers): a row's name medium (the Archive's, the palette's, the picker's), a section label semibold; a
+// sidebar tree row's name regular, medium while selected.
 export const weight_row = 500
+export const weight_tree = 400
+export const weight_tree_on = 560
 export const weight_label = 600
 
-// Rows: a session 24 tall, a run 20, the fold 20 (packed: the tree has no gap between rows); children indented 16 a level; icons 14 in a 16 box.
+// The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
+// box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
 export const row_h = 24
-export const run_h = 20
-export const more_h = 20
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
-// A tree row's disclosure slot: the chevron's hit target, left of the row's icon. In the sidebar it hangs in the gutter
-// left of the icon (never pushing the row's content right).
 export const disclose_w = 18
-// The sidebar's side margin: the tree pads itself by it (so a depth-0 chevron hangs in it, inside the tree's clip), and
-// the section label and the Archive row sit in from it. label_inset is side_inset + row_pad: the section label's left
-// edge, where depth-0 icons start.
-export const side_inset = 10
-export const label_inset = 18
+// The sidebar's tree, a source list (Finder's, Xcode's): a session row tree_row_h tall, a run tree_run_h, the fold
+// tree_more_h, packed (the air between rows is the pill's inset). Each row starts its chevron gutter (tree_gutter wide)
+// tree_pad in from its left edge plus indent_step a level, so a child's chevron sits under its parent's icon (gutter and
+// step are equal) and the icon column never moves; then its icon (tree_icon box), tree_gap, its name; tree_pad_r on the
+// right for the trailing shortcut and status mark. The chevron is a thin vector mark tree_chevron across (its ink about
+// 7.5 tall), always shown in tone_chevron where the row has rows under it: hover-only hid which rows fold.
+export const tree_row_h = 28
+export const tree_run_h = 24
+export const tree_more_h = 22
+export const tree_gutter = 16
+export const tree_icon = 16
+export const tree_chevron = 9
+export const tree_pad = 2
+export const tree_pad_r = 8
+export const tree_gap = 6
+export const line_row = 16
+// The selection pill and the hover wash hug the row pill_inset in from its frame (4 points of air between neighbours),
+// corners radius_row.
+export const pill_inset = 2
+export const radius_row = 6
+// How a row stands (hn.Status): a dot status_size across, or a ring status_ring wide.
+export const status_size = 6
+export const status_ring = 1.25
+// The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
+// in line with the depth-0 chevrons.
+export const group_h = 28
+
+// The sidebar's side margin: the tree pads itself by it, and the Archive row sits in from it. label_inset is the group
+// header's left edge: side_inset + tree_pad + the chevron's inset in its gutter, in line with the depth-0 chevrons.
+export const side_inset = 8
+export const label_inset = 16
 // The seam between the sidebar and the main card: a soft shadow off the card's left edge.
 export const seam_blur = 14
 export const seam_alpha = 0
@@ -206,7 +232,16 @@ export const spring_press_zeta = 0.62
 export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
 export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+export const tone_select: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// The tree's rows (hn.ObjRow, hn.RunRow): a name's ink at rest and selected; the hover wash, softer than the selection;
+// the selection while the tree has the keyboard (the accent's wash, so focus reads apart from a selection elsewhere); the
+// disclosure chevron; how a row stands: a live session's dot, an exited one's ring.
+export const tone_row: Fill = {dark: {1, 1, 1, 0.78}, light: {0, 0, 0, 0.76}}
+export const tone_row_on: Fill = {dark: {1, 1, 1, 0.94}, light: {0, 0, 0, 0.90}}
+export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.035}}
+export const tone_select_focus: Fill = {dark: {0.580, 0.600, 1.0, 0.24}, light: {0.369, 0.384, 0.902, 0.16}}
+export const tone_chevron: Fill = {dark: {1, 1, 1, 0.42}, light: {0, 0, 0, 0.40}}
+export const tone_status_ring: Fill = {dark: {1, 1, 1, 0.36}, light: {0, 0, 0, 0.34}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
@@ -232,6 +267,8 @@ export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
 export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
 export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
+// A live session's status dot on its tree row (hn.ObjRow): the running green.
+export const tone_status_running: Fill = $tone_running
 export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
 export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}

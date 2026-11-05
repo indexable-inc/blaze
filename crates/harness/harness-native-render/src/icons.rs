@@ -17,6 +17,8 @@ const SOURCES: &[(&str, &str)] = &[
     ("claude", include_str!("../icons/claude.svg")),
     ("openai", include_str!("../icons/openai.svg")),
     ("cursor", include_str!("../icons/cursor.svg")),
+    // Not a brand: the tree's disclosure chevron (an SF-like thin chevron.right, drawn here), turned open by its spring.
+    ("chevron", include_str!("../icons/chevron.svg")),
 ];
 
 /// The viewBox side every Simple Icons SVG uses.
