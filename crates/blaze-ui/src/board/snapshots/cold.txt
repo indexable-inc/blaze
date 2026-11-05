@@ -1,0 +1,14 @@
+-- full 100x20
+ blaze test  fetching                                                                          1m02s
+ waits for its pinned native inputs, 1 of 1 layouts left
+ memory  ━───────────────────  1.2 of 24.0 GB
+
+ workers  0 busy · 16 idle
+
+ downloads
+   llvm-21.1.8-aarch64-apple-darwin.tar.xz  ────────────  34.0 of 410.0 MB  260 kB/s  24m06s left
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- line
+[1m02s] fetching · mem 1.2/24.0 GB · downloading llvm-21.1.8-aarch64-apple-darwin.tar.xz 34.0 of 410.0 MB, 260 kB/s, 24m06s left

@@ -109,7 +109,7 @@ crate::in_key_order! {
 /// process holds against the ceiling it runs under, the subsystem past its fair share, and what
 /// the plane holds back for memory. Andrew's build of 2026-11-05 reached 99 GiB with nothing on
 /// screen to say so: a view shows this in its header, always.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Memory {
     /// The process's footprint as the system counts it.
     pub held: u64,
@@ -177,7 +177,7 @@ pub const BEHIND: usize = 4;
 
 crate::in_key_order! {
 /// How many of the build's tasks are where.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Tally {
     pub waiting: u32,
     pub ready: u32,

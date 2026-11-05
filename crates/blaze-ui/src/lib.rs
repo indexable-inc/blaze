@@ -10,6 +10,8 @@
 //! - [`Plain`], elsewhere (CI, a pipe): one line per step and crate, as cargo writes them,
 //!   and a line every [`HEARTBEAT_NS`] that nothing else was said.
 //! - [`api`]: the agent API's responses, for a client of it to print.
+//! - [`board`]: the live view of `blaze build`, `check` and `test`, drawn from the build's
+//!   model as it runs ([`blaze_protocol::now::Now`]): full screen, inline, or a compact line.
 //! - [`test_view`]: `blaze test`'s live view, a ratatui buffer drawn from what the build
 //!   and the test executables say, for the command's inline viewport.
 //!
@@ -19,6 +21,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 /// `write!` into a `String`, which cannot fail.
 macro_rules! put {
@@ -28,6 +33,7 @@ macro_rules! put {
 }
 
 pub mod api;
+pub mod board;
 mod live;
 mod plain;
 pub mod test_view;
