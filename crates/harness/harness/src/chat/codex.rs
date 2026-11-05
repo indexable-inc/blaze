@@ -276,7 +276,7 @@ impl Codex {
             }
             Pending::ModelList(mut got) => {
                 if let Some(e) = err {
-                    return vec![Body::Error { text: format!("codex app-server refused model/list, so this chat's model and effort are fixed: {e}") }];
+                    return vec![Body::Error { text: format!("codex app-server refused model/list, so its picker offers the models the last codex listed: {e}") }];
                 }
                 let r = &v["result"];
                 got.extend(r["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true).map(|m| {
@@ -303,7 +303,7 @@ impl Codex {
                         self.out.push(line);
                         vec![]
                     }
-                    Some(_) => vec![Body::Error { text: format!("codex's model/list went past {MODEL_PAGES} pages; its models are left unlisted, so this chat's model and effort are fixed") }],
+                    Some(_) => vec![Body::Error { text: format!("codex's model/list went past {MODEL_PAGES} pages; its models are left unlisted, so its picker offers the models the last codex listed") }],
                     None => vec![Body::Models { models: got }],
                 }
             }
@@ -597,6 +597,10 @@ impl super::Adapter for Codex {
 
     /// Kept, and sent on every `turn/start` from the next one on: app-server has no call that switches a thread's model or
     /// effort between turns.
+    fn agent(&self) -> &'static str {
+        "codex"
+    }
+
     fn choose(&mut self, model: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String> {
         if self.dead {
             return Err("its codex thread could not start, so it takes no model or effort".to_owned());

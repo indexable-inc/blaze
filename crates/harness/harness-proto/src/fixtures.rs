@@ -63,7 +63,24 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         one("up-detach", &Up::Detach),
         one("up-set-model", &Up::Req(Request::SetModel { id: 7, model: Some("haiku".into()), effort: Some("xhigh".into()) })),
         one("down-hello", &Down::Hello { schema: crate::SCHEMA, pid: 4242 }),
-        one("down-sessions", &Down::Reply(Reply::Sessions { sessions: vec![info.clone()] })),
+        one(
+            "down-sessions",
+            &Down::Reply(Reply::Sessions {
+                sessions: vec![info.clone()],
+                models: [(
+                    "claude".to_owned(),
+                    vec![ModelChoice {
+                        id: "sonnet".into(),
+                        model: "claude-sonnet-5".into(),
+                        name: "Sonnet 5".into(),
+                        about: String::new(),
+                        efforts: vec!["low".into(), "high".into()],
+                        effort: None,
+                    }],
+                )]
+                .into(),
+            }),
+        ),
         one("down-attached", &Down::Reply(Reply::Attached { info })),
         one("down-ok", &Down::Reply(Reply::Ok)),
         one("down-record", &Down::Reply(Reply::Record(json!({"id": "r12", "exit_code": 0, "signal": null})))),

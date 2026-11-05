@@ -11,9 +11,10 @@
 //!   keyboard (`T_DATA`), resizes (`Up::Resize`) and the detach (`Up::Detach`).
 use harness_native_model::{LinkState, Mailbox, Msg};
 use harness_proto::frame::{self, T_CBOR, T_DATA, T_EVENT};
+use harness_proto::event::ModelChoice;
 use harness_proto::msg::{Down, Reply, Request, RunReq, Up};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -337,6 +338,9 @@ pub struct Link {
     /// The person's events on cells' UI (`Request::UiEvent`), in the order they happened, to the one thread that sends
     /// them ([`Link::ui_event`]).
     ui: Sender<UiEvent>,
+    /// By agent kind, the models it last listed to the daemon (`list`'s `models`): what a chat whose own log has none
+    /// picks from (chat/pick.rs).
+    models: Arc<Mutex<Arc<BTreeMap<String, Vec<ModelChoice>>>>>,
 }
 
 /// One event on a cell's UI: cell `<repl>.<task>` runs handler `handler` with `value`.
@@ -360,8 +364,9 @@ impl Link {
             bytes: Arc::default(),
             run_bytes: Arc::default(),
             ui: ui_sender(),
+            models: Arc::default(),
         };
-        let (rtt_us, pid) = (link.rtt_us.clone(), link.pid.clone());
+        let (rtt_us, pid, agent_models) = (link.rtt_us.clone(), link.pid.clone(), link.models.clone());
         std::thread::Builder::new()
             .name("harness-list".into())
             .spawn(move || {
@@ -376,7 +381,13 @@ impl Link {
                     // Every chat too, from before the daemon's restarts (the Archive files them; opening one asks the
                     // daemon for its log's events, resuming one sends it a message).
                     let listed = match request(Request::List { all: false, chats: true }) {
-                        Ok(Ok(Reply::Sessions { sessions })) => Ok(sessions),
+                        Ok(Ok(Reply::Sessions { sessions, models })) => {
+                            let mut kept = agent_models.lock().unwrap();
+                            if **kept != models {
+                                *kept = Arc::new(models);
+                            }
+                            Ok(sessions)
+                        }
                         Ok(Ok(r)) => Err((format!("list answered {r:?}"), None)),
                         Ok(Err(e)) => Err((e, None)),
                         Err(e) => Err((e.to_string(), refusal(&e).map(str::to_owned))),
@@ -476,6 +487,12 @@ impl Link {
     pub fn rtt_ms(&self) -> Option<f32> {
         let us = self.rtt_us.load(Ordering::Relaxed);
         (us > 0).then(|| us as f32 / 1000.0)
+    }
+
+    /// By agent kind, the models it last listed to the daemon (none before the first `list`, or for a kind that never
+    /// listed).
+    pub fn agent_models(&self) -> Arc<BTreeMap<String, Vec<ModelChoice>>> {
+        self.models.lock().unwrap().clone()
     }
 
     /// The daemon's pid, as its `info` said when the link last came up.

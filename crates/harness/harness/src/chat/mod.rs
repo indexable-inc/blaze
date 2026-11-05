@@ -88,6 +88,7 @@
 //! harness-proto's `migrate`), and marked in the index (`meta.chat_log`); [`Chat::open`] refuses one it finds unconverted.
 pub mod claude;
 pub mod codex;
+pub mod models;
 
 use crate::daemon::Ev;
 use bytes::Bytes;
@@ -129,6 +130,11 @@ pub trait Adapter: Send {
     /// The lines that switch the model (a [`harness_proto::event::ModelChoice::id`]) and/or the effort for the turns from
     /// here on (none when the adapter carries them on its next turn itself), or why this agent cannot.
     fn choose(&mut self, model: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String>;
+    /// The agent kind it speaks for (`claude`, `codex`), whose `models` events the daemon keeps ([`models`]); empty for
+    /// none.
+    fn agent(&self) -> &'static str {
+        ""
+    }
 }
 
 /// The adapter of a chat whose agent is not running (restored from its log, before a resume): it reads and writes
@@ -274,7 +280,7 @@ pub struct Chat {
     pub busy: AtomicBool,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
@@ -361,14 +367,18 @@ impl Chat {
         (some(&st.transcript.chosen_model), some(&st.transcript.chosen_effort))
     }
 
-    /// Switch to `model` and/or `effort` for the turns from here on: each checked against the models the agent listed
-    /// (the effort against the model it will run, the one chosen now or the one it runs), the adapter asked for it, and
-    /// the choice recorded (a `choice` event, what a resume keeps). The lines to write to the agent.
+    /// Switch to `model` and/or `effort` for the turns from here on: each checked against the models the agent listed in
+    /// this chat's log, else the list its kind `kind` last gave the daemon ([`models`]; a chat from before chats listed
+    /// them, or whose agent is not running), the effort against the model it will run (the one chosen now or the one it
+    /// runs), and the choice recorded (a `choice` event, what a resume keeps). While its agent runs (`live`) the adapter
+    /// is asked for it and the lines to write to the agent come back; otherwise only the choice is recorded.
     ///
     /// # Errors
-    /// Nothing to choose; the agent never listed its models; a model it does not offer or an effort that model does not
-    /// take (each naming the chat, the value and what it offers); the adapter's refusal.
-    pub fn choose(&self, model: Option<&str>, effort: Option<&str>, tx: &broadcast::Sender<Ev>) -> anyhow::Result<Vec<String>> {
+    /// Nothing to choose; no agent of its kind has listed models yet; a model the list lacks or an effort that model does
+    /// not take (each naming the chat, the value and what it offers); the adapter's refusal.
+    pub fn choose(
+        &self, kind: &str, model: Option<&str>, effort: Option<&str>, live: bool, tx: &broadcast::Sender<Ev>,
+    ) -> anyhow::Result<Vec<String>> {
         let oid = &self.oid;
         let (model, effort) = (model.filter(|m| !m.is_empty()), effort.filter(|e| !e.is_empty()));
         anyhow::ensure!(model.is_some() || effort.is_some(), "set_model for chat {oid} names neither a model nor an effort");
@@ -376,16 +386,21 @@ impl Chat {
             let mut guard = self.store.lock();
             let st = &mut *guard;
             let t = &st.transcript;
-            if t.models.is_empty() {
-                anyhow::bail!(
-                    "chat {oid}'s agent ({}) has not listed the models it offers (no `models` event in its log), so its model and effort are fixed",
-                    if t.agent.is_empty() { "unknown" } else { &t.agent }
-                );
+            let kind = if kind.is_empty() { t.agent.as_str() } else { kind };
+            let kept;
+            let listed: &[harness_proto::event::ModelChoice] = if t.models.is_empty() {
+                kept = models::snapshot();
+                kept.get(kind).map_or(&[], Vec::as_slice)
+            } else {
+                &t.models
+            };
+            if listed.is_empty() {
+                anyhow::bail!("chat {oid}: no {kind} has listed its models to harness yet; the list arrives when a {kind} chat starts");
             }
-            let ids = || t.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ");
+            let ids = || listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ");
             let target = match model {
-                Some(m) => Some(t.models.iter().find(|c| c.id == m).ok_or_else(|| anyhow::anyhow!("chat {oid}'s agent offers no model {m:?} (it offers {})", ids()))?),
-                None => [t.chosen_model.as_str(), t.model.as_str()].into_iter().find_map(|m| t.models.iter().find(|c| c.is(m))),
+                Some(m) => Some(listed.iter().find(|c| c.id == m).ok_or_else(|| anyhow::anyhow!("chat {oid}'s agent offers no model {m:?} (it offers {})", ids()))?),
+                None => [t.chosen_model.as_str(), t.model.as_str()].into_iter().find_map(|m| listed.iter().find(|c| c.is(m))),
             };
             if let Some(e) = effort {
                 let Some(target) = target else {
@@ -396,7 +411,7 @@ impl Chat {
                     anyhow::bail!("chat {oid}'s model {} {takes}, not {e:?}", target.id);
                 }
             }
-            st.adapter.choose(model, effort).map_err(|why| anyhow::anyhow!("chat {oid}: {why}"))?
+            if live { st.adapter.choose(model, effort).map_err(|why| anyhow::anyhow!("chat {oid}: {why}"))? } else { Vec::new() }
         };
         self.record(Body::Choice { model: model.map(str::to_owned), effort: effort.map(str::to_owned) }, tx);
         Ok(lines)
@@ -419,7 +434,7 @@ impl Chat {
         if line.is_empty() {
             return (false, Vec::new());
         }
-        let (evs, replies) = {
+        let (evs, replies, agent) = {
             let mut st = self.store.lock();
             if let Some(raw) = st.raw.as_mut()
                 && let Err(e) = raw.write_all(format!("{line}\n").as_bytes())
@@ -427,10 +442,13 @@ impl Chat {
                 eprintln!("{} raw: {e}", self.oid);
             }
             let evs = st.adapter.events(line);
-            (evs, st.adapter.replies())
+            (evs, st.adapter.replies(), st.adapter.agent())
         };
         let mut flipped = false;
         for ev in evs {
+            if let Body::Models { models: listed } = &ev {
+                models::learned(agent, listed);
+            }
             flipped |= self.record(ev, tx);
         }
         (flipped, replies)

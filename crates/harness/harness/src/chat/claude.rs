@@ -103,7 +103,7 @@ impl Claude {
         match (what, error) {
             (Asked::Interrupt, None) => vec![],
             (Asked::Interrupt, Some(e)) => vec![Body::Error { text: format!("claude refused the interrupt: {e}") }],
-            (Asked::ListModels, Some(e)) => vec![Body::Error { text: format!("claude refused list_models, so this chat's model and effort are fixed: {e}") }],
+            (Asked::ListModels, Some(e)) => vec![Body::Error { text: format!("claude refused list_models, so its picker offers the models the last claude listed: {e}") }],
             (Asked::ListModels, None) => {
                 let mut out = vec![Body::Models { models: models(a) }];
                 // Claude says the model it runs only in its init, which waits for the first message: until then it is
@@ -391,6 +391,10 @@ impl super::Adapter for Claude {
 
     fn interrupt(&mut self) -> Vec<String> {
         vec![self.ask(json!({"subtype": "interrupt"}), Asked::Interrupt)]
+    }
+
+    fn agent(&self) -> &'static str {
+        "claude"
     }
 
     fn choose(&mut self, model: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String> {

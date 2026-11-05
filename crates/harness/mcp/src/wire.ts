@@ -89,7 +89,7 @@ export type SessionInfo = {
 export type Reply =
   | { reply: "ok" | "watching" | "listening" }
   | { reply: "spawned"; id: number }
-  | { reply: "sessions"; sessions: SessionInfo[] }
+  | { reply: "sessions"; sessions: SessionInfo[]; models?: Record<string, ModelChoice[]> }
   | { reply: "daemon"; pid: number; sock: string }
   | { reply: "last"; id: number | null }
   | { reply: "screen"; text: string; info: SessionInfo }
