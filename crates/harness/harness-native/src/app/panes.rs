@@ -270,10 +270,21 @@ impl App {
         })
     }
 
-    /// The terminal under the pointer (a few points around its grid count).
+    /// The terminal under the pointer (a few points around its grid count), of those that can be seen.
     fn term_at(&self) -> Option<u64> {
         let (x, y) = (self.pointer.x, self.pointer.y);
-        self.terminals().into_iter().find(|&t| self.get::<TermGrid>(t).holds(x, y, 4.0))
+        self.terminals().into_iter().find(|&t| self.term_seen(t) && self.get::<TermGrid>(t).holds(x, y, 4.0))
+    }
+
+    /// Whether terminal `t` was painted this frame where it can be seen (`super::seen`): not Hidden or under a Hidden
+    /// ancestor, not faded out, not clipped away. One that cannot be seen is neither laid out, attached, resized, drawn
+    /// nor hit.
+    fn term_seen(&self, t: u64) -> bool {
+        let w = self.world.world_ref();
+        let Some(frame) = w.try_get::<&harness_native_ui_draw_api::Paint>(|p| p.frame) else { return false };
+        w.entity_from_id(t)
+            .try_cloned::<&harness_native_ui_draw_api::Painted>()
+            .is_some_and(|p| p.frame == frame && super::seen(&p))
     }
 
     /// A pane's object changed under the focused terminal: its selection, smooth scroll and mouse report start over.
@@ -287,8 +298,8 @@ impl App {
 
     // ---- the terminals ----
 
-    /// Every terminal pane: its grid the size of its node, and its object's output followed (a session attached, a run
-    /// or stage watched); runs no pane shows any more stop being followed.
+    /// Every terminal pane that can be seen this frame: its grid the size of its node, and its object's output followed (a
+    /// session attached, a run or stage watched); runs no pane shows any more stop being followed.
     pub(super) fn sync_terms(&mut self) {
         let mut shown_runs: HashMap<u64, (u64, Option<u32>)> = HashMap::new();
         for p in self.panes() {
@@ -298,6 +309,10 @@ impl App {
             let run = self.run_of(e);
             if let Some(r) = run {
                 shown_runs.insert(e, r);
+            }
+            // Out of sight it keeps what it follows, but its grid is not laid out and nothing is attached or resized.
+            if !self.term_seen(t) {
+                continue;
             }
             let laid = w.entity_from_id(t).try_cloned::<&Laid>();
             let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { continue };
