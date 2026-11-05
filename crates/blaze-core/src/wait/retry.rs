@@ -121,9 +121,10 @@ impl fmt::Display for WaitError {
             Why::Stuck { calls, at } => write!(
                 f,
                 "waiting for {}: {calls} calls in a row returned with nothing ready and the \
-                 clock still at {at:?}; a wait whose clock does not move is refused \
+                 clock still at {} ns; a wait whose clock does not move is refused \
                  (rule bounded-progress)",
-                self.what
+                self.what,
+                at.as_nanos()
             ),
         }
     }

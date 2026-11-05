@@ -25,18 +25,18 @@ pub use self::retry::{Clock, Deadline, Once, WaitError, Waited};
 pub(crate) use self::retry::Plant;
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code, reason = "Linux's waits: io_uring_enter and clock_nanosleep, one call each")]
+#[expect(unsafe_code, reason = "Linux's waits: io_uring_enter and clock_nanosleep, one call each")]
 mod linux;
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code, reason = "macOS's waits: kevent and mach_wait_until, one call each")]
+#[expect(unsafe_code, reason = "macOS's waits: kevent and mach_wait_until, one call each")]
 mod macos;
 #[cfg(not(any(unix, windows)))]
 mod other;
 #[cfg(unix)]
-#[allow(unsafe_code, reason = "poll of the caller's descriptors, one call")]
+#[expect(unsafe_code, reason = "poll of the caller's descriptors, one call")]
 mod unix;
 #[cfg(windows)]
-#[allow(
+#[expect(
     unsafe_code,
     reason = "Windows' waits: GetQueuedCompletionStatusEx and WaitForSingleObject, one call each"
 )]
@@ -72,6 +72,10 @@ pub struct Monotonic {
 
 impl Monotonic {
     /// A clock at zero now.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one real clock of code with no driver: waits read time only through it"
+    )]
     pub fn new() -> Monotonic {
         Monotonic { origin: Instant::now() }
     }
@@ -89,6 +93,10 @@ impl Default for Monotonic {
 }
 
 impl Clock for Monotonic {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one real clock of code with no driver: waits read time only through it"
+    )]
     fn now(&self) -> Duration {
         self.origin.elapsed()
     }

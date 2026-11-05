@@ -2374,6 +2374,7 @@ impl Ring {
 
     /// The job and fiber running on its thread now (0: none): atomics only, so the sampler
     /// may read them while the thread is stopped.
+    #[cfg(target_vendor = "apple")]
     pub(crate) fn running_now(&self) -> (u64, u32) {
         (self.job.load(Ordering::Relaxed), self.fiber.load(Ordering::Relaxed) as u32)
     }
