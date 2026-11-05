@@ -48,8 +48,9 @@ hn {
     Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
+  // Top-aligned, every one: a dashboard's cards (and whatever else sits side by side) start on one line.
   prefab GenRow : ui.Row {
-    Flex: {axis: Row, gap: $gen_gap, align: Center, justify: Start, wrap: false}
+    Flex: {axis: Row, gap: $gen_gap, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
 

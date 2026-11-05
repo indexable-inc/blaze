@@ -1,7 +1,7 @@
 <script>
   // SVG markup as a drawing (lowercase svg, g, path, rect, circle, ellipse, line, polyline, polygon, text), and the same
   // shapes as Canvas elements; inks are tones and series slots, never colours.
-  const pts = [0, 40, 20, 18, 40, 26, 60, 8, 80, 14, 100, 2];
+  const pts = [6, 40, 22, 20, 40, 27, 58, 11, 76, 16, 94, 8];
 </script>
 <Row gap={24}>
   <Card title="SVG">
