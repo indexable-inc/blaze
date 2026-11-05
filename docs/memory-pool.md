@@ -102,6 +102,45 @@ jetsam on macOS (`memorystatus_control`) and a cgroup's `memory.max` on Linux st
 ceiling, so a bug in any of the above ends one daemon, with a typed error on the client, and
 never the machine.
 
+### 7. What the kernel does for it (Linux 7.2, macOS)
+
+blaze's Linux floor is 7.2, the ix VM kernel (docs/kernel.md). The pool uses the kernel
+features below directly, with no probe and no path for an older kernel:
+
+- **`MAP_DROPPABLE` (6.11) for evictable cache pages.** A cache's arena is mapped droppable, so
+  under pressure the kernel discards its pages without asking the evictor, and with swap off
+  there is no writeback. A dropped page reads back as zeros, so each entry carries a nonzero
+  header word that the cache checks on every read. A zeroed header is a miss, and the entry is
+  reloaded from the store, as an evicted one would be (section 3). The evictor's count of a
+  droppable arena is its mapped size less what `mincore` says is gone. Only values the store
+  holds go in a droppable arena: a value that has not been placed yet is not droppable.
+- **cgroup `memory.reclaim` (5.19) for the evictor's own sweep.** The caches' arenas are
+  charged to a child cgroup of the daemon's (`cache`) with the memory controller on. When the
+  evictor needs `n` bytes it writes `n` to `cache/memory.reclaim` first. The kernel then takes
+  the coldest pages (droppable and lazyfree heap pages), with nothing for blaze to rank. It
+  falls back to its own cost order only for what the kernel gives back short (`EAGAIN`). The
+  write blocks while the kernel reclaims, so it runs on the evictor's thread, never on the
+  loop.
+- **Per-cgroup PSI triggers.** Pressure is read from the daemon's own cgroup's
+  `memory.pressure` (memory-budget.md section 7, "Pressure"; built in the ceiling PR). The pool
+  arms a second trigger on `cache/memory.pressure`, so stalls on cache pages alone tell the
+  evictor to slow its refills.
+- **`MADV_COLLAPSE` (6.1) and mTHP for the big arenas.** The query and frame arenas, which live
+  for a build, are `MADV_HUGEPAGE`. Once filled, they are collapsed in place with
+  `MADV_COLLAPSE` on the evictor's thread, with mTHP sizes (`hugepages-64kB` on arm64) enabled
+  for the daemon's anon memory. This cuts TLB misses and page-table memory (#1726's 97.9 GiB
+  committed heap is about 200 MiB of page tables at 4 KiB). A collapse that fails (no
+  contiguous memory) leaves the arena as it was, which is correct, and its span names it.
+- **`memory.events` for the hard ceiling.** The 100 ms footprint watch stays the bound on
+  macOS. On Linux the cgroup's `memory.high` (15/16 of the ceiling) already makes the kernel
+  reclaim past that line, and `memory.max` is the kill. The watch is kept as the line in the
+  log that names the daemon's tags before a kill, and an inotify watch on `memory.events`
+  (`high` and `max` counts) wakes it as soon as the kernel acts, not on the next tick.
+
+On macOS, the equivalents are the dispatch memory pressure source (built), `madvise(MADV_FREE_REUSABLE)`
+for evicted arenas, and the jetsam limit where the entitlement allows it (memory-budget.md
+section 7).
+
 ## Proof
 
 A Hegel deterministic simulation test of admission and eviction together (the `testing`
@@ -137,3 +176,6 @@ Each piece is its own pull request, admin-merged once `blaze check` and its focu
    kind and input size.
 6. Link inputs and the plane heap as store-backed tiers.
 7. One daemon per machine (memory-budget.md section 8).
+8. The kernel's part (section 7): droppable cache arenas and the `cache` cgroup with
+   `memory.reclaim` land with the evictor (4); `MADV_COLLAPSE` and the `memory.events` wake
+   are each a pull request of their own.
