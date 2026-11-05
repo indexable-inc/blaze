@@ -36,11 +36,8 @@ seed, its allocator named: a frame's for a task, `Global` with a reason otherwis
 `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
 persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never
 pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
-`crossbeam-channel`; a counter or flag is an atomic. On a pool thread or fiber, a wait goes through
-the scheduler (a key, a counter, a job), never a `Condvar`, a channel receive, `thread::sleep` or a
-raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper and a delay is a deadline
-in the sans-IO core or a driver's timer. `BTreeMap` only where iteration order is part of the
-output.
+`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
+`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
 
 ## sans-io-cores (rule 14)
 
@@ -100,5 +97,40 @@ needs the database while the database is attached.
 A fiber can resume on another thread after any wait, so nothing held across a wait may be tied to a
 thread: no thread-local borrow, lock guard or `Rc`. Mark regions that must not wait with `NoWait`;
 read thread-locals in `#[inline(never)]` functions that end before any wait.
+
+## deadline-waits (rule 43)
+
+A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on
+the injected clock (a driver's `now()`), recomputes the time left from that clock before every
+system call, treats an interrupted (EINTR) or spurious return as a retry, and ends in a typed
+outcome (`Waited::Ready` or `Waited::Deadline`), with fuel for a clock that does not move.
+`Driver::poll` takes that `Deadline`, never a relative timeout, so no layer restarts one. The
+kernel's waits (`poll`, `ppoll`, `select`, `epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`,
+`GetQueuedCompletionStatusEx`, ...) are banned in `.clippy.toml` outside
+`crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a
+signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and
+the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on
+the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel
+receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park
+helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples
+(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`, Windows `SuspendThread`). The
+DST in `crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its
+deadline, with a planted relative-timeout retry it must catch.
+
+See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
+
+## macos-private-apis (rule 44)
+
+On macOS, use any private or undocumented interface (Mach calls, libsystem and libdispatch
+internals, `__ulock_wait2`, `kevent_qos`/`kevent_id` workloops, `sandbox_init_with_parameters`,
+kperf, `thread_selfcounts`, `proc_info`, ...) where it is more efficient or more capable than the
+public one, and the public one where it is the better (`os_sync_wait_on_address_with_deadline`'s
+absolute deadline over `__ulock_wait2`'s relative one). Each use carries a comment naming the symbol
+and why it wins, and a test that resolves the symbol at run time and fails naming it if it is gone,
+so an OS update that removes it fails loudly in CI. There is no public-API fallback (`no-fallback`):
+a missing symbol is an error naming it. Which are in use and which are next is in
+docs/v2/plan/design/deadline-waits.md.
+
+See [docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis](../../../docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
