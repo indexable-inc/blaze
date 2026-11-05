@@ -2241,11 +2241,11 @@ impl<'db> MirBody<'db> {
     /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
     /// out of it depends on its type alone.
     /// `copy` is what is known already of which types are `Copy`.
-    pub fn mark_moves(
+    pub fn mark_moves<A: std::alloc::Allocator>(
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
-        copy: &mut blaze_hash::HashMap<Ty<'db>, bool, Global>,
+        copy: &mut blaze_hash::HashMap<Ty<'db>, bool, A>,
     ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {

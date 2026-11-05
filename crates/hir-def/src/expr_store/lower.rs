@@ -2540,7 +2540,11 @@ impl<'db> ExprCollector<'db> {
         if path.is_Self() {
             return true;
         }
-        let (resolution, unresolved_idx, _) = self.def_map.resolve_path_locally(
+        // `self.def_map` is the innermost block's when the body's blocks have items, so the path
+        // is resolved in the def maps around it too, as rustc's lexical walk does: a constructor
+        // declared outside a block with items (`struct S(u8); fn f() { struct L; S(a) = s; }`)
+        // is still one.
+        let (resolution, unresolved_idx, _) = self.def_map.resolve_path_around(
             self.local_def_map,
             self.db,
             self.module,
