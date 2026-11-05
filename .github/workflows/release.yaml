@@ -55,7 +55,11 @@ jobs:
           path: ${{ runner.temp }}/notes.md
           if-no-files-found: error
       # library/, which a blaze with no checkout of its commit downloads once and checks
-      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
+      # BLAKE3, by b3sum, which the ix runner image does not carry.
+      - run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends b3sum
       - run: |
           python3 -I harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
       - uses: actions/upload-artifact@v7
