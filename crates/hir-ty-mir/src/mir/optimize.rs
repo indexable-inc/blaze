@@ -125,7 +125,8 @@ pub(super) fn optimize<'db>(
     // One span a body optimized, named for it as it starts: a pass that runs for minutes
     // shows in `blaze debug live` as the function it is on and, below it, the pass (copy
     // propagation's walk of `MInst` ran 493 s under a span that said only `codegen describe`).
-    let span = tracing::info_span!(target: "blaze", "mir optimize", function = tracing::field::Empty);
+    let span =
+        tracing::info_span!(target: "blaze", "mir optimize", function = tracing::field::Empty);
     if !span.is_disabled() {
         span.record("function", owner_path(db, body.owner).as_str());
     }
