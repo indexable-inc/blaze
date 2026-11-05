@@ -57,12 +57,6 @@ concurrency:
   # still a group of its own.
   group: blaze-${{ github.event_name == 'push' && 'main' || format('{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  # Main queues every push (`queue: max`, GitHub's 2026-05-07 concurrency queue: up to 100 waiting,
-  # first in first out) rather than replacing the waiting run with the newest: on 2026-11-05 a
-  # merge every few minutes replaced each waiting run before it started, so the batches merged
-  # that day never got a run of their own. A pull request keeps `single` (`max` with
-  # cancel-in-progress is a validation error).
-  queue: ${{ github.event_name == 'push' && 'max' || 'single' }}
 
 permissions:
   contents: read
