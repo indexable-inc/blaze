@@ -124,7 +124,7 @@ pub fn spawn(d: &Arc<Daemon>, v: &Value) -> Result<Value> {
         r["id"].as_str().unwrap_or_default().to_string()
     } else {
         let mut args: Vec<String> = serde_json::from_value(v["args"].clone()).unwrap_or_default();
-        // Claude is a chat session unless asked for its terminal UI (`mode: "tui"`, or `--tui` in args).
+        // Claude and Codex are chat sessions unless asked for their terminal UI (`mode: "tui"`, or `--tui` in args).
         if v["mode"] == "tui" {
             args.push("--tui".into());
         }

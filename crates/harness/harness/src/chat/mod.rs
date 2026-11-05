@@ -1,6 +1,6 @@
 //! Chat mode: an agent session driven over its structured protocol instead of its TUI in a PTY, so the native app draws
 //! the conversation itself (harness-native's chat pane) and agents talk to it without typing into a terminal. The agent's
-//! own protocol stays in its adapter ([`claude`]: stream-json; [`codex`]: the slot for `codex app-server`); everything
+//! own protocol stays in its adapter ([`claude`]: stream-json; [`codex`]: `codex app-server`'s JSON-RPC); everything
 //! here, and everything a client reads, is the one agent-neutral event model below.
 //!
 //! # The event model
@@ -33,7 +33,9 @@
 //!   history, then each event live, then T_EXIT. The history leaves out the partials of every block that came whole
 //!   since, so a reattach is the finished conversation plus what is still streaming. Without `events` (the terminal
 //!   client) the same events come as plain text.
-//! - `send` writes the adapter's user line and records a `user` event; `interrupt` writes the adapter's interrupt.
+//! - `send` writes the adapter's user lines and records a `user` event; `interrupt` writes the adapter's interrupt. An
+//!   adapter may also write lines of its own: a handshake as the child starts ([`Adapter::start`]) and answers to what
+//!   the child asks or queued messages once it can take them ([`Adapter::replies`], drained after every line read).
 //! - Busy (the sidebar's breathing dot) is a turn in flight, from a `user` until its `turn_end`. The title is the first
 //!   user message's first line.
 //! - The `messages` stream (what `Obj.reply()` reads) is written here from the events, `turn_end` on each turn's end;
@@ -55,14 +57,24 @@ use tokio::sync::broadcast;
 /// How many lines of the conversation `screen` returns (its tail).
 const SCREEN_LINES: usize = 200;
 
-/// An agent's protocol: how its output lines become events, and the lines that send a message and stop a turn.
+/// An agent's protocol: how its output lines become events, and the lines that start it, send a message, stop a turn
+/// and answer what it asks.
 pub trait Adapter: Send {
+    /// The lines to write as the child starts, before any message (a handshake).
+    fn start(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// The events one line of the agent's output stands for (none for what the model has no place for).
     fn events(&mut self, line: &str) -> Vec<Value>;
-    /// The line that sends the user's `text`.
-    fn user(&mut self, text: &str) -> String;
-    /// The line that stops the turn in flight.
-    fn interrupt(&mut self) -> String;
+    /// The lines to write now that [`Adapter::events`] read a line: answers to the child's requests, messages it can
+    /// take now. Drained.
+    fn replies(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The lines that send the user's `text` (none while the adapter holds it until the agent can take it).
+    fn user(&mut self, text: &str) -> Vec<String>;
+    /// The lines that stop the turn in flight (none when there is nothing to stop yet).
+    fn interrupt(&mut self) -> Vec<String>;
 }
 
 /// Whether event `ev` is a partial a whole block replaces.
@@ -158,35 +170,42 @@ impl Chat {
         self.model.lock().unwrap().clone()
     }
 
-    /// A line the agent wrote: kept in `raw`, and its events recorded. Whether the busy state changed.
-    pub fn agent_line(&self, line: &str, tx: &broadcast::Sender<Ev>) -> bool {
+    /// The lines to write to the child as it starts.
+    pub fn start_lines(&self) -> Vec<String> {
+        self.store.lock().unwrap().adapter.start()
+    }
+
+    /// A line the agent wrote: kept in `raw`, and its events recorded. Whether the busy state changed, and the lines to
+    /// write back to the agent.
+    pub fn agent_line(&self, line: &str, tx: &broadcast::Sender<Ev>) -> (bool, Vec<String>) {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            return false;
+            return (false, Vec::new());
         }
-        let evs = {
+        let (evs, replies) = {
             let mut st = self.store.lock().unwrap();
             if let Err(e) = st.raw.write_all(format!("{line}\n").as_bytes()) {
                 eprintln!("{} raw: {e}", self.oid);
             }
-            st.adapter.events(line)
+            let evs = st.adapter.events(line);
+            (evs, st.adapter.replies())
         };
         let mut flipped = false;
         for ev in evs {
             flipped |= self.record(ev, tx);
         }
-        flipped
+        (flipped, replies)
     }
 
-    /// The line that sends `text` to the agent, after recording its `user` event (and the turn starting).
-    pub fn user_line(&self, text: &str, tx: &broadcast::Sender<Ev>) -> String {
+    /// The lines that send `text` to the agent, after recording its `user` event (and the turn starting).
+    pub fn user_lines(&self, text: &str, tx: &broadcast::Sender<Ev>) -> Vec<String> {
         self.record(json!({"ev": "user", "text": text}), tx);
         self.record(json!({"ev": "busy", "busy": true}), tx);
         self.store.lock().unwrap().adapter.user(text)
     }
 
-    /// The line that stops the turn in flight.
-    pub fn interrupt_line(&self) -> String {
+    /// The lines that stop the turn in flight.
+    pub fn interrupt_lines(&self) -> Vec<String> {
         self.store.lock().unwrap().adapter.interrupt()
     }
 
