@@ -333,10 +333,27 @@ fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
     if let Some(value) = own.and_then(|it| it.value.as_deref()) {
         return value.parse().ok();
     }
-    let arrow =
-        parquet::arrow::parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata())
-            .ok()?;
-    arrow.metadata().get("blaze.schema")?.parse().ok()
+    let pairs = file.key_value_metadata()?;
+    let encoded = pairs.iter().find(|it| it.key == "ARROW:schema")?.value.as_deref()?;
+    arrow_schema_version(encoded)
+}
+
+/// The `blaze.schema` key of the Arrow schema a Parquet footer encodes (`ARROW:schema`: base64
+/// of an IPC schema message, after a continuation marker and length when it has one, as
+/// parquet's `get_arrow_schema_from_metadata` reads it), read from the flatbuffer in place: no
+/// `Schema` is built, whose metadata map would draw a hasher's random state, which a sans-IO
+/// core does not read.
+fn arrow_schema_version(encoded: &str) -> Option<u32> {
+    use base64::Engine as _;
+    // alloc: the footer's encoded schema, decoded once a file read
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let message = match bytes.get(..4) {
+        Some([0xff, 0xff, 0xff, 0xff]) if bytes.len() > 8 => &bytes[8..],
+        _ => &bytes[..],
+    };
+    let schema = arrow_ipc::root_as_message(message).ok()?.header_as_schema()?;
+    let pair = schema.custom_metadata()?.iter().find(|it| it.key() == Some("blaze.schema"))?;
+    pair.value()?.parse().ok()
 }
 
 /// Which files a reader reads.

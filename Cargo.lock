@@ -1551,6 +1551,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
+ "base64",
  "blaze-core",
  "blaze-graph",
  "blaze-hash",

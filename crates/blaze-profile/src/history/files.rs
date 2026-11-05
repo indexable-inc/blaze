@@ -454,12 +454,18 @@ fn unexpected(path: PathBuf, doing: &'static str, done: &Done) -> HistoryError {
         path,
         doing,
         // alloc: an error
-        error: io::Error::other(format!("the driver answered {done:?}, which no such effect answers")),
+        error: io::Error::other(format!(
+            "the driver answered {done:?}, which no such effect answers"
+        )),
     }
 }
 
 /// `done`, or the error of its effect on `path` doing `doing`.
-fn check(done: Done, path: impl FnOnce() -> PathBuf, doing: &'static str) -> Result<Done, HistoryError> {
+fn check(
+    done: Done,
+    path: impl FnOnce() -> PathBuf,
+    doing: &'static str,
+) -> Result<Done, HistoryError> {
     match done {
         Done::Failed(error) => Err(io_failed(path(), doing, error)),
         done => Ok(done),
@@ -616,7 +622,11 @@ impl Read {
                             self.stage = Reading::List;
                         }
                         Ok(other) => {
-                            return Step::Ready(Err(unexpected(cx.path(manifest::FILE), doing, &other)));
+                            return Step::Ready(Err(unexpected(
+                                cx.path(manifest::FILE),
+                                doing,
+                                &other,
+                            )));
                         }
                         Err(error) => return Step::Ready(Err(error)),
                     }
@@ -624,19 +634,23 @@ impl Read {
                 }
                 Reading::Read => {
                     let doing = "reading the manifest";
-                    return Step::Ready(match check(only(done.take()), || cx.path(manifest::FILE), doing) {
-                        Ok(Done::Read(bytes)) => match Manifest::decode(&bytes) {
-                            Ok(it) => Ok((it, Adoption::Written)),
-                            Err(why) => Err(manifest_error(cx, why)),
+                    return Step::Ready(
+                        match check(only(done.take()), || cx.path(manifest::FILE), doing) {
+                            Ok(Done::Read(bytes)) => match Manifest::decode(&bytes) {
+                                Ok(it) => Ok((it, Adoption::Written)),
+                                Err(why) => Err(manifest_error(cx, why)),
+                            },
+                            Ok(other) => Err(unexpected(cx.path(manifest::FILE), doing, &other)),
+                            Err(error) => Err(error),
                         },
-                        Ok(other) => Err(unexpected(cx.path(manifest::FILE), doing, &other)),
-                        Err(error) => Err(error),
-                    });
+                    );
                 }
                 Reading::List => {
                     let entries = match check(only(done.take()), || cx.dir_path(), "listing") {
                         Ok(Done::Listed(entries)) => entries,
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.dir_path(), "listing", &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.dir_path(), "listing", &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     };
                     for (file, meta) in &entries {
@@ -657,7 +671,9 @@ impl Read {
                                 manifest::Kind::Other if name == manifest::LEGACY_RETIRED => {
                                     self.legacy = true;
                                 }
-                                manifest::Kind::Schema | manifest::Kind::Hidden | manifest::Kind::Other => {}
+                                manifest::Kind::Schema
+                                | manifest::Kind::Hidden
+                                | manifest::Kind::Other => {}
                             }
                         } else if let Some(PinFile::Said { generation, .. }) =
                             cx.name_in_pins(file).and_then(PinFile::parse)
@@ -688,10 +704,14 @@ impl Read {
                     let mut footers = Vec::with_capacity(names.len());
                     for name in &names {
                         let doing = "opening to read its footer";
-                        let Some(it) = done.next() else { unreachable!("one completion an effect") };
+                        let Some(it) = done.next() else {
+                            unreachable!("one completion an effect")
+                        };
                         match check(it, || cx.path(name), doing) {
                             Ok(Done::Mapped(mapping)) => footers.push(mapping),
-                            Ok(other) => return Step::Ready(Err(unexpected(cx.path(name), doing, &other))),
+                            Ok(other) => {
+                                return Step::Ready(Err(unexpected(cx.path(name), doing, &other)));
+                            }
                             Err(error) => return Step::Ready(Err(error)),
                         }
                     }
@@ -699,16 +719,26 @@ impl Read {
                         true => {
                             let doing = "reading the retired files of a history before manifests";
                             let path = cx.path(manifest::LEGACY_RETIRED);
-                            let Some(it) = done.next() else { unreachable!("one completion an effect") };
+                            let Some(it) = done.next() else {
+                                unreachable!("one completion an effect")
+                            };
                             match check(it, || path.clone(), doing) {
                                 Ok(Done::Read(bytes)) => Some(bytes),
-                                Ok(other) => return Step::Ready(Err(unexpected(path, doing, &other))),
+                                Ok(other) => {
+                                    return Step::Ready(Err(unexpected(path, doing, &other)));
+                                }
                                 Err(error) => return Step::Ready(Err(error)),
                             }
                         }
                         false => None,
                     };
-                    let adopted = manifest::adopt(&cx.dir_path(), names, footers, legacy.as_deref(), self.said);
+                    let adopted = manifest::adopt(
+                        &cx.dir_path(),
+                        names,
+                        footers,
+                        legacy.as_deref(),
+                        self.said,
+                    );
                     return Step::Ready(adopted.map(|it| (it, Adoption::Adopted)));
                 }
             }
@@ -739,16 +769,27 @@ struct Hold {
 
 impl Hold {
     fn new() -> Hold {
-        Hold { stage: Holding::Start, since: Duration::ZERO, retry: LOCK_RETRY_FIRST, lock: Tag(0), read: Read::new() }
+        Hold {
+            stage: Holding::Start,
+            since: Duration::ZERO,
+            retry: LOCK_RETRY_FIRST,
+            lock: Tag(0),
+            read: Read::new(),
+        }
     }
 
     fn take_lock<H: Host>(&mut self, cx: &mut Cx<'_, H>) {
         let file = cx.file(manifest::LOCK);
-        self.lock = cx.ask(Wait::ManifestLock, |tag| Effect::Lock { file, mode: LockMode::Exclusive, tag });
+        self.lock =
+            cx.ask(Wait::ManifestLock, |tag| Effect::Lock { file, mode: LockMode::Exclusive, tag });
         self.stage = Holding::Lock;
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, mut done: Option<Vec<Done>>) -> Step<Result<Held, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Held, HistoryError>> {
         loop {
             match self.stage {
                 Holding::Start => {
@@ -773,13 +814,20 @@ impl Hold {
                             self.stage = Holding::Wait;
                             return Step::Pending;
                         }
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(manifest::LOCK), doing, &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(
+                                cx.path(manifest::LOCK),
+                                doing,
+                                &other,
+                            )));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                 }
                 Holding::Wait => {
                     let doing = "waiting to lock the manifest's lock";
-                    if let Err(error) = check(only(done.take()), || cx.path(manifest::LOCK), doing) {
+                    if let Err(error) = check(only(done.take()), || cx.path(manifest::LOCK), doing)
+                    {
                         return Step::Ready(Err(error));
                     }
                     self.take_lock(cx);
@@ -789,10 +837,14 @@ impl Hold {
                     return match self.read.resume(cx, done.take()) {
                         Step::Pending => Step::Pending,
                         Step::Ready(Err(error)) => Step::Ready(Err(error)),
-                        Step::Ready(Ok((manifest, Adoption::Written))) => Step::Ready(Ok(Held::read(manifest))),
+                        Step::Ready(Ok((manifest, Adoption::Written))) => {
+                            Step::Ready(Ok(Held::read(manifest)))
+                        }
                         // Written at the next commit, so the next open sweeps against it, and the
                         // file of a blaze before manifests deleted after.
-                        Step::Ready(Ok((manifest, Adoption::Adopted))) => Step::Ready(Ok(Held::adopted(manifest))),
+                        Step::Ready(Ok((manifest, Adoption::Adopted))) => {
+                            Step::Ready(Ok(Held::adopted(manifest)))
+                        }
                     };
                 }
             }
@@ -827,9 +879,16 @@ impl Commit {
         Commit { stage: Committing::Start, bytes: Vec::new() }
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, held: &mut Held, done: Option<Vec<Done>>) -> Step<Result<(), HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        held: &mut Held,
+        done: Option<Vec<Done>>,
+    ) -> Step<Result<(), HistoryError>> {
         let hidden = cx.hidden(manifest::FILE);
-        let failed = |cx: &Cx<'_, H>, done: Option<Vec<Done>>, doing| check(only(done), || cx.path(manifest::FILE), doing).err();
+        let failed = |cx: &Cx<'_, H>, done: Option<Vec<Done>>, doing| {
+            check(only(done), || cx.path(manifest::FILE), doing).err()
+        };
         match self.stage {
             Committing::Start => {
                 if !held.changed() {
@@ -934,7 +993,9 @@ impl Change {
                     Step::Pending => return Step::Pending,
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                     Step::Ready(Ok(mut held)) => {
-                        let Some(change) = change.take() else { unreachable!("a change is made once") };
+                        let Some(change) = change.take() else {
+                            unreachable!("a change is made once")
+                        };
                         if let Err(error) = change(cx, st, &mut held) {
                             return Step::Ready(Err(error));
                         }
@@ -943,7 +1004,9 @@ impl Change {
                     }
                 },
                 Changing::Commit => {
-                    let Some(held) = self.held.as_mut() else { unreachable!("held before its commit") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held before its commit")
+                    };
                     match self.commit.resume(cx, held, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
@@ -956,7 +1019,9 @@ impl Change {
                         }
                     }
                 }
-                Changing::Unlock => return Step::Ready(unlocked(only(done.take()), cx.path(manifest::LOCK))),
+                Changing::Unlock => {
+                    return Step::Ready(unlocked(only(done.take()), cx.path(manifest::LOCK)));
+                }
             }
         }
     }
@@ -1023,9 +1088,10 @@ impl Place {
                     if let Done::Failed(error) = done {
                         let path = match self.stage {
                             Placing::Rename => cx.path(&self.slots[at].name),
-                            Placing::Start | Placing::Truncate | Placing::Append | Placing::Sync => {
-                                cx.path_of(&cx.hidden(&self.slots[at].name))
-                            }
+                            Placing::Start
+                            | Placing::Truncate
+                            | Placing::Append
+                            | Placing::Sync => cx.path_of(&cx.hidden(&self.slots[at].name)),
                         };
                         self.slots[at].failed = Some(io_failed(path, doing, error));
                     }
@@ -1145,14 +1211,23 @@ impl Trim {
         gone
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, done: Option<Vec<Done>>) -> Step<Result<u32, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        done: Option<Vec<Done>>,
+    ) -> Step<Result<u32, HistoryError>> {
         let gone = self.gone.get_or_insert_with(|| Trim::plan(st));
         if gone.is_empty() {
             return Step::Ready(Ok(0));
         }
         let step = self.change.resume(cx, st, done, |_, st, held| {
             held.retire(
-                st.kept.iter().enumerate().filter(|&(at, kept)| goes(gone, at, kept)).map(|(_, kept)| kept.file.as_str()),
+                st.kept
+                    .iter()
+                    .enumerate()
+                    .filter(|&(at, kept)| goes(gone, at, kept))
+                    .map(|(_, kept)| kept.file.as_str()),
             );
             st.reaping = true;
             Ok(())
@@ -1259,7 +1334,12 @@ impl Reap {
         !self.reapable.is_empty()
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<u32, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<u32, HistoryError>> {
         loop {
             match self.stage {
                 Reaping::Start => {
@@ -1301,14 +1381,18 @@ impl Reap {
                             self.stage = Reaping::ListPins;
                             return Step::Pending;
                         }
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(PINS), doing, &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(PINS), doing, &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                 }
                 Reaping::ListPins => {
                     let entries = match check(only(done.take()), || cx.path(PINS), "listing") {
                         Ok(Done::Listed(entries)) => entries,
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(PINS), "listing", &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(PINS), "listing", &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     };
                     for (file, meta) in &entries {
@@ -1323,12 +1407,18 @@ impl Reap {
                             Some(PinFile::Lock { .. }) => true,
                             // Pins nothing until it is named; a dead process's is deleted (never
                             // a live process's: it may be between making the file and locking it).
-                            Some(it @ PinFile::Making { .. }) => it.pid().is_some_and(|pid| !cx.host.alive(pid)),
+                            Some(it @ PinFile::Making { .. }) => {
+                                it.pid().is_some_and(|pid| !cx.host.alive(pid))
+                            }
                             Some(PinFile::Said { .. }) | None => false,
                         };
                         if look {
                             let file = cx.pin_file(&self.pins[at]);
-                            let tag = cx.ask(Wait::Reap, |tag| Effect::Lock { file, mode: LockMode::Exclusive, tag });
+                            let tag = cx.ask(Wait::Reap, |tag| Effect::Lock {
+                                file,
+                                mode: LockMode::Exclusive,
+                                tag,
+                            });
                             // clone: a pin's name, once a reap
                             self.looked.push((self.pins[at].clone(), tag));
                         }
@@ -1361,7 +1451,13 @@ impl Reap {
                                     self.live.push(id.to_owned());
                                 }
                             }
-                            Ok(other) => return Step::Ready(Err(unexpected(cx.path(PINS).join(&name), doing, &other))),
+                            Ok(other) => {
+                                return Step::Ready(Err(unexpected(
+                                    cx.path(PINS).join(&name),
+                                    doing,
+                                    &other,
+                                )));
+                            }
                             Err(error) => return Step::Ready(Err(error)),
                         }
                     }
@@ -1387,7 +1483,9 @@ impl Reap {
                 }
                 Reaping::RemoveStale => {
                     for done in round(done.take()) {
-                        if let Err(error) = check(done, || cx.path(PINS), "deleting a dead reader's pin file") {
+                        if let Err(error) =
+                            check(done, || cx.path(PINS), "deleting a dead reader's pin file")
+                        {
                             return Step::Ready(Err(error));
                         }
                     }
@@ -1416,11 +1514,17 @@ impl Reap {
                 }
                 Reaping::RemoveRetired => {
                     let reapable = std::mem::take(&mut self.reapable);
-                    let Some(held) = self.held.as_mut() else { unreachable!("held through a reap") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held through a reap")
+                    };
                     for (&at, done) in reapable.iter().zip(round(done.take())) {
                         if let Done::Failed(error) = done {
                             let path = cx.path(&held.manifest().retired().files[at].0);
-                            return Step::Ready(Err(io_failed(path, "deleting a retired file no reader pins", error)));
+                            return Step::Ready(Err(io_failed(
+                                path,
+                                "deleting a retired file no reader pins",
+                                error,
+                            )));
                         }
                     }
                     held.reaped(&reapable);
@@ -1428,7 +1532,9 @@ impl Reap {
                     self.stage = Reaping::Commit;
                 }
                 Reaping::Commit => {
-                    let Some(held) = self.held.as_mut() else { unreachable!("held before its commit") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held before its commit")
+                    };
                     match self.commit.resume(cx, held, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
@@ -1526,12 +1632,28 @@ impl Compact {
         }
     }
 
-    fn fail<H: Host>(&self, cx: &Cx<'_, H>, file: PathBuf, doing: &'static str, error: CompactError) -> HistoryError {
-        HistoryError::Compact { output: cx.path(&self.current().output.file_name()), file, doing, error }
+    fn fail<H: Host>(
+        &self,
+        cx: &Cx<'_, H>,
+        file: PathBuf,
+        doing: &'static str,
+        error: CompactError,
+    ) -> HistoryError {
+        HistoryError::Compact {
+            output: cx.path(&self.current().output.file_name()),
+            file,
+            doing,
+            error,
+        }
     }
 
     /// The error of a merge's write of its hidden file that failed doing `doing`.
-    fn failed_write<H: Host>(&self, cx: &Cx<'_, H>, done: Done, doing: &'static str) -> Option<HistoryError> {
+    fn failed_write<H: Host>(
+        &self,
+        cx: &Cx<'_, H>,
+        done: Done,
+        doing: &'static str,
+    ) -> Option<HistoryError> {
         let Done::Failed(error) = done else { return None };
         let hidden = cx.path_of(&cx.hidden(&self.current().output.file_name()));
         Some(self.fail(cx, hidden, doing, CompactError::Io(io::Error::other(error.0))))
@@ -1578,7 +1700,12 @@ impl Compact {
         }
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<(), HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<(), HistoryError>> {
         loop {
             match self.stage {
                 Merging::Next => {
@@ -1600,14 +1727,30 @@ impl Compact {
                             Done::Mapped(it) => it,
                             Done::Failed(error) => {
                                 let error = CompactError::Io(io::Error::other(error.0));
-                                return Step::Ready(Err(self.fail(cx, path, "opening the input", error)));
+                                return Step::Ready(Err(self.fail(
+                                    cx,
+                                    path,
+                                    "opening the input",
+                                    error,
+                                )));
                             }
-                            other => return Step::Ready(Err(unexpected(path, "opening the input", &other))),
+                            other => {
+                                return Step::Ready(Err(unexpected(
+                                    path,
+                                    "opening the input",
+                                    &other,
+                                )));
+                            }
                         };
                         match merge::Input::of(mapping) {
                             Ok(it) => inputs.push(it),
                             Err(error) => {
-                                return Step::Ready(Err(self.fail(cx, path, "reading the footer of the input", error)));
+                                return Step::Ready(Err(self.fail(
+                                    cx,
+                                    path,
+                                    "reading the footer of the input",
+                                    error,
+                                )));
                             }
                         }
                     }
@@ -1635,7 +1778,8 @@ impl Compact {
                     return Step::Pending;
                 }
                 Merging::Sync => {
-                    if let Some(error) = self.failed_write(cx, only(done.take()), "syncing to disk") {
+                    if let Some(error) = self.failed_write(cx, only(done.take()), "syncing to disk")
+                    {
                         return Step::Ready(Err(error));
                     }
                     let hidden = cx.hidden(&self.current().output.file_name());
@@ -1645,28 +1789,44 @@ impl Compact {
                     return Step::Pending;
                 }
                 Merging::Rename => {
-                    if let Some(error) = self.failed_write(cx, only(done.take()), "renaming into place") {
+                    if let Some(error) =
+                        self.failed_write(cx, only(done.take()), "renaming into place")
+                    {
                         return Step::Ready(Err(error));
                     }
                     let merge = self.current();
-                    let entry = Entry::merged(st.kept.iter().filter(|it| merge.inputs.contains(&it.file)).map(|it| &it.entry));
+                    let entry = Entry::merged(
+                        st.kept
+                            .iter()
+                            .filter(|it| merge.inputs.contains(&it.file))
+                            .map(|it| &it.entry),
+                    );
                     let Some(entry) = entry else {
                         let path = cx.path(&merge.output.file_name());
-                        let doing = "taking the entries of its inputs, of which the history keeps none";
-                        return Step::Ready(Err(self.fail(cx, path, doing, CompactError::SchemaDiffers)));
+                        let doing =
+                            "taking the entries of its inputs, of which the history keeps none";
+                        return Step::Ready(Err(self.fail(
+                            cx,
+                            path,
+                            doing,
+                            CompactError::SchemaDiffers,
+                        )));
                     };
                     self.entry = Some(entry);
                     self.change = Change::new();
                     self.stage = Merging::Change;
                 }
                 Merging::Change => {
-                    let Some(merge) = self.merge.as_ref() else { unreachable!("a merge under way") };
+                    let Some(merge) = self.merge.as_ref() else {
+                        unreachable!("a merge under way")
+                    };
                     let Some(entry) = self.entry.as_ref() else { unreachable!("a merge's entry") };
                     // The commit point: the output listed and its inputs retired at once, so a
                     // reader reads the rows once.
                     let step = self.change.resume(cx, st, done.take(), |cx, st, held| {
                         // clone: a file's entry, once a merge
-                        held.add(&merge.output.file_name(), entry.clone()).map_err(|why| manifest_error(cx, why))?;
+                        held.add(&merge.output.file_name(), entry.clone())
+                            .map_err(|why| manifest_error(cx, why))?;
                         held.retire(merge.inputs.iter().map(String::as_str));
                         st.reaping = true;
                         Ok(())
@@ -1754,7 +1914,8 @@ impl Recover {
     /// Recovers the mappings named in `listing`, the history's directory's files.
     fn new(listing: &[(String, Meta)]) -> Recover {
         // alloc: once a postmortem
-        let mut named: Vec<u32> = listing.iter().filter_map(|(name, _)| postmortem::pid_of(name)).collect();
+        let mut named: Vec<u32> =
+            listing.iter().filter_map(|(name, _)| postmortem::pid_of(name)).collect();
         named.sort_unstable();
         Recover {
             stage: Recovering::Start,
@@ -1777,7 +1938,12 @@ impl Recover {
         self.failed.get_or_insert(error);
     }
 
-    fn mapping_error<H: Host>(cx: &Cx<'_, H>, pid: u32, doing: &'static str, error: IoError) -> HistoryError {
+    fn mapping_error<H: Host>(
+        cx: &Cx<'_, H>,
+        pid: u32,
+        doing: &'static str,
+        error: IoError,
+    ) -> HistoryError {
         HistoryError::Postmortem(postmortem::PostmortemError::Io {
             path: cx.path(&postmortem::file_name(pid)),
             doing,
@@ -1798,7 +1964,12 @@ impl Recover {
         self.stage = Recovering::Released;
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<(usize, Option<HistoryError>)> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<(usize, Option<HistoryError>)> {
         loop {
             match self.stage {
                 Recovering::Start => {
@@ -1808,7 +1979,11 @@ impl Recover {
                     for at in 0..self.named.len() {
                         let pid = self.named[at];
                         let file = cx.file(&postmortem::file_name(pid));
-                        let tag = cx.ask(Wait::Files, |tag| Effect::Lock { file, mode: LockMode::Exclusive, tag });
+                        let tag = cx.ask(Wait::Files, |tag| Effect::Lock {
+                            file,
+                            mode: LockMode::Exclusive,
+                            tag,
+                        });
                         self.locks.push((pid, tag));
                     }
                     self.stage = Recovering::Lock;
@@ -1831,7 +2006,11 @@ impl Recover {
                                 self.note(error);
                             }
                             other => {
-                                let error = unexpected(cx.path(&postmortem::file_name(pid)), "locking", &other);
+                                let error = unexpected(
+                                    cx.path(&postmortem::file_name(pid)),
+                                    "locking",
+                                    &other,
+                                );
                                 self.note(error);
                             }
                         }
@@ -1856,7 +2035,11 @@ impl Recover {
                                 unlocks = true;
                             }
                             other => {
-                                let error = unexpected(cx.path(&postmortem::file_name(pid)), "opening", &other);
+                                let error = unexpected(
+                                    cx.path(&postmortem::file_name(pid)),
+                                    "opening",
+                                    &other,
+                                );
                                 self.note(error);
                                 cx.unlock(lock);
                                 unlocks = true;
@@ -1910,7 +2093,11 @@ impl Recover {
                             let mut placing = Vec::with_capacity(files.len());
                             for file in files {
                                 // clone: a file's name, kept with its entry until it is listed
-                                self.files.push((file.file.clone(), file.bytes.len() as u64, file.entry));
+                                self.files.push((
+                                    file.file.clone(),
+                                    file.bytes.len() as u64,
+                                    file.entry,
+                                ));
                                 placing.push((file.file, file.bytes));
                             }
                             self.place = Some(Place::new(placing, Then::Rename));
@@ -1919,7 +2106,9 @@ impl Recover {
                     }
                 }
                 Recovering::Place => {
-                    let Some(place) = self.place.as_mut() else { unreachable!("placing a postmortem's files") };
+                    let Some(place) = self.place.as_mut() else {
+                        unreachable!("placing a postmortem's files")
+                    };
                     match place.resume(cx, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(()) => {
@@ -1966,7 +2155,14 @@ impl Recover {
                         st.total += bytes;
                         // Not this history's to merge: of another process, as a file there
                         // before it opened.
-                        st.kept.push_back(Kept { name: named, file: name, bytes, entry, ours: Ours::Theirs, listed: Listed::Listed });
+                        st.kept.push_back(Kept {
+                            name: named,
+                            file: name,
+                            bytes,
+                            entry,
+                            ours: Ours::Theirs,
+                            listed: Listed::Listed,
+                        });
                         self.written += 1;
                     }
                     // The next mapping's files take the next flush number.
@@ -1979,7 +2175,8 @@ impl Recover {
                 Recovering::Remove => {
                     let Some((pid, _)) = self.at else { unreachable!("a mapping under way") };
                     if let Done::Failed(error) = only(done.take()) {
-                        let error = Recover::mapping_error(cx, pid, "deleting, its rows written,", error);
+                        let error =
+                            Recover::mapping_error(cx, pid, "deleting, its rows written,", error);
                         self.note(error);
                     }
                     self.release(cx);
@@ -2006,7 +2203,12 @@ enum Job {
 }
 
 impl Job {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         match self {
             Job::Open(job) => job.resume(cx, st, done),
             Job::Flush(job) => job.resume(cx, st, done),
@@ -2103,7 +2305,9 @@ impl Open {
             let retired = held.manifest().retired().holds(name);
             match manifest::kind(name) {
                 // clone: a name, once a history
-                manifest::Kind::Hidden if half_written(&*cx.host, name) => self.removes.push(name.clone()),
+                manifest::Kind::Hidden if half_written(&*cx.host, name) => {
+                    self.removes.push(name.clone())
+                }
                 // A newer blaze's table, listed: kept as written, read by no view of this blaze.
                 manifest::Kind::Listable | manifest::Kind::Unclassified if listed => {
                     present.insert(name);
@@ -2114,7 +2318,10 @@ impl Open {
                 manifest::Kind::Listable => self.removes.push(name.clone()),
                 manifest::Kind::Unclassified => {
                     // clone: an error
-                    return Err(HistoryError::Unclassified { dir: cx.dir_path(), file: name.clone() });
+                    return Err(HistoryError::Unclassified {
+                        dir: cx.dir_path(),
+                        file: name.clone(),
+                    });
                 }
                 manifest::Kind::Hidden | manifest::Kind::Schema | manifest::Kind::Other => {}
             }
@@ -2129,11 +2336,13 @@ impl Open {
         st.kept.clear();
         st.last_build = 0;
         for name in held.manifest().all() {
-            let (Some(named), Some(entry)) = (Name::parse(name), held.manifest().entry(name)) else {
+            let (Some(named), Some(entry)) = (Name::parse(name), held.manifest().entry(name))
+            else {
                 continue;
             };
             st.last_build = st.last_build.max(named.build);
-            let bytes = self.listing.iter().find(|(it, _)| it == name).map_or(0, |(_, meta)| meta.len);
+            let bytes =
+                self.listing.iter().find(|(it, _)| it == name).map_or(0, |(_, meta)| meta.len);
             st.kept.push_back(Kept {
                 name: named,
                 // alloc: a file's name, once a history
@@ -2145,7 +2354,9 @@ impl Open {
                 listed: Listed::Listed,
             });
         }
-        st.kept.make_contiguous().sort_unstable_by(|a, b| (a.name.last, &a.file).cmp(&(b.name.last, &b.file)));
+        st.kept
+            .make_contiguous()
+            .sort_unstable_by(|a, b| (a.name.last, &a.file).cmp(&(b.name.last, &b.file)));
         st.total = st.kept.iter().map(|it| it.bytes).sum();
         st.side = side_bytes(&self.listing);
         let last = st.kept.iter().map(|it| it.name.last).max().unwrap_or(0);
@@ -2182,7 +2393,10 @@ impl Open {
             if let Done::Failed(error) = it {
                 let doing = match manifest::kind(name) {
                     manifest::Kind::Hidden => "deleting a half-written file",
-                    manifest::Kind::Listable | manifest::Kind::Schema | manifest::Kind::Other | manifest::Kind::Unclassified => {
+                    manifest::Kind::Listable
+                    | manifest::Kind::Schema
+                    | manifest::Kind::Other
+                    | manifest::Kind::Unclassified => {
                         "deleting a file no manifest lists (a crash left it)"
                     }
                 };
@@ -2196,13 +2410,21 @@ impl Open {
                 Done::Read(bytes) => bytes,
                 Done::Failed(error) => {
                     let error = io::Error::other(error.0);
-                    self.crashes.refused.push(crash::CrashError::Io { path, doing: "reading", error });
+                    self.crashes.refused.push(crash::CrashError::Io {
+                        path,
+                        doing: "reading",
+                        error,
+                    });
                     continue;
                 }
                 other => {
                     // alloc: an error
                     let error = io::Error::other(format!("the driver answered {other:?}"));
-                    self.crashes.refused.push(crash::CrashError::Io { path, doing: "reading", error });
+                    self.crashes.refused.push(crash::CrashError::Io {
+                        path,
+                        doing: "reading",
+                        error,
+                    });
                     continue;
                 }
             };
@@ -2210,7 +2432,9 @@ impl Open {
                 CrashRead::Nothing => self.crash_files.push((name, CrashFile::Delete)),
                 // A record whose row a listed file holds: a crash came between that commit and
                 // its delete. Deleted unread, never written twice.
-                CrashRead::Row(crash) if held.manifest().consumed().crashes.contains(&(crash.pid, crash.t_ns)) => {
+                CrashRead::Row(crash)
+                    if held.manifest().consumed().crashes.contains(&(crash.pid, crash.t_ns)) =>
+                {
                     self.crash_files.push((name, CrashFile::Delete));
                 }
                 CrashRead::Row(crash) => {
@@ -2244,7 +2468,12 @@ impl Open {
         Ok(())
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Opening::Hold => match self.hold.resume(cx, done.take()) {
@@ -2288,20 +2517,33 @@ impl Open {
                     for ((name, what), it) in self.crash_files.iter().zip(round(done.take())) {
                         if let Done::Failed(error) = it {
                             let doing = match what {
-                                CrashFile::Delete => "deleting a crash record with nothing recorded, or whose row the history lists",
+                                CrashFile::Delete => {
+                                    "deleting a crash record with nothing recorded, or whose row the history lists"
+                                }
                                 CrashFile::SetAside => "setting aside a refused crash record",
                             };
                             let error = io::Error::other(error.0);
-                            self.crashes.refused.push(crash::CrashError::Io { path: cx.path(name), doing, error });
+                            self.crashes.refused.push(crash::CrashError::Io {
+                                path: cx.path(name),
+                                doing,
+                                error,
+                            });
                         }
                     }
                     // A build of a daemon that crashed before a flush named a file for it keeps
                     // its number.
-                    st.last_build = self.crashes.rows.iter().filter_map(|it| it.build_id).fold(st.last_build, u64::max);
+                    st.last_build = self
+                        .crashes
+                        .rows
+                        .iter()
+                        .filter_map(|it| it.build_id)
+                        .fold(st.last_build, u64::max);
                     self.stage = Opening::Commit;
                 }
                 Opening::Commit => {
-                    let Some(held) = self.held.as_mut() else { unreachable!("held through the open") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held through the open")
+                    };
                     match self.commit.resume(cx, held, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
@@ -2322,11 +2564,14 @@ impl Open {
                     }
                     // An empty `schema.<table>.parquet` of each table, each written over: a
                     // writer of the history makes them its own blaze's columns.
-                    self.schemas = Some(Place::new(std::mem::take(&mut self.schema_files), Then::Rename));
+                    self.schemas =
+                        Some(Place::new(std::mem::take(&mut self.schema_files), Then::Rename));
                     self.stage = Opening::Schemas;
                 }
                 Opening::Schemas => {
-                    let Some(place) = self.schemas.as_mut() else { unreachable!("placing the schema files") };
+                    let Some(place) = self.schemas.as_mut() else {
+                        unreachable!("placing the schema files")
+                    };
                     match place.resume(cx, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(()) => {
@@ -2436,14 +2681,21 @@ impl FlushJob {
         !locks.is_empty()
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Flushing::Place => match self.place.resume(cx, done.take()) {
                     Step::Pending => return Step::Pending,
                     Step::Ready(()) => {
                         let entries = std::mem::take(&mut self.entries);
-                        for (at, ((name, len, failed), entry)) in self.place.take().into_iter().zip(entries).enumerate() {
+                        for (at, ((name, len, failed), entry)) in
+                            self.place.take().into_iter().zip(entries).enumerate()
+                        {
                             if let Some(error) = failed {
                                 // A crash record's row in a file not placed is the next flush's.
                                 if self.crashes.as_ref().is_some_and(|(it, _)| *it == at) {
@@ -2456,7 +2708,14 @@ impl FlushJob {
                                 unreachable!("a flush's file `{name}` is named as a flush's")
                             };
                             st.last_build = st.last_build.max(named.build);
-                            st.kept.push_back(Kept { name: named, file: name, bytes: len, entry, ours: Ours::Ours, listed: Listed::Unlisted });
+                            st.kept.push_back(Kept {
+                                name: named,
+                                file: name,
+                                bytes: len,
+                                entry,
+                                ours: Ours::Ours,
+                                listed: Listed::Unlisted,
+                            });
                             st.total += len;
                             self.out.files += 1;
                             self.out.bytes += len;
@@ -2482,7 +2741,8 @@ impl FlushJob {
                         // Every file not yet listed: this flush's, and any a failed commit left.
                         for kept in st.kept.iter().filter(|it| it.listed == Listed::Unlisted) {
                             // clone: a file's entry, once a file
-                            held.add(&kept.file, kept.entry.clone()).map_err(|why| manifest_error(cx, why))?;
+                            held.add(&kept.file, kept.entry.clone())
+                                .map_err(|why| manifest_error(cx, why))?;
                         }
                         held.flush_committed(seq);
                         if consumes {
@@ -2558,7 +2818,9 @@ impl FlushJob {
                         return Step::Pending;
                     }
                     // The listing: one that fails leaves the count as it was, said.
-                    let Some(it) = done.into_iter().next() else { unreachable!("one completion an effect") };
+                    let Some(it) = done.into_iter().next() else {
+                        unreachable!("one completion an effect")
+                    };
                     match listing(cx, it) {
                         Ok(listing) => st.side = side_bytes(&listing),
                         Err(error) => self.out.deferred.push(error),
@@ -2642,7 +2904,12 @@ struct Recount {
 }
 
 impl Recount {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Recounting::Start => {
@@ -2705,7 +2972,12 @@ struct WriteListed {
 }
 
 impl WriteListed {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Listing::Place => match self.place.resume(cx, done.take()) {
@@ -2724,7 +2996,11 @@ impl WriteListed {
                     Step::Pending => return Step::Pending,
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                     Step::Ready(Ok(held)) => {
-                        if let Some((name, _)) = self.entries.iter().find(|(name, _)| held.manifest().retired().holds(name)) {
+                        if let Some((name, _)) = self
+                            .entries
+                            .iter()
+                            .find(|(name, _)| held.manifest().retired().holds(name))
+                        {
                             // clone: an error
                             let why = ManifestError::Relisted { file: name.clone() };
                             return Step::Ready(Err(manifest_error(cx, why)));
@@ -2746,10 +3022,16 @@ impl WriteListed {
                 Listing::Rename => {
                     for ((name, _), it) in self.entries.iter().zip(round(done.take())) {
                         if let Done::Failed(error) = it {
-                            return Step::Ready(Err(io_failed(cx.path(name), "renaming into place", error)));
+                            return Step::Ready(Err(io_failed(
+                                cx.path(name),
+                                "renaming into place",
+                                error,
+                            )));
                         }
                     }
-                    let Some(held) = self.held.as_mut() else { unreachable!("held through a write") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held through a write")
+                    };
                     for (name, entry) in std::mem::take(&mut self.entries) {
                         if let Err(why) = held.add(&name, entry) {
                             return Step::Ready(Err(manifest_error(cx, why)));
@@ -2758,7 +3040,9 @@ impl WriteListed {
                     self.stage = Listing::Commit;
                 }
                 Listing::Commit => {
-                    let Some(held) = self.held.as_mut() else { unreachable!("held before its commit") };
+                    let Some(held) = self.held.as_mut() else {
+                        unreachable!("held before its commit")
+                    };
                     match self.commit.resume(cx, held, done.take()) {
                         Step::Pending => return Step::Pending,
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
@@ -2797,7 +3081,11 @@ struct Schemas {
 }
 
 impl Schemas {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         if let Some(place) = self.place.as_mut() {
             return match place.resume(cx, done) {
                 Step::Pending => Step::Pending,
@@ -2812,11 +3100,13 @@ impl Schemas {
                         .collect();
                     match placed.into_iter().find_map(|it| it.2) {
                         None => Step::Ready(Ok(Outcome::Schemas(Ok(())))),
-                        Some(error) => Step::Ready(Ok(Outcome::Schemas(Err(HistoryError::SchemasMissing {
-                            dir: cx.dir_path(),
-                            tables,
-                            error: Box::new(error),
-                        })))),
+                        Some(error) => {
+                            Step::Ready(Ok(Outcome::Schemas(Err(HistoryError::SchemasMissing {
+                                dir: cx.dir_path(),
+                                tables,
+                                error: Box::new(error),
+                            }))))
+                        }
                     }
                 }
             };
@@ -2836,7 +3126,13 @@ impl Schemas {
             match check(it, || cx.path(&self.files[at].0), "looking for") {
                 Ok(Done::Stat(None)) => self.missing.push(at),
                 Ok(Done::Stat(Some(_))) => {}
-                Ok(other) => return Step::Ready(Err(unexpected(cx.path(&self.files[at].0), "looking for", &other))),
+                Ok(other) => {
+                    return Step::Ready(Err(unexpected(
+                        cx.path(&self.files[at].0),
+                        "looking for",
+                        &other,
+                    )));
+                }
                 Err(error) => return Step::Ready(Err(error)),
             }
         }
@@ -2888,7 +3184,12 @@ struct RecoverDead {
 }
 
 impl RecoverDead {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, st: &mut State, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        st: &mut State,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Dying::Start => {
@@ -2901,13 +3202,21 @@ impl RecoverDead {
                     let doing = "looking for the owner file of";
                     match check(only(done.take()), || cx.path(OWNER), doing) {
                         // No daemon ever wrote here, so none left a mapping.
-                        Ok(Done::Stat(None)) => return Step::Ready(Ok(Outcome::RecoveredDead(Ok(0)))),
+                        Ok(Done::Stat(None)) => {
+                            return Step::Ready(Ok(Outcome::RecoveredDead(Ok(0))));
+                        }
                         Ok(Done::Stat(Some(_))) => {}
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(OWNER), doing, &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(OWNER), doing, &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                     let file = cx.file(OWNER);
-                    self.owner = cx.ask(Wait::Files, |tag| Effect::Lock { file, mode: LockMode::Exclusive, tag });
+                    self.owner = cx.ask(Wait::Files, |tag| Effect::Lock {
+                        file,
+                        mode: LockMode::Exclusive,
+                        tag,
+                    });
                     self.stage = Dying::Lock;
                     return Step::Pending;
                 }
@@ -2916,8 +3225,12 @@ impl RecoverDead {
                     match check(only(done.take()), || cx.path(OWNER), doing) {
                         Ok(Done::Locked) => cx.locks.push(self.owner),
                         // A daemon writes the history: it recovered as it opened.
-                        Ok(Done::Contended) => return Step::Ready(Ok(Outcome::RecoveredDead(Ok(0)))),
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(OWNER), doing, &other))),
+                        Ok(Done::Contended) => {
+                            return Step::Ready(Ok(Outcome::RecoveredDead(Ok(0))));
+                        }
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(OWNER), doing, &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                     self.stage = Dying::Read;
@@ -2929,7 +3242,12 @@ impl RecoverDead {
                         // The next flush number is past every file the manifest lists and its
                         // last flush, as the open numbers it: an unlisted file is a crash's
                         // garbage the next open deletes.
-                        let last = manifest.all().filter_map(Name::parse).map(|it| it.last).max().unwrap_or(0);
+                        let last = manifest
+                            .all()
+                            .filter_map(Name::parse)
+                            .map(|it| it.last)
+                            .max()
+                            .unwrap_or(0);
                         st.seq = last.max(manifest.flushed()) + 1;
                         st.manifest = manifest;
                         let dir = cx.dir.clone(); // clone: a refcount
@@ -2961,7 +3279,9 @@ impl RecoverDead {
                     if let Err(error) = unlocked(only(done.take()), cx.path(OWNER)) {
                         return Step::Ready(Err(error));
                     }
-                    let Some((written, failed)) = self.result.take() else { unreachable!("recovered") };
+                    let Some((written, failed)) = self.result.take() else {
+                        unreachable!("recovered")
+                    };
                     return Step::Ready(Ok(Outcome::RecoveredDead(match failed {
                         Some(error) => Err(error),
                         None => Ok(written),
@@ -3005,7 +3325,11 @@ impl PinJob {
         PinFile::Making { id: &self.id }.file_name()
     }
 
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, mut done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        mut done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         loop {
             match self.stage {
                 Pinning::Start => {
@@ -3027,14 +3351,18 @@ impl PinJob {
                             self.stage = Pinning::Clear;
                             done = nothing_asked();
                         }
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(PINS), doing, &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(PINS), doing, &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                 }
                 Pinning::List => {
                     let entries = match check(only(done.take()), || cx.path(PINS), "listing") {
                         Ok(Done::Listed(entries)) => entries,
-                        Ok(other) => return Step::Ready(Err(unexpected(cx.path(PINS), "listing", &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(cx.path(PINS), "listing", &other)));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     };
                     let mut clears = false;
@@ -3055,12 +3383,18 @@ impl PinJob {
                 }
                 Pinning::Clear => {
                     for it in round(done.take()) {
-                        if let Err(error) = check(it, || cx.path(PINS), "deleting a dead reader's pin file") {
+                        if let Err(error) =
+                            check(it, || cx.path(PINS), "deleting a dead reader's pin file")
+                        {
                             return Step::Ready(Err(error));
                         }
                     }
                     let making = cx.pin_file(&self.making());
-                    self.lock = cx.ask(Wait::Files, |tag| Effect::Lock { file: making, mode: LockMode::Exclusive, tag });
+                    self.lock = cx.ask(Wait::Files, |tag| Effect::Lock {
+                        file: making,
+                        mode: LockMode::Exclusive,
+                        tag,
+                    });
                     self.stage = Pinning::Lock;
                     return Step::Pending;
                 }
@@ -3075,7 +3409,13 @@ impl PinJob {
                                 error: io::ErrorKind::WouldBlock.into(),
                             }));
                         }
-                        Ok(other) => return Step::Ready(Err(unexpected(path, "locking a reader's pin", &other))),
+                        Ok(other) => {
+                            return Step::Ready(Err(unexpected(
+                                path,
+                                "locking a reader's pin",
+                                &other,
+                            )));
+                        }
                         Err(error) => return Step::Ready(Err(error)),
                     }
                     let from = cx.pin_file(&self.making());
@@ -3086,7 +3426,9 @@ impl PinJob {
                 }
                 Pinning::Rename => {
                     let path = cx.path(PINS).join(self.making());
-                    if let Err(error) = check(only(done.take()), || path, "naming a reader's pin into place") {
+                    if let Err(error) =
+                        check(only(done.take()), || path, "naming a reader's pin into place")
+                    {
                         return Step::Ready(Err(error));
                     }
                     self.stage = Pinning::Read;
@@ -3096,7 +3438,8 @@ impl PinJob {
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                     Step::Ready(Ok((manifest, _))) => {
                         let generation = manifest.retired().generation;
-                        let said = cx.pin_file(&PinFile::Said { id: &self.id, generation }.file_name());
+                        let said =
+                            cx.pin_file(&PinFile::Said { id: &self.id, generation }.file_name());
                         self.said = Some(said.clone()); // clone: a refcount
                         cx.ask(Wait::Files, |tag| Effect::Truncate { file: said, len: 0, tag });
                         self.manifest = Some(manifest);
@@ -3142,7 +3485,11 @@ struct Unpin {
 }
 
 impl Unpin {
-    fn resume<H: Host>(&mut self, cx: &mut Cx<'_, H>, _done: Option<Vec<Done>>) -> Step<Result<Outcome, HistoryError>> {
+    fn resume<H: Host>(
+        &mut self,
+        cx: &mut Cx<'_, H>,
+        _done: Option<Vec<Done>>,
+    ) -> Step<Result<Outcome, HistoryError>> {
         match self.stage {
             Unpinning::Said => {
                 let file = self.pin.said.clone(); // clone: a refcount
@@ -3171,7 +3518,12 @@ impl<H: Host> Files<H> {
     /// The core of the history in `dir` under the driver's root `root`, with each table's
     /// writer properties (what its merges write with), by its place in
     /// [`crate::schema::TABLES`].
-    pub(crate) fn new(host: H, root: PathBuf, dir: FileName, properties: Vec<WriterProperties>) -> Files<H> {
+    pub(crate) fn new(
+        host: H,
+        root: PathBuf,
+        dir: FileName,
+        properties: Vec<WriterProperties>,
+    ) -> Files<H> {
         Files {
             host,
             root,
@@ -3299,7 +3651,12 @@ impl<H: Host> Files<H> {
 
     /// Counts the side files again, then the cap and the reap: [`Outcome::Recounted`].
     pub(crate) fn recount(&mut self) {
-        self.push(Job::Recount(Box::new(Recount { stage: Recounting::Start, trim: Trim::new(), reap: Reap::new(), deleted: 0 })));
+        self.push(Job::Recount(Box::new(Recount {
+            stage: Recounting::Start,
+            trim: Trim::new(),
+            reap: Reap::new(),
+            deleted: 0,
+        })));
     }
 
     /// Writes `files` and lists them in one commit: [`Outcome::WroteListed`].
@@ -3333,7 +3690,12 @@ impl<H: Host> Files<H> {
     /// [`Outcome::Schemas`].
     pub(crate) fn ensure_schemas(&mut self, files: Vec<(String, &'static str, Vec<u8>)>) {
         // alloc: empty until one is missing
-        self.push(Job::Schemas(Box::new(Schemas { files, looked: false, missing: Vec::new(), place: None })));
+        self.push(Job::Schemas(Box::new(Schemas {
+            files,
+            looked: false,
+            missing: Vec::new(),
+            place: None,
+        })));
     }
 
     /// Recovers dead daemons' rows for a reader: [`Outcome::RecoveredDead`].
@@ -3349,7 +3711,14 @@ impl<H: Host> Files<H> {
 
     /// Pins the history for a reader, `id` the pin's (`<pid>-<n>`): [`Outcome::Pinned`].
     pub(crate) fn pin(&mut self, id: String) {
-        self.push(Job::Pin(Box::new(PinJob { stage: Pinning::Start, id, lock: Tag(0), read: Read::new(), manifest: None, said: None })));
+        self.push(Job::Pin(Box::new(PinJob {
+            stage: Pinning::Start,
+            id,
+            lock: Tag(0),
+            read: Read::new(),
+            manifest: None,
+            said: None,
+        })));
     }
 
     /// Lets go of `pin`: [`Outcome::Unpinned`].
@@ -3427,7 +3796,9 @@ impl<H: Host> Files<H> {
                             let error = HistoryError::Io {
                                 path: self.root.join(self.dir.as_str()),
                                 doing: "stepping the history's files",
-                                error: io::Error::other("a step of the history's core waited on no effect"),
+                                error: io::Error::other(
+                                    "a step of the history's core waited on no effect",
+                                ),
                             };
                             Some(running.job.failed(error))
                         }
@@ -3458,7 +3829,8 @@ impl<H: Host> Files<H> {
                 }
                 None => {
                     // alloc: a round's tags, once a round
-                    self.round = self.io.asked[before..].iter().map(|it| (it.tag(), None)).collect();
+                    self.round =
+                        self.io.asked[before..].iter().map(|it| (it.tag(), None)).collect();
                     self.wait = match self.io.wait {
                         Wait::Nothing => Wait::Files,
                         wait => wait,

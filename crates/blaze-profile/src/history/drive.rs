@@ -512,7 +512,11 @@ pub(crate) fn write_listed(
         };
         let bytes = writer.encode(path, table, parts)?;
         // alloc: a file's name, once a file
-        placed.push(Placed { file: name.to_owned(), bytes, entry: Entry::of_batches(table, parts) });
+        placed.push(Placed {
+            file: name.to_owned(),
+            bytes,
+            entry: Entry::of_batches(table, parts),
+        });
     }
     let mut core = Core::new(Live::new(dir), dir)?;
     match core.job(|it| it.write_listed(placed))? {

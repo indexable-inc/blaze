@@ -1806,11 +1806,11 @@ impl Driver for Threads {
                 // A lock never waits, so it is taken here rather than on an IO thread.
                 Effect::Lock { file, mode, tag } => {
                     let done = self.locks.lock(&self.shared.root, &file, mode, tag);
-                    self.tell(tag, done.unwrap_or_else(crate::locks::failed));
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
                 }
                 Effect::Unlock { lock, tag } => {
                     let done = self.locks.unlock(lock);
-                    self.tell(tag, done.unwrap_or_else(crate::locks::failed));
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
                 }
                 #[cfg(unix)]
                 Effect::Spawn { command, tag } => {

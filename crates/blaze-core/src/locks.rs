@@ -19,7 +19,7 @@ use blaze_hash::HashMap;
 use crate::{Done, FileName, IoError, LockMode, Tag, fs};
 
 /// [`Done::Failed`] of a lock's or an unlock's error, which names what it is about.
-pub(crate) fn failed(error: io::Error) -> Done {
+pub(crate) fn failed(error: &io::Error) -> Done {
     // alloc: an error path.
     Done::Failed(IoError(error.to_string()))
 }

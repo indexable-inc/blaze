@@ -18,6 +18,7 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+base64.workspace = true
 blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true

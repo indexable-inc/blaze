@@ -95,12 +95,17 @@ struct Crash {
 enum Fault {
     None,
     /// The disk has `room` bytes left for the flush.
-    Fill { room: u64 },
+    Fill {
+        room: u64,
+    },
     /// Every sync of the history fails, until the next crash.
     FailSyncs,
     /// Another process holds the manifest's lock until `release_at` completions in; with
     /// `timeout`, the clock jumps past [`manifest::LOCK_WAIT`] then and the hold stays.
-    Contend { release_at: u32, timeout: bool },
+    Contend {
+        release_at: u32,
+        timeout: bool,
+    },
 }
 
 /// The fault classes a case turns on: a swarm, so a rare class is not drowned by a common one.
@@ -145,7 +150,13 @@ impl Draw for Rng {
 
 fn plan(d: &mut impl Draw) -> Plan {
     let seed = d.int(0, u64::MAX);
-    let swarm = Swarm { fail: d.coin(), fill: d.coin(), fail_syncs: d.one_in(4), contend: d.coin(), records: d.coin() };
+    let swarm = Swarm {
+        fail: d.coin(),
+        fill: d.coin(),
+        fail_syncs: d.one_in(4),
+        contend: d.coin(),
+        records: d.coin(),
+    };
     let fail_one_in = match swarm.fail {
         true => d.int(20, 200) as u32,
         false => 0,
@@ -181,7 +192,9 @@ fn fault(d: &mut impl Draw, swarm: &Swarm) -> Fault {
     match d.int(0, 5) {
         0 if swarm.fill => Fault::Fill { room: d.int(0, 4096) },
         1 if swarm.fail_syncs => Fault::FailSyncs,
-        2 if swarm.contend => Fault::Contend { release_at: d.int(0, 40) as u32, timeout: d.one_in(3) },
+        2 if swarm.contend => {
+            Fault::Contend { release_at: d.int(0, 40) as u32, timeout: d.one_in(3) }
+        }
         _ => Fault::None,
     }
 }
@@ -239,11 +252,22 @@ fn rows_of(bytes: Vec<u8>) -> Result<Vec<i64>, String> {
 }
 
 fn entry(rows: usize, pid: u32) -> Entry {
-    Entry { version: schema::VERSION, rows: rows as u64, builds: None, t_ns: None, boot: None, pid: Some(pid) }
+    Entry {
+        version: schema::VERSION,
+        rows: rows as u64,
+        builds: None,
+        t_ns: None,
+        boot: None,
+        pid: Some(pid),
+    }
 }
 
 fn placed(name: Name, rows: &[i64], pid: u32, properties: &[WriterProperties]) -> Placed {
-    Placed { file: name.file_name(), bytes: parquet_of(rows, &properties[name.table]), entry: entry(rows.len(), pid) }
+    Placed {
+        file: name.file_name(),
+        bytes: parquet_of(rows, &properties[name.table]),
+        entry: entry(rows.len(), pid),
+    }
 }
 
 // --- The recorder's mapping and the crash records, as the test writes them ------------------
@@ -353,7 +377,9 @@ impl Host for TestHost {
 
     fn crash(&mut self, _path: &Path, bytes: &[u8]) -> CrashRead {
         match decode_record(bytes) {
-            Some((pid, t_ns, row)) => CrashRead::Row(CrashRow { pid, t_ns, row: panic_row(pid, t_ns, row), image: None }),
+            Some((pid, t_ns, row)) => {
+                CrashRead::Row(CrashRow { pid, t_ns, row: panic_row(pid, t_ns, row), image: None })
+            }
             None => CrashRead::Nothing,
         }
     }
@@ -365,7 +391,13 @@ impl Host for TestHost {
                 // alloc: a postmortem's files
                 let mut files = Vec::new();
                 if !rows.is_empty() {
-                    let name = Name { build: 0, table: table("spans"), first: dead.seq, last: dead.seq, level: 0 };
+                    let name = Name {
+                        build: 0,
+                        table: table("spans"),
+                        first: dead.seq,
+                        last: dead.seq,
+                        level: 0,
+                    };
                     files.push(placed(name, &rows, dead.pid, &self.properties));
                 }
                 Recovery::Files { nonce, files }
@@ -459,7 +491,9 @@ fn drive(
         if sim.poll(&mut done, Duration::ZERO) == 0 {
             let waits = files.waits_on();
             // alloc: an oracle's finding
-            return Err(Broke::Oracle(format!("{job}: the core waits ({waits:?}) with nothing in flight")));
+            return Err(Broke::Oracle(format!(
+                "{job}: the core waits ({waits:?}) with nothing in flight"
+            )));
         }
         for completion in done.drain(..) {
             if crash_at == Some(delivered) {
@@ -471,7 +505,9 @@ fn drive(
         }
     }
     // alloc: an oracle's finding
-    Err(Broke::Oracle(format!("{job}: not done after {STEP_CAP} polls ({delivered} completions): bounded-progress")))
+    Err(Broke::Oracle(format!(
+        "{job}: not done after {STEP_CAP} polls ({delivered} completions): bounded-progress"
+    )))
 }
 
 fn outcome_name(outcome: &Outcome) -> &'static str {
@@ -605,13 +641,20 @@ impl World {
             self.next_pid += 1;
             let host = TestHost { pid, properties: self.properties.clone() }; // clone: once a process
             // clone: the directory's name and the properties, once a process
-            let mut files = Files::new(host, PathBuf::from(ROOT), self.dir.clone(), self.properties.clone());
+            let mut files =
+                Files::new(host, PathBuf::from(ROOT), self.dir.clone(), self.properties.clone());
             files.plant(self.plant);
             loop {
                 // alloc: the job's name, once an open
                 let job = format!("the open of pid {pid}");
                 files.open(u64::MAX, Vec::new());
-                let opened = match drive(&mut self.sim, &mut files, crash_at.take(), &mut Contention::none(), &job)? {
+                let opened = match drive(
+                    &mut self.sim,
+                    &mut files,
+                    crash_at.take(),
+                    &mut Contention::none(),
+                    &job,
+                )? {
                     Driven::Crashed => {
                         // alloc: none, empty
                         self.record_crash(pid, &BTreeMap::new(), false);
@@ -627,17 +670,23 @@ impl World {
                     }
                     Err(error) => {
                         // alloc: an oracle's finding
-                        return Err(Broke::Oracle(format!("{job}: the history did not open ({tries} injected failures before): {error:?}")));
+                        return Err(Broke::Oracle(format!(
+                            "{job}: the history did not open ({tries} injected failures before): {error:?}"
+                        )));
                     }
                 };
-                oracle(self, pid, &opened).map_err(|why| Broke::Oracle(format!("after {job}: {why}")))?;
+                oracle(self, pid, &opened)
+                    .map_err(|why| Broke::Oracle(format!("after {job}: {why}")))?;
                 // alloc: the crash rows handed back, once an open
                 let mut crashes = Vec::new();
-                let returned = opened.crashes.rows.iter().zip(&opened.crashes.ids).zip(&opened.crashes.files);
+                let returned =
+                    opened.crashes.rows.iter().zip(&opened.crashes.ids).zip(&opened.crashes.files);
                 for ((row, &id), name) in returned {
                     let Some(job) = row.job else {
                         // alloc: a test's finding
-                        return Err(Broke::Harness(format!("{name}: a crash row with no row id in `job`")));
+                        return Err(Broke::Harness(format!(
+                            "{name}: a crash row with no row id in `job`"
+                        )));
                     };
                     // clone: a record's name, once an open
                     crashes.push((name.clone(), id, job as i64));
@@ -691,7 +740,14 @@ impl World {
 
     /// One flush of `live`: the rows it holds and `rows` new ones, and the crash rows its open
     /// handed back. Whether the machine crashed during it.
-    fn flush(&mut self, live: &mut Live, rows: u8, end: bool, fault: Fault, crash: Option<Crash>) -> Result<bool, Broke> {
+    fn flush(
+        &mut self,
+        live: &mut Live,
+        rows: u8,
+        end: bool,
+        fault: Fault,
+        crash: Option<Crash>,
+    ) -> Result<bool, Broke> {
         let seq = live.seq;
         live.seq += 1;
         for _ in 0..rows {
@@ -706,7 +762,8 @@ impl World {
         let mut spans = None;
         if !live.held.is_empty() {
             spans = Some(files.len());
-            let name = Name { build: self.build, table: table("spans"), first: seq, last: seq, level: 0 };
+            let name =
+                Name { build: self.build, table: table("spans"), first: seq, last: seq, level: 0 };
             files.push(placed(name, &live.held, live.pid, &self.properties));
         }
         let mut panics = None;
@@ -714,7 +771,8 @@ impl World {
         if !live.crashes.is_empty() {
             let at = files.len();
             panics = Some(at);
-            let name = Name { build: self.build, table: table("panics"), first: seq, last: seq, level: 0 };
+            let name =
+                Name { build: self.build, table: table("panics"), first: seq, last: seq, level: 0 };
             // alloc: a flush's crash rows
             let rows: Vec<i64> = live.crashes.iter().map(|it| it.2).collect();
             files.push(placed(name, &rows, live.pid, &self.properties));
@@ -736,7 +794,8 @@ impl World {
         let mut contention = self.fault(fault);
         // alloc: the job's name, once a flush
         let job = format!("flush {seq} of pid {}", live.pid);
-        let driven = drive(&mut self.sim, &mut live.files, crash.map(|it| it.at), &mut contention, &job);
+        let driven =
+            drive(&mut self.sim, &mut live.files, crash.map(|it| it.at), &mut contention, &job);
         self.unfault(fault);
         if end {
             self.build += 1;
@@ -748,7 +807,10 @@ impl World {
         let was_placed = |at: usize| match flushed.placed.get(at) {
             Some(it) => Ok(it.is_none()),
             // alloc: an oracle's finding
-            None => Err(Broke::Oracle(format!("{job}: its outcome says nothing of file {at} of {}", flushed.placed.len()))),
+            None => Err(Broke::Oracle(format!(
+                "{job}: its outcome says nothing of file {at} of {}",
+                flushed.placed.len()
+            ))),
         };
         if let Some(at) = spans {
             match was_placed(at)? {
@@ -780,7 +842,8 @@ impl World {
 /// no crash record leaves none unread.
 fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
     let manifest_file = world.file(manifest::FILE);
-    let manifest = Manifest::decode(&world.sim.contents(&manifest_file)).map_err(|why| format!("the manifest does not decode: {why:?}"))?;
+    let manifest = Manifest::decode(&world.sim.contents(&manifest_file))
+        .map_err(|why| format!("the manifest does not decode: {why:?}"))?;
     // Each row, and everywhere it is.
     // alloc: an oracle's map
     let mut seen: BTreeMap<i64, Vec<String>> = BTreeMap::new();
@@ -789,11 +852,16 @@ fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
         if !world.sim.exists(&file) {
             return Err(format!("{name}: the manifest lists it and it is not there"));
         }
-        let rows = rows_of(world.sim.contents(&file)).map_err(|why| format!("{name}: listed, and torn: {why}"))?;
+        let rows = rows_of(world.sim.contents(&file))
+            .map_err(|why| format!("{name}: listed, and torn: {why}"))?;
         if let Some(entry) = manifest.entry(name)
             && entry.rows != rows.len() as u64
         {
-            return Err(format!("{name}: its entry says {} rows and it holds {}", entry.rows, rows.len()));
+            return Err(format!(
+                "{name}: its entry says {} rows and it holds {}",
+                entry.rows,
+                rows.len()
+            ));
         }
         for row in rows {
             // alloc: an oracle's note
@@ -803,10 +871,14 @@ fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
     // alloc: an oracle's set
     let mut returned = BTreeSet::new();
     for (row, id) in opened.crashes.rows.iter().zip(&opened.crashes.ids) {
-        let Some(job) = row.job else { return Err(format!("crash {id:?}: handed back with no row id")) };
+        let Some(job) = row.job else {
+            return Err(format!("crash {id:?}: handed back with no row id"));
+        };
         returned.insert(job as i64);
         // alloc: an oracle's note
-        seen.entry(job as i64).or_default().push(format!("the crash row {id:?} the open handed back"));
+        seen.entry(job as i64)
+            .or_default()
+            .push(format!("the crash row {id:?} the open handed back"));
     }
     let consumed = manifest.consumed();
     for dead in FIRST_PID..pid {
@@ -825,7 +897,9 @@ fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
                     }
                     for row in rows {
                         // alloc: an oracle's note
-                        seen.entry(row).or_default().push(format!("flight-{dead}.map, left for the next open"));
+                        seen.entry(row)
+                            .or_default()
+                            .push(format!("flight-{dead}.map, left for the next open"));
                     }
                 }
             }
@@ -839,7 +913,9 @@ fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
                 continue;
             }
             if opened.crashes.refused.is_empty() {
-                return Err(format!("crash.{dead}: neither consumed nor handed back, and the open refused no record"));
+                return Err(format!(
+                    "crash.{dead}: neither consumed nor handed back, and the open refused no record"
+                ));
             }
             // alloc: an oracle's note
             seen.entry(row).or_default().push(format!("crash.{dead}, left for the next open"));
@@ -853,7 +929,10 @@ fn oracle(world: &World, pid: u32, opened: &Opened) -> Result<(), String> {
     }
     if let Some(row) = world.rows.iter().find(|row| !seen.contains_key(row)) {
         let all = world.rows.len();
-        return Err(format!("row {row} is lost: in no listed file, crash row or file left to read ({} of {all} rows found)", seen.len()));
+        return Err(format!(
+            "row {row} is lost: in no listed file, crash row or file left to read ({} of {all} rows found)",
+            seen.len()
+        ));
     }
     Ok(())
 }
@@ -925,14 +1004,18 @@ fn control(plant: Plant) {
     for seed in 0..CONTROL_SEEDS {
         match run(&plan_of(seed), plant) {
             Err(Broke::Oracle(why)) => {
-                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}");
+                eprintln!(
+                    "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}"
+                );
                 return;
             }
             Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
             Ok(()) => {}
         }
     }
-    panic!("the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak");
+    panic!(
+        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    );
 }
 
 #[test]

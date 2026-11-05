@@ -170,7 +170,11 @@ impl Concat {
             }
             group.close().map_err(of_output("ending a row group of"))?;
             self.at = (input_at, group_at + 1);
-            writer.flush().map_err(of_output("writing"))?;
+            writer.flush().map_err(|error| Failed {
+                input: None,
+                doing: "writing",
+                error: CompactError::Io(error),
+            })?;
             if writer.inner().len() >= PIECE {
                 // alloc: a piece of the output, handed to its writer
                 let piece = std::mem::replace(writer.inner_mut(), Vec::with_capacity(PIECE));
