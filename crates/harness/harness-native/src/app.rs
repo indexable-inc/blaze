@@ -127,6 +127,8 @@ impl Palette {
 
 /// How long typing in the palette pauses before older history is searched (seconds).
 const PALETTE_DEBOUNCE: f32 = 0.2;
+/// How far up from what the pointer is on a node's hover reaches: a chat's drawn view is hovered from a control deep in it.
+const HOVER_DEPTH: usize = 16;
 
 /// The view's fixed nodes, by entity id.
 struct Ids {
@@ -380,9 +382,10 @@ impl App {
         });
         world.system_named::<&mut HoverAmt>("Hover").each_iter(move |it, row, h| {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
-            // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron).
+            // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron, a control deep in a
+            // chat's drawn view, whose hover shows the view's code button).
             let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
-                std::iter::successors(Some(t), |n| n.parent()).take(4).any(|n| n.id() == e.id())
+                std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
             });
             if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
                 moving(&w);

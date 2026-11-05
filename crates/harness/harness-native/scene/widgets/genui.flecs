@@ -6,18 +6,33 @@
 
 @tree ChildOf
 hn {
-  // The row a cell's UI sits in, under its card's head: its elements down a column, and a quiet note when the tree was
-  // cut at the caps (genui.rs MAX_ELEMENTS, MAX_DEPTH).
+  // The row a cell's UI sits in: the view is the message, with no line over it, set where the agent's words are. Its
+  // elements down a column, and a quiet note when the tree was cut at the caps (genui.rs MAX_ELEMENTS, MAX_DEPTH). It
+  // takes the pointer (Hoverable) so its hover shows `code`: a quiet button hung in the column's gutter left of the
+  // view, shown only while the view is hovered or its code is open; pressed, the cell's code shows under the view
+  // (src/app/chat.rs fill_row).
   prefab ChatUi : ui.Column {
+    Hoverable
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 6, r: 0, t: 4, b: 10}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: 10}
     body : ui.Column {
       Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
     note : ui.Line, Faint {
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+    code_at : ui.ZStack {
+      Overlay
+      code : ui.IconButton {
+        AlignmentGuide: {dx: $chat_view_code_hang, dy: 0}
+        Size: {w: {kind: Fixed, value: $chat_view_code, min: 0, max: 0}, h: {kind: Fixed, value: $chat_view_code, min: 0, max: 0}}
+        Tooltip: {text: "Show code"}
+        icon : ui.Symbol {
+          Size: {w: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}}
+        }
+      }
     }
   }
 

@@ -344,9 +344,20 @@ export const chat_bubble_radius = 12
 export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
 export const chat_row_estimate = 44
-// A tool call's or a run's line, and how far a run's calls sit in from its line (its icon's place).
+// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): its height, its lead-in, its icon and the
+// gap after it. What sits under a line (its output, its table, its steps) starts under its words (chat_line_inset); a
+// run's calls sit in from its line by its icon's place (chat_nest).
 export const chat_tool_h = 24
-export const chat_nest = 19
+export const chat_line_pad = 4
+export const chat_line_icon = 14
+export const chat_line_gap = 7
+// Between a line's words, its argument and its detail.
+export const chat_line_word_gap = 5
+export const chat_line_inset = $chat_line_pad + $chat_line_icon + $chat_line_gap
+export const chat_nest = $chat_line_icon + $chat_line_gap
+// A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
+export const chat_view_code = 20
+export const chat_view_code_hang = $chat_view_code + 2
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
 export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
