@@ -4511,6 +4511,7 @@ dependencies = [
  "arrow-schema",
  "base64",
  "blake3",
+ "blaze-core",
  "blaze-http",
  "blaze-inproc-rt",
  "blaze-sha256",

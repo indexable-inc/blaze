@@ -415,32 +415,32 @@ written, but with no unit), children a test's fork server forks, and Windows.
 | span_id | u64? | the innermost span its thread was inside |
 | cpu | dict? | `on` when its thread was running or runnable as it was sampled, `off` when blocked inside a span, so what it blocked in shows; the same on Linux and macOS |
 | stack_pcs | pcs? | the stack's addresses, outermost first, one a frame of the unwind (an inlined function's frames in `stack` share one): the last is where the thread was, each other a return address, so the call is the address before it; null in rows of a blaze before it |
+| job | u64? | the job its thread was running as it was sampled, as the profiler numbers jobs (`switches.job`); null for none, and in rows of a blaze before it |
+| fiber | u32? | the fiber that job ran on; null for none, and in rows of a blaze before it |
 
 Both samplers take 49 samples a second of each thread that records spans (holds a ring): one
 running or runnable, `cpu = on`, and one blocked inside a span, `cpu = off`. A blocked thread
 outside every span is not sampled: no span could be blamed for its wait. `on` means the same on
-both systems: the thread's state as it was sampled (Linux's `R` in `/proc/self/task/<tid>/stat`,
-macOS's `TH_STATE_RUNNING`, both of which count a runnable thread). `raw_blocks` lists the `off`
+both systems: the thread was running or runnable (on Linux, a sample of its task clock, or a
+preemption; on macOS, `TH_STATE_RUNNING`, which counts a runnable thread too). `raw_blocks` lists the `off`
 samples of pool workers with no `wait` span open above them, each a block that bypasses
 `blaze_graph::wait`.
 
-- **Linux** (`crates/blaze-profile/src/sampler/linux.rs`). Each tick the sampler's thread sends
-  each such thread a realtime signal of its own (`SIGRTMIN+6`, `tgkill`), holding the lock the
-  thread takes to leave its ring, so a thread is never signalled once it has gone. The thread's
-  handler runs on its alternate signal stack (a thread whose own is smaller than 256 KiB, as
-  std's are, is given one of 256 KiB as it takes a ring), walks its frame pointers from the
-  interrupted registers, reads its innermost span and that span's build, and writes the sample
-  into its ring's slot, which the sampler collects on its next tick. The handler allocates
-  nothing and takes no lock; it reads the stack through `process_vm_readv`, one call for the
-  8 KiB above the stack pointer and one per frame record past it, so a garbage frame pointer
-  ends the walk instead of faulting. An answer more than 100 ms after it was asked (a thread in
-  uninterruptible sleep, or runnable but kept off every CPU) is dropped, and a request unanswered
-  for 1 s is asked again; `blaze debug dump`'s sampler state counts both, and threads that could
-  not be given an alternate stack. Until 2026-11-04 Linux sampled through `perf_event_open`,
-  whose samples came from the kernel's buffer after the fact, so every one had span 0 and build
-  0, and a blocked thread was never sampled. There is no fallback: where the signal is taken
-  already, or a seccomp filter refuses `process_vm_readv` (a container's default filter does
-  without `CAP_SYS_PTRACE`), the sampler is off and its state says why.
+- **Linux** (`crates/blaze-profile/src/sampler/linux.rs`). No signal is sent to any thread
+  (rule `deadline-waits`; a signal every 20 ms kept `io_uring_enter` from ever timing out and
+  hung `blaze serve` 0.20261105.0 before it listened). The sampler's thread opens one
+  `perf_event_open` event for each such thread: its user-only task clock at 49 Hz, with user
+  call chains the kernel walks by frame pointer, times on `CLOCK_MONOTONIC`, and the kernel's
+  context-switch records, read from the event's mapped ring every 20 ms (the one perf reader,
+  `crates/ix-prof/src/perf.rs`). Perf's samples arrive after the fact, so each flight ring
+  keeps a context log, the span, job and fiber its thread was in from each instant (written at
+  every span enter and exit and every fiber switch), and a sample takes the entry in force at
+  its time; a span that has closed since gives way to its innermost ancestor still open. A
+  switch-out that is not a preemption, inside a span, becomes `cpu = off` samples weighed by how
+  long it blocked, with no stack: the kernel's stack of a block is a kernel-mode sample, which
+  `perf_event_paranoid` 2 (the default here) refuses, so the span says where it blocked. It
+  needs `perf_event_paranoid` 2 or lower, or `CAP_PERFMON`; where perf is refused, the sampler is
+  off and its state names the error and the setting. There is no fallback.
 - **macOS** (arm64, `sampler/macos.rs`). Each tick the sampler stops each such thread
   (`thread_suspend`), reads its registers, walks its frame pointers inside its stack, reads its
   span and build, and lets it go.

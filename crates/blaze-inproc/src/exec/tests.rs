@@ -217,8 +217,11 @@ fn a_child_forked_after_a_write_runs_the_code() {
     for round in 0..16 {
         let exec = Executable::written(FORTY_TWO.len(), 0, |code, _| {
             code.copy_from_slice(FORTY_TWO);
-            // SAFETY: a plain sleep of this thread, which takes it off its CPU mid-write.
-            unsafe { libc::usleep(1000) };
+            // A sleep of this thread, which takes it off its CPU mid-write.
+            use blaze_core::wait::{self, Clock as _, Deadline, Monotonic};
+            let clock = Monotonic::new();
+            let until = Deadline::after(clock.now(), std::time::Duration::from_millis(1));
+            wait::sleep_until("a millisecond, mid-write", until, &clock).unwrap();
         })
         .unwrap();
         // SAFETY: the child only sets its view of the code's pages, calls the code (no

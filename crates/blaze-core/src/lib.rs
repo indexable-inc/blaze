@@ -92,6 +92,7 @@ pub mod utf8;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the inotify driver: its system calls and the events it reads")]
 mod watch;
+pub mod wait;
 pub mod wheel;
 
 use std::{fmt, time::Duration};
@@ -921,9 +922,12 @@ pub struct Completion {
 pub trait Driver {
     /// Starts every effect in `effects`, leaving it empty.
     fn submit(&mut self, effects: &mut Vec<Effect>);
-    /// Moves completions into `out`, waiting up to `wait` for the first if none is ready.
+    /// Moves completions into `out`, waiting until `until` (on [`Driver::now`]'s clock) for
+    /// the first if none is ready: [`wait::Deadline::PASSED`] only looks, and
+    /// [`wait::Deadline::NEVER`] waits until one comes. An absolute deadline, never a length,
+    /// so no layer between the caller and the kernel restarts it (rule deadline-waits).
     /// Returns how many it moved.
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize;
+    fn poll(&mut self, out: &mut Vec<Completion>, until: wait::Deadline) -> usize;
     /// How many effects were submitted and have not completed.
     fn in_flight(&self) -> usize;
     /// Monotonic time since the driver began.
@@ -947,7 +951,7 @@ pub fn run_until_idle(
         if driver.in_flight() == 0 {
             return;
         }
-        driver.poll(&mut done, Duration::from_secs(60));
+        driver.poll(&mut done, wait::Deadline::NEVER);
         for completion in done.drain(..) {
             on(completion, effects);
         }

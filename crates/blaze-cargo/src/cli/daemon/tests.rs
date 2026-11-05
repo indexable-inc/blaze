@@ -43,11 +43,13 @@ fn a_start_that_never_listens_names_the_socket() {
         Path::new("/c/blaze/v2/serve.log"),
         41,
         Phase::Setup,
+        None,
     );
     assert_eq!(
         said,
         "the daemon (`blaze serve`, pid 41) was started and did not listen at /run/blaze/v2.sock: it was \
-         installing its store and the toolchain's proc macros for 60s; its log is /c/blaze/v2/serve.log"
+         installing its store and the toolchain's proc macros for 60s, and said nothing about what it was \
+         inside; its log is /c/blaze/v2/serve.log"
     );
 }
 

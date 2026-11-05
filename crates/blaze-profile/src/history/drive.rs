@@ -18,7 +18,7 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
-use blaze_core::{Completion, Driver, Effect, FileName};
+use blaze_core::{Completion, Driver, Effect, FileName, wait::Deadline};
 
 use super::{
     BuildRow, HistoryError, Outcome as BuildOutcome, Writer, arrow_error, builds,
@@ -332,7 +332,7 @@ pub(crate) fn run<H: Host>(
             span = span_of(wait, dir);
             spanned = wait;
         }
-        let moved = driver.poll(&mut done, POLL);
+        let moved = driver.poll(&mut done, Deadline::after(driver.now(), POLL));
         let now = driver.now();
         if moved == 0 {
             if now.saturating_sub(progressed) >= STALL {

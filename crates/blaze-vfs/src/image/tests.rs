@@ -37,7 +37,7 @@ fn run(sim: &mut Sim, vfs: &mut Vfs, effects: &mut Vec<Effect>) {
     let mut done = Vec::new();
     while !effects.is_empty() || sim.in_flight() > 0 {
         sim.submit(effects);
-        sim.poll(&mut done, Duration::ZERO);
+        sim.poll(&mut done, blaze_core::wait::Deadline::NEVER);
         for completion in done.drain(..) {
             assert!(vfs.owns(completion.tag));
             vfs.complete(completion, effects);

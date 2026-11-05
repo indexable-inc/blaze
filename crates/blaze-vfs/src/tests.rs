@@ -74,7 +74,7 @@ fn settle(sim: &mut Sim, vfs: &mut Vfs, effects: &mut Vec<Effect>) -> Vec<Ticket
     let mut done = Vec::new();
     while !effects.is_empty() || sim.in_flight() > 0 {
         sim.submit(effects);
-        sim.poll(&mut done, Duration::ZERO);
+        sim.poll(&mut done, blaze_core::wait::Deadline::NEVER);
         for completion in done.drain(..) {
             assert!(vfs.owns(completion.tag));
             durable.extend(vfs.complete(completion, effects));
@@ -1133,7 +1133,7 @@ fn journal_run(seed: u64) {
             }
             56..=93 => {
                 sim.submit(&mut effects);
-                sim.poll(&mut done, Duration::ZERO);
+                sim.poll(&mut done, blaze_core::wait::Deadline::NEVER);
                 for completion in done.drain(..) {
                     for ticket in vfs.complete(completion, &mut effects) {
                         let (head, sequence, removal) =

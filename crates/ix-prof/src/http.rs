@@ -47,7 +47,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connections waiting for their token check at once; one more evicts the oldest of them.
 pub(crate) const MAX_UNCHECKED: usize = 32;
 /// The longest the accept loop pauses after a failed `accept` (EMFILE and the like).
-const MAX_BACKOFF_MS: i32 = 1_000;
+const MAX_BACKOFF_MS: u64 = 1_000;
 
 /// A bound listener, not yet serving: [`crate::start`] binds first, so a bad address fails
 /// before anything else starts.
@@ -118,39 +118,47 @@ impl Drop for Server {
     }
 }
 
-/// Accepts until a byte arrives on `woken` (or it closes): a `poll` on both, no timer, except
-/// after a failed `accept`, when it polls `woken` alone for a while (10 ms, doubling to 1 s)
-/// rather than spin on a listener that stays readable.
+/// Accepts until a byte arrives on `woken` (or it closes): a wait on both, no timer, except
+/// after a failed `accept`, when it waits on `woken` alone for a while (10 ms, doubling to 1 s)
+/// rather than spin on a listener that stays readable. Each pause is one deadline on `clock`,
+/// made as it begins, so an interrupted wait goes on for what is left of it, never anew.
 fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, token: &Arc<str>) {
     use std::os::fd::AsRawFd;
+
+    use blaze_core::wait::{self, Clock as _, Deadline, Monotonic, Waited};
+    let clock = Monotonic::new();
     let gate = Arc::new(Gate::default());
     let mut fds = [
         libc::pollfd { fd: woken.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
     ];
-    // Set while `accept` keeps failing: the pause before the listener is polled again.
-    let mut backoff_ms: Option<i32> = None;
+    // Set while `accept` keeps failing: the pause before the listener is waited on again.
+    let mut backoff_ms: Option<u64> = None;
     loop {
         fds[0].revents = 0;
         fds[1].revents = 0;
-        // Backing off, only `woken` is polled (the first fd), until the pause ends.
-        let (nfds, timeout) = match backoff_ms {
-            Some(ms) => (1, ms),
-            None => (2, -1),
+        // Backing off, only `woken` is waited on (the first fd), until the pause ends.
+        let (nfds, deadline) = match backoff_ms {
+            Some(ms) => (1, Some(Deadline::after(clock.now(), Duration::from_millis(ms)))),
+            None => (2, None),
         };
-        let n = {
+        let waited = {
             let _wait = backoff_ms
                 .map(|ms| tracing::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
-            // SAFETY: `fds` is two pollfds, both open for the loop's life; `nfds` is 1 or 2.
-            unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout) }
+            wait::readable(
+                "the ix-prof endpoint's listener or its stop byte",
+                &mut fds[..nfds],
+                deadline,
+                &clock,
+            )
         };
-        if n < 0 {
-            let why = std::io::Error::last_os_error();
-            if why.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        match waited {
+            // A pause that ran out leaves both `revents` at 0: the listener is tried again.
+            Ok(Waited::Ready(_) | Waited::Deadline) => {}
+            Err(why) => {
+                eprintln!("ix-prof: the /debug/pprof endpoint stopped: {why}");
+                return;
             }
-            eprintln!("ix-prof: the /debug/pprof endpoint stopped: poll: {why}");
-            return;
         }
         if fds[0].revents != 0 {
             return;

@@ -2599,6 +2599,8 @@ mod tests {
             span: 0,
             build: 0,
             on_cpu: true,
+            job: 0,
+            fiber: 0,
         };
         OWN.keep(&[sample]);
         assert_eq!(

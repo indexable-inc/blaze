@@ -75,6 +75,7 @@ use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST,
     Stamp, Tag,
     handoff::Claims,
+    wait::{self, Clock, Deadline, Monotonic},
     wheel::{self, Wheel},
 };
 
@@ -107,9 +108,8 @@ const FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const FEAT_NODROP: u32 = 1 << 1;
 const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
 const FEAT_EXT_ARG: u32 = 1 << 8;
-const ENTER_GETEVENTS: u32 = 1 << 0;
+/// `IORING_ENTER_SQ_WAKEUP`; the waiting flags are `wait::uring_enter`'s.
 const ENTER_SQ_WAKEUP: u32 = 1 << 1;
-const ENTER_EXT_ARG: u32 = 1 << 3;
 /// In the submission ring's flags: the kernel's thread sleeps, to be woken by an enter.
 const SQ_NEED_WAKEUP: u32 = 1 << 0;
 /// In the submission ring's flags: completions wait in the kernel for room, flushed by an
@@ -286,20 +286,6 @@ struct Cqe {
     user_data: u64,
     res: i32,
     flags: u32,
-}
-
-#[repr(C)]
-struct Timespec {
-    sec: i64,
-    nsec: i64,
-}
-
-#[repr(C)]
-struct GeteventsArg {
-    sigmask: u64,
-    sigmask_sz: u32,
-    pad: u32,
-    ts: u64,
 }
 
 #[repr(C)]
@@ -1138,9 +1124,11 @@ impl Ring {
     }
 
     /// Wakes the kernel's thread where it sleeps with requests written since, and, with
-    /// `wait`, waits up to it for one completion. Completions the kernel held for want of room
-    /// are flushed to the ring by any enter that gets events.
-    fn enter(&mut self, wait: Option<Duration>) -> io::Result<()> {
+    /// `until`, waits until that deadline on `clock` for one completion, through
+    /// [`wait::uring_enter`] (the time left recomputed on every entry, asynchronous signals
+    /// masked). Completions the kernel held for want of room are flushed to the ring by any
+    /// enter that gets events.
+    fn enter(&mut self, until: Option<Deadline>, clock: &impl Clock) -> io::Result<()> {
         self.publish();
         let flags = self.flags();
         // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
@@ -1150,59 +1138,17 @@ impl Ring {
         let queued = head != self.sq_local;
         let wake = queued && flags & SQ_NEED_WAKEUP != 0;
         self.unsubmitted = 0;
-        let wait = wait.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Duration::ZERO));
-        if wait.is_none() && !wake {
+        let until = until.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Deadline::PASSED));
+        if until.is_none() && !wake {
             return Ok(());
         }
-        let ts =
-            wait.map(|it| Timespec { sec: it.as_secs() as i64, nsec: it.subsec_nanos() as i64 });
-        let arg = GeteventsArg {
-            sigmask: 0,
-            sigmask_sz: 0,
-            pad: 0,
-            ts: ts.as_ref().map_or(0, |it| it as *const Timespec as u64),
+        let flags = match wake {
+            true => ENTER_SQ_WAKEUP,
+            false => 0,
         };
-        let (min_complete, mut flags) = match wait {
-            Some(_) => (1, ENTER_GETEVENTS | ENTER_EXT_ARG),
-            None => (0, ENTER_EXT_ARG),
-        };
-        if wake {
-            flags |= ENTER_SQ_WAKEUP;
-        }
-        loop {
-            // SAFETY: `arg` and the timespec it points at outlive the call. With SQPOLL the
-            // kernel's thread submits; the call only wakes it and waits.
-            let entered = unsafe {
-                libc::syscall(
-                    libc::SYS_io_uring_enter,
-                    self.fd.as_raw_fd(),
-                    0,
-                    min_complete,
-                    flags,
-                    &raw const arg,
-                    size_of::<GeteventsArg>(),
-                )
-            };
-            if entered >= 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                // A signal ended a timed wait early: back to the caller, whose deadline says
-                // how much of it is left. Entering again with the same relative timeout would
-                // never end under a signal that comes sooner than it: the profile's sampler
-                // signals this thread every 20 ms, so a 50 ms wait never timed out and the
-                // daemon's first turn never ended (0.20261105.0 on Linux, `blaze serve` stuck
-                // before it listened).
-                Some(libc::EINTR) if wait.is_some() => return Ok(()),
-                Some(libc::EINTR) => continue,
-                // The wait ended with nothing done.
-                Some(libc::ETIME) => return Ok(()),
-                // Completions to reap first.
-                Some(libc::EBUSY | libc::EAGAIN) => return Ok(()),
-                _ => return Err(error),
-            }
-        }
+        let what = "a completion of the io_uring driver";
+        wait::uring_enter(what, self.fd.as_raw_fd(), flags, until, clock)?;
+        Ok(())
     }
 
     /// The completions posted and not yet reaped, from the first to one past the last: read
@@ -2580,23 +2526,20 @@ impl Driver for Uring {
         self.submit_ring();
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize {
+    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let before = out.len();
         self.reap();
         self.fire_timers();
         out.append(&mut self.ready);
         if out.len() == before && self.in_flight > 0 {
-            let deadline = Instant::now() + wait;
+            let clock = Monotonic::since(self.start);
             while out.len() == before {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let now = wheel::ticks(self.start.elapsed());
-                let until_timer = self
+                // The caller's deadline or the next timer's, whichever is sooner.
+                let wait = self
                     .timers
                     .next_deadline()
-                    .map(|due| Duration::from_nanos(due.saturating_sub(now)));
-                if let Err(error) =
-                    self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left))))
-                {
+                    .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
+                if let Err(error) = self.ring.enter(Some(wait), &clock) {
                     self.fail_unsubmitted(&error);
                     out.append(&mut self.ready);
                     break;
@@ -2604,7 +2547,7 @@ impl Driver for Uring {
                 self.reap();
                 self.fire_timers();
                 out.append(&mut self.ready);
-                if left.is_zero() {
+                if until.passed(clock.now()) {
                     break;
                 }
             }
@@ -2841,7 +2784,8 @@ mod tests {
         driver.submit(&mut effects);
         let began = Instant::now();
         let mut out = Vec::new();
-        assert_eq!(driver.poll(&mut out, Duration::from_millis(20)), 0);
+        let until = Deadline::after(driver.now(), Duration::from_millis(20));
+        assert_eq!(driver.poll(&mut out, until), 0);
         let waited = began.elapsed();
         assert!(
             waited >= Duration::from_millis(19) && waited < Duration::from_secs(5),
@@ -3210,7 +3154,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         let mut done = Vec::new();
         while seen.len() < 17 && started.elapsed() < Duration::from_secs(20) {
-            driver.poll(&mut done, Duration::from_secs(10));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_secs(10)));
             for completion in done.drain(..) {
                 let shown = match completion.done {
                     Done::Listed(found) => {
@@ -3249,7 +3193,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut client = None;
         while client.is_none() && Instant::now() < deadline {
-            ring.poll(&mut out, Duration::from_millis(50));
+            ring.poll(&mut out, Deadline::after(ring.now(), Duration::from_millis(50)));
             client = out.iter().find_map(|it| match it.done {
                 Done::Connected { conn } => Some(conn),
                 _ => None,
@@ -3302,7 +3246,7 @@ mod tests {
         // The slot is emptied through the ring, a close no effect waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.table.free.borrow().len() < free + 1 && Instant::now() < deadline {
-            driver.poll(&mut Vec::new(), Duration::from_millis(1));
+            driver.poll(&mut Vec::new(), Deadline::after(driver.now(), Duration::from_millis(1)));
         }
         assert_eq!((driver.table.free.borrow().len(), driver.closes), (free + 1, 0));
         drop(driver);
@@ -3782,7 +3726,7 @@ mod tests {
             let mut driver = Uring::new(&root).unwrap();
             driver.submit(&mut vec![Effect::Journal { dir: src.clone(), since, tag: Tag(7) }]);
             let mut done = Vec::new();
-            driver.poll(&mut done, Duration::from_secs(5));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_secs(5)));
             let lost = if lost { vec![(src.clone(), Lost::NoJournal)] } else { Vec::new() };
             match done.remove(0) {
                 Completion { tag: Tag(7), done: Done::Journaled(first) } => assert_eq!(
@@ -3799,7 +3743,7 @@ mod tests {
             let (mut heard, mut flushed) = (Vec::new(), false);
             let deadline = Instant::now() + Duration::from_secs(10);
             while !flushed && Instant::now() < deadline {
-                driver.poll(&mut done, Duration::from_millis(50));
+                driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
                 for it in done.drain(..) {
                     match (it.tag.0, it.done) {
                         (7, Done::Journaled(batch)) => {
@@ -3987,7 +3931,7 @@ mod tests {
     ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !enough(out) && Instant::now() < deadline {
-            driver.poll(out, Duration::from_millis(50));
+            driver.poll(out, Deadline::after(driver.now(), Duration::from_millis(50)));
         }
     }
 
@@ -4166,7 +4110,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let (mut seen, mut sent, mut read) = (0, false, false);
                 while (!read || !sent) && Instant::now() < deadline {
-                    ring.poll(&mut out, Duration::from_millis(50));
+                    ring.poll(&mut out, Deadline::after(ring.now(), Duration::from_millis(50)));
                     for it in &mut out[seen..] {
                         match &mut it.done {
                             Done::Sent(bytes) => {
@@ -4450,7 +4394,7 @@ mod tests {
         while (driver.table.free.borrow().len() < free || driver.closes > 0)
             && Instant::now() < deadline
         {
-            driver.poll(&mut Vec::new(), Duration::from_millis(1));
+            driver.poll(&mut Vec::new(), Deadline::after(driver.now(), Duration::from_millis(1)));
         }
         assert_eq!(
             (driver.table.free.borrow().len(), driver.closes, driver.slots_held),
@@ -4550,7 +4494,7 @@ mod tests {
         let (mut out, mut seen) = (Vec::new(), BTreeMap::new());
         let deadline = Instant::now() + Duration::from_secs(30);
         while driver.in_flight() > 0 && Instant::now() < deadline {
-            driver.poll(&mut out, Duration::from_millis(50));
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
             assert!(driver.loading <= most, "{} reads open of {most}", driver.loading);
             seen.extend(out.drain(..).map(|it| (it.tag.0 as usize, it.done)));
         }
@@ -4623,10 +4567,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A timed poll ends within its wait while signals keep interrupting it, as the profile's
-    /// sampler does every 20 ms: `Ring::enter` once entered again with the whole relative
-    /// timeout after each EINTR, so a wait longer than the gap between signals never ended and
-    /// the daemon never got past its first turn.
+    /// A timed poll ends by its deadline while signals keep coming, as the profile's sampler
+    /// sent them every 20 ms: `Ring::enter` once entered again with the whole relative timeout
+    /// after each EINTR, so a wait longer than the gap between signals never ended and the
+    /// daemon never got past its first turn. Now the wait masks the signal
+    /// (`wait::uring_enter`) and, interrupted by one it lets through, waits only for what is
+    /// left of its deadline (`wait::until`, proven in wait/tests.rs).
     #[test]
     fn a_timed_poll_ends_under_a_storm_of_signals() {
         extern "C" fn nothing(_: libc::c_int) {}
@@ -4668,7 +4614,7 @@ mod tests {
         });
         let started = Instant::now();
         let mut out = Vec::new();
-        ring.poll(&mut out, Duration::from_millis(50));
+        ring.poll(&mut out, Deadline::after(ring.now(), Duration::from_millis(50)));
         let took = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         storm.join().unwrap();
@@ -4741,7 +4687,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while received < sent && Instant::now() < deadline {
             ring.submit_ring();
-            ring.ring.enter(Some(Duration::from_millis(50))).unwrap();
+            let clock = Monotonic::since(ring.start);
+            let until = Deadline::after(clock.now(), Duration::from_millis(50));
+            ring.ring.enter(Some(until), &clock).unwrap();
             let shown = ring.provided.shown();
             let (first, tail) = ring.ring.completions();
             let (mut head, mut given) = (first, 0);

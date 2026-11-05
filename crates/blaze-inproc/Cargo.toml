@@ -41,6 +41,8 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+# The test that sleeps mid-write sleeps through `blaze_core::wait` (rule deadline-waits).
+blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-inproc-rt = { workspace = true, features = ["testing"] }
 blaze-spin.workspace = true

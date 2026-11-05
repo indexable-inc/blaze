@@ -755,6 +755,10 @@ pub fn take_open() -> Option<NonZeroUsize> {
     let depth = ring.map_or(0, |it| it.depth.load(Ordering::Relaxed));
     let nothing = depth == 0 && build == 0 && job.is_none() && running == OnThread::default();
     if nothing {
+        if let Some(ring) = ring {
+            // No job runs here once it parks: the samples after this are the worker's own.
+            ring.set_running(0, 0);
+        }
         return None;
     }
     let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], job, running };
@@ -765,6 +769,8 @@ pub fn take_open() -> Option<NonZeroUsize> {
             *to = from.load(Ordering::Relaxed);
         }
         ring.depth.store(0, Ordering::Release);
+        // Inside no span, running no job: what the context log says until the next resumes.
+        ring.set_running(0, 0);
     }
     let mut parked = lock(&PARKED);
     let at = match parked.free.pop() {
@@ -817,6 +823,9 @@ pub fn put_open(taken: NonZeroUsize) {
             to.store(*from, Ordering::Relaxed);
         }
         ring.depth.store(depth, Ordering::Release);
+        // Its spans are back, and its job (its fiber, its `resumed` switch says).
+        ring.job.store(carried.running.job, Ordering::Relaxed);
+        ring.note_context();
         // Its innermost span counts this thread's ticks from here.
         if counting() {
             ring.top_since.store(clock::ticks(), Ordering::Relaxed);
@@ -1011,6 +1020,11 @@ pub fn job_begins(spawner: u64, given: u64, build: u32, creator: u64) {
         it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, creator, outer }))
     });
     RUNNING.with(|it| it.set(OnThread { job: unjoined, build }));
+    // A pool job runs on the thread from here, by its number until it joins the graph; on no
+    // fiber of the graph's.
+    if let Some(ring) = MINE.with(Cell::get) {
+        ring.set_running(unjoined, 0);
+    }
 }
 
 /// The span the pool job beginning on this thread was given inside ([`job_begins`]): what its
@@ -1084,6 +1098,16 @@ pub fn switched(switch: Switch) {
     }
     // The thread's running job moves above whether or not the row is kept.
     let Some(ring) = ring() else { return };
+    // What runs on the thread from here, for the sampler: the job and fiber a start or a
+    // resume brings, none after a park, an end or an idle stretch; a wake-up told on the
+    // waker's thread changes nothing here.
+    match switch.event {
+        Switched::Started | Switched::Resumed => ring.set_running(switch.job, switch.fiber),
+        Switched::Parked | Switched::Ended | Switched::Ran | Switched::Idle | Switched::Woke => {
+            ring.set_running(0, 0);
+        }
+        Switched::Ready => {}
+    }
     let queued_low = (queued & ((1 << QUEUED_LOW_BITS) - 1)) << QUEUED_LOW_SHIFT;
     let what =
         KIND_PLOT << 62 | queued_low | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
@@ -1950,6 +1974,114 @@ impl Store {
     }
 }
 
+/// Entries a ring's [`ContextLog`] keeps: a power of two. A thread changes what it is inside
+/// a few hundred thousand times a second at the most, and the sampler reads every 20 ms, so
+/// the log covers a perf sample's delay whenever the thread is not that busy; an older sample
+/// reads span 0 and is counted ([`crate::sampler`]).
+pub(crate) const CONTEXT_LOG: usize = 4096;
+/// Words an entry holds: its ticks, the innermost span, the span under it on the enter stack,
+/// the job and the fiber.
+const CONTEXT_WORDS: usize = 5;
+
+/// A ring's context log: a fixed ring of what its thread was inside, an entry at every change
+/// of its innermost span (a span entered or left, a fiber's spans moved off the thread as it
+/// parks and back as it resumes) and of its job or fiber, so a sample whose time the kernel
+/// gives later (Linux's perf) is told the span, job and fiber in force at that time.
+///
+/// Written by the ring's thread alone, atomics only, as [`Ring::put`] writes rows: a release
+/// fence, the entry's words, then `head` with release. A reader loads `head` (acquire), reads
+/// the entries it needs, then an acquire fence and `head` again: an entry `j` it read is whole
+/// when `j + CONTEXT_LOG > head` then, since the writer stores the head that names the write
+/// over `j` before its fence and that write's words, so a reader that saw any of them sees
+/// that head too. An entry written over as it was read is dropped, never misread.
+pub(crate) struct ContextLog {
+    head: AtomicU64,
+    words: Box<[AtomicU64]>,
+}
+
+impl ContextLog {
+    pub(crate) fn new() -> ContextLog {
+        // alloc: once per ring, 160 KiB, kept for the process's life as the ring is
+        let words = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(CONTEXT_LOG * CONTEXT_WORDS)
+            // alloc: as above
+            .collect();
+        ContextLog { head: AtomicU64::new(0), words }
+    }
+
+    /// Writes `entry` as the log's next, over the oldest once [`CONTEXT_LOG`] are written.
+    #[inline]
+    pub(crate) fn put(&self, entry: [u64; CONTEXT_WORDS]) {
+        let i = self.head.load(Ordering::Relaxed);
+        let at = (i as usize & (CONTEXT_LOG - 1)) * CONTEXT_WORDS;
+        fence(Ordering::Release);
+        for (word, value) in self.words[at..at + CONTEXT_WORDS].iter().zip(entry) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.head.store(i + 1, Ordering::Release);
+    }
+
+    /// Entry number `i`, as it reads now: whole only if [`ContextLog::whole`] says so after.
+    fn entry(&self, i: u64) -> [u64; CONTEXT_WORDS] {
+        let at = (i as usize & (CONTEXT_LOG - 1)) * CONTEXT_WORDS;
+        std::array::from_fn(|w| self.words[at + w].load(Ordering::Relaxed))
+    }
+
+    /// Whether entry `i` and every later one read before this call were whole: none was
+    /// written over while it was read.
+    fn whole(&self, i: u64) -> bool {
+        fence(Ordering::Acquire);
+        i + CONTEXT_LOG as u64 > self.head.load(Ordering::Relaxed)
+    }
+
+    /// The span, job and fiber in force at `ticks`: those of the last entry at or before it.
+    /// A span `is_open` says closed gives way to the span under it, and so on down, each
+    /// one's own parent read from the latest entry before that names it innermost; 0 when
+    /// none is open or the log no longer holds the entry. `None` for a moment older than the
+    /// oldest entry, or an entry written over as it was read. Bounded: every step down reads
+    /// only entries older than the step before, at most [`CONTEXT_LOG`] in all.
+    pub(crate) fn at(&self, ticks: u64, is_open: impl Fn(u64) -> bool) -> Option<(u64, u64, u32)> {
+        let end = self.head.load(Ordering::Acquire);
+        // One short of a full log: the oldest slot is the next one written.
+        let first = end.saturating_sub(CONTEXT_LOG as u64 - 1);
+        // The entries' ticks go up (one thread writes them, on a clock that only goes
+        // forward): the first entry past `ticks`, by halves.
+        let (mut lo, mut hi) = (first, end);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entry(mid)[0] <= ticks {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let matched = lo.checked_sub(1).filter(|it| *it >= first)?;
+        let [at, span, parent, job, fiber] = self.entry(matched);
+        if at > ticks {
+            return None;
+        }
+        let (mut span, mut parent, mut low) = (span, parent, matched);
+        while span != 0 && !is_open(span) {
+            if parent == 0 || is_open(parent) {
+                span = parent;
+                break;
+            }
+            // The parent closed too: its own parent is in the latest entry naming it
+            // innermost, older than this one.
+            match (first..low).rev().find(|&i| self.entry(i)[1] == parent) {
+                Some(i) => {
+                    (span, parent, low) = (parent, self.entry(i)[2], i);
+                }
+                None => {
+                    span = 0;
+                    low = first;
+                }
+            }
+        }
+        self.whole(low).then_some((span, job, fiber as u32))
+    }
+}
+
 pub(crate) struct Ring {
     /// Its number, in span ids and in [`BY_NUMBER`].
     number: u16,
@@ -1990,6 +2122,13 @@ pub(crate) struct Ring {
     owners: Mutex<Vec<Owner>>,
     /// What the sampler needs of the thread, under the lock the thread takes to leave.
     pub(crate) sampled: Mutex<crate::sampler::Thread>,
+    /// What its thread was inside, moment by moment: the sampler's way from a sample's time
+    /// to its span, job and fiber ([`Ring::context_at`]).
+    context: ContextLog,
+    /// The job and fiber running on its thread now, 0 for none: written by its thread at each
+    /// switch, read by the macOS sampler while the thread is stopped ([`Ring::running_now`]).
+    job: AtomicU64,
+    fiber: AtomicU64,
     /// Its thread's CPU accounting ([`crate::time::cpu`]), written by that thread alone: when
     /// its innermost span began counting ticks (0: none counts); the reading its stretch began
     /// with (CPU [`NO_CPU`]: none); the rate of the stretch before (ticks 0: none); when it last
@@ -2040,6 +2179,9 @@ impl Ring {
             // alloc: once per thread, as it first records
             owners: Mutex::new(Vec::new()),
             sampled: Mutex::new(crate::sampler::Thread::default()),
+            context: ContextLog::new(),
+            job: AtomicU64::new(0),
+            fiber: AtomicU64::new(0),
             top_since: AtomicU64::new(0),
             stretch_ticks: AtomicU64::new(0),
             stretch_cpu: AtomicU64::new(NO_CPU),
@@ -2230,6 +2372,50 @@ impl Ring {
             .map_or(0, |it| it.load(Ordering::Relaxed))
     }
 
+    /// The job and fiber running on its thread now (0: none): atomics only, so the sampler
+    /// may read them while the thread is stopped.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn running_now(&self) -> (u64, u32) {
+        (self.job.load(Ordering::Relaxed), self.fiber.load(Ordering::Relaxed) as u32)
+    }
+
+    /// Notes in the context log what its thread is inside now: its innermost span (and that
+    /// span's place under the one below it), its job and its fiber. By the ring's thread alone,
+    /// at every change of any of them.
+    #[inline]
+    fn note_context(&self) {
+        let depth = self.depth.load(Ordering::Relaxed) as usize;
+        let at = |i: Option<usize>| {
+            i.and_then(|it| self.entered.get(it)).map_or(0, |it| it.load(Ordering::Relaxed))
+        };
+        self.context.put([
+            clock::ticks(),
+            at(depth.checked_sub(1)),
+            at(depth.checked_sub(2)),
+            self.job.load(Ordering::Relaxed),
+            self.fiber.load(Ordering::Relaxed),
+        ]);
+    }
+
+    /// Sets the job and fiber running on its thread, and notes them: by the ring's thread.
+    #[inline]
+    fn set_running(&self, job: u64, fiber: u32) {
+        self.job.store(job, Ordering::Relaxed);
+        self.fiber.store(u64::from(fiber), Ordering::Relaxed);
+        self.note_context();
+    }
+
+    /// The span, job and fiber its thread was inside at `ticks` ([`clock::ticks`]), from its
+    /// context log: `None` for a moment older than the log's oldest entry, or one whose
+    /// entries the thread wrote over as they were read. A span that has closed since (and may
+    /// have been folded) gives way to its innermost ancestor still open; the span given is
+    /// kept, so it is written whole as it closes, never folded ([`keep`]).
+    pub(crate) fn context_at(&self, ticks: u64) -> Option<(u64, u64, u32)> {
+        let (span, job, fiber) = self.context.at(ticks, |id| open_slot(id).is_some())?;
+        keep(span);
+        Some((span, job, fiber))
+    }
+
     /// The tid and name of [`Ring::current`].
     fn current(&self) -> (u32, Sym) {
         let current = self.current.load(Ordering::Acquire);
@@ -2276,6 +2462,7 @@ impl Drop for Held {
             let mut sampled = lock(&ring.sampled);
             sampled.leave();
             ring.depth.store(0, Ordering::Relaxed);
+            ring.set_running(0, 0);
             ring.live.store(false, Ordering::Release);
             drop(sampled);
         }
@@ -2361,6 +2548,9 @@ fn claim() -> Option<&'static Ring> {
         ring.rate_ticks.store(0, Ordering::Relaxed);
         ring.idle_since.store(0, Ordering::Relaxed);
         ring.left_len.store(0, Ordering::Relaxed);
+        // A new thread, inside nothing and running no job: the log's entries from here are
+        // its own.
+        ring.set_running(0, 0);
         lock(&ring.sampled).enter(u64::from(tid));
         held.0.set(Some(ring));
         MINE.with(|it| it.set(Some(ring)));
@@ -2658,6 +2848,7 @@ pub(crate) fn entered(id: u64) {
         slot.store(id, Ordering::Relaxed);
     }
     ring.depth.store(depth + 1, Ordering::Release);
+    ring.note_context();
     if counts {
         counted_from(ring, now);
     }
@@ -2698,6 +2889,7 @@ pub(crate) fn exited(id: u64) {
         left_open(ring, id);
     }
     ring.depth.store(top, Ordering::Release);
+    ring.note_context();
     if counts {
         counted_from(ring, now);
         if top == 0 {
@@ -5483,5 +5675,51 @@ mod tests {
                 "a cursor never reads a counted span before its rate: {span:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod context_log_tests {
+    use super::{CONTEXT_LOG, ContextLog};
+
+    /// The log answers with the entry in force at a moment; a moment before its oldest entry
+    /// is `None`, as is any once the log wrapped past it; a closed span gives way to its
+    /// innermost ancestor still open, through spans closed in between.
+    #[test]
+    fn the_context_log_tells_the_entry_in_force_and_an_open_ancestor() {
+        let log = ContextLog::new();
+        let open = |id: u64| id != 0 && id != 20 && id != 30;
+        assert_eq!(log.at(5, open), None, "an empty log tells nothing");
+        // ticks, innermost, under it, job, fiber: 10 entered at 100, 20 inside it at 200, 30
+        // inside 20 at 300, back to 10 at 400 (20 and 30 since closed), out of all at 500.
+        log.put([100, 10, 0, 7, 1]);
+        log.put([200, 20, 10, 7, 1]);
+        log.put([300, 30, 20, 7, 1]);
+        log.put([400, 10, 0, 8, 2]);
+        log.put([500, 0, 0, 0, 0]);
+        assert_eq!(log.at(99, open), None, "older than the oldest entry");
+        assert_eq!(log.at(100, open), Some((10, 7, 1)));
+        assert_eq!(log.at(250, open), Some((10, 7, 1)), "20 closed: its parent 10 is open");
+        assert_eq!(
+            log.at(350, open),
+            Some((10, 7, 1)),
+            "30 and 20 closed: 30's parent's parent, from 20's own entry"
+        );
+        assert_eq!(log.at(450, open), Some((10, 8, 2)), "the job and fiber of the entry");
+        assert_eq!(log.at(10_000, open), Some((0, 0, 0)), "the last entry holds until the next");
+        assert_eq!(log.at(350, |id| id == 10 || id == 20), Some((20, 7, 1)), "20 still open");
+        // Wrapped: the first entries are gone, so their moments are too old.
+        for i in 0..CONTEXT_LOG as u64 {
+            log.put([1_000 + i, 40, 10, 9, 3]);
+        }
+        assert_eq!(log.at(450, open), None, "written over: older than the oldest");
+        assert_eq!(log.at(1_000 + CONTEXT_LOG as u64, open), Some((40, 9, 3)));
+        assert_eq!(
+            log.at(2_000, |id| id == 10),
+            Some((10, 9, 3)),
+            "a closed span after a wrap gives way to its parent"
+        );
+        // A closed span whose parent closed too and has no entry left reads span 0.
+        assert_eq!(log.at(2_000, |_| false), Some((0, 9, 3)));
     }
 }

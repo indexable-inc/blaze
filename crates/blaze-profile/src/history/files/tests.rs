@@ -488,7 +488,7 @@ fn drive(
             };
         }
         contention.step(sim, delivered);
-        if sim.poll(&mut done, Duration::ZERO) == 0 {
+        if sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 {
             let waits = files.waits_on();
             // alloc: an oracle's finding
             return Err(Broke::Oracle(format!(
@@ -602,6 +602,8 @@ impl World {
             max_latency: Duration::from_micros(plan.latency_us),
             no_clone: false,
             lose_change_one_in: 0,
+            // Half the runs wait under interrupted system calls (rule `deadline-waits`).
+            interrupt_one_in: if plan.seed & 1 == 0 { 0 } else { 3 },
         };
         let Some(dir) = FileName::new(DIR) else { unreachable!("`{DIR}` is a name") };
         World {

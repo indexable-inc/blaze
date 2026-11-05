@@ -46,6 +46,7 @@ use crate::{
     fsevents::{self, Tell},
     handoff::Wake,
     net, process,
+    wait::{self, Clock as _, Deadline, Monotonic, Waited},
     wheel::{self, Wheel},
 };
 
@@ -114,26 +115,21 @@ impl Notify {
         id: u64,
     ) -> io::Result<()> {
         let event = Kevent { ident, filter, flags, fflags, data, udata: id as usize };
-        loop {
-            // SAFETY: one change, laid out as a `kevent`, to read and no events to write.
-            let changed = unsafe {
-                libc::kevent(
-                    self.kq.as_raw_fd(),
-                    (&raw const event).cast(),
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if changed >= 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        // With no room for events the call never waits: the clock only bounds its retries.
+        // SAFETY: one change, laid out as a `kevent`, to read and no events to write.
+        let changed = unsafe {
+            wait::kevent(
+                "a change of the kqueue",
+                self.kq.as_raw_fd(),
+                (&raw const event).cast(),
+                1,
+                std::ptr::null_mut(),
+                0,
+                None,
+                &Monotonic::new(),
+            )
+        };
+        changed.map(drop).map_err(io::Error::from)
     }
 
     /// After a hand-back into a channel: wakes the polling thread, unless one since its last
@@ -990,29 +986,23 @@ impl Kqueue {
         Ok(())
     }
 
-    /// Makes the changes asked for and waits up to `left` (forever for `None`), or until the
+    /// Makes the changes asked for and waits until `until` (forever for `None`), or until the
     /// next timer is due, for events, and acts on them; then fires the timers due.
-    fn wait(&mut self, left: Option<Duration>) {
-        let now = wheel::ticks(self.start.elapsed());
-        let until_timer =
-            self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
-        let left = match (left, until_timer) {
-            (Some(left), Some(until_timer)) => Some(left.min(until_timer)),
-            (left, until_timer) => left.or(until_timer),
+    fn wait(&mut self, until: Option<Deadline>) {
+        let timer = self.timers.next_deadline().map(|due| Deadline::at(Duration::from_nanos(due)));
+        let until = match (until, timer) {
+            (Some(until), Some(timer)) => Some(until.min(timer)),
+            (until, timer) => until.or(timer),
         };
-        self.wait_events(left);
+        self.wait_events(until);
         let ready = &mut self.ready;
         self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
             ready.push(Completion { tag, done: Done::Fired });
         });
     }
 
-    fn wait_events(&mut self, left: Option<Duration>) {
-        let timeout = left.map(|it| libc::timespec {
-            tv_sec: libc::time_t::try_from(it.as_secs()).unwrap_or(libc::time_t::MAX),
-            tv_nsec: it.subsec_nanos().into(),
-        });
-        let timeout = timeout.as_ref().map_or(std::ptr::null(), |it| it as *const libc::timespec);
+    fn wait_events(&mut self, until: Option<Deadline>) {
+        let clock = Monotonic::since(self.start);
         let mut changes = std::mem::take(&mut self.changes);
         let mut events = std::mem::take(&mut self.events);
         // Room for a failure of every change besides the events: a failure with no room for it
@@ -1020,32 +1010,33 @@ impl Kqueue {
         let room = changes.len() + EVENTS;
         events.clear();
         events.reserve(room);
-        // SAFETY: the changes and the room for events laid out as `kevent`s, and a timeout that
-        // outlives the call.
+        // SAFETY: the changes and the room for events laid out as `kevent`s, both kept until
+        // the call returns.
         let got = unsafe {
-            libc::kevent(
+            wait::kevent(
+                "the kqueue driver's events",
                 self.notify.kq.as_raw_fd(),
                 changes.as_ptr().cast(),
-                changes.len() as libc::c_int,
+                changes.len(),
                 events.as_mut_ptr().cast(),
-                room as libc::c_int,
-                timeout,
+                room,
+                until,
+                &clock,
             )
         };
-        // Made before the call waits, interrupted or not.
+        // Made by the first call, before it waited, interrupted or not.
         changes.clear();
         self.changes = changes;
-        if got < 0 {
-            let error = io::Error::last_os_error();
-            assert!(error.kind() == io::ErrorKind::Interrupted, "waiting on the kqueue: {error}");
-            self.events = events;
-            return;
-        }
+        let got = match got {
+            Ok(Waited::Ready(got)) => got,
+            Ok(Waited::Deadline) => 0,
+            Err(error) => panic!("{error}"),
+        };
         // SAFETY: the call wrote `got` events, at most the `room` it was given, which `reserve`
         // made capacity for; a `Kevent` is integers only, so any bytes it wrote are one. What
         // `udata` names is checked in `dispatch` (a slab lookup by index and generation),
         // never followed as a pointer.
-        unsafe { events.set_len(got as usize) };
+        unsafe { events.set_len(got) };
         for &event in &events {
             self.dispatch(event);
         }
@@ -1248,22 +1239,21 @@ impl Driver for Kqueue {
         }
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize {
+    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let before = out.len();
-        let deadline = Instant::now().checked_add(wait);
+        let clock = Monotonic::since(self.start);
         loop {
             self.take(out);
             if out.len() > before || self.in_flight == 0 {
                 // Changes asked for are made now, not once nothing else is ready.
                 if !self.changes.is_empty() {
-                    self.wait(Some(Duration::ZERO));
+                    self.wait(Some(Deadline::PASSED));
                     self.take(out);
                 }
                 break;
             }
-            let left = deadline.map(|it| it.saturating_duration_since(Instant::now()));
-            self.wait(left);
-            if left.is_some_and(|it| it.is_zero()) {
+            self.wait(until.finite());
+            if until.passed(clock.now()) {
                 self.take(out);
                 break;
             }
@@ -1433,7 +1423,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while out.len() < n {
             assert!(Instant::now() < deadline, "never came: {out:?}");
-            driver.poll(out, Duration::from_millis(100));
+            driver.poll(out, Deadline::after(driver.now(), Duration::from_millis(100)));
         }
     }
 
@@ -1684,7 +1674,8 @@ mod tests {
         driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(60), tag: Tag(1) }]);
         let began = Instant::now();
         let mut out = Vec::new();
-        assert_eq!(driver.poll(&mut out, Duration::from_millis(20)), 0);
+        let until = Deadline::after(driver.now(), Duration::from_millis(20));
+        assert_eq!(driver.poll(&mut out, until), 0);
         let waited = began.elapsed();
         assert!(
             waited >= Duration::from_millis(19) && waited < Duration::from_secs(5),
@@ -1915,7 +1906,7 @@ mod tests {
                     tag: Tag(100 + n),
                 }]);
             }
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 match it.done {
                     Done::Changed { files, .. } => {
@@ -1960,7 +1951,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut flushed = false;
             while !flushed && Instant::now() < deadline {
-                driver.poll(&mut done, Duration::from_millis(50));
+                driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
                 for it in done.drain(..) {
                     match it.done {
                         Done::Changed { files, .. } => heard.extend(files),
@@ -2023,7 +2014,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let (mut batches, mut done) = (Vec::new(), Vec::new());
         while Instant::now() < deadline {
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 assert_eq!(it.tag, tag);
                 let Done::Journaled(batch) = it.done else { panic!("{:?}", it.done) };
@@ -2251,7 +2242,7 @@ mod tests {
             driver.notify.change(1, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, id).unwrap();
         };
         user(&driver, ended);
-        driver.wait(Some(Duration::from_millis(50)));
+        driver.wait(Some(Deadline::after(driver.now(), Duration::from_millis(50))));
         let mut out = Vec::new();
         driver.take(&mut out);
         assert!(out.is_empty(), "{out:?}");
@@ -2260,7 +2251,7 @@ mod tests {
         user(&driver, live);
         let deadline = Instant::now() + Duration::from_secs(5);
         while out.is_empty() && Instant::now() < deadline {
-            driver.wait(Some(Duration::from_millis(50)));
+            driver.wait(Some(Deadline::after(driver.now(), Duration::from_millis(50))));
             driver.take(&mut out);
         }
         assert!(
@@ -2420,8 +2411,9 @@ mod tests {
             while !heard {
                 assert!(Instant::now() < deadline, "round {round}: the change was never heard");
                 std::fs::write(&path, b"edited").unwrap();
+                let until = Deadline::after(driver.now(), Duration::from_millis(50));
                 let (_, used) =
-                    blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+                    blaze_alloc_count::measure(|| driver.poll(&mut out, until));
                 on_driver += used.allocations;
                 for it in out.drain(..) {
                     match it.done {
@@ -2435,7 +2427,7 @@ mod tests {
                 driver.submit(&mut effects);
                 poll_for(&mut driver, &mut out, 1);
                 while !matches!(out.last(), Some(Completion { done: Done::Unwatched, .. })) {
-                    driver.poll(&mut out, Duration::from_millis(50));
+                    driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
                 }
             });
             on_driver += used.allocations;
