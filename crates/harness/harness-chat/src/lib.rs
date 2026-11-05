@@ -9,6 +9,8 @@
 //!
 //! [`Transcript::feed`] takes the bytes of a chat attach stream (its event frames, harness-proto's `T_EVENT`) in any
 //! pieces; [`Transcript::apply`] one typed event.
+pub mod group;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
