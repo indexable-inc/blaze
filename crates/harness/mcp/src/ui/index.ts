@@ -20,6 +20,22 @@ export { isElement, type UiNode };
 const MAX_LIVE = 16;
 const live = new Map<Task, UiTree>();
 
+/**
+ * Run handler `handler` of task `id`'s live UI with `value` (what the person did, from the app through harnessd). The
+ * tree re-renders and posts itself as it does after any change. When it cannot run, the reason goes in that cell's logs
+ * (or is returned, when no live tree is that cell's).
+ */
+export async function dispatch(id: string, handler: string, value: unknown): Promise<string | undefined> {
+  for (const [t, tree] of live) {
+    if (t.id !== id) continue;
+    if (await tree.dispatch(handler, value)) return undefined;
+    t.logs.push(`[ui] ${handler} did nothing: no element of this cell's UI has that handler now (it re-rendered without it)`);
+    t.touch();
+    return undefined;
+  }
+  return `ui event ${handler} for cell ${id}: its UI is not live (the cell was replaced, or ${MAX_LIVE} newer UIs unmounted it)`;
+}
+
 /** Mount `component` with `props` as task `t`'s UI, replacing any it had; what the first render throws is thrown here. */
 export function show(t: Task, component: unknown, props: Record<string, unknown> = {}): UiTree {
   live.get(t)?.unmount();

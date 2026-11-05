@@ -61,6 +61,8 @@ export type Request =
   | ({ op: "spawn_object" } & Record<string, unknown>)
   | { op: "object"; id: string }
   | { op: "rpc"; id: string; method: string; args?: unknown }
+  | { op: "ui_event"; cell: string; handler: string; value?: unknown }
+  | { op: "ui_listen"; repl: string }
   | { op: "run"; cmd: string; cwd?: string | null; env?: Record<string, string>; clear_env?: boolean; session?: number | null; parent?: string | null; stdin?: string | null; repl?: string | null }
   | { op: "run_status" | "run_kill"; id: string }
   | { op: "runs"; session?: number | null; limit?: number | null; before?: number | null; q?: string | null }
@@ -84,7 +86,7 @@ export type SessionInfo = {
 
 /** A request's answer, tagged by `reply`; a run's or an object's answer is an open record. */
 export type Reply =
-  | { reply: "ok" | "watching" }
+  | { reply: "ok" | "watching" | "listening" }
   | { reply: "spawned"; id: number }
   | { reply: "sessions"; sessions: SessionInfo[] }
   | { reply: "daemon"; pid: number; sock: string }
@@ -99,7 +101,8 @@ export type Down =
   | ({ t: "reply" } & Reply)
   | { t: "error"; error: string }
   | { t: "exit"; code: number }
-  | { t: "changed"; gen: number };
+  | { t: "changed"; gen: number }
+  | { t: "ui"; cell: string; handler: string; value?: unknown };
 
 // ---- events (event.rs)
 
