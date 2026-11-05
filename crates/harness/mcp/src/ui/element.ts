@@ -195,6 +195,16 @@ export const BINDABLE: Partial<Record<string, string>> = {
   Split: 'ratio', Tabs: 'selected', Disclosure: 'open', Popover: 'open', Menu: 'open', Dialog: 'open', Sheet: 'open',
 };
 
+/**
+ * The names a model writes for an element's binding out of HTML's and Svelte's habit (`bind:checked` on a switch, `bind:value` on a
+ * select), each taken as the binding itself: compile.ts rewrites `bind:checked` on a Toggle to `bind:value`, and a plain `checked={x}`
+ * to `value={x}`, so the cell works as written instead of failing on a name.
+ */
+export const BIND_ALIAS: Partial<Record<string, Readonly<Record<string, string>>>> = {
+  Toggle: { checked: 'value' }, Checkbox: { value: 'checked' }, Select: { value: 'selected' }, Choice: { value: 'selected' },
+  Radio: { value: 'selected', group: 'selected' }, Tabs: { value: 'selected' },
+};
+
 /** An event that writes a binding back, and what it writes when not the event's value. */
 export interface WriteBack { event: string; value?: unknown }
 /**
@@ -213,7 +223,7 @@ export const BOUND_BY: Partial<Record<string, readonly WriteBack[]>> = {
  */
 export function bindError(element: string, name: string, where?: string): TypeError | undefined {
   const bound = BINDABLE[element];
-  if (name === 'this' || name === bound) return undefined;
+  if (name === 'this' || name === bound || BIND_ALIAS[element]?.[name] === bound) return undefined;
   if (bound) return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: a ${element}'s binding is bind:${bound}={...}`);
   const takers = Object.entries(BINDABLE).map(([el, prop]) => `${el} (bind:${prop})`).join(', ');
   return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: only ${takers} take a binding; pass ${name}={...} and an on-handler instead`);

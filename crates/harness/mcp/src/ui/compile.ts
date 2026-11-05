@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { parse } from 'acorn';
-import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, WORDS_ONLY, article, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
+import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, WORDS_ONLY, article, BIND_ALIAS, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
 import { SVG_SAID, attributeError, isSvgTag, svgSizeError, unknownTagError } from './draw.ts';
 import { svelteSpecifier } from './files.ts';
 
@@ -444,12 +444,22 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
       if (attribute.type === 'BindDirective') {
         const error = bindError(name, attribute.name, here);
         if (error) throw fail(error);
+        // `bind:checked` on a Toggle is its `bind:value` (element.ts `BIND_ALIAS`); `bind:checked` alone binds `checked`, so it keeps that name as the value.
+        const alias = BIND_ALIAS[name]?.[attribute.name];
+        if (alias) {
+          const from = attribute.start + 'bind:'.length;
+          const shorthand = !source.slice(attribute.start, attribute.end).includes('=');
+          splices.push({ start: from, end: from + attribute.name.length, text: shorthand ? `${alias}={${attribute.name}}` : alias });
+        }
         continue;
       }
       if (attribute.type === 'StyleDirective') throw fail(new TypeError(`style:${attribute.name} on ${said} is not drawn (${here}): no styles; colour comes from tone= on words and fill= and stroke= (an ink) on shapes`));
       if (attribute.type !== 'Attribute') continue;
-      const prop = attribute.name as string;
-      if (prop === AT) continue;
+      const written = attribute.name as string;
+      if (written === AT) continue;
+      // `checked={x}` on a Toggle is its `value={x}` (element.ts `BIND_ALIAS`); `{checked}` gets its name put in front below.
+      const prop = BIND_ALIAS[name]?.[written] ?? written;
+      if (prop !== written && source[attribute.start] !== '{') splices.push({ start: attribute.start, end: attribute.start + written.length, text: prop });
       if (name === 'Text' && within === 'page' && CANVAS_TEXT_PROPS.has(prop)) {
         throw fail(new TypeError(`<Text ${prop}=...> outside a drawing (${here}): only a Text in a Canvas or an <svg> takes x, y, anchor, size and fill; words elsewhere take tone and bold`));
       }
