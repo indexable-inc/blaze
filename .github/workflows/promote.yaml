@@ -417,11 +417,14 @@ jobs:
       - uses: actions/checkout@v7
       # Only GH_TOKEN: the Cloudflare token reaches no script, only wrangler-action below.
       - name: pointers and latest.json
+        id: metadata
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
         run: |
-          python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -I .github/scripts/promote.py metadata '{"out": "latest.json", "channels": "channels"}' | tee -a "$GITHUB_STEP_SUMMARY"
+          # The pointers in R2 too, where blaze reads them (r2.py, docs/release.md "Where the bytes are").
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
       # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
       # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
       # missing secret fails the run without holding a release back.
@@ -430,12 +433,14 @@ jobs:
           TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::error::latest.json is not published: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
+            echo "::error::the channels' pointers and latest.json are not in R2: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
             exit 1
           fi
-      - name: Publish latest.json
+      - name: Publish the pointers and latest.json
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote
+          command: |
+            ${{ steps.metadata.outputs.r2 }}
+            r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote

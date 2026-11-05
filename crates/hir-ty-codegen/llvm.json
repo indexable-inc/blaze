@@ -3,7 +3,7 @@
   "repo": "https://github.com/indexable-inc/llvm",
   "ref": "ix/23.x",
   "commit": "e152d9fa2bc259b3f831769ba1e1b17cf71d45da",
-  "release": "https://github.com/indexable-inc/blaze/releases/download/llvm-23.1.4-e152d9fa2bc2",
+  "release": "https://blaze-releases.ix.dev/native",
   "targets": {
     "aarch64-apple-darwin": {
       "name": "blaze-llvm-23.1.4-e152d9fa2bc2-aarch64-apple-darwin-e95fc3b4bd332691.tar.xz",
