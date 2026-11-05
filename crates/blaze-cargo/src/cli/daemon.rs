@@ -1555,14 +1555,20 @@ pub fn status_lines(status: &Status) -> String {
     for bug in &status.bugs {
         lines.push_str(&format!("  {bug}\n"));
     }
-    // What each build is doing: its request, command and age, where it is, and the outermost
-    // and innermost open spans of each thread working for it.
+    // What each build is doing: its request and command, then its compact line from its live
+    // model (its age, phase, tasks, workers, memory and what it is blocked on, as a build's own
+    // client prints it off a terminal), and the outermost and innermost open spans of each
+    // thread working for it.
     if !status.builds.is_empty() {
         lines.push_str(&format!("builds: {}\n", status.builds.len()));
     }
     for build in &status.builds {
-        let age = blaze_fetch::progress::Secs(Duration::from_millis(build.for_ms));
-        lines.push_str(&format!("  #{} {} ({age}): {}\n", build.id, build.what, build.phase));
+        let mut board = blaze_ui::board::Board::new(&build.what, blaze_ui::test_view::Paint::Plain);
+        board.take(build.now.clone()); // clone: the status is borrowed, and read once
+        let mut compact = String::new(); // alloc: a line a build
+        // A fresh board's first line is always due.
+        board.line(&mut compact);
+        lines.push_str(&format!("  #{} {}: {compact}\n", build.id, build.what));
         for span in &build.spans {
             lines.push_str(&format!("    {span}\n"));
         }

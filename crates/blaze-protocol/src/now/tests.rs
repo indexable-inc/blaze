@@ -1,6 +1,6 @@
-//! The fold on small graphs (a chain, a diamond, Andrew's build of 2026-11-05), its phase and
-//! memory, `Now`'s CBOR, and a property over random graphs: every unfinished task off the
-//! frontier is held by a blocker.
+//! The fold on small graphs (a chain, a diamond, Andrew's build of 2026-11-05, a program that is
+//! no build), its phase and memory, `Now`'s CBOR, and a property over random graphs: every
+//! unfinished task off the frontier is held by a blocker.
 
 use super::*;
 use crate::Message;
@@ -27,7 +27,7 @@ fn batch(first: u32, nodes: &[(NodeKind, String, Vec<u32>)]) -> Event {
 }
 
 fn moved(fold: &mut Fold, id: u32, state: NodeState) {
-    fold.take(&Event::Moved { id, state });
+    fold.take_event(&Event::Moved { id, state });
 }
 
 fn span(name: &str, for_ms: u64) -> Span {
@@ -48,9 +48,9 @@ fn named(now: &Now) -> Vec<&str> {
 fn a_chain_waits_on_its_running_head() {
     let mut fold = Fold::new();
     fold.advance_clock(0);
-    fold.take(&node(0, NodeKind::Link, "c", &[1]));
-    fold.take(&node(1, NodeKind::Bodies, "b", &[2]));
-    fold.take(&node(2, NodeKind::Bodies, "a", &[]));
+    fold.take_event(&node(0, NodeKind::Link, "c", &[1]));
+    fold.take_event(&node(1, NodeKind::Bodies, "b", &[2]));
+    fold.take_event(&node(2, NodeKind::Bodies, "a", &[]));
     moved(&mut fold, 2, NodeState::Ready);
     moved(&mut fold, 2, NodeState::Running);
     fold.advance_clock(3 * S);
@@ -72,11 +72,11 @@ fn a_chain_waits_on_its_running_head() {
 fn a_diamond_is_held_by_its_base_and_then_by_both_sides() {
     let mut fold = Fold::new();
     fold.advance_clock(0);
-    fold.take(&node(0, NodeKind::Link, "top", &[1, 2, 2]));
-    fold.take(&node(1, NodeKind::Bodies, "left", &[3]));
-    fold.take(&node(2, NodeKind::Bodies, "right", &[3]));
-    fold.take(&node(3, NodeKind::Names, "base", &[]));
-    fold.take(&node(4, NodeKind::Script, "lone", &[]));
+    fold.take_event(&node(0, NodeKind::Link, "top", &[1, 2, 2]));
+    fold.take_event(&node(1, NodeKind::Bodies, "left", &[3]));
+    fold.take_event(&node(2, NodeKind::Bodies, "right", &[3]));
+    fold.take_event(&node(3, NodeKind::Names, "base", &[]));
+    fold.take_event(&node(4, NodeKind::Script, "lone", &[]));
     moved(&mut fold, 3, NodeState::Ready);
     fold.advance_clock(S);
     moved(&mut fold, 3, NodeState::Running);
@@ -135,7 +135,7 @@ fn one_codegen_holds_back_the_build() {
 
     let mut fold = Fold::new();
     fold.advance_clock(0);
-    fold.take(&batch(0, &nodes));
+    fold.take_event(&batch(0, &nodes));
     for id in 0..core {
         moved(&mut fold, id, NodeState::Ready);
         moved(&mut fold, id, NodeState::Running);
@@ -151,7 +151,7 @@ fn one_codegen_holds_back_the_build() {
     fold.advance_clock(271 * S);
 
     let mut threads: Vec<Worker> = (0..16)
-        .map(|at| Worker { thread: format!("blaze-worker-{at}"), node: None, open: vec![] })
+        .map(|at| Worker { thread: format!("blaze-worker-{at}"), task: None, open: vec![] })
         .collect();
     let freeze = Span {
         name: "is_freeze".into(),
@@ -160,7 +160,7 @@ fn one_codegen_holds_back_the_build() {
         awaits: None,
         for_ms: 250_000,
     };
-    threads[3].node = Some(core);
+    threads[3].task = Some(u64::from(core));
     threads[3].open = vec![
         span("task", 270_000),
         span("codegen", 269_000),
@@ -178,7 +178,11 @@ fn one_codegen_holds_back_the_build() {
     assert_eq!((now.busy.len(), now.idle()), (1, 15));
     let busy = &now.busy[0];
     assert_eq!(busy.thread, "blaze-worker-3");
-    let task = Task { id: core, kind: NodeKind::Codegen, name: "codegen core".into() };
+    let task = Task {
+        id: u64::from(core),
+        kind: NodeKind::Codegen.name().into(),
+        name: "codegen core".into(),
+    };
     assert_eq!(busy.task.as_ref(), Some(&task));
     assert_eq!(busy.span, freeze);
     assert_eq!(busy.path, ["codegen", "copy_prop"]);
@@ -214,7 +218,7 @@ fn one_codegen_holds_back_the_build() {
     // No worker busy and nothing moving for 20 s: stalled.
     fold.advance_clock(291 * S);
     let idle: Vec<Worker> = (0..16)
-        .map(|at| Worker { thread: format!("blaze-worker-{at}"), node: None, open: vec![] })
+        .map(|at| Worker { thread: format!("blaze-worker-{at}"), task: None, open: vec![] })
         .collect();
     let now = fold.look(&look(&idle, &[], &lower));
     assert_eq!((now.busy.len(), now.quiet_ms), (0, 20_000));
@@ -245,8 +249,8 @@ fn a_download_with_nothing_running_is_fetching() {
     assert_eq!(now.quiet_ms, 200, "a byte came 200 ms ago");
     assert_eq!(now.downloads, [llvm.clone()]);
 
-    fold.take(&node(0, NodeKind::Manifest, "manifest", &[]));
-    fold.take(&node(1, NodeKind::Std, "std", &[0]));
+    fold.take_event(&node(0, NodeKind::Manifest, "manifest", &[]));
+    fold.take_event(&node(1, NodeKind::Std, "std", &[0]));
     assert_eq!(fold.look(&look(&[], downloads, &memory)).phase, Phase::Fetching);
     assert_eq!(fold.look(&look(&[], &[], &memory)).phase, Phase::Resolving);
     let planning = Look { stage: "waits for its plan", ..look(&[], &[], &memory) };
@@ -259,6 +263,69 @@ fn a_download_with_nothing_running_is_fetching() {
     assert_eq!(fold.look(&look(&[], downloads, &memory)).phase, Phase::Compiling);
     moved(&mut fold, 1, NodeState::Cached { remote: true });
     assert_eq!(fold.look(&look(&[], downloads, &memory)).phase, Phase::Finishing);
+}
+
+/// A program that is no build, said as task records: ids past `u32::MAX`, kinds of its own
+/// layers, a dep said after the task that waits on it. Its phase is running, the whole time,
+/// and its blockers, tally and slowest are a build's.
+#[test]
+fn a_program_that_is_no_build_is_running_with_wide_ids() {
+    let big = u64::from(u32::MAX) + 1;
+    let (crawl, fetch, parse, index) = (big, big + 7, 3 * big, u64::MAX);
+    let record = |id: u64, kind: &str, name: &str, deps: &[u64]| TaskRecord {
+        id,
+        kind: kind.into(),
+        name: name.into(),
+        deps: deps.to_vec(),
+    };
+    let mut fold = Fold::new();
+    fold.advance_clock(0);
+    fold.take(&record(index, "index", "index all", &[parse]));
+    fold.take(&record(parse, "parse", "parse pages", &[fetch]));
+    fold.take(&record(fetch, "fetch-page", "fetch pages", &[crawl]));
+    fold.take(&record(crawl, "crawl", "crawl site", &[]));
+    let memory = Memory::default();
+    let now = fold.look(&look(&[], &[], &memory));
+    assert_eq!(now.phase, Phase::Running, "{now:?}");
+    assert_eq!(named(&now), ["crawl site"]);
+
+    fold.moved(crawl, State::Ready);
+    fold.moved(crawl, State::Running);
+    fold.advance_clock(2 * S);
+    let threads = [Worker {
+        thread: "crawler-0".into(),
+        task: Some(crawl),
+        open: vec![span("task", 2000), span("get", 1500)],
+    }];
+    let now = fold.look(&look(&threads, &[], &memory));
+    assert_eq!(now.phase, Phase::Running, "not compiling: no task is a build's");
+    let crawling = Task { id: crawl, kind: "crawl".into(), name: "crawl site".into() };
+    assert_eq!(now.busy[0].task.as_ref(), Some(&crawling));
+    let blocker = &now.blockers[0];
+    assert_eq!(blocker.task, crawling);
+    assert_eq!((blocker.running, blocker.holds, blocker.chain, blocker.for_ms), (true, 3, 3, 2000));
+    assert_eq!(blocker.behind, ["fetch pages"]);
+    assert_eq!(blocker.span.as_ref().map(|it| it.name.as_str()), Some("get"));
+
+    fold.moved(crawl, State::Done);
+    fold.moved(fetch, State::Ready);
+    fold.moved(fetch, State::Running);
+    fold.advance_clock(3 * S);
+    fold.moved(fetch, State::Failed);
+    fold.moved(parse, State::Cancelled);
+    fold.moved(index, State::Cancelled);
+    fold.moved(big + 1, State::Done);
+    let now = fold.look(&look(&[], &[], &memory));
+    assert_eq!(now.phase, Phase::Running);
+    assert!(now.blockers.is_empty(), "{now:?}");
+    assert_eq!(now.tally, Tally { waiting: 0, ready: 0, running: 0, done: 1, failed: 3, total: 4 });
+    let slowest: Vec<(u64, u64)> = now.slowest.iter().map(|it| (it.task.id, it.ms)).collect();
+    assert_eq!(slowest, [(crawl, 2000), (fetch, 1000)]);
+
+    // One task of a build's kind and it is a build again.
+    fold.take(&record(big + 1, NodeKind::Link.name(), "link", &[]));
+    fold.moved(big + 1, State::Running);
+    assert_eq!(fold.look(&look(&[], &[], &memory)).phase, Phase::Linking);
 }
 
 /// Each pressure line, on a limit of 1000: three quarters is 750, the release line 875.
@@ -290,7 +357,7 @@ fn memory_pressure_at_each_line() {
 /// reads back equal; the same entries as JSON has.
 #[test]
 fn a_now_is_written_in_its_keys_order_and_round_trips() {
-    let task = Task { id: 10, kind: NodeKind::Codegen, name: "codegen core".into() };
+    let task = Task { id: 10, kind: "codegen".into(), name: "codegen core".into() };
     let span = Span {
         name: "is_freeze".into(),
         item: Some("core::ptr::is_freeze".into()),
@@ -391,7 +458,7 @@ fn every_task_off_the_frontier_is_held_by_a_blocker(tc: hegel::TestCase) {
         .enumerate()
         .map(|(id, it)| (NodeKind::Bodies, format!("t{id}"), it.clone()))
         .collect();
-    fold.take(&batch(0, &nodes));
+    fold.take_event(&batch(0, &nodes));
     for (id, state) in states.iter().enumerate() {
         fold.advance_clock((id as u64 + 1) * S);
         if *state != NodeState::Waiting {

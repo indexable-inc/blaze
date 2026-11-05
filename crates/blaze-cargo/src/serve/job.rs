@@ -5359,6 +5359,8 @@ impl<S: Steps> Jobs<S> {
         // Its node settled before its request finishes, which clears the job's `storing`: the
         // set says, not the job.
         if self.store_requests.remove(&request) {
+            // No job looks at a store's request: its live model goes as it finishes.
+            w.plane.forget(request);
             return;
         }
         blaze_profile::built(blaze_profile::Built {
@@ -5698,6 +5700,10 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        // The job's last request, finished, is no build's live view any more: this one is.
+        if let Some(last) = job.request {
+            w.plane.forget(last);
+        }
         let request = w.plane.open(w.now, false, job.idle);
         job.request = Some(request);
         job.opening();
@@ -5847,6 +5853,10 @@ impl<S: Steps> Jobs<S> {
             self.native_let_go(id, true);
             self.kill_runs(w, id);
             let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
+            // Its live model ends with it.
+            if let Some(request) = job.request {
+                w.plane.forget(request);
+            }
             // Its store's task may still run: what it gives back is dropped with the job.
             if let Some(storing) = job.storing.take() {
                 self.roots.storing[storing.root as usize] -= 1;
@@ -6144,6 +6154,10 @@ impl<S: Steps> Jobs<S> {
         self.recheck = (recheck && w.store.broken().is_none()).then(|| w.now + RECHECK);
         for (id, ok, error) in over.drain(..) {
             let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
+            // Its live model ends with it.
+            if let Some(request) = job.request {
+                w.plane.forget(request);
+            }
             let placed = job.placed;
             tracing::info_span!(
                 target: "blaze",

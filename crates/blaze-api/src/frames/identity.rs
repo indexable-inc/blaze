@@ -616,6 +616,7 @@ impl Gen {
                 memory_bytes: self.wide(),
                 builds: self.many(depth, |g| crate::Building {
                     id: g.u32(),
+                    now: blaze_protocol::now::Now::default(),
                     what: g.text(),
                     phase: g.text(),
                     spans: g.texts(depth + 1),
@@ -786,6 +787,7 @@ impl Gen {
             42 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
             43 => Response::Doing(crate::Doing {
                 on: self.maybe_text(),
+                now: blaze_protocol::now::Now::default(),
                 busy: self.u32(),
                 idle: self.u32(),
                 units: self

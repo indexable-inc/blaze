@@ -118,8 +118,8 @@ pub struct Board {
 struct Mark {
     at_ms: u64,
     phase: Phase,
-    /// The first blocker's task, by its plane node.
-    blocker: Option<u32>,
+    /// The first blocker's task, by its id.
+    blocker: Option<u64>,
     pressure: Pressure,
     stalled: bool,
     slow: bool,
@@ -533,7 +533,7 @@ impl Board {
         left.push(Span::styled(thread, self.style(Color::Cyan)));
         if let Some(task) = &busy.task {
             left.push(Span::raw("  "));
-            left.push(Span::styled(task.kind.name(), self.dim()));
+            left.push(Span::styled(task.kind.clone(), self.dim())); // clone: a row's text
         }
         let item = span.item.as_deref().or(busy.task.as_ref().map(|it| it.name.as_str()));
         if let Some(item) = item {
@@ -687,7 +687,7 @@ impl Board {
         let mut line = vec![Span::raw("   ")]; // alloc: a row
         let mut used = 3;
         for (at, took) in self.now.slowest.iter().take(limit).enumerate() {
-            let (kind, name) = (took.task.kind.name(), &took.task.name);
+            let (kind, name) = (&took.task.kind, &took.task.name);
             let name = format!("{kind} {name} {}", time(took.ms)); // alloc: a row's text
             let sep = if at == 0 { "" } else { " · " };
             let need = text_width(sep) + text_width(&name);
@@ -798,7 +798,7 @@ fn time(ms: u64) -> String {
 
 /// A blocker's task: `codegen core`.
 fn label(blocker: &Blocker) -> String {
-    format!("{} {}", blocker.task.kind.name(), blocker.task.name) // alloc: a row's text
+    format!("{} {}", blocker.task.kind, blocker.task.name) // alloc: a row's text
 }
 
 /// Whether a blocker runs or waits for a worker, and since when: `running 4m30s`, `ready 12.0s`.
