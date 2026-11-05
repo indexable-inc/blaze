@@ -40,13 +40,42 @@ impl Response {
     }
 }
 
+/// What a streamed download hands its watcher, every [`TICK`] and once at its end.
+// dyn: the caller's printer, once a tick
+pub type Watch<'w> = &'w mut (dyn FnMut(&blaze_fetch::progress::Line) + Send);
+
+/// A download that got no byte for [`blaze_fetch::progress::STALL`]: stopped, not tried again
+/// (what it got is the caller's to resume from).
+#[derive(Debug)]
+pub struct Stalled {
+    pub url: String,
+    pub idle: Duration,
+    pub line: blaze_fetch::progress::Line,
+}
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no data from {} for {}, with {} come: the download is stopped as stalled \
+             (a download may go {} without a byte)",
+            self.url,
+            blaze_fetch::progress::Secs(self.idle),
+            blaze_fetch::progress::Bytes(self.line.done),
+            blaze_fetch::progress::Secs(blaze_fetch::progress::STALL),
+        )
+    }
+}
+
+impl std::error::Error for Stalled {}
+
 /// Work started at once and finished on whichever thread does it, awaited from any executor.
 // dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
 pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// Where a streamed body goes, a piece at a time ([`Http::stream`]); an error stops the
-/// transfer.
-pub type Sink<'s> = &'s mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send);
+/// Where a streamed body goes, a piece at a time with its offset in the whole body
+/// ([`Http::stream`]); an error stops the transfer.
+pub type Sink<'s> = &'s mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send);
 
 /// What asks servers for files. An error is one where no answer came, which is worth trying
 /// again, as cargo tries a connection or a transfer that failed again.
@@ -59,20 +88,27 @@ pub trait Http: Send + Sync {
         Box::pin(std::future::ready(self.get(url, headers)))
     }
 
-    /// [`Http::get`] whose 200 body goes to `sink` as it comes instead of into the answer, whose
-    /// `body` is then empty; any other answer is given for its error, with at most the first
-    /// 64 KiB of its body (HyperHttp's bound: no error page fills memory). By default (a test's
-    /// fake) the body is collected first and handed over after.
+    /// [`Http::get`] of the body from byte `from`, which goes to `sink` as it comes, each piece
+    /// with its offset in the whole body, instead of into the answer, whose `body` is then
+    /// empty: a 206 from `from`, or a 200 of the whole body from 0 (a server that ignores
+    /// ranges). Any other answer is given for its error, with at most the first 64 KiB of its
+    /// body (HyperHttp's bound: no error page fills memory). HyperHttp asks a large body as
+    /// many ranges at once and shows it among blaze-fetch's downloads. By default (a test's
+    /// fake) the whole body is got and handed over from 0.
     fn stream(
         &self,
         url: &str,
         headers: &[(&str, &str)],
+        _from: u64,
         sink: Sink<'_>,
     ) -> anyhow::Result<Response> {
         let mut answer = self.get(url, headers)?;
         if answer.status == 200 {
+            let mut at = 0u64;
             for piece in answer.body.chunks(64 * 1024) {
-                sink(piece).map_err(|e| {
+                let offset = at;
+                at += piece.len() as u64;
+                sink(offset, piece).map_err(|e| {
                     anyhow::anyhow!("keeping the body of {}: {e}", blaze_fetch::redact(url))
                 })?;
             }

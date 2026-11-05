@@ -141,6 +141,17 @@ pub enum Event {
     /// Lines to print above the region as they are: the compiler's diagnostics and cargo's
     /// status lines, with their ANSI colors.
     Said(String),
+    /// What the build is doing, about once a second (the daemon's `Response::Doing`): what it
+    /// waits on while no unit compiles; the worker pool's busy and idle workers and what the
+    /// longest busy one runs; and what each unit under way is inside, by unit id. Each replaces
+    /// the last.
+    Doing {
+        on: Option<String>,
+        busy: u32,
+        idle: u32,
+        running: Option<String>,
+        units: Vec<(u32, String)>,
+    },
 }
 
 /// The most lines of a failure's captured output a box shows: its last ones.
@@ -154,6 +165,16 @@ const FAILURES: usize = 20;
 
 /// A test is slow, and its row is marked, past this.
 const SLOW: Duration = Duration::from_secs(5);
+
+/// A unit open this long has what it is inside said after it.
+const DOING_AFTER: Duration = Duration::from_secs(3);
+
+/// A build running this long has the hint to `blaze explore` and `blaze debug live` under it.
+const HINT_AFTER: Duration = Duration::from_secs(10);
+const HINT: &str = " what each step does: `blaze explore`; live spans: `blaze debug live`";
+
+/// How many of the steps a busy worker holds up are named; the rest are counted.
+const BLOCKED_NAMED: usize = 2;
 
 /// One frame of the spinner every this.
 const SPIN: Duration = Duration::from_millis(80);
@@ -207,6 +228,15 @@ struct Failure {
     location: Option<String>,
 }
 
+/// The build's last [`Event::Doing`].
+struct Doing {
+    on: Option<String>,
+    busy: u32,
+    idle: u32,
+    running: Option<String>,
+    units: Vec<(u32, String)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Build {
     Running,
@@ -234,6 +264,8 @@ pub struct TestView {
     stopping: Option<String>,
     /// The test units that never built, as (unit, behind, why), in the order said.
     unbuilt: Vec<(String, String, String)>,
+    /// What the build is doing, as it last said; `None` before it said and once it ended.
+    doing: Option<Doing>,
     /// Lines made to print above the region and not yet taken, each a block of styled lines
     /// to wrap to the width it is taken at.
     above: Vec<Above>,
@@ -270,6 +302,7 @@ impl TestView {
             failures: Vec::new(),                     // alloc: one a failure
             stopping: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
+            doing: None,
             above: Vec::new(),   // alloc: drained at every draw
         }
     }
@@ -311,6 +344,12 @@ impl TestView {
             Event::BuildEnded { ok } => {
                 self.build = Build::Ended { ok: ok && self.units_failed == 0, at: now };
                 self.compiling.clear();
+                self.doing = None;
+            }
+            Event::Doing { on, busy, idle, running, units } => {
+                if self.build == Build::Running {
+                    self.doing = Some(Doing { on, busy, idle, running, units });
+                }
             }
             Event::Unbuilt { unit, behind, why } => self.unbuilt.push((unit, behind, why)),
             Event::BinaryQueued { binary, label, order, rerun } => {
@@ -482,10 +521,14 @@ impl TestView {
         rows.push(self.header(width));
         rows.push(self.gauge(width));
         rows.push(self.build_row(width));
+        if let Some(row) = self.held_row() {
+            rows.push(row);
+        }
         if !self.binaries.is_empty() || self.build != Build::Running {
             rows.push(self.binaries_row(width));
         }
-        let room = (area.height as usize).saturating_sub(rows.len());
+        let hint = self.build == Build::Running && self.now >= HINT_AFTER;
+        let room = (area.height as usize).saturating_sub(rows.len() + usize::from(hint));
         let mut running: Vec<&Running> = self.running.iter().collect(); // alloc: one a draw
         // The oldest first: the slowest under way leads, ties by name so a draw is stable.
         running.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.name.cmp(&b.name)));
@@ -503,6 +546,9 @@ impl TestView {
                 self.dim(),
             )])); // alloc: a row
         }
+        if hint {
+            rows.push(Line::from(vec![Span::styled(HINT, self.dim())]));
+        }
         for (y, row) in (area.y..area.bottom()).zip(&rows) {
             buf.set_line(area.x, y, row, area.width);
         }
@@ -510,9 +556,19 @@ impl TestView {
 
     fn header(&self, width: usize) -> Line<'static> {
         let accent = self.style(Color::Cyan).add_modifier(Modifier::BOLD);
+        // "compiling" only while a unit compiles: before one has begun, or with none under way,
+        // the build is waiting (on a download, a lowering, its plan), or just started.
+        let compiling = !self.compiling.is_empty();
+        let waiting = match self.doing.as_ref().is_some_and(|it| it.on.is_some()) {
+            true => "waiting",
+            false => "starting",
+        };
         let phase = match (self.build, self.binaries.iter().any(|it| it.state == State::Running)) {
-            (Build::Running, true) => "compiling and testing",
-            (Build::Running, false) => "compiling",
+            (Build::Running, true) if compiling => "compiling and testing",
+            (Build::Running, true) => "testing",
+            (Build::Running, false) if compiling => "compiling",
+            (Build::Running, false) if self.units_began > 0 => "building",
+            (Build::Running, false) => waiting,
             (Build::Ended { ok: false, .. }, _) if self.running.is_empty() => "build failed",
             (Build::Ended { .. }, true) => "testing",
             (Build::Ended { .. }, false) => "finishing",
@@ -611,13 +667,32 @@ impl TestView {
                     format!(" {}/{}  ", self.units_ended, self.units_began),
                     self.dim(),
                 )); // alloc: a row
+                // No unit under way: what the build waits on instead (a download's progress, the
+                // span it is in), clipped to the row.
+                if self.compiling.is_empty() {
+                    match self.doing.as_ref().and_then(|it| it.on.as_deref()) {
+                        Some(on) => line.push(Span::styled(on.to_owned(), self.dim())), // alloc: a row's text
+                        None if self.units_began == 0 => line.push(Span::styled("starting", self.dim())),
+                        None => {}
+                    }
+                    return Line::from(line);
+                }
+                let doing = |id: u32| {
+                    let units = self.doing.as_ref().map_or(&[][..], |it| &it.units[..]);
+                    units.iter().find(|(of, _)| *of == id).map(|(_, it)| it.as_str())
+                };
                 let mut units: Vec<&Unit> = self.compiling.iter().collect(); // alloc: one a draw
                 units.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.label.cmp(&b.label)));
                 let mut used: usize = line.iter().map(Span::width).sum();
                 for (at, unit) in units.iter().enumerate() {
-                    let took = duration(self.now.saturating_sub(unit.since));
+                    let open = self.now.saturating_sub(unit.since);
+                    let took = duration(open);
                     let sep = if at == 0 { "" } else { " · " };
-                    let need = sep.len() + text_width(&unit.label) + 1 + took.len();
+                    // A unit open a while says what it is inside: `libc build script: waiting
+                    // on the download of llvm.tar.xz (1.2 of 2.0 GB) 14.0s`.
+                    let inside = doing(unit.id).filter(|it| open >= DOING_AFTER && !it.is_empty());
+                    let said = inside.map_or(0, |it| 2 + text_width(it));
+                    let need = sep.len() + text_width(&unit.label) + said + 1 + took.len();
                     if used + need > width {
                         let left = units.len() - at;
                         if used + 8 <= width {
@@ -628,11 +703,57 @@ impl TestView {
                     used += need;
                     line.push(Span::styled(sep, self.dim()));
                     line.push(Span::raw(unit.label.clone())); // clone: a row's text
+                    if let Some(inside) = inside {
+                        line.push(Span::styled(format!(": {inside}"), self.dim())); // alloc: a row
+                    }
                     line.push(Span::styled(format!(" {took}"), self.dim())); // alloc: a row
                 }
             }
         }
         Line::from(line)
+    }
+
+    /// While most workers are idle and steps under way wait behind what the busy ones run, the
+    /// row that says so: `held   1 worker busy, 15 idle: waiting on codegen `std::fmt::write`
+    /// in std (4 min 30 s) · blocks std build script, libc build script, +79`. A step blocks
+    /// when it is under way with no thread working on it (the daemon names what each one that
+    /// has a thread is inside). Clipped to the row by the draw.
+    fn held_row(&self) -> Option<Line<'static>> {
+        let doing = self.doing.as_ref()?;
+        let running = doing.running.as_deref()?;
+        if self.build != Build::Running || doing.busy == 0 || doing.idle <= doing.busy {
+            return None;
+        }
+        let mut blocked: Vec<&Unit> = self
+            .compiling
+            .iter()
+            .filter(|unit| !doing.units.iter().any(|(id, _)| *id == unit.id))
+            .collect(); // alloc: one a draw
+        if blocked.is_empty() {
+            return None;
+        }
+        blocked.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.label.cmp(&b.label)));
+        let workers = match doing.busy {
+            1 => "worker",
+            _ => "workers",
+        };
+        let mut said = format!(
+            "{} {workers} busy, {} idle: waiting on {running} · blocks ",
+            doing.busy, doing.idle
+        ); // alloc: a row
+        for (at, unit) in blocked.iter().take(BLOCKED_NAMED).enumerate() {
+            if at > 0 {
+                said.push_str(", ");
+            }
+            said.push_str(&unit.label);
+        }
+        if blocked.len() > BLOCKED_NAMED {
+            said.push_str(&format!(", +{}", blocked.len() - BLOCKED_NAMED)); // alloc: a row
+        }
+        Some(Line::from(vec![
+            Span::styled(" held   ", self.dim()),
+            Span::styled(said, self.style(Color::Yellow)),
+        ]))
     }
 
     /// A bar of `cells` cells filled `done` of `of`, by eighths.

@@ -21,6 +21,10 @@ blaze-ids.workspace = true
 blaze-sha256.workspace = true
 crossbeam-channel.workspace = true
 papaya.workspace = true
+# The lock on one download's meter (`downloads`), held for a field update.
+parking_lot.workspace = true
+# A partial download's lock (`fetcher::Part`), let go of as it drops.
+stdx.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # The one checked unpacker of a tar stream (`unpack`), and the times cargo's rules give its files.
@@ -34,6 +38,8 @@ unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The resume property test (`tests::a_cut_download_resumes_and_keeps_only_the_pinned_bytes`).
+hegeltest.workspace = true
 
 [lints]
 workspace = true

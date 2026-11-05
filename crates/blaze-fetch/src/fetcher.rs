@@ -41,15 +41,18 @@ pub const DEFAULT_MOST_BYTES: u64 = 4 << 30;
 
 /// What asks servers for bytes.
 pub trait Net: Send + Sync {
-    /// `url`'s body, a piece at a time into `sink`, after its redirects; `Ok` once all of a 200
-    /// answer went in. Any other answer, or no answer, is a [`Failure`]: transient when another
-    /// try may get the bytes. An error of `sink` stops the transfer and is a permanent failure.
+    /// `url`'s body from byte `from`, a piece at a time into `sink` with each piece's offset in
+    /// the whole body, after its redirects; `Ok` once all of it went in. A server that ignores
+    /// the range sends the whole body, whose pieces start at offset 0. Any other answer, or no
+    /// answer, is a [`Failure`]: transient when another try may get the bytes. An error of
+    /// `sink` stops the transfer and is a permanent failure.
     fn get(
         &self,
         url: &str,
         headers: &[(&str, &str)],
+        from: u64,
         // dyn: the driver's file and counter, once a try
-        sink: &mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send),
+        sink: &mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send),
     ) -> Result<(), Failure>;
 }
 
@@ -256,9 +259,11 @@ impl Fetcher {
         pin: &Digest,
         headers: &[(&str, &str)],
     ) -> Result<Object, FetchError> {
-        let part = Part::new(&self.scratch)?;
-        self.download_to(&part, url, pin, headers)?;
+        let mut part = Part::new(&self.scratch, pin)?;
+        self.download_to(&mut part, url, pin, headers)?;
         let from = Producer::Url(redact(url));
+        // Checked, whether it matched or not, it is not resumed again.
+        part.checked();
         check_and_file(objects, pin, Produced { made: Made::File(&part.path), from })
     }
 
@@ -271,8 +276,9 @@ impl Fetcher {
         pin: &Digest,
         headers: &[(&str, &str)],
     ) -> Result<Verified, FetchError> {
-        let part = Part::new(&self.scratch)?;
-        self.download_to(&part, url, pin, headers)?;
+        let mut part = Part::new(&self.scratch, pin)?;
+        self.download_to(&mut part, url, pin, headers)?;
+        part.checked();
         // alloc: the download, whole, as the caller is given it; once a download
         let bytes = std::fs::read(&part.path).map_err(|error| FetchError::Io {
             what: format!("reading back {}", part.path.display()), // alloc: error path
@@ -282,11 +288,14 @@ impl Fetcher {
         Ok(Verified { bytes, hashed })
     }
 
-    /// `url`'s body into `part`, tried as the policy says, each try from nothing; a body past
-    /// the byte limit stops its transfer and is [`FetchError::TooBig`], not tried again.
+    /// `url`'s body into `part`, tried as the policy says, each try resuming from what `part`
+    /// has (an earlier try's, or an earlier attempt's, even of another process: it is named by
+    /// the pin); a body past the byte limit stops its transfer and is [`FetchError::TooBig`],
+    /// not tried again. What is resumed is checked with the rest, against the pin, by the
+    /// caller.
     fn download_to(
         &self,
-        part: &Part,
+        part: &mut Part,
         url: &str,
         pin: &Digest,
         headers: &[(&str, &str)],
@@ -298,26 +307,37 @@ impl Fetcher {
             attempts.advance_clock(start.elapsed());
             match attempts.next_decision() {
                 Decision::Ask { attempt } => {
-                    let _span = tracing::info_span!(target: "blaze", "blaze-fetch download", url = %from, attempt).entered();
-                    let mut file = part.create()?;
-                    let mut got = 0u64;
+                    let mut written = part.resume()?;
+                    let _span = tracing::info_span!(target: "blaze", "blaze-fetch download", url = %from, attempt, resumed_from = written).entered();
                     let mut too_big = false;
                     let most = self.most;
-                    let asked = self.net.get(url, headers, &mut |bytes: &[u8]| {
-                        got += bytes.len() as u64;
-                        if got > most {
+                    let asked = self.net.get(url, headers, written, &mut |offset: u64, bytes: &[u8]| {
+                        if offset != written {
+                            // The server sent the whole body, not the range from `written`:
+                            // what was there is dropped and the body kept from its start.
+                            if offset != 0 {
+                                return Err(std::io::Error::other(format!(
+                                    "a piece at byte {offset} came after byte {written}"
+                                ))); // alloc: error path
+                            }
+                            part.restart()?;
+                            written = 0;
+                        }
+                        written += bytes.len() as u64;
+                        if written > most {
                             too_big = true;
                             return Err(std::io::Error::other(format!(
                                 "the body is past the limit of {most} bytes"
                             ))); // alloc: error path
                         }
-                        file.write_all(bytes)
+                        part.file.write_all(bytes)
                     });
                     if too_big {
+                        part.checked();
                         return Err(FetchError::TooBig { from, most });
                     }
                     let asked = asked.and_then(|()| {
-                        file.flush().map_err(|e| {
+                        part.file.flush().map_err(|e| {
                             Failure::Permanent(format!("writing {}: {e}", part.path.display()))
                         }) // alloc: error path
                     });
@@ -500,39 +520,85 @@ fn next() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A download's temporary file, removed when it drops.
+/// A download's partial file, named by its pin (`.part-pin-<algo>-<hex>`) so that any later
+/// try, attempt or process resumes it: kept when the download fails, removed once it was
+/// checked against the pin ([`Part::checked`]), matched or not, so a partial that was wrong is
+/// downloaded again from nothing. It is held locked from [`Part::new`] until it drops. A
+/// second download of the same pin at once (another process: one process downloads a pin
+/// once, [`crate::flight`]) gets a name of its own, as every download had before, removed
+/// whatever happens.
 struct Part {
     path: PathBuf,
+    file: stdx::file_lock::Locked,
+    /// Whether the name is this download's alone, never resumed.
+    own: bool,
+    checked: std::cell::Cell<bool>,
 }
 
 impl Part {
-    fn new(scratch: &Path) -> Result<Part, FetchError> {
+    fn new(scratch: &Path, pin: &Digest) -> Result<Part, FetchError> {
         std::fs::create_dir_all(scratch).map_err(|error| FetchError::Io {
             what: format!("creating {}", scratch.display()),
             error,
         })?; // alloc: error path
-        let path = scratch.join(format!("{PART}{}-{}", std::process::id(), next())); // alloc: once a download
-        Ok(Part { path })
+        let path = scratch.join(format!("{PART}pin-{}-{}", pin.algo().name(), pin.hex())); // alloc: once a download
+        let io = |path: &Path, error| FetchError::Io { what: format!("opening {}", path.display()), error }; // alloc: error path
+        // A symlink or directory at the name is refused, never written through (the scratch
+        // directory is blaze's own; this is the check `create_new` made before).
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => {
+                return Err(io(&path, std::io::Error::other("it is not a plain file")));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io(&path, error)),
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| io(&path, e))?;
+        match stdx::file_lock::Locked::try_lock(file).map_err(|e| io(&path, e))? {
+            Ok(file) => Ok(Part { path, file, own: false, checked: std::cell::Cell::new(false) }),
+            Err(_held) => {
+                let own = scratch.join(format!("{PART}{}-{}", std::process::id(), next())); // alloc: once such a download
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&own)
+                    .map_err(|e| io(&own, e))?;
+                let file = stdx::file_lock::Locked::lock(file).map_err(|e| io(&own, e))?;
+                Ok(Part { path: own, file, own: true, checked: std::cell::Cell::new(false) })
+            }
+        }
     }
 
-    /// The file, empty: each try starts from nothing. The last try's is removed and the file
-    /// made anew with `create_new` (`O_EXCL`), so a file or symlink someone else put at the
-    /// name is refused, never written through.
-    fn create(&self) -> Result<std::fs::File, FetchError> {
-        let io =
-            |error| FetchError::Io { what: format!("creating {}", self.path.display()), error }; // alloc: error path
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io(error)),
-        }
-        std::fs::OpenOptions::new().write(true).create_new(true).open(&self.path).map_err(io)
+    /// Where a try resumes: the file's length, its end sought.
+    fn resume(&mut self) -> Result<u64, FetchError> {
+        let io = |error| FetchError::Io { what: format!("reading {}", self.path.display()), error }; // alloc: error path
+        std::io::Seek::seek(&mut *self.file, std::io::SeekFrom::End(0)).map_err(io)
+    }
+
+    /// Empty again, written from its start: the server sent the whole body.
+    fn restart(&mut self) -> std::io::Result<()> {
+        self.file.set_len(0)?;
+        std::io::Seek::seek(&mut *self.file, std::io::SeekFrom::Start(0)).map(drop)
+    }
+
+    /// It was checked against its pin: it goes when this drops.
+    fn checked(&self) {
+        self.checked.set(true);
     }
 }
 
 impl Drop for Part {
     fn drop(&mut self) {
-        _ = std::fs::remove_file(&self.path);
+        if self.own || self.checked.get() {
+            _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

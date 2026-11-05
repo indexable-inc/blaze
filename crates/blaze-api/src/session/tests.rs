@@ -91,6 +91,8 @@ impl World {
             hot: hotted,
             history: None,
             bugs: Vec::new,
+            builds: &[],
+            downloads: Vec::new,
         };
         f(&mut self.session, &mut cx, &mut out);
         out
@@ -514,6 +516,8 @@ fn status_lists_every_connections_requests_sorted() {
         build: BUILD.clone(),
         bugs: Vec::new(),
         settings: Vec::new(),
+        builds: Vec::new(),
+        downloads: Vec::new(),
     };
     assert_eq!(
         world.request(3, 1, Request::Status),
@@ -547,6 +551,8 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             hot: hotted,
             history: None,
             bugs: Vec::new,
+            builds: &[],
+            downloads: Vec::new,
         };
         let from = to(2, id);
         let arrived = Arrived::Request { from, request: Request::Status };
@@ -566,6 +572,8 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             build: BUILD.clone(),
             bugs: Vec::new(),
             settings: Vec::new(),
+            builds: Vec::new(),
+            downloads: Vec::new(),
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
@@ -1006,6 +1014,8 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             hot: hotted,
             history: None,
             bugs: Vec::new,
+            builds: &[],
+            downloads: Vec::new,
         };
         let arrived = Arrived::Request { from: to(1, id), request: Request::Snapshot };
         blaze_alloc_count::assert_at_most(0, "a warm start of a job", || {
@@ -1027,6 +1037,8 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             hot: hotted,
             history: None,
             bugs: Vec::new,
+            builds: &[],
+            downloads: Vec::new,
         };
         blaze_alloc_count::assert_at_most(0, "a warm finish of a job", || {
             session.finish(&mut cx, job, true, None, &mut out)

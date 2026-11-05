@@ -267,6 +267,18 @@ pub fn drive<A: Api>(
                 let _ = to_runner.send(Run::Ready(artifact));
                 Ok(())
             }
+            // What the build waits on and what its units are inside: the view draws it, so
+            // nothing is printed above it.
+            ResponseRef::Doing(doing) => {
+                view(Event::Doing {
+                    on: doing.on,
+                    busy: doing.busy,
+                    idle: doing.idle,
+                    running: doing.running,
+                    units: doing.units.into_iter().map(|it| (it.id, it.doing)).collect(), // alloc: once a second
+                });
+                Ok(())
+            }
             response => printer.on(response),
         };
         let written = printed.and_then(|()| match more {

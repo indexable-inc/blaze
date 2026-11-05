@@ -38,6 +38,10 @@ filetime.workspace = true
 # Where `.crate` files are kept: blaze-fetch's objects in the store, found by their sha256.
 blaze-cas.workspace = true
 blaze-fetch.workspace = true
+# `git fetch`'s stderr, handed from the thread that reads it to the one that waits on it.
+crossbeam-channel.workspace = true
+# The span a `git fetch`'s wait opens.
+tracing.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true

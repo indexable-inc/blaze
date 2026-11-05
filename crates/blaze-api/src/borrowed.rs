@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Ranked,
+    Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Ranked,
     Reach, Rebuilt, Report, Response, Span, Status, Table, TargetKind, TestOutcome, TestResult,
     Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb, Worked,
 };
@@ -131,6 +131,8 @@ pub enum ResponseRef<'a> {
         unit: Option<UnitOfRef<'a>>,
         report: Report,
     },
+    /// Once a second at most, a request: read owned.
+    Doing(Doing),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -378,6 +380,7 @@ impl ResponseRef<'_> {
             ResponseRef::Report { unit, report } => {
                 Response::Report { unit: unit.map(UnitOfRef::into_owned), report }
             }
+            ResponseRef::Doing(it) => Response::Doing(it),
         }
     }
 }

@@ -7,12 +7,14 @@
 //! its place.
 
 use std::{
+    io::{IsTerminal as _, Write as _},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context as _, bail};
-use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp, Retry};
+use blaze_fetch::progress::{Bytes, LOG_EVERY, Line, STALL, Secs};
+use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp, Response, Retry};
 
 use crate::pin;
 
@@ -25,8 +27,18 @@ const RELEASES: &str = "https://github.com/indexable-inc/blaze/releases/download
 /// from the same place as the archive, so anyone on the path could change both.
 const RELEASES_FROM: &str = "BLAZE_RELEASES";
 
-/// How long one answer may take.
-const PATIENCE: Duration = Duration::from_secs(120);
+/// How long a download may go without a byte before it is stopped as stalled, everywhere
+/// blaze downloads.
+const PATIENCE: Duration = STALL;
+
+/// The archive formats a release's build for a host may come in, the one fetched first: the
+/// `.tar.xz` (a third the size, from 0.20261105.2 on) where the release's sums name it, else the
+/// `.tar.gz` every release publishes.
+const ARCHIVES: [&str; 2] = ["tar.xz", "tar.gz"];
+
+/// How long a download runs before its progress is said: a release's small assets (its sums, a
+/// channel's pointer) come and go unsaid.
+const SAID_AFTER: Duration = Duration::from_secs(1);
 
 /// The most an asset of a release may be, as sent and once decoded: reading stops there.
 const MOST: u64 = 1 << 30;
@@ -93,17 +105,28 @@ fn fetched(
     exe: &Path,
     read: impl Fn(&str) -> anyhow::Result<Option<Vec<u8>>>,
 ) -> anyhow::Result<()> {
-    let archive = format!("blaze-v{version}-{host}.tar.gz");
-    let mut published = Vec::new(); // alloc: at most two lists, once per fetched release
+    let top = format!("blaze-v{version}-{host}");
+    let mut texts = Vec::new(); // alloc: at most two lists, once per fetched release
     for (list, hash, of) in SUMS {
         let Some(text) = read(list)? else { continue };
-        let text = String::from_utf8_lossy(&text);
-        let wanted = text.lines().find_map(|line| {
+        texts.push((list, hash, of, String::from_utf8_lossy(&text).into_owned()));
+    }
+    let digest_in = |text: &str, archive: &str| {
+        text.lines().find_map(|line| {
             let (digest, name) = line.split_once(char::is_whitespace)?;
             (name.trim_start().trim_start_matches('*') == archive).then(|| digest.to_owned())
-        });
-        published.push((list, hash, of, wanted));
-    }
+        })
+    };
+    // The smallest format any list names; every list is then held to naming it.
+    let archive = ARCHIVES
+        .iter()
+        .map(|kind| format!("{top}.{kind}"))
+        .find(|archive| texts.iter().any(|(.., text)| digest_in(text, archive).is_some()))
+        .unwrap_or_else(|| format!("{top}.{}", ARCHIVES[ARCHIVES.len() - 1]));
+    let published: Vec<_> = texts
+        .iter()
+        .map(|(list, hash, of, text)| (*list, *hash, *of, digest_in(text, &archive)))
+        .collect(); // alloc: as above
     let lists = || published.iter().map(|(list, ..)| *list).collect::<Vec<_>>().join(" and "); // alloc: an error's text
     if published.is_empty() {
         let names = SUMS.map(|(list, ..)| list).join(" or ");
@@ -137,7 +160,7 @@ fn fetched(
         }
     }
     let dir = exe.parent().context("a release in no directory")?;
-    unpacked(&bytes, dir, &format!("blaze-v{version}-{host}"))
+    unpacked(&bytes, dir, &top, &archive)
         .with_context(|| format!("unpacking {archive} into {}", dir.display()))?;
     if !exe.is_file() {
         bail!("{archive} of blaze {version} has no `blaze`");
@@ -320,11 +343,95 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;
     let http = HyperHttp::new(PATIENCE)?;
     let bounds = Bounds { most: MOST, https_only: true };
-    let answer = Retry::default().run(|| http.get_bounded(address.as_str(), &[], bounds))?;
+    let mut body = Vec::new(); // alloc: the asset, handed to the caller
+    let mut shown = Shown::new(name);
+    let answer: Response = Retry::default().run(|| {
+        body.clear();
+        let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
+            if offset != body.len() as u64 {
+                if offset != 0 {
+                    return Err(std::io::Error::other(format!(
+                        "a piece at byte {offset} came after {} bytes",
+                        body.len()
+                    )));
+                }
+                // The server sent the whole body over again.
+                body.clear();
+            }
+            body.extend_from_slice(bytes);
+            Ok(())
+        };
+        http.stream_watched(address.as_str(), &[], 0, bounds, &mut sink, name, &mut |line| {
+            shown.watch(line);
+        })
+    });
+    shown.end(answer.is_ok());
+    let answer = answer?;
     match answer.status {
         404 => Ok(None),
-        200..300 => Ok(Some(answer.body)),
+        200 | 206 => Ok(Some(body)),
         _ => Err(HttpNotSuccessful::new(address.as_str(), &answer).into()),
+    }
+}
+
+/// A download's progress on stderr, once it has run [`SAID_AFTER`]: on a terminal one line
+/// redrawn in place as it comes, off one (a CI log, a pipe) a line every [`LOG_EVERY`], and at
+/// its end what came, how fast.
+struct Shown<'n> {
+    name: &'n str,
+    terminal: bool,
+    /// When the last line was said, by the download's clock; `None` before the first.
+    said: Option<Duration>,
+    last: Option<Line>,
+}
+
+impl<'n> Shown<'n> {
+    fn new(name: &'n str) -> Shown<'n> {
+        Shown { name, terminal: std::io::stderr().is_terminal(), said: None, last: None }
+    }
+
+    fn watch(&mut self, line: &Line) {
+        self.last = Some(*line);
+        if line.elapsed < SAID_AFTER {
+            return;
+        }
+        let due = match self.said {
+            None => true,
+            Some(_) if self.terminal => true,
+            Some(at) => line.elapsed.saturating_sub(at) >= LOG_EVERY,
+        };
+        if !due {
+            return;
+        }
+        self.said = Some(line.elapsed);
+        let mut err = std::io::stderr().lock();
+        if self.terminal {
+            _ = write!(err, "\r\x1b[2Kblaze: {}: {line}", self.name);
+            _ = err.flush();
+        } else {
+            _ = writeln!(err, "blaze: {}: {line}", self.name);
+        }
+    }
+
+    /// The download ended, `ok` or not: the in-place line gives way to what came.
+    fn end(&self, ok: bool) {
+        let (Some(_), Some(line)) = (self.said, self.last) else { return };
+        let mut err = std::io::stderr().lock();
+        if self.terminal {
+            _ = write!(err, "\r\x1b[2K");
+        }
+        if ok {
+            let rate = line.average().map(|it| format!(", {}/s", Bytes(it as u64))).unwrap_or_default();
+            _ = writeln!(
+                err,
+                "blaze: fetched {}: {} in {}{rate}",
+                self.name,
+                Bytes(line.done),
+                Secs(line.elapsed)
+            );
+        } else {
+            _ = writeln!(err, "blaze: {}: {line}, then stopped", self.name);
+        }
     }
 }
 
@@ -423,9 +530,10 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
-/// Unpacks the `.tar.gz` `bytes`, whose files are under `top`, into `dir`. Unpacked beside it
-/// first and moved into place whole, so a `dir` that is there is a whole release.
-fn unpacked(bytes: &[u8], dir: &Path, top: &str) -> anyhow::Result<()> {
+/// Unpacks the archive `bytes` (named `archive`: a `.tar.xz` or a `.tar.gz`), whose files are
+/// under `top`, into `dir`. Unpacked beside it first and moved into place whole, so a `dir` that
+/// is there is a whole release.
+fn unpacked(bytes: &[u8], dir: &Path, top: &str, archive: &str) -> anyhow::Result<()> {
     let parent = dir.parent().context("a release in no directory")?;
     std::fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".{}.{}", top, std::process::id()));
@@ -435,7 +543,14 @@ fn unpacked(bytes: &[u8], dir: &Path, top: &str) -> anyhow::Result<()> {
         }
         _ => {}
     }
-    tar::Archive::new(flate2::read::GzDecoder::new(bytes)).unpack(&staging)?;
+    if archive.ends_with(".tar.xz") {
+        let xz = lzma_rust2::XzReader::new(std::io::Cursor::new(bytes), false);
+        tar::Archive::new(xz).unpack(&staging)?;
+    } else if archive.ends_with(".tar.gz") {
+        tar::Archive::new(flate2::read::GzDecoder::new(bytes)).unpack(&staging)?;
+    } else {
+        bail!("{archive} is neither a .tar.xz nor a .tar.gz");
+    }
     let moved = std::fs::rename(staging.join(top), dir);
     _ = std::fs::remove_dir_all(&staging);
     match moved {
@@ -486,8 +601,9 @@ mod tests {
         header.set_mode(0o755);
         header.set_cksum();
         tar.append_data(&mut header, format!("{top}/blaze"), &b"run"[..]).unwrap();
+        let plain = tar.into_inner().unwrap();
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut gz, &tar.into_inner().unwrap()).unwrap();
+        std::io::Write::write_all(&mut gz, &plain).unwrap();
         let bytes = gz.finish().unwrap();
         let sha = blaze_format::hex::encode(&blaze_sha256::digest(&bytes));
         let b3 = blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes));
@@ -522,6 +638,42 @@ mod tests {
         assert!(got.unwrap_err().contains("has no B3SUMS or SHA256SUMS") && !unpacked);
         let (got, _) = run("no-host", Some(String::new()), Some(String::new()));
         assert!(got.unwrap_err().contains("has no build for x86_64-unknown-linux-gnu"));
+        // A release with a `.tar.xz` beside its `.tar.gz`: the `.tar.xz` is fetched, checked and
+        // unpacked, and a list that names only the `.tar.gz` then disagrees.
+        let xz_name = format!("{top}.tar.xz");
+        let mut xz = lzma_rust2::XzWriter::new(Vec::new(), Default::default()).unwrap();
+        std::io::Write::write_all(&mut xz, &plain).unwrap();
+        let xz_bytes = xz.finish().unwrap();
+        let both = |of: fn(&[u8]) -> [u8; 32], named_xz: bool| {
+            let mut text = line(&blaze_format::hex::encode(&of(&bytes))).unwrap();
+            if named_xz {
+                text.push_str(&format!("{}  {xz_name}\n", blaze_format::hex::encode(&of(&xz_bytes))));
+            }
+            text
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let exe = root.join("xz").join("versions/0.1.0/blaze");
+        fetched("0.1.0", host, &exe, |name| {
+            asked.borrow_mut().push(name.to_owned());
+            Ok(match name {
+                "B3SUMS" => Some(both(blaze_ids::b3::hash, true).into_bytes()),
+                "SHA256SUMS" => Some(both(blaze_sha256::digest, true).into_bytes()),
+                it if it == xz_name => Some(xz_bytes.clone()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"run");
+        assert!(asked.borrow().contains(&xz_name) && !asked.borrow().contains(&archive));
+        let exe = root.join("xz-disagree").join("versions/0.1.0/blaze");
+        let got = fetched("0.1.0", host, &exe, |name| {
+            Ok(match name {
+                "B3SUMS" => Some(both(blaze_ids::b3::hash, true).into_bytes()),
+                "SHA256SUMS" => Some(both(blaze_sha256::digest, false).into_bytes()),
+                _ => None,
+            })
+        });
+        assert!(format!("{:#}", got.unwrap_err()).contains("SHA256SUMS names no"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -563,15 +715,15 @@ mod tests {
         std::io::Write::write_all(&mut gz, &tar).unwrap();
         let bytes = gz.finish().unwrap();
         let dest = root.join("home/versions/0.1.0");
-        unpacked(&bytes, &dest, &top).unwrap();
+        unpacked(&bytes, &dest, &top, "it.tar.gz").unwrap();
         assert_eq!(std::fs::read(dest.join("blaze")).unwrap(), b"run");
         // a second fetch at once finds it there
-        unpacked(&bytes, &dest, &top).unwrap();
+        unpacked(&bytes, &dest, &top, "it.tar.gz").unwrap();
         // what an earlier fetch left that can't be removed stops this one
         let elsewhere = root.join("home/versions/0.2.0");
         let staging = root.join(format!("home/versions/.{top}.{}", std::process::id()));
         std::fs::write(&staging, b"not a directory").unwrap();
-        let error = unpacked(&bytes, &elsewhere, &top).unwrap_err();
+        let error = unpacked(&bytes, &elsewhere, &top, "it.tar.gz").unwrap_err();
         assert!(
             matches!(error.downcast_ref::<FetchError>(), Some(FetchError::Staging { .. })),
             "{error:#}"

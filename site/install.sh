@@ -203,7 +203,16 @@ $releases.atom"
 $releases/download/$tag/SHA256SUMS"
     fi
 
+    # The .tar.xz, a third of the size, where the release has one and this tar reads xz (bsdtar
+    # does itself, GNU tar through xz); else the .tar.gz every release has.
     asset="blaze-$tag-$target.tar.gz"
+    if awk -v n="blaze-$tag-$target.tar.xz" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS"; then
+        if command -v xz >/dev/null 2>&1 || tar --version 2>/dev/null | grep -q bsdtar; then
+            asset="blaze-$tag-$target.tar.xz"
+        else
+            step "no xz here: downloading the larger .tar.gz"
+        fi
+    fi
     awk -v n="$asset" '$2 == n || $2 == "*" n { found = 1 } END { exit !found }' "$tmp/SHA256SUMS" ||
         fail "blaze release $tag has no build for $machine." "Its files: $releases/tag/$tag"
     want=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1; exit }' "$tmp/SHA256SUMS")
@@ -224,7 +233,8 @@ fi
 
 mkdir "$tmp/unpacked"
 # -o: as root, tar gives files the archive's owner, which a container's user namespace may not have.
-tar -xzof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
+# tar tells .tar.xz from .tar.gz itself.
+tar -xof "$tmp/$asset" -C "$tmp/unpacked" 2>"$tmp/error" ||
     fail "the downloaded archive could not be unpacked." "$(cat "$tmp/error")"
 # The archive's one folder, whatever the file is named.
 set -- "$tmp/unpacked"/*/
