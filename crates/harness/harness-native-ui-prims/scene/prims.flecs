@@ -207,7 +207,7 @@ ui {
   // A virtualized column of rows of any height (a chat transcript): only the rows in view and `overscan` points more
   // exist, measured as they are laid out; spacers stand for the rest (`estimate` points a row never seen). Kept by
   // harness_native_ui_view::lazy_stack. Put it in a ui.Scroll; rows carry their own padding (no gap).
-  prefab LazyStack : ui.Column {
+  prefab LazyList : ui.Column {
     LazyStack: {estimate: 40, overscan: 400}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}

@@ -1,5 +1,5 @@
 // The chat pane (src/app/chat.rs): a chat session's transcript over its agent's structured events, drawn as a chat, not
-// a terminal. The transcript is a ui.LazyStack (only the rows in view exist, each as tall as its words); the input a
+// a terminal. The transcript is a ui.LazyList (only the rows in view exist, each as tall as its words); the input a
 // ui.TextArea on a soft plate at the foot, a quiet status line under it.
 
 @tree ChildOf
@@ -8,7 +8,7 @@ hn {
   prefab ChatPane : hn.Pane {
     list : ui.Scroll {
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
-      rows : ui.LazyStack {
+      rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
