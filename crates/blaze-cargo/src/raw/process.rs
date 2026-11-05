@@ -226,6 +226,23 @@ pub fn kill_group(child: &mut std::process::Child) {
     }
 }
 
+/// Sends SIGINT to this process's own process group, as a terminal's Ctrl-C does: what the
+/// live view does when raw mode made Ctrl-C a key (`cli/live.rs`), so the test executables
+/// it runs, which share the group, end as they would have. The daemon runs in a group of its
+/// own and is not reached.
+#[cfg(unix)]
+pub fn interrupt_own_group() {
+    // SAFETY: `kill` takes no pointer, so no memory of this process is at stake; pid 0 is
+    // this process's own group, and this process's SIGINT handler (`serve::signals::catch`)
+    // only sets a flag.
+    unsafe { libc::kill(0, libc::SIGINT) };
+}
+
+/// Off unix nothing is sent: a console in raw mode delivers Ctrl-C to no process, so the test
+/// executables under way are not interrupted by it.
+#[cfg(not(unix))]
+pub fn interrupt_own_group() {}
+
 /// Has a write to a pipe whose reader is gone end the process quietly, as `SIGPIPE`'s
 /// default action does, where std ignores the signal so that the write fails with `EPIPE`.
 /// Not for a process that writes to sockets: a reset from the other end would end it.
