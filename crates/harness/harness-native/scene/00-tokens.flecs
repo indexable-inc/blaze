@@ -343,6 +343,9 @@ export const chat_bubble_radius = 12
 export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
 export const chat_row_estimate = 44
+// A tool call's or a run's line, and how far a run's calls sit in from its line (its icon's place).
+export const chat_tool_h = 24
+export const chat_nest = 19
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
 export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}

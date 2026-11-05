@@ -270,15 +270,17 @@ fn natural(items: &mut [Item], i: usize, a: usize) {
     }
     let flow = flow(items, i);
     let it = &items[i];
-    let content = if flow.is_empty() {
+    // A `Lazy` container is as long as all its rows whether or not any are made: its rows come from the range this
+    // length puts in view, so measuring only the made ones would let a container with none stay empty for good.
+    let content = if let Some(l) = it.lazy.filter(|_| it.main(a) || (it.adaptive.is_some() && a == 1)) {
+        lazy_extent(l, it.cols.len(), it.flex.gap)
+    } else if flow.is_empty() {
         it.intrinsic[a]
     } else if it.fits {
         // As wide as its widest variant would like; as tall as the one chosen (width runs first).
         if a == 0 { items[flow[0]].nat[0] } else { items[flow[it.chosen.min(flow.len() - 1)]].nat[1] }
     } else if let Some(g) = &it.grid {
         grid_natural(items, i, g, a)
-    } else if let Some(l) = it.lazy.filter(|_| it.main(a) || (it.adaptive.is_some() && a == 1)) {
-        lazy_extent(l, it.cols.len(), it.flex.gap)
     } else if let Some([min, _]) = it.adaptive {
         if a == 0 {
             flow.iter().map(|&c| contribution(&items[c], 0)).fold(min, f32::max)
@@ -697,11 +699,15 @@ fn place(items: &mut [Item], i: usize, view: [f32; 4]) {
         place(items, c, view);
     }
     let kids = flow(items, i);
-    if kids.is_empty() {
-        return;
-    }
     let (ox, oy) = (x0 + pad[0] - scroll[0], y0 + pad[2] - scroll[1]);
     let (iw, ih) = ((w - pad[0] - pad[1]).max(0.0), (h - pad[2] - pad[3]).max(0.0));
+    if kids.is_empty() {
+        // A `Lazy` container with no rows made yet still says which are in view, or none would ever be made.
+        if items[i].lazy.is_some() {
+            lazy_place(items, i, &kids, [ox, oy, iw, ih], view);
+        }
+        return;
+    }
     let mut done = vec![false; kids.len()];
     if items[i].fits {
         for &c in &kids {
@@ -1084,6 +1090,19 @@ mod tests {
         assert_eq!(items[2].out.y, 101.0 * 24.0 - 2400.0);
         assert_eq!(items[2].out.w, 200.0);
         assert_eq!(items[2].out.h, 20.0);
+    }
+
+    /// A lazy column with none of its 6 rows made yet (all were out of view on the last frame) is still as tall as the 6
+    /// and says all of them are in view now, so the next frame makes them; before, it measured 0 tall, said none were in
+    /// view, and stayed an empty bar for good (a wide table under a chat tool card).
+    #[test]
+    fn a_lazy_column_with_no_rows_made_still_asks_for_them() {
+        let scroll = Item { clip: true, scrolls: true, ..item([Sizing::fixed(200.0), Sizing::fixed(400.0)], vec![1]) };
+        let list = Item { lazy: Some(LazySpec { count: 6, row: 24.0, overscan: 8 }), flex: Flex { axis: FlexAxis::Column, align: Align::Stretch, ..Flex::default() }, ..item([Sizing::GROW, Sizing::FIT], vec![]) };
+        let mut items = vec![scroll, list];
+        solve(&mut items, 0, [800.0, 600.0]);
+        assert_eq!(items[1].out.h, 6.0 * 24.0);
+        assert_eq!(items[1].range, Some((0, 6)));
     }
 
     /// A 2x2 grid: each column as wide as its widest cell, the second column end-aligned, a spanning row as wide as the grid.
