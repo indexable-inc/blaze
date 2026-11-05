@@ -282,6 +282,9 @@ pub fn drive<A: Api>(
         Err(error) => {
             // alloc: the error a build ends with, once
             let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
+                // Stopped at its memory ceiling, or killed by the kernel at its limit: that is
+                // the failure, said as itself, never as a hang-up.
+                Some(Ok(died)) if died.at_ceiling().is_some() => died.to_string(),
                 Some(Ok(died)) => format!("{error}: {died}"),
                 Some(Err(why)) => {
                     format!("{error}, and what came of the daemon is not known: {why:#}")

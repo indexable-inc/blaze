@@ -718,8 +718,22 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
     blaze_mem::tag::resident().unwrap_or_else(|| snapshot.footprint(held()))
 }
 
-/// The memory the plane may grant: the machine's limit, less what others use within it, less
-/// `margin`.
+/// The share of each of the machine's own memory limits (`hw.memsize`, `MemTotal`, a cgroup's
+/// `memory.max`) that blaze may hold, as (numerator, denominator): 3/4 (docs/memory-budget.md
+/// section 7, "The machine budget"). The quarter left is the kernel's, the compressor's and the
+/// user's other programs', whatever blaze admits: on 2026-11-05 a 128 GiB Mac whose daemons
+/// were let hold all of it kernel-panicked twice with its compressor full. A limit the daemon is
+/// told (`BLAZE_DAEMON_MEMORY_GB`, `--memory-gb`) and `RLIMIT_AS` are not scaled: they are more
+/// limits, the least winning, so a daemon's ceiling is never more than this share.
+pub const MACHINE_SHARE: (u64, u64) = (3, 4);
+
+/// [`MACHINE_SHARE`] of `bytes`.
+const fn machine_share(bytes: u64) -> u64 {
+    bytes / MACHINE_SHARE.1 * MACHINE_SHARE.0
+}
+
+/// The memory the plane may grant: the machine's limit ([`MACHINE_SHARE`] of it), less what
+/// others use within it, less `margin`.
 ///
 /// The limit is the least of what the machine has and what the process may use: on Linux
 /// the machine's memory ([`linux_machine`]: `MemTotal`, or the ceiling a VM that hot-plugs
@@ -744,6 +758,11 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
 /// read or nothing is left, never a guess.
 pub fn machine_budget(margin: u64, told: Option<(u64, String)>) -> io::Result<Budget> {
     let mut limits = machine_limits()?;
+    for (bytes, from) in &mut limits {
+        *bytes = machine_share(*bytes);
+        // alloc: the budget's name, once per daemon start
+        *from = format!("{}/{} of {from}", MACHINE_SHARE.0, MACHINE_SHARE.1);
+    }
     limits.extend(told);
     #[cfg(unix)]
     // alloc: the budget's name, once per daemon start
@@ -1872,6 +1891,12 @@ mod tests {
         let budget = machine_budget(1 << 20, None).unwrap();
         assert!(budget.bytes > 0);
         assert!(budget.from.contains("a margin of 0.00 GB"), "{}", budget.from);
+        // The machine's own limit counts at its share, the quarter left to the machine.
+        assert!(
+            budget.from.starts_with("3/4 of ") || budget.from.starts_with("the process's RLIMIT_AS"),
+            "{}",
+            budget.from
+        );
         #[cfg(target_os = "linux")]
         assert!(budget.from.contains("others use in cgroup") || budget.from.contains("less a"));
     }
