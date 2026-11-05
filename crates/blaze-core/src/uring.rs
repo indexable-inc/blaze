@@ -4297,10 +4297,8 @@ mod tests {
                 action.sa_sigaction = trapped as usize;
                 action.sa_flags = libc::SA_SIGINFO;
                 // SAFETY: a handler that touches an atomic and its context alone.
-                assert_eq!(
-                    unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) },
-                    0
-                );
+                let set = unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) };
+                assert_eq!(set, 0);
             });
             const LD_W_ABS: u16 = 0x20;
             const JEQ_K: u16 = 0x15;
