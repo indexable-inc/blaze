@@ -105,11 +105,14 @@ impl Ord for ModPath {
 
 impl fmt::Debug for ModPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ModPath")
-            .field("kind", &self.kind)
-            .field("segments", &self.segments())
-            .field("contexts", &self.contexts())
-            .finish()
+        let mut out = f.debug_struct("ModPath");
+        out.field("kind", &self.kind).field("segments", &self.segments());
+        // Only a path some of whose segments a macro 2.0 wrote has contexts: every other prints
+        // as it did before paths had them.
+        if let Some(contexts) = self.contexts() {
+            out.field("contexts", &contexts);
+        }
+        out.finish()
     }
 }
 
