@@ -1,7 +1,7 @@
 //! The transcript's tool calls as a reader takes them in, derived from the reduced items (never stored): a run of calls
 //! with no words of the agent's between them is one [`Run`], summed up in plain words ("Read 2 files, ran 1 shell
-//! command") the way Claude Code's terminal does; and which calls open by default ([`Grouped::default_open`]): a call that
-//! failed, and the transcript's last item when it is a shell call. Fold state a person set lives in the app, by call id;
+//! command") the way Claude Code's terminal does; and which calls open by default ([`Grouped::default_open`]): only the
+//! transcript's last item when it is a shell call that went well (a failure is one folded line). Fold state a person set lives in the app, by call id;
 //! this is only the default it starts from. Agent-neutral: Claude's, Codex's and the harness REPL's calls alike.
 use crate::{Detail, Item, Transcript};
 use serde_json::Value;
@@ -256,11 +256,12 @@ impl Grouped {
         Grouped { pieces, last }
     }
 
-    /// Whether call `c` (item `i`) is open before anyone folds or opens it: when it failed, or when it is a shell call and
-    /// the transcript's last item. Everything else starts folded; a run starts folded too, its open calls showing under it.
+    /// Whether call `c` (item `i`) is open before anyone folds or opens it: when it is a shell call that went well and the
+    /// transcript's last item. Everything else starts folded, a failure too (one line in the failed tone that opens on a
+    /// press); a run starts folded, its failed and open calls showing under it.
     #[must_use]
     pub fn default_open(&self, i: usize, c: &Call) -> bool {
-        c.failed || (c.shell() && self.last == Some(i))
+        !c.failed && c.shell() && self.last == Some(i)
     }
 }
 
@@ -289,7 +290,7 @@ mod tests {
     }
 
     /// Calls with only reasoning between them are one run, summed up in words by kind in the order each came; prose ends
-    /// a run; a lone call is no run; a failed call opens and its run counts it; the last shell call opens.
+    /// a run; a lone call is no run; a failed call stays folded and its run counts it; the last shell call opens.
     #[test]
     fn runs_group_and_default_open() {
         let mut lines = vec![serde_json::json!({"ev": "user", "text": "go"})];
@@ -320,7 +321,7 @@ mod tests {
             .filter(|(i, c)| g.default_open(*i, c))
             .map(|(_, c)| c.block.as_str())
             .collect();
-        assert_eq!(open, ["b", "f"], "the failed call and the last shell call");
+        assert_eq!(open, ["f"], "the last shell call; the failed one stays folded");
 
         // Something after the last shell call: it folds.
         let mut more = lines.clone();
