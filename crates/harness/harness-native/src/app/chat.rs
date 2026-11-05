@@ -536,7 +536,11 @@ impl App {
             if let Some(txt) = area.part("text") {
                 txt.text(&shown);
                 let mut te = txt.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, ..te };
+                // The caret blinks as the terminal's cursor does (Ghostty's cursor-style-blink), solid again as it moves.
+                let blink = self.look.themes[usize::from(self.dark)].blink;
+                let moved = (te.caret, te.anchor, te.mark_lo, te.mark_hi) != (caret, anchor, lo, hi) || (focused && !te.focused);
+                let since = if moved { self.time } else { te.since };
+                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, blink, since, ..te };
                 if next != te {
                     te = next;
                     txt.entity().set(te);
@@ -628,6 +632,10 @@ impl App {
         }
         if moving {
             self.poke();
+        }
+        // A focused input's caret fades on the clock: keep drawing.
+        if self.focused && self.look.themes[usize::from(self.dark)].blink && self.chat_focused() && !self.tree_focus && self.palette.is_none() {
+            self.poke_why("caret blink");
         }
     }
 

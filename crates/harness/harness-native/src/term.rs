@@ -117,7 +117,7 @@ enum Pick {
 }
 
 /// The cursor's blink clock: where the cursor was, a hash of its row, and when either last changed (typing), app
-/// seconds. The blink waits [`BLINK_PAUSE`] after that.
+/// seconds. The blink waits `paint::BLINK_PAUSE` after that.
 #[derive(Clone, Copy, Debug, Default)]
 struct Blink {
     at: (u16, u16),
@@ -125,9 +125,6 @@ struct Blink {
     since: f32,
 }
 
-/// Seconds the cursor stays solid after it moved or its row changed, and a full blink's period.
-const BLINK_PAUSE: f32 = 0.5;
-const BLINK_PERIOD: f32 = 1.2;
 
 /// The cell grid's metrics at a font size and display scale (Ghostty's: a cell is the primary face's advance by its
 /// ascent + descent + line gap, each rounded to whole device pixels, the baseline on a pixel), and the runs shaped so far.
@@ -319,7 +316,7 @@ impl Grid {
     }
 
     /// The cursor's opacity this frame (1 solid, 0 hidden): a smooth fade on the app clock when it blinks and the pane
-    /// is focused, held solid for [`BLINK_PAUSE`] after the cursor moved or its row changed.
+    /// is focused, held solid for `paint::BLINK_PAUSE` after the cursor moved or its row changed.
     fn cursor_alpha(&mut self, snap: &Snapshot, p: &Paint<'_>, blinking: bool, shown: bool) -> f32 {
         let row = snap.rows.get(usize::from(snap.cursor.0)).map_or(FNV0, |r| {
             r.iter().fold(FNV0, |h, c| fnv_mix(fnv_mix(h, c.text.as_bytes()), &[0]))
@@ -331,13 +328,7 @@ impl Grid {
         if !self.animating {
             return 1.0;
         }
-        let t = p.time - self.blink.since - BLINK_PAUSE;
-        if t <= 0.0 {
-            return 1.0;
-        }
-        let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
-        let k = ((v + 0.5) / 1.0).clamp(0.0, 1.0);
-        k * k * (3.0 - 2.0 * k)
+        harness_native_render::paint::caret_blink(p.time - self.blink.since)
     }
 }
 

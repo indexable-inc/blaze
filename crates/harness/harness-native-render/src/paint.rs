@@ -432,7 +432,7 @@ impl Painter {
                     }
                 }
                 if let Some(t) = edit {
-                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha);
+                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha, time);
                 }
                 if let Some(c) =
                     e.try_cloned::<&Caret>().filter(|c| (c.at..c.until).contains(&time))
@@ -709,11 +709,11 @@ fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
 
 /// A `TextEdit`'s selection wash, marked text's underline and caret bar over its words' layout.
 #[allow(clippy::too_many_arguments)]
-fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32) {
+fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32, time: f32) {
     let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
     let snap = |v: f32| (v * sc).round() / sc;
     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
-    if t.focused && lo < hi {
+    if lo < hi {
         let wash = rgba(if dark { t.select_dark } else { t.select_light });
         for r in spans_of(lay, lo, hi) {
             d.panel(panel_from(wash, [0.0; 4], square, [laid.x + r[0], laid.y + r[1], r[2], r[3]], alpha));
@@ -737,6 +737,26 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
         };
         let w = (2.0 * sc).round().max(1.0) / sc;
         let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
-        d.panel(panel_from(ink, [0.0; 4], square, rect, alpha));
+        let on = if t.blink { caret_blink(time - t.since) } else { 1.0 };
+        if on > 0.004 {
+            d.panel(panel_from(ink, [0.0; 4], square, rect, alpha * on));
+        }
     }
+}
+
+/// Seconds a caret stays solid after it moved, and a whole blink's period (the terminal's cursor and a text area's caret).
+pub const BLINK_PAUSE: f32 = 0.5;
+pub const BLINK_PERIOD: f32 = 1.2;
+
+/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then a smooth fade in and out
+/// every [`BLINK_PERIOD`].
+#[must_use]
+pub fn caret_blink(since: f32) -> f32 {
+    let t = since - BLINK_PAUSE;
+    if t <= 0.0 {
+        return 1.0;
+    }
+    let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
+    let k = (v + 0.5).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
 }
