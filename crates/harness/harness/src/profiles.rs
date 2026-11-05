@@ -44,7 +44,8 @@ labels={[...]} unit height /> (pie and donut take data as [{label, value}]); nev
 SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect, Circle, Line, \
 Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint, series1..series8), never \
 colours. For input use Button (label, onclick), Toggle, Checkbox, Slider, NumberField, Input, TextArea, Select, Choice and \
-Radio (options), with bind:value (bind:checked, bind:selected) to $state; what the person does runs the cell's handlers \
+Radio (options), bound to $state with bind:value (Slider, NumberField, Input, TextArea, Toggle), bind:checked (Checkbox) \
+or bind:selected (Select, Choice, Radio); what the person does runs the cell's handlers \
 and redraws it. Layout: Grid (columns), Wrap, Scroll, Split (bind:ratio), Stack with Layer (anchor); folding and floating: \
 Tabs (tabs, bind:selected; pick the body with {#if}), Disclosure (title) in an Accordion, Popover, Menu (items), Dialog \
 and Sheet (bind:open on each) and Toast; status and pictures: Progress, Loading, Skeleton, Icon, Image (src: a file \
