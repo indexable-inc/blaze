@@ -1067,6 +1067,13 @@ impl Ring {
             }
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
+                // A signal ended a timed wait early: back to the caller, whose deadline says
+                // how much of it is left. Entering again with the same relative timeout would
+                // never end under a signal that comes sooner than it: the profile's sampler
+                // signals this thread every 20 ms, so a 50 ms wait never timed out and the
+                // daemon's first turn never ended (0.20261105.0 on Linux, `blaze serve` stuck
+                // before it listened).
+                Some(libc::EINTR) if wait.is_some() => return Ok(()),
                 Some(libc::EINTR) => continue,
                 // The wait ended with nothing done.
                 Some(libc::ETIME) => return Ok(()),
@@ -4495,6 +4502,59 @@ mod tests {
         .join()
         .unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A timed poll ends within its wait while signals keep interrupting it, as the profile's
+    /// sampler does every 20 ms: `Ring::enter` once entered again with the whole relative
+    /// timeout after each EINTR, so a wait longer than the gap between signals never ended and
+    /// the daemon never got past its first turn.
+    #[test]
+    fn a_timed_poll_ends_under_a_storm_of_signals() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        let signal = libc::SIGRTMIN() + 5;
+        // SAFETY: `sigaction` is a C struct of integers, pointers and a mask, for which all
+        // zeroes is valid; no SA_RESTART, as the sampler's handler has none.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = nothing as usize;
+        // SAFETY: a handler that does nothing, for a signal nothing else in the test uses.
+        assert_eq!(unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) }, 0);
+        let root = dir("uring-eintr");
+        let mut ring = Uring::new(&root).unwrap();
+        let at = Address::Unix(FileName::new("s.sock").unwrap());
+        ring.submit(&mut vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ]);
+        let mut out = Vec::new();
+        poll_until(&mut ring, &mut out, |out| out.len() == 2);
+        out.sort_by_key(|it| it.tag.0);
+        let server = match &out[0].done {
+            Done::Accepted { conn } => *conn,
+            other => panic!("{other:?}"),
+        };
+        // Nothing is sent, so the receive stays in flight through the poll.
+        ring.submit(&mut vec![Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(3) }]);
+        // SAFETY: the calling thread's own handle.
+        let me = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storm = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: `me` is the test's thread, which lives until this one is joined.
+                    unsafe { libc::pthread_kill(me, signal) };
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let started = Instant::now();
+        let mut out = Vec::new();
+        ring.poll(&mut out, Duration::from_millis(50));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        storm.join().unwrap();
+        assert!(out.is_empty(), "nothing was sent, and the poll ended with {out:?}");
+        assert!(took < Duration::from_secs(2), "a 50 ms poll under signals every 5 ms took {took:?}");
     }
 
     /// The provided buffers a pass of completions gives back are shown to the kernel together,
