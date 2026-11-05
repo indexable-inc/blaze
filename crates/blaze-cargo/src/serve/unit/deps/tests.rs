@@ -19,7 +19,7 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
         if store.owns(completion.tag) {
             store.complete(completion, effects);
         }
-    });
+    }).expect("the effects end");
     assert!(store.ready(), "{:?}", store.broken());
     store
 }

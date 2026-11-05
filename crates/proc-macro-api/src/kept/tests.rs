@@ -323,7 +323,7 @@ fn daemon(
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
-    });
+    }).expect("the effects end");
     assert!(store.ready());
     let environment = super::Environment::new();
     environment.pass(vec![("PATH".into(), path.into())]).unwrap();

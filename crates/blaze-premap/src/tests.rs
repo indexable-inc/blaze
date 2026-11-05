@@ -1419,7 +1419,7 @@ fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) {
         if store.owns(completion.tag) {
             store.complete(completion, effects);
         }
-    });
+    }).expect("the effects end");
 }
 
 fn open_store(sim: &mut Sim) -> Store {

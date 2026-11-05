@@ -1223,7 +1223,7 @@ mod tests {
         run_until_idle(sim, effects, |completion, effects| {
             assert!(store.owns(completion.tag));
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
     }
 
     /// Commits what was put, so its batch's keys are new keys.

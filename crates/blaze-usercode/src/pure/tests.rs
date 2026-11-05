@@ -172,7 +172,7 @@ fn opened(sim: &mut Sim) -> Store {
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
-    });
+    }).expect("the effects end");
     assert!(store.ready());
     store
 }

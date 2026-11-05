@@ -2516,7 +2516,7 @@ mod tests {
                     }),
                     _ => {}
                 }
-            });
+            }).expect("the effects end");
             seen
         }
         let (ours, theirs) = (dir("uring"), dir("uring-threads"));
@@ -2569,7 +2569,7 @@ mod tests {
                         });
                     }
                     seen.push(done.done);
-                });
+                }).expect("the effects end");
             }
             seen
         }
@@ -2596,7 +2596,8 @@ mod tests {
         let mut seen = BTreeMap::new();
         let mut effects =
             vec![Effect::Append { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
-        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
         std::fs::remove_dir_all(root.join("state")).unwrap();
         let mut effects = vec![Effect::Sync { file: file.clone(), tag: Tag(2) }];
         run_until_idle(&mut driver, &mut effects, |done, effects| {
@@ -2608,7 +2609,7 @@ mod tests {
                 });
             }
             _ = seen.insert(done.tag.0, done.done);
-        });
+        }).expect("the effects end");
         assert_eq!(seen[&1], Done::Appended);
         let path = root.join("state/journal").display().to_string();
         assert!(
@@ -2645,7 +2646,7 @@ mod tests {
             Done::Appended => appended += 1,
             Done::Fired => fired.push(done.tag.0 - count),
             other => panic!("{other:?}"),
-        });
+        }).expect("the effects end");
         assert_eq!((appended, fired), (count, vec![2, 1, 0]));
         let mut total = 0;
         for n in 0..64 {
@@ -2755,7 +2756,7 @@ mod tests {
                 effects.push(Effect::Kill { tag: Tag(3) });
             }
             seen.insert(done.tag.0, done.done);
-        });
+        }).expect("the effects end");
         assert_eq!(driver.in_flight(), 0);
         seen
     }
@@ -2840,7 +2841,8 @@ mod tests {
             tag: Tag(1),
         }];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         let [Done::Exited(exit)] = &seen[..] else { panic!("{seen:?}") };
         assert_eq!(exit.stdout, b"confined 2\n");
         assert_eq!(exit.traced, Some(fake_trace()));
@@ -2922,7 +2924,7 @@ mod tests {
                 }
                 _ => {}
             }
-        });
+        }).expect("the effects end");
         assert_eq!(driver.in_flight(), 0);
         seen
     }
@@ -2975,7 +2977,8 @@ mod tests {
         // Nothing listens there now.
         let mut effects = vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(1) }];
         let mut seen = Vec::new();
-        run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert!(matches!(&seen[..], [Done::Failed(_)]), "{seen:?}");
     }
 
@@ -2992,7 +2995,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| {
             _ = seen.insert(done.tag.0, shown(&done.done))
-        });
+        }).expect("the effects end");
         seen
     }
 
@@ -3107,7 +3110,8 @@ mod tests {
             Effect::Append { file: name("b"), bytes: b"two".to_vec(), tag: Tag(2) },
         ];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert_eq!(seen, [Done::Appended, Done::Appended]);
         let slot = |driver: &Uring, it: &str| {
             driver.kept.get(driver.names[&name(it)]).expect("kept").fixed.slot
@@ -3120,7 +3124,8 @@ mod tests {
             Effect::Remove { file: name("b"), tag: Tag(4) },
         ];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert_eq!(seen, [Done::Read(b"one".to_vec()), Done::Removed]);
         // The slot is emptied through the ring, a close no effect waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3149,7 +3154,8 @@ mod tests {
             let mut effects =
                 vec![Effect::Append { file: file.clone(), bytes: vec![n], tag: Tag(n.into()) }];
             let mut seen = Vec::new();
-            run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+            run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+            .expect("the effects end");
             assert_eq!(seen, [Done::Appended]);
             assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
         }
@@ -3189,7 +3195,8 @@ mod tests {
             tag: Tag(99),
         });
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert_eq!(seen, vec![Done::Written; count + 1]);
         let file = std::fs::read(root.join("store/pack")).unwrap();
         for n in 0..count {
@@ -3270,7 +3277,7 @@ mod tests {
                     effects.push(Effect::Unlisten { tag: Tag(1) });
                 }
             }
-        });
+        }).expect("the effects end");
         assert_eq!(sent, messages);
         let wanted: Vec<u8> = (0..messages).flat_map(message).collect();
         assert!(got == wanted, "{} bytes of {}", got.len(), wanted.len());
@@ -3299,7 +3306,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut effects, |done, _| {
             _ = seen.insert(done.tag.0, shown(&done.done))
-        });
+        }).expect("the effects end");
         assert_eq!(
             seen,
             BTreeMap::from([
@@ -3324,7 +3331,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut effects, |done, _| {
             _ = seen.insert(done.tag.0, shown(&done.done))
-        });
+        }).expect("the effects end");
         assert_eq!(seen, BTreeMap::from([(4, "Renamed".to_owned()), (5, "failed".to_owned())]));
         assert_eq!(std::fs::read(root.join("moved/file")).unwrap().len(), 3 << 20);
         assert!(!root.join("out/file").exists());
@@ -3403,7 +3410,8 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let mut effects = vec![Effect::Stamp { files: names.clone(), tag: Tag(1) }];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done))
+        .expect("the effects end");
         let [Completion { tag: Tag(1), done: Done::Stamped(stamps) }] = &seen[..] else {
             panic!("{seen:?}")
         };
@@ -3464,7 +3472,7 @@ mod tests {
             run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
                 assert!(matches!(done.done, Done::Stamped(_)), "{done:?}");
                 seen += 1;
-            });
+            }).expect("the effects end");
             assert_eq!(seen, 1);
         }
         for round in 0..3 {
@@ -3480,7 +3488,7 @@ mod tests {
             run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
                 assert!(matches!(done.done, Done::Entries(_)), "{done:?}");
                 seen += 1;
-            });
+            }).expect("the effects end");
             assert_eq!(seen, 1);
         }
         drop(driver);
@@ -3521,7 +3529,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
             _ = seen.insert(done.tag.0, done.done)
-        });
+        }).expect("the effects end");
         assert!(seen[&1] == Done::Stamped(reference.clone()), "the first sweep");
         let mut backwards = reference;
         backwards.reverse();
@@ -3538,7 +3546,8 @@ mod tests {
         let mut driver = Uring::new(&nowhere).unwrap();
         let mut effects = vec![Effect::Stamp { files: names, tag: Tag(1) }];
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
+        .expect("the effects end");
         let [Done::Failed(why)] = &seen[..] else { panic!("{seen:?}") };
         assert!(why.0.contains(&*nowhere.to_string_lossy()), "{why}");
         unsweep(&root);
@@ -3562,7 +3571,7 @@ mod tests {
             run_until_idle(&mut driver, &mut effects, |done, _| match done.done {
                 Done::Stamped(stamps) => stamped = stamps.len(),
                 other => panic!("{other:?}"),
-            });
+            }).expect("the effects end");
             assert_eq!(stamped, names.len());
             // The first warms the caches, as a daemon's earlier life has.
             if round > 0 {
@@ -3647,7 +3656,7 @@ mod tests {
                     (7, Done::Unwatched) => ended = true,
                     other => panic!("{other:?}"),
                 },
-            );
+            ).expect("the effects end");
             assert!(ended);
             assert_eq!(driver.in_flight(), 0);
             drop(driver);
@@ -3749,12 +3758,13 @@ mod tests {
             &mut driver,
             &mut vec![Effect::Sync { file: file.clone(), tag: Tag(0) }],
             |_, _| {},
-        );
+        ).expect("the effects end");
         driver.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         let ids = requests(&driver);
         let [synced] = ids[..] else { panic!("{ids:?}") };
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut Vec::new(), |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut Vec::new(), |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert_eq!(seen, [Done::Synced]);
         driver.submit(&mut vec![Effect::Read { file: file.clone(), at: 0, len: 5, tag: Tag(2) }]);
         let ids = requests(&driver);
@@ -3766,7 +3776,8 @@ mod tests {
         assert!(driver.ready.is_empty(), "{:?}", driver.ready);
         assert!(driver.ops.contains(read));
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut Vec::new(), |done, _| seen.push(done.done));
+        run_until_idle(&mut driver, &mut Vec::new(), |done, _| seen.push(done.done))
+        .expect("the effects end");
         assert_eq!(seen, [Done::Read(b"bytes".to_vec())]);
 
         let src = FileName::new("src").unwrap();
@@ -3775,7 +3786,7 @@ mod tests {
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(3) }], |done, _| {
             seen.push(done.done)
-        });
+        }).expect("the effects end");
         let (last, rest) = seen.split_last().expect("unwatched");
         assert_eq!(last, &Done::Unwatched);
         assert!(rest.iter().all(|it| matches!(it, Done::Changed { .. })), "{seen:?}");
@@ -3794,7 +3805,7 @@ mod tests {
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(4) }], |done, _| {
             _ = seen.insert(done.tag.0, done.done)
-        });
+        }).expect("the effects end");
         assert_eq!((seen.get(&4), seen.get(&5)), (Some(&Done::Unwatched), Some(&Done::Synced)));
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
@@ -4034,19 +4045,23 @@ mod tests {
         }
         // Bits no connection was given (an even generation, as a free slot may have) name none.
         let forged = Conn(server.0 ^ 1 << 32);
+        // Polled for its one completion, not run until idle: the listen stays in flight until
+        // its unlisten below (an accept does not end it), so the driver is never idle here.
         let mut seen = Vec::new();
-        let mut send = vec![Effect::Send { conn: forged, bytes: b"x".to_vec(), tag: Tag(5) }];
-        run_until_idle(&mut ring, &mut send, |done, _| seen.push(done.done));
+        ring.submit(&mut vec![Effect::Send { conn: forged, bytes: b"x".to_vec(), tag: Tag(5) }]);
+        poll_until(&mut ring, &mut seen, |seen| !seen.is_empty());
         assert!(
-            matches!(&seen[..], [Done::Broken { buffer, .. }] if buffer.is_empty()),
+            matches!(&seen[..], [Completion { tag: Tag(5), done: Done::Broken { buffer, .. } }]
+                if buffer.is_empty()),
             "{seen:?}"
         );
+        assert_eq!(ring.in_flight(), 1, "only the listen is left in flight");
         let mut effects = vec![
             Effect::Hangup { conn: client, tag: Tag(3) },
             Effect::Hangup { conn: server, tag: Tag(4) },
             Effect::Unlisten { tag: Tag(1) },
         ];
-        run_until_idle(&mut ring, &mut effects, |_, _| {});
+        run_until_idle(&mut ring, &mut effects, |_, _| {}).expect("the effects end");
         assert_eq!(ring.in_flight(), 0);
         assert!(ring.conns.is_empty());
         drop(ring);
@@ -4256,7 +4271,8 @@ mod tests {
             Effect::Read { file: name("plain/under"), at: 0, len: 1, tag: Tag(4) },
         ];
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
         let opened = |tag: u64, path: PathBuf| match &seen[&tag] {
             Done::Failed(IoError(why)) => {
                 let path = path.display().to_string();
@@ -4290,7 +4306,8 @@ mod tests {
 
     fn read_all(driver: &mut Uring, mut effects: Vec<Effect>) -> BTreeMap<u64, Done> {
         let mut seen = BTreeMap::new();
-        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
         seen
     }
 
@@ -4564,7 +4581,7 @@ mod tests {
             Effect::Hangup { conn: server, tag: Tag(6) },
             Effect::Unlisten { tag: Tag(1) },
         ];
-        run_until_idle(&mut ring, &mut effects, |_, _| {});
+        run_until_idle(&mut ring, &mut effects, |_, _| {}).expect("the effects end");
         assert_eq!(ring.in_flight(), 0);
         drop(ring);
         _ = std::fs::remove_dir_all(root);
@@ -4628,7 +4645,7 @@ mod tests {
             }
             Done::HungUp | Done::Unlistened => {}
             other => panic!("{other:?}"),
-        });
+        }).expect("the effects end");
         assert_eq!(got.len(), whole);
         assert!(got[..large.len()] == large[..] && got[large.len()..] == b"tail"[..]);
         assert_eq!(

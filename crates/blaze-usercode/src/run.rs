@@ -879,7 +879,7 @@ mod tests {
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.ready());
         store
     }
@@ -1000,7 +1000,8 @@ mod tests {
             Begun::Running(run) => run,
         };
         let mut done = None;
-        run_until_idle(sim, &mut effects, |completion, _| done = Some(completion));
+        run_until_idle(sim, &mut effects, |completion, _| done = Some(completion))
+        .expect("the effects end");
         let completed =
             run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
         Ok((completed.value, true))

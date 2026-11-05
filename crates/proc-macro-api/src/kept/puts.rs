@@ -225,7 +225,7 @@ mod tests {
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.ready());
         store
     }
@@ -374,7 +374,7 @@ mod tests {
         store.flush(&mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             _ = store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.durable(ticket), "a flushed retraction is durable");
         drop(store);
         // Restored, the record is there: no checkout is given the verified value again.

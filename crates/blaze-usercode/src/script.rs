@@ -774,7 +774,7 @@ mod tests {
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.ready());
         let proof = Proof {
             identity: ContentId::of("blaze v2 test 1", b"pure script"),

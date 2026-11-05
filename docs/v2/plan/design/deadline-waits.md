@@ -132,8 +132,8 @@ Steps, each its own PR:
    signal mask, the ban with callers moved, and the DST.
 3. The daemon's start says what it is inside.
 4. The perf sampler with the context log, fiber attribution on both systems, SIGRT deleted.
-5. Every kernel wait through the ring (Linux floor 7.2, the ix VM kernel; no probe, no
-   fallback; what is adopted is recorded in docs/kernel.md):
+5. Every kernel wait through the ring (Linux floor 7.3, the ix VM kernel, on Andrew's call;
+   no probe, no fallback; what is adopted is recorded in docs/kernel.md):
    - The deadline wait itself: the SQE-embedded timeout (7.1) in place of `EXT_ARG`'s
      separate timespec, and a registered wait region (6.13) holding the deadline and the
      signal mask, so `Ring::enter` passes nothing per call and a retry rewrites only the
@@ -142,7 +142,9 @@ Steps, each its own PR:
      driver's `idle`, `fiber.rs:1455`): each worker parks on its own small ring with
      `IORING_OP_FUTEX_WAIT` (6.7) on its slot word and one absolute timeout for the next
      due job or stall check; `Shared::wake` and `unpark_workers` wake it with
-     `IORING_OP_FUTEX_WAKE` (or a plain `FUTEX_WAKE` from a thread with no ring). The pool's
+     `IORING_OP_FUTEX_WAKE` (or a plain `FUTEX_WAKE` from a thread with no ring). This step
+     needs 7.3: it fixes io_uring futex in-flight accounting, so the waits are private
+     (`FUTEX2_PRIVATE`) only and a wake is not counted as a request in flight. The pool's
      timers are then driven by that timeout instead of being seen only at the next wake.
    - A client thread off a fiber (`pool::block_until`, `pool.rs:2489`) parks the same way.
    - Child processes: `IORING_OP_WAITID` (6.7) on the driver's ring replaces the blocking

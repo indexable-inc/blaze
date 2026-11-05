@@ -593,7 +593,7 @@ fn opened(sim: &mut blaze_core::sim::Sim) -> blaze_cas::Store {
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         _ = store.complete(completion, effects);
-    });
+    }).expect("the effects end");
     assert!(store.ready());
     store
 }
@@ -604,7 +604,7 @@ fn flushed(sim: &mut blaze_core::sim::Sim, store: &mut blaze_cas::Store) {
     store.flush(&mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         _ = store.complete(completion, effects);
-    });
+    }).expect("the effects end");
 }
 
 /// [`ran`] into a real store, through [`verify::keep`].
