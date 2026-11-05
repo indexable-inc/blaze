@@ -46,65 +46,68 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     `runtime-code`.
 16. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed
     fix, and the fix quotes before and after from the spans. Skill: `perf-and-tracing`.
-17. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome;
+17. **ask-the-profile-first**: Answer why a build was slow, reran or used memory from its profile
+    (`blaze explain`, `blaze debug sql`) before guessing or starting a new measurement. Skill:
+    `debugging`.
+18. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome;
     never an open loop or an uncapped spin. Skill: `runtime-code`.
-18. **errors-name-the-thing**: An error names the item it is about and the rule that refused it. Skill:
+19. **errors-name-the-thing**: An error names the item it is about and the rule that refused it. Skill:
     `runtime-code`.
-19. **panics-fail-one-job**: A panic fails only its job, with a typed error; the daemon keeps serving
+20. **panics-fail-one-job**: A panic fails only its job, with a typed error; the daemon keeps serving
     and the build keeps going. Skill: `runtime-code`.
-20. **keys-cover-every-input**: A key covers every input its value depends on; two values under one key
+21. **keys-cover-every-input**: A key covers every input its value depends on; two values under one key
     is a typed refusal, and the fix is the key. Skill: `compiler-correctness`.
-21. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
+22. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
     ran on. Skill: `build-and-test`.
-22. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
+23. **test-the-cause**: Test a causal claim by removing the cause and watching the effect go. Skill:
     `testing`.
-23. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
+24. **whole-ports**: A change to a shared signature or type updates every caller in the same batch, so
     the tree compiles at every save point. Skill: `changing-code`.
-24. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
+25. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
-25. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
+26. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
     fresh build; a restore never silently starts empty. Skill: `testing`.
-26. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
+27. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
-27. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
+28. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
     proving it right. Skill: `changing-code`.
-28. **spec-then-build**: A change that needs a design gets a spec first, then the same lane builds it
+29. **spec-then-build**: A change that needs a design gets a spec first, then the same lane builds it
     right away; a spec is never the deliverable. Skill: `changing-code`.
-29. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
+30. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-30. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
+31. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
     (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
     runtime stay outside. Skill: `compiler-correctness`.
-31. **library-over-language**: Build a feature as a library on the language that exists; when no library
+32. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
     `compiler-correctness`.
-32. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
+33. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-33. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
+34. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-34. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
+35. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
     runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
-35. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
+36. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
-36. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
+37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
-37. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
+38. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-38. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
+39. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
     branch. Skill: `build-and-test`.
-39. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
+40. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
-40. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
+41. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
-41. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
+42. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
-42. **dst-not-review**: Prove concurrent, durable, crash-recovering, billing and data-deletion code with
+43. **dst-not-review**: Prove concurrent, durable, crash-recovering, billing and data-deletion code with
     a Hegel deterministic simulation test whose oracle checks the invariant; a code review is not
     evidence. Skill: `testing`.
-43. **deadline-waits**: Every blocking kernel wait goes through blaze-core's one deadline wait
+44. **deadline-waits**: Every blocking kernel wait goes through blaze-core's one deadline wait
     (`blaze_core::wait`); nothing signals pool threads; a fiber parks on the scheduler, never in the
     kernel. Skill: `runtime-code`.
-44. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
+45. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
     sandbox, ...) where it is more efficient or more capable than the public one; comment which and
     why, and test that its symbol exists. Skill: `runtime-code`.
 

@@ -79,13 +79,13 @@ nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is repla
 
 See [docs/v2/plan/lanes/usercode/macros.md](../../../docs/v2/plan/lanes/usercode/macros.md).
 
-## keys-cover-every-input (rule 20)
+## keys-cover-every-input (rule 21)
 
 A query key, store key, fold key or template key covers every input its value depends on, including
 the data a constant points to and the identity of a closure callee. Two different values under one
 key is a refusal with a typed error, never an overwrite, and the fix is the key, never the check.
 
-## deterministic-output (rule 24)
+## deterministic-output (rule 25)
 
 No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on
 hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds,
@@ -96,7 +96,7 @@ be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run 
 then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
 a test builds twice and compares bytes.
 
-## semantics-in-front-end (rule 30)
+## semantics-in-front-end (rule 31)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
 hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
@@ -108,7 +108,7 @@ end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
-## library-over-language (rule 31)
+## library-over-language (rule 32)
 
 Before adding an attribute, intrinsic or special case to the compiler, write the feature as library
 code on what the language already has: traits, generics, const eval, compile-time reflection

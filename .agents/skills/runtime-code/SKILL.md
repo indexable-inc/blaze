@@ -72,33 +72,33 @@ A thread or fiber that blocks says what it waits for: the wait opens a span nami
 lock, channel, IO or child, and its owner when known. A wait with no name, and time on a worker
 covered by no span, are bugs; the profile test fails on them.
 
-## bounded-progress (rule 17)
+## bounded-progress (rule 18)
 
 Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a retry) has a bound
 (fuel, depth or a deadline from the injected clock) and ends in a typed outcome: done, or a failure
 naming what it was doing, the goal or key, and how far it got. Never an open loop whose only exit is
 success, and never a spin with no cap.
 
-## errors-name-the-thing (rule 18)
+## errors-name-the-thing (rule 19)
 
 An error names the item it is about (the function or instance with its path, the crate, the key, the
 file and line) and the rule that refused it, in the message itself. "a template made against 6
 references is given 7" is unfinished until it says which function and which template.
 
-## panics-fail-one-job (rule 19)
+## panics-fail-one-job (rule 20)
 
 A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with
 a typed error naming the panic and the job; the daemon keeps serving and keep-going (the default;
 `--fail-fast` opts out) keeps building the rest. Formatting an error must not panic: render what
 needs the database while the database is attached.
 
-## no-wait-across-thread-locals (rule 26)
+## no-wait-across-thread-locals (rule 27)
 
 A fiber can resume on another thread after any wait, so nothing held across a wait may be tied to a
 thread: no thread-local borrow, lock guard or `Rc`. Mark regions that must not wait with `NoWait`;
 read thread-locals in `#[inline(never)]` functions that end before any wait.
 
-## deadline-waits (rule 43)
+## deadline-waits (rule 44)
 
 A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on
 the injected clock (a driver's `now()`), recomputes the time left from that clock before every
@@ -119,7 +119,7 @@ deadline, with a planted relative-timeout retry it must catch.
 
 See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
 
-## macos-private-apis (rule 44)
+## macos-private-apis (rule 45)
 
 On macOS, use any private or undocumented interface (Mach calls, libsystem and libdispatch
 internals, `__ulock_wait2`, `kevent_qos`/`kevent_id` workloops, `sandbox_init_with_parameters`,
