@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, Io, Kind, Request, RequestId, Step,
-    client::redirect_to,
+    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, Io, Kind, Proxies, Proxy,
+    ProxyKind, Request, RequestId, Step, client::redirect_to, proxy::Credentials,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -445,7 +445,7 @@ fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
                     client.complete(Completion::Sent { conn });
                 }
                 Io::Recv { .. } | Io::Close { .. } => {}
-                Io::Connect { .. } => panic!("a second connect"),
+                Io::Connect { .. } | Io::Resolve { .. } => panic!("a second connect"),
             }
         }
         let mut plain = [0u8; 4096];
@@ -496,4 +496,258 @@ fn tls_is_spoken_through_rustls_sans_io() {
     };
     assert_eq!(host, "other.test");
     assert!(why.contains("certificate"), "{why}");
+}
+
+/// A client whose connections go through `proxies`; its TLS has no roots, and no test of it
+/// gets past TLS's first message.
+fn proxied(proxies: Proxies) -> Client {
+    let tls = crate::roots::with_roots(rustls::RootCertStore::empty()).unwrap();
+    Client::new(Config { proxies, ..Config::new(tls, "blaze-test", TIMEOUT) })
+}
+
+fn proxy(kind: ProxyKind, host: &str, port: u16, auth: Option<(&str, &str)>) -> Proxy {
+    let auth = auth.map(|(user, password)| Credentials {
+        user: user.to_owned(),
+        password: Some(password.to_owned()),
+    });
+    Proxy { kind, host: host.to_owned(), port, auth }
+}
+
+/// The connect `client` asks first, to `host:port`: its connection, connected.
+fn connected(client: &mut Client, host: &str, port: u16) -> ConnId {
+    let asked = ios(client);
+    let Some(Io::Connect { conn, host: to, port: at }) = asked.first().cloned() else {
+        panic!("no connect first: {asked:?}")
+    };
+    assert_eq!((to.as_str(), at), (host, port), "{asked:?}");
+    client.complete(Completion::Connected { conn });
+    conn
+}
+
+/// An `http` origin through an HTTP proxy is asked of the proxy in absolute form, with the
+/// proxy's credentials and the origin's `Host`; no tunnel is opened.
+#[test]
+fn an_http_origin_through_an_http_proxy_is_asked_in_absolute_form() {
+    let through = proxy(ProxyKind::Http, "proxy.test", 3128, Some(("u", "p")));
+    let mut client = proxied(Proxies { http: Some(through), ..Proxies::none() });
+    client.request(RequestId(1), Request::get("http://user:secret@example.test/a?x=1")).unwrap();
+    let conn = connected(&mut client, "proxy.test", 3128);
+    let written = String::from_utf8(sent(&mut client, conn)).unwrap();
+    assert!(
+        written.starts_with(
+            "GET http://example.test/a?x=1 HTTP/1.1\r\nhost: example.test\r\nproxy-authorization: Basic dTpw\r\n"
+        ),
+        "{written}"
+    );
+    assert!(!written.contains("secret"), "{written}");
+    received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    assert_eq!(answer(&events(&mut client)), (200, b"ok".to_vec(), true));
+}
+
+/// An `https` origin through an HTTP proxy tunnels through `CONNECT`, its TLS starting only
+/// once the proxy said yes; a proxy that says no fails the request in the proxy's step, naming
+/// the proxy and its status.
+#[test]
+fn an_https_origin_tunnels_through_connect() {
+    let through = proxy(ProxyKind::Http, "proxy.test", 3128, None);
+    let mut client = proxied(Proxies { https: Some(through.clone()), ..Proxies::none() });
+    client.request(RequestId(1), Request::get("https://example.test/a")).unwrap();
+    let conn = connected(&mut client, "proxy.test", 3128);
+    assert_eq!(
+        String::from_utf8(sent(&mut client, conn)).unwrap(),
+        "CONNECT example.test:443 HTTP/1.1\r\nhost: example.test:443\r\n\r\n"
+    );
+    received(&mut client, conn, b"HTTP/1.1 200 Connection established\r\n\r\n");
+    let hello = sent(&mut client, conn);
+    assert_eq!(hello.first(), Some(&0x16), "TLS's first record, a handshake: {hello:?}");
+
+    let mut client = proxied(Proxies { https: Some(through), ..Proxies::none() });
+    client.request(RequestId(1), Request::get("https://example.test/a")).unwrap();
+    let conn = connected(&mut client, "proxy.test", 3128);
+    sent(&mut client, conn);
+    received(
+        &mut client,
+        conn,
+        b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+    );
+    let got = events(&mut client);
+    let error = failed(&got);
+    let Kind::Io { step: Step::Proxy, host, port: 443, why } = &error.kind else {
+        panic!("{error:?}")
+    };
+    assert_eq!(host, "example.test");
+    assert!(why.contains("proxy.test:3128") && why.contains("407"), "{why}");
+    assert!(ios(&mut client).contains(&Io::Close { conn }));
+}
+
+/// `socks5h://` names the origin to the proxy, after its user and password; `socks5://`
+/// resolves it first and names it by its address. The request follows the tunnel as it would
+/// go direct.
+#[test]
+fn socks5_opens_a_tunnel_by_name_or_by_address() {
+    let through =
+        proxy(ProxyKind::Socks5 { remote_dns: true }, "127.0.0.1", 1080, Some(("u", "p")));
+    let mut client = proxied(Proxies { http: Some(through), ..Proxies::none() });
+    client.request(RequestId(1), Request::get("http://example.test/a")).unwrap();
+    let conn = connected(&mut client, "127.0.0.1", 1080);
+    assert_eq!(sent(&mut client, conn), [5u8, 2, 0, 2]);
+    received(&mut client, conn, &[5, 2]);
+    assert_eq!(sent(&mut client, conn), [1, 1, b'u', 1, b'p']);
+    received(&mut client, conn, &[1, 0]);
+    let mut asked = vec![5, 1, 0, 3, 12];
+    asked.extend_from_slice(b"example.test");
+    asked.extend_from_slice(&[0, 80]);
+    assert_eq!(sent(&mut client, conn), asked);
+    received(&mut client, conn, &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    assert!(sent(&mut client, conn).starts_with(b"GET /a HTTP/1.1\r\nhost: example.test\r\n"));
+    received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    assert_eq!(answer(&events(&mut client)), (200, b"ok".to_vec(), true));
+
+    let through = proxy(ProxyKind::Socks5 { remote_dns: false }, "127.0.0.1", 1080, None);
+    let mut client = proxied(Proxies { http: Some(through), ..Proxies::none() });
+    client.request(RequestId(1), Request::get("http://example.test/a")).unwrap();
+    let asked = ios(&mut client);
+    let Some(Io::Resolve { conn, host }) = asked.first().cloned() else { panic!("{asked:?}") };
+    assert_eq!(host, "example.test");
+    let addresses = vec!["10.0.0.1".parse().unwrap()];
+    client.complete(Completion::Resolved { conn, addresses });
+    assert_eq!(connected(&mut client, "127.0.0.1", 1080), conn);
+    assert_eq!(sent(&mut client, conn), [5u8, 1, 0]);
+    received(&mut client, conn, &[5, 0]);
+    assert_eq!(sent(&mut client, conn), [5u8, 1, 0, 1, 10, 0, 0, 1, 0, 80]);
+}
+
+/// `vars` as the environment, names matched exactly, or ignoring case as on Windows.
+fn from_vars(vars: &[(&str, &str)], windows: bool) -> Result<Proxies, crate::ProxyError> {
+    Proxies::from_vars(
+        |name| {
+            vars.iter()
+                .find(
+                    |(key, _)| if windows { key.eq_ignore_ascii_case(name) } else { *key == name },
+                )
+                .map(|(_, value)| (*value).into())
+        },
+        windows,
+    )
+}
+
+/// The host of the proxy an origin goes through, if any.
+fn via(proxies: &Proxies, https: bool, host: &str) -> Option<String> {
+    proxies.of(https, host).map(|it| it.host.clone())
+}
+
+/// The variables are read as curl and cargo read them: cargo's override first (empty turns
+/// the others off), then the lower-case name over the upper, the scheme's own over `all_proxy`;
+/// under CGI `HTTP_PROXY` is not trusted, nor, on Windows, `http_proxy`.
+#[test]
+fn proxy_variables_are_read_as_curl_and_cargo_read_them() {
+    for windows in [false, true] {
+        let off = from_vars(
+            &[
+                ("CARGO_HTTP_PROXY", ""),
+                ("HTTPS_PROXY", "http://inherited.test"),
+                ("ALL_PROXY", "ftp://not-a-proxy.test"),
+            ],
+            windows,
+        )
+        .unwrap();
+        assert_eq!((via(&off, true, "o.test"), via(&off, false, "o.test")), (None, None));
+        let cargo = from_vars(
+            &[("CARGO_HTTP_PROXY", "cargo.test:8080"), ("https_proxy", "ftp://x.test")],
+            windows,
+        )
+        .unwrap();
+        assert_eq!(via(&cargo, true, "o.test").as_deref(), Some("cargo.test"));
+        assert_eq!(
+            cargo.https.as_ref().map(|it| (it.kind, it.port)),
+            Some((ProxyKind::Http, 8080))
+        );
+    }
+
+    let lower = from_vars(
+        &[("https_proxy", "http://lower.test"), ("HTTPS_PROXY", "ftp://upper.test")],
+        false,
+    )
+    .unwrap();
+    assert_eq!(via(&lower, true, "o.test").as_deref(), Some("lower.test"));
+    let all = from_vars(&[("ALL_PROXY", "socks5h://all.test"), ("http_proxy", "own.test")], false)
+        .unwrap();
+    assert_eq!(via(&all, true, "o.test").as_deref(), Some("all.test"));
+    assert_eq!(via(&all, false, "o.test").as_deref(), Some("own.test"));
+
+    let upper = [("HTTP_PROXY", "http://upper.test")];
+    assert_eq!(
+        via(&from_vars(&upper, false).unwrap(), false, "o.test").as_deref(),
+        Some("upper.test")
+    );
+    let cgi = [("REQUEST_METHOD", "GET"), ("HTTP_PROXY", "http://untrusted.test")];
+    assert_eq!(via(&from_vars(&cgi, false).unwrap(), false, "o.test"), None);
+    let cgi = [("REQUEST_METHOD", "GET"), ("Http_Proxy", "http://untrusted.test")];
+    assert_eq!(via(&from_vars(&cgi, true).unwrap(), false, "o.test"), None);
+    let cgi = [("REQUEST_METHOD", "GET"), ("http_proxy", "http://trusted.test")];
+    assert_eq!(
+        via(&from_vars(&cgi, false).unwrap(), false, "o.test").as_deref(),
+        Some("trusted.test")
+    );
+}
+
+/// `no_proxy` takes names with their subdomains, addresses and ranges; `*` is everything.
+#[test]
+fn no_proxy_takes_names_addresses_and_ranges() {
+    let proxies = from_vars(
+        &[
+            ("https_proxy", "http://proxy.test:3128"),
+            ("no_proxy", ".internal.test, localhost 10.0.0.0/8,[::1],*.corp.test"),
+            ("NO_PROXY", "upper.test"),
+        ],
+        false,
+    )
+    .unwrap();
+    for direct in
+        ["internal.test", "a.b.internal.test", "LOCALHOST", "10.1.2.3", "::1", "x.corp.test"]
+    {
+        assert_eq!(via(&proxies, true, direct), None, "{direct}");
+    }
+    for proxied in ["xinternal.test", "upper.test", "11.0.0.1", "::2", "example.test"] {
+        assert_eq!(via(&proxies, true, proxied).as_deref(), Some("proxy.test"), "{proxied}");
+    }
+    let all = from_vars(&[("https_proxy", "proxy.test"), ("NO_PROXY", "*")], false).unwrap();
+    assert_eq!(via(&all, true, "example.test"), None);
+}
+
+/// A proxy's port is curl's 1080 when it names none, and the one it names otherwise, `:80`
+/// too; its user and password are percent-decoded.
+#[test]
+fn a_proxy_address_is_read_as_curl_reads_it() {
+    let read = |value: &str| from_vars(&[("https_proxy", value)], false).unwrap().https.unwrap();
+    assert_eq!(read("proxy.test").port, 1080);
+    assert_eq!(read("http://proxy.test:80").port, 80);
+    let socks = read("SOCKS5H://us%40er:p%3Ass@[::1]:9050");
+    assert_eq!(
+        (socks.kind, socks.host.as_str(), socks.port),
+        (ProxyKind::Socks5 { remote_dns: true }, "::1", 9050)
+    );
+    let auth = socks.auth.unwrap();
+    assert_eq!((auth.user.as_str(), auth.password.as_deref()), ("us@er", Some("p:ss")));
+    assert_eq!(read("socks4a://user@proxy.test").kind, ProxyKind::Socks4 { remote_dns: true });
+}
+
+/// A variable that can't be used is an error naming it, never quoting its value.
+#[test]
+fn a_proxy_that_cannot_be_used_is_refused_naming_its_variable() {
+    for value in [
+        "ftp://private-user:private-password@proxy.test",
+        "https://private-user:private-password@proxy.test",
+        "http://private-user:private-password@proxy.test:bad port",
+        "socks4://private-user:private-password@proxy.test",
+        "socks5h://private-user:private-password@",
+    ] {
+        let error = from_vars(&[("HTTPS_PROXY", value)], false).unwrap_err();
+        assert_eq!(error.var, "HTTPS_PROXY", "{value}");
+        let said = error.to_string();
+        assert!(said.contains("HTTPS_PROXY"), "{said}");
+        assert!(!said.contains("private-user") && !said.contains("private-password"), "{said}");
+    }
+    let error = from_vars(&[("no_proxy", "10.0.0.0/33")], false).unwrap_err();
+    assert_eq!(error.var, "no_proxy");
 }

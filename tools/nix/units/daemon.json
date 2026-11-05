@@ -3158,10 +3158,16 @@
    },
    {
     "dependencies": [
-     "cc"
+     "cc",
+     "flecs-distr"
     ],
     "name": "flecs-c",
     "version": "0.1.0"
+   },
+   {
+    "name": "flecs-distr",
+    "source": "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0",
+    "version": "4.2.0"
    },
    {
     "checksum": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
@@ -13327,7 +13333,7 @@
   },
   "flecs-c@0.1.0": {
    "authors": "",
-   "description": "Flecs's amalgamated C (flecs/) built with cc, plus the declarations Rust calls it through",
+   "description": "Flecs's amalgamated C (the indexable-inc/flecs fork's, pinned below) built with cc, plus the declarations Rust calls it through",
    "homepage": "",
    "license": "MIT",
    "license_file": "",
@@ -13341,6 +13347,25 @@
     "kind": "path"
    },
    "version": "0.1.0"
+  },
+  "flecs-distr@4.2.0": {
+   "authors": "",
+   "description": "Where this fork's amalgamated flecs (distr/flecs.c, distr/flecs.h) is, for a build script that compiles it with its own defines. Builds nothing itself.",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "flecs-distr",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/flecs",
+   "rust_version": "",
+   "source": {
+    "dir": "distr",
+    "kind": "git",
+    "rev": "ab8b8e051c6f8ac014557136c97847941bd3caa0",
+    "url": "https://github.com/indexable-inc/flecs"
+   },
+   "version": "4.2.0"
   },
   "fnv@1.0.7": {
    "authors": "Alex Crichton <alex@alexcrichton.com>",
@@ -30772,6 +30797,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -30846,6 +30875,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -56629,6 +56678,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -56703,6 +56756,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -82307,6 +82380,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -82381,6 +82458,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -108154,6 +108251,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -108228,6 +108329,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": 16,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",

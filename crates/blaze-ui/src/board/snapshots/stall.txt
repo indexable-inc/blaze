@@ -1,0 +1,16 @@
+-- full 100x20
+ blaze test  compiling                                                      100 of 120 tasks   3m20s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  0 running · 1 ready · 19 waiting
+ memory  ━━━━━━──────────────  8.0 of 24.0 GB
+ ⚠ stalled: nothing settled for 45.0s; no worker busy, no download moving
+
+ workers  0 busy · 16 idle
+
+ blocked on
+   link blaze-cargo blaze  ready 45.0s  holds 19  chain 3
+     blaze-cargo test, blaze-ui test, +17
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- line
+[3m20s] compiling 100/120 · 0/16 busy · mem 8.0/24.0 GB · on link blaze-cargo blaze (ready 45.0s), holds 19 · stalled: nothing settled for 45.0s

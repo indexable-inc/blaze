@@ -5,6 +5,8 @@ date: 2026-10-29
 ---
 # Memory, the way a game engine does it
 
+Where this leads: [memory-pool.md](../../../memory-pool.md), memory as one buffer pool with one evictor.
+
 A game has a frame budget and never calls `malloc` per frame. blaze's frame is an edit: from
 a file changing to code patched in. The warm loop should allocate nothing from the
 general-purpose allocator. Every byte comes from an allocator chosen by how long it lives.

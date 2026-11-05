@@ -1,0 +1,47 @@
+-- over full 100x30
+ memory  ━━━━━━━━━━━━━━━━━━━━  106.3 of 25.8 GB  OVER THE LIMIT
+ blaze test  compiling                                                     488 of 570 tasks   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  1 running · 81 waiting
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+
+ workers  1 busy · 15 idle
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+
+ blocked on
+   codegen core  running 4m30s  holds 82  chain 41
+     std build script, libc build script, alloc lib, +79
+
+ slowest so far
+   bodies hir-ty 1m12s · codegen syntax 48.0s · script-run ring 31.0s
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- over inline 100x6
+ blaze test  compiling  488/570  1/16 busy  mem 106.3/25.8 GB                                 15m14s
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+ blocked on codegen core  running 4m30s  holds 82  chain 41
+
+-- over line
+[15m14s] compiling 488/570 · 1/16 busy · mem 106.3/25.8 GB over the limit · on codegen core (core::ptr::is_freeze, 4m30s), holds 82 · slow: nothing settled for 4m30s
+
+-- squeezed full 100x30
+ blaze test  compiling                                                     488 of 570 tasks   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  1 running · 81 waiting
+ memory  23.1 of 25.8 GB  peak 24.2 GB  squeezed: mir over its share, 3 tasks held back, 2 releases
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+
+ workers  1 busy · 15 idle
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+
+ blocked on
+   codegen core  running 4m30s  holds 82  chain 41
+     std build script, libc build script, alloc lib, +79
+
+ slowest so far
+   bodies hir-ty 1m12s · codegen syntax 48.0s · script-run ring 31.0s
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- squeezed line
+[15m14s] compiling 488/570 · 1/16 busy · mem 23.1/25.8 GB squeezed · on codegen core (core::ptr::is_freeze, 4m30s), holds 82 · slow: nothing settled for 4m30s

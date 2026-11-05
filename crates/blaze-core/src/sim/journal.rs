@@ -396,8 +396,6 @@ impl Disk {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::{
         Completion, Done, Driver, Effect, Names, Tag,
@@ -418,7 +416,7 @@ mod tests {
         let (mut out, mut done) = (Vec::new(), Vec::new());
         loop {
             sim.submit(&mut effects);
-            sim.poll(&mut done, Duration::ZERO);
+            sim.poll(&mut done, crate::wait::Deadline::NEVER);
             for Completion { tag, done } in done.drain(..) {
                 assert_eq!(tag, Tag(5));
                 match done {
@@ -475,7 +473,7 @@ mod tests {
         let mut done = Vec::new();
         sim.submit(&mut effects);
         while sim.in_flight() > 0 {
-            sim.poll(&mut done, Duration::ZERO);
+            sim.poll(&mut done, crate::wait::Deadline::NEVER);
         }
         done.sort_by_key(|it| it.tag);
         let b = stamp(&mut sim, "src/b.rs");
@@ -528,13 +526,13 @@ mod tests {
         let mut effects = vec![Effect::Journal { dir: name("src"), since: saved, tag: Tag(5) }];
         let mut done = Vec::new();
         sim.submit(&mut effects);
-        sim.poll(&mut done, Duration::ZERO);
+        sim.poll(&mut done, crate::wait::Deadline::NEVER);
         let Done::Journaled(first) = &done[0].done else { panic!("{done:?}") };
         assert_eq!(first.lost, [(name("src"), Lost::NoJournal)]);
         assert!(first.caught_up && first.cursor == Cursor::None);
         done.clear();
         sim.change(&name("src/x.rs"), b"x");
-        sim.poll(&mut done, Duration::ZERO);
+        sim.poll(&mut done, crate::wait::Deadline::NEVER);
         let Done::Journaled(live) = &done[0].done else { panic!("{done:?}") };
         assert_eq!(live.files, [name("src/x.rs")]);
     }

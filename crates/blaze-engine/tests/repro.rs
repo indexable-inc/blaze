@@ -408,6 +408,24 @@ fn a_promoted_temporary_with_its_place_in_it_runs() {
     assert_eq!(case.ok(&["run"]), "main.rs:16\nmain.rs:11\n");
 }
 
+/// sqlx's `#[sqlx::test(migrations = "..")]` passes `&Migrator { migrations: Cow::Borrowed(const
+/// { &[..] }), .., ..Migrator::DEFAULT }` where a `&'static Migrator` is wanted: a record literal
+/// with a constant base, and a `const { .. }` block, are promoted, as rustc promotes them. blaze
+/// promoted neither, so its borrow checker refused every such test (E0716). Each borrow here
+/// outlives its function and is read after a call has written over that frame.
+#[test]
+fn a_record_literal_with_a_constant_base_is_promoted() {
+    let case = Case::new("a_record_literal_with_a_constant_base_is_promoted");
+    assert_eq!(
+        case.ok(&["run"]),
+        "Migrator { migrations: [1, 2, 3], locking: true, table: \"_migrations\" }\n\
+         Migrator { migrations: [], locking: true, table: \"_migrations\" }\n\
+         State { state: Empty, n: 7 }\n\
+         None\n\
+         0\n"
+    );
+}
+
 /// object's `ImageSymbol::name`, a provided trait method generic over its reader, reached
 /// through `CoffFile` (psm's build script, through ar_archive_writer): its references held a
 /// call of a trait method `distance` resolved to no impl, so the function was refused.

@@ -11,9 +11,10 @@
 //! `Content-Length`, `chunked` or the connection's close, decodes gzip where it asked for it,
 //! holds each body to its bound, follows redirects (at most [`REDIRECTS`]), keeps connections
 //! between requests in a pool keyed by origin (scheme, host, port) with an idle expiry and an
-//! idle cap, and turns every timeout into a deadline on the clock it is given
-//! ([`Client::advance_clock`]). Bytes and completions go in; IO to do ([`Io`]), events for the
-//! asker ([`Event`]) and the next deadline come out.
+//! idle cap, goes through the proxy its config names for an origin ([`proxy`]: an HTTP
+//! `CONNECT` tunnel, a request in absolute form, or SOCKS5 or SOCKS4), and turns every timeout
+//! into a deadline on the clock it is given ([`Client::advance_clock`]). Bytes and completions
+//! go in; IO to do ([`Io`]), events for the asker ([`Event`]) and the next deadline come out.
 //!
 //! # The driver contract
 //!
@@ -31,7 +32,11 @@
 //! 3. **IO.** After every call into the core, drain [`Client::next_io`] and do each [`Io`]:
 //!    - [`Io::Connect`]: resolve the host and open a TCP connection to it, then
 //!      [`Completion::Connected`] or [`Completion::ConnectFailed`] (with why, from the
-//!      system). TLS is the core's: the driver only moves bytes.
+//!      system). TLS is the core's, and so is a proxy's handshake: the driver only moves
+//!      bytes, and `host` is the proxy's when the connection goes through one.
+//!    - [`Io::Resolve`]: resolve the name, then [`Completion::Resolved`] with its addresses
+//!      or [`Completion::ResolveFailed`] (with why). Asked only for a proxy given the origin
+//!      by its address (`socks4://`, `socks5://`); the connection's [`Io::Connect`] follows.
 //!    - [`Io::Send`]: write all of the bytes, then [`Completion::Sent`] or
 //!      [`Completion::Broken`]. At most one send per connection is in flight.
 //!    - [`Io::Recv`]: read what the peer sent, up to any amount the driver picks (the tokio
@@ -58,7 +63,8 @@
 //! rustls checks a server's certificate against the wall clock through its own
 //! `TimeProvider`; that is the one clock read under the core, and it is rustls's.
 //!
-//! [`roots`] reads the machine's root certificates, outside the core, once per client.
+//! [`roots`] reads the machine's root certificates, outside the core, once per client;
+//! [`proxy_env`] the proxy variables, the same way.
 
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -68,6 +74,8 @@ mod gzip;
 pub mod h1;
 pub mod h3;
 mod pool;
+pub mod proxy;
+pub mod proxy_env;
 pub mod roots;
 mod tls;
 #[cfg(feature = "tokio")]
@@ -80,3 +88,4 @@ pub use client::{
     Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, REDIRECTS,
     Request, RequestId, Step, WINDOW,
 };
+pub use proxy::{Proxies, Proxy, ProxyError, ProxyKind};

@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+pub mod ceiling;
 mod daemon;
 mod fetch;
 mod fetch_url;
@@ -23,6 +24,8 @@ mod gc;
 mod heads;
 mod image;
 mod job;
+#[cfg(all(unix, feature = "native"))]
+mod machine;
 mod mounts;
 mod native;
 pub mod observe;
@@ -55,6 +58,14 @@ use anyhow::{Context, bail};
 use blaze_core::{Confine, FileName};
 
 pub use daemon::{Daemon, Options};
+#[cfg(all(unix, feature = "native"))]
+pub use machine::Machine;
+
+/// Where blaze keeps no machine's memory ledger (the seed's one-shot build, which is one
+/// process of its own; Windows, which has no `/tmp/blaze-<uid>` yet): there is no place in one
+/// to hold, so [`Options::machine`] is always `None`.
+#[cfg(not(all(unix, feature = "native")))]
+pub enum Machine {}
 
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
@@ -402,6 +413,15 @@ fn writer_of(state: &Path) -> anyhow::Result<blaze_ids::ContentId> {
 /// An absolute path as the driver names it: the driver's root is `/`.
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
+    // The driver's root / is joined with the name, and C:/dir joined to it is itself: a drive path is its own
+    // name, as the daemon's `/C:/dir` is once its root is taken off.
+    #[cfg(windows)]
+    let (text, rest) = match (path.is_absolute(), text.replace('\\', "/")) {
+        (true, name) => (text, name),
+        (false, name) if name.starts_with('/') => (text, name[1..].to_owned()),
+        (false, _) => bail!("{text} is not an absolute path"),
+    };
+    #[cfg(not(windows))]
     let Some(rest) = text.strip_prefix('/') else { bail!("{text} is not an absolute path") };
     FileName::new(rest.trim_end_matches('/'))
         .with_context(|| format!("{text} has an empty, `.` or `..` part"))
@@ -521,6 +541,18 @@ pub(crate) fn told_limit(
     told_memory(MEMORY_VAR, &text).map(Some)
 }
 
+/// The machine budget the engine was told: [`machine::MACHINE_VAR`]'s (`var`, as the
+/// environment has it) in GiB, else none, when it is made from the machine's limits
+/// ([`blaze_graph::arena::machine_wide`]).
+#[cfg(all(unix, feature = "native"))]
+fn told_machine(var: Option<std::ffi::OsString>) -> anyhow::Result<Option<(u64, String)>> {
+    let Some(var) = var else { return Ok(None) };
+    let text = var.into_string().map_err(|it| {
+        anyhow::anyhow!("{} {} is not UTF-8", machine::MACHINE_VAR, it.to_string_lossy())
+    })?;
+    told_memory(machine::MACHINE_VAR, &text).map(Some)
+}
+
 /// What a start says of the limit it runs under (`budget`, [`blaze_graph::arena::machine_budget`]'s):
 /// its bytes and what told it, and when a build's release is due under it
 /// ([`blaze_graph::admission::Squeeze`]): past the limit's line, or one subsystem a release
@@ -560,7 +592,8 @@ fn activated() -> anyhow::Result<blaze_api::activation::Passed> {
 /// What `blaze serve --ready-fd N` writes on that pipe: a byte as it enters each phase of its
 /// start, in order, then [`Phase::Listening`]'s once its socket is bound. That last is the
 /// word of the CLI that started it to connect, which it never does before; when the start
-/// stops short, the CLI names the last phase it read.
+/// stops short, the CLI names the last phase it read, and the last [`INSIDE`] record, which
+/// the start writes between phases to say what its thread is inside.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Phase {
     /// Nothing said yet: the process started, and finds its executable's build and its state.
@@ -601,6 +634,29 @@ impl Phase {
             Phase::Listening => "listening",
         }
     }
+}
+
+/// The tag of the other record `blaze serve --ready-fd N` writes on that pipe, between its
+/// phases' bytes until it listens: what the thread of its start is inside now ([`Ready`]'s
+/// reporter, every [`REPORT_EVERY`]). The tag, then the text's length as a little-endian `u16`,
+/// then that many bytes of UTF-8, at most [`INSIDE_MAX`]: "`open store` (1.2s open)", or none
+/// when the thread is inside no span. No [`Phase`] has this byte.
+pub const INSIDE: u8 = b'i';
+
+/// The most bytes of text an [`INSIDE`] record carries; longer text is cut at a character's
+/// boundary at or before it.
+pub const INSIDE_MAX: usize = 512;
+
+/// Appends to `out` the [`INSIDE`] record that says `text`, cut to [`INSIDE_MAX`] bytes.
+pub fn inside_record(text: &str, out: &mut Vec<u8>) {
+    let mut end = text.len().min(INSIDE_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push(INSIDE);
+    // At most `INSIDE_MAX`, which a `u16` holds.
+    out.extend_from_slice(&(end as u16).to_le_bytes());
+    out.extend_from_slice(&text.as_bytes()[..end]);
 }
 
 /// How long a daemon that starts waits for the one before it on the same state to end: that
@@ -685,7 +741,7 @@ const STOPPED: &str = "stopped";
 #[cfg(unix)]
 fn hold(
     state: &Path,
-    ready: Option<&mut std::fs::File>,
+    ready: Option<&Ready>,
 ) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
     use std::{
         io::{Read as _, Seek as _, Write as _},
@@ -757,12 +813,109 @@ fn hold(
     Ok((file, before))
 }
 
-/// Says `phase` on the ready pipe, if there is one. The CLI that waits may be gone, and then
-/// nobody is to be told.
-fn say(ready: Option<&mut std::fs::File>, phase: Phase) {
-    if let Some(ready) = ready {
-        _ = std::io::Write::write_all(ready, &[phase.byte()]);
+/// The pipe of `blaze serve --ready-fd N` ([`Phase`]), and the thread that says on it, every
+/// [`REPORT_EVERY`] until the daemon listens, what the thread of its start is inside
+/// ([`INSIDE`]). One lock holds the pipe for both, so no record cuts into another, and none
+/// follows [`Phase::Listening`]'s byte: the pipe is closed as that is said, or as this drops
+/// with a start that failed, and the reporter ends at its next tick, finding it gone.
+pub(crate) struct Ready {
+    pipe: Arc<parking_lot::Mutex<Option<std::fs::File>>>,
+}
+
+impl Ready {
+    /// The pipe, its reporter started: the calling thread is the start's, which it reports on.
+    #[cfg(all(unix, feature = "native"))]
+    fn new(pipe: std::fs::File) -> anyhow::Result<Ready> {
+        let pipe = Arc::new(parking_lot::Mutex::new(Some(pipe)));
+        let starting = blaze_profile::starting::Starting::here();
+        let reported = Arc::clone(&pipe);
+        std::thread::Builder::new()
+            .name("blaze-serve-start".to_owned()) // alloc: once a start
+            .spawn(move || report(&reported, starting))
+            .context(
+                "starting the thread that says on the ready pipe what the daemon's start is inside",
+            )?;
+        Ok(Ready { pipe })
     }
+
+    /// Says `phase`, closing the pipe once it is [`Phase::Listening`]. The CLI that waits may be
+    /// gone, and then nobody is to be told.
+    fn say(&self, phase: Phase) {
+        let mut pipe = self.pipe.lock();
+        if let Some(file) = pipe.as_mut() {
+            _ = std::io::Write::write_all(file, &[phase.byte()]);
+        }
+        if phase == Phase::Listening {
+            *pipe = None;
+        }
+    }
+}
+
+impl Drop for Ready {
+    /// A start that ends without listening closes the pipe: the CLI hears it end.
+    fn drop(&mut self) {
+        *self.pipe.lock() = None;
+    }
+}
+
+/// Says `phase` on the ready pipe, if there is one ([`Ready::say`]).
+fn say(ready: Option<&Ready>, phase: Phase) {
+    if let Some(ready) = ready {
+        ready.say(phase);
+    }
+}
+
+/// How often [`Ready`]'s reporter says what the start's thread is inside.
+#[cfg(all(unix, feature = "native"))]
+const REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// The most reports [`Ready`]'s reporter writes: a start's phases are bounded (the CLI waits
+/// [`BEFORE_ENDS`] and a minute a phase), so a start still going past ten minutes on top of
+/// that has long been given up on, and the reporter stops, saying so in the log.
+#[cfg(all(unix, feature = "native"))]
+const REPORTS_MAX: u64 = (BEFORE_ENDS.as_secs() + 600) * 1000 / REPORT_EVERY.as_millis() as u64;
+
+/// [`Ready`]'s reporter: every [`REPORT_EVERY`], an [`INSIDE`] record of what `starting` is
+/// inside, until the pipe is gone (the daemon listens, or its start failed), a write fails (the
+/// CLI that waited is gone) or [`REPORTS_MAX`]. Each tick waits for an absolute deadline taken
+/// as the tick before ended, so nothing restarts a wait that is interrupted.
+#[cfg(all(unix, feature = "native"))]
+fn report(
+    pipe: &parking_lot::Mutex<Option<std::fs::File>>,
+    starting: blaze_profile::starting::Starting,
+) {
+    use blaze_core::wait::{Clock, Deadline, Monotonic, sleep_until};
+    let clock = Monotonic::new();
+    // alloc: one record's bytes, reused by every report of a start
+    let mut record = Vec::with_capacity(3 + INSIDE_MAX);
+    let mut deadline = Deadline::after(Clock::now(&clock), REPORT_EVERY);
+    for _ in 0..REPORTS_MAX {
+        if let Err(error) =
+            sleep_until("the next report of what the daemon's start is inside", deadline, &clock)
+        {
+            eprintln!(
+                "blaze serve: the report on its ready pipe of what its start is inside stops: {error}"
+            );
+            return;
+        }
+        deadline = Deadline::after(Clock::now(&clock), REPORT_EVERY);
+        // alloc: the report's text, every 500 ms of a start
+        let text = starting.inside().map(|it| it.to_string()).unwrap_or_default();
+        record.clear();
+        inside_record(&text, &mut record);
+        let mut pipe = pipe.lock();
+        // Gone: the daemon listens, or its start failed.
+        let Some(file) = pipe.as_mut() else { return };
+        if std::io::Write::write_all(file, &record).is_err() {
+            // The CLI that waited is gone: nobody is to be told.
+            return;
+        }
+    }
+    eprintln!(
+        "blaze serve: the report on its ready pipe of what its start is inside stops after {REPORTS_MAX} reports, \
+         {}s: the start has not listened, and the CLI that started it gave up long ago",
+        REPORTS_MAX * REPORT_EVERY.as_millis() as u64 / 1000
+    );
 }
 
 /// The pipe of `blaze serve --ready-fd N`, made this process's: close-on-exec from here on.
@@ -811,7 +964,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     }
     // First too: nothing this process starts may inherit the pipe.
     #[cfg(unix)]
-    let ready = args.ready.map(ready).transpose()?;
+    let ready = args.ready.map(ready).transpose()?.map(Ready::new).transpose()?;
     #[cfg(not(unix))]
     let ready = match args.ready {
         Some(_) => bail!("blaze serve --ready-fd: the CLI starts the daemon so on Unix only"),
@@ -822,7 +975,6 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
             .with_context(|| format!("the socket {}", socket.display()))?,
         None => socket()?,
     };
-    let mut ready = ready;
     let serving = Serving {
         socket: Some(socket),
         http: args.http,
@@ -831,8 +983,16 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         stall: args.stall,
         memory: args.memory,
     };
-    let engine = engine(serving, ready.as_mut())?;
-    let mut running = start(engine, "blaze serve", ready.as_mut())?;
+    let engine = engine(serving, ready.as_ref())?;
+    // The hard ceiling (docs/memory-budget.md section 7, Hard), set before the daemon restores
+    // its image or takes a request: the kernel's limit where this process may set one, and the
+    // stop's guard's watch, at the budget itself (the machine's 3/4, or `--memory-gb`). In
+    // `blaze serve` alone, whose process is the daemon's own: never the one-shot build's or a
+    // test's, whose process is another's too.
+    if let Some(budget) = &engine.options.budget {
+        ceiling::hold(budget.bytes, &budget.from)?;
+    }
+    let mut running = start(engine, "blaze serve", ready.as_ref())?;
     // blaze's update check (docs/install.md, "Updates"), off the loop, for the daemon's life.
     let _updates =
         crate::release::watch_updates().context("starting the daemon's update check thread")?;
@@ -887,7 +1047,7 @@ struct Held {
 /// of `blaze serve --ready-fd`, hears if it waits for the engine before it on the same state.
 pub(crate) fn engine(
     serving: Serving,
-    ready: Option<&mut std::fs::File>,
+    ready: Option<&Ready>,
 ) -> anyhow::Result<Engine> {
     let state = state()?;
     std::fs::create_dir_all(&state)
@@ -989,6 +1149,23 @@ pub(crate) fn engine(
     // the daemon says it was started with ([`settings`]), so a client asking another is told.
     let told = told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?;
     let settings = settings::of_daemon(told.as_ref(), |name| std::env::var_os(name));
+    // The machine's memory ledger joined (docs/memory-budget.md, section 7): the machine
+    // budget every daemon of this user shares, and this daemon's ceiling under it, the plane's
+    // budget. A ledger that cannot be joined stops the start, naming it.
+    #[cfg(all(unix, feature = "native"))]
+    let (machine, budget) = {
+        let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
+        let joined = machine::Machine::join(told_machine, told, &crate::version(), &build, &root()?)
+            .context("joining the machine's memory ledger")?;
+        tracing::info!(target: "blaze", "{}", joined.machine.said());
+        (Some(joined.machine), joined.ceiling)
+    };
+    #[cfg(not(all(unix, feature = "native")))]
+    let (machine, budget) = (
+        None,
+        blaze_graph::arena::machine_budget(1 << 30, told)
+            .context("the memory the daemon's tasks may hold")?,
+    );
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
@@ -997,10 +1174,8 @@ pub(crate) fn engine(
         writer: writer_of(&paths.state)?,
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
-        budget: Some(
-            blaze_graph::arena::machine_budget(1 << 30, told)
-                .context("the memory the daemon's tasks may hold")?,
-        ),
+        budget: Some(budget),
+        machine,
         threads,
         io: 16,
         env: ["PATH", "HOME"]
@@ -1112,10 +1287,10 @@ impl Running {
 pub(crate) fn start(
     engine: Engine,
     who: &str,
-    mut ready: Option<&mut std::fs::File>,
+    ready: Option<&Ready>,
 ) -> anyhow::Result<Running> {
     let Engine { options, steps, runner, driver, keeper, held } = engine;
-    match begin(driver, options, steps, runner, who, held.before, ready.as_deref_mut()) {
+    match begin(driver, options, steps, runner, who, held.before, ready) {
         Ok(daemon) => Ok(Running { daemon, keeper, held }),
         Err(error) => {
             // The daemon was never made, or is gone: the history's sender with it.
@@ -1132,15 +1307,21 @@ fn begin(
     runner: plane::Runner<job::Step<unit::Real>>,
     who: &str,
     before: Before,
-    mut ready: Option<&mut std::fs::File>,
+    ready: Option<&Ready>,
 ) -> anyhow::Result<Daemon<blaze_core::Native, unit::Real>> {
-    say(ready.as_deref_mut(), Phase::State);
+    say(ready, Phase::State);
     let limit = options.budget.as_ref().map(limit_said);
+    #[cfg(all(unix, feature = "native"))]
+    let shared = options.machine.as_ref().map(|it| it.said().to_owned()); // alloc: the start's line
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
     say(ready, Phase::Setup);
     // Each start says the limit it runs under, so a run's log shows it was told one (B5).
     if let Some(limit) = limit {
         eprintln!("{who}: {limit}");
+    }
+    #[cfg(all(unix, feature = "native"))]
+    if let Some(shared) = shared {
+        eprintln!("{who}: {shared}");
     }
     let started = daemon.started();
     if started.cold == Some(daemon::Cold::Interned) {
@@ -1183,7 +1364,7 @@ fn begin(
 #[cfg(feature = "native")]
 fn listen(
     daemon: &mut Daemon<blaze_core::Native, unit::Real>,
-    mut ready: Option<std::fs::File>,
+    ready: Option<Ready>,
 ) -> anyhow::Result<()> {
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.
@@ -1202,8 +1383,10 @@ fn listen(
     // is reported with the children it leaves unreaped.
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     eprintln!("{LISTENING}{} (pid {})", daemon.listening(), std::process::id());
-    // Its last word: the pipe closes as it goes.
-    say(ready.take().as_mut(), Phase::Listening);
+    // Its last word: the pipe closes as it goes, and the reporter of what the start is inside
+    // writes nothing after it.
+    say(ready.as_ref(), Phase::Listening);
+    drop(ready);
     let (mut told, mut guarded) = (false, false);
     loop {
         if signals::signalled() && !told {

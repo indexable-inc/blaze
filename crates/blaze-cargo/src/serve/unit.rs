@@ -843,6 +843,10 @@ impl Writer<Real> for UnitWriter {
         self.release.short_under(blaze_graph::admission::Pressure::now);
     }
 
+    fn pressed(&mut self) {
+        self.release.pressed();
+    }
+
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
     /// of the database ([`base_db::Trigger`] names each on its `maintain` span), not one per
     /// input set: every proc macro's load and build script's run in one batch; then, reading

@@ -316,7 +316,53 @@ impl KeyOf {
 }
 
 fn path_to_url(path: &Path) -> Result<Url> {
-    Url::from_file_path(path).map_err(|()| anyhow!("invalid path url `{}`", path.display()))
+    file_url(path).map_err(|()| anyhow!("invalid path url `{}`", path.display()))
+}
+
+/// [`Url::from_file_path`]. On Windows the daemon roots every path at `/`, a drive its first
+/// part (`C:\a` is `/C:/a`), and names paths of no drive too (`/rustc/…/library`): the URL's
+/// path is that name, `file:///C:/a` as `Url::from_file_path` makes it.
+pub fn file_url(path: impl AsRef<Path>) -> Result<Url, ()> {
+    let path = path.as_ref();
+    if !cfg!(windows) {
+        return Url::from_file_path(path);
+    }
+    let text = path.to_str().ok_or(())?.replace('\\', "/");
+    let rooted = match text.as_bytes() {
+        [b'/', ..] => text,
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => format!("/{text}"),
+        _ => return Err(()),
+    };
+    let mut url = Url::parse("file:///").map_err(drop)?;
+    url.set_path(&rooted);
+    Ok(url)
+}
+
+/// [`Url::to_file_path`], naming a path on Windows as the daemon does ([`file_url`]'s inverse).
+pub fn url_file(url: &Url) -> Result<std::path::PathBuf, ()> {
+    if !cfg!(windows) || url.scheme() != "file" || url.host().is_some() {
+        return url.to_file_path();
+    }
+    Ok(percent_decoded(url.path())?.into())
+}
+
+/// `%XX` escapes taken out of a URL's path.
+fn percent_decoded(text: &str) -> Result<String, ()> {
+    let (bytes, mut out, mut at) = (text.as_bytes(), Vec::with_capacity(text.len()), 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'%' => {
+                let hex = text.get(at + 1..at + 3).ok_or(())?;
+                out.push(u8::from_str_radix(hex, 16).map_err(drop)?);
+                at += 3;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(drop)
 }
 
 fn str_to_url(s: &str) -> Result<Url> {
@@ -517,7 +563,7 @@ impl SourceId {
         if self.inner.kind != SourceKind::Path {
             return None;
         }
-        Some(self.inner.url.to_file_path().unwrap())
+        Some(url_file(&self.inner.url).unwrap())
     }
 
     /// A registry, remote or local.
@@ -712,7 +758,7 @@ impl Hash for SourceId {
 
 fn url_display(url: &Url) -> String {
     if url.scheme() == "file"
-        && let Ok(path) = url.to_file_path()
+        && let Ok(path) = url_file(url)
         && let Some(path_str) = path.to_str()
     {
         return path_str.to_owned();

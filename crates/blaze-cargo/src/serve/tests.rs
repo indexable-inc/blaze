@@ -1366,6 +1366,7 @@ fn options() -> Options {
         #[cfg(unix)]
         activated: None,
         profiling: None,
+        machine: None,
     }
 }
 

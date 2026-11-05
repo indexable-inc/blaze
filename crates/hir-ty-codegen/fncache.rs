@@ -41,7 +41,8 @@ use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use hir_def::{
-    AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
+    AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule, ItemContainerId, Lookup,
+    StaticId, VariantId,
     signatures::{FunctionSignature, StaticSignature, StructSignature, TraitSignature},
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
@@ -1373,7 +1374,15 @@ fn describe(db: &Db, node: &Node) -> String {
 
 /// File, line and column of a place in a body, the file relative to the workspace.
 pub(super) fn location(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> Option<String> {
-    let InferBodyId::DefWithBodyId(owner) = owner else { return None };
+    let owner = match owner {
+        InferBodyId::DefWithBodyId(owner) => owner,
+        // An inline constant or an array length in a body is written in the store of that body,
+        // and its spans are places in it. One in a signature has no body to find them in.
+        InferBodyId::AnonConstId(id) => match id.loc(db).owner {
+            ExpressionStoreOwnerId::Body(owner) => owner,
+            _ => return None,
+        },
+    };
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);

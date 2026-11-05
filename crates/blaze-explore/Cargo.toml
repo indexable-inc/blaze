@@ -1,6 +1,6 @@
 [package]
 name = "blaze-explore"
-description = "The explorer's daemon side: the HTTP/3 WebTransport server on 127.0.0.1 that https://ix.dev/explore connects to, pinning its self-signed certificate by hash; builds, spans, tiles, views, SQL over the history and the live feed as Arrow IPC"
+description = "The explorer's daemon side: the daemon as a source of ix-prof's explorer (the HTTP/3 WebTransport server on 127.0.0.1 that https://ix.dev/explore connects to); the blaze layer: builds, spans, tiles, views, SQL over the history and the flight recorder's live feed"
 publish = false
 
 version.workspace = true
@@ -20,26 +20,24 @@ test = false
 
 [dependencies]
 arrow-array.workspace = true
-arrow-ipc.workspace = true
 arrow-schema.workspace = true
-base64.workspace = true
 blaze-hash.workspace = true
 blaze-profile.workspace = true
 blaze-serde.workspace = true
-blaze-sha256.workspace = true
 blaze-web.workspace = true
-crossbeam-channel.workspace = true
-rcgen.workspace = true
+# The explorer's server, which serves this crate's source.
+ix-prof = { workspace = true, features = ["explore"] }
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
+# The probe's echo server: blaze-http's sans-IO HTTP/3 core and its tokio driver.
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
-# The WebTransport server (and the tests' client): blaze-http's sans-IO HTTP/3 core and its
-# tokio driver.
 blaze-http = { workspace = true, features = ["tokio"] }
 
 [dev-dependencies]
 blaze-rng.workspace = true
+# A stop that never comes, for the ops' tests.
+crossbeam-channel.workspace = true
 
 [lints]
 workspace = true

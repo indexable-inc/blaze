@@ -54,11 +54,22 @@ jobs:
       # is its own Rust release's wasm32 with LTO at opt-level z, and blaze's wasm32 modules are
       # still many times rustc's size (docs/platforms.md, "wasm32").
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-      - name: wasm-opt (binaryen)
+      # The release build for the runner's architecture (the ix runners are AArch64; an x86-64
+      # wasm-opt there fails with "Exec format error"), checked by its sha256 (the release's own
+      # .sha256 files).
+      - name: wasm-opt (binaryen version_133)
         env:
           BINARYEN: version_133
         run: |
-          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-x86_64-linux.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          case "$RUNNER_ARCH" in
+            X64) arch=x86_64 sum=2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489 ;;
+            ARM64) arch=aarch64 sum=89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d427f299bf8 ;;
+            *) echo "::error::no pinned binaryen $BINARYEN for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tgz="$RUNNER_TEMP/binaryen.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-$arch-linux.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
       - name: Renderer
         run: |

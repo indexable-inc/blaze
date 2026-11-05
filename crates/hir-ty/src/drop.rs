@@ -6,9 +6,9 @@ use hir_def::{AdtId, ImplId, signatures::StructFlags};
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
 
 use crate::{
-    FrameSet, consteval,
+    FrameMap, FrameSet, consteval,
     db::HirDatabase,
-    frame_set,
+    frame_map, frame_set,
     layout::{enum_variant_ids, struct_flags},
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
@@ -49,58 +49,127 @@ pub enum DropGlue {
 }
 
 /// Whether no part of a value of `ty` can change behind a shared reference: no `UnsafeCell`,
-/// no union, no type parameter. rustc promotes `&expr` only of such a type. One level per level
-/// of `ty`, as deep as the program built it, each with stack to spare (rule 17).
+/// no union, no type parameter. rustc promotes `&expr` only of such a type. A caller asking of
+/// many types in one environment (a body's locals) keeps one [`Freeze`] for all of them.
 pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
-    stdx::ensure_sufficient_stack(|| is_freeze_level(infcx, ty, env))
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Freeze::new(frame).of(infcx, ty, env))
 }
 
-/// One level of [`is_freeze`]: its parts go back through it.
-fn is_freeze_level<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
-    let mut ocx = ObligationCtxt::new(infcx);
-    // A field of an associated type, `Cow<str>`'s `<str as ToOwned>::Owned`, is what it
-    // normalizes to; one the solver can't decide stays the alias, which is not `Freeze`.
-    let ty = match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
-        Ok(normalized) if !matches!(normalized.kind(), TyKind::Infer(_)) => normalized,
-        _ => ty,
-    };
-    let interner = infcx.interner;
-    let db = interner.db;
-    match ty.kind() {
-        TyKind::Bool
-        | TyKind::Char
-        | TyKind::Int(_)
-        | TyKind::Uint(_)
-        | TyKind::Float(_)
-        | TyKind::Str
-        | TyKind::Never
-        | TyKind::Ref(..)
-        | TyKind::RawPtr(..)
-        | TyKind::FnPtr(..)
-        | TyKind::FnDef(..) => true,
-        TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
-            is_freeze(infcx, element, env)
+/// What [`is_freeze`] found of the types it walked, in one inference context and environment:
+/// each type is normalized and walked once, however many fields, variants and locals reach it.
+/// Without it a type that reaches one part twice at each level was walked once per path, two
+/// to the depth: one function of cranelift's ISLE lowering, thousands of locals of `MInst`'s
+/// hundreds of variants, took 493 s of `codegen describe` in copy propagation (build 42 of a
+/// self-build, 2026-11-05).
+pub struct Freeze<'f, 'db> {
+    known: FrameMap<'f, Ty<'db>, Walked>,
+    /// How many types the walk is inside.
+    depth: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Walked {
+    /// Still being walked, this many types deep.
+    Inside(u32),
+    Known(bool),
+}
+
+/// No type still being walked was read.
+const NO_CYCLE: u32 = u32::MAX;
+
+impl<'f, 'db> Freeze<'f, 'db> {
+    pub fn new(frame: &'f Frame) -> Self {
+        Freeze { known: frame_map(frame), depth: 0 }
+    }
+
+    /// [`is_freeze`] of `ty`. `infcx` and `env` are the ones every earlier ask of this memo
+    /// passed: an answer is of them.
+    pub fn of(&mut self, infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
+        self.walk(infcx, ty, env).0
+    }
+
+    /// Whether `ty` is freeze, and the shallowest depth of a type still being walked whose
+    /// answer it read ([`NO_CYCLE`] for none). A type that reaches itself is freeze if nothing
+    /// else in it is not: `Freeze` is an auto trait, and an auto trait's cycle holds (rustc's
+    /// coinduction). A type's answer that read a type outside it still being walked depends on
+    /// that one's guess, so it is not kept; its walk's outermost such type keeps its own.
+    /// One level per level of `ty`, as deep as the program built it, each with stack to spare
+    /// (rule 17).
+    fn walk(&mut self, infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> (bool, u32) {
+        match self.known.get(&ty) {
+            Some(&Walked::Known(freeze)) => return (freeze, NO_CYCLE),
+            Some(&Walked::Inside(depth)) => return (true, depth),
+            None => {}
         }
-        TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(infcx, field, env)),
-        TyKind::Closure(_, args) => is_freeze(infcx, args.as_closure().tupled_upvars_ty(), env),
-        TyKind::Adt(def, args) => {
-            let fields_freeze = |variant: hir_def::VariantId| {
-                db.field_types(variant).iter().all(|(_, field)| {
-                    let ty = field.ty().instantiate(interner, args).skip_norm_wip();
-                    is_freeze(infcx, ty, env)
-                })
-            };
-            match def.def_id() {
-                AdtId::StructId(id) => {
-                    Some(id) != interner.lang_items().UnsafeCell && fields_freeze(id.into())
-                }
-                AdtId::EnumId(id) => {
-                    enum_variant_ids(db, id).iter().all(|&variant| fields_freeze(variant.into()))
-                }
-                AdtId::UnionId(_) => false,
+        let depth = self.depth;
+        self.known.insert(ty, Walked::Inside(depth));
+        self.depth += 1;
+        let (freeze, cycle) = stdx::ensure_sufficient_stack(|| self.level(infcx, ty, env));
+        self.depth -= 1;
+        if cycle >= depth {
+            self.known.insert(ty, Walked::Known(freeze));
+            (freeze, NO_CYCLE)
+        } else {
+            self.known.remove(&ty);
+            (freeze, cycle)
+        }
+    }
+
+    /// One level of [`Self::walk`]: its parts go back through it.
+    fn level(&mut self, infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> (bool, u32) {
+        let mut ocx = ObligationCtxt::new(infcx);
+        // A field of an associated type, `Cow<str>`'s `<str as ToOwned>::Owned`, is what it
+        // normalizes to; one the solver can't decide stays the alias, which is not `Freeze`.
+        let ty = match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
+            Ok(normalized) if !matches!(normalized.kind(), TyKind::Infer(_)) => normalized,
+            _ => ty,
+        };
+        drop(ocx);
+        let interner = infcx.interner;
+        let db = interner.db;
+        let mut cycle = NO_CYCLE;
+        let mut part = |this: &mut Self, part: Ty<'db>| {
+            let (freeze, at) = this.walk(infcx, part, env);
+            cycle = cycle.min(at);
+            freeze
+        };
+        let freeze = match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Str
+            | TyKind::Never
+            | TyKind::Ref(..)
+            | TyKind::RawPtr(..)
+            | TyKind::FnPtr(..)
+            | TyKind::FnDef(..) => true,
+            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+                part(self, element)
             }
-        }
-        _ => false,
+            TyKind::Tuple(fields) => fields.iter().all(|field| part(self, field)),
+            TyKind::Closure(_, args) => part(self, args.as_closure().tupled_upvars_ty()),
+            TyKind::Adt(def, args) => {
+                let mut fields_freeze = |this: &mut Self, variant: hir_def::VariantId| {
+                    db.field_types(variant).iter().all(|(_, field)| {
+                        part(this, field.ty().instantiate(interner, args).skip_norm_wip())
+                    })
+                };
+                match def.def_id() {
+                    AdtId::StructId(id) => {
+                        Some(id) != interner.lang_items().UnsafeCell
+                            && fields_freeze(self, id.into())
+                    }
+                    AdtId::EnumId(id) => enum_variant_ids(db, id)
+                        .iter()
+                        .all(|&variant| fields_freeze(self, variant.into())),
+                    AdtId::UnionId(_) => false,
+                }
+            }
+            _ => false,
+        };
+        (freeze, cycle)
     }
 }
 

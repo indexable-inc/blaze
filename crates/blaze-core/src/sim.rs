@@ -34,7 +34,7 @@
 
 mod journal;
 
-use std::{mem, path::PathBuf, time::Duration};
+use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
 use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
@@ -45,6 +45,7 @@ use crate::{
     Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
     LockMode, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
+    wait::{self, Clock, Deadline, Once},
     wheel::{self, Wheel},
 };
 
@@ -114,6 +115,10 @@ pub struct Faults {
     pub no_clone: bool,
     /// A watch's change is reported as lost (the queue overflowed) once in this many.
     pub lose_change_one_in: u32,
+    /// A poll's wait is interrupted once in this many calls (0: never), after a drawn part of
+    /// it, as a signal ends a blocking system call: the poll waits again, through
+    /// [`wait::until`], for what is left of its deadline.
+    pub interrupt_one_in: u32,
 }
 
 impl Default for Faults {
@@ -123,6 +128,7 @@ impl Default for Faults {
             max_latency: Duration::from_micros(200),
             no_clone: false,
             lose_change_one_in: 0,
+            interrupt_one_in: 0,
         }
     }
 }
@@ -336,6 +342,9 @@ pub struct Sim {
     unlinked: Vec<Tag>,
     /// The locks another process holds ([`Sim::hold_lock`]).
     outside: HashMap<FileName, LockMode, Global>,
+    /// The tags of each [`Effect::Pressure`] in flight, in the order asked: each is told of
+    /// the memory pressure a test makes ([`Sim::press`]).
+    pressures: Vec<Tag>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -410,6 +419,17 @@ impl Sim {
             // alloc: none until a locked file is removed.
             unlinked: Vec::new(),
             outside: HashMap::new_in(Global),
+            // alloc: none until memory pressure is watched.
+            pressures: Vec::new(),
+        }
+    }
+
+    /// The system says memory is short: each [`Effect::Pressure`] in flight is told
+    /// [`Done::Pressed`], `critical` as given, after a delay drawn as any completion's.
+    pub fn press(&mut self, critical: bool) {
+        for at in 0..self.pressures.len() {
+            let tag = self.pressures[at];
+            self.tell(tag, Done::Pressed { critical }, Of::Op);
         }
     }
 
@@ -510,6 +530,7 @@ impl Sim {
         self.spawns.clear();
         self.watches.clear();
         self.ending = 0;
+        self.pressures.clear();
         self.told.clear();
         self.listens.clear();
         self.ends.clear();
@@ -1366,6 +1387,7 @@ impl Sim {
             | Effect::Recv { .. }
             | Effect::Send { .. }
             | Effect::Hangup { .. }
+            | Effect::Pressure { .. }
             | Effect::Unlock { .. } => {
                 unreachable!("watches, kills, sockets and unlocks are not pending effects")
             }
@@ -1413,6 +1435,50 @@ impl Sim {
     }
 }
 
+/// The simulation's clock, as a wait reads it.
+struct Virtual<'a>(&'a Cell<Duration>);
+
+impl Clock for Virtual<'_> {
+    fn now(&self) -> Duration {
+        self.0.get()
+    }
+}
+
+impl Sim {
+    /// Waits from now for a completion due at `first`, until `until`: the clock where the wait
+    /// ended, `first` or the deadline, never past either. Each call of the wait blocks to the
+    /// sooner of the two, or, interrupted, ends after a drawn part of that as EINTR or a
+    /// spurious wakeup.
+    fn wait(&mut self, first: Duration, until: Deadline) -> Duration {
+        let now = Cell::new(self.now);
+        let (rng, one_in) = (&mut self.rng, u64::from(self.faults.interrupt_one_in));
+        let what = "a completion of the simulation";
+        let waited = wait::until(what, &Virtual(&now), until.finite(), |left| {
+            let at = now.get();
+            let wake = left.map_or(first, |left| first.min(at.saturating_add(left)));
+            // An interrupt comes while the call blocks, and the call took some time: the clock
+            // moves at least a nanosecond, so every rate of interrupts still ends the wait.
+            if one_in > 0 && wake > at && rng.below(one_in) == 0 {
+                let span = wake.saturating_sub(at).as_nanos() as u64;
+                now.set(at + Duration::from_nanos(1 + rng.below(span)));
+                return Ok(match rng.below(2) {
+                    0 => Once::Interrupted,
+                    _ => Once::Spurious,
+                });
+            }
+            now.set(wake);
+            Ok(match wake >= first {
+                true => Once::Ready(()),
+                false => Once::TimedOut,
+            })
+        });
+        if let Err(error) = waited {
+            panic!("the simulation's clock: {error}");
+        }
+        now.get()
+    }
+}
+
 impl Driver for Sim {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {
@@ -1429,6 +1495,27 @@ impl Driver for Sim {
                         // alloc: the batch's payload.
                         self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
                     }
+                    continue;
+                }
+                Effect::Pressure { tag } => {
+                    match self.pressures.contains(&tag) {
+                        // alloc: an error's message.
+                        true => self.tell(
+                            tag,
+                            Done::Failed(IoError(format!(
+                                "memory pressure is watched as {tag:?} already"
+                            ))),
+                            Of::Op,
+                        ),
+                        // alloc: none past the most watched at once.
+                        false => self.pressures.push(tag),
+                    }
+                    continue;
+                }
+                // A watch of memory pressure ends after every pressure told it.
+                Effect::Unwatch { tag } if self.pressures.contains(&tag) => {
+                    self.pressures.retain(|&it| it != tag);
+                    self.tell_after(tag, tag, Done::Unwatched, Of::Op);
                     continue;
                 }
                 Effect::Unwatch { tag } => {
@@ -1704,13 +1791,21 @@ impl Driver for Sim {
         }
     }
 
-    /// Never waits: time jumps to the first completion when none is ready.
-    fn poll(&mut self, out: &mut Vec<Completion>, _wait: Duration) -> usize {
+    /// Waits in virtual time: the clock moves to the first completion when none is ready, or
+    /// to `until` where that comes first (then nothing is moved). The wait goes through
+    /// [`wait::until`], interrupted at [`Faults::interrupt_one_in`]'s rate as a kernel's is.
+    /// With nothing in flight that will complete, it returns at once.
+    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let first = self.pending.next_deadline().map(Duration::from_nanos);
         let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.at)).min() else {
             return 0;
         };
-        self.now = self.now.max(first);
+        if first > self.now {
+            self.now = self.wait(first, until);
+            if self.now < first {
+                return 0;
+            }
+        }
         let mut ready = mem::take(&mut self.ready);
         self.pending.advance(wheel::ticks(self.now), |_, pending| ready.push(pending));
         // In the order they were due; shuffled so it is the seed's.
@@ -1755,7 +1850,10 @@ impl Driver for Sim {
         let ending = self.told.iter().filter(|it| {
             !matches!(
                 it.completion.done,
-                Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                Done::Changed { .. }
+                    | Done::Journaled(_)
+                    | Done::Accepted { .. }
+                    | Done::Pressed { .. }
             )
         });
         self.pending.len()
@@ -1763,6 +1861,7 @@ impl Driver for Sim {
             + (self.watches.len() - self.ending)
             + self.listens.len()
             + self.receiving.len()
+            + self.pressures.len()
             + ending.count()
     }
 
@@ -1833,7 +1932,7 @@ mod tests {
         // Appended after the sync was asked for, completed before it.
         sim.files.get_mut(&file).unwrap().ops.push(Op::Append(b"b".to_vec()));
         let mut out = Vec::new();
-        sim.poll(&mut out, Duration::ZERO);
+        sim.poll(&mut out, Deadline::NEVER);
         let file = &sim.files[&file];
         assert_eq!((file.durable.as_slice(), file.contents().as_slice()), (&b"a"[..], &b"ab"[..]));
     }
@@ -2066,7 +2165,7 @@ mod tests {
             }]);
             let mut out = Vec::new();
             if sim.rng().one_in(2) {
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
             }
             let acknowledged = out.iter().any(|it| it.done == Done::Written);
             sim.crash();
@@ -2157,7 +2256,7 @@ mod tests {
             // Changes told for after the end are not in flight: each is due, and dropped.
             let mut out = Vec::new();
             while !sim.told.is_empty() {
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 assert!(out.is_empty(), "seed {seed}: {out:?} after the end");
             }
             match sim.stale() {
@@ -2305,7 +2404,7 @@ mod tests {
             ]);
             let mut out = Vec::new();
             while sim.in_flight() > 0 {
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 for done in out.drain(..) {
                     if done.done == Done::Fired {
                         at.push((sim.now(), done.tag.0));
@@ -2335,7 +2434,7 @@ mod tests {
         sim.submit(&mut vec![Effect::Spawn { command: command("/bin/echo", None), tag: Tag(1) }]);
         sim.submit(&mut vec![Effect::Kill { tag: Tag(1) }]);
         let mut out = Vec::new();
-        sim.poll(&mut out, Duration::ZERO);
+        sim.poll(&mut out, Deadline::NEVER);
         assert!(sim.now() < Duration::from_millis(5), "{:?}", sim.now());
         assert!(
             matches!(&out[..], [Completion { done: Done::Exited(it), .. }] if it.signal == Some(KILLED))
@@ -2362,7 +2461,7 @@ mod tests {
             let mut out = Vec::new();
             while !effects.is_empty() || sim.in_flight() > 0 {
                 sim.submit(&mut effects);
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 for done in out.drain(..) {
                     next += 1;
                     match done.done {
@@ -2451,7 +2550,7 @@ mod tests {
             let mut seen = BTreeMap::new();
             let mut out = Vec::new();
             while !seen.contains_key(&Tag(1)) {
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
             }
             sim.peer_send(conn, b"bytes");
@@ -2463,7 +2562,7 @@ mod tests {
             }]);
             if sim.rng().one_in(2) {
                 while !seen.contains_key(&Tag(2)) {
-                    sim.poll(&mut out, Duration::ZERO);
+                    sim.poll(&mut out, Deadline::NEVER);
                     seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
                 }
             }
@@ -2514,7 +2613,7 @@ mod tests {
             sim.submit(&mut vec![effect]);
             let mut out = Vec::new();
             loop {
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 if let Some(at) = out.iter().position(|it| it.tag == tag) {
                     return out.swap_remove(at).done;
                 }
@@ -2595,7 +2694,7 @@ mod tests {
                         assert_eq!(sim.peer_hung_up_on(conns[at]), gone, "seed {seed} step {step}");
                     }
                 }
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, Deadline::NEVER);
                 out.clear();
             }
             let live = model.len();

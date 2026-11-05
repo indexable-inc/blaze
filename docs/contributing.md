@@ -381,7 +381,7 @@ variable, with the archive somewhere its sandbox lets llvm-sys search, below `/u
 (`.github/actions/blaze`):
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
-    python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
+    python3 .github/scripts/llvm.py '{"command": "fetch", "target": "<triple>", "dir": "/usr/local/lib/blaze-llvm/<triple>"}'
     LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release
 
 Every crate that uses LLVM (`hir-ty-codegen` through inkwell, `blaze-stencil`'s build script)
@@ -403,7 +403,7 @@ no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for a
 macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
 archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
-summary prints (`llvm.py pin`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
+summary prints (`llvm.py` with `{"command": "pin", "root": DIR}`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
 `-C target-cpu` takes and `rustc --print target-cpus` leaves out) with
 `uv run --frozen python tools/cpus.py '{"write": true, "fetch_llvm": true}'`, which writes
 crates/target-features/llvm_cpus.json and the CPU table (`target_features::cpus`) from it. LLVM's own release archives do not do: the macOS ones hold

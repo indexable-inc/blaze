@@ -77,10 +77,16 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script alone: the job decides in seconds, before a whole checkout.
+      # The script alone: the job decides in seconds, before a whole checkout. The two flecs
+      # manifests are for the pin check below.
       - uses: actions/checkout@v7
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            vendor/flecs-c
+            crates/harness/vendor/hyperion-flecs-c
+      # blaze and harness build one flecs: the same indexable-inc/flecs rev in both manifests.
+      - run: python3 .github/scripts/flecs_pin.py
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -199,7 +205,7 @@ jobs:
         run: |
           sudo mkdir -p /usr/local/lib/blaze-llvm
           sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir "$LLVM_SYS_231_PREFIX"
+          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"x86_64-unknown-linux-gnu\", \"dir\": \"$LLVM_SYS_231_PREFIX\"}"
           "$LLVM_SYS_231_PREFIX/bin/llvm-config" --version
       - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
       - name: an x86-64 ELF, not run

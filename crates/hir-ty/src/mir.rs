@@ -2005,6 +2005,9 @@ pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
     pub context: LocalId,
+    /// rustc's span of the body: the `async` block, or the block an `async fn` or closure is
+    /// written with. A future polled after it ended panics there.
+    pub span: MirSpan,
 }
 
 /// A walk over every place a body mentions, as `walk_places` (each place can be changed) or
@@ -2241,11 +2244,11 @@ impl<'db> MirBody<'db> {
     /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
     /// out of it depends on its type alone.
     /// `copy` is what is known already of which types are `Copy`.
-    pub fn mark_moves(
+    pub fn mark_moves<A: std::alloc::Allocator>(
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
-        copy: &mut blaze_hash::HashMap<Ty<'db>, bool, Global>,
+        copy: &mut blaze_hash::HashMap<Ty<'db>, bool, A>,
     ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {

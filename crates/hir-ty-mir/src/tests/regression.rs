@@ -853,7 +853,7 @@ fn issue_4966() {
             279..284 'inner': Map<impl Fn(&'?0.0 f64) -> f64>
             287..311 'Map { ... 0.0 }': Map<impl Fn(&'?0.0 f64) -> f64>
             296..309 '|_: &f64| 0.0': impl Fn(&'?0.0 f64) -> f64
-            297..298 '_': &'_ f64
+            297..298 '_': &'? f64
             306..309 '0.0': f64
             322..328 'repeat': Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>
             331..356 'Repeat...nner }': Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>
@@ -2953,7 +2953,7 @@ fn foo() {
 fn regression_21885() {
     check_no_mismatches(
         r#"
-//- minicore: coerce_unsized, future, result
+//- minicore: coerce_unsized, dispatch_from_dyn, future, result
 use core::future::Future;
 
 trait Foo {

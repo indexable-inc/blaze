@@ -16,6 +16,13 @@
 //! the timeout of the last (not counting time the asker holds the body back), a redirect's
 //! body within the timeout, and an idle connection within the pool's idle expiry.
 //!
+//! A connection goes through the proxy its [`Config::proxies`] names for its origin, if one
+//! does ([`crate::proxy`]): an `https` origin, or any origin through SOCKS, through a tunnel
+//! opened first ([`Handshake`]: the driver connects to the proxy, or resolves the origin's name
+//! first for `socks4://` and `socks5://`), its TLS spoken inside the tunnel to the origin; an
+//! `http` origin through an HTTP proxy by sending the proxy each request in absolute form. Its
+//! pool key is still the origin: every connection to one origin goes the same way.
+//!
 //! A request sent on a connection taken from the pool, which closes before any byte of its
 //! answer comes (the server closed it as it was taken), is sent once more on a new connection
 //! when its method is idempotent (RFC 9110 section 9.2.2), as hyper-util retried a request its
@@ -26,6 +33,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
+    net::IpAddr,
     sync::Arc,
     time::Duration,
 };
@@ -36,6 +44,7 @@ use crate::{
     gzip::Gunzip,
     h1,
     pool::{Origin, Pool},
+    proxy::{Credentials, Handshake, Proxies, ProxyKind},
     tls::Session,
 };
 
@@ -75,10 +84,14 @@ pub struct Config {
     pub idle_for: Duration,
     /// The most idle connections kept.
     pub idle_most: usize,
+    /// The proxies connections go through, by their origin ([`crate::proxy_env::from_env`]
+    /// reads the process's).
+    pub proxies: Proxies,
 }
 
 impl Config {
-    /// `tls`, `user_agent` and `timeout`, with [`REDIRECTS`], [`IDLE_FOR`] and [`IDLE_MOST`].
+    /// `tls`, `user_agent` and `timeout`, with [`REDIRECTS`], [`IDLE_FOR`], [`IDLE_MOST`] and
+    /// no proxy.
     pub fn new(
         tls: Arc<rustls::ClientConfig>,
         user_agent: impl Into<String>,
@@ -91,6 +104,7 @@ impl Config {
             redirects: REDIRECTS,
             idle_for: IDLE_FOR,
             idle_most: IDLE_MOST,
+            proxies: Proxies::none(),
         }
     }
 }
@@ -139,6 +153,11 @@ pub enum Io {
     /// A TCP connection to `host` (a name to resolve, or an IP address without brackets) at
     /// `port`: [`Completion::Connected`] or [`Completion::ConnectFailed`].
     Connect { conn: ConnId, host: String, port: u16 },
+    /// The addresses `host` (a name) resolves to, for a proxy that is given the origin by its
+    /// address (`socks4://`, `socks5://`): [`Completion::Resolved`] or
+    /// [`Completion::ResolveFailed`]. `conn` is the connection that will need them; its
+    /// connect is asked after.
+    Resolve { conn: ConnId, host: String },
     /// All of `bytes` written to `conn`: [`Completion::Sent`] or [`Completion::Broken`].
     Send { conn: ConnId, bytes: Vec<u8> },
     /// The next bytes `conn`'s peer sends: [`Completion::Received`] or [`Completion::Broken`].
@@ -160,6 +179,16 @@ pub enum Completion {
     },
     Sent {
         conn: ConnId,
+    },
+    /// What the name of an [`Io::Resolve`] resolves to, in the order the system gave them.
+    Resolved {
+        conn: ConnId,
+        addresses: Vec<IpAddr>,
+    },
+    /// `why` as the system said it.
+    ResolveFailed {
+        conn: ConnId,
+        why: String,
     },
     /// Empty when the peer closed the connection.
     Received {
@@ -275,6 +304,8 @@ impl Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Connect,
+    /// Through the proxy: connecting to it, or the tunnel's handshake.
+    Proxy,
     Tls,
     Send,
     Head,
@@ -286,6 +317,7 @@ impl Step {
     pub fn says(self) -> &'static str {
         match self {
             Step::Connect => "connecting to",
+            Step::Proxy => "through a proxy to",
             Step::Tls => "TLS with",
             Step::Send => "sending to",
             Step::Head => "reading the answer's head from",
@@ -378,6 +410,12 @@ struct Exchange {
 /// A connection.
 struct Conn {
     origin: Origin,
+    /// The proxy it goes through, as a message names it (`host:port`); `None` when direct.
+    via: Option<String>,
+    /// The tunnel through the proxy still being opened: until it is, the session's bytes wait.
+    tunnel: Option<Handshake>,
+    /// A plain session's bytes sent before the tunnel opened, held for it.
+    held: Vec<u8>,
     session: Session,
     /// Whether the driver said it is open.
     connected: bool,
@@ -415,6 +453,10 @@ impl Conn {
     fn new(origin: Origin, session: Session) -> Conn {
         Conn {
             origin,
+            via: None,
+            tunnel: None,
+            // alloc: empty, allocates nothing unless a plain request waits for a tunnel.
+            held: Vec::new(),
             session,
             connected: false,
             sending: false,
@@ -615,7 +657,36 @@ impl Client {
                 it.connected = true;
                 self.pump(conn);
             }
-            Completion::ConnectFailed { conn, why } => self.conn_failed(conn, Step::Connect, why),
+            Completion::ConnectFailed { conn, why } => {
+                let Some(it) = self.conns.get(&conn) else { return };
+                let (step, why) = match &it.via {
+                    // alloc: an error's message, made only when it fails.
+                    Some(via) => (Step::Proxy, format!("connecting to the proxy {via}: {why}")),
+                    None => (Step::Connect, why),
+                };
+                self.conn_failed(conn, step, why);
+            }
+            Completion::Resolved { conn, addresses } => {
+                let Some(it) = self.conns.get_mut(&conn) else { return };
+                let Some(tunnel) = it.tunnel.as_mut() else { return };
+                if let Err(why) = tunnel.resolved(&addresses) {
+                    return self.conn_failed(conn, Step::Proxy, why);
+                }
+                let proxy = tunnel.proxy();
+                // alloc: one per connection, the proxy's host the driver resolves.
+                let host = proxy.host.clone();
+                self.io.push_back(Io::Connect { conn, host, port: proxy.port });
+            }
+            Completion::ResolveFailed { conn, why } => {
+                let Some(it) = self.conns.get(&conn) else { return };
+                // alloc: an error's message, made only when it fails.
+                let why = format!(
+                    "resolving {}, which the proxy {} is given by its address: {why}",
+                    it.origin.host,
+                    it.via.as_deref().unwrap_or_default()
+                );
+                self.conn_failed(conn, Step::Proxy, why);
+            }
             Completion::Sent { conn } => {
                 let Some(it) = self.conns.get_mut(&conn) else { return };
                 it.sending = false;
@@ -624,7 +695,9 @@ impl Client {
             Completion::Received { conn, bytes } => self.received(conn, &bytes),
             Completion::Broken { conn, why } => {
                 let Some(it) = self.conns.get(&conn) else { return };
-                let step = if it.session.handshaking() {
+                let step = if it.tunnel.is_some() {
+                    Step::Proxy
+                } else if it.session.handshaking() {
                     Step::Tls
                 } else {
                     match it.work {
@@ -648,17 +721,29 @@ impl Client {
             Err(kind) => return self.fail(id, kind),
         };
         let fresh = exchange.fresh;
+        // The proxy every connection to this origin goes through: the config's, which never
+        // changes, so a pooled connection went the way a new one would.
+        let proxy = self.config.proxies.of(origin.https, &origin.host);
+        // An `http` origin through an HTTP proxy: each request to the proxy, in absolute form.
+        let forward = proxy.filter(|it| !origin.https && it.kind == ProxyKind::Http);
+        let target = match forward {
+            Some(_) => absolute_of(&exchange.url),
+            None => target_of(&exchange.url),
+        };
+        // alloc: one per exchange through a proxy with a user, its header's value.
+        let proxy_authorization = forward.and_then(|it| it.auth.as_ref()).map(Credentials::basic);
         // alloc: one per exchange, its head and body as written.
         let mut written = Vec::with_capacity(512 + exchange.request.body.len());
         h1::write_request(
             &mut written,
             &exchange.request.method,
-            &target_of(&exchange.url),
+            &target,
             &host_of(&exchange.url),
             &self.config.user_agent,
             exchange.request.gzip,
             &exchange.request.headers,
             exchange.request.body.len(),
+            proxy_authorization.as_deref(),
         );
         written.extend_from_slice(&exchange.request.body);
         let pooled = if fresh { None } else { self.pool.take(&origin) };
@@ -690,14 +775,41 @@ impl Client {
                 };
                 let conn = ConnId(self.next_conn);
                 self.next_conn += 1;
-                // alloc: one per connection, the host the driver resolves.
-                self.io.push_back(Io::Connect {
-                    conn,
-                    host: origin.host.clone(),
-                    port: origin.port,
-                });
                 // alloc: one per connection, its origin.
-                self.conns.insert(conn, Conn::new(origin.clone(), session));
+                let mut made = Conn::new(origin.clone(), session);
+                match proxy {
+                    None => {
+                        // alloc: one per connection, the host the driver resolves.
+                        let host = origin.host.clone();
+                        self.io.push_back(Io::Connect { conn, host, port: origin.port });
+                    }
+                    Some(proxy) => {
+                        if forward.is_none() {
+                            let tunnel = match Handshake::new(proxy, &origin.host, origin.port) {
+                                Ok(tunnel) => tunnel,
+                                Err(why) => {
+                                    let (host, port) = (origin.host, origin.port);
+                                    let kind = Kind::Io { step: Step::Proxy, host, port, why };
+                                    return self.fail(id, kind);
+                                }
+                            };
+                            if tunnel.resolving() {
+                                // alloc: one per connection, the origin's name the driver resolves.
+                                let host = origin.host.clone();
+                                self.io.push_back(Io::Resolve { conn, host });
+                            }
+                            made.tunnel = Some(tunnel);
+                        }
+                        // A tunnel that waits for the origin's addresses connects once they come.
+                        if !made.tunnel.as_ref().is_some_and(Handshake::resolving) {
+                            // alloc: one per connection, the proxy's host the driver resolves.
+                            let host = proxy.host.clone();
+                            self.io.push_back(Io::Connect { conn, host, port: proxy.port });
+                        }
+                        made.via = Some(proxy.at());
+                    }
+                }
+                self.conns.insert(conn, made);
                 conn
             }
         };
@@ -713,7 +825,11 @@ impl Client {
         it.work = Work::Head { request: id };
         it.reused = pooled.is_some();
         it.got = false;
-        if let Err(why) = it.session.send(&written, &mut it.out) {
+        let Conn { session, out, held, tunnel, .. } = it;
+        // A tunnel still opening holds a plain request's bytes until it is open (TLS holds its
+        // own, its handshake not begun).
+        let into = if tunnel.is_some() { held } else { out };
+        if let Err(why) = session.send(&written, into) {
             return self.conn_failed(conn, Step::Send, why);
         }
         self.pump(conn);
@@ -728,7 +844,15 @@ impl Client {
             return;
         }
         if !conn.sending {
-            if let Err(why) = conn.session.outgoing(&mut conn.out) {
+            // Through a tunnel still opening, only its handshake goes: the session waits.
+            let made = match conn.tunnel.as_mut() {
+                Some(tunnel) => {
+                    tunnel.outgoing(&mut conn.out);
+                    Ok(())
+                }
+                None => conn.session.outgoing(&mut conn.out),
+            };
+            if let Err(why) = made {
                 let step = if conn.session.handshaking() { Step::Tls } else { Step::Send };
                 return self.conn_failed(id, step, why);
             }
@@ -754,6 +878,25 @@ impl Client {
     fn received(&mut self, id: ConnId, bytes: &[u8]) {
         let Some(conn) = self.conns.get_mut(&id) else { return };
         conn.receiving = false;
+        // What came after a tunnel's handshake, the origin's first bytes.
+        let mut after = None;
+        if let Some(tunnel) = conn.tunnel.as_mut() {
+            let opened =
+                if bytes.is_empty() { Err(tunnel.closed()) } else { tunnel.received(bytes) };
+            match opened {
+                Ok(None) => return self.pump(id),
+                Ok(Some(rest)) => {
+                    conn.tunnel = None;
+                    conn.out.append(&mut conn.held);
+                    if rest.is_empty() {
+                        return self.pump(id);
+                    }
+                    after = Some(rest);
+                }
+                Err(why) => return self.conn_failed(id, Step::Proxy, why),
+            }
+        }
+        let bytes = after.as_deref().unwrap_or(bytes);
         if bytes.is_empty() {
             conn.eof = true;
         } else {
@@ -1112,6 +1255,14 @@ fn host_of(url: &url::Url) -> String {
         // alloc: one per exchange, its `Host` header.
         None => host.to_owned(),
     }
+}
+
+/// `url`'s request target in absolute form, as a proxy is asked (RFC 9112 section 3.2.2): its
+/// scheme, host and port as [`host_of`] says them, path and query; no credentials and no
+/// fragment.
+fn absolute_of(url: &url::Url) -> String {
+    // alloc: one per exchange through a proxy, its request target.
+    format!("{}://{}{}", url.scheme(), host_of(url), target_of(url))
 }
 
 /// `url`'s request target in origin form: its path and query, no fragment.

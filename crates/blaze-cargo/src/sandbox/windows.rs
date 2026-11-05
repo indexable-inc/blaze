@@ -328,7 +328,12 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     drop(Handle(process.hThread));
     // SAFETY: `child` owns the process handle until `run` returns, so the wait is on this
     // process and no other object that took its number.
-    if unsafe { WaitForSingleObject(child.0, INFINITE) } != WAIT_OBJECT_0 {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a child's exit has no deadline and `blaze_core::wait` has no handle wait yet: child waits move to the driver in deadline-waits step 5 (docs/v2/plan/design/deadline-waits.md)"
+    )]
+    let ended = unsafe { WaitForSingleObject(child.0, INFINITE) };
+    if ended != WAIT_OBJECT_0 {
         let why = failed("waiting for the program, which started", "WaitForSingleObject");
         end(&made.job, 1);
         return Err(why);
@@ -917,6 +922,10 @@ fn gone_within(job: &Handle, long: Duration) -> Result<(), usize> {
             let ms = u32::try_from(left.as_millis()).unwrap_or(INFINITE - 1);
             // SAFETY: the first `open` handles are open process handles `held` owns until the
             // wait returns; the call reads them and nothing more.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "`blaze_core::wait` has no handle wait yet (deadline-waits step 5); each wait's timeout is what is left of the one deadline `until`, recomputed before the call, so no round restarts it"
+            )]
             let waited = unsafe { WaitForMultipleObjects(open as u32, handles.as_ptr(), 1, ms) };
             for it in &mut held {
                 *it = None;
@@ -1092,7 +1101,12 @@ impl Lock {
         };
         // SAFETY: `mutex` is the handle in MUTEX, which is opened once and never closed, so it
         // names the session's mutex for as long as the process lives.
-        match unsafe { WaitForSingleObject(mutex, INFINITE) } {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "taking a session-wide mutex, held only while the grants are written; `blaze_core::wait` has no handle wait yet (docs/v2/plan/design/deadline-waits.md)"
+        )]
+        let taken = unsafe { WaitForSingleObject(mutex, INFINITE) };
+        match taken {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Lock { mutex, _thread: PhantomData }),
             // alloc: the error, once, and the sandbox stops.
             _ => Err(failed(

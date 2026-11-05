@@ -48,13 +48,30 @@ written).
 
 ## Where it runs
 
-`blaze_explore::start(Config)` starts one thread, `blaze-explore`, with a current-thread tokio
-runtime and one QUIC endpoint on `127.0.0.1:0`. The daemon's own threads never wait on a page.
-The work of an answer (DuckDB, the tiles, Arrow encoding) runs on that runtime's blocking pool,
-so a slow query never holds up the live stream or another query. Dropping the `Explorer` closes
-every session (code 0) and joins the thread.
+The server is ix-prof's, not the daemon's (2026-11-05, explore-generic.md steps 2 and 3): any
+program using ix-prof can serve the page by enabling ix-prof's `explore` feature and calling
+`ix_prof::explore::serve(Config { source, dev_origin, name, every })` with its own
+`Arc<dyn Source>`. The module holds the certificate (`cert`), the link and token (`link`), the
+framing (`frame`), the sans-IO session core (`session`: hello first, the token, at most 16
+requests in flight, the live emit rules, every header and answer's bytes) and the thin driver
+that does the IO. A `Source` gives its `hello` fields (name and version, schema, clock, kind,
+extensions, `layers`), a live feed per session (`Live::tick` into a `Tick` of IPC tables, each
+`Append` or `Replace`), and answers every op but `hello`, `None` for an op it lacks, which the
+session refuses as `unknown_op` naming it. `hello` also says `protocol: 1` and
+`layers: [{name, version}]`.
 
-`Config` holds the history (the DuckDB binary from `nix run .#duckdb` and the history's
+The daemon is one `Source`: `blaze_explore::start(Config)` (`crates/blaze-explore/src/source.rs`)
+builds it over the history, the build world and blaze-profile's flight recorder, its one layer
+`{name: "blaze", version: blaze_profile::schema::VERSION}`, and calls `serve`. blaze-explore
+keeps the `blaze` layer's ops (`ops.rs`), their requests (`wire.rs`) and `tiles`.
+
+`serve` starts one thread named after the source (`blaze-explore` for the daemon) with a
+current-thread tokio runtime and one QUIC endpoint on `127.0.0.1:0`. The daemon's own threads
+never wait on a page. The work of an answer (DuckDB, the tiles, Arrow encoding) and each live
+tick run on that runtime's blocking pool, so a slow query never holds up the live stream or
+another query. Dropping the `Explorer` closes every session (code 0) and joins the thread.
+
+blaze-explore's `Config` holds the history (the DuckDB binary from `nix run .#duckdb` and the history's
 directory, `history::dir_in(state)`), Flecs's world (`Option<Arc<blaze_web::Graphs>>`), whether
 the page's development server may connect, and the daemon's version for `hello`. Wiring it into
 `blaze serve` and adding the `blaze explore` command in blaze-cargo is queued to the coordinator.

@@ -292,3 +292,32 @@ fn is_freeze_walks_every_variant() {
     });
     assert_eq!(answers, [false, false, true, false, false, false, true, true]);
 }
+
+/// `Freeze` walks each type once however many paths reach it: `P<T>` holds two `T`s, so 64
+/// levels of it reach the bottom by 2^64 paths, which a walk without its memo never finished
+/// (copy propagation of cranelift's ISLE `constructor_lower` ran 493 s on `MInst`). The answer
+/// still comes from the bottom: a `Cell` there makes every level not `Freeze`.
+#[test]
+fn is_freeze_walks_each_type_once() {
+    let fx = fixture::db(&format!(
+        "//- /main.rs crate:main\n{FREEZE}\npub struct P<T>(pub T, pub T);\n"
+    ));
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    let main = crate_named(&db, "main");
+    let pair = adt_named(&db, main, "P");
+    let leaves = [adt_named(&db, main, "Plain"), adt_named(&db, main, "Cell")];
+    let answers = blaze_query::db::attach(&db, || {
+        let interner = DbInterner::new_with(&db, main);
+        let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        leaves.map(|leaf| {
+            let mut ty =
+                Ty::new_adt(interner, leaf, GenericArgs::identity_for_item(interner, leaf.into()));
+            for _ in 0..64 {
+                ty = Ty::new_adt(interner, pair, GenericArgs::new_from_slice(&[ty.into()]));
+            }
+            is_freeze(&infcx, ty, ParamEnv::empty())
+        })
+    });
+    assert_eq!(answers, [true, false]);
+}

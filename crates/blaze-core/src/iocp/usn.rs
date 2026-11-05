@@ -59,7 +59,6 @@ use windows_sys::Win32::{
             USN_REASON_REPARSE_POINT_CHANGE, USN_REASON_SECURITY_CHANGE, USN_REASON_STREAM_CHANGE,
             USN_RECORD_V2, USN_RECORD_V3,
         },
-        SystemServices::FILE_SUPPORTS_USN_JOURNAL,
     },
 };
 
@@ -837,13 +836,10 @@ impl Journal {
                 "{shown} is on a network share, whose changes are in no journal blaze can read"
             )));
         }
-        let (system, flags) = volume_info(&hint).map_err(|it| context("its volume", it))?;
-        if flags & FILE_SUPPORTS_USN_JOURNAL == 0 {
-            // alloc: an error path.
-            return Err(refuse(format!(
-                "{shown} is on a {system} volume, which keeps no USN journal"
-            )));
-        }
+        // The volume's flags do not say whether it keeps a journal: Windows 11 (26200) reports
+        // none of `FILE_SUPPORTS_USN_JOURNAL` on NTFS volumes that answer the query, so the query
+        // itself is the test.
+        let (system, _) = volume_info(&hint).map_err(|it| context("its volume", it))?;
         // `\\?\Volume{GUID}\...`: the volume is its first component, opened as a device.
         final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &mut scratch)
             .map_err(|it| context("its volume", it))?;
@@ -867,6 +863,8 @@ impl Journal {
                 "the volume of {shown} has no USN journal; `fsutil usn createjournal m=0x2000000 a=0x400000 <drive>` \
                  run as an administrator makes one (blaze reads it and does not make it)"
             )),
+            // alloc: an error path.
+            Some(ERROR_INVALID_FUNCTION) => refuse(format!("{shown} is on a {system} volume, which keeps no USN journal")),
             // alloc: an error path.
             Some(ERROR_JOURNAL_DELETE_IN_PROGRESS) => refuse(format!("the USN journal of the volume of {shown} is being deleted")),
             _ => context("querying it", error),

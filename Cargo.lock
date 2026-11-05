@@ -496,6 +496,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sonic-rs",
+ "uds_windows",
 ]
 
 [[package]]
@@ -873,22 +874,35 @@ name = "blaze-explore"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
- "arrow-ipc",
  "arrow-schema",
- "base64",
  "blaze-hash",
  "blaze-http",
  "blaze-profile",
  "blaze-rng",
  "blaze-serde",
- "blaze-sha256",
  "blaze-web",
  "crossbeam-channel",
- "rcgen",
+ "ix-prof",
  "serde",
  "serde_derive",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "blaze-explore-core"
+version = "0.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
+ "blaze-explore",
+ "blaze-profile",
+ "blaze-protocol",
+ "blaze-serde",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1067,6 +1081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stdx",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1110,11 +1125,13 @@ dependencies = [
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "blaze-sha256",
  "bytes",
  "flate2",
  "http",
  "httparse",
+ "percent-encoding",
  "quinn-proto",
  "rcgen",
  "rustls",
@@ -1890,6 +1907,7 @@ dependencies = [
  "blaze-report",
  "blaze-v2-proof",
  "blaze-vfs",
+ "expect-test",
  "hashbrown 0.17.1",
  "ratatui",
  "serde_json",
@@ -3196,7 +3214,13 @@ name = "flecs-c"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "flecs-distr",
 ]
+
+[[package]]
+name = "flecs-distr"
+version = "4.2.0"
+source = "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0"
 
 [[package]]
 name = "fnv"
@@ -4512,8 +4536,13 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "base64",
  "blake3",
+ "blaze-core",
+ "blaze-http",
  "blaze-inproc-rt",
+ "blaze-sha256",
+ "crossbeam-channel",
  "crossbeam-queue",
  "flate2",
  "gimli",
@@ -4521,9 +4550,11 @@ dependencies = [
  "libc",
  "object 0.40.0",
  "parking_lot",
+ "rcgen",
  "regex",
  "rustc-demangle",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

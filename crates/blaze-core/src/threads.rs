@@ -38,6 +38,7 @@ use blaze_mem::{Slab, Tag as MemTag};
 
 use crate::{
     Completion, Confine, Done, Driver, Effect, IoError, Tag, fs,
+    wait::Deadline,
     wheel::{self, Wheel},
 };
 
@@ -571,20 +572,20 @@ impl Threads {
         });
     }
 
-    /// What was told, taken from the mailbox; with nothing told, `wait` waited out where a
+    /// What was told, taken from the mailbox; with nothing told, slept until `until` where a
     /// timer is due by then. On WASI nothing completes while the driver waits: each file effect
     /// was told as it was submitted, and there are no threads, watches, processes or sockets.
     /// So with no timer there is nothing to wait for, and a wait never blocks on the mailbox.
-    /// `wait` is already cut to the next timer's deadline by `poll`.
+    /// `until` is already cut to the next timer's deadline by `poll`.
     #[cfg(target_os = "wasi")]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the driver's own timer: WASI's one wait is a sleep on its clock"
-    )]
-    fn take_done(&mut self, wait: Duration) {
+    fn take_done(&mut self, until: Deadline) {
         self.shared.done.take_all(&mut self.inbox, Duration::ZERO);
-        if self.inbox.is_empty() && !wait.is_zero() && self.timers.next_deadline().is_some() {
-            std::thread::sleep(wait);
+        if self.inbox.is_empty() && self.timers.next_deadline().is_some() {
+            let clock = crate::wait::Monotonic::since(self.start);
+            let what = "the threads driver's next timer";
+            if let Err(error) = crate::wait::sleep_until(what, until, &clock) {
+                panic!("{error}");
+            }
         }
     }
 
@@ -1078,7 +1079,8 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Connect { .. }
         | Effect::Recv { .. }
         | Effect::Send { .. }
-        | Effect::Hangup { .. } => {
+        | Effect::Hangup { .. }
+        | Effect::Pressure { .. } => {
             unreachable!("timers, watches, processes and sockets are kept by the driver")
         }
     }
@@ -1803,6 +1805,16 @@ impl Driver for Threads {
                         self.tell(tag, Done::Failed(IoError(no_watch(watch))));
                     }
                 }
+                // The driver of no target the daemon runs on: its memory pressure is the
+                // native driver's (kqueue's on macOS, io_uring's on Linux), so it ends here.
+                Effect::Pressure { tag } => self.tell(
+                    tag,
+                    Done::Failed(IoError(
+                        "the threads driver watches no memory pressure: only kqueue (macOS) and \
+                         io_uring (Linux) do"
+                            .to_owned(), // alloc: an error path.
+                    )),
+                ),
                 // A lock never waits, so it is taken here rather than on an IO thread.
                 Effect::Lock { file, mode, tag } => {
                     let done = self.locks.lock(&self.shared.root, &file, mode, tag);
@@ -1925,24 +1937,21 @@ impl Driver for Threads {
         }
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize {
+    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let before = out.len();
         self.fire_timers();
-        let wait = match self.ready.is_empty() {
-            true => {
-                let now = wheel::ticks(self.start.elapsed());
-                let until_timer = self
-                    .timers
-                    .next_deadline()
-                    .map(|at| Duration::from_nanos(at.saturating_sub(now)));
-                until_timer.map_or(wait, |it| it.min(wait))
-            }
-            false => Duration::ZERO,
+        // The caller's deadline or the next timer's, whichever is sooner, on the driver's clock.
+        let until = match self.ready.is_empty() {
+            true => self
+                .timers
+                .next_deadline()
+                .map_or(until, |at| until.min(Deadline::at(Duration::from_nanos(at)))),
+            false => Deadline::PASSED,
         };
         #[cfg(not(target_os = "wasi"))]
-        self.shared.done.take_all(&mut self.inbox, wait);
+        self.shared.done.take_all(&mut self.inbox, until.left(self.start.elapsed()));
         #[cfg(target_os = "wasi")]
-        self.take_done(wait);
+        self.take_done(until);
         self.take_told();
         self.fire_timers();
         self.in_flight -= self.ready_ends;

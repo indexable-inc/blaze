@@ -1,10 +1,11 @@
-//! The link `blaze explore` prints and opens, and who may use what it names.
+//! The link an explorer prints and opens (`blaze explore` prints the daemon's), and who may use
+//! what it names.
 //!
 //! `https://ix.dev/explore#127.0.0.1:<port>/<token>/<certhash>`: the fragment never leaves the
 //! browser, so ix.dev never sees the port, the token or the hash. The page connects to
 //! `https://127.0.0.1:<port>/explore/v1` pinning the certificate by `certhash` (the SHA-256 of
 //! its DER, base64url without padding), and its first request on the session is `hello` with
-//! the token. The daemon accepts the session's CONNECT only from [`ORIGIN`] (and [`DEV_ORIGIN`]
+//! the token. The server accepts the session's CONNECT only from [`ORIGIN`] (and [`DEV_ORIGIN`]
 //! when started for the page's development server), so another site that learned a link still
 //! cannot open a session from a browser; the token keeps out a local process that is not a
 //! browser, which sends any Origin it likes.

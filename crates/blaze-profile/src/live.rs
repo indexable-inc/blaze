@@ -603,6 +603,20 @@ struct Thread {
     closed: u64,
 }
 
+impl Thread {
+    /// What the `i`th span it is inside is of, as the view writes it. A pool `job`'s is the type
+    /// of the closure it runs, hundreds of characters of `Scope::submit_as<..>` that would fill
+    /// the line ahead of the spans inside it, which name the work: it is shown only when no
+    /// span is inside it.
+    fn of(&self, i: usize) -> &str {
+        let span = &self.open[i];
+        match span.name == "job" && i + 1 < self.open.len() {
+            true => "",
+            false => &span.of,
+        }
+    }
+}
+
 /// The client's view of the feed, folded from each frame.
 #[derive(Default, Debug)]
 pub struct Top {
@@ -772,7 +786,7 @@ impl Top {
             for (i, span) in thread.open.iter().enumerate() {
                 out.push_str(if i == 0 { "" } else { " > " });
                 out.push_str(&span.name);
-                out.push_str(&span.of);
+                out.push_str(thread.of(i));
             }
             if thread.open.is_empty() {
                 _ = write!(out, "(idle, tid {tid})");
@@ -781,23 +795,25 @@ impl Top {
             out.push('\n');
         }
         // alloc: the view's rows, once a frame
-        let mut longest: Vec<(&Running, &str)> = threads
+        let mut longest: Vec<(&Running, &str, &str)> = threads
             .iter()
-            .flat_map(|&(_, thread)| thread.open.iter().map(move |it| (it, thread.name.as_str())))
+            .flat_map(|&(_, thread)| {
+                (thread.open.iter().enumerate())
+                    .map(move |(i, it)| (it, thread.of(i), thread.name.as_str()))
+            })
             // alloc: the view's rows, once a frame
             .collect();
-        longest.sort_by_key(|(it, _)| it.start_ns);
+        longest.sort_by_key(|(it, ..)| it.start_ns);
         if !longest.is_empty() {
             out.push_str("longest running\n");
         }
-        for (span, thread) in longest.iter().take(10) {
+        for (span, of, thread) in longest.iter().take(10) {
             let line_start = out.len();
             _ = write!(
                 out,
-                "{:>8.1}s  {}{}  ({thread})",
+                "{:>8.1}s  {}{of}  ({thread})",
                 secs(self.at_ns - span.start_ns),
                 span.name,
-                span.of
             );
             cut(out, line_start, width);
             out.push('\n');

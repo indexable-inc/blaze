@@ -21,8 +21,19 @@ default = ["sampler", "layer"]
 sampler = []
 # `ix_prof::layer()`, a `tracing_subscriber::Layer`.
 layer = ["dep:tracing-subscriber"]
-# `/debug/pprof/*` and `/debug/pprof/live` on a loopback port.
-http = []
+# `/debug/pprof/*` and `/debug/pprof/live` on a loopback port. Its accept loop waits through
+# blaze-core's one deadline wait (rule deadline-waits).
+http = ["dep:blaze-core"]
+# `ix_prof::explore`: the WebTransport server https://ix.dev/explore connects to on 127.0.0.1, for
+# any program with an `explore::Source` (the blaze daemon's is blaze-explore's).
+explore = [
+  "dep:base64",
+  "dep:blaze-http",
+  "dep:blaze-sha256",
+  "dep:crossbeam-channel",
+  "dep:rcgen",
+  "dep:tokio",
+]
 
 [dependencies]
 addr2line.workspace = true
@@ -30,6 +41,7 @@ arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
+blaze-core = { workspace = true, optional = true }
 # The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true
@@ -44,6 +56,15 @@ rustc-demangle.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
+# The explorer (feature `explore`): the certificate's hash in the link (base64url, SHA-256), the
+# certificate (rcgen), the request's stop (crossbeam-channel), and the WebTransport server:
+# blaze-http's sans-IO HTTP/3 core under its tokio driver (and the tests' client).
+base64 = { workspace = true, optional = true }
+blaze-http = { workspace = true, optional = true, features = ["tokio"] }
+blaze-sha256 = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

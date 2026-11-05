@@ -1,4 +1,5 @@
-//! Compiles Flecs's amalgamated source (vendor/flecs/distr/flecs.c, upstream master: vendor/flecs/SOURCE.md) and csrc/glue.c with cc, for the host
+//! Compiles Flecs's amalgamated source (the indexable-inc/flecs fork's distr/flecs.c, through the `flecs-distr` build
+//! dependency pinned in Cargo.toml) and csrc/glue.c with cc, for the host
 //! and for wasm32-unknown-unknown. Adapted from den's vendor/hyperion-flecs-c/build.rs.
 //!
 //! Addons: FLECS_CUSTOM_BUILD plus LOG (error messages), SCRIPT (which pulls in META, DOC and PARSER), PREFAB and
@@ -30,25 +31,22 @@ use std::path::PathBuf;
 fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     // Host mode compiles glue.c against the host's own flecs.h: the game's tree (`<vendor>/flecs-opinionated/crates/
-    // flecs-c` beside `<vendor>/flecs_ecs_sys`) or host-check's copy of it (vendor/flecs_ecs_sys). Otherwise this
-    // repo's pin (vendor/flecs/distr), or, vendored into a host's tree, the host's amalgamation.
+    // flecs-c` beside `<vendor>/flecs_ecs_sys`) or host-check's copy of it (vendor/flecs_ecs_sys). Otherwise the
+    // pinned fork's amalgamation (flecs-distr).
     let host = env::var_os("CARGO_FEATURE_HOST").is_some();
-    let candidates: &[&str] = if host {
-        &["../../../flecs_ecs_sys/src", "../../vendor/flecs_ecs_sys/src"]
+    let flecs = if host {
+        let candidates = ["../../../flecs_ecs_sys/src", "../../vendor/flecs_ecs_sys/src"];
+        candidates
+            .iter()
+            .map(|p| root.join(p))
+            .find(|d| d.join("flecs.h").is_file())
+            .unwrap_or_else(|| {
+                panic!("flecs.h not found under any of {candidates:?} from {}", root.display())
+            })
     } else {
-        // blaze: the amalgamation is the crate's own (SOURCE.md).
-        &["flecs"]
+        // blaze: the pinned fork's amalgamation (SOURCE.md).
+        PathBuf::from(flecs_distr::DIR)
     };
-    let flecs = candidates
-        .iter()
-        .map(|p| root.join(p))
-        .find(|d| d.join("flecs.h").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "flecs.h not found under any of {candidates:?} from {} (vendored: vendor/flecs/SOURCE.md)",
-                root.display()
-            )
-        });
     let target = env::var("TARGET").expect("TARGET");
     let rest = env::var_os("CARGO_FEATURE_REST").is_some();
     if rest && (host || target.starts_with("wasm32")) {

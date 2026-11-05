@@ -20,6 +20,7 @@
 
 use std::{
     collections::BTreeMap,
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -56,6 +57,8 @@ enum Message {
     Cancel { id: RequestId },
     Connected { conn: ConnId, stream: TcpStream },
     ConnectFailed { conn: ConnId, why: String },
+    Resolved { conn: ConnId, addresses: Vec<IpAddr> },
+    ResolveFailed { conn: ConnId, why: String },
     Sent { conn: ConnId, half: OwnedWriteHalf },
     Received { conn: ConnId, half: OwnedReadHalf, bytes: Vec<u8> },
     Broken { conn: ConnId, why: String },
@@ -184,6 +187,24 @@ impl Loop {
                 });
                 self.connecting.insert(conn, task.abort_handle());
             }
+            Io::Resolve { conn, host } => {
+                let to_loop = self.to_loop.clone();
+                let task = tokio::spawn(async move {
+                    let message = match tokio::net::lookup_host((host.as_str(), 0)).await {
+                        Ok(found) => {
+                            // alloc: one per name resolved for a proxy, its few addresses.
+                            let addresses = found.map(|it| it.ip()).collect();
+                            Message::Resolved { conn, addresses }
+                        }
+                        // alloc: an error's message, made only when it fails.
+                        Err(e) => Message::ResolveFailed { conn, why: e.to_string() },
+                    };
+                    _ = to_loop.send(message);
+                });
+                // Kept with the connects: a close while it resolves aborts it, and its answer
+                // is taken only while the connection is still wanted.
+                self.connecting.insert(conn, task.abort_handle());
+            }
             Io::Send { conn, bytes } => {
                 let Some(socket) = self.sockets.get_mut(&conn) else { return };
                 let Some(mut half) = socket.write.take() else { return };
@@ -273,6 +294,16 @@ impl Loop {
             Message::ConnectFailed { conn, why } => {
                 if self.connecting.remove(&conn).is_some() {
                     client.complete(Completion::ConnectFailed { conn, why });
+                }
+            }
+            Message::Resolved { conn, addresses } => {
+                if self.connecting.remove(&conn).is_some() {
+                    client.complete(Completion::Resolved { conn, addresses });
+                }
+            }
+            Message::ResolveFailed { conn, why } => {
+                if self.connecting.remove(&conn).is_some() {
+                    client.complete(Completion::ResolveFailed { conn, why });
                 }
             }
             Message::Sent { conn, half } => {

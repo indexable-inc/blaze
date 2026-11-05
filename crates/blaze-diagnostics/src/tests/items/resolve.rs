@@ -311,3 +311,127 @@ fn main() {
         &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])],
     );
 }
+
+#[test]
+fn a_struct_with_named_fields_used_as_a_value_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct A { b: u8 }
+
+fn main() {
+    let _ = A(1);
+    let _ = A;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[
+            error(
+                4,
+                &["E0423", "expected function, tuple struct or tuple variant, found struct `A`"],
+            ),
+            error(5, &["E0423", "expected value, found struct `A`"]),
+        ],
+    );
+}
+
+#[test]
+fn a_raw_identifier_struct_used_as_a_value_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct r#match { b: u8 }
+
+fn main() {
+    let _ = r#match;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(4, &["E0423", "expected value, found struct `r#match`"])],
+    );
+}
+
+
+#[test]
+fn a_raw_identifier_struct_called_as_a_function_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct r#Widget { b: u8 }
+
+fn main() {
+    let _ = r#Widget(1);
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(
+            4,
+            &["E0423", "expected function, tuple struct or tuple variant, found struct `r#Widget`"],
+        )],
+    );
+}
+
+#[test]
+fn a_struct_used_as_a_value_still_offers_the_value_to_import() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+mod values {
+    pub const A: u8 = 1;
+}
+
+struct A { b: u8 }
+
+fn main() {
+    let _ = A;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(8, &["E0423", "expected value, found struct `A`", "use crate::values::A;"])],
+    );
+}
+
+#[test]
+fn a_typo_of_a_raw_identifier_suggests_the_raw_identifier() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+fn main() {
+    let r#match = 1;
+    let _ = r#matc;
+}
+"#;
+    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0425", "r#match"])]);
+}
+
+#[test]
+fn an_aliased_struct_used_as_a_value_names_the_struct_it_points_at() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+mod m {
+    pub struct Real { pub b: u8 }
+}
+
+use m::Real as Alias;
+
+fn main() {
+    let _ = Alias;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(
+            8,
+            &["E0423", "expected value, found struct `Alias`", "`Real` (imported as `Alias`) defined here"],
+        )],
+    );
+}
+
+#[test]
+fn a_struct_used_as_a_value_still_suggests_a_similar_value() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct Foo { x: u8 }
+
+fn main() {
+    let foo = 1;
+    let _ = Foo;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(5, &["E0423", "expected value, found struct `Foo`", "similar name", "foo"])],
+    );
+}

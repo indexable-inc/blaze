@@ -91,6 +91,12 @@ runs:
     # build script in blaze's sandbox may name only system directories of libraries
     # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
     # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
+    # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has
+    # 3.10. An ix runner's python3 is new enough (blaze.yaml's runs of typed_input scripts).
+    - if: inputs.llvm == 'true' && runner.environment == 'github-hosted'
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
     - name: LLVM (the pin)
       if: inputs.llvm == 'true'
       shell: bash
@@ -103,7 +109,7 @@ runs:
         esac
         sudo mkdir -p /usr/local/lib/blaze-llvm
         sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-        python3 .github/scripts/llvm.py fetch --target "$triple" --dir "/usr/local/lib/blaze-llvm/$triple"
+        python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$triple\", \"dir\": \"/usr/local/lib/blaze-llvm/$triple\"}"
         echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"
     # A cold store (a release of other sources, or a project main has not pushed yet) builds blaze in more
     # than a hosted runner's 16 GB (rcache, #664): swap lets that run finish, slowly, where it

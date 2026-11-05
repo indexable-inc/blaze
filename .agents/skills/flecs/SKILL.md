@@ -18,8 +18,13 @@ small scripts through each build listed below.
 | Runtime | Flecs | Pinned in |
 | --- | --- | --- |
 | harness native app | v4.2.0 (fork `indexable-inc/flecs`, branch `indexable/v4.2`) | `flecs-distr` rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml` |
+| blaze daemon's build page (`crates/blaze-web`, through `vendor/flecs-c`) | the same v4.2.0 fork rev as harness | `flecs-distr` rev in `vendor/flecs-c/Cargo.toml`; `.github/scripts/flecs_pin.py` (CI's `changes` job) fails if it differs from harness's |
 | site build (`site-snapshot.wasm`) | upstream master `785ea7c` (2026-10-15, 90 commits before v4.2.0); its header says 4.1.6. Addons: SCRIPT, PREFAB, LOG only | flecs-opinionated rev in `site/renderer/Cargo.toml` |
 | site type checker (`flecs-doc.wasm`) | `v4.1.6-665-gce3b06a6e`; accepted and rejected the same scripts as `785ea7c` | `site/flecs/FLECS_VERSION` |
+
+The site is not on the shared pin: its runtime is flecs-opinionated's `flecs-c`, whose own vendored flecs is still
+pre-4.2 (main at upstream `37a7ef90d` on 2026-11-04). Moving it means porting flecs-opinionated to 4.2, then the
+site's `.flecs` files (`Override` to `Copy` and the rest of `script.md`'s **4.2** marks) and rebuilding `flecs-doc.wasm`.
 
 "v4.1.6" on the site means the header, not the release: the v4.1.6 tag's script language is older (it rejects
 `struct P(x: f32)`, typed `prop`, `match`, vector literals, maps, `export mut`). Never write site script from 4.1.6-era

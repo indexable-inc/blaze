@@ -95,7 +95,12 @@ fn pin_report(pin: &Pin, json: &str, prefix: Option<&std::ffi::OsStr>, found: &s
     let target = std::env::var("TARGET").unwrap_or_default();
     match pin_sha256(json, &target) {
         Ok(Some(_)) => {
-            say("fix", &format!("python3 .github/scripts/llvm.py fetch --target {target} --dir ~/.blaze/llvm"));
+            say(
+                "fix",
+                &format!(
+                    r#"python3 .github/scripts/llvm.py '{{"command": "fetch", "target": "{target}", "dir": "~/.blaze/llvm"}}'"#
+                ),
+            );
             say("fix+", &format!("export {PIN_PREFIX}=~/.blaze/llvm"));
         }
         Ok(None) | Err(_) => say(

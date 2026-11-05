@@ -1289,7 +1289,20 @@ fn render_variant_after_name<'db>(
 }
 
 impl<'db> HirDisplay<'db> for Ty<'db> {
-    fn hir_fmt(&self, f @ &mut HirFormatter { db, .. }: &mut HirFormatter<'_, 'db>) -> Result {
+    fn hir_fmt(&self, f: &mut HirFormatter<'_, 'db>) -> Result {
+        // A type nests as deep as it is written or inferred (`&&&…T`, or the cycle of recursive
+        // inference variables `recursive_vars_2` prints), one call per level, and each call is a
+        // frame of the large match below (9.7 KiB in a debug build): that overflowed a test
+        // thread's 2 MiB at 216 levels. So the recursion runs on a grown stack.
+        stdx::ensure_sufficient_stack(|| self.hir_fmt_here(f))
+    }
+}
+
+impl<'db> Ty<'db> {
+    fn hir_fmt_here(
+        &self,
+        f @ &mut HirFormatter { db, .. }: &mut HirFormatter<'_, 'db>,
+    ) -> Result {
         let interner = f.interner;
         if f.should_truncate() {
             return write!(f, "{TYPE_HINT_TRUNCATION}");

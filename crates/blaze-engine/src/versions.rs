@@ -1,5 +1,5 @@
 //! The releases of blaze a workspace pins (`pin.rs`), fetched once into
-//! `~/.blaze/versions/<version>`: the release's archive for this host from its GitHub release,
+//! `~/.blaze/versions/<version>`: the release's archive for this host from blaze's releases ([`RELEASES`]),
 //! checked against every list of sums the release publishes ([`SUMS`]: `B3SUMS` and
 //! `SHA256SUMS`, as `b3sum` and `sha256sum` write them), unpacked there. The launcher asks this
 //! only when the pinned release is not there, so a pinned build reaches the network once per
@@ -18,8 +18,9 @@ use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp, Response, Retry
 
 use crate::pin;
 
-/// Where the releases are: `<this>/v<version>/<asset>`.
-const RELEASES: &str = "https://github.com/indexable-inc/blaze/releases/download";
+/// Where the releases are: `<this>/v<version>/<asset>` and `<this>/channels/<channel>`, blaze's
+/// R2 bucket (docs/release.md, "Where the bytes are").
+const RELEASES: &str = blaze_cargo::release::RELEASES;
 
 /// The variable that names another place the releases are: an `https://` address laid out as
 /// [`RELEASES`], or a directory with a `v<version>` directory of each release's assets. A
@@ -298,10 +299,10 @@ pub(crate) fn why_this_one(given: bool) -> String {
     }
 }
 
-/// Where blaze's releases are read from: GitHub, or what [`RELEASES_FROM`] names.
+/// Where blaze's releases are read from: [`RELEASES`], or what [`RELEASES_FROM`] names.
 pub(crate) enum Source {
     /// [`RELEASES`], and `latest.json` from blaze's site (`update.rs`).
-    GitHub,
+    Ours,
     /// A directory of `v<version>` directories of each release's assets, `latest.json` beside them.
     Dir(PathBuf),
     /// An `https://` mirror laid out as [`RELEASES`], `latest.json` at its top.
@@ -319,7 +320,7 @@ pub(crate) fn source() -> Result<Source, FetchError> {
         }
     };
     Ok(match given {
-        None => Source::GitHub,
+        None => Source::Ours,
         Some(given) if !given.contains("://") => Source::Dir(PathBuf::from(given)),
         Some(given) if given.starts_with("https://") => Source::Mirror(given),
         Some(given) => return Err(FetchError::NotHttps(given)),
@@ -337,7 +338,7 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
             };
         }
-        Source::GitHub => RELEASES.to_owned(),
+        Source::Ours => RELEASES.to_owned(),
         Source::Mirror(base) => base,
     };
     let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;

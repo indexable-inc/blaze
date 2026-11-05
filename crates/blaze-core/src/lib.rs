@@ -36,7 +36,7 @@
 
 pub mod busy;
 #[cfg(target_os = "linux")]
-mod cgroup;
+pub mod cgroup;
 #[allow(
     unsafe_code,
     reason = "getpriority and setpriority on the calling process, each one call behind a safe function"
@@ -92,6 +92,7 @@ pub mod utf8;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the inotify driver: its system calls and the events it reads")]
 mod watch;
+pub mod wait;
 pub mod wheel;
 
 use std::{fmt, time::Duration};
@@ -551,7 +552,29 @@ pub enum Effect {
         conn: Conn,
         tag: Tag,
     },
+    /// The system's memory pressure, watched: completes with [`Done::Pressed`] each time the
+    /// system says memory is short (docs/memory-budget.md section 7, "Pressure"), until an
+    /// [`Effect::Unwatch`] of the same tag ends it with [`Done::Unwatched`]. In flight until it
+    /// ends, as a watch is. Where the system has no such source (Linux without PSI, or one
+    /// this process may not arm; Windows and the other targets, not yet), it ends at once with
+    /// a [`Done::Failed`] naming why: the asker runs without it.
+    ///
+    /// - macOS (kqueue): `EVFILT_MEMORYSTATUS` with `NOTE_MEMORYSTATUS_PRESSURE_WARN` and
+    ///   `_CRITICAL`, the filter libdispatch's `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` is made of.
+    /// - Linux (io_uring): a PSI trigger ([`PSI_TRIGGER`]) on the memory pressure of the
+    ///   process's own cgroup where one is delegated to it, else of the whole system
+    ///   (`/proc/pressure/memory`), polled through the ring for `POLLPRI`.
+    Pressure {
+        tag: Tag,
+    },
 }
+
+/// The PSI trigger an [`Effect::Pressure`] arms on Linux: some task stalled on memory for 300
+/// ms of a 2 s window, 15%. The window is 2 s, not 1, because the kernel lets a process without
+/// `CAP_SYS_RESOURCE` arm only windows that are whole multiples of 2 s (Linux 6.5, "sched/psi:
+/// allow unprivileged polling of N*2s period"), and the daemon runs as its user. The trailing
+/// NUL is written too: the kernel ends the trigger's text at the last byte written.
+pub const PSI_TRIGGER: &[u8] = b"some 300000 2000000\0";
 
 impl Effect {
     pub fn tag(&self) -> Tag {
@@ -592,7 +615,8 @@ impl Effect {
             | Effect::Connect { tag, .. }
             | Effect::Recv { tag, .. }
             | Effect::Send { tag, .. }
-            | Effect::Hangup { tag, .. } => *tag,
+            | Effect::Hangup { tag, .. }
+            | Effect::Pressure { tag } => *tag,
         }
     }
 }
@@ -855,6 +879,12 @@ pub enum Done {
     /// Of an [`Effect::Entries`]: each name under the root, sorted.
     Entries(Vec<(FileName, Stamp)>),
     Unwatched,
+    /// Of an [`Effect::Pressure`]: the system said memory is short, `critical` when it said so
+    /// at its highest level (macOS's critical; PSI has one level, said as not critical). One
+    /// of many the effect gives: it stays in flight.
+    Pressed {
+        critical: bool,
+    },
     /// Of an [`Effect::Flush`]: the watch's changes queued when it was asked are all told.
     Flushed,
     Fired,
@@ -921,9 +951,12 @@ pub struct Completion {
 pub trait Driver {
     /// Starts every effect in `effects`, leaving it empty.
     fn submit(&mut self, effects: &mut Vec<Effect>);
-    /// Moves completions into `out`, waiting up to `wait` for the first if none is ready.
+    /// Moves completions into `out`, waiting until `until` (on [`Driver::now`]'s clock) for
+    /// the first if none is ready: [`wait::Deadline::PASSED`] only looks, and
+    /// [`wait::Deadline::NEVER`] waits until one comes. An absolute deadline, never a length,
+    /// so no layer between the caller and the kernel restarts it (rule deadline-waits).
     /// Returns how many it moved.
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize;
+    fn poll(&mut self, out: &mut Vec<Completion>, until: wait::Deadline) -> usize;
     /// How many effects were submitted and have not completed.
     fn in_flight(&self) -> usize;
     /// Monotonic time since the driver began.
@@ -947,7 +980,7 @@ pub fn run_until_idle(
         if driver.in_flight() == 0 {
             return;
         }
-        driver.poll(&mut done, Duration::from_secs(60));
+        driver.poll(&mut done, wait::Deadline::NEVER);
         for completion in done.drain(..) {
             on(completion, effects);
         }

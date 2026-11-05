@@ -15,6 +15,7 @@ use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
     InferBodyId,
+    method_resolution::CandidateId,
     mir::{
         BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, PlaceElem,
         ProjectionElem,
@@ -359,6 +360,13 @@ fn const_promotable(
     match ctx.store.expr(expr) {
         Expr::Literal(_) => true,
         Expr::Path(path) => {
+            // Associated constants are resolved by type inference, not value-name lookup.
+            if matches!(
+                ctx.infer.assoc_resolutions_for_expr(expr),
+                Some((CandidateId::ConstId(_), _))
+            ) {
+                return true;
+            }
             let owner = body.owner;
             let mut resolver = owner.resolver(ctx.db);
             let _guard =

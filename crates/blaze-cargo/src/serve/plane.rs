@@ -680,6 +680,10 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
+    /// What the system last said of memory ([`Plane::pressed`]), and the cap on the budget it
+    /// makes as last given to the plane ([`PlaneInput::Cap`]).
+    pressure: blaze_graph::pressure::Pressured,
+    capped: Option<u64>,
 }
 
 /// A ready node's wait for admission, as its profile span says it ([`Plane::admitting`]).
@@ -690,7 +694,12 @@ struct Admitting {
 
 /// What a unit's phase of a kind with no ratio measured yet is predicted to hold per KiB of
 /// its source: 1 MiB, a thousand bytes for each byte of source. Never more than the kind's own
-/// peak ([`Plane::push_sized`]), so a guess too high costs no more than the kind floor did.
+/// peak once a task of the kind was measured ([`Plane::push_sized`]), so a guess too high costs
+/// no more than the kind floor did; before that, the guess stands (under a budget, at most the
+/// budget, [`admitted`]). Capping it then by the history's prediction for a kind never seen,
+/// [`SIZED_FLOOR`], granted every unit of a cold daemon's first build 64 MiB, whatever its
+/// size: hir-def's front end held 2.39 GiB on its grant of 64 MiB, and a cold `blaze test
+/// --workspace` reached 169 GiB on a 127 GiB Mac (#1726).
 pub const PER_SOURCE_KIB: u64 = 1 << 20;
 
 /// The least a sized unit's phase is predicted to hold, however small its source: the
@@ -759,7 +768,53 @@ impl<W: Work, P: Predict> Plane<W, P> {
             replays: HashSet::new_in(Global), // alloc: the plane's, once
             per_kib: HashMap::new_in(Global), // alloc: the plane's, once
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
+            pressure: blaze_graph::pressure::Pressured::default(),
+            capped: None,
         })
+    }
+
+    /// The system says memory is short at `at` (docs/memory-budget.md section 7, "Pressure"):
+    /// from the next [`Plane::poll`] until [`blaze_graph::pressure::HOLD_NS`] after the last
+    /// such event, the budget the plane admits against is held at what the process holds now.
+    /// Whether the front ends are to be asked for a release for it
+    /// ([`blaze_graph::pressure::Pressured::release_due`]).
+    pub fn pressed(&mut self, at: Duration) -> bool {
+        self.pressure = self.pressure.pressed(ns(at), arena::held());
+        self.pressure.release_due(ns(at))
+    }
+
+    /// What admission counts the daemon at (the most of what it held as the plane last heard
+    /// and what its running tasks are granted), the budget it admits against (its allowance;
+    /// `None` with no budget), and the pressure cap on it while there is one.
+    pub fn memory(&self) -> (u64, Option<u64>, Option<u64>) {
+        let budget = self.graph.config().budget.as_ref().map(|it| it.bytes);
+        (self.graph.held().max(self.graph.granted()), budget, self.graph.cap())
+    }
+
+    /// The requests (by number) with a ready task held back for memory alone now
+    /// ([`blaze_graph::Plane::waits_for_memory`]), into `into`, ascending, each once.
+    pub fn held_back(&self, into: &mut Vec<u32>) {
+        for &id in self.admitting.keys() {
+            if self.graph.waits_for_memory(id)
+                && let Some((batch, _)) = self.task(id)
+            {
+                into.push(batch.request); // alloc: none once it has held this many.
+            }
+        }
+        into.sort_unstable();
+        into.dedup();
+    }
+
+    /// Each running task granted memory, by its node and name, to `each`: what a task held back
+    /// for memory waits on. A task several requests share comes once each.
+    pub fn granted_running<'a>(&'a self, mut each: impl FnMut(NodeId, &'a str)) {
+        self.graph.unsettled(|it| {
+            if matches!(it.state, NodeState::Running)
+                && self.graph.admitted(it.id).is_some_and(|admitted| admitted.granted > 0)
+            {
+                each(it.id, it.name);
+            }
+        });
     }
 
     pub fn budget(&self) -> Option<&Budget> {
@@ -954,15 +1009,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// What a unit of `source` bytes of source is predicted to hold in a task of `kind`: its
     /// KiB times the kind's bytes per KiB, at least [`SIZED_FLOOR`], at most the kind's peak
-    /// (or the floor, where that is less).
+    /// (or the floor, where that is less) once a task of the kind was measured.
     fn sized(&self, kind: TaskKind, source: u64) -> u64 {
         let per_kib = self.per_kib(kind).unwrap_or(PER_SOURCE_KIB);
-        let kind_peak = self.predict.predict(kind, None).peak;
-        source
-            .div_ceil(1024)
-            .saturating_mul(per_kib)
-            .max(SIZED_FLOOR)
-            .min(kind_peak.max(SIZED_FLOOR))
+        let guess = source.div_ceil(1024).saturating_mul(per_kib).max(SIZED_FLOOR);
+        match self.predict.measured(kind, None) {
+            true => guess.min(self.predict.predict(kind, None).peak.max(SIZED_FLOOR)),
+            // No task of the kind measured: its "peak" is the default for a kind never seen,
+            // no measure of anything, so the unit's own size says what it may hold.
+            false => guess,
+        }
     }
 
     /// The bytes a sized node of `kind` held per KiB of its source lately, once one ended:
@@ -976,6 +1032,35 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// none was, or only granted tasks did. The loop lets go of what it can for it.
     pub fn short(&self) -> u64 {
         self.graph.short()
+    }
+
+    /// The machine ledger's word on what this daemon may grant now, taken at `at` while the
+    /// daemon holds the ledger's lock ([`PlaneInput::Allowance`], `super::machine`): what now
+    /// fits starts, and until the next one the plane grants no more than it then holds.
+    pub fn allow(&mut self, at: Duration, bytes: u64) {
+        self.step(PlaneInput::Allowance { at_ns: ns(at), bytes })
+            .unwrap_or_else(|error| panic!("the plane refused the machine's allowance: {error}"));
+    }
+
+    /// What the process held at the plane's last measure ([`Plane::poll`]).
+    pub fn held(&self) -> u64 {
+        self.graph.held()
+    }
+
+    /// What the tasks running now were granted.
+    pub fn granted(&self) -> u64 {
+        self.graph.granted()
+    }
+
+    /// The most the plane grants until the next [`Plane::allow`]
+    /// ([`blaze_graph::Plane::room`]).
+    pub fn room(&self) -> u64 {
+        self.graph.room()
+    }
+
+    /// Whether a task with memory was held back for it as the plane last dispatched.
+    pub fn held_any_back(&self) -> bool {
+        self.graph.held_back()
     }
 
     /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its
@@ -1262,6 +1347,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.ran = ran;
         let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::held() };
         self.step(held).unwrap_or_else(|error| panic!("the plane refused what is held: {error}"));
+        // The pressure cap, given as it changes: on an event, and once it passes.
+        let cap = self.pressure.cap(ns(at));
+        if cap != self.capped {
+            self.capped = cap;
+            let input = PlaneInput::Cap { at_ns: ns(at), bytes: cap };
+            self.step(input)
+                .unwrap_or_else(|error| panic!("the plane refused the pressure cap: {error}"));
+        }
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the
@@ -1948,6 +2041,33 @@ mod tests {
         let why = settled[2].2.as_deref().unwrap_or_default();
         assert!(why.contains("measured big needs 2.00 GB of memory"), "{why}");
         assert!(why.contains("2.00 GB is what this unit's own last runs held at most"), "{why}");
+    }
+
+    /// A cold daemon has measured no task of any kind: a unit is predicted by its own size, not
+    /// capped at the default for a kind never seen. #1726: every unit of a cold workspace build
+    /// was granted 64 MiB, hir-def's front end held 2.39 GiB on it, and the daemon went past its
+    /// limit.
+    #[test]
+    fn a_cold_daemon_predicts_a_unit_by_its_size_not_the_unseen_kinds_default() {
+        let mib = 1u64 << 20;
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let history = blaze_history::History::new(blaze_history::Config::default());
+        // No task runs: the batch's type only names one.
+        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        // 4 MiB of source at PER_SOURCE_KIB: 4 GiB, though the kind was never seen.
+        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 4096 * mib);
+        // A small unit stays at the floor.
+        assert_eq!(plane.sized(kinds::COMPILE, 4 << 10), SIZED_FLOOR);
+
+        // Once the kind is measured, its peak caps the guess again.
+        let mut history = blaze_history::History::new(blaze_history::Config::default());
+        history.observe(kinds::COMPILE, None, 1_000, 512 * mib);
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 512 * mib);
     }
 
     /// Runs `plane` until each of `ids` settled, saying which did well.

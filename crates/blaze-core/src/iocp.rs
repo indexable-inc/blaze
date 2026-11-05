@@ -83,7 +83,6 @@ use windows_sys::Win32::{
     System::{
         IO::{CancelIoEx, OVERLAPPED_ENTRY},
         SystemServices::JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
-        Threading::WaitForSingleObject,
     },
 };
 
@@ -96,6 +95,7 @@ use crate::{
     IoError, RECV_MOST, Sandbox, Tag,
     handoff::Wake,
     journal::barrier::{At, Barrier, Decision},
+    wait::{self, Clock as _, Deadline, Monotonic},
     wheel::{self, Wheel},
 };
 
@@ -1019,6 +1019,13 @@ impl Iocp {
                 Ok(())
             }
             Effect::Hangup { conn, tag } => self.hangup(conn, tag),
+            // Not yet: `CreateMemoryResourceNotification` is the source to wait on here. Until
+            // then it ends at once, naming why, and the daemon runs without it.
+            Effect::Pressure { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the IOCP driver watches no memory pressure yet \
+                 (CreateMemoryResourceNotification is not waited on)",
+            )),
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
                 unreachable!("taken where they are submitted")
             }
@@ -1978,9 +1985,14 @@ impl Iocp {
         (request.head.overlapped().cast_const() == entry.lpOverlapped.cast_const()).then_some(id)
     }
 
-    /// Takes what the port has, waiting up to `wait` for the first, and acts on it.
-    fn wait(&mut self, wait: Duration) {
-        let got = self.port.take(&mut self.entries, wait).expect("waiting on the completion port");
+    /// Takes what the port has, waiting until `until` (forever for `None`) for the first,
+    /// and acts on it.
+    fn wait(&mut self, until: Option<Deadline>) {
+        let clock = Monotonic::since(self.start);
+        let got = match self.port.take(&mut self.entries, until, &clock) {
+            Ok(got) => got,
+            Err(error) => panic!("waiting on the completion port: {error}"),
+        };
         for at in 0..got {
             let entry = self.entries[at];
             match entry.lpCompletionKey {
@@ -2233,13 +2245,13 @@ impl Drop for Iocp {
         }
         // Each request is let go only once the port gives it back: until then the kernel may
         // still write to what it lent.
-        let deadline = Instant::now() + GIVE_BACK;
+        let clock = Monotonic::since(self.start);
+        let deadline = Deadline::after(clock.now(), GIVE_BACK);
         while !self.requests.is_empty() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if deadline.passed(clock.now()) {
                 break;
             }
-            let Ok(got) = self.port.take(&mut self.entries, left) else { break };
+            let Ok(got) = self.port.take(&mut self.entries, Some(deadline), &clock) else { break };
             for at in 0..got {
                 let entry = self.entries[at];
                 if entry.lpCompletionKey == KEY_IO
@@ -2265,10 +2277,11 @@ impl Drop for Iocp {
         // Handed runs are abandoned as started ones are, their run directories removed once
         // the launcher, which writes in them, has exited.
         for (_, warm) in self.warms.iter_mut() {
-            // SAFETY: an open process; it exits once its input has ended, which it has.
-            unsafe {
-                WaitForSingleObject(warm.process.as_raw_handle(), GIVE_BACK.as_millis() as u32)
-            };
+            // An open process; it exits once its input has ended, which it has. One that has
+            // not by then is left to the job's end; what it wrote is removed with its dirs.
+            let deadline = Deadline::after(clock.now(), GIVE_BACK);
+            let what = "the warm launcher to exit as the driver is dropped";
+            _ = wait::signaled(what, warm.process.as_raw_handle(), Some(deadline), &clock);
             drop(warm.waiting.take());
         }
         for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_none()) {
@@ -2348,23 +2361,22 @@ impl Driver for Iocp {
         }
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize {
+    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let before = out.len();
-        let deadline = Instant::now().checked_add(wait);
+        let clock = Monotonic::since(self.start);
         loop {
             self.gather(out);
             if out.len() > before || self.in_flight == 0 {
                 break;
             }
-            let now = Instant::now();
-            let mut left = deadline.map_or(Duration::MAX, |it| it.saturating_duration_since(now));
-            if let Some(due) = self.timers.next_deadline() {
-                let at = wheel::ticks(now.saturating_duration_since(self.start));
-                left = left.min(Duration::from_nanos(due.saturating_sub(at)));
-            }
-            self.wait(left);
+            // The caller's deadline or the next timer's, whichever is sooner.
+            let wait = self
+                .timers
+                .next_deadline()
+                .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
+            self.wait(wait.finite());
             self.gather(out);
-            if out.len() > before || deadline.is_some_and(|it| Instant::now() >= it) {
+            if out.len() > before || until.passed(clock.now()) {
                 break;
             }
         }
@@ -2541,8 +2553,12 @@ fn abandon(
 ) {
     process::terminate(job, process::KILLED);
     if let Some(process) = process {
-        // SAFETY: an open process handle; a kill of its job ends it promptly.
-        unsafe { WaitForSingleObject(process.as_raw_handle(), GIVE_BACK.as_millis() as u32) };
+        // An open process handle; a kill of its job ends it promptly. One that has not ended
+        // by then is left as it is: its run directory is removed below either way.
+        let clock = Monotonic::new();
+        let deadline = Some(Deadline::after(clock.now(), GIVE_BACK));
+        let what = "an abandoned run's process to exit after its job was killed";
+        _ = wait::signaled(what, process.as_raw_handle(), deadline, &clock);
     }
     if let Some(dir) = finish.scratch.take() {
         dirs.remove(dir);
@@ -2962,7 +2978,7 @@ mod tests {
         // Long enough, mostly, for the launcher to start its program in the run's job.
         let began = Instant::now();
         while began.elapsed() < Duration::from_millis(500) {
-            driver.poll(&mut out, Duration::from_millis(50));
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
         }
         assert!(out.is_empty(), "{out:?}");
         let seen = run(&mut driver, vec![Effect::Kill { tag: Tag(1) }]);
@@ -3121,7 +3137,7 @@ mod tests {
         let mut driver = Iocp::new(&root, 1).unwrap();
         let mut out = Vec::new();
         driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), tag: Tag(1) }]);
-        driver.poll(&mut out, Duration::ZERO);
+        driver.poll(&mut out, Deadline::PASSED);
         assert!(out.is_empty(), "{out:?}");
         let seen = run(
             &mut driver,
@@ -3192,7 +3208,8 @@ mod tests {
         driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(60), tag: Tag(1) }]);
         let began = Instant::now();
         let mut out = Vec::new();
-        assert_eq!(driver.poll(&mut out, Duration::from_millis(20)), 0);
+        let until = Deadline::after(driver.now(), Duration::from_millis(20));
+        assert_eq!(driver.poll(&mut out, until), 0);
         let waited = began.elapsed();
         assert!(
             waited >= Duration::from_millis(19) && waited < Duration::from_secs(5),
@@ -3353,7 +3370,7 @@ mod tests {
                     tag: Tag(100 + n),
                 }]);
             }
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 match it.done {
                     Done::Changed { files, .. } => {
@@ -3391,7 +3408,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut asked_end = false;
         loop {
-            driver.poll(&mut out, Duration::from_millis(50));
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in out.drain(..) {
                 assert_eq!(it.tag, Tag(7));
                 match it.done {
@@ -3601,7 +3618,7 @@ mod tests {
                     Instant::now() < deadline,
                     "the flush {flush:?} was never told; heard {heard:?}"
                 );
-                driver.poll(&mut out, Duration::from_millis(50));
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
                 let mut told = false;
                 for it in out.drain(..) {
                     match (it.tag, it.done) {
@@ -3724,7 +3741,7 @@ mod tests {
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.stale() == 0 && Instant::now() < deadline {
-            driver.poll(&mut out, Duration::from_millis(10));
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(10)));
         }
         assert_eq!(driver.stale(), 1);
         assert!(out.iter().all(|it| matches!(it.done, Done::Changed { .. })), "{out:?}");
@@ -3742,7 +3759,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while out.len() < n {
             assert!(Instant::now() < deadline, "{out:?}");
-            driver.poll(out, Duration::from_millis(100));
+            driver.poll(out, Deadline::after(driver.now(), Duration::from_millis(100)));
         }
     }
 
@@ -3940,7 +3957,7 @@ mod tests {
             let ((), added) = blaze_alloc_count::measure(|| {
                 effects.push(watch);
                 driver.submit(&mut effects);
-                driver.poll(&mut out, Duration::ZERO);
+                driver.poll(&mut out, Deadline::PASSED);
             });
             std::fs::write(root.join("src/f.rs"), round.to_ne_bytes()).unwrap();
             let mut used = added.allocations;
@@ -3952,8 +3969,9 @@ mod tests {
             };
             while !heard(&out) {
                 assert!(Instant::now() < deadline, "{out:?}");
+                let until = Deadline::after(driver.now(), Duration::from_millis(50));
                 let (_, polled) =
-                    blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+                    blaze_alloc_count::measure(|| driver.poll(&mut out, until));
                 used += polled.allocations;
             }
             let ((), removed) = blaze_alloc_count::measure(|| {
@@ -3961,7 +3979,7 @@ mod tests {
                 driver.submit(&mut effects);
                 while !out.iter().any(|it| it.done == Done::Unwatched) {
                     assert!(Instant::now() < deadline + Duration::from_secs(10), "{out:?}");
-                    driver.poll(&mut out, Duration::from_millis(50));
+                    driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
                 }
             });
             used += removed.allocations;

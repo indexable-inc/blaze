@@ -1,0 +1,52 @@
+-- full 100x30
+ blaze test  compiling                                                     488 of 570 tasks   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  1 running · 81 waiting
+ memory  106.3 GB, no limit
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+
+ workers  1 busy · 15 idle
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+
+ blocked on
+   codegen core  running 4m30s  holds 82  chain 41
+     std build script, libc build script, alloc lib, +79
+
+ slowest so far
+   bodies hir-ty 1m12s · codegen syntax 48.0s · script-run ring 31.0s
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- full 100x8
+ blaze test  compiling                                                     488 of 570 tasks   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  1 running · 81 waiting
+ memory  106.3 GB, no limit
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+
+ e expand · blaze explore for the graph · blaze debug live for every thread
+
+-- expanded 100x30
+ blaze test  compiling                                                     488 of 570 tasks   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───────────  1 running · 81 waiting
+ memory  106.3 GB, no limit
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+
+ workers  1 busy · 15 idle
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+
+ blocked on
+   codegen core  running 4m30s  holds 82  chain 41
+     std build script, libc build script, alloc lib, +79
+
+ slowest so far
+   bodies hir-ty 1m12s · codegen syntax 48.0s · script-run ring 31.0s
+
+ e collapse · blaze explore for the graph · blaze debug live for every thread
+
+-- inline 100
+ blaze test  compiling  488/570  1/16 busy  mem 106.3 GB                                      15m14s
+ ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+   blaze-worker-3  codegen  core::ptr::is_freeze  core  task > codegen > copy_prop > is_freeze 4m30s
+ blocked on codegen core  running 4m30s  holds 82  chain 41
+
+-- line
+[15m14s] compiling 488/570 · 1/16 busy · mem 106.3 GB · on codegen core (core::ptr::is_freeze, 4m30s), holds 82 · slow: nothing settled for 4m30s

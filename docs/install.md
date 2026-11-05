@@ -55,8 +55,10 @@ with blaze's error.
 
 ## The installer
 
-The installer downloads the build for your machine from the
-[releases](https://github.com/indexable-inc/blaze/releases), checks it against the checksums
+The installer downloads the build for your machine from blaze's releases
+(`https://blaze-releases.ix.dev`, an R2 bucket at Cloudflare's edge, [release.md](release.md#where-the-bytes-are);
+the [GitHub releases](https://github.com/indexable-inc/blaze/releases) list the same ones with
+their notes), checks it against the checksums
 published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
 runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
 step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
@@ -69,8 +71,6 @@ it is built and promoted to stable, unchanged, once it passes them. End the line
 `--no-toolchain` skips that download (v1 left it to the first build; v2's first build does not
 download it), and `--help` says what else it takes.
 Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
-Until the first dated release, it
-installs the `nightly` prerelease, a build of 2026-10-20 that nothing updates any more.
 
 ## Updates
 
@@ -168,6 +168,14 @@ release: in a project that pins a release of blaze (`[workspace.metadata.blaze] 
 runs that release, fetched once, saying so in one line on stderr, as a release does;
 `blaze --ignore-pin <command>` runs the build itself there
 ([cargo.md](cargo.md#pinning-a-release-of-blaze)).
+
+## With MacPorts
+
+```sh
+sudo port install blaze
+```
+
+This fetches the blaze source and compiles locally without having to configure anything else on Apple Silicon Macs.
 
 ## The old names
 

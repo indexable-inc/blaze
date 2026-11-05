@@ -39,7 +39,7 @@ use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use crate::{
     InferBodyId, InferenceResult,
     db::{HirDatabase, InternedCoroutineId},
-    drop::{DropGlue, has_drop_glue},
+    drop::{DropGlue, Freeze, has_drop_glue},
     next_solver::{
         DbInterner, ParamEnv, Region, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -66,6 +66,8 @@ pub(super) struct Ctx<'f, 'db> {
     /// The frame of the body's pipeline, which outlives each pass's own.
     pub(super) frame: &'f Frame,
     needs_drop: RefCell<FrameMap<'f, Ty<'db>, bool>>,
+    /// Which types are freeze, each walked once for the whole pipeline.
+    freeze: RefCell<Freeze<'f, 'db>>,
 }
 
 impl<'f, 'db> Ctx<'f, 'db> {
@@ -77,7 +79,15 @@ impl<'f, 'db> Ctx<'f, 'db> {
         // `for const` binders (`#![feature(blaze_comptime)]`): the passes solve what inference
         // solved, in its environment. `env` itself in a body without a loop.
         let env = hir_ty::comptime_env::owner_env(db, owner, &infcx, env);
-        Ctx { db, infcx, env, krate, frame, needs_drop: RefCell::new(framed::map_in(frame)) }
+        Ctx {
+            db,
+            infcx,
+            env,
+            krate,
+            frame,
+            needs_drop: RefCell::new(framed::map_in(frame)),
+            freeze: RefCell::new(Freeze::new(frame)),
+        }
     }
 
     /// Whether a value of `ty` may have something to drop: a type parameter may.
@@ -88,6 +98,11 @@ impl<'f, 'db> Ctx<'f, 'db> {
         let needs = has_drop_glue(&self.infcx, ty, self.env) != DropGlue::None;
         self.needs_drop.borrow_mut().insert(ty, needs);
         needs
+    }
+
+    /// [`crate::drop::is_freeze`] of `ty`, from what the pipeline already walked.
+    pub(super) fn is_freeze(&self, ty: Ty<'db>) -> bool {
+        self.freeze.borrow_mut().of(&self.infcx, ty, self.env)
     }
 
     pub(super) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -129,7 +144,7 @@ impl<'f, 'db> Ctx<'f, 'db> {
 
     /// Whether a value of `ty` has nothing to drop and no cell in it.
     fn is_plain(&self, ty: Ty<'db>) -> bool {
-        !self.needs_drop(ty) && crate::drop::is_freeze(&self.infcx, ty, self.env)
+        !self.needs_drop(ty) && self.is_freeze(ty)
     }
 
     pub(super) fn bool_ty(&self) -> Ty<'db> {

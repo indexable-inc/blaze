@@ -21,6 +21,16 @@
 //! The format and every interface: docs/ix-prof.md and docs/ix-prof-format.md.
 //! The aggregation is [`core::Recorder`], a sans-IO state machine; everything else here is a
 //! driver (the sampler thread, the layer, the allocator, the ticker, the HTTP server).
+//!
+//! With the feature `explore`, `explore` serves https://ix.dev/explore over WebTransport for
+//! any program that has an `explore::Source` (the blaze daemon is one).
+
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (`explore::session`);
+// inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// `std::random`: the explorer's token (`explore::link::Token`).
+#![cfg_attr(feature = "explore", feature(random))]
 
 use std::{
     path::PathBuf,
@@ -38,6 +48,8 @@ pub mod chrome;
 pub mod clock;
 pub mod core;
 pub mod endpoint;
+#[cfg(feature = "explore")]
+pub mod explore;
 #[cfg(all(feature = "http", unix))]
 pub mod http;
 pub mod images;
@@ -47,6 +59,9 @@ pub mod json;
 #[cfg(feature = "layer")]
 pub mod layer;
 pub mod live;
+/// blaze's one `perf_event_open` reader, ix-prof's sampler's and blaze-profile's.
+#[cfg(target_os = "linux")]
+pub mod perf;
 pub mod pprof;
 pub mod profile;
 pub mod report;

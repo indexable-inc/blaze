@@ -173,7 +173,7 @@ impl<W: Watch> Run<W> {
             }
             self.log.extend(self.effects.iter().cloned());
             self.sim.submit(&mut self.effects);
-            if self.sim.poll(&mut done, Duration::ZERO) == 0 && self.effects.is_empty() {
+            if self.sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 && self.effects.is_empty() {
                 return;
             }
             for completion in done.drain(..) {

@@ -64,7 +64,7 @@ use crate::{
 };
 
 /// The domain of an image key.
-pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 5";
+pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 6";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
@@ -218,7 +218,7 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         crate_types,
         proc_macro_cwd,
     } = krate.data(db);
-    let ExtraCrateData { version, display_name, potential_cfg_options, built_for } =
+    let ExtraCrateData { version, display_name, potential_cfg_options, built_for, build_script_runs } =
         krate.extra_data(db);
 
     let root = db.file_source_root(*root_file_id).source_root_id(db);
@@ -262,6 +262,10 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         Some(cfg) => hasher.update(&[1]).id(&base_db::cfg_options_content(cfg)),
     };
     built_for.hash_into(hasher);
+    hasher.update(&(build_script_runs.len() as u64).to_le_bytes());
+    for run in build_script_runs {
+        hasher.part(run.as_bytes());
+    }
     hasher
         .id(&krate.workspace_data(db).content())
         .id(&base_db::cfg_options_content(krate.cfg_options(db)));
