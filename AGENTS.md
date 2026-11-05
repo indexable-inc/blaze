@@ -35,8 +35,7 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 11. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
     alloc: <why>` on its line. Skill: `runtime-code`.
 12. **standard-structures**: One standard structure per need (parking_lot locks, papaya and blaze_hash
-    maps, crossbeam queues and channels, atomics); a wait on a pool thread goes through the
-    scheduler. Skill: `runtime-code`.
+    maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.
@@ -102,6 +101,12 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 42. **dst-not-review**: Prove concurrent, durable, crash-recovering, billing and data-deletion code with
     a Hegel deterministic simulation test whose oracle checks the invariant; a code review is not
     evidence. Skill: `testing`.
+43. **deadline-waits**: Every blocking kernel wait goes through blaze-core's one deadline wait
+    (`blaze_core::wait`); nothing signals pool threads; a fiber parks on the scheduler, never in the
+    kernel. Skill: `runtime-code`.
+44. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
+    sandbox, ...) where it is more efficient or more capable than the public one; comment which and
+    why, and test that its symbol exists. Skill: `runtime-code`.
 
 ## Code Review Rules
 
