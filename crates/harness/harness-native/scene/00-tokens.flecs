@@ -58,15 +58,34 @@ export const pill_zeta = 0.86
 // From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
 export const pill_jump_rows = 3
 export const sidebar_omega = 24
-// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
+// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade.
 export const tree_glide_omega = 22
 export const tree_fold_omega = 26
 export const tree_fold_zeta = 1
 export const tree_glide_zeta = 1
 export const tree_reveal_margin = 8
 export const tree_fade_len = 22
-export const knob_width = 6
 export const sidebar_zeta = 1
+// Overlay scrollers (prims.flecs ui.Scroller, on every ui.Scroll; macOS's overlay NSScroller): the knob scroller_thin
+// across at rest and scroller_wide over its track while the pointer is within scroller_grab of the edge, scroller_inset
+// off the edge, never shorter than scroller_min (but shortened under a rubber band). It shows as the content scrolls,
+// stays scroller_hold seconds after it stops, then fades; it comes in on the show spring, goes on the hide spring, widens
+// on the wide spring. A press on the track pages toward it on the page spring, keeping scroller_keep points in view.
+export const scroller_thin = 6
+export const scroller_wide = 10
+export const scroller_inset = 2
+export const scroller_min = 24
+export const scroller_grab = 16
+export const scroller_hold = 0.7
+export const scroller_keep = 24
+export const scroller_show_omega = 40
+export const scroller_show_zeta = 1
+export const scroller_hide_omega = 13
+export const scroller_hide_zeta = 1
+export const scroller_wide_omega = 32
+export const scroller_wide_zeta = 1
+export const scroller_page_omega = 20
+export const scroller_page_zeta = 1
 // The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
 export const lights_omega = 26
 export const lights_zeta = 1
@@ -147,8 +166,11 @@ export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
+// black over a light one (a scroll on the terminal's ground follows its Scheme).
+export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.42}, light: {0, 0, 0, 0.40}}
+export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.05}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_knob: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}

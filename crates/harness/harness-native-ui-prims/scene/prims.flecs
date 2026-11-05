@@ -132,8 +132,38 @@ ui {
     OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
   }
 
-  // Content larger than it is shown: it clips its children and shifts them by ScrollState.
-  prefab Scroll : ui.Column {
+  // A scroller's parts (macOS's overlay NSScroller): a rounded knob and the faint track under it, laid over a scroll's
+  // trailing edge out of its flow by layout (`ScrollerPart`, harness_native_ui_layout_api::scroller_axis), faded by
+  // motion and driven by input; never set by hand. Over them the pointer is the arrow.
+  prefab ScrollKnob : ui.Node {
+    ScrollerPart: {axis: Y, track: false}
+    Fill: $tone_scroller_knob
+    Shape: {radius: $scroller_wide, n: 2, border: 0, feather: 0}
+    Cursor: {shape: Arrow}
+    Z: {z: 2}
+  }
+  prefab ScrollTrack : ui.Node {
+    ScrollerPart: {axis: Y, track: true}
+    Fill: $tone_scroller_track
+    Cursor: {shape: Arrow}
+    Z: {z: 1}
+  }
+
+  // The overlay scroller a scroll carries (ui.Scroll has it; `NoScroller` on an instance turns it off): its widths, hold
+  // and page from the tokens, a track and a knob per axis. It shows while the content scrolls (and `hold` seconds after),
+  // then fades; near its edge the knob widens over the track; a drag on the knob scrolls in proportion, a press on the
+  // track pages (`keep` points of the old page stay in view). It never takes layout room.
+  prefab Scroller {
+    Scroller: {thin: $scroller_thin, wide: $scroller_wide, inset: $scroller_inset, min: $scroller_min,
+      grab: $scroller_grab, hold: $scroller_hold, keep: $scroller_keep}
+    track_y : ui.ScrollTrack {}
+    knob_y : ui.ScrollKnob {}
+    track_x : ui.ScrollTrack { ScrollerPart: {axis: X, track: true} }
+    knob_x : ui.ScrollKnob { ScrollerPart: {axis: X, track: false} }
+  }
+
+  // Content larger than it is shown: it clips its children, shifts them by ScrollState, and shows the overlay scroller.
+  prefab Scroll : ui.Column, ui.Scroller {
     Clip
     ScrollState: {x: 0, y: 0}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
@@ -265,6 +295,19 @@ ui {
     }
     prefab layout {
       Motion: {omega: $spring_layout_omega, zeta: $spring_layout_zeta}
+    }
+    // The overlay scroller's: showing, fading away, widening near its edge, and a page on its track.
+    prefab scroller_show {
+      Motion: {omega: $scroller_show_omega, zeta: $scroller_show_zeta}
+    }
+    prefab scroller_hide {
+      Motion: {omega: $scroller_hide_omega, zeta: $scroller_hide_zeta}
+    }
+    prefab scroller_wide {
+      Motion: {omega: $scroller_wide_omega, zeta: $scroller_wide_zeta}
+    }
+    prefab scroller_page {
+      Motion: {omega: $scroller_page_omega, zeta: $scroller_page_zeta}
     }
   }
 }

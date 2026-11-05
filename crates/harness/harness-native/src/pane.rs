@@ -193,13 +193,17 @@ impl TermSelection {
 
 /// Row-snapped scrolling: the wheel's fraction of a row not yet scrolled (the grid only moves by whole rows), wheel
 /// lines not yet sent as keys or reports, and where the last frame drew the grid's first row and how many rows back
-/// that viewport was.
+/// that viewport was. `total` and `len` are the rows in all and in view as the last frame fed them to the node's overlay
+/// scroller (0: nothing to scroll, as on the alternate screen), and `row` how many of the scroller's points a row was.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TermScroll {
     pub frac: f32,
     pub wheel: f32,
     pub top: f32,
     pub shift: i64,
+    pub total: u64,
+    pub len: u64,
+    pub row: f32,
 }
 
 /// The program's mouse button held down (its mouse mode is on), and the cell last reported.

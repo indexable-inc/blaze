@@ -7,7 +7,7 @@
 //! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
 use super::*;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
-use harness_native_ui_layout_api::ScrollState;
+use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
 use crate::pane::Unit;
 use harness_native_render::text::Layout;
@@ -584,7 +584,7 @@ fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
 
 impl App {
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
-    fn term_ground_dark(&self) -> bool {
+    pub(super) fn term_ground_dark(&self) -> bool {
         let w = self.world.world_ref();
         let Some(f) = view::prefab(w, "hn.Main").and_then(|e| e.try_cloned::<&Fill>()) else { return self.dark };
         let c = if self.dark { f.dark } else { f.light };
@@ -722,7 +722,7 @@ impl App {
                 let ah = area.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.h);
                 let y = if st.draft.caret == st.draft.text.len() { (th - ah).max(0.0) } else { 0.0 };
                 if area.entity().try_cloned::<&ScrollState>().is_none_or(|s| (s.y - y).abs() > 0.5) {
-                    area.entity().set(ScrollState { x: 0.0, y });
+                    scroll_quietly(area.entity(), ScrollState { x: 0.0, y });
                 }
             }
         }
@@ -764,6 +764,14 @@ impl App {
             let Some(l) = list.entity().try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { continue };
             let mut states = self.chat.borrow_mut();
             let st = states.entry(sid).or_default();
+            // A drag or a page on the overlay scroller moved the list: that is the origin now, off the bottom.
+            if let Some(s) = list.entity().try_cloned::<&ScrollState>().filter(|s| (s.y - st.y).abs() > 0.01)
+                && list.entity().try_cloned::<&ScrollerGrip>().is_some_and(|g| g.drag != 0 || g.page != 0)
+            {
+                st.y = s.y;
+                st.stick = false;
+                st.rev += 1;
+            }
             let max = (st.content - l.h).max(0.0);
             let mut origin = st.y;
             let busy = st.engine.needs_frame();
@@ -799,7 +807,12 @@ impl App {
             }
             st.y = y;
             if list.entity().try_cloned::<&ScrollState>().is_none_or(|s| (s.y - y).abs() > 0.001) {
-                list.entity().set(ScrollState { x: 0.0, y });
+                // Following the agent at the bottom moves it quietly; a scroll of the reader's shows the scroller.
+                if st.stick && !st.engine.needs_frame() {
+                    scroll_quietly(list.entity(), ScrollState { x: 0.0, y });
+                } else {
+                    list.entity().set(ScrollState { x: 0.0, y });
+                }
             }
         }
         if moving {

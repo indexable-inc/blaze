@@ -7,6 +7,7 @@ use crate::pane::{
     TermNode, TermScroll, TermSelection, Unit,
 };
 use harness_native_flecs::ComponentId;
+use harness_native_ui_layout_api::{ScrollExtent, ScrollState, ScrollerGrip, ScrollerPart, scroll_quietly};
 use model::PaneKind;
 
 /// The prefab that draws a pane of `kind` (None: nothing shown).
@@ -419,19 +420,24 @@ impl App {
         }
         let Some((terms, key)) = self.parser_of(t) else { return };
         let mut st = self.get::<TermScroll>(t);
+        let gripped = self.term_scroller_grip(t, st);
         // Whole rows only: the grid snaps to its cells, and a wheel's fraction of a row waits in `frac`.
         let want = self.scroll(t);
         let mut map = terms.borrow_mut();
         let Some(parser) = map.get_mut(&key) else { return };
         parser.set_scrollback(want);
         let shown = parser.scrollback();
+        let bar = parser.scrollbar().filter(|_| !parser.alternate_screen());
         let history = if self.stats_shown() { parser.history() } else { 0 };
         let snap = term::snapshot(parser, &self.look.themes[usize::from(self.dark)]);
         parser.set_scrollback(0);
         drop(map);
         self.stats_history(t, history);
+        let moved = shown as i64 != st.shift;
         st.top = g.y;
         st.shift = shown as i64;
+        (st.total, st.len) = bar.map_or((0, 0), |b| (b.total, b.len));
+        st.row = self.feed_term_scroller(t, bar, moved, gripped);
         self.put(t, st);
         self.put(t, TermInput::pack(&snap.input));
         self.put(t, TermCursor { row: snap.input.cursor.0, col: snap.input.cursor.1 });
@@ -465,6 +471,59 @@ impl App {
             // The cursor fades on the app clock: keep drawing.
             self.poke_why("cursor blink");
         }
+    }
+
+    /// A drag or a page on terminal `t`'s overlay scroller (ui.Scroller, which wrote its `ScrollState`): the rows back it
+    /// points at become the terminal's scroll. Whether the scroller holds the scroll this frame (then its `ScrollState` is
+    /// its own, not fed).
+    fn term_scroller_grip(&mut self, t: u64, st: TermScroll) -> bool {
+        let te = self.world.entity_from_id(t);
+        if !te.try_cloned::<&ScrollerGrip>().is_some_and(|g| g.drag != 0 || g.page != 0) {
+            return false;
+        }
+        let Some(s) = te.try_cloned::<&ScrollState>().filter(|_| st.row > 0.0 && st.total > st.len) else { return true };
+        let top = st.total - st.len;
+        let offset = ((s.y / st.row).round().max(0.0) as u64).min(top);
+        let back = usize::try_from(top - offset).unwrap_or(0);
+        if back != self.scroll(t) {
+            self.set_scroll(t, back);
+        }
+        true
+    }
+
+    /// Feed terminal `t`'s overlay scroller from where its viewport sits in its history (`bar`, rows; None on the
+    /// alternate screen, which has no history): its extent and its scroll in points, a row being the node's height over
+    /// the rows shown. A scroll through the history (`moved`) shows the scroller; output arriving on the live screen moves
+    /// it quietly. While the scroller holds the scroll (`gripped`) its `ScrollState` is left to it. Returns the points a
+    /// row is.
+    fn feed_term_scroller(&self, t: u64, bar: Option<harness_vt::Scrollbar>, moved: bool, gripped: bool) -> f32 {
+        let te = self.world.entity_from_id(t);
+        let Some(l) = te.try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { return 0.0 };
+        let (h, y, row) = match bar.filter(|b| b.len > 0 && b.total > b.len) {
+            Some(b) => {
+                let row = l.h / b.len as f32;
+                (b.total as f32 * row, b.offset as f32 * row, row)
+            }
+            None => (l.h, 0.0, 0.0),
+        };
+        let x = ScrollExtent { w: l.w, h };
+        if te.try_cloned::<&ScrollExtent>() != Some(x) {
+            te.set(x);
+        }
+        let s = ScrollState { x: 0.0, y };
+        if !gripped && te.try_cloned::<&ScrollState>() != Some(s) {
+            if moved {
+                te.set(s);
+            } else {
+                scroll_quietly(te, s);
+            }
+        }
+        // Drawn in the terminal ground's appearance, as a chat's transcript is.
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        if te.try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme) {
+            te.set(scheme);
+        }
+        row
     }
 
     // ---- input ----
@@ -615,6 +674,11 @@ impl App {
             self.pointer.went_down = true;
         }
         if self.palette.is_some() {
+            return;
+        }
+        // A press on a scroll's overlay scroller is the scroller's (ui.Scroller: the UI layer drags or pages it), not the
+        // pane's, its transcript's or its terminal's.
+        if self.world.lookup(APP).target(Hovered::id(), 0).is_some_and(|h| h.has(ScrollerPart::id())) {
             return;
         }
         // A press in another pane focuses it (the selection follows what it shows), and takes the keyboard from the tree.

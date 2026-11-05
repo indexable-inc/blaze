@@ -1705,6 +1705,7 @@ impl App {
             // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
             p.alpha *= crate::look::alpha(w, e, lo);
             let is_term = e.has(TermNode::id());
+            let scroller_part = e.has(harness_native_ui_layout_api::ScrollerPart::id());
             if p.alpha <= 0.002 && !is_term {
                 continue;
             }
@@ -1759,8 +1760,8 @@ impl App {
                     ];
                 }
             }
-            if p.clipped {
-                // Cut to the tree's band: soft at an edge with more of the tree beyond it.
+            if p.clipped && !scroller_part {
+                // Cut to the tree's band: soft at an edge with more of the tree beyond it (not its scroller).
                 if let Some(fade) = self.tree_fade(&p) {
                     for panel in &mut d.panels[np..] {
                         panel.clip[2..].copy_from_slice(&fade);
@@ -1772,7 +1773,6 @@ impl App {
             }
             let _ = Level::Base;
         }
-        self.emit_tree_knob(d);
     }
 
     /// Text typed into the open palette (a key no binding takes): its query.
@@ -2039,5 +2039,15 @@ mod tests {
             }
         });
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+        // A scroll carries ui.Scroller's parts (from its second base) and its settings; the terminal's too.
+        for prefab in ["hn.Tree", "hn.Terminal", "ui.TextArea"] {
+            let v = View::root(world.world_ref(), prefab);
+            for part in ["track_y", "knob_y", "track_x", "knob_x"] {
+                let p = v.part(part).unwrap_or_else(|| panic!("{prefab} has no scroller part {part}"));
+                assert!(p.entity().has(harness_native_ui_layout_api::ScrollerPart::id()), "{prefab}.{part} is no ScrollerPart");
+            }
+            let c = v.entity().try_cloned::<&harness_native_ui_layout_api::Scroller>();
+            assert!(c.is_some_and(|c| c.thin > 0.0 && c.wide > c.thin && c.min > 0.0), "{prefab} has no Scroller: {c:?}");
+        }
     }
 }

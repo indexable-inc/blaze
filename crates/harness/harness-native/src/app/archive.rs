@@ -195,11 +195,6 @@ impl App {
         View::of(self.world.entity_from_id(self.archive_pane()?)).part("list").map(View::id)
     }
 
-    /// The lazy column of rows inside the Archive's list.
-    fn archive_rows_node(&self) -> Option<View<'_>> {
-        View::of(self.world.entity_from_id(self.archive_list()?)).part("rows")
-    }
-
     /// Whether `e` failed: killed, lost, or a nonzero exit.
     fn failed(&self, e: u64) -> bool {
         matches!(self.status_of(e), "killed" | "lost")
@@ -555,13 +550,8 @@ impl App {
         if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
             return false;
         }
-        // The lazy column stands for all its rows, made or not: `count` rows `row` long with `gap` between, and the foot pad.
-        let lazy = self.archive_rows_node().map(|v| v.entity());
-        let content = lazy.map_or(0.0, |e| {
-            let l = e.try_cloned::<&harness_native_ui_layout_api::Lazy>().unwrap_or_default();
-            let gap = e.try_cloned::<&harness_native_ui_layout_api::Flex>().map_or(0.0, |f| f.gap);
-            l.count as f32 * (l.row + gap) - gap + 12.0
-        });
+        // How far its content reaches, as layout measured it (the lazy column stands for all its rows, made or not).
+        let content = le.try_cloned::<&harness_native_ui_layout_api::ScrollExtent>().map_or(r.h, |x| x.h);
         let max = (content - r.h).max(0.0);
         let by = if precise { dy } else { dy * 28.0 };
         let now = le.try_cloned::<&ScrollStateOf>().map_or(0.0, |s| s.y);
