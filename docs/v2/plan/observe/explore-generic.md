@@ -80,8 +80,9 @@ once, then batches with dictionary deltas, end-of-stream and a new stream at the
 
 ## Producers
 
-- **Any program (ix-prof).** A `tracing` span is a task when it has a `task` field (its label)
-  or a `progress.total` field; `span.record("progress.done", n)` moves it; `Span::follows_from`
+- **Any program (ix-prof).** A `tracing` span is a task when it has a `task` field (its id,
+  as ix-prof's `poll` spans already carry a future's address) or a `progress.total` field (its
+  id is then the span's); its name is the task's name; `span.record("progress.done", n)` moves it; `Span::follows_from`
   adds a task edge; the existing `wait`/`on`/`owner` fields fill `awaits` and `waiting_on`. A
   task's worker is the thread it is entered on. No new macro.
 - **The blaze daemon.** Tasks are the plane's nodes (`blaze_graph::plane`): id the node id,
