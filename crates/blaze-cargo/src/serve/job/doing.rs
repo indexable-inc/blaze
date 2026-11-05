@@ -73,7 +73,16 @@ impl<S: Steps> Jobs<S> {
                 idle: look.idle,
                 units: seen.units,
                 for_ms,
-                running: seen.longest.and_then(|it| it.open.last()).map(said_span),
+                // What a busy worker runs: the oldest of the build's threads whose innermost
+                // span is work, not a wait (what the waiting steps are held behind); a build
+                // whose threads all wait names the one waiting longest.
+                running: seen
+                    .threads
+                    .iter()
+                    .filter_map(|it| it.open.last())
+                    .find(|span| span.awaits.is_none())
+                    .or_else(|| seen.longest.and_then(|it| it.open.last()))
+                    .map(said_span),
             };
             said.push(Said::Report(*id, Response::Doing(doing)));
         }
