@@ -808,9 +808,9 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
 }
 
 /// The transcript as rows ([`Grouped`]: runs of calls under one line), and the keys of the rows nested under a run.
-/// A folded run shows its line, its calls that failed or are open (the last shell call, one the person opened), and under
-/// it the results of the rest ([`result_value`]: a table a call returned is the answer, not plumbing); an opened one,
-/// every call and the reasoning between them, each folded as it is.
+/// A folded run shows its line, its calls that failed or are open (the last shell call, one the person opened), and the
+/// rest that returned a result ([`result_value`]: a table is the answer, not plumbing) folded, their line over their
+/// table, in call order; an opened one, every call and the reasoning between them, each folded as it is.
 fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Row)>, HashSet<String>) {
     let g = Grouped::of(t);
     let mut out = Vec::new();
@@ -832,13 +832,12 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
                     let call = run.calls.iter().find(|(i, _)| *i == n).map(|(_, c)| c);
                     let shows = open
                         || call.is_some_and(|c| c.failed || fold.get(&c.block).copied().unwrap_or_else(|| opens(t, &g, n, c)));
+                    // A call kept for its result shows folded, its own line over its table, so the table never reads as the
+                    // line above it's (a failed call's).
+                    let result = call.and_then(|c| t.details.get(&c.block)).and_then(result_value).is_some();
                     let from = out.len();
-                    if shows {
+                    if shows || result {
                         item_rows(t, &g, n, fold, &mut out);
-                    } else if let Some(v) = call.and_then(|c| t.details.get(&c.block)).and_then(result_value) {
-                        let mut part = Vec::new();
-                        value_rows(v, PREVIEW_ROWS, &mut part);
-                        out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.r{k}"), r)));
                     }
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
@@ -2313,11 +2312,13 @@ mod tests {
         let (k, failed) = &rows[2];
         assert!(matches!(failed, Row::Card { open: false, error: true, .. }), "{kinds:?}");
         assert_eq!(k, "i1.0");
-        // The table under the run's line, without the call's own line; the echo's output folds away.
-        assert_eq!(rows[3].0, "i2.r0");
-        assert!(matches!(&rows[3].1, Row::Grid { cap: PREVIEW_ROWS, .. }), "{kinds:?}");
-        assert!(nested.contains("i1.0") && nested.contains("i2.r0"));
-        assert_eq!(rows.len(), 5, "user, run, failure, table, prose: {kinds:?}");
+        // The table under its own call's line, folded, so it never reads as the failure's; the echo's output folds away.
+        assert_eq!(rows[3].0, "i2.0");
+        assert!(matches!(&rows[3].1, Row::Card { open: false, error: false, .. }), "{kinds:?}");
+        assert_eq!(rows[4].0, "i2.1");
+        assert!(matches!(&rows[4].1, Row::Grid { cap: PREVIEW_ROWS, .. }), "{kinds:?}");
+        assert!(nested.contains("i1.0") && nested.contains("i2.0") && nested.contains("i2.1"));
+        assert_eq!(rows.len(), 6, "user, run, failure, table's call, table, prose: {kinds:?}");
     }
 
     #[test]

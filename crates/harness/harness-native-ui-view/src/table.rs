@@ -5,9 +5,10 @@
 //! url on hover, opened on a press), nulls dim.
 //!
 //! Columns are as wide as they need, measured by the host's typesetter: a short column (a bool, a number, a few words)
-//! hugs its widest cell and its header is never cut; the long ones share what is left by how much they need, down to a
-//! floor (at least half of what shows across, shared among them, so the main column is never cut to a sliver); past the
-//! floors the table scrolls sideways (its `scroll`). A cell cut short shows its whole value on hover.
+//! hugs its widest cell and its header is never cut; the long ones split what the short ones leave ([`allot`]: a column
+//! that needs less than an even split keeps only its need, the widest gets the slack), down to a floor of a few words so
+//! the main column is never cut to a sliver; only past the floors does the table scroll sideways (its `scroll`). A long
+//! cell is cut at its column's end with an ellipsis and shows its whole value on hover.
 //! A press on a row (when the host gives an action) opens it below as a record, every field whole and wrapped at the
 //! width that shows (Nushell's `get`): it stays in view while the rows scroll sideways under it. Only the rows in view
 //! exist, in two lazy columns around the open record.
@@ -196,8 +197,6 @@ pub struct Opts<'s> {
 const SHORT_EM: f32 = 11.0;
 /// The narrowest a long column gets before the table scrolls sideways.
 const FLOOR_EM: f32 = 8.0;
-/// How much of what shows across the long columns keep between them before the table scrolls sideways.
-const LONG_SHARE: f32 = 0.5;
 /// The widest a column grows.
 const MAX_EM: f32 = 34.0;
 /// Rows measured for widths (a long table's later rows are like its first).
@@ -213,7 +212,7 @@ pub struct Width {
 impl Width {
     /// The width of a column whose header is `head` points wide and widest cell `widest`, in a face `em` points tall: a
     /// short column's floor is its need (it hugs its content); a long one's is the less of its need and the most of a few
-    /// words, its header and `share` (its part of what shows across).
+    /// words, its header and `share` (what [`allot`] gave it of the room the short columns leave).
     #[must_use]
     pub fn of(head: f32, widest: f32, em: f32, share: f32) -> Self {
         let need = Self::need(head, widest, em);
@@ -221,17 +220,34 @@ impl Width {
         Self { need, floor }
     }
 
-    fn need(head: f32, widest: f32, em: f32) -> f32 {
+    pub fn need(head: f32, widest: f32, em: f32) -> f32 {
         head.max(widest).min(MAX_EM * em).max(head).max(1.0)
     }
 
-    fn short(need: f32, em: f32) -> bool {
+    pub fn short(need: f32, em: f32) -> bool {
         need <= SHORT_EM * em
     }
 
     fn size(self) -> Size {
         Size { w: Sizing { kind: SizeKind::Grow, value: self.need, min: self.floor, max: self.need }, h: Sizing::GROW }
     }
+}
+
+/// Split `room` among columns needing `needs` (in any order): each gets an even share of what is left, or its need when
+/// that is less, so what a narrow column does not use goes to the wider ones and the widest takes the slack. Never below
+/// zero; the shares sum to `room` unless every column fits whole.
+#[must_use]
+pub fn allot(needs: &[f32], room: f32) -> Vec<f32> {
+    let mut order: Vec<usize> = (0..needs.len()).collect(); // alloc: one table's few columns
+    order.sort_by(|&a, &b| needs[a].total_cmp(&needs[b]).then(a.cmp(&b)));
+    let mut out = vec![0.0; needs.len()]; // alloc: one table's few columns
+    let mut left = room.max(0.0);
+    for (k, &c) in order.iter().enumerate() {
+        let give = needs[c].min(left / (order.len() - k) as f32);
+        out[c] = give;
+        left -= give;
+    }
+    out
 }
 
 /// The prefab of a cell of `kind` in look `look`.
@@ -296,9 +312,18 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
             (head, widest)
         })
         .collect();
-    let long = measured.iter().filter(|&&(h, x)| !Width::short(Width::need(h, x, em), em)).count().max(1);
-    let share = (view_w - pad).max(0.0) * LONG_SHARE / long as f32;
-    let widths: Vec<Width> = measured.iter().map(|&(head, widest)| Width::of(head, widest, em, share)).collect();
+    // The long columns split what the short ones and the gaps leave of what shows across.
+    let needs: Vec<f32> = measured.iter().map(|&(h, x)| Width::need(h, x, em)).collect();
+    let long: Vec<usize> = (0..n).filter(|&c| !Width::short(needs[c], em)).collect();
+    let short_w: f32 = (0..n).filter(|c| !long.contains(c)).map(|c| needs[c]).sum();
+    let left = view_w - pad - gap * n.saturating_sub(1) as f32 - short_w;
+    let shares = allot(&long.iter().map(|&c| needs[c]).collect::<Vec<_>>(), left);
+    let widths: Vec<Width> = (0..n)
+        .map(|c| {
+            let share = long.iter().position(|&l| l == c).map_or(0.0, |k| shares[k]);
+            Width::of(measured[c].0, measured[c].1, em, share)
+        })
+        .collect();
     let aligns: Vec<Justify> = (0..n)
         .map(|c| match data.align(c) {
             Align::End => Justify::End,
@@ -538,6 +563,10 @@ mod tests {
         // ...or to its share of what shows, when that is more (never past its need).
         assert_eq!(Width::of(30.0, 900.0, 13.0, 200.0).floor, 200.0);
         assert_eq!(Width::of(30.0, 900.0, 13.0, 1000.0).floor, 34.0 * 13.0);
+        // The room the short columns leave: a narrow long column keeps its need, the widest takes the rest.
+        assert_eq!(allot(&[400.0, 150.0], 300.0), vec![150.0, 150.0]);
+        assert_eq!(allot(&[400.0, 100.0], 300.0), vec![200.0, 100.0]);
+        assert_eq!(allot(&[400.0], -20.0), vec![0.0]);
         assert_eq!(host("https://www.corrosionhour.com/rust-november-2024/?x=1"), "corrosionhour.com");
         assert_eq!(host("http://user@docs.rs:8080/a"), "docs.rs:8080");
     }
