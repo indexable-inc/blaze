@@ -449,6 +449,7 @@ impl App {
             .map(|m| m.s.as_str().to_owned())
             .filter(|s| focus && !s.is_empty());
         let sel = self.get::<TermSelection>(t).get();
+        let select = harness_native_render::select::Look::of(self.world.world_ref());
         let paint = term::Paint {
             origin: (g.x, st.top),
             scale: sc,
@@ -458,6 +459,9 @@ impl App {
             theme: &self.look.themes[usize::from(self.dark)],
             time: self.time,
             marked: marked.as_deref(),
+            select: &select,
+            select_ink: select.colour(self.term_ground_dark()),
+            flash: te.try_cloned::<&CopyFlash>(),
         };
         let paint_ = self.paint.get_mut();
         term::draw(
