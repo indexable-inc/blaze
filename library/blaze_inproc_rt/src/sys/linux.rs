@@ -659,7 +659,9 @@ pub fn overlay(
 /// this process and in every fork of it, so nothing can make the program's code writable or
 /// put other code in its place. Nothing needs to: the daemon changes code by writing its own
 /// view of the object and by atomic word stores (blaze-inproc), the runtime never unmaps an
-/// overlay, and blaze-live cuts no window over the patch code region. A refusal (ENOSYS from
+/// overlay, and blaze-live's windows never reach code: its data writes are of data classes only,
+/// since blaze-link restarts a run whose change is in an executable section outside the patch
+/// code region (`Class::Named { exec: true }`, the one data class in the code segment). A refusal (ENOSYS from
 /// a seccomp profile, EPERM, EINVAL) stops the start, naming the range: the code is never left
 /// unsealed.
 fn seal(at: u64, len: usize, object: u32) -> Result<(), Error> {

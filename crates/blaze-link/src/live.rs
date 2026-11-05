@@ -242,6 +242,17 @@ impl Stage<'_> {
                         name,
                     });
                 }
+                Class::Named { exec: true, .. } => {
+                    // An executable section outside the patch code region is in the image's
+                    // code, which a dev run's start hook lays from the code memory and seals
+                    // (`mseal`): a running program takes no write there.
+                    // alloc: a restart's reason, which the message carries: once per message
+                    return restart(format!(
+                        "{} changed in an executable section, outside the patch code region: a running \
+                         program's code is sealed",
+                        self.symbols.describe(piece.sym)
+                    ));
+                }
                 Class::PatchData
                 | Class::EhFrame
                 | Class::Rodata

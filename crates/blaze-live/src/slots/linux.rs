@@ -233,8 +233,8 @@ fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
         if moved != to {
             let sealed = std::io::Error::last_os_error().raw_os_error() == Some(EPERM);
             let error = error(if sealed {
-                "moving a memory file over the region, code the start hook sealed (mseal): data \
-                 is never written into the image's code"
+                "moving a memory file over the region, code the start hook sealed (mseal): a \
+                 link restarts, never patches, an executable section outside the patch code region"
             } else {
                 "moving a memory file over the region"
             });
