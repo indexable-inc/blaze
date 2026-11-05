@@ -81,14 +81,21 @@ hn {
     Padding: {l: $row_pad, r: $row_pad, t: 0, b: 8}
   }
 
-  // The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
-  // springs from where the last one was drawn.
-  prefab Selection : ui.Node {
+  // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
+  // frame on every side so it hugs the row's content with air between neighbours, and matched by id so a new selection's
+  // pill springs from where the last one was drawn. The row picks the plate's Fill (tone_select, or tone_select_focus
+  // while the tree has the keyboard).
+  prefab Selection : ui.Row {
     Background
-    MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
-    Fill: $tone_select
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    Motion: {omega: $pill_omega, zeta: $pill_zeta}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
+    plate : ui.Node {
+      MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
+      Fill: $tone_select
+      Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+      Motion: {omega: $pill_omega, zeta: $pill_zeta}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
   }
 
   // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
@@ -158,12 +165,12 @@ hn {
   }
 
   // A tree row's look, shared by every kind: pressable, a wash on hover and press, one row tall.
+  // Its hover wash is inset as the selection's pill is (pill_inset), so the two hug the row alike.
   prefab TreeRowLook : ui.Row {
     Pressable
     Fill: $tone_clear
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-    Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+    Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_row_hover.dark, light: $tone_row_hover.light, pad: 0 - $pill_inset, radius: $radius_row}
+    Flex: {axis: Row, gap: $tree_gap, align: Center, justify: Start, wrap: false}
   }
 }

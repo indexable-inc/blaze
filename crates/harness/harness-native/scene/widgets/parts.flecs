@@ -9,6 +9,15 @@ hn {
     Shape: {radius: $dot_radius, n: 2, border: 0, feather: 0}
   }
 
+  // How a tree row stands, as a mark rather than words: a dot `status_size` across in its Fill, or a hollow ring (its
+  // Edge, `status_ring` wide) with a clear Fill. The row sets which (hn.ObjRow, hn.RunRow).
+  prefab Status : ui.Node {
+    Fill: $tone_clear
+    Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+    Size: {w: {kind: Fixed, value: $status_size, min: 0, max: 0}, h: {kind: Fixed, value: $status_size, min: 0, max: 0}}
+    Shape: {radius: $status_size, n: 2, border: $status_ring, feather: 0}
+  }
+
   // A failure's badge: the exit code, small and red on a red wash. Clear, empty and unpadded otherwise.
   prefab Badge : ui.Row {
     Fill: $tone_clear
@@ -22,12 +31,15 @@ hn {
     }
   }
 
-  // A section label over the tree: the device's name (11 semibold, tertiary), how many objects, and a dot only while the
-  // daemon is offline or connecting.
+  // The group header over the tree, a source list's section: the device's name (11 semibold, faint), in line with the
+  // rows' chevrons; on its hover how many objects it holds (the host keeps the count shown while the daemon is offline,
+  // connecting or refused, when it says so instead), and a dot only while the daemon is not up.
   prefab DeviceRow : ui.Row {
+    Hoverable
+    HoverLook: {dark: $tone_clear.dark, light: $tone_clear.light, pad: 0, radius: 0}
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
-    Padding: {l: $label_inset, r: $row_pad, t: 0, b: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $group_h, min: 0, max: 0}}
+    Padding: {l: $label_inset, r: $tree_pad_r, t: 0, b: 0}
     name : ui.Lead, Faint {
       TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
     }
@@ -35,6 +47,7 @@ hn {
     spacer : ui.Spacer {}
     count : ui.Line, Faint {
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      HoverShow: {row: 0, keep: false}
     }
   }
 

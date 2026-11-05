@@ -414,6 +414,8 @@ impl App {
         let root = View::root(w, "hn.Window");
         let side = root.child("hn.SideClip").child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
+        // Its count shows on its hover (scene/widgets/parts.flecs).
+        device.set(HoverAmt::default());
         let side_w = crate::prefs::get("sidebar_width")
             .and_then(|v| v.as_f64())
             .map(|v| {
@@ -753,7 +755,8 @@ impl App {
             n.text(&host);
         }
         if let Some(n) = device.part("count") {
-            n.text(&link_word);
+            // How many objects, on the header's hover; the link's trouble (offline, refused, connecting) always.
+            crate::look::hover_show(n.text(&link_word).entity(), 0, link != *w.component_id::<model::Up>());
         }
         // The refusal in words (which daemon, `harness stop`), in place of a spinner that never ends.
         let why = dev.try_cloned::<&model::LinkError>().map(|e| e.text.as_str().to_owned()).unwrap_or_default();
@@ -819,6 +822,7 @@ impl App {
                 ("depth", Prop::Int(depth as i64)),
                 ("kids", Prop::Bool(fold::has_kids(o))),
                 ("open", Prop::Bool(!o.has(model::Collapsed::id()))),
+                ("focus", Prop::Bool(sel == Some(e) && me.tree_focus && me.focused)),
             ];
             if me.run_of(e).is_some() {
                 // A run: a small dot tinted by how it went, breathing while it runs; how long it took (and how it failed)
@@ -850,11 +854,16 @@ impl App {
                     .filter(|&&i| i < 9)
                     .map(|i| me.hint(&format!("Select{}", i + 1)))
                     .unwrap_or_default();
+                // How it stands, as a mark (hn.Status): a dot while it runs, a ring once it exited, red when it failed
+                // or was killed, amber when lost; the words (with a failure's exit code) are the mark's tooltip.
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
-                let badge = match (status, code) {
-                    ("killed", _) => "\u{2715}".to_owned(),
-                    (_, Some(c)) => c.to_string(),
-                    _ => String::new(),
+                let (mark, why) = match (status, code) {
+                    ("killed", _) => ("failed", "Killed".to_owned()),
+                    (_, Some(c)) => ("failed", format!("Exited with code {c}")),
+                    ("running", _) => ("running", "Running".to_owned()),
+                    ("lost", _) => ("lost", "Lost (the daemon restarted under it)".to_owned()),
+                    ("exited", _) => ("exited", "Exited".to_owned()),
+                    _ => ("", String::new()),
                 };
                 row.props(
                     "hn.ObjRow",
@@ -862,7 +871,8 @@ impl App {
                         &common[..],
                         &[
                             ("kind", Prop::Str(model::kind_name(o))),
-                            ("badge", Prop::Str(&badge)),
+                            ("status", Prop::Str(mark)),
+                            ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
                         ],
                     ]
@@ -1813,7 +1823,7 @@ impl App {
                 }
             };
             let (np, ng) = (at.panels, at.glyphs);
-            let turn = (p.kind == PaintKind::Icon).then(|| crate::look::turn(e)).flatten();
+            let turn = matches!(p.kind, PaintKind::Icon | PaintKind::Mark).then(|| crate::look::turn(e)).flatten();
             if is_term && p.kind == PaintKind::Plate {
                 let cells = (d.panels.len(), d.glyphs.len(), d.sprites.len());
                 self.emit_term(id, d, sc, upload);
