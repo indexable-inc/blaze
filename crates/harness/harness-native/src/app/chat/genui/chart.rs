@@ -523,7 +523,8 @@ fn pie(v: View<'_>, node: &Value, kind: &str, slices: Vec<(String, f64)>, unit: 
     let side = points(node, "height").unwrap_or(140.0).clamp(48.0, 480.0);
     let donut = kind == "donut";
     let hole = if donut { prop(node, "hole").as_f64().unwrap_or(0.62).clamp(0.2, 0.9) } else { 0.0 };
-    let sep = prop(node, "sep").as_f64().unwrap_or(1.5).clamp(0.0, 8.0);
+    // The gap between slices, in points: the card's ground showing through, as wide at the centre as at the rim.
+    let sep = prop(node, "sep").as_f64().unwrap_or(1.0).clamp(0.0, 8.0);
     let mut shapes = Vec::new(); // alloc: this frame's slices as shapes
     let mut keys_in = Vec::new(); // alloc: this frame's legend entries
     let mut a0 = -std::f64::consts::FRAC_PI_2;
@@ -533,10 +534,13 @@ fn pie(v: View<'_>, node: &Value, kind: &str, slices: Vec<(String, f64)>, unit: 
         let k = k.ok_or("a slice has no ink")?;
         let turn = value / total * std::f64::consts::TAU;
         let a1 = a0 + turn;
-        // The gap between slices: half of `sep` points off each end, at the rim.
-        let g = if slices.len() > 1 { (sep * 0.5 / r_pt).min(turn * 0.25) } else { 0.0 };
+        // Each straight edge moved in by half of `sep` (`h`, in radii), so a gap is a strip of one width: the rim's ends
+        // turn in by the angle that is `h` across, and a pie's point leaves the centre along the middle of its turn.
+        let h = if slices.len() > 1 { sep * 0.5 / r_pt } else { 0.0 };
+        let g = h.min(0.99).asin().min(turn * 0.25);
         let (s0, s1) = (a0 + g, a1 - g);
         let pt = |r: f64, a: f64| (r * a.cos(), r * a.sin());
+        let apex = if h > 0.0 { pt((h / (turn * 0.5).sin().max(1e-6)).min(0.5), a0 + turn * 0.5) } else { (0.0, 0.0) };
         let d = if slices.len() == 1 {
             let o = "M-1 0A1 1 0 1 1 1 0A1 1 0 1 1 -1 0Z".to_owned();
             if donut { format!("{o}M-{hole} 0A{hole} {hole} 0 1 0 {hole} 0A{hole} {hole} 0 1 0 -{hole} 0Z") } else { o }
@@ -545,14 +549,15 @@ fn pie(v: View<'_>, node: &Value, kind: &str, slices: Vec<(String, f64)>, unit: 
             let (ox0, oy0) = pt(1.0, s0);
             let (ox1, oy1) = pt(1.0, s1);
             if donut {
-                let gi = (sep * 0.5 / (r_pt * hole)).min(turn * 0.25);
+                let gi = (h / hole).min(0.99).asin().min(turn * 0.25);
                 let (i0, i1) = (a0 + gi, a1 - gi);
                 let (ix0, iy0) = pt(hole, i0);
                 let (ix1, iy1) = pt(hole, i1);
                 let il = u8::from(i1 - i0 > std::f64::consts::PI);
                 format!("M{ox0} {oy0}A1 1 0 {large} 1 {ox1} {oy1}L{ix1} {iy1}A{hole} {hole} 0 {il} 0 {ix0} {iy0}Z")
             } else {
-                format!("M0 0L{ox0} {oy0}A1 1 0 {large} 1 {ox1} {oy1}Z")
+                let (px, py) = apex;
+                format!("M{px} {py}L{ox0} {oy0}A1 1 0 {large} 1 {ox1} {oy1}Z")
             }
         };
         let mut s = Shape::new(d, [-1.0, -1.0, 2.0, 2.0]);
