@@ -45,9 +45,9 @@ pub const RULES: &[Rule] = &[
                no Homebrew. A stock LLVM, or a build at another commit, is refused, since code generated against \
                another LLVM is not the code blaze's tests and caches are of.\n\n\
                Ways out: build inside `nix develop`, which sets LLVM_SYS_231_PREFIX to the flake's blaze-llvm; or \
-               unpack the release for your target with `python3 .github/scripts/llvm.py fetch --target <triple> \
-               --dir <dir>` and set LLVM_SYS_231_PREFIX to <dir>; for a target llvm.json has no release for, \
-               build one with the `llvm` workflow (.github/workflows/llvm.yaml).",
+               unpack the release for your target with `python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \
+               \"target\": \"<triple>\", \"dir\": \"<dir>\"}'` and set LLVM_SYS_231_PREFIX to <dir>; for a target \
+               llvm.json has no release for, build one with the `llvm` workflow (.github/workflows/llvm.yaml).",
     },
     Rule {
         id: "sandbox:link-arg",

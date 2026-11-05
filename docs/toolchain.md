@@ -85,7 +85,7 @@ archive. blaze fetches it itself, by that sha256, and hands it to the build scri
 it: the root `Cargo.toml` declares it a pinned native input
 ([cargo.md](cargo.md#pinned-native-inputs)), so no Nix and no `LLVM_SYS_231_PREFIX` is needed
 (`nix develop` still sets the variable to the same archive, which blaze's value overrides); a
-stage 0 older than that table needs the variable, from `python3 .github/scripts/llvm.py fetch`.
+stage 0 older than that table needs the variable, from `.github/scripts/llvm.py` with `{"command": "fetch", ...}`.
 For a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds one. llvm-sys's build script refuses any other prefix with one error before anything links it
 ([contributing.md](contributing.md#llvm)). The LLVM inside a blaze binary
 is not a toolchain for projects: it builds them with the toolchain above. Its MC assembler is

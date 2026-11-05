@@ -14,7 +14,7 @@
 //!   └ blocks 247 packages, including blaze-engine
 //!
 //!   fix   nix develop
-//!    or   python3 .github/scripts/llvm.py fetch --target aarch64-apple-darwin --dir ~/.blaze/llvm
+//!    or   python3 .github/scripts/llvm.py '{"command": "fetch", "target": "aarch64-apple-darwin", "dir": "~/.blaze/llvm"}'
 //!         export LLVM_SYS_231_PREFIX=~/.blaze/llvm
 //!
 //!   more  blaze explain llvm-sys

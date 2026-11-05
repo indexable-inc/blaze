@@ -196,7 +196,7 @@ jobs:
         run: |
           sudo mkdir -p /usr/local/lib/blaze-llvm
           sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir "$LLVM_SYS_231_PREFIX"
+          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"x86_64-unknown-linux-gnu\", \"dir\": \"$LLVM_SYS_231_PREFIX\"}"
           "$LLVM_SYS_231_PREFIX/bin/llvm-config" --version
       - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
       - name: an x86-64 ELF, not run
