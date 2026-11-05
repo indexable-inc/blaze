@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod genui;
+mod pick;
 
 pub(super) use genui::Live as GenLive;
 
@@ -223,6 +224,8 @@ pub struct ChatState {
     /// not) and when (the clock), while he still shows it.
     kip_busy: bool,
     kip_end: Option<(bool, f32)>,
+    /// The model and effort picker's menu open under the composer (chat/pick.rs), and which.
+    pick: Option<pick::Pick>,
 }
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
@@ -274,6 +277,7 @@ impl Default for ChatState {
             rows_open: HashMap::new(),
             kip_busy: false,
             kip_end: None,
+            pick: None,
         }
     }
 }
@@ -1365,8 +1369,8 @@ impl App {
         }
         if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
             let o = w.entity_from_id(e);
-            // The model and the effort it runs with ("claude-opus-5-5 · high"): the transcript's when its `session`
-            // event said them, else the daemon's listing; the model alone when the effort is unknown.
+            // The model and the effort it runs with, as den's picker (chat/pick.rs): the transcript's when its `session`
+            // event (or a choice) said them, else the daemon's listing; the model alone when the effort is unknown.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let (model, effort) = if t.model.is_empty() {
                 (listed.s.as_str().to_owned(), listed.effort.as_str().to_owned())
@@ -1374,10 +1378,7 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            let shown = if model.is_empty() || effort.is_empty() { model } else { format!("{model} \u{00B7} {effort}") };
-            if let Some(m) = status.part("model") {
-                m.text(&shown);
-            }
+            self.fill_chat_pick(status, sid, t, st.pick, &model, &effort);
             let state = if self.status_of(e) != "running" {
                 "ended \u{00B7} a message resumes it"
             } else if t.busy {
@@ -1472,6 +1473,8 @@ impl App {
         }
         // A cell's controls: its field's typing, a dragged slider, an open select.
         self.step_genui();
+        // A press off the picker's open menu closes it.
+        self.step_chat_pick();
     }
 
     /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
@@ -1552,8 +1555,12 @@ impl App {
         if self.genui_editing() {
             return self.genui_edit(op);
         }
-        // Escape closes what a cell floats over the transcript (a popover, a menu, a dialog) before it interrupts.
-        if op == "interrupt" && self.genui_escape() {
+        if op == "pick_model" || op == "effort_next" {
+            return self.chat_pick_key(op);
+        }
+        // Escape closes the picker's menu, and what a cell floats over the transcript (a popover, a menu, a dialog),
+        // before it interrupts.
+        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape()) {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };

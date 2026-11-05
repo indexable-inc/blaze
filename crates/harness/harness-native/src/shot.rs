@@ -56,6 +56,10 @@ pub fn run(path: &str) -> Result<(), String> {
             }
         } else if let Ok(sid) = s.parse() {
             app.select_session(sid);
+            // HARNESS_NATIVE_SHOT_CHAT_MENU `model|effort|all`: that chat's model and effort picker open on that menu.
+            if let Ok(page) = std::env::var("HARNESS_NATIVE_SHOT_CHAT_MENU") {
+                app.shot_chat_pick(sid, &page);
+            }
         }
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title

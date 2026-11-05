@@ -45,15 +45,171 @@ hn {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: 0, b: 0}
-        model : ui.Line, Faint {
-          TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        // The model, the effort and the context meter (src/app/chat/pick.rs fills it: hn.ChatPick, hn.ChatPickWord,
+        // hn.ChatPickMore, hn.ChatContext, each only while it has something to say).
+        pick : ui.Row {
+          Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         }
         spacer : ui.Spacer {}
         state : ui.Line, Faint {
           TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
         }
+        // The picker's menu while it is open (hn.ChatPickMenu): out of the row's flow, its plate placed above what opened
+        // it.
+        menu : ui.Node {
+          Overlay
+        }
       }
     }
+  }
+
+  // Den's model and effort picker under the composer (src/app/chat/pick.rs): the model's name in the ink, the effort's
+  // word and a chevron muted, each its own control with no plate, its ink easing to the strong ink under the pointer
+  // (pick.rs mixes hn.ChatPickInk's by the hover spring). The name opens the models, the word the efforts, the chevron
+  // both; Command-/ opens the models and Shift-Command-/ steps the effort (scene/20-keys.flecs).
+  prefab ChatPickBase : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+  }
+  prefab ChatPick : hn.ChatPickBase {
+    Tooltip: {text: "Select model  ⌘/"}
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatPickWord : hn.ChatPickBase {
+    Tooltip: {text: "Effort  ⇧⌘/"}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatPickMore : hn.ChatPickBase {
+    Tooltip: {text: "Model and effort"}
+    icon : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
+    }
+  }
+  // The picker's inks at rest (the name's, the effort's and the chevron's); under the pointer each eases to `name` at
+  // full strength.
+  prefab ChatPickInk {
+    name { Fill: $tone_term_ink }
+    word { Fill: $tone_term_muted }
+  }
+  // Its menu, den's: above what opened it, a head over each part when it shows both (the chevron's), the current row
+  // ticked, a model's line about it muted after its name. An agent that listed no models, or a model with no efforts,
+  // shows one row saying so (hn.ChatPickFixed), never a choice it cannot make.
+  // (genui's menu plate's look, hn.GenMenuPlate, which loads after this file.)
+  prefab ChatPickMenu : ui.Column {
+    Placed
+    Hoverable
+    Layer: {level: Overlay}
+    Side: {edge: Top, dx: 0, dy: $gen_float_gap}
+    Fill: $tone_gen_float
+    Edge: {dark: $tone_gen_float_edge.dark, light: $tone_gen_float_edge.light}
+    Shape: {radius: $chat_pick_menu_radius, n: 4, border: 1, feather: 0}
+    Lift: {blur: 22, alpha: 0.32, dy: 6}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: $chat_pick_menu_min, max: $chat_pick_menu_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 4, r: 4, t: 4, b: 4}
+  }
+  prefab ChatPickSep : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 6, r: 6, t: 4, b: 4}
+    line : ui.Node {
+      Fill: $tone_gen_rule
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+  }
+  prefab ChatPickHead : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_head_h, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 1}
+    }
+  }
+  prefab ChatPickRow : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_row_h, min: 0, max: 0}}
+    Padding: {l: 8, r: 10, t: 0, b: 0}
+    mark : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_clear
+      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    }
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+    about : ui.Lead {
+      Fill: $tone_term_muted
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+  }
+  prefab ChatPickRowOn : hn.ChatPickRow {
+    mark : ui.Symbol { Fill: $tone_term_ink }
+  }
+  prefab ChatPickFixed : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 7, b: 7}
+    label : ui.Words {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+  }
+  // The context meter (den's): a ring filling as the conversation fills its model's window, and the percentage; muted,
+  // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Its tooltip says the tokens.
+  prefab ChatContext : ui.Row {
+    Hoverable
+    Cursor: {shape: Arrow}
+    Tooltip: {text: ""}
+    Flex: {axis: Row, gap: $chat_context_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+    Padding: {l: $chat_context_lead, r: 0, t: 0, b: 0}
+    ring : ui.ZStack {
+      Size: {w: {kind: Fixed, value: $chat_ring, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ring, min: 0, max: 0}}
+      track : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_faint.dark, light: $tone_term_faint.light}
+        Vector: {d: "M6 1 A5 5 0 1 1 6 11 A5 5 0 1 1 6 1", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
+      }
+      arc : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_muted.dark, light: $tone_term_muted.light}
+        Vector: {d: "M6 1 A5 5 0 0 1 6.5 1.03", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
+      }
+    }
+    pct : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatContextTone {
+    ok { Fill: $tone_term_muted }
+    warn { Fill: $tone_lost }
+    full { Fill: $tone_failed }
   }
 
   // Kip on the composer, as chat.rs `chat_kip` copies him onto its `kip`: greeting over an empty chat, his feet above

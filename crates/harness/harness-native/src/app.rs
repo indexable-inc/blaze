@@ -1720,6 +1720,10 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("chat:pick:") {
+                self.chat_pick_action(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:set:") {
+                self.chat_pick_set(rest);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {

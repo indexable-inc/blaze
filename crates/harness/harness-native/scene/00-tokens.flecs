@@ -343,6 +343,25 @@ export const chat_bubble_radius = 12
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
+// The status line under the composer (hn.ChatPane's foot.status): its words, and den's model and effort picker in it
+// (hn.ChatPick, src/app/chat/pick.rs): each word its own control chat_pick_h tall, chat_pick_gap apart, the chevron
+// chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
+// chat_ring_stroke, chat_context_gap from its percentage. The picker's menu is den's: chat_pick_menu_min to
+// chat_pick_menu_max wide, corners chat_pick_menu_radius, rows chat_pick_row_h tall under heads chat_pick_head_h tall.
+export const size_chat_status = 12.5
+export const line_chat_status = 16
+export const chat_pick_h = 20
+export const chat_pick_gap = 6
+export const chat_pick_chevron = 10
+export const chat_ring = 12
+export const chat_ring_stroke = 2
+export const chat_context_gap = 5
+export const chat_context_lead = 4
+export const chat_pick_menu_min = 248
+export const chat_pick_menu_max = 360
+export const chat_pick_menu_radius = 12
+export const chat_pick_row_h = 30
+export const chat_pick_head_h = 24
 export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): its height, its lead-in, its icon and the
 // gap after it. What sits under a line (its output, its table, its steps) starts under its words (chat_line_inset); a

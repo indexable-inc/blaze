@@ -11,7 +11,10 @@
 //!
 //! | `ev` | fields | |
 //! | --- | --- | --- |
-//! | `session` | `agent`, `model`, `session_id` | the agent started (or resumed) with this model; `session_id` is its own id for the conversation (Claude's session id, Codex's thread id), what a resume names |
+//! | `session` | `agent`, `model`, `session_id`, `effort` | the agent started (or resumed) with this model and effort, or a switch to them took; `session_id` is its own id for the conversation (Claude's session id, Codex's thread id), what a resume names |
+//! | `models` | `models` (`id`, `model`, `name`, `about`, `efforts`, `effort`) | the models the agent offers, from its own list, as it starts |
+//! | `choice` | `model`, `effort` | the person switched the model and/or effort for the turns from here on (`set_model`); a resume starts with the latest |
+//! | `context` | `used`, `window` | tokens of the model's context window the conversation fills, after a turn |
 //! | `user` | `text` | the user's message (written by the daemon as it sends it) |
 //! | `busy` | `busy` | a turn started (true) or ended (false) |
 //! | `block_start` | `block`, `kind` (`text` \| `thinking`) | a block began streaming *(partial)* |
@@ -123,6 +126,9 @@ pub trait Adapter: Send {
     fn user(&mut self, text: &str) -> Vec<String>;
     /// The lines that stop the turn in flight (none when there is nothing to stop yet).
     fn interrupt(&mut self) -> Vec<String>;
+    /// The lines that switch the model (a [`harness_proto::event::ModelChoice::id`]) and/or the effort for the turns from
+    /// here on (none when the adapter carries them on its next turn itself), or why this agent cannot.
+    fn choose(&mut self, model: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String>;
 }
 
 /// The adapter of a chat whose agent is not running (restored from its log, before a resume): it reads and writes
@@ -138,6 +144,10 @@ impl Adapter for NoAdapter {
     }
     fn interrupt(&mut self) -> Vec<String> {
         Vec::new()
+    }
+    /// Nothing runs to ask: the choice is in the log, and the resume starts the agent with it.
+    fn choose(&mut self, _: Option<&str>, _: Option<&str>) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -343,6 +353,55 @@ impl Chat {
         self.store.lock().transcript.effort.clone()
     }
 
+    /// The person's latest choice of model and of effort (`choice` events), each None when never chosen: what a resume
+    /// starts the agent with.
+    pub fn chosen(&self) -> (Option<String>, Option<String>) {
+        let st = self.store.lock();
+        let some = |s: &String| Some(s.clone()).filter(|s| !s.is_empty());
+        (some(&st.transcript.chosen_model), some(&st.transcript.chosen_effort))
+    }
+
+    /// Switch to `model` and/or `effort` for the turns from here on: each checked against the models the agent listed
+    /// (the effort against the model it will run, the one chosen now or the one it runs), the adapter asked for it, and
+    /// the choice recorded (a `choice` event, what a resume keeps). The lines to write to the agent.
+    ///
+    /// # Errors
+    /// Nothing to choose; the agent never listed its models; a model it does not offer or an effort that model does not
+    /// take (each naming the chat, the value and what it offers); the adapter's refusal.
+    pub fn choose(&self, model: Option<&str>, effort: Option<&str>, tx: &broadcast::Sender<Ev>) -> anyhow::Result<Vec<String>> {
+        let oid = &self.oid;
+        let (model, effort) = (model.filter(|m| !m.is_empty()), effort.filter(|e| !e.is_empty()));
+        anyhow::ensure!(model.is_some() || effort.is_some(), "set_model for chat {oid} names neither a model nor an effort");
+        let lines = {
+            let mut guard = self.store.lock();
+            let st = &mut *guard;
+            let t = &st.transcript;
+            if t.models.is_empty() {
+                anyhow::bail!(
+                    "chat {oid}'s agent ({}) has not listed the models it offers (no `models` event in its log), so its model and effort are fixed",
+                    if t.agent.is_empty() { "unknown" } else { &t.agent }
+                );
+            }
+            let ids = || t.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ");
+            let target = match model {
+                Some(m) => Some(t.models.iter().find(|c| c.id == m).ok_or_else(|| anyhow::anyhow!("chat {oid}'s agent offers no model {m:?} (it offers {})", ids()))?),
+                None => [t.chosen_model.as_str(), t.model.as_str()].into_iter().find_map(|m| t.models.iter().find(|c| c.is(m))),
+            };
+            if let Some(e) = effort {
+                let Some(target) = target else {
+                    anyhow::bail!("chat {oid} runs model {:?}, which is not among the models its agent listed ({}), so its effort is not known to take {e:?}", t.model, ids());
+                };
+                if !target.efforts.iter().any(|x| x == e) {
+                    let takes = if target.efforts.is_empty() { "takes no effort".to_owned() } else { format!("takes {}", target.efforts.join(", ")) };
+                    anyhow::bail!("chat {oid}'s model {} {takes}, not {e:?}", target.id);
+                }
+            }
+            st.adapter.choose(model, effort).map_err(|why| anyhow::anyhow!("chat {oid}: {why}"))?
+        };
+        self.record(Body::Choice { model: model.map(str::to_owned), effort: effort.map(str::to_owned) }, tx);
+        Ok(lines)
+    }
+
     /// The agent's own id for this conversation (what resumes it), when its log said one.
     pub fn session_id(&self) -> Option<String> {
         Some(self.store.lock().transcript.session_id.clone()).filter(|s| !s.is_empty())
@@ -515,6 +574,9 @@ mod tests {
         }
         fn interrupt(&mut self) -> Vec<String> {
             Vec::new()
+        }
+        fn choose(&mut self, _: Option<&str>, _: Option<&str>) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
         }
     }
 

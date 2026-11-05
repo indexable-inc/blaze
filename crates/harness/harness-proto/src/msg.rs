@@ -118,6 +118,18 @@ pub enum Request {
         #[serde(default)]
         submit: Option<bool>,
     },
+    /// Switch chat session `id`'s model (an id from its `models` event) and/or reasoning effort (one that model takes)
+    /// for its turns from here on. The daemon checks both against the agent's own list, records the choice in the chat's
+    /// log (a `choice` event, so a resume keeps it) and asks the agent: claude live over its control requests (`set_model`,
+    /// `apply_flag_settings`), codex on its next `turn/start`; a chat whose agent is not running takes it when it resumes.
+    /// Refused, naming the session and the value, when the agent has not listed its models or does not offer it.
+    SetModel {
+        id: u64,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+    },
     Screen { id: u64 },
     Resize { id: u64, cols: u16, rows: u16 },
     Kill { id: u64 },

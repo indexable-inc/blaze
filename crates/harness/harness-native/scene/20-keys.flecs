@@ -140,6 +140,9 @@ act {
   // Command-Return: sends the chat's message, and submits a cell's TextArea (where Return breaks the line).
   ChatSubmit : act.Edit { EditOp: {op: "submit"} }
   ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
+  // The model and effort picker under the composer (src/app/chat/pick.rs): open its models, step its effort.
+  ChatPickModel : act.Edit { EditOp: {op: "pick_model"} }
+  ChatEffortNext : act.Edit { EditOp: {op: "effort_next"} }
   ChatLeft : act.Edit { EditOp: {op: "left"} }
   ChatRight : act.Edit { EditOp: {op: "right"} }
   ChatUp : act.Edit { EditOp: {op: "up"} }
@@ -373,6 +376,8 @@ key {
   chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_submit { Keybind: {key: "return", cmd: 1}; (Does, act.ChatSubmit); (When, ctx.Chat) }
+  chat_pick_model { Keybind: {key: "/", cmd: 1}; (Does, act.ChatPickModel); (When, ctx.Chat) }
+  chat_effort_next { Keybind: {key: "/", cmd: 1, shift: 1}; (Does, act.ChatEffortNext); (When, ctx.Chat) }
   chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }

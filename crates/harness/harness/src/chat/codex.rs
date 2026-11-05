@@ -13,10 +13,16 @@
 //! turn's `status` (`completed` | `interrupted` | `failed`), `error` and `durationMs`. An interrupt is `turn/interrupt`
 //! on the turn in flight; the turn then completes as `interrupted`, its items left unfinished.
 //!
+//! The model and effort: `model/list` (every page, hidden models left out) as the session starts is the `models` event;
+//! a choice rides on every `turn/start` from then on as its `model` and `effort` ("for this turn and subsequent turns",
+//! the way den's den-codex sends them), and on a resume's `thread/resume` as its `model`. Codex says what the thread runs
+//! with in `thread/settings/updated`, read as a `session` event; it sends none for a turn's own `model` and `effort`, so
+//! a `turn/start` it accepts with them is that turn's `session` event.
+//!
 //! Codex asks the client too (server requests, each answered at once so a turn never hangs): approvals are approved
 //! (the profile already runs with approval policy never and no sandbox, the TUI's yolo), questions for the user get no
 //! answers, MCP elicitations are declined, and everything else is refused with a JSON-RPC error naming the method.
-use harness_proto::event::{Body, Kind};
+use harness_proto::event::{Body, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -40,7 +46,12 @@ enum Pending {
     ThreadStart,
     TurnStart,
     Interrupt,
+    /// A page of `model/list`, after the models of the pages before it.
+    ModelList(Vec<ModelChoice>),
 }
+
+/// How many pages of `model/list` a session reads before it calls the list whole.
+const MODEL_PAGES: usize = 16;
 
 /// A streaming text or thinking item: its kind, whether its `block_start` went out, and its text so far.
 struct Open {
@@ -78,6 +89,17 @@ pub struct Codex {
     total: Value,
     /// An `error` event already said why this turn failed.
     error_said: bool,
+    /// Pages of `model/list` read past the first.
+    pages: usize,
+    /// The model and the effort chosen for its turns ([`super::Adapter::choose`], or a resumed chat's last choice): sent
+    /// on every `turn/start`.
+    model: Option<String>,
+    effort: Option<String>,
+    /// The context the thread fills and its model's window, from the last `thread/tokenUsage/updated`.
+    context: Option<(u64, u64)>,
+    /// The model and effort the thread runs with, as Codex last said (its thread start or resume, a settings update, a
+    /// turn it took with a choice).
+    runs: (String, Option<String>),
 }
 
 impl Codex {
@@ -112,7 +134,20 @@ impl Codex {
             total_before: Value::Null,
             total: Value::Null,
             error_said: false,
+            pages: 0,
+            model: None,
+            effort: None,
+            context: None,
+            runs: (String::new(), None),
         }
+    }
+
+    /// This adapter with a chat's last choice of model and effort (a resume), sent on its turns.
+    #[must_use]
+    pub fn with_choice(mut self, (model, effort): (Option<String>, Option<String>)) -> Self {
+        self.model = model;
+        self.effort = effort;
+        self
     }
 
     fn request(&mut self, method: &str, params: Value, what: Pending) -> String {
@@ -126,15 +161,18 @@ impl Codex {
         self.in_turn = true;
         self.turn = None;
         let thread = self.thread.clone().unwrap_or_default();
-        self.request(
-            "turn/start",
-            json!({
-                "threadId": thread,
-                "input": [{"type": "text", "text": text, "text_elements": []}],
-                "summary": "auto",
-            }),
-            Pending::TurnStart,
-        )
+        let mut params = json!({
+            "threadId": thread,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+            "summary": "auto",
+        });
+        if let Some(m) = &self.model {
+            params["model"] = json!(m);
+        }
+        if let Some(e) = &self.effort {
+            params["effort"] = json!(e);
+        }
+        self.request("turn/start", params, Pending::TurnStart)
     }
 
     /// Start the next waiting message's turn, when the thread can take one.
@@ -174,7 +212,12 @@ impl Codex {
                     return self.refuse_waiting(&format!("codex app-server refused initialize: {e}"));
                 }
                 self.out.push(json!({"method": "initialized"}).to_string());
+                let list = self.request("model/list", json!({"includeHidden": false}), Pending::ModelList(Vec::new()));
+                self.out.push(list);
                 let mut params = json!({"cwd": self.cwd, "approvalPolicy": "never", "sandbox": "danger-full-access"});
+                if let Some(m) = &self.model {
+                    params["model"] = json!(m);
+                }
                 let method = match &self.resume {
                     Some(thread) => {
                         // Its turns are already in the chat's log: only the thread's state comes back.
@@ -204,6 +247,7 @@ impl Codex {
                 // The v2 ThreadStartResponse and ThreadResumeResponse both carry `reasoningEffort` (a string, or null
                 // when the model has none): the effort the thread runs with.
                 let effort = r["reasoningEffort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned);
+                self.runs = (model.to_owned(), effort.clone());
                 vec![Body::Session {
                     agent: "codex".to_owned(),
                     model: model.to_owned(),
@@ -217,7 +261,51 @@ impl Codex {
                     return self.turn_over(false, "error", None, why);
                 }
                 // The answer names the turn, but Codex refuses to interrupt it ("no active turn") until `turn/started`.
-                vec![]
+                // Codex sends no settings update for a turn's own model and effort: that it took the turn with them is
+                // the confirmation.
+                if self.model.is_none() && self.effort.is_none() {
+                    return vec![];
+                }
+                if let Some(m) = &self.model {
+                    self.runs.0.clone_from(m);
+                }
+                if self.effort.is_some() {
+                    self.runs.1.clone_from(&self.effort);
+                }
+                vec![Body::Session { agent: "codex".to_owned(), model: self.runs.0.clone(), session_id: None, effort: self.runs.1.clone() }]
+            }
+            Pending::ModelList(mut got) => {
+                if let Some(e) = err {
+                    return vec![Body::Error { text: format!("codex app-server refused model/list, so this chat's model and effort are fixed: {e}") }];
+                }
+                let r = &v["result"];
+                got.extend(r["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true).map(|m| {
+                    let id = m["model"].as_str().or_else(|| m["id"].as_str()).unwrap_or("").to_owned();
+                    ModelChoice {
+                        model: id.clone(),
+                        id,
+                        name: m["displayName"].as_str().unwrap_or("").to_owned(),
+                        about: m["description"].as_str().unwrap_or("").to_owned(),
+                        efforts: m["supportedReasoningEfforts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|e| e["reasoningEffort"].as_str())
+                            .map(str::to_owned)
+                            .collect(),
+                        effort: m["defaultReasoningEffort"].as_str().map(str::to_owned),
+                    }
+                }));
+                match r["nextCursor"].as_str() {
+                    Some(c) if self.pages < MODEL_PAGES => {
+                        self.pages += 1;
+                        let line = self.request("model/list", json!({"includeHidden": false, "cursor": c}), Pending::ModelList(got));
+                        self.out.push(line);
+                        vec![]
+                    }
+                    Some(_) => vec![Body::Error { text: format!("codex's model/list went past {MODEL_PAGES} pages; its models are left unlisted, so this chat's model and effort are fixed") }],
+                    None => vec![Body::Models { models: got }],
+                }
             }
             Pending::Interrupt => match err {
                 Some(e) => vec![Body::Error { text: format!("codex app-server refused turn/interrupt: {e}") }],
@@ -246,6 +334,9 @@ impl Codex {
             out.push(Body::Block { block, kind: o.kind, text: o.text });
         }
         out.extend(why);
+        if let Some((used, window)) = self.context.take() {
+            out.push(Body::Context { used, window });
+        }
         let usage = usage(&self.total_before, &self.total);
         self.total_before = self.total.clone();
         out.push(turn_end(ok, stop, duration_ms, usage, std::mem::take(&mut self.last_text)));
@@ -369,7 +460,11 @@ impl Codex {
                 self.more(p["itemId"].as_str().unwrap_or(""), Kind::Thinking, "\n\n")
             }
             "thread/tokenUsage/updated" => {
-                self.total = p["tokenUsage"]["total"].clone();
+                let u = &p["tokenUsage"];
+                if let Some(used) = u["last"]["totalTokens"].as_u64() {
+                    self.context = Some((used, u["modelContextWindow"].as_u64().unwrap_or(0)));
+                }
+                self.total = u["total"].clone();
                 if self.total_before.is_null() {
                     // The first figure of the session: the turn so far is all of it.
                     self.total_before = json!({});
@@ -405,6 +500,11 @@ impl Codex {
             "warning" | "configWarning" | "deprecationNotice" | "guardianWarning" => {
                 let text = ["message", "summary", "details"].iter().find_map(|k| p[*k].as_str()).map_or_else(|| p.to_string(), str::to_owned);
                 vec![Body::Note { text }]
+            }
+            "thread/settings/updated" if self.thread.as_deref().is_some_and(|t| p["threadId"] == t) => {
+                let t = &p["threadSettings"];
+                self.runs = (t["model"].as_str().unwrap_or("").to_owned(), t["effort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned));
+                vec![Body::Session { agent: "codex".to_owned(), model: self.runs.0.clone(), session_id: None, effort: self.runs.1.clone() }]
             }
             "model/rerouted" => {
                 let s = |k: &str| p[k].as_str().unwrap_or("?").to_owned();
@@ -493,6 +593,21 @@ impl super::Adapter for Codex {
             "capabilities": {"experimentalApi": false, "requestAttestation": false, "optOutNotificationMethods": OPT_OUT},
         });
         vec![self.request("initialize", params, Pending::Initialize)]
+    }
+
+    /// Kept, and sent on every `turn/start` from the next one on: app-server has no call that switches a thread's model or
+    /// effort between turns.
+    fn choose(&mut self, model: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String> {
+        if self.dead {
+            return Err("its codex thread could not start, so it takes no model or effort".to_owned());
+        }
+        if let Some(m) = model {
+            self.model = Some(m.to_owned());
+        }
+        if let Some(e) = effort {
+            self.effort = Some(e.to_owned());
+        }
+        Ok(Vec::new())
     }
 
     fn events(&mut self, line: &str) -> Vec<Body> {
