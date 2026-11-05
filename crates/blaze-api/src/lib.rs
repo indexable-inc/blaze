@@ -85,8 +85,10 @@ use serde::{Deserialize, Serialize};
 /// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
 /// then reads the history itself; and [`Request::ClientRows`] and [`Worked::build_id`]: a client
 /// sends its own recorder's rows of a build to the daemon, which writes them to the history. 39:
-/// [`Request::Lock`]. 40: [`Status::uptime_ms`], for `blaze status --json`.
-pub const SCHEMA: u32 = 40;
+/// [`Request::Lock`]. 40: [`Status::uptime_ms`], for `blaze status --json`. 41:
+/// [`Response::Doing`] (what a build waits on and what each unit under way does, about once a
+/// second), [`Status::builds`] and [`Status::downloads`].
+pub const SCHEMA: u32 = 41;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -850,6 +852,48 @@ pub enum Response {
         unit: Option<UnitOf>,
         report: Report,
     },
+    /// What a build is doing, said about once a second while it runs: what it waits on while
+    /// none of its units compiles (a download and how far it has come, the longest open span of
+    /// the build, or the stage it is in), and what each unit under way is inside now. The
+    /// command's live view shows it in place of a bare "compiling"; off a terminal its
+    /// [`Doing::on`] is a line every few seconds.
+    Doing(Doing),
+}
+
+/// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Doing {
+    /// What the build waits on while none of its units compiles: `downloading
+    /// llvm-23.1.4-aarch64-apple-darwin.tar.xz: 34.0 of 410.0 MB (8%), 260.0 kB/s, 24 min 10 s
+    /// left`, the longest open span on its threads with its age, or the stage it is in (`waits
+    /// for its pinned native inputs, 1 of 1 layouts left`); `None` while a unit compiles.
+    pub on: Option<String>,
+    /// The daemon's workers running a job's code now (`blaze_graph::pool::Pool::working`),
+    /// and those that are not: with most idle, the build waits on what the busy ones run.
+    pub busy: u32,
+    pub idle: u32,
+    /// Each unit under way ([`UnitOf::id`]) and what it is inside now, by the id order: those
+    /// a thread works for now. A unit the client has under way and that is not here is
+    /// blocked (parked on a wait, queued), not running.
+    pub units: Vec<UnitDoing>,
+    /// How long the request has been under way, on the daemon's clock: what a client paces a
+    /// line off a terminal by.
+    pub for_ms: u64,
+    /// The innermost open span of the busy worker working for this build longest, with its
+    /// age: `codegen of `core::ptr::is_freeze` in core (4 min 30 s)`; `None` with no worker
+    /// busy for it.
+    pub running: Option<String>,
+}
+
+/// One unit under way and what it is inside now ([`Doing::units`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct UnitDoing {
+    /// Its [`UnitOf::id`].
+    pub id: u32,
+    /// `waiting on the download of llvm-….tar.xz (1.2 of 2.0 GB)`, `unit bodies (infer)`,
+    /// `build script run 12 s`: the innermost open span of the thread working for it, with
+    /// its age.
+    pub doing: String,
 }
 
 /// What a [`Request::Doc`] documented.
@@ -1514,6 +1558,9 @@ pub struct Status {
     /// Which blaze the daemon is: a client of another build never sends it a request of one.
     pub build: Build,
     pub views: u32,
+    /// Every build under way, oldest first, as of the daemon's last look (once a second while
+    /// one runs): what it is, its stage, and what its threads are inside.
+    pub builds: Vec<Building>,
     /// The profile history's last error (`blaze_profile::history`): a flush that failed,
     /// naming the file; `None` while every flush has been written.
     pub history: Option<String>,
@@ -1523,11 +1570,52 @@ pub struct Status {
     /// whose own environment says otherwise restarts an idle daemon, or refuses at once, before
     /// it sends a request, never builds under the daemon's values.
     pub settings: Vec<Setting>,
+    /// Every download in flight in the daemon (`blaze_fetch::downloads`), oldest first.
+    pub downloads: Vec<Downloading>,
     /// How long the daemon has run, on its driver's clock (which starts with it), as of this
     /// answer.
     pub uptime_ms: u64,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+}
+
+/// One build under way ([`Status::builds`]). Its fields are declared in the order CBOR writes
+/// a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Building {
+    /// Its plane request: the build's number in the profile history and its spans; 0 before
+    /// the job has posted one (while it fetches, or its views open).
+    pub id: u32,
+    /// The command, as the client ran it: `test -p blaze-api`, or the work's name for an
+    /// agent's request (`check`).
+    pub what: String,
+    /// Where it is: its stage and what it waits on there (`waits for its pinned native
+    /// inputs, 1 of 1 layouts left`), or the units it builds and how many run.
+    pub phase: String,
+    /// Each thread working for it, a line each: its outermost open span and its innermost,
+    /// with their ages (`blaze-worker-3: task `unit bodies (infer)` (2 min 05 s) > infer_query
+    /// `app::main` (1 s)`); at most a few, the longest open first.
+    pub spans: Vec<String>,
+    /// How long it has been under way, on the daemon's clock.
+    pub for_ms: u64,
+}
+
+/// One download in flight ([`Status::downloads`]), as `blaze_fetch::progress::Line` counts
+/// it. Its fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Downloading {
+    /// Where from, redacted.
+    pub url: String,
+    pub done: u64,
+    /// Bytes a second over the last few seconds; `None` before there are two samples.
+    pub rate: Option<u64>,
+    /// What it is: the URL's file name, or what the downloader called it.
+    pub what: String,
+    pub total: Option<u64>,
+    /// How long since its last byte.
+    pub idle_ms: u64,
+    /// How long since it began.
+    pub elapsed_ms: u64,
 }
 
 /// One setting a daemon takes from how it was started and keeps for its life

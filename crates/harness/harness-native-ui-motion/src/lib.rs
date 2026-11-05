@@ -183,18 +183,17 @@ pub fn install(world: WorldRef<'_>) {
         }
     });
 
-    // A copy's pulse (CopyFlash): back to rest on the `ui.spring.copy` token, then exactly at rest so nothing more is drawn
-    // and the frame goes idle. Without the token a pulse lands at rest at once.
+    // A copy's pulse (CopyFlash): its timeline runs on the frame clock and lands exactly at rest at its end, so nothing
+    // more is drawn and the frame goes idle.
     world.system_named::<&mut CopyFlash>("CopyFlash").each_iter(|it, _, f| {
-        if f.spring == Spring::default() {
+        if f.secs == 0.0 {
             return;
         }
-        let w = it.world();
-        let dt = it.delta_time();
-        f.age += dt;
-        match token(w, "copy") {
-            Some(m) if settle(&mut f.spring, 0.0, Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) }, dt) => moving(&w),
-            _ => f.spring = Spring::default(),
+        f.age += it.delta_time();
+        if f.live() {
+            moving(&it.world());
+        } else {
+            *f = CopyFlash::default();
         }
     });
 

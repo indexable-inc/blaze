@@ -16,9 +16,9 @@
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 //! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
 //!   each build that ends goes to the profile history's thread. A build whose tasks run while
-//!   no pool job ends, no query completes and no task or unit's step ends for the stall bound
-//!   ([`Options::stall`], [`Watchdog::BOUND`] unless `blaze serve --stall-bound` names another)
-//!   fails with the stall, whose trace is written to the state's `stalls/`, and the daemon
+//!   no pool job ends, no query completes, no task or unit's step ends and no byte arrives on a
+//!   download for the stall bound ([`Options::stall`], [`Watchdog::BOUND`] unless `blaze serve
+//!   --stall-bound` names another) fails with the stall, whose trace is written to the state's `stalls/`, and the daemon
 //!   stops: its workers may be deadlocked, and cannot be got back.
 
 #![forbid(unsafe_code)]
@@ -45,7 +45,7 @@ use intern::RestoreError;
 use super::{
     heads::{Heads, Out},
     image::{ImageFailed, Images, Parts, Unlearned, on_pool},
-    job::{Jobs, Said, Setup, Step, Value, WaitedOn, World},
+    job::{Jobs, Said, Setup, Step, Value, WaitedOn, World, doing},
     mounts::Mounts,
     observe::{Observe, Profiling},
     plane::{Happened, Plane, Runner, ns},
@@ -255,6 +255,20 @@ impl<W: super::plane::Work, P: blaze_graph::admission::Predict> fmt::Display
     }
 }
 
+/// Every download in flight, as a stall names them: `; downloads in flight: <what> from
+/// <url>: <line>, …`, each with its bytes and how long since its last; nothing with none.
+struct DownloadsNow<'a>(&'a [blaze_fetch::downloads::Shown]);
+
+impl fmt::Display for DownloadsNow<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (at, it) in self.0.iter().enumerate() {
+            f.write_str(if at == 0 { "; downloads in flight: " } else { ", " })?;
+            write!(f, "{} from {}: {}", it.what, it.url, it.line)?;
+        }
+        Ok(())
+    }
+}
+
 /// The builds clients wait on, as a stall names them: how many jobs of requests the session
 /// has not seen finish, and each job of the build with its stage and what it waits on there.
 /// A request the session waits on with no job of the build left for it is a lost job, said
@@ -286,6 +300,8 @@ macro_rules! cx {
             hot: crate::serve::observe::hot,
             history: $daemon.observe.history_error(),
             bugs: crate::serve::observe::bugs,
+            builds: &$daemon.builds,
+            downloads: crate::serve::job::doing::downloads,
         }
     };
 }
@@ -522,6 +538,11 @@ pub struct Daemon<D: Driver, S: Steps> {
     completions: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
+    /// When the builds were last looked at ([`doing::EVERY`]), on the driver's clock.
+    looked: Duration,
+    /// What that look found of each build a client waits on, for `blaze status`
+    /// ([`blaze_api::Status::builds`]): empty once none runs.
+    builds: Vec<blaze_api::Building>,
     /// When the memory by tag was last logged, on the driver's clock.
     memory_logged: Duration,
     /// When the daemon past its limit's line last asked for the heaps' free pages back
@@ -1491,6 +1512,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             pulse: Arc::default(), // alloc: once a daemon
             completions: 0,
             plotted: Duration::ZERO,
+            looked: Duration::ZERO,
+            builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
             pressure_watched: true,
@@ -1799,6 +1822,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.store_broke();
         self.observed();
         self.watch();
+        self.doing();
         self.plot();
         let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
         let front = self.jobs.front_db();
@@ -1908,9 +1932,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// The stall watchdog's turn: once the plane's tasks run and none of its counts (the worker
-    /// pool's jobs ended; queries completed; tasks and unit's steps ended: work on what the
-    /// build waits for, never the loop's turns or the workers' idle and search spans, which
-    /// close on through a stall) has moved for the stall bound, every job with a plane request under way fails with the
+    /// pool's jobs ended; queries completed; tasks and unit's steps ended; a worker running a
+    /// job's code, a run of user code, or a byte arriving on a download in flight
+    /// (`blaze_fetch::downloads`, whose own meter stops a download quiet for
+    /// `blaze_fetch::progress::STALL`): work on what the build waits for, never the loop's
+    /// turns or the workers' idle and search spans, which close on through a stall) has moved
+    /// for the stall bound, every job with a plane request under way fails with the
     /// stall, its trace is written to the state directory, and the daemon stops. A step or a
     /// span that runs long while anything else moves is no stall. At half the bound, what
     /// every thread is inside is written to the log first, so a client's own watchdog that
@@ -1926,7 +1953,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let busy = running > 0 || self.jobs.under_way() > 0;
         let now = ns(self.driver.now());
         let pool = blaze_graph::exec::shared();
-        if pool.working() > 0 || self.jobs.runs_live() {
+        // A byte that arrived since the last turn (about one; the loop turns at least every
+        // 50 ms) is a download moving: the bound is measured from a download's last byte.
+        let downloading = blaze_fetch::downloads::Downloads::process()
+            .quiet_for()
+            .is_some_and(|quiet| quiet < Duration::from_secs(1));
+        if pool.working() > 0 || self.jobs.runs_live() || downloading {
             self.working += 1;
         }
         let progress = Progress {
@@ -1959,10 +1991,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let stall = blaze_profile::watchdog::stall(quiet, running);
         // alloc: a stall, once
         let said = format!(
-            "{stall}; {}; {}; {}",
+            "{stall}; {}; {}; {}{}",
             blaze_graph::sched::waits_now(),
             RunningTasks(&self.plane),
-            BuildsWaited(self.session.building(), self.jobs.waited_on())
+            BuildsWaited(self.session.building(), self.jobs.waited_on()),
+            DownloadsNow(&blaze_fetch::downloads::Downloads::process().shown())
         );
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
@@ -2108,6 +2141,49 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut said = self.spare.said.pop().unwrap_or_default();
         let says = self.machine.as_ref().and_then(|it| it.says());
         self.jobs.tell_paused(&mut world!(self, said), says);
+        self.said(said);
+    }
+
+    /// What each build is doing, looked at once each [`doing::EVERY`] of the driver's clock
+    /// while a job runs ([`Jobs::doing`]): said to its client as `Response::Doing`, and kept in
+    /// `builds` for `blaze status`. Reads the plane's running nodes, the recorder's open spans
+    /// and the downloads in flight once for every build; blocks on nothing.
+    fn doing(&mut self) {
+        let now = self.driver.now();
+        if now.saturating_sub(self.looked) < doing::EVERY {
+            return;
+        }
+        self.looked = now;
+        self.builds.clear();
+        if self.jobs.under_way() == 0 {
+            return;
+        }
+        // alloc: a look, once a second while a build runs
+        let mut running = Vec::new();
+        let plane = &self.plane;
+        plane.unsettled(|it| {
+            if matches!(it.state, blaze_protocol::events::NodeState::Running)
+                && !plane.loop_runs(it.id)
+            {
+                running.push((it.request, it.id));
+            }
+        });
+        let threads = blaze_profile::flight::threads_now();
+        let downloads = blaze_fetch::downloads::Downloads::process().shown();
+        let pool = blaze_graph::exec::shared();
+        let working = pool.working();
+        let look = doing::Look {
+            now,
+            running: &running,
+            threads: &threads,
+            downloads: &downloads,
+            busy: u32::try_from(working).unwrap_or(u32::MAX),
+            idle: u32::try_from(pool.workers().saturating_sub(working)).unwrap_or(u32::MAX),
+        };
+        let mut said = self.spare.said.pop().unwrap_or_default();
+        let mut builds = std::mem::take(&mut self.builds);
+        self.jobs.doing(&look, &mut said, &mut builds);
+        self.builds = builds;
         self.said(said);
     }
 

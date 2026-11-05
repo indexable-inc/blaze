@@ -1,7 +1,7 @@
 //! The selection: one plate under the glyphs for every surface that selects (a chat's words and input through `TextEdit`,
 //! a table's copied row, the terminal), and the pulse a copy plays over it. Copied from den-native (ui.rs `emit_selection`
 //! and `Flash`, select.rs `join_plates`, github.com/andrewgazelka/den); its look is the scene's `ui.selection` (prims.flecs)
-//! and its pulse a `CopyFlash` spring on what was copied.
+//! and its pulse a `CopyFlash` (den's 300 ms flash) on what was copied.
 use harness_native_flecs::prelude::*;
 use harness_native_ui_look_api::{CopyLook, Fill, Shape};
 use harness_native_ui_motion_api::CopyFlash;
@@ -81,37 +81,67 @@ fn centre(plates: &[Plate]) -> (f32, f32) {
     ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
 }
 
+/// A copy's grow at this moment: about the selection's middle by `scale`. The plates and the glyphs they hold grow
+/// together (den grows the copied words with their plate), so the words stay on their plate through the pulse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grow {
+    pub cx: f32,
+    pub cy: f32,
+    pub scale: f32,
+}
+
+impl Grow {
+    /// The grow of a selection over `plates` (points) under `flash`, while it plays; None at rest.
+    #[must_use]
+    pub fn of(plates: &[Plate], look: &Look, flash: Option<CopyFlash>) -> Option<Self> {
+        let f = flash.filter(CopyFlash::live)?;
+        if plates.is_empty() {
+            return None;
+        }
+        let (cx, cy) = centre(plates);
+        Some(Self { cx, cy, scale: 1.0 + look.copy.grow * f.amount() })
+    }
+
+    /// Rect `[x, y, w, h]` (points) grown about the middle.
+    #[must_use]
+    pub fn rect(&self, r: [f32; 4]) -> [f32; 4] {
+        [self.cx + (r[0] - self.cx) * self.scale, self.cy + (r[1] - self.cy) * self.scale, r[2] * self.scale, r[3] * self.scale]
+    }
+}
+
 /// Draw a selection's rows (in reading order, points) as one shape of `look` in `colour` at `alpha`, joined ([`join`]).
-/// Under a copy's `flash` the shape grows by `look.copy.grow` at the pulse's peak and a light crosses each row (den's
-/// `emit_selection`); at rest the plates sit on whole device pixels at scale `sc`. Draw it before the glyphs it is under.
+/// Under a copy's `flash` the shape grows ([`Grow`]) and a light crosses each row (den's `emit_selection`): the plate's
+/// colour as a soft band sweeping left to right over the pulse, at `look.copy.light` times `sin(pi * phase)`, row `i`
+/// coming in from `i * stagger` over `row_in`. At rest the plates sit on whole device pixels at scale `sc`. Draw it before
+/// the glyphs it is under, and grow those glyphs by the same [`Grow`].
 pub fn emit(d: &mut Draw, plates: &[Plate], look: &Look, colour: [f32; 4], flash: Option<CopyFlash>, alpha: f32, sc: f32) {
     if plates.is_empty() || alpha <= 0.0 {
         return;
     }
     let mut plates = plates.to_vec(); // alloc: a selection's rows, a handful a frame
     join(&mut plates);
-    let pulse = flash.map_or(0.0, |f| f.amount());
-    let scale = 1.0 + look.copy.grow * pulse;
-    let (cx, cy) = centre(&plates);
-    let sweep = look.copy.sweep.max(1e-3);
+    let grow = Grow::of(&plates, look, flash);
+    let scale = grow.map_or(1.0, |g| g.scale);
     for (i, p) in plates.iter().enumerate() {
         let (w, h) = (p.x1 - p.x0, p.y1 - p.y0);
-        let rect = [cx + (p.x0 - cx) * scale, cy + (p.y0 - cy) * scale, w * scale, h * scale];
-        let rect = if pulse > 0.0 { rect } else { snap_rect(rect, sc) };
+        let rect = [p.x0, p.y0, w, h];
+        let rect = match grow {
+            Some(g) => g.rect(rect),
+            None => snap_rect(rect, sc),
+        };
         let shape = Shape { radius: look.shape.radius.min(h / 4.0) * scale, ..look.shape };
         let mut pi = panel_from(colour, [0.0; 4], shape, rect, alpha);
         pi.fx2[3] = f32::from(p.square);
         d.panel(pi);
-        if let Some(f) = flash.filter(|_| pulse > 0.0) {
-            // The light: the plate's colour as a soft band crossing the row (shader kind 5), the rows coming in one after
-            // another, as bright as the pulse is high.
+        if let Some(f) = flash.filter(CopyFlash::live) {
+            // The light (shader kind 5): its band's centre at `phase` across the row.
             let enter = ((f.age - i as f32 * look.copy.stagger) / look.copy.row_in.max(1e-3)).clamp(0.0, 1.0);
-            let lit = look.copy.light * pulse * enter;
+            let lit = look.copy.light * f.light() * enter;
             if lit > 0.0 {
                 pi.fill_d[3] = lit;
                 pi.fill_l[3] = lit;
                 pi.fx[3] = 5.0;
-                pi.fx2[2] = (f.age / sweep).clamp(0.0, 1.0);
+                pi.fx2[2] = f.phase();
                 d.panel(pi);
             }
         }
@@ -134,20 +164,21 @@ mod tests {
         assert_eq!(v[2].square, 0, "a row across a gap keeps all four corners round");
     }
 
-    /// A copy's pulse peaks at 1 and is back exactly at rest within a second on the scene's spring (omega 18, zeta 1), so
-    /// the frame goes idle after it.
+    /// A copy's pulse is den's: the grow peaks (1) `rise` of the way in, the light halfway, and both are exactly at rest
+    /// at its end, so the frame goes idle after it.
     #[test]
-    fn a_copy_pulse_peaks_at_one_and_settles() {
-        use harness_native_api::spring::Tune;
-        let tune = Tune { omega: 18.0, zeta: 1.0 };
-        let mut f = CopyFlash::kicked(tune.omega);
-        let (mut peak, mut t, dt) = (0.0f32, 0.0f32, 1.0 / 120.0);
-        while !f.spring.settled(0.0) && t < 2.0 {
-            f.spring.step(0.0, tune, dt);
-            peak = peak.max(f.amount());
-            t += dt;
-        }
-        assert!((peak - 1.0).abs() < 0.01, "peak {peak}");
-        assert!(t < 1.0, "settled after {t}s");
+    fn a_copy_pulse_follows_dens_timeline() {
+        let mut f = CopyFlash::kicked(0.3, 0.18);
+        let at = |f: &mut CopyFlash, t: f32| {
+            f.age = t;
+            (f.amount(), f.light())
+        };
+        assert_eq!(at(&mut f, 0.0), (0.0, 0.0));
+        let (grow, _) = at(&mut f, 0.054);
+        assert!((grow - 1.0).abs() < 1e-3, "grow peaks at 54 ms: {grow}");
+        let (_, light) = at(&mut f, 0.15);
+        assert!((light - 1.0).abs() < 1e-3, "light peaks at 150 ms: {light}");
+        let (grow, light) = at(&mut f, 0.3);
+        assert!(!f.live() && grow == 0.0 && light == 0.0, "at rest at 300 ms");
     }
 }

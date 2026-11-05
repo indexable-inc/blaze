@@ -262,9 +262,14 @@ ui {
     Cursor: {shape: Text}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $textarea_max_h}}
-    hint : ui.Words, Faint {
+    // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start).
+    hint_at : ui.Row {
       Background
-      TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
+      hint : ui.Words, Faint {
+        TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      }
     }
     text : ui.Words, Strong {
       Cursor: {shape: Text}
@@ -427,17 +432,13 @@ ui {
 @tree ChildOf
 ui {
   // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
-  // here, and a Cmd+C pulses it with CopyLook on the `copy` spring below.
+  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook: a 300 ms timeline, not a spring).
   prefab selection {
     Fill: $plate_selection
     Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
-    CopyLook: {grow: $copy_grow, light: $copy_light, sweep: $copy_sweep, stagger: $copy_stagger, row_in: $copy_row_in}
+    CopyLook: {secs: $copy_secs, rise: $copy_rise, grow: $copy_grow, light: $copy_light, stagger: $copy_stagger, row_in: $copy_row_in}
   }
   spring {
-    // A copy's pulse (CopyFlash): critically damped, kicked from rest, back at rest in about half a second.
-    prefab copy {
-      Motion: {omega: $copy_omega, zeta: $copy_zeta}
-    }
     // The springs the generic motion falls back on when a node has no Motion of its own.
     prefab transition {
       Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}

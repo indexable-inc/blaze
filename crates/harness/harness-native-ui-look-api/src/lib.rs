@@ -128,15 +128,16 @@ pub struct HoverLook {
     pub radius: f32,
 }
 
-/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): the selection's shape grows by the share
-/// `grow` at the pulse's peak, and a light of the plate's colour at alpha `light` sweeps across each row over `sweep` seconds,
-/// the rows joining `stagger` seconds apart, each taking `row_in` seconds to come in. The pulse itself is a spring
-/// (`CopyFlash`, on the `ui.spring.copy` token).
+/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): it lasts `secs`; the selection's
+/// shape and glyphs grow by the share `grow`, peaking `rise` of the way in, and come back; a light of the plate's colour at
+/// alpha `light` crosses each row over the whole pulse, the rows joining `stagger` seconds apart, each taking `row_in`
+/// seconds to come in. The pulse itself is a `CopyFlash` (harness-native-ui-motion-api).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CopyLook {
+    pub secs: f32,
+    pub rise: f32,
     pub grow: f32,
     pub light: f32,
-    pub sweep: f32,
     pub stagger: f32,
     pub row_in: f32,
 }

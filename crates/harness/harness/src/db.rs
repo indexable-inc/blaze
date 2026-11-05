@@ -308,6 +308,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         title: meta["title"].as_str().unwrap_or("").to_owned(),
         mode: meta["mode"].as_str().unwrap_or("tui").to_owned(),
         model: meta["model"].as_str().map(str::to_owned),
+        effort: meta["effort"].as_str().map(str::to_owned),
         ..SessionInfo::default()
     })
 }

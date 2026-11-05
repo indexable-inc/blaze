@@ -201,10 +201,14 @@ impl Codex {
                 self.thread = r["thread"]["id"].as_str().map(str::to_owned);
                 self.pump();
                 let model = r["model"].as_str().or_else(|| r["thread"]["model"].as_str()).unwrap_or("");
+                // The v2 ThreadStartResponse and ThreadResumeResponse both carry `reasoningEffort` (a string, or null
+                // when the model has none): the effort the thread runs with.
+                let effort = r["reasoningEffort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned);
                 vec![Body::Session {
                     agent: "codex".to_owned(),
                     model: model.to_owned(),
                     session_id: self.thread.clone().filter(|t| !t.is_empty()),
+                    effort,
                 }]
             }
             Pending::TurnStart => {

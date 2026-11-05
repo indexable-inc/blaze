@@ -162,15 +162,16 @@ pub fn emit_layout(
     limit: usize,
     upload: &mut Upload<'_>,
 ) {
-    emit_glyphs(d, fonts, cache, lay, at, sc, upload, &mut |n, _| {
+    emit_glyphs(d, fonts, cache, lay, at, sc, upload, None, &mut |n, _| {
         (n < limit).then_some((ink, alpha, 0.0))
     });
 }
 
 /// A layout's glyphs at `(ox, oy)`, each as `look(n, glyph)` says (its ink, opacity and how far below its place it sits,
 /// points), stopping at the first it gives None. Glyphs in place snap to the device pixel grid with den's subpixel steps;
-/// one still moving is drawn where it is. Where the pen stands after the last one drawn (x, its line's top and height),
-/// in points, if any was.
+/// one still moving is drawn where it is. `grow` grows the glyphs of a UTF-16 range (a copied selection, under its pulse)
+/// as their plate grows. Where the pen stands after the last one drawn (x, its line's top and height), in points, if any
+/// was.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_glyphs(
     d: &mut Draw,
@@ -180,6 +181,7 @@ pub fn emit_glyphs(
     (ox, oy): (f32, f32),
     sc: f32,
     upload: &mut Upload<'_>,
+    grow: Option<(usize, usize, select::Grow)>,
     look: &mut dyn FnMut(usize, &Glyph) -> Option<([f32; 4], f32, f32)>,
 ) -> Option<(f32, f32, f32)> {
     let asz = cache.size as f32;
@@ -205,13 +207,13 @@ pub fn emit_glyphs(
             }
             let mut col = ink;
             col[3] *= alpha;
+            let rect = [(ix + e.left as f32) / sc, (base_px - e.top as f32) / sc, e.w as f32 / sc, e.h as f32 / sc];
+            let rect = match grow {
+                Some((lo, hi, gr)) if (lo..hi).contains(&g.idx) => gr.rect(rect),
+                _ => rect,
+            };
             d.glyph(GlyphInst {
-                rect: [
-                    (ix + e.left as f32) / sc,
-                    (base_px - e.top as f32) / sc,
-                    e.w as f32 / sc,
-                    e.h as f32 / sc,
-                ],
+                rect,
                 uv: [
                     e.x as f32 / asz,
                     e.y as f32 / asz,
@@ -453,10 +455,10 @@ impl Painter {
                     d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                 }
                 // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts.
-                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.amount() > 0.0) {
+                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.live()) {
                     let look = select::Look::of(e.world());
                     let plate = [select::Plate::of(rect[0], rect[1], rect[2], rect[3])];
-                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount(), sc);
+                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount().max(f.light()), sc);
                 }
             }
             PaintKind::Glyphs => {
@@ -537,7 +539,9 @@ impl Painter {
                     let col = std::array::from_fn(|k| col[k] + (hot[k] - col[k]) * heat);
                     Some((col, p.alpha * a, dy))
                 };
-                // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy.
+                // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy, the
+                // words it holds growing with it.
+                let mut grow = None;
                 if let Some(t) = edit.filter(|t| t.anchor != t.caret) {
                     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
                     let plates: Vec<select::Plate> = spans_of(&lay, lo, hi)
@@ -545,7 +549,9 @@ impl Painter {
                         .map(|r| select::Plate::of(laid.x + r[0], laid.y + r[1], r[2], r[3]))
                         .collect();
                     let look = select::Look::of(e.world());
-                    select::emit(d, &plates, &look, look.colour(dark), e.try_cloned::<&CopyFlash>(), p.alpha, sc);
+                    let flash = e.try_cloned::<&CopyFlash>();
+                    grow = select::Grow::of(&plates, &look, flash).map(|g| (lo, hi, g));
+                    select::emit(d, &plates, &look, look.colour(dark), flash, p.alpha, sc);
                 }
                 let pen = emit_glyphs(
                     d,
@@ -555,6 +561,7 @@ impl Painter {
                     (laid.x, laid.y),
                     sc,
                     upload,
+                    grow,
                     &mut look,
                 );
                 if let Some(m) = md {
@@ -842,10 +849,34 @@ impl Painter {
         }
         let Some(pic) = e.try_cloned::<&Picture>() else { return Ok(()) };
         if !e.has(Pixelated::id()) {
-            return Err(format!(
-                "{path}: Picture {:?} without Pixelated: only pixel art is drawn so far",
-                pic.handle.as_str()
-            ));
+            // A photo (an absolute path to a PNG or JPEG): filtered, covering its box, cut to the box's shape about its
+            // middle (layout gives a contained photo a box of its own shape).
+            let handle = pic.handle.as_str();
+            if !handle.starts_with('/') {
+                return Err(format!(
+                    "{path}: Picture {handle:?} without Pixelated: a photo is an absolute path, pixel art is Pixelated"
+                ));
+            }
+            let rest = e.try_cloned::<&Laid>().map_or([rect[2], rect[3]], |l| [l.w, l.h]);
+            if rest[0] <= 0.0 || rest[1] <= 0.0 {
+                return Ok(());
+            }
+            // The shape to a thousandth, so a box that wobbles by a fraction of a point decodes once.
+            let milli = (rest[0] / rest[1] * 1000.0).round().max(1.0) as u32;
+            let key = format!("photo:{milli}:{handle}");
+            let sheet = match self.sheets.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0))
+                        .map_err(|err| format!("{path}: {err}"))?;
+                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba] });
+                    self.sheets.insert(key, s.clone());
+                    s
+                }
+            };
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4] };
+            d.image(img, sheet.frames[0].clone());
+            return Ok(());
         }
         let frames = e.try_cloned::<&Frames>().unwrap_or(Frames { count: 1, fps: 0.0 });
         let sheet = self

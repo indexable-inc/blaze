@@ -1166,6 +1166,10 @@ struct DaemonJson<'a> {
     views: u32,
     history: Option<&'a str>,
     settings: std::collections::BTreeMap<&'a str, Option<&'a str>>,
+    /// The builds clients wait on, as the daemon last looked at them ([`Status::builds`]).
+    builds: &'a [blaze_api::Building],
+    /// Every download in flight ([`Status::downloads`]).
+    downloads: &'a [blaze_api::Downloading],
 }
 
 /// The [`StatusJson`] of `place` and the daemon's `status` (`None`: no daemon runs), one
@@ -1183,6 +1187,8 @@ pub fn status_json(place: &StatusPlace, status: Option<&Status>) -> anyhow::Resu
         views: status.views,
         history: status.history.as_deref(),
         settings: status.settings.iter().map(|it| (&*it.name, it.value.as_deref())).collect(), // alloc: as above
+        builds: &status.builds,
+        downloads: &status.downloads,
     });
     let json = StatusJson {
         format: 1,
@@ -1323,6 +1329,31 @@ pub fn status_lines(status: &Status) -> String {
     lines.push_str(&format!("bugs: {bugs}\n"));
     for bug in &status.bugs {
         lines.push_str(&format!("  {bug}\n"));
+    }
+    // What each build is doing: its request, command and age, where it is, and the outermost
+    // and innermost open spans of each thread working for it.
+    if !status.builds.is_empty() {
+        lines.push_str(&format!("builds: {}\n", status.builds.len()));
+    }
+    for build in &status.builds {
+        let age = blaze_fetch::progress::Secs(Duration::from_millis(build.for_ms));
+        lines.push_str(&format!("  #{} {} ({age}): {}\n", build.id, build.what, build.phase));
+        for span in &build.spans {
+            lines.push_str(&format!("    {span}\n"));
+        }
+    }
+    if !status.downloads.is_empty() {
+        lines.push_str(&format!("downloads: {}\n", status.downloads.len()));
+    }
+    for it in &status.downloads {
+        let line = blaze_fetch::progress::Line {
+            done: it.done,
+            total: it.total,
+            rate: it.rate.map(|rate| rate as f64),
+            idle: Duration::from_millis(it.idle_ms),
+            elapsed: Duration::from_millis(it.elapsed_ms),
+        };
+        lines.push_str(&format!("  {}: {line}\n    from {}\n", it.what, it.url));
     }
     lines
 }

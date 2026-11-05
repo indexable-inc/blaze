@@ -1019,12 +1019,22 @@ error. `blaze status` prints:
     requests: 1 (7)
     views: 2
     memory: 1.3 GiB of 30.1 GiB
+    bugs: 0
+    builds: 1
+      #7 test (2 min 05 s): waits for its pinned native inputs, 1 of 1 layouts left
+        downloading llvm-21.1-aarch64-apple-darwin.tar.xz: 34.0 of 410.0 MB (8%), 2.1 MB/s, 3 min 00 s left
+    downloads: 1
+      llvm-21.1-aarch64-apple-darwin.tar.xz: 34.0 of 410.0 MB (8%), 2.1 MB/s, 3 min 00 s left
+        from https://…/llvm-21.1-aarch64-apple-darwin.tar.xz
 
 the requests it is answering, how many views (a workspace at a checkout) it holds, and what it
-holds of its budget. `blaze status --json` prints one object instead, for a script or an agent,
+holds of its budget; then each build a client waits on, as the daemon looks at it once a
+second (its request, command and age, where it is, and for each thread working for it the
+outermost and innermost open span with their ages), and every download in flight with its
+progress. `blaze status --json` prints one object instead, for a script or an agent,
 and starts no daemon:
 
-    {"format":1,"version":"blaze 0.1.0 (...)","api_schema":40,"home":"/Users/me/.cache/blaze","state":"/Users/me/.cache/blaze/v2","socket":"/Users/me/.cache/blaze/v2.sock","daemon":{"pid":10969,"build":"<64 hex>","exe":"/usr/local/bin/blaze","uptime_ms":5230000,"memory_bytes":1395864371,"budget_bytes":32319628083,"bugs":0,"requests":[7],"views":2,"history":null,"settings":{"BLAZE_DAEMON_MEMORY_GB":null}}}
+    {"format":1,"version":"blaze 0.1.0 (...)","api_schema":41,"home":"/Users/me/.cache/blaze","state":"/Users/me/.cache/blaze/v2","socket":"/Users/me/.cache/blaze/v2.sock","daemon":{"pid":10969,"build":"<64 hex>","exe":"/usr/local/bin/blaze","uptime_ms":5230000,"memory_bytes":1395864371,"budget_bytes":32319628083,"bugs":0,"requests":[7],"views":2,"history":null,"settings":{"BLAZE_DAEMON_MEMORY_GB":null},"builds":[],"downloads":[]}}
 
 `format` is the object's own shape (a new number when a field changes meaning or goes);
 `version` and `api_schema` are this blaze's (`blaze --version`, the daemon API's schema);
@@ -1033,7 +1043,9 @@ daemon's directory under it and `socket` where the CLI connects. `daemon` is `nu
 answers; else its pid, the hash of its executable as it started (`build`) and that file, how
 long it has run, its memory and budget in bytes, the bugs it went on past (every site's summed;
 the human `blaze status` lists each), the requests under way, its views, the profile history's
-last error and the settings it was started with. `blaze toolchain --json` is the same for the
+last error, the settings it was started with, its `builds` (`id`, `what`, `phase`, `spans`,
+`for_ms`) and its `downloads` (`what`, `url`, `done`, `total`, `rate`, `idle_ms`,
+`elapsed_ms`). `blaze toolchain --json` is the same for the
 Rust blaze builds with: `{"name","nightly","rustc","release","commit","host","sysroot"}`, the
 host's tuple among them, what a script asks instead of `rustc -vV`
 ([toolchain.md](toolchain.md)).
@@ -1184,7 +1196,10 @@ it). From then on the `blaze` anyone runs in that workspace runs that
 release, as Bazelisk runs the Bazel a `.bazelversion` names: when it is another release
 itself, it runs `~/.blaze/versions/<version>/blaze` (`$BLAZE_HOME/versions` with `BLAZE_HOME`)
 with the same arguments, and when that is not there it first downloads
-`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks it against every list of
+`blaze-v<version>-<host>.tar.xz` from the release on GitHub (the `.tar.gz`, three times the
+size, for a release from before the `.tar.xz`), in ranges eight at once, saying how far it has
+come (on a terminal one line redrawn in place, off one a line every five seconds) and stopping
+with an error naming the address after 30 s without a byte, checks it against every list of
 sums the release publishes (`SHA256SUMS`, which every release has, and `B3SUMS`, BLAKE3, which
 every release dated 2026-10-31 or later has too, and is refused without) and unpacks it there.
 The sums come from the same release as the archive, so they catch a corrupt or cut-short

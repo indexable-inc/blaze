@@ -161,6 +161,27 @@ pub fn request(r: Request) -> std::io::Result<Result<Reply, String>> {
     }
 }
 
+/// The thread that sends the UI's events to the daemon, one at a time so they arrive in the order they happened (a
+/// slider's values while it is dragged), and the sender that feeds it.
+fn ui_sender() -> Sender<UiEvent> {
+    let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+    std::thread::Builder::new()
+        .name("harness-ui-events".into())
+        .spawn(move || {
+            for UiEvent { cell, handler, value } in rx {
+                let shown: String = value.to_string().chars().take(80).collect();
+                let said = format!("harness-native: ui event {cell} {handler} {shown}");
+                match request(Request::UiEvent { cell, handler, value }) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("{said}: the daemon refused it: {e}"),
+                    Err(e) => eprintln!("{said}: {e}"),
+                }
+            }
+        })
+        .expect("ui events thread");
+    tx
+}
+
 /// A request whose reply is an open record (runs, objects).
 fn record(r: Request) -> std::io::Result<Result<Value, String>> {
     Ok(request(r)?.and_then(|reply| match reply {
@@ -313,6 +334,16 @@ pub struct Link {
     pid: Arc<AtomicU32>,
     bytes: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
     run_bytes: Arc<Mutex<HashMap<(u64, Option<u32>), Arc<AtomicU64>>>>,
+    /// The person's events on cells' UI (`Request::UiEvent`), in the order they happened, to the one thread that sends
+    /// them ([`Link::ui_event`]).
+    ui: Sender<UiEvent>,
+}
+
+/// One event on a cell's UI: cell `<repl>.<task>` runs handler `handler` with `value`.
+struct UiEvent {
+    cell: String,
+    handler: String,
+    value: Value,
 }
 
 impl Link {
@@ -328,6 +359,7 @@ impl Link {
             pid: Arc::default(),
             bytes: Arc::default(),
             run_bytes: Arc::default(),
+            ui: ui_sender(),
         };
         let (rtt_us, pid) = (link.rtt_us.clone(), link.pid.clone());
         std::thread::Builder::new()
@@ -574,6 +606,16 @@ impl Link {
             }
             let _ = poke.send(());
         });
+    }
+
+    /// The person did something to a cell's UI: cell `cell` (`<repl>.<task>`) runs handler `handler` (`h3`) with `value`
+    /// (null for a press). Sent in order, one after another, by the link's UI thread; a daemon's refusal (no kernel
+    /// listens for the cell's REPL) is logged naming the cell and handler.
+    pub fn ui_event(&self, cell: &str, handler: &str, value: Value) {
+        let ev = UiEvent { cell: cell.to_owned(), handler: handler.to_owned(), value };
+        if self.ui.send(ev).is_err() {
+            eprintln!("harness-native: ui event {cell} {handler}: the link's UI thread is gone");
+        }
     }
 
     /// Interrupt chat session `id`'s turn in flight.

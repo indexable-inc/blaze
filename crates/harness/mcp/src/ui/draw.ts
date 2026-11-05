@@ -168,11 +168,13 @@ const INSTEAD: Readonly<Record<string, string>> = {
   header: 'Row or Column', footer: 'Row or Column', nav: 'Row', aside: 'Column', span: 'Text', p: 'Text', label: 'Text', strong: 'Text bold',
   b: 'Text bold', em: 'Text', i: 'Text', small: 'Text tone="muted"', h1: 'Text bold', h2: 'Text bold', h3: 'Text bold', h4: 'Text bold',
   h5: 'Text bold', h6: 'Text bold', hr: 'Divider', br: 'a new Text', pre: 'Code', code: 'Code', table: 'Table', tr: 'Table rows={...}',
-  td: 'Table rows={...}', th: 'Table columns={...}', ul: 'Column of Text', ol: 'Column of Text', li: 'Text', img: 'nothing yet (no images)',
-  button: 'nothing yet (no inputs)', input: 'nothing yet (no inputs)', foreignObject: 'no HTML inside a drawing: words in an <svg> are <text x y>',
+  td: 'Table rows={...}', th: 'Table columns={...}', ul: 'Column of Text', ol: 'Column of Text', li: 'Text', img: 'Image src="/path/to/picture.png"',
+  details: 'Disclosure title="..."', summary: 'Disclosure title="..."', dialog: 'Dialog', progress: 'Progress', a: 'FileRef path="..." (a file) or Button',
+  video: 'nothing: Video is not drawn by the harness app',
+  button: 'Button', input: 'Input (words), Slider or NumberField (a number), Checkbox or Toggle (on or off)', textarea: 'TextArea', select: 'Select', form: 'Column', foreignObject: 'no HTML inside a drawing: words in an <svg> are <text x y>',
   tspan: 'one <text> per run of words', defs: 'nothing: no gradients or patterns, colour is an ink', linearGradient: 'an ink: no gradients',
   radialGradient: 'an ink: no gradients', clipPath: 'nothing yet: no clipping', mask: 'nothing yet: no masks', use: 'the shape written again',
-  title: 'tip="..." on the shape', image: 'nothing yet (no images)', marker: 'a small <path> at the line\'s end',
+  title: 'tip="..." on the shape', image: 'an Image beside the drawing (no pictures inside one)', marker: 'a small <path> at the line\'s end',
 };
 
 /** The error for a lowercase element that is neither one of the app's nor an SVG tag the kernel takes. */

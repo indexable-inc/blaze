@@ -98,6 +98,22 @@ impl ChildKiller for NoAgent {
 /// When this daemon started (ms since the epoch): a session that ended before it is past (`list`'s `past`).
 static STARTED_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// Each kernel's UI feed (ui_feed.rs): where the app's `ui_event`s go.
+static FEEDS: std::sync::LazyLock<Mutex<crate::ui_feed::Feeds<FeedSink>>> = std::sync::LazyLock::new(|| Mutex::new(crate::ui_feed::Feeds::default()));
+
+/// A `ui_listen` connection's queue, [`crate::ui_feed::FEED_CAP`] deep.
+struct FeedSink(tokio::sync::mpsc::Sender<crate::ui_feed::UiEv>);
+
+impl crate::ui_feed::Sink for FeedSink {
+    fn offer(&self, ev: crate::ui_feed::UiEv) -> Result<(), crate::ui_feed::Refused> {
+        use tokio::sync::mpsc::error::TrySendError;
+        self.0.try_send(ev).map_err(|e| match e {
+            TrySendError::Full(_) => crate::ui_feed::Refused::Full,
+            TrySendError::Closed(_) => crate::ui_feed::Refused::Closed,
+        })
+    }
+}
+
 impl Session {
     /// A chat session around `chat`, its agent not running yet (a new chat starts it next; a restored one when resumed).
     #[allow(clippy::too_many_arguments)]
@@ -183,6 +199,7 @@ impl Session {
             busy: self.busy.load(Ordering::Relaxed),
             mode: if self.chat.is_some() { "chat" } else { "tui" }.to_owned(),
             model: self.chat.as_ref().map(|c| c.model()),
+            effort: self.chat.as_ref().map(|c| c.effort()).filter(|e| !e.is_empty()),
             past: false,
         }
     }
@@ -432,7 +449,7 @@ impl Daemon {
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
-            "claude" => Box::new(chat::claude::Claude::default()),
+            "claude" => Box::new(chat::claude::Claude::new(launch.effort.clone())),
             "codex" => Box::new(chat::codex::Codex::new(&cwd)),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
@@ -579,20 +596,23 @@ impl Daemon {
                 a => args.push(a.to_owned()),
             }
         }
-        let adapter: Box<dyn chat::Adapter> = match s.kind.as_str() {
-            "claude" => {
-                args.extend(["--resume".to_owned(), session.clone()]);
-                Box::new(chat::claude::Claude::default())
-            }
-            "codex" => Box::new(chat::codex::Codex::resume(&s.cwd, &session)),
+        match s.kind.as_str() {
+            "claude" => args.extend(["--resume".to_owned(), session.clone()]),
+            "codex" => {}
             other => anyhow::bail!("{other} has no chat adapter to resume with"),
-        };
+        }
         if let Some(n) = &s.name {
             db::check_name(n)?;
         }
         let launch = profiles::launch(
             &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
         )?;
+        // Claude's adapter says the effort its launch passed, so it is made after the launch.
+        let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
+            Box::new(chat::claude::Claude::new(launch.effort.clone()))
+        } else {
+            Box::new(chat::codex::Codex::resume(&s.cwd, &session))
+        };
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
         db::session_start(&db::SessionRow {
@@ -694,7 +714,13 @@ impl Daemon {
                 std::process::exit(0);
             }
             Req::Runs(r) => Reply::Record(runs::handle(r)?),
-            Req::Attach { .. } | Req::Watch => anyhow::bail!("attach and watch hold the connection: send them as a connection's request, not through rpc"),
+            Req::UiEvent { cell, handler, value } => {
+                FEEDS.lock().deliver(crate::ui_feed::UiEv { cell, handler, value }).map_err(anyhow::Error::msg)?;
+                Reply::Ok
+            }
+            Req::Attach { .. } | Req::Watch | Req::UiListen { .. } => {
+                anyhow::bail!("attach, watch and ui_listen hold the connection: send them as a connection's request, not through rpc")
+            }
         })
     }
 }
@@ -890,6 +916,10 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             send(&mut w, &Down::Reply(Reply::Watching)).await?;
             return watch(r, w).await;
         }
+        if let Req::UiListen { repl } = req {
+            send(&mut w, &Down::Reply(Reply::Listening)).await?;
+            return ui_listen(repl, r, w).await;
+        }
         let d2 = d.clone();
         let what = request_name(&req);
         let resp = blocking(&what, move || d2.handle(req)).await;
@@ -919,6 +949,27 @@ async fn watch(mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::
             _ = aio::read(&mut r) => return Ok(()),
         }
     }
+}
+
+/// A `ui_listen` connection: kernel `repl`'s UI feed, a [`Down::Ui`] per event the app sends for one of its cells, until
+/// the kernel sends anything or goes, or a newer listener for `repl` replaces it (its queue's sender is dropped).
+async fn ui_listen(repl: String, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::ui_feed::FEED_CAP);
+    let id = FEEDS.lock().listen(&repl, FeedSink(tx));
+    let out = async {
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(crate::ui_feed::UiEv { cell, handler, value }) => send(&mut w, &Down::Ui { cell, handler, value }).await?,
+                    None => return Ok::<(), anyhow::Error>(()),
+                },
+                _ = aio::read(&mut r) => return Ok(()),
+            }
+        }
+    }
+    .await;
+    FEEDS.lock().gone(&repl, id);
+    out
 }
 
 async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {

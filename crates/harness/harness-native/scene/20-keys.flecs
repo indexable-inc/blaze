@@ -62,6 +62,9 @@ act {
     MenuItem: {bar: "File", title: "New Shell"} }
   Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
 
+  // The Edit menu's: sent up the responder chain to the view (src/window.rs), which runs the app's cut, copy, paste.
+  Cut { Selector: {sel: "cut:"}
+    MenuItem: {bar: "Edit", title: "Cut"} }
   Copy { Selector: {sel: "copy:"}
     MenuItem: {bar: "Edit", title: "Copy"} }
   Paste { Selector: {sel: "paste:"}
@@ -134,6 +137,8 @@ act {
   prefab Edit
   ChatSend : act.Edit { EditOp: {op: "send"} }
   ChatNewline : act.Edit { EditOp: {op: "newline"} }
+  // Command-Return: sends the chat's message, and submits a cell's TextArea (where Return breaks the line).
+  ChatSubmit : act.Edit { EditOp: {op: "submit"} }
   ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
   ChatLeft : act.Edit { EditOp: {op: "left"} }
   ChatRight : act.Edit { EditOp: {op: "right"} }
@@ -158,7 +163,6 @@ act {
   ChatWordErase : act.Edit { EditOp: {op: "word_erase"} }
   ChatWordDelete : act.Edit { EditOp: {op: "word_delete"} }
   ChatLineErase : act.Edit { EditOp: {op: "line_erase"} }
-  ChatCut : act.Edit { EditOp: {op: "cut"} }
 }
 
 // ---- bindings ----
@@ -181,6 +185,8 @@ key {
   archive { Keybind: {key: "w", cmd: 1}
     (Does, act.Archive) }
 
+  cut { Keybind: {key: "x", cmd: 1}
+    (Does, act.Cut) }
   copy { Keybind: {key: "c", cmd: 1}
     (Does, act.Copy) }
   paste { Keybind: {key: "v", cmd: 1}
@@ -366,6 +372,7 @@ key {
   chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_submit { Keybind: {key: "return", cmd: 1}; (Does, act.ChatSubmit); (When, ctx.Chat) }
   chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
@@ -394,5 +401,4 @@ key {
   chat_word_erase { Keybind: {key: "backspace", opt: 1}; (Does, act.ChatWordErase); (When, ctx.Chat) }
   chat_word_delete { Keybind: {key: "delete", opt: 1}; (Does, act.ChatWordDelete); (When, ctx.Chat) }
   chat_line_erase { Keybind: {key: "backspace", cmd: 1}; (Does, act.ChatLineErase); (When, ctx.Chat) }
-  chat_cut { Keybind: {key: "x", cmd: 1}; (Does, act.ChatCut); (When, ctx.Chat) }
 }

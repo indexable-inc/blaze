@@ -215,3 +215,43 @@ fn ansi_keeps_the_text_and_fit_keeps_the_end() {
     assert_eq!(fit("crate::module::tests::name", 12), "…tests::name");
     assert_eq!(fit("short", 12), "short");
 }
+
+/// A cold build that compiles nothing yet says what it waits on, never "compiling"; a unit
+/// open a while says what it is inside; most workers idle behind one busy one says what it
+/// runs and what waits on it; and past ten seconds the hint is under the view.
+#[test]
+fn a_build_that_waits_says_on_what() {
+    let mut view = TestView::new(Paint::Plain);
+    let doing = |on: Option<&str>, units: Vec<(u32, &str)>| Event::Doing {
+        on: on.map(str::to_owned),
+        busy: 1,
+        idle: 15,
+        running: Some("codegen `std::fmt::write` in std (4 min 30 s)".to_owned()),
+        units: units.into_iter().map(|(id, it)| (id, it.to_owned())).collect(),
+    };
+    view.apply(ms(2000), doing(Some("downloading llvm.tar.xz: 34.0 of 410.0 MB (8%)"), vec![]));
+    let area = Rect::new(0, 0, 160, 8);
+    let mut buf = Buffer::empty(area);
+    view.render(area, &mut buf);
+    let shown = text(&buf);
+    assert!(shown.contains("waiting") && !shown.contains("compiling"), "{shown}");
+    assert!(shown.contains("0/0  downloading llvm.tar.xz: 34.0 of 410.0 MB (8%)"), "{shown}");
+
+    view.apply(ms(3000), Event::UnitBegan { id: 0, label: "std build script".to_owned() });
+    view.apply(ms(3000), Event::UnitBegan { id: 1, label: "libc build script".to_owned() });
+    view.apply(ms(3000), Event::UnitBegan { id: 2, label: "core lib".to_owned() });
+    view.apply(ms(12_000), doing(None, vec![(2, "codegen `std::fmt::write` in std (9 s)")]));
+    let mut buf = Buffer::empty(area);
+    view.render(area, &mut buf);
+    let shown = text(&buf);
+    assert!(shown.contains("compiling"), "{shown}");
+    assert!(shown.contains("core lib: codegen `std::fmt::write` in std (9 s) 9.00s"), "{shown}");
+    assert!(
+        shown.contains(
+            "held   1 worker busy, 15 idle: waiting on codegen `std::fmt::write` in std (4 min 30 s) \
+             · blocks libc build script, std build script"
+        ),
+        "{shown}"
+    );
+    assert!(shown.contains("what each step does: `blaze explore`; live spans: `blaze debug live`"), "{shown}");
+}

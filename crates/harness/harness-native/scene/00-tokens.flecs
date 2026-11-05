@@ -280,25 +280,28 @@ export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {
 export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
 
 // The selection (harness-native-render's select.rs, den's plate_selection): one plate under the glyphs wherever text is
-// selected (a chat's transcript and input, a table's copied row, the terminal), ink-1 at 22% (18% on the light page),
-// corners of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays
-// square). Ghostty's selection-background, where the theme sets one, retints it. Cmd+C pulses it (den's FlashLook): the
-// shape grows by copy_grow and back on the copy spring (kicked to peak at 1, settling to rest so the frame goes idle), a
-// light of copy_light sweeps across each row over copy_sweep seconds, the rows joining copy_stagger seconds apart, each
-// taking copy_row_in to come in.
-export const plate_selection: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.18}}
+// selected (a chat's transcript and input, a table's copied row, the terminal), den's ink-1 at 22% (18% on the light
+// page), corners of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays
+// square). Ghostty's selection-background, where the theme sets one, retints it.
+export const plate_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.18}}
 export const plate_selection_radius = 4
 export const plate_selection_n = 2
-export const copy_omega = 18
-export const copy_zeta = 1
+// Cmd+C pulses it: den's FlashLook (after the site's selshape.ts and the os text field), a timeline of copy_secs rather
+// than a spring. The selection's shape and its glyphs grow by copy_grow about the selection's middle on a fast ease-out
+// (peaking copy_rise of the way in) and fall back as a cubic; a light of the plate's colour at copy_light (at its
+// brightest halfway) crosses each row left to right over the whole pulse, the rows joining copy_stagger seconds apart,
+// each taking copy_row_in to come in. At its end the pulse is exactly at rest and the frame goes idle.
+export const copy_secs = 0.3
+export const copy_rise = 0.18
 export const copy_grow = 0.025
 export const copy_light = 0.12
-export const copy_sweep = 0.3
 export const copy_stagger = 0.04
 export const copy_row_in = 0.11
 // Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
+// How far a text area's placeholder starts after its caret (which stands at the words' start), as a macOS field's does.
+export const textarea_hint_inset = 4
 // ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
 export const table_row = 24
 export const table_gap = 14
@@ -312,6 +315,8 @@ export const result_snippet_h = 36
 // edges either side when the pane is narrower.
 export const chat_w = 672
 export const chat_pad = 24
+// How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
+export const chat_fade_len = 28
 // Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
 // person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
 // its answer).
@@ -339,6 +344,9 @@ export const chat_bubble_radius = 12
 export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
 export const chat_row_estimate = 44
+// A tool call's or a run's line, and how far a run's calls sit in from its line (its icon's place).
+export const chat_tool_h = 24
+export const chat_nest = 19
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
 export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
@@ -363,6 +371,83 @@ export const tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.890
 // The quietest ink on the terminal's ground: a chart's gridlines, a canvas's `faint`.
 export const tone_term_faint: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.12}}
 export const line_gen_stat = 28
+// A cell's controls (genui/control.rs, hn.Gen<control> in widgets/genui.flecs), on the terminal's ground: one height for
+// a button, a field and a select; a switch's track and knob, a check box's square, a radio's dot, a slider's rail and
+// knob; a field's widest. Their plates each appearance its own step: a quiet control plate and the hairline round a
+// field, the off track, the knob, the solid accent under white words (the on state; deeper than tone_accent in dark so
+// white reads on it), a segment's raised plate.
+export const gen_control_h = 28
+export const gen_switch_w = 30
+export const gen_switch_h = 18
+export const gen_switch_knob = 14
+export const gen_box = 16
+export const gen_dot = 6
+export const gen_rail = 4
+export const gen_slider_knob = 16
+export const gen_field_w = 320
+export const gen_option_h = 26
+export const size_gen_control = 13
+export const tone_gen_plate: Fill = {dark: {1, 1, 1, 0.085}, light: {0, 0, 0, 0.055}}
+export const tone_gen_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.16}}
+export const tone_gen_field: Fill = {dark: {1, 1, 1, 0.045}, light: {1, 1, 1, 1}}
+export const tone_gen_track: Fill = {dark: {1, 1, 1, 0.17}, light: {0, 0, 0, 0.13}}
+export const tone_gen_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_knob_edge: Fill = {dark: {0, 0, 0, 0.25}, light: {0, 0, 0, 0.16}}
+export const tone_gen_on: Fill = {dark: {0.400, 0.424, 0.957, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_gen_on_ink: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_segment: Fill = {dark: {1, 1, 1, 0.16}, light: {1, 1, 1, 1}}
+export const tone_gen_error_wash: Fill = $tone_failed_wash
+export const tone_gen_success_wash: Fill = {dark: {0.298, 0.718, 0.510, 0.15}, light: {0.18, 0.60, 0.38, 0.11}}
+export const tone_gen_warning_wash: Fill = {dark: {0.949, 0.733, 0.322, 0.15}, light: {0.78, 0.55, 0.10, 0.12}}
+// How faint a control is drawn while it takes no input (disabled, or no handler): a Pose fade.
+export const gen_inert_fade = 0.55
+
+// Generative UI, tier 3 (scene/widgets/genui.flecs, src/app/chat/genui/{layout,float,media}.rs): what floats over the
+// transcript (a popover, a menu, a dialog's plate over its scrim, a toast) and what folds, splits, tabs and shows status,
+// after den's 30-genui.flecs and 33-genui-prims.flecs.
+export const size_gen_small = 12
+export const gen_float_w = 280
+export const gen_menu_w = 160
+export const gen_dialog_w = 380
+export const gen_toast_w = 420
+export const gen_float_gap = 6
+export const gen_split_h = 240
+export const gen_split_hit = 13
+export const gen_tab_h = 30
+export const gen_chip_h = 28
+export const gen_file_h = 24
+export const gen_icon = 18
+export const gen_image_h = 360
+export const size_gen_title = 15
+export const gen_bone_h = 10
+export const tone_gen_float: Fill = {dark: {0.137, 0.137, 0.149, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_float_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.12}}
+export const tone_gen_scrim: Fill = {dark: {0, 0, 0, 0.42}, light: {0, 0, 0, 0.18}}
+export const tone_gen_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.10}}
+export const tone_gen_bone: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.07}}
+export const tone_gen_chip_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.14}}
+export const tone_gen_chip_on: Fill = {dark: {0.263, 0.263, 0.278, 1}, light: {0.847, 0.847, 0.863, 1}}
+export const tone_gen_chip_on_edge: Fill = {dark: {1, 1, 1, 0.34}, light: {0, 0, 0, 0.30}}
+// File kinds as the IntelliJ New UI colours them (den's scene/15-filetypes.flecs): an Icon's or a FileRef's kind.
+export const tone_file_rust: Fill = {dark: {0.878, 0.38, 0.298, 1}, light: {0.784, 0.263, 0.184, 1}}
+export const tone_file_typescript: Fill = {dark: {0.298, 0.604, 0.91, 1}, light: {0.165, 0.435, 0.753, 1}}
+export const tone_file_tsx: Fill = {dark: {0.486, 0.525, 0.949, 1}, light: {0.29, 0.341, 0.816, 1}}
+export const tone_file_javascript: Fill = {dark: {0.894, 0.867, 0.314, 1}, light: {0.647, 0.627, 0, 1}}
+export const tone_file_json: Fill = {dark: {0.796, 0.796, 0.255, 1}, light: {0.541, 0.541, 0.071, 1}}
+export const tone_file_toml: Fill = {dark: {0.769, 0.529, 0.722, 1}, light: {0.604, 0.31, 0.557, 1}}
+export const tone_file_yaml: Fill = {dark: {0.878, 0.392, 0.498, 1}, light: {0.753, 0.227, 0.361, 1}}
+export const tone_file_markdown: Fill = {dark: {0.373, 0.659, 0.827, 1}, light: {0.227, 0.51, 0.69, 1}}
+export const tone_file_nix: Fill = {dark: {0.494, 0.729, 0.894, 1}, light: {0.31, 0.451, 0.753, 1}}
+export const tone_file_shell: Fill = {dark: {0.545, 0.859, 0.353, 1}, light: {0.247, 0.608, 0.114, 1}}
+export const tone_file_python: Fill = {dark: {0.31, 0.718, 0.651, 1}, light: {0.165, 0.561, 0.494, 1}}
+export const tone_file_go: Fill = {dark: {0.235, 0.769, 0.91, 1}, light: {0.055, 0.612, 0.761, 1}}
+export const tone_file_html: Fill = {dark: {0.898, 0.314, 0.227, 1}, light: {0.788, 0.227, 0.141, 1}}
+export const tone_file_css: Fill = {dark: {0.627, 0.455, 0.878, 1}, light: {0.478, 0.31, 0.753, 1}}
+export const tone_file_image: Fill = {dark: {0.333, 0.753, 0.541, 1}, light: {0.184, 0.6, 0.4, 1}}
+export const tone_file_lock: Fill = {dark: {0.557, 0.569, 0.612, 1}, light: {0.424, 0.439, 0.494, 1}}
+export const tone_file_git: Fill = {dark: {0.922, 0.353, 0.267, 1}, light: {0.816, 0.251, 0.173, 1}}
+export const tone_file_folder: Fill = {dark: {0.541, 0.643, 0.808, 1}, light: {0.427, 0.525, 0.69, 1}}
+export const tone_file_text: Fill = {dark: {0.627, 0.639, 0.678, 1}, light: {0.424, 0.439, 0.494, 1}}
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
 // `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and

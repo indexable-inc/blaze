@@ -247,6 +247,859 @@ hn {
     }
   }
 
+  // ---- Controls (genui/control.rs): what a cell's UI takes input with. Each sends one handler of its cell's with a
+  // value (Request::UiEvent) and the kernel draws the tree again. The looks are here; genui/control.rs makes a control
+  // Pressable (and gives it its Action) only while it has a handler and is not disabled, and fades it by hn.GenInert
+  // otherwise, so an inert control is never hovered or pressed. A state the tree says (on, checked, selected) is a
+  // prefab of its own (hn.GenToggleOn), made again when it changes.
+  prefab GenInert {
+    Pose: {dx: 0, dy: 0, shrink: 0, fade: $gen_inert_fade, cut: 0}
+  }
+  // A control's label over it (a field's, a slider's, a select's): small, muted; it takes no room when there is none.
+  prefab GenLabel : ui.Line {
+    Fill: $tone_term_muted
+    TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0, weight: $weight_label}
+  }
+
+  // A button: its label on a quiet plate (`tone` gives the solid accent, a tinted wash, or no plate at all for `muted`).
+  prefab GenButton : ui.Row {
+    Fill: $tone_gen_plate
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 6, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 56, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Padding: {l: 12, r: 12, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
+    }
+  }
+  prefab GenButtonAccent : hn.GenButton {
+    Fill: $tone_gen_on
+    label : ui.Line { Fill: $tone_gen_on_ink }
+  }
+  prefab GenButtonError : hn.GenButton {
+    Fill: $tone_gen_error_wash
+    label : ui.Line { Fill: $tone_failed }
+  }
+  prefab GenButtonSuccess : hn.GenButton {
+    Fill: $tone_gen_success_wash
+    label : ui.Line { Fill: $tone_running }
+  }
+  prefab GenButtonWarning : hn.GenButton {
+    Fill: $tone_gen_warning_wash
+    label : ui.Line { Fill: $tone_lost }
+  }
+  prefab GenButtonMuted : hn.GenButton {
+    Fill: $tone_clear
+    Padding: {l: 8, r: 8, t: 0, b: 0}
+    label : ui.Line { Fill: $tone_term_muted }
+  }
+
+  // A switch and its label: the track off (a quiet rail, the knob at its start) or on (the accent, the knob at its end).
+  prefab GenToggle : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 22, max: 0}}
+    track : ui.Row {
+      Fill: $tone_gen_track
+      Shape: {radius: 9, n: 2, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $gen_switch_w, min: 0, max: 0}, h: {kind: Fixed, value: $gen_switch_h, min: 0, max: 0}}
+      Padding: {l: 2, r: 2, t: 2, b: 2}
+      knob : ui.Node {
+        Fill: $tone_gen_knob
+        Shape: {radius: 7, n: 2, border: 0, feather: 0}
+        Lift: {blur: 2, alpha: 0.25, dy: 0.5}
+        Size: {w: {kind: Fixed, value: $gen_switch_knob, min: 0, max: 0}, h: {kind: Fixed, value: $gen_switch_knob, min: 0, max: 0}}
+      }
+    }
+    label : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+  prefab GenToggleOn : hn.GenToggle {
+    track : ui.Row {
+      Fill: $tone_gen_on
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    }
+  }
+
+  // A check box and its label: an outlined square, filled with the accent and ticked in white when checked.
+  prefab GenCheckbox : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 22, max: 0}}
+    box : ui.Row {
+      Fill: $tone_gen_field
+      Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+      Shape: {radius: 4, n: 4, border: 1, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $gen_box, min: 0, max: 0}, h: {kind: Fixed, value: $gen_box, min: 0, max: 0}}
+      tick : ui.Symbol {
+        Fill: $tone_clear
+        Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+      }
+    }
+    label : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+  prefab GenCheckboxOn : hn.GenCheckbox {
+    box : ui.Row {
+      Fill: $tone_gen_on
+      Edge: {dark: $tone_gen_on.dark, light: $tone_gen_on.light}
+      tick : ui.Symbol { Fill: $tone_gen_on_ink }
+    }
+  }
+
+  // Radio dots down a column (or along a row, `row`): each an outlined circle and its label; the selected one the accent
+  // with a white dot in it.
+  prefab GenRadio : ui.Column {
+    Flex: {axis: Column, gap: 6, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenRadioRow : ui.Row {
+    Flex: {axis: Row, gap: 16, align: Center, justify: Start, wrap: true}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenRadioItem : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 20, max: 0}}
+    dot : ui.Row {
+      Fill: $tone_gen_field
+      Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+      Shape: {radius: 8, n: 2, border: 1, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $gen_box, min: 0, max: 0}, h: {kind: Fixed, value: $gen_box, min: 0, max: 0}}
+      mark : ui.Node {
+        Fill: $tone_clear
+        Shape: {radius: 3, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Fixed, value: $gen_dot, min: 0, max: 0}, h: {kind: Fixed, value: $gen_dot, min: 0, max: 0}}
+      }
+    }
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+  prefab GenRadioItemOn : hn.GenRadioItem {
+    dot : ui.Row {
+      Fill: $tone_gen_on
+      Edge: {dark: $tone_gen_on.dark, light: $tone_gen_on.light}
+      mark : ui.Node { Fill: $tone_gen_on_ink }
+    }
+  }
+
+  // A segmented control: its options side by side on one quiet plate, the selected one raised on its own plate in the
+  // strong ink, the rest muted.
+  prefab GenChoice : ui.Row {
+    Fill: $tone_gen_plate
+    Shape: {radius: 7, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Padding: {l: 2, r: 2, t: 2, b: 2}
+  }
+  prefab GenChoiceItem : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: 5, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 40, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Padding: {l: 11, r: 11, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
+    }
+  }
+  prefab GenChoiceItemOn : hn.GenChoiceItem {
+    Fill: $tone_gen_segment
+    Edge: {dark: $tone_clear.dark, light: $tone_gen_edge.light}
+    Shape: {radius: 5, n: 4, border: 0.5, feather: 0}
+    Lift: {blur: 2, alpha: 0.14, dy: 0.5}
+    label : ui.Line { Fill: $tone_term_ink }
+  }
+
+  // A labelled control (a slider, a field, a number, a select) is a column of its parts, made by genui/control.rs in
+  // order: `label` (hn.GenLabel, only when it has one, so none takes no room), `body` (the control), and a select's open
+  // `menu`.
+  prefab GenLabelled : ui.Column {
+    Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: $gen_field_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A slider: a rail with the knob on it (the accent up to the knob, the quiet rail after) and its value beside, in
+  // tabular figures. The rail is the hit target: a press jumps the knob there and a drag carries it.
+  prefab GenSlider : hn.GenLabelled {}
+  prefab GenSliderBody : ui.Row {
+    Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 20, min: 0, max: 0}}
+    rail : ui.Row {
+      Cursor: {shape: Arrow}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 20, min: 0, max: 0}}
+      fill : ui.Node {
+        Fill: $tone_gen_on
+        Shape: {radius: 2, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Fixed, value: $gen_rail, min: 0, max: 0}}
+      }
+      knob : ui.Node {
+        Fill: $tone_gen_knob
+        Edge: {dark: $tone_gen_knob_edge.dark, light: $tone_gen_knob_edge.light}
+        Shape: {radius: 8, n: 2, border: 0.5, feather: 0}
+        Lift: {blur: 2, alpha: 0.25, dy: 0.5}
+        Size: {w: {kind: Fixed, value: $gen_slider_knob, min: 0, max: 0}, h: {kind: Fixed, value: $gen_slider_knob, min: 0, max: 0}}
+      }
+      rest : ui.Node {
+        Fill: $tone_gen_track
+        Shape: {radius: 2, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Fixed, value: $gen_rail, min: 0, max: 0}}
+      }
+    }
+    value : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 16, role: 10, bold: 0}
+      Size: {w: {kind: Fit, value: 0, min: 28, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // A one-line field: a box with the words (or the placeholder, faint) in it; while it has the keys its hairline is the
+  // accent and the caret blinks in it.
+  prefab GenInput : hn.GenLabelled {}
+  prefab GenInputBox : ui.Row {
+    Clip
+    Cursor: {shape: Text}
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Padding: {l: 9, r: 9, t: 0, b: 0}
+    text : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+      TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
+        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+    }
+    hint : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+  // Words over several lines: the box grows with them from `lines` lines (genui/control.rs sets its least height).
+  prefab GenTextArea : hn.GenLabelled {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 520}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenTextAreaBox : ui.Column {
+    Clip
+    Cursor: {shape: Text}
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 64, max: 0}}
+    Padding: {l: 9, r: 9, t: 6, b: 6}
+    text : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 19, role: 0, bold: 0}
+      TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
+        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+    }
+    // Over the words' place (out of the flow, laid on the box's frame and drawn in by its padding), so an empty
+    // field's first line is the hint's.
+    hint : ui.Words {
+      Overlay
+      Fill: $tone_term_muted
+      Pose: {dx: 9, dy: 6, shrink: 0, fade: 0, cut: 0}
+      TextStyle: {size: $size_gen_control, line: 19, role: 0, bold: 0}
+    }
+  }
+  // A stepper's minus or plus: its sign on a wash that shows on hover.
+  prefab GenStep : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    sign : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: 15, line: 18, role: 0, bold: 0}
+    }
+  }
+
+  // A number: a stepper, one plate holding the minus, the number (typed into) and the plus.
+  prefab GenNumberField : hn.GenLabelled {
+    Flex: {axis: Column, gap: 4, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenNumberBody : ui.Row {
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    minus : hn.GenStep {}
+    box : ui.Row {
+      Clip
+      Cursor: {shape: Text}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: 72, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Padding: {l: 6, r: 6, t: 0, b: 0}
+      text : ui.Line {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_gen_control, line: 18, role: 10, bold: 0}
+        TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
+          caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+      }
+      hint : ui.Line {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+      }
+    }
+    plus : hn.GenStep {}
+  }
+  // A dropdown: a button showing the selected option (or the placeholder, faint) and a chevron; pressed, its options
+  // open in a list below it (`menu`, in the flow, so the transcript's clip and scroll hold it), the selected one ticked.
+  prefab GenSelect : hn.GenLabelled {
+    Flex: {axis: Column, gap: 4, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenSelectButton : ui.Row {
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 160, max: $gen_field_w}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Padding: {l: 9, r: 7, t: 0, b: 0}
+    text : ui.Lead {
+      Fill: $tone_term_ink
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+    chevron : ui.Symbol {
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    }
+  }
+  // The open list: the options on the field's plate.
+  prefab GenSelectMenu : ui.Column {
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_edge.dark, light: $tone_gen_edge.light}
+    Shape: {radius: 8, n: 4, border: 1, feather: 0}
+    Lift: {blur: 10, alpha: 0.18, dy: 3}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 160, max: $gen_field_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 4, r: 4, t: 4, b: 4}
+  }
+  prefab GenSelectOption : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: 5, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_option_h, min: 0, max: 0}}
+    Padding: {l: 6, r: 10, t: 0, b: 0}
+    mark : ui.Symbol {
+      Fill: $tone_clear
+      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    }
+    label : ui.Lead {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+  prefab GenSelectOptionOn : hn.GenSelectOption {
+    mark : ui.Symbol { Fill: $tone_accent }
+  }
+
+  // ---- Tier 3: layout, folding, floating, status, pictures (genui/layout.rs, genui/float.rs, genui/media.rs), after
+  // den's 33-genui-prims.flecs. What floats (a popover's or a menu's plate, a dialog's scrim, a toast) is a Placed node in
+  // its element's tree with a Layer of its own: laid out apart from the flow (against its trigger, or over the pane the
+  // transcript scrolls in), drawn and hit over everything at the Base level, cut by the pane's clip.
+
+  // A grid of `columns` equal columns, its children row by row (a row of cells; the last row's empty ones keep the
+  // width), or as many columns at least `fit` points wide as fit (GenGridFit). `gap` apart both ways.
+  prefab GenGrid : ui.Column {
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenGridRow : ui.Row {
+    Flex: {axis: Row, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenGridCell : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenGridFit : ui.AdaptiveGrid {
+    GridColumns: {min: 120, max: 0}
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+  }
+  // Children on top of one another, centred, the box as big as the largest; a GenLayer over them adds no size: laid on
+  // the stack's frame (out of the flow), its children at its anchor moved by x and y (genui/layout.rs sets its alignment
+  // and padding), above the rest by its z.
+  prefab GenStack : ui.ZStack {
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenLayer : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  }
+  // Children left to right, wrapping, `gap` apart.
+  prefab GenWrap : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: true}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  // A box `height` points tall (genui/layout.rs sets it) whose children scroll with the wheel, or across (GenScrollAcross).
+  prefab GenScroll : ui.Scroll {
+    Hoverable
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 240, min: 0, max: 0}}
+  }
+  prefab GenScrollAcross : ui.Scroll {
+    Hoverable
+    Flex: {axis: Row, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 240, min: 0, max: 0}}
+  }
+  // Two panes side by side (or one over the other, GenSplitDown) shared by `ratio` (their Grow weights), a hairline
+  // between them on a strip the pointer drags (`rule`: genui/control.rs follows it and sends the ratio).
+  prefab GenSplit : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    a : ui.Column {
+      Flex: {axis: Column, gap: $gen_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    rule : ui.Row {
+      Fill: $tone_clear
+      Shape: {radius: 3, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+      Cursor: {shape: ResizeLeftRight}
+      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $gen_split_hit, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      line : ui.Node {
+        Fill: $tone_gen_rule
+        Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      }
+    }
+    b : ui.Column {
+      Flex: {axis: Column, gap: $gen_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab GenSplitDown : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_split_h, min: 0, max: 0}}
+    a : ui.Column {
+      Clip
+      Flex: {axis: Column, gap: $gen_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 0.5, min: 0, max: 0}}
+    }
+    rule : ui.Column {
+      Fill: $tone_clear
+      Shape: {radius: 3, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+      Cursor: {shape: ResizeUpDown}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Center, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_split_hit, min: 0, max: 0}}
+      line : ui.Node {
+        Fill: $tone_gen_rule
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
+    }
+    b : ui.Column {
+      Clip
+      Flex: {axis: Column, gap: $gen_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 0.5, min: 0, max: 0}}
+    }
+  }
+
+  // Tabs: a row of them over a hairline, the selected one in the ink with the accent under it, then what the cell shows
+  // under the selected tab (`body`).
+  prefab GenTabs : ui.Column {
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    bar : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      tabs : ui.Row {
+        Flex: {axis: Row, gap: 2, align: End, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      rule : ui.Node {
+        Fill: $tone_gen_rule
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
+    }
+    body : ui.Column {
+      Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab GenTab : ui.Column {
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    head : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_tab_h, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 0, b: 0}
+      label : ui.Line {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: 500}
+      }
+    }
+    mark : ui.Node {
+      Fill: $tone_clear
+      Shape: {radius: 1, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 2, min: 0, max: 0}}
+    }
+  }
+  prefab GenTabOn : hn.GenTab {
+    head : ui.Row {
+      label : ui.Line {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: $weight_label}
+      }
+    }
+    mark : ui.Node { Fill: $tone_accent }
+  }
+
+  // A disclosure: its head (a chevron, right when shut and down when open, and its title) and, open, its body in from
+  // the chevron. An accordion is disclosures down a column, at most one open.
+  prefab GenDisclosure : ui.Column {
+    Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenDisclosureHead : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_tab_h, min: 0, max: 0}}
+    Padding: {l: 4, r: 8, t: 0, b: 0}
+    chevron : ui.Symbol {
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    }
+    title : ui.Lead {
+      Fill: $tone_term_ink
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: $weight_label}
+    }
+  }
+  prefab GenDisclosureBody : ui.Column {
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 22, r: 0, t: 0, b: 6}
+  }
+  prefab GenAccordion : ui.Column {
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A popover or a menu: its trigger (the first child, inline; a press on it toggles) and, open, its plate floating by
+  // the trigger on the side `placement` says (flipped and kept on screen), over the transcript.
+  prefab GenPopover : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenMenu : hn.GenPopover {}
+  prefab GenTrigger : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenFloat : ui.Column {
+    Placed
+    Hoverable
+    Layer: {level: Overlay}
+    Side: {edge: Bottom, dx: 0, dy: $gen_float_gap}
+    Fill: $tone_gen_float
+    Edge: {dark: $tone_gen_float_edge.dark, light: $tone_gen_float_edge.light}
+    Shape: {radius: 12, n: 4, border: 1, feather: 0}
+    Lift: {blur: 22, alpha: 0.32, dy: 6}
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_float_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+  }
+  prefab GenMenuPlate : hn.GenFloat {
+    Shape: {radius: 10, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: $gen_menu_w, max: $gen_float_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 4, r: 4, t: 4, b: 4}
+  }
+  // A menu's row: its label, its keys quiet at the end; a danger row in the failed tone, a disabled one faded and inert.
+  prefab GenMenuItem : ui.Row {
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 16, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 0, b: 0}
+    label : ui.Lead {
+      Fill: $tone_term_ink
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+    keys : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+  }
+  prefab GenMenuDanger : hn.GenMenuItem {
+    label : ui.Lead { Fill: $tone_failed }
+  }
+  prefab GenMenuSep : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 6, r: 6, t: 4, b: 4}
+    line : ui.Node {
+      Fill: $tone_gen_rule
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+  }
+  // A dialog, a sheet or a toast is laid over the pane the transcript scrolls in (genui/float.rs gives it the pane's
+  // place while it shows, none while it does not), out of the flow and in the Overlay stack. A dialog's or a sheet's
+  // `scrim` covers it (a press on it closes when it may) with the plate on it, centred, or along the pane's foot for a
+  // sheet: its title, then its body. A toast's plate sits at the pane's foot, centred, and lets the pointer through
+  // around it.
+  prefab GenOverPane : ui.Column {
+    Placed
+    Layer: {level: Overlay}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenDialog : hn.GenOverPane {}
+  prefab GenSheet : hn.GenOverPane {}
+  prefab GenScrim : ui.Column {
+    Hoverable
+    Fill: $tone_gen_scrim
+    Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Padding: {l: 24, r: 24, t: 24, b: 24}
+  }
+  prefab GenScrimFoot : hn.GenScrim {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: End, wrap: false}
+    Padding: {l: 0, r: 0, t: 24, b: 0}
+  }
+  prefab GenDialogPlate : ui.Column {
+    Hoverable
+    Fill: $tone_gen_float
+    Edge: {dark: $tone_gen_float_edge.dark, light: $tone_gen_float_edge.light}
+    Shape: {radius: 14, n: 4, border: 1, feather: 0}
+    Lift: {blur: 40, alpha: 0.40, dy: 12}
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: $gen_dialog_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 20, r: 20, t: 18, b: 20}
+  }
+  prefab GenSheetPlate : hn.GenDialogPlate {
+    Shape: {radius: 14, n: 4, border: 1, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 20, r: 20, t: 16, b: 22}
+  }
+  prefab GenFloatTitle : ui.Words {
+    Fill: $tone_term_ink
+    TextStyle: {size: $size_gen_title, line: 20, role: 0, bold: 1}
+  }
+  prefab GenFloatBody : ui.Column {
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenToast : hn.GenOverPane {
+    Flex: {axis: Column, gap: 8, align: Center, justify: End, wrap: false}
+    Padding: {l: 16, r: 16, t: 16, b: 20}
+  }
+  prefab GenToastPlate : ui.Row {
+    Fill: $tone_gen_float
+    Edge: {dark: $tone_gen_float_edge.dark, light: $tone_gen_float_edge.light}
+    Shape: {radius: 12, n: 4, border: 1, feather: 0}
+    Lift: {blur: 22, alpha: 0.32, dy: 6}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 9, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_toast_w}, h: {kind: Fit, value: 0, min: 40, max: 0}}
+    Padding: {l: 14, r: 16, t: 8, b: 8}
+    mark : ui.Node {
+      Fill: $tone_term_ink
+      Shape: {radius: 4, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: 8, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}}
+    }
+    text : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
+    }
+  }
+
+  // A bar: its label quiet over a round track filled to value over max (the fill's and the rest's Grow weights).
+  prefab GenProgress : hn.GenLabelled {}
+  prefab GenProgressTrack : ui.Row {
+    Fill: $tone_gen_track
+    Shape: {radius: 3, n: 2, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 6, min: 0, max: 0}}
+    fill : ui.Node {
+      Fill: $tone_gen_on
+      Shape: {radius: 3, n: 2, border: 0, feather: 0}
+      Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+    rest : ui.Node {
+      Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+  }
+  // A spinner (a quiet ring, an arc of it turning once a second: genui/media.rs turns the arc's transform on the clock)
+  // and quiet words.
+  prefab GenLoading : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    spinner : ui.ZStack {
+      Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+      ring : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_faint.dark, light: $tone_term_faint.light}
+        Vector: {d: "M8 1.5 A6.5 6.5 0 1 1 8 14.5 A6.5 6.5 0 1 1 8 1.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: 2}
+      }
+      arc : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_muted.dark, light: $tone_term_muted.light}
+        Vector: {d: "M8 1.5 A6.5 6.5 0 0 1 14.18 10.01", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: 2}
+      }
+    }
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+  }
+  // Grey bars that breathe (genui/media.rs fades them on the clock), the last one shorter.
+  prefab GenSkeleton : ui.Column {
+    Flex: {axis: Column, gap: 10, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenBone : ui.Node {
+    Fill: $tone_gen_bone
+    Shape: {radius: 5, n: 2, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_bone_h, min: 0, max: 0}}
+  }
+  prefab GenBoneShort : hn.GenBone {
+    Size: {w: {kind: Percent, value: 0.6, min: 0, max: 0}, h: {kind: Fixed, value: $gen_bone_h, min: 0, max: 0}}
+  }
+
+  // A file kind's icon (in the kind's colour, hn.GenFileKind) or a symbol (in the ink), $gen_icon square.
+  prefab GenIcon : ui.Symbol {
+    Fill: $tone_term_ink
+    Size: {w: {kind: Fixed, value: $gen_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_icon, min: 0, max: 0}}
+  }
+  prefab GenFileKind {
+    rust { Fill: $tone_file_rust }
+    typescript { Fill: $tone_file_typescript }
+    tsx { Fill: $tone_file_tsx }
+    javascript { Fill: $tone_file_javascript }
+    json { Fill: $tone_file_json }
+    toml { Fill: $tone_file_toml }
+    yaml { Fill: $tone_file_yaml }
+    markdown { Fill: $tone_file_markdown }
+    nix { Fill: $tone_file_nix }
+    shell { Fill: $tone_file_shell }
+    python { Fill: $tone_file_python }
+    go { Fill: $tone_file_go }
+    html { Fill: $tone_file_html }
+    css { Fill: $tone_file_css }
+    image { Fill: $tone_file_image }
+    lock { Fill: $tone_file_lock }
+    git { Fill: $tone_file_git }
+    folder { Fill: $tone_file_folder }
+    folder_open { Fill: $tone_file_folder }
+    text { Fill: $tone_file_text }
+  }
+  // A photo: its box (the width and height said, or the photo's own shape up to its own width and the column's), the
+  // picture in it (`pic`: contained in its own shape, or covering the box).
+  prefab GenImage : ui.ZStack {
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $gen_image_h}}
+    pic : ui.Image {}
+  }
+  // A pill, brighter when selected.
+  prefab GenChip : ui.Row {
+    Fill: $tone_clear
+    Edge: {dark: $tone_gen_chip_edge.dark, light: $tone_gen_chip_edge.light}
+    Shape: {radius: 14, n: 4, border: 1, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 6, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_chip_h, min: 0, max: 0}}
+    Padding: {l: 12, r: 12, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
+    }
+  }
+  prefab GenChipOn : hn.GenChip {
+    Fill: $tone_gen_chip_on
+    Edge: {dark: $tone_gen_chip_on_edge.dark, light: $tone_gen_chip_on_edge.light}
+    label : ui.Line { Fill: $tone_term_ink }
+  }
+  // A column pressed as a whole, on the card's plate; it shows the hover while it takes a press.
+  prefab GenTile : ui.Column {
+    Fill: $tone_chat_card
+    Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+    Shape: {radius: 10, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: 8, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 12, r: 12, t: 12, b: 12}
+  }
+  prefab GenTileOn : hn.GenTile {
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+  }
+  // A file chip: its kind's icon, its name and line; a press opens the file.
+  prefab GenFileRef : ui.Row {
+    Fill: $tone_code_chip
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_field_w}, h: {kind: Fixed, value: $gen_file_h, min: 0, max: 0}}
+    Padding: {l: 7, r: 8, t: 0, b: 0}
+    icon : ui.Symbol {
+      Fill: $tone_file_text
+      Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
+    }
+    name : ui.Lead {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+    }
+    line : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: 16, role: 10, bold: 0}
+    }
+  }
+
   // The generative-UI gallery's page (src/gallery.rs, HARNESS_NATIVE_GALLERY=genui): one cell's UI on the terminal's
   // ground, as wide as a transcript.
   prefab GenGallery : ui.Column {

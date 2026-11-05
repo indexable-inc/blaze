@@ -188,6 +188,8 @@ pub struct ChatMode;
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct AgentModel {
     pub s: ScriptString,
+    /// The reasoning effort it runs with (the daemon's `effort`; empty when unknown).
+    pub effort: ScriptString,
 }
 
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
@@ -654,7 +656,14 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): 
         // The stream ended (the program exited, or the daemon went): the last screen stays to read; the host attaches
         // again (on a fresh parser) when it wants the live one.
         Msg::Detached { .. } => {}
-        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs, false),
+        Msg::Runs(runs) => {
+            // A poll with no runs at all: nothing older exists to page in, so the Archive says it is empty instead of
+            // offering older runs it can never find.
+            if runs.is_empty() && w.try_get::<&History>(|h| !h.exhausted).unwrap_or(true) {
+                w.set(History { loading: false, exhausted: true });
+            }
+            reconcile_runs(w, dev, idx, &runs, false);
+        }
         Msg::RunsPage { runs, full } => {
             reconcile_runs(w, dev, idx, &runs, true);
             w.set(History { loading: false, exhausted: !full });
@@ -911,8 +920,9 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
             }
         }
         let model = s["model"].as_str().unwrap_or("");
-        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
-            e.set(AgentModel { s: model.into() });
+        let effort = s["effort"].as_str().unwrap_or("");
+        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model || m.effort.as_str() != effort) {
+            e.set(AgentModel { s: model.into(), effort: effort.into() });
         }
         let past = s["past"].as_bool().unwrap_or(false);
         if e.has(Past::id()) != past {

@@ -57,7 +57,7 @@ resolver = "2"
 
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
-version = "0.20261105.1"
+version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"

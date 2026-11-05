@@ -20,6 +20,8 @@ fn status() -> Status {
         build: crate::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
+        builds: Vec::new(),
+        downloads: Vec::new(),
     }
 }
 

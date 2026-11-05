@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { parse } from 'acorn';
-import { AT, CANVAS_TEXT_PROPS, DRAWING, PROPS, SVELTE, bindError, isKnownElement, unknownPropError } from './element.ts';
+import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, WORDS_ONLY, article, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
 import { SVG_SAID, attributeError, isSvgTag, svgSizeError, unknownTagError } from './draw.ts';
 import { svelteSpecifier } from './files.ts';
 
@@ -426,6 +426,12 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
         throw fail(unknownPropError(name as keyof typeof PROPS, 'children', undefined, at));
       }
     }
+    // A Button's (a Chip's, a Loading's, a Toast's) children are its words: text and {expressions}, never another element.
+    if (WORDS_ONLY.has(name)) {
+      const inner = ((node.fragment?.nodes ?? []) as Anything[]).find(kid => kid.type === 'RegularElement' || kid.type === 'Component' || kid.type === 'SvelteElement');
+      const prop = name === 'Toast' ? 'text' : 'label';
+      if (inner) throw fail(new TypeError(`<${name}> holds <${inner.name ?? 'svelte:element'}> (${at}): ${article(name)} ${name} holds only its words, <${name}>Save</${name}> or ${prop}="Save"`));
+    }
     // The text values of its attributes, for the checks that read two together (a Chart's kind with its data).
     const known: Record<string, unknown> = {};
     for (const attribute of node.attributes as Anything[]) {
@@ -476,6 +482,8 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
     if (Array.isArray(node)) { for (const item of node) visit(item, within); return; }
     if (!node || typeof node !== 'object') return;
     const it = node as Anything;
+    // Den's elements the app does not draw are named as such at their line, not left to be a name the cell never defined.
+    if (it.type === 'Component' && NOT_DRAWN.has(it.name)) throw fail(notDrawnError(it.name, placeOf(source, lines, it.start, shift).at));
     if (it.type === 'RegularElement' || (it.type === 'Component' && isKnownElement(it.name))) {
       visit(it.fragment, element(it, within));
       return;
