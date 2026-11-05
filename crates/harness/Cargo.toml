@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["harness", "harness-chat", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]
+members = ["harness", "harness-chat", "harness-proto", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]

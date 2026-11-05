@@ -1,0 +1,13 @@
+{
+  "cost_usd": 0.02,
+  "duration_ms": 900,
+  "ev": "turn_end",
+  "ok": true,
+  "stop": "end_turn",
+  "text": "3 files.",
+  "ts": 9,
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 30
+  }
+}
