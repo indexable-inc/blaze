@@ -75,7 +75,7 @@ pub fn spec_kind_is(want: &spec::SourceKind, kind: &SourceKind) -> bool {
 
 /// The source a `PackageIdSpec`'s kind and URL name.
 pub fn from_spec(kind: &spec::SourceKind, url: &Url) -> anyhow::Result<SourceId> {
-    let path = || url.to_file_path().map_err(|()| anyhow!("`{url}` is not a path"));
+    let path = || blaze_source::url_file(&url).map_err(|()| anyhow!("`{url}` is not a path"));
     match kind {
         spec::SourceKind::Git(reference) => SourceId::for_git(
             url,

@@ -5,6 +5,21 @@ use std::path::{Component, Path, PathBuf};
 /// Removes `.` and resolves `..` lexically, without touching the file system: cargo's
 /// `cargo_util::paths::normalize_path`.
 pub fn normalize_path(path: &Path) -> PathBuf {
+    // On Windows the daemon's `/C:/a` has no prefix: pushed part by part, its `C:` would take the
+    // root's place (`C:a`). It stays `/`-separated, as the daemon names it.
+    if cfg!(windows) && path.has_root() && !matches!(path.components().next(), Some(Component::Prefix(..))) {
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                Component::Normal(c) => parts.push(c.to_string_lossy()),
+                _ => {}
+            }
+        }
+        return PathBuf::from(format!("/{}", parts.join("/")));
+    }
     let mut components = path.components().peekable();
     let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
         components.next();
