@@ -1,0 +1,39 @@
+[package]
+name = "blaze-api"
+description = "blaze v2's agent API: one versioned schema of requests and responses in deterministic CBOR, over a Unix socket or HTTP; the CLI is a client of it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-protocol.workspace = true
+blaze-query.workspace = true
+blaze-report.workspace = true
+blaze-serde.workspace = true
+blaze-vfs.workspace = true
+memchr.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sonic-rs.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-protocol = { workspace = true, features = ["reference"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

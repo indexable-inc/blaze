@@ -1,0 +1,5 @@
+# The layout of rustfmt's own sources (src/tools/rustfmt/rustfmt.toml at rust-lang/rust
+# 12433c307, without its error_on_* checks), so that the files ported from it read side by side
+# with upstream.
+edition = "2024"
+style_edition = "2024"

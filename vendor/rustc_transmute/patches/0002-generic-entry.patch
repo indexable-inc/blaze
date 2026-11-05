@@ -1,0 +1,262 @@
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 54cd37a..ad97ed8 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -3,7 +3,7 @@ use std::hash::Hash;
+ use std::ops::RangeInclusive;
+ 
+ pub(crate) mod tree;
+-pub(crate) use tree::Tree;
++pub use tree::{Endian, Tree};
+ 
+ pub(crate) mod dfa;
+ pub(crate) use dfa::{Dfa, union};
+@@ -17,7 +17,7 @@ pub(crate) struct Uninhabited;
+ /// and `256` represents an uninitialized byte. A range containing that value
+ /// therefore has an exclusive upper bound of `257`.
+ #[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+-pub(crate) struct Byte {
++pub struct Byte {
+     // Store the endpoints separately because `Range` is not `Copy`.
+     pub(crate) start: u16,
+     pub(crate) end: u16,
+@@ -83,16 +83,16 @@ impl From<u8> for Byte {
+ 
+ /// A reference, i.e., `&'region T` or `&'region mut T`.
+ #[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+-pub(crate) struct Reference<R, T>
++pub struct Reference<R, T>
+ where
+     R: Region,
+     T: Type,
+ {
+-    pub(crate) region: R,
+-    pub(crate) is_mut: bool,
+-    pub(crate) referent: T,
+-    pub(crate) referent_size: usize,
+-    pub(crate) referent_align: usize,
++    pub region: R,
++    pub is_mut: bool,
++    pub referent: T,
++    pub referent_size: usize,
++    pub referent_align: usize,
+ }
+ 
+ impl<R, T> fmt::Display for Reference<R, T>
+@@ -109,13 +109,13 @@ where
+     }
+ }
+ 
+-pub(crate) trait Def: Debug + Hash + Eq + PartialEq + Copy + Clone {
++pub trait Def: Debug + Hash + Eq + PartialEq + Copy + Clone {
+     fn has_safety_invariants(&self) -> bool;
+ }
+ 
+-pub(crate) trait Region: Debug + Hash + Eq + PartialEq + Copy + Clone {}
++pub trait Region: Debug + Hash + Eq + PartialEq + Copy + Clone {}
+ 
+-pub(crate) trait Type: Debug + Hash + Eq + PartialEq + Copy + Clone {}
++pub trait Type: Debug + Hash + Eq + PartialEq + Copy + Clone {}
+ 
+ impl Def for ! {
+     fn has_safety_invariants(&self) -> bool {
+diff --git a/src/layout/tree.rs b/src/layout/tree.rs
+index 43e2008..a0b2617 100644
+--- a/src/layout/tree.rs
++++ b/src/layout/tree.rs
+@@ -23,7 +23,7 @@ mod tests;
+ /// 2. A `Seq` is never directly nested beneath another `Seq`.
+ /// 3. `Seq`s and `Alt`s with a single member do not exist.
+ #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+-pub(crate) enum Tree<D, R, T>
++pub enum Tree<D, R, T>
+ where
+     D: Def,
+     R: Region,
+@@ -42,7 +42,7 @@ where
+ }
+ 
+ #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+-pub(crate) enum Endian {
++pub enum Endian {
+     Little,
+     Big,
+ }
+@@ -64,37 +64,37 @@ where
+     T: Type,
+ {
+     /// A `Tree` consisting only of a definition node.
+-    pub(crate) fn def(def: D) -> Self {
++    pub fn def(def: D) -> Self {
+         Self::Def(def)
+     }
+ 
+     /// A `Tree` representing an uninhabited type.
+-    pub(crate) fn uninhabited() -> Self {
++    pub fn uninhabited() -> Self {
+         Self::Alt(vec![])
+     }
+ 
+     /// A `Tree` representing a zero-sized type.
+-    pub(crate) fn unit() -> Self {
++    pub fn unit() -> Self {
+         Self::Seq(Vec::new())
+     }
+ 
+     /// A `Tree` containing one byte that may be initialized to any value or uninitialized.
+-    pub(crate) fn uninit() -> Self {
++    pub fn uninit() -> Self {
+         Self::Byte(Byte::uninit())
+     }
+ 
+     /// A `Tree` representing the layout of `bool`.
+-    pub(crate) fn bool() -> Self {
++    pub fn bool() -> Self {
+         Self::byte(0x00..=0x01)
+     }
+ 
+     /// A `Tree` whose layout matches that of a `u8`.
+-    pub(crate) fn u8() -> Self {
++    pub fn u8() -> Self {
+         Self::byte(0x00..=0xFF)
+     }
+ 
+     /// A `Tree` whose layout matches that of a `char`.
+-    pub(crate) fn char(order: Endian) -> Self {
++    pub fn char(order: Endian) -> Self {
+         // `char`s can be in the following ranges:
+         // - [0, 0xD7FF]
+         // - [0xE000, 10FFFF]
+@@ -115,7 +115,7 @@ where
+ 
+     /// A `Tree` whose layout matches `std::num::NonZeroXxx`.
+     #[allow(dead_code)]
+-    pub(crate) fn nonzero(width_in_bytes: u64) -> Self {
++    pub fn nonzero(width_in_bytes: u64) -> Self {
+         const BYTE: RangeInclusive<u8> = 0x00..=0xFF;
+         const NONZERO: RangeInclusive<u8> = 0x01..=0xFF;
+ 
+@@ -128,23 +128,23 @@ where
+             .fold(Self::uninhabited(), Self::or)
+     }
+ 
+-    pub(crate) fn bytes<const N: usize, B: Into<Byte>>(bytes: [B; N]) -> Self {
++    pub fn bytes<const N: usize, B: Into<Byte>>(bytes: [B; N]) -> Self {
+         Self::seq(bytes.map(B::into).map(Self::Byte))
+     }
+ 
+-    pub(crate) fn byte(byte: impl Into<Byte>) -> Self {
++    pub fn byte(byte: impl Into<Byte>) -> Self {
+         Self::Byte(byte.into())
+     }
+ 
+     /// A `Tree` whose layout is a number of the given width.
+-    pub(crate) fn number(width_in_bytes: u64) -> Self {
++    pub fn number(width_in_bytes: u64) -> Self {
+         Self::Seq(vec![Self::u8(); width_in_bytes.try_into().unwrap()])
+     }
+ 
+     /// A `Tree` whose layout is entirely padding of the given width.
+     ///
+     /// Each padding byte may be initialized to any value or uninitialized.
+-    pub(crate) fn padding(width_in_bytes: usize) -> Self {
++    pub fn padding(width_in_bytes: usize) -> Self {
+         Self::Seq(vec![Self::uninit(); width_in_bytes])
+     }
+ 
+@@ -154,7 +154,7 @@ where
+     /// alternatives retain their surviving branches. Retained definitions become
+     /// empty sequences, so the result contains no definition nodes, as expressed
+     /// by its `Tree<!, R, T>` type.
+-    pub(crate) fn prune<F>(self, f: &F) -> Tree<!, R, T>
++    pub fn prune<F>(self, f: &F) -> Tree<!, R, T>
+     where
+         F: Fn(D) -> bool,
+     {
+@@ -188,7 +188,7 @@ where
+     }
+ 
+     /// Produces `true` if `Tree` is an inhabited type; otherwise false.
+-    pub(crate) fn is_inhabited(&self) -> bool {
++    pub fn is_inhabited(&self) -> bool {
+         match self {
+             Self::Seq(elts) => elts.into_iter().all(|elt| elt.is_inhabited()),
+             Self::Alt(alts) => alts.into_iter().any(|alt| alt.is_inhabited()),
+@@ -201,7 +201,7 @@ where
+     ///
+     /// `bytes` is taken to be in big-endian byte order, and its order will be
+     /// swapped if `order == Endian::Little`.
+-    pub(crate) fn from_big_endian<const N: usize, B: Into<Byte>>(
++    pub fn from_big_endian<const N: usize, B: Into<Byte>>(
+         order: Endian,
+         mut bytes: [B; N],
+     ) -> Self {
+@@ -214,18 +214,18 @@ where
+ 
+     /// Produces a `Tree` where each of the trees in `trees` are sequenced one
+     /// after another.
+-    pub(crate) fn seq<const N: usize>(trees: [Tree<D, R, T>; N]) -> Self {
++    pub fn seq<const N: usize>(trees: [Tree<D, R, T>; N]) -> Self {
+         trees.into_iter().fold(Tree::unit(), Self::then)
+     }
+ 
+     /// Produces a `Tree` where each of the trees in `trees` are accepted as
+     /// alternative layouts.
+-    pub(crate) fn alt<const N: usize>(trees: [Tree<D, R, T>; N]) -> Self {
++    pub fn alt<const N: usize>(trees: [Tree<D, R, T>; N]) -> Self {
+         trees.into_iter().fold(Tree::uninhabited(), Self::or)
+     }
+ 
+     /// Produces a new `Tree` where `other` is sequenced after `self`.
+-    pub(crate) fn then(self, other: Self) -> Self {
++    pub fn then(self, other: Self) -> Self {
+         match (self, other) {
+             (Self::Seq(elts), other) | (other, Self::Seq(elts)) if elts.len() == 0 => other,
+             (Self::Seq(mut lhs), Self::Seq(mut rhs)) => {
+@@ -245,7 +245,7 @@ where
+     }
+ 
+     /// Produces a new `Tree` accepting either `self` or `other` as alternative layouts.
+-    pub(crate) fn or(self, other: Self) -> Self {
++    pub fn or(self, other: Self) -> Self {
+         match (self, other) {
+             (Self::Alt(alts), other) | (other, Self::Alt(alts)) if alts.len() == 0 => other,
+             (Self::Alt(mut lhs), Self::Alt(rhs)) => {
+diff --git a/src/lib.rs b/src/lib.rs
+index 887cfe6..ac85a2e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,6 +17,20 @@ pub(crate) type Set<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
+ pub mod layout;
+ mod maybe_transmutable;
+ 
++pub use maybe_transmutable::query_context::QueryContext;
++
++/// Whether `src`'s layout can be reinterpreted as `dst`'s, for a caller that builds each type's
++/// [`layout::Tree`] from layouts of its own. Under `rustc`, `TransmuteTypeEnv` builds them from
++/// the compiler's.
++pub fn is_transmutable<C: QueryContext>(
++    src: layout::Tree<C::Def, C::Region, C::Type>,
++    dst: layout::Tree<C::Def, C::Region, C::Type>,
++    assume: Assume,
++    context: C,
++) -> rustc_type_ir::transmute::Answer<C::Region, C::Type> {
++    maybe_transmutable::MaybeTransmutableQuery::new(src, dst, assume, context).answer()
++}
++
+ /// Proof obligations supplied by the caller rather than checked by the analysis.
+ ///
+ /// This mirrors `core::mem::Assume`. A `true` field transfers the corresponding
+diff --git a/src/maybe_transmutable/query_context.rs b/src/maybe_transmutable/query_context.rs
+index 6be0cb1..07e8a93 100644
+--- a/src/maybe_transmutable/query_context.rs
++++ b/src/maybe_transmutable/query_context.rs
+@@ -1,7 +1,7 @@
+ use crate::layout;
+ 
+ /// Context necessary to answer the question "Are these types transmutable?".
+-pub(crate) trait QueryContext {
++pub trait QueryContext {
+     type Def: layout::Def;
+     type Region: layout::Region;
+     type Type: layout::Type;

@@ -1,0 +1,5 @@
+daemon 0.1.0-d598af6f-6461908-18e2465a3b228e00 (blaze 0.1.0 (32ccb28)) of pid 393315 listens on /root/perf/noop-ws/32ccb28b37/home/daemon.sock
+worker aaf8a13c5cc8c3ce of pid 393316 for /root/perf/noop-ws/32ccb28b37/rg/
+/root/perf/noop-ws/32ccb28b37/rg: ready
+worker 33144052cc114dcf of pid 397766 for /root/perf/noop-ws/32ccb28b37/rg/
+/root/perf/noop-ws/32ccb28b37/rg: ready

@@ -1,0 +1,13 @@
+[package]
+name = "liveegui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "An egui app (a ledger of invoices, generic widgets) laid out and tessellated every frame without a window, that takes edits while it runs; harness/live_latency.py edits it"
+
+[dependencies]
+blaze-live = { path = "../../crates/blaze-live" }
+egui = "0.37"
+
+# Its own workspace and lock, like demo/life.
+[workspace]

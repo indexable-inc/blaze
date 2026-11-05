@@ -1,0 +1,3483 @@
+{
+ "blaze": "/home/ubuntu/blaze-main/harness/../target/release/blaze-engine",
+ "toolchain": "1.99.0",
+ "projects": [
+  {
+   "project": "ripgrep",
+   "mode": "blaze",
+   "tag": "15.1.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     6.32,
+     6.61
+    ],
+    "cold run": [
+     2.23,
+     0.47
+    ],
+    "warm-up": [
+     0.03,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.49
+    ],
+    "warm run": [
+     0.03,
+     0.45
+    ],
+    "cold test": [
+     5.87,
+     6.97
+    ],
+    "test warm-up": [
+     2.88,
+     null
+    ],
+    "warm test": [
+     1.27,
+     2.26
+    ],
+    "edit build": [
+     0.57,
+     2.38
+    ],
+    "edit run": [
+     0.07,
+     0.6
+    ],
+    "edit test": [
+     2.74,
+     3.03
+    ],
+    "broken": [
+     0.49,
+     0.41
+    ],
+    "mended": [
+     0.54,
+     1.01
+    ],
+    "mended run": [
+     0.11,
+     0.87
+    ],
+    "tree build": [
+     10.52,
+     null
+    ],
+    "tree warm-up": [
+     0.3,
+     null
+    ],
+    "tree edit": [
+     0.38,
+     null
+    ],
+    "tree run": [
+     0.04,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /tmp/blaze-cargo-309llw__/ripgrep/crates/printer/src/standard.rs changed",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 946185, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 960094, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/2/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n  worker: pid 946186, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/0/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n    /tmp/blaze-cargo-309llw__/ripgrep-worktree-blaze: ready\n  worker: pid 968198, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-blaze/workers/ea074a7331d4923d297c71f2d4bc4cac/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n/tmp/blaze-cargo-309llw__/ripgrep (test, 2d30343e00bf3e02): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /tmp/blaze-cargo-309llw__/ripgrep/crates/printer/src/standard.rs changed\n/tmp/blaze-cargo-309llw__/ripgrep (dev, d630e062f9380567): 8 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "ripgrep",
+   "mode": "plain",
+   "tag": "15.1.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     8.12,
+     9.75
+    ],
+    "cold run": [
+     2.08,
+     0.91
+    ],
+    "warm-up": [
+     0.01,
+     null
+    ],
+    "warm build": [
+     0.15,
+     0.55
+    ],
+    "warm run": [
+     0.2,
+     0.55
+    ],
+    "cold test": [
+     8.69,
+     7.88
+    ],
+    "test warm-up": [
+     6.57,
+     null
+    ],
+    "warm test": [
+     1.36,
+     2.17
+    ],
+    "edit build": [
+     0.94,
+     1.7
+    ],
+    "edit run": [
+     0.19,
+     0.64
+    ],
+    "edit test": [
+     1.81,
+     1.9
+    ],
+    "broken": [
+     0.42,
+     0.28
+    ],
+    "mended": [
+     0.22,
+     0.62
+    ],
+    "mended run": [
+     0.25,
+     1.1
+    ],
+    "tree build": [
+     8.11,
+     null
+    ],
+    "tree warm-up": [
+     0.42,
+     null
+    ],
+    "tree edit": [
+     0.63,
+     null
+    ],
+    "tree run": [
+     0.05,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp/blaze-cargo-309llw__/cargo-home/config.toml\n  14 programs linked by the daemon, 5 by rustc\n    1 x \tthe build is not one the daemon has loadedthe build is not one the daemon has loaded\n    4 x the daemon had not loaded the build yet\ndaemon: pid 981422, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1006207, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-plain/workers/ba660f949e661705ef94232efaf4775a/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n  worker: pid 981425, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-plain/spares/0/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n    /tmp/blaze-cargo-309llw__/ripgrep-worktree-plain: ready\n  worker: pid 997023, /tmp/blaze-cargo-309llw__/ripgrep/, log /tmp/blaze-cargo-309llw__/home-plain/spares/2/log\n    /tmp/blaze-cargo-309llw__/ripgrep: ready\n/tmp/blaze-cargo-309llw__/ripgrep (dev, d630e062f9380567): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "fd",
+   "mode": "blaze",
+   "tag": "v10.3.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     26.14,
+     28.6
+    ],
+    "cold run": [
+     0.13,
+     0.76
+    ],
+    "warm-up": [
+     0.03,
+     null
+    ],
+    "warm build": [
+     0.04,
+     0.61
+    ],
+    "warm run": [
+     0.05,
+     0.61
+    ],
+    "cold test": [
+     8.34,
+     9.96
+    ],
+    "test warm-up": [
+     1.87,
+     null
+    ],
+    "warm test": [
+     1.53,
+     2.43
+    ],
+    "edit build": [
+     0.42,
+     0.98
+    ],
+    "edit run": [
+     0.07,
+     0.88
+    ],
+    "edit test": [
+     2.01,
+     2.37
+    ],
+    "broken": [
+     0.23,
+     0.29
+    ],
+    "mended": [
+     0.36,
+     0.91
+    ],
+    "mended run": [
+     0.1,
+     0.87
+    ],
+    "tree build": [
+     37.01,
+     null
+    ],
+    "tree warm-up": [
+     0.62,
+     null
+    ],
+    "tree edit": [
+     0.55,
+     null
+    ],
+    "tree run": [
+     0.06,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 1020586, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1020587, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/0/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n    /tmp/blaze-cargo-309llw__/fd-worktree-blaze: ready\n  worker: pid 1029718, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-blaze/workers/47c2176de6116539e33d2974080a295e/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n  worker: pid 1024952, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/1/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n/tmp/blaze-cargo-309llw__/fd (test, 9ab226c930c6d32d): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/fd (dev, 61efcf6047c87138): 8 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "fd",
+   "mode": "plain",
+   "tag": "v10.3.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     39.04,
+     36.16
+    ],
+    "cold run": [
+     0.26,
+     0.52
+    ],
+    "warm-up": [
+     0.01,
+     null
+    ],
+    "warm build": [
+     0.18,
+     0.61
+    ],
+    "warm run": [
+     0.21,
+     0.99
+    ],
+    "cold test": [
+     6.05,
+     7.93
+    ],
+    "test warm-up": [
+     1.58,
+     null
+    ],
+    "warm test": [
+     1.05,
+     1.57
+    ],
+    "edit build": [
+     0.36,
+     1.21
+    ],
+    "edit run": [
+     0.19,
+     0.72
+    ],
+    "edit test": [
+     1.28,
+     1.74
+    ],
+    "broken": [
+     0.4,
+     0.27
+    ],
+    "mended": [
+     0.48,
+     0.88
+    ],
+    "mended run": [
+     0.21,
+     0.6
+    ],
+    "tree build": [
+     27.54,
+     null
+    ],
+    "tree warm-up": [
+     0.44,
+     null
+    ],
+    "tree edit": [
+     0.26,
+     null
+    ],
+    "tree run": [
+     0.14,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp/blaze-cargo-309llw__/cargo-home/config.toml\n  29 programs linked by the daemon, 10 by rustc\n    1 x \tthe build is not one the daemon has loadedthe build is not one the daemon has loaded\n    9 x the daemon had not loaded the build yet\ndaemon: pid 1067014, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1067015, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-plain/spares/0/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n    /tmp/blaze-cargo-309llw__/fd-worktree-plain: ready\n  worker: pid 1072159, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-plain/spares/1/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n  worker: pid 1076583, /tmp/blaze-cargo-309llw__/fd/, log /tmp/blaze-cargo-309llw__/home-plain/workers/b5829014a6f5bdb8785c0bd7a8f69ebd/log\n    /tmp/blaze-cargo-309llw__/fd: ready\n/tmp/blaze-cargo-309llw__/fd (test, 9ab226c930c6d32d): 0 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/fd (dev, 61efcf6047c87138): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "bat",
+   "mode": "blaze",
+   "tag": "v0.26.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     14.71,
+     26.11
+    ],
+    "cold run": [
+     0.65,
+     0.15
+    ],
+    "warm-up": [
+     8.39,
+     null
+    ],
+    "warm build": [
+     0.02,
+     0.08
+    ],
+    "warm run": [
+     0.03,
+     0.09
+    ],
+    "cold test": [
+     16.44,
+     14.68
+    ],
+    "test warm-up": [
+     14.88,
+     null
+    ],
+    "warm test": [
+     1.49,
+     1.29
+    ],
+    "edit build": [
+     0.21,
+     0.47
+    ],
+    "edit run": [
+     0.03,
+     0.09
+    ],
+    "edit test": [
+     2.78,
+     1.09
+    ],
+    "broken": [
+     0.18,
+     0.19
+    ],
+    "mended": [
+     0.17,
+     0.39
+    ],
+    "mended run": [
+     0.03,
+     0.09
+    ],
+    "tree build": [
+     15.12,
+     null
+    ],
+    "tree warm-up": [
+     9.83,
+     null
+    ],
+    "tree edit": [
+     0.74,
+     null
+    ],
+    "tree run": [
+     0.03,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "cargo: `bat`: the daemon is still loading the workspace (26s so far), and /dev/shm/blaze-cargo-7yd14bzf/bat/.git/index changed",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-7yd14bzf/bat/target/debug/build/bat-06819bf121a91340/out/codegen_static_syntax_mappings.rs changed",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "failed: /dev/shm/blaze-cargo-7yd14bzf/bat/.git/worktrees/bat-worktree-blaze/index changed while cargo built or the daemon loaded",
+    "tree edit": "cargo: `bat`: /dev/shm/blaze-cargo-7yd14bzf/bat/.git/worktrees/bat-worktree-blaze/index changed while cargo built or the daemon loaded, and /dev/shm/blaze-cargo-7yd14bzf/bat-worktree-blaze/src/bin/bat/main.rs changed",
+    "tree run": "unchanged: the daemon is still loading the workspace (773ms so far)"
+   },
+   "share": [
+    195,
+    558
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2331302, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2401832, /dev/shm/blaze-cargo-7yd14bzf/bat-worktree-blaze/, log /dev/shm/blaze-cargo-7yd14bzf/home-blaze/workers/1ca77a732c6ab9ca4f313a87fd936a76/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat: loading for 182ms\n    /dev/shm/blaze-cargo-7yd14bzf/bat-worktree-blaze: loading for 921ms\n  worker: pid 2346783, /dev/shm/blaze-cargo-7yd14bzf/bat/, log /dev/shm/blaze-cargo-7yd14bzf/home-blaze/workers/130706cd81530ba431fc708edb8cfe2c/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat: ready\n  worker: pid 2346780, /dev/shm/blaze-cargo-7yd14bzf/bat/, log /dev/shm/blaze-cargo-7yd14bzf/home-blaze/workers/d2e170d718c3dd54cbbd13acf3c90db8/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat: ready\n/dev/shm/blaze-cargo-7yd14bzf/bat (dev, a8b0c5008df95495): 6 builds by the daemon, 2 by cargo\n  1 x `bat`: the daemon has not loaded this build of the workspace, and /dev/shm/blaze-cargo-7yd14bzf/bat/src/bin/bat/main.rs changed\n  1 x `bat`: the daemon is still loading the workspace (26s so far), and /dev/shm/blaze-cargo-7yd14bzf/bat/.git/index changed\n/dev/shm/blaze-cargo-7yd14bzf/bat (test, 1e3c4234c4f1d3c5): 1 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-7yd14bzf/bat/target/debug/build/bat-06819bf121a91340/out/codegen_static_syntax_mappings.rs changed\n"
+  },
+  {
+   "project": "bat",
+   "mode": "plain",
+   "tag": "v0.26.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     14.8,
+     26.58
+    ],
+    "cold run": [
+     0.09,
+     0.09
+    ],
+    "warm-up": [
+     2.32,
+     null
+    ],
+    "warm build": [
+     0.09,
+     0.09
+    ],
+    "warm run": [
+     0.09,
+     0.09
+    ],
+    "cold test": [
+     14.5,
+     16.03
+    ],
+    "test warm-up": [
+     15.41,
+     null
+    ],
+    "warm test": [
+     1.28,
+     1.27
+    ],
+    "edit build": [
+     0.48,
+     0.5
+    ],
+    "edit run": [
+     0.09,
+     0.09
+    ],
+    "edit test": [
+     2.24,
+     1.68
+    ],
+    "broken": [
+     0.22,
+     0.22
+    ],
+    "mended": [
+     0.61,
+     0.82
+    ],
+    "mended run": [
+     0.09,
+     0.09
+    ],
+    "tree build": [
+     18.28,
+     null
+    ],
+    "tree warm-up": [
+     10.7,
+     null
+    ],
+    "tree edit": [
+     0.5,
+     null
+    ],
+    "tree run": [
+     0.11,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "nothing to build",
+    "warm-up": "ready",
+    "warm build": "nothing to build",
+    "warm run": "nothing to build",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "nothing to build",
+    "edit build": "cargo: the environment variable CARGO_PKG_VERSION changed",
+    "edit run": "nothing to build",
+    "edit test": "cargo: the environment variable CARGO_PKG_VERSION changed",
+    "broken": "cargo: the environment variable CARGO_PKG_VERSION changed",
+    "mended": "cargo: the environment variable CARGO_PKG_VERSION changed",
+    "mended run": "nothing to build",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "cargo: the environment variable CARGO_PKG_VERSION changed",
+    "tree run": "nothing to build"
+   },
+   "share": [
+    195,
+    558
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-7yd14bzf/cargo-home/config.toml\n  0 programs linked by the daemon, 25 by rustc\n    19 x the daemon had not loaded the build yet\n    6 x the environment variable CARGO_PKG_VERSION changed\ndaemon: pid 2406790, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2468137, /dev/shm/blaze-cargo-7yd14bzf/bat-worktree-plain/, log /dev/shm/blaze-cargo-7yd14bzf/home-plain/workers/947e9c646a3fc6428312238f0be80ffc/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat-worktree-plain: loading for 203ms\n  worker: pid 2453506, /dev/shm/blaze-cargo-7yd14bzf/bat/, log /dev/shm/blaze-cargo-7yd14bzf/home-plain/workers/532e9d47ff3dc936819327b1ea6487f6/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat: failed: /dev/shm/blaze-cargo-7yd14bzf/bat/src/bin/bat/main.rs changed while cargo built or the daemon loaded\n  worker: pid 2453631, /dev/shm/blaze-cargo-7yd14bzf/bat/, log /dev/shm/blaze-cargo-7yd14bzf/home-plain/workers/18c1e77a093cf7aa1266f20c9a0aba08/log\n    /dev/shm/blaze-cargo-7yd14bzf/bat: failed: /dev/shm/blaze-cargo-7yd14bzf/bat/src/bin/bat/main.rs changed while cargo built or the daemon loaded\n/dev/shm/blaze-cargo-7yd14bzf/bat (dev, a8b0c5008df95495): 0 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-7yd14bzf/bat (test, 1e3c4234c4f1d3c5): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "hyperfine",
+   "mode": "blaze",
+   "tag": "v1.19.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     9.48,
+     7.17
+    ],
+    "cold run": [
+     3.92,
+     0.43
+    ],
+    "warm-up": [
+     0.03,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.39
+    ],
+    "warm run": [
+     0.04,
+     0.37
+    ],
+    "cold test": [
+     5.93,
+     7.95
+    ],
+    "test warm-up": [
+     0.04,
+     null
+    ],
+    "warm test": [
+     0.67,
+     1.26
+    ],
+    "edit build": [
+     0.24,
+     0.48
+    ],
+    "edit run": [
+     0.04,
+     0.44
+    ],
+    "edit test": [
+     0.84,
+     0.98
+    ],
+    "broken": [
+     0.13,
+     0.27
+    ],
+    "mended": [
+     0.18,
+     0.7
+    ],
+    "mended run": [
+     0.05,
+     0.59
+    ],
+    "tree build": [
+     8.99,
+     null
+    ],
+    "tree warm-up": [
+     0.31,
+     null
+    ],
+    "tree edit": [
+     0.12,
+     null
+    ],
+    "tree run": [
+     0.04,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 1108741, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1113876, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-blaze/workers/bed611f6d1febdf4c0bb4220ffe0f196/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n  worker: pid 1108742, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/0/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n    /tmp/blaze-cargo-309llw__/hyperfine-worktree-blaze: ready\n  worker: pid 1112279, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-blaze/spares/1/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n/tmp/blaze-cargo-309llw__/hyperfine (dev, d1454f895bf03962): 8 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/hyperfine (test, fc2893af6b005cfb): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "hyperfine",
+   "mode": "plain",
+   "tag": "v1.19.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     7.63,
+     8.26
+    ],
+    "cold run": [
+     5.23,
+     0.48
+    ],
+    "warm-up": [
+     0.01,
+     null
+    ],
+    "warm build": [
+     0.16,
+     0.4
+    ],
+    "warm run": [
+     0.18,
+     0.46
+    ],
+    "cold test": [
+     5.36,
+     5.7
+    ],
+    "test warm-up": [
+     1.08,
+     null
+    ],
+    "warm test": [
+     0.69,
+     0.96
+    ],
+    "edit build": [
+     0.32,
+     0.51
+    ],
+    "edit run": [
+     0.31,
+     0.52
+    ],
+    "edit test": [
+     1.12,
+     1.15
+    ],
+    "broken": [
+     0.33,
+     0.35
+    ],
+    "mended": [
+     0.27,
+     0.4
+    ],
+    "mended run": [
+     0.15,
+     0.42
+    ],
+    "tree build": [
+     8.5,
+     null
+    ],
+    "tree warm-up": [
+     0.48,
+     null
+    ],
+    "tree edit": [
+     0.25,
+     null
+    ],
+    "tree run": [
+     0.07,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "daemon",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "cargo: the build is not one the daemon has loaded",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    1044,
+    1244
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp/blaze-cargo-309llw__/cargo-home/config.toml\n  45 programs linked by the daemon, 20 by rustc\n    1 x \tthe build is not one the daemon has loadedthe build is not one the daemon has loaded\n    4 x the build is not one the daemon has loaded\n    15 x the daemon had not loaded the build yet\ndaemon: pid 1138485, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1138486, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-plain/spares/0/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n    /tmp/blaze-cargo-309llw__/hyperfine-worktree-plain: ready\n  worker: pid 1153838, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-plain/spares/2/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n  worker: pid 1161333, /tmp/blaze-cargo-309llw__/hyperfine/, log /tmp/blaze-cargo-309llw__/home-plain/workers/0980898abb4103b4b2ee2b65eb196259/log\n    /tmp/blaze-cargo-309llw__/hyperfine: ready\n/tmp/blaze-cargo-309llw__/hyperfine (dev, d1454f895bf03962): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "just",
+   "mode": "blaze",
+   "tag": "1.43.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     7.91,
+     12.14
+    ],
+    "cold run": [
+     0.03,
+     0.06
+    ],
+    "warm-up": [
+     7.61,
+     null
+    ],
+    "warm build": [
+     0.02,
+     0.06
+    ],
+    "warm run": [
+     0.03,
+     0.06
+    ],
+    "cold test": [
+     7.55,
+     7.1
+    ],
+    "test warm-up": [
+     7.09,
+     null
+    ],
+    "warm test": [
+     1.7,
+     1.33
+    ],
+    "edit build": [
+     0.13,
+     0.23
+    ],
+    "edit run": [
+     0.03,
+     0.06
+    ],
+    "edit test": [
+     1.75,
+     0.93
+    ],
+    "broken": [
+     0.14,
+     0.11
+    ],
+    "mended": [
+     0.1,
+     0.23
+    ],
+    "mended run": [
+     0.03,
+     0.06
+    ],
+    "tree build": [
+     8.04,
+     null
+    ],
+    "tree warm-up": [
+     3.41,
+     null
+    ],
+    "tree edit": [
+     0.1,
+     null
+    ],
+    "tree run": [
+     0.03,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (12s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    868,
+    1471
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2535828, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2541139, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-blaze/workers/15dda3d2a5a09123383ab96abe82a490/log\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n  worker: pid 2535831, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-blaze/workers/73ea7c1d7b6cad91ac68dc96cc80d17e/log\n    /dev/shm/blaze-cargo-isq4_r60/just-worktree-blaze: ready\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n  worker: pid 2541136, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-blaze/workers/d1a517e547f897a9cf68d80d98c1fc5e/log\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n/dev/shm/blaze-cargo-isq4_r60/just (dev, 112f13c65a8f0a8e): 7 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-isq4_r60/just (test, 2fb02849097776ed): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "just",
+   "mode": "plain",
+   "tag": "1.43.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     8.25,
+     11.43
+    ],
+    "cold run": [
+     0.06,
+     0.06
+    ],
+    "warm-up": [
+     7.95,
+     null
+    ],
+    "warm build": [
+     0.06,
+     0.06
+    ],
+    "warm run": [
+     0.06,
+     0.06
+    ],
+    "cold test": [
+     6.66,
+     6.99
+    ],
+    "test warm-up": [
+     6.69,
+     null
+    ],
+    "warm test": [
+     1.34,
+     1.33
+    ],
+    "edit build": [
+     0.11,
+     0.24
+    ],
+    "edit run": [
+     0.07,
+     0.06
+    ],
+    "edit test": [
+     1.29,
+     0.94
+    ],
+    "broken": [
+     0.15,
+     0.1
+    ],
+    "mended": [
+     0.13,
+     0.23
+    ],
+    "mended run": [
+     0.07,
+     0.06
+    ],
+    "tree build": [
+     7.75,
+     null
+    ],
+    "tree warm-up": [
+     3.26,
+     null
+    ],
+    "tree edit": [
+     0.11,
+     null
+    ],
+    "tree run": [
+     0.07,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "nothing to build",
+    "warm-up": "ready",
+    "warm build": "nothing to build",
+    "warm run": "nothing to build",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "nothing to build",
+    "edit build": "daemon",
+    "edit run": "nothing to build",
+    "edit test": "nothing to build",
+    "broken": "cargo: rustc finds errors in the source",
+    "mended": "daemon",
+    "mended run": "nothing to build",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "nothing to build"
+   },
+   "share": [
+    868,
+    1471
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-isq4_r60/cargo-home/config.toml\n  3 programs linked by the daemon, 5 by rustc\n    1 x rustc finds errors in the source\n    4 x the daemon had not loaded the build yet\ndaemon: pid 2586019, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2586034, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-plain/workers/b00da0333249b73c39c66f670e4987f6/log\n    /dev/shm/blaze-cargo-isq4_r60/just-worktree-plain: ready\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n  worker: pid 2591658, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-plain/workers/b76995cacb9ce03ffa3eb11c423f8621/log\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n  worker: pid 2591684, /dev/shm/blaze-cargo-isq4_r60/just/, log /dev/shm/blaze-cargo-isq4_r60/home-plain/workers/93874dadca5cfc06bfaf61ed07e6e3c9/log\n    /dev/shm/blaze-cargo-isq4_r60/just: ready\n/dev/shm/blaze-cargo-isq4_r60/just (dev, 112f13c65a8f0a8e): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "axum",
+   "mode": "blaze",
+   "tag": "axum-v0.8.6",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     7.78,
+     9.35
+    ],
+    "warm-up": [
+     10.27,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.1
+    ],
+    "cold test": [
+     9.17,
+     9.54
+    ],
+    "test warm-up": [
+     12.79,
+     null
+    ],
+    "warm test": [
+     0.03,
+     0.11
+    ],
+    "edit build": [
+     0.58,
+     0.53
+    ],
+    "edit test": [
+     0.26,
+     0.77
+    ],
+    "broken": [
+     0.16,
+     0.16
+    ],
+    "mended": [
+     0.15,
+     0.29
+    ],
+    "tree build": [
+     7.9,
+     null
+    ],
+    "tree warm-up": [
+     4.95,
+     null
+    ],
+    "tree edit": [
+     0.15,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon"
+   },
+   "share": [
+    43,
+    43
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2634604, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2634607, /dev/shm/blaze-cargo-t0pnt28p/axum/examples/hello-world, log /dev/shm/blaze-cargo-t0pnt28p/home-blaze/workers/58494a8220df6a3436f59654c274f0f1/log\n    /dev/shm/blaze-cargo-t0pnt28p/axum: ready\n    /dev/shm/blaze-cargo-t0pnt28p/axum-worktree-blaze: ready\n  worker: pid 2639168, /dev/shm/blaze-cargo-t0pnt28p/axum/examples/testing, log /dev/shm/blaze-cargo-t0pnt28p/home-blaze/workers/f7154ed743fb20da860d58d7bfce8024/log\n    /dev/shm/blaze-cargo-t0pnt28p/axum: ready\n/dev/shm/blaze-cargo-t0pnt28p/axum (dev, b2313cb0c01eaf28): 6 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-t0pnt28p/axum (test, 5fc8f76952009a0d): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "axum",
+   "mode": "plain",
+   "tag": "axum-v0.8.6",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     7.85,
+     9.15
+    ],
+    "warm-up": [
+     11.79,
+     null
+    ],
+    "warm build": [
+     0.11,
+     0.11
+    ],
+    "cold test": [
+     8.91,
+     9.89
+    ],
+    "test warm-up": [
+     11.29,
+     null
+    ],
+    "warm test": [
+     0.11,
+     0.11
+    ],
+    "edit build": [
+     0.68,
+     0.41
+    ],
+    "edit test": [
+     0.33,
+     0.75
+    ],
+    "broken": [
+     0.21,
+     0.16
+    ],
+    "mended": [
+     0.16,
+     0.29
+    ],
+    "tree build": [
+     7.87,
+     null
+    ],
+    "tree warm-up": [
+     4.85,
+     null
+    ],
+    "tree edit": [
+     0.17,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "warm-up": "ready",
+    "warm build": "nothing to build",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready",
+    "warm test": "nothing to build",
+    "edit build": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: rustc finds errors in the source",
+    "mended": "daemon",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon"
+   },
+   "share": [
+    43,
+    43
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-t0pnt28p/cargo-home/config.toml\n  4 programs linked by the daemon, 4 by rustc\n    1 x rustc finds errors in the source\n    3 x the daemon had not loaded the build yet\ndaemon: pid 2646757, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2646760, /dev/shm/blaze-cargo-t0pnt28p/axum/examples/hello-world, log /dev/shm/blaze-cargo-t0pnt28p/home-plain/workers/faafd875ebd2951989171513e6204a34/log\n    /dev/shm/blaze-cargo-t0pnt28p/axum-worktree-plain: ready\n    /dev/shm/blaze-cargo-t0pnt28p/axum: ready\n  worker: pid 2650897, /dev/shm/blaze-cargo-t0pnt28p/axum/examples/testing, log /dev/shm/blaze-cargo-t0pnt28p/home-plain/workers/3f717a3a59bc150d4c91fa3f58a9a310/log\n    /dev/shm/blaze-cargo-t0pnt28p/axum: ready\n/dev/shm/blaze-cargo-t0pnt28p/axum (test, 5fc8f76952009a0d): 0 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-t0pnt28p/axum (dev, b2313cb0c01eaf28): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "nushell",
+   "tag": "0.108.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     46.74,
+     54.82
+    ],
+    "cold run": [
+     0.11,
+     0.3
+    ],
+    "warm-up": [
+     44.18,
+     null
+    ],
+    "warm build": [
+     0.06,
+     0.31
+    ],
+    "warm run": [
+     0.23,
+     0.33
+    ],
+    "cold test": [
+     3.88,
+     2.94
+    ],
+    "test warm-up": [
+     1.19,
+     null
+    ],
+    "warm test": [
+     0.81,
+     0.7
+    ],
+    "edit build": [
+     0.89,
+     1.78
+    ],
+    "edit run": [
+     0.27,
+     0.33
+    ],
+    "edit test": [
+     0.65,
+     0.72
+    ],
+    "broken": [
+     1.19,
+     0.47
+    ],
+    "mended": [
+     0.83,
+     2.16
+    ],
+    "mended run": [
+     0.17,
+     0.5
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (55s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: `nu`: the crate root has errors, `cargo check` shows them: mismatched types, and /dev/shm/blaze-cargo-gmzd99y9/nushell/src/main.rs changed",
+    "mended": "daemon",
+    "mended run": "daemon"
+   },
+   "status": "daemon: pid 1164232, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1164235, /dev/shm/blaze-cargo-gmzd99y9/nushell/, log /dev/shm/blaze-cargo-gmzd99y9/home/workers/535bba2c9cbe4f7eb438f41d777e476f/log\n    /dev/shm/blaze-cargo-gmzd99y9/nushell: ready\n  worker: pid 1184247, /dev/shm/blaze-cargo-gmzd99y9/nushell/crates/nu-path, log /dev/shm/blaze-cargo-gmzd99y9/home/workers/c51a54f302afa136605429db3ab12a4f/log\n    /dev/shm/blaze-cargo-gmzd99y9/nushell: ready\n/dev/shm/blaze-cargo-gmzd99y9/nushell (dev, 11e1db07f0378c20): 6 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-gmzd99y9/nushell (test, f1dbd7ff16624a3f): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "cargo",
+   "tag": "0.92.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     48.8,
+     57.33
+    ],
+    "cold run": [
+     0.11,
+     0.3
+    ],
+    "warm-up": [
+     32.69,
+     null
+    ],
+    "warm build": [
+     0.05,
+     0.2
+    ],
+    "warm run": [
+     0.16,
+     0.24
+    ],
+    "cold test": [
+     2.06,
+     2.16
+    ],
+    "test warm-up": [
+     2.06,
+     null
+    ],
+    "warm test": [
+     0.25,
+     0.18
+    ],
+    "edit build": [
+     9.59,
+     1.73
+    ],
+    "edit run": [
+     0.16,
+     0.23
+    ],
+    "edit test": [
+     0.17,
+     0.12
+    ],
+    "broken": [
+     0.8,
+     0.34
+    ],
+    "mended": [
+     0.63,
+     1.18
+    ],
+    "mended run": [
+     0.16,
+     0.25
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (57s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: `cargo`: the crate root has errors, `cargo check` shows them: mismatched types, and /dev/shm/blaze-cargo-m2q1c57s/cargo/src/bin/cargo/main.rs changed",
+    "mended": "daemon",
+    "mended run": "daemon"
+   },
+   "status": "daemon: pid 1130531, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1148589, /dev/shm/blaze-cargo-m2q1c57s/cargo/crates/cargo-platform, log /dev/shm/blaze-cargo-m2q1c57s/home/workers/4b753f4fc1448f3da231eb21cce5ecda/log\n    /dev/shm/blaze-cargo-m2q1c57s/cargo: ready\n  worker: pid 1148592, /dev/shm/blaze-cargo-m2q1c57s/cargo/crates/cargo-platform, log /dev/shm/blaze-cargo-m2q1c57s/home/workers/64af9b58e37bba7e5faf457554e8ea02/log\n    /dev/shm/blaze-cargo-m2q1c57s/cargo: ready\n  worker: pid 1130534, /dev/shm/blaze-cargo-m2q1c57s/cargo/, log /dev/shm/blaze-cargo-m2q1c57s/home/workers/352aaba48ce5ed87d20f71da4358a5c8/log\n    /dev/shm/blaze-cargo-m2q1c57s/cargo: ready\n/dev/shm/blaze-cargo-m2q1c57s/cargo (dev, 82bb2ababf65e924): 6 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-m2q1c57s/cargo (test, b389231fd8fa3218): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "rust-analyzer",
+   "tag": "2026-10-12",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     52.46,
+     58.01
+    ],
+    "cold run": [
+     0.04,
+     0.12
+    ],
+    "warm-up": [
+     170.01,
+     null
+    ],
+    "warm build": [
+     0.04,
+     0.13
+    ],
+    "warm run": [
+     0.06,
+     0.13
+    ],
+    "cold test": [
+     1.37,
+     1.25
+    ],
+    "test warm-up": [
+     2.62,
+     null
+    ],
+    "warm test": [
+     0.04,
+     0.07
+    ],
+    "edit build": [
+     0.38,
+     1.15
+    ],
+    "edit run": [
+     0.06,
+     0.12
+    ],
+    "edit test": [
+     0.05,
+     0.07
+    ],
+    "broken": [
+     0.63,
+     0.21
+    ],
+    "mended": [
+     0.51,
+     1.1
+    ],
+    "mended run": [
+     0.04,
+     0.12
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (58s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: `rust-analyzer`: the crate root has errors, `cargo check` shows them: mismatched types, and /dev/shm/blaze-cargo-p10gyq5x/rust-analyzer/crates/rust-analyzer/src/bin/main.rs changed",
+    "mended": "daemon",
+    "mended run": "daemon"
+   },
+   "status": "daemon: pid 1195390, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1234105, /dev/shm/blaze-cargo-p10gyq5x/rust-analyzer/crates/stdx, log /dev/shm/blaze-cargo-p10gyq5x/home/workers/67c1d0a589d3c47bd1010164c0f3c827/log\n    /dev/shm/blaze-cargo-p10gyq5x/rust-analyzer: ready\n  worker: pid 1195393, /dev/shm/blaze-cargo-p10gyq5x/rust-analyzer/crates/rust-analyzer, log /dev/shm/blaze-cargo-p10gyq5x/home/workers/d66be2f7326813eb5b684697ac784897/log\n    /dev/shm/blaze-cargo-p10gyq5x/rust-analyzer: ready\n/dev/shm/blaze-cargo-p10gyq5x/rust-analyzer (dev, 328c7956d1093286): 6 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-p10gyq5x/rust-analyzer (test, b3935ccc8cbbe35b): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "tokei",
+   "mode": "blaze",
+   "tag": "v15.0.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     9.46,
+     16.32
+    ],
+    "cold run": [
+     0.15,
+     0.11
+    ],
+    "warm-up": [
+     11.34,
+     null
+    ],
+    "warm build": [
+     0.19,
+     0.07
+    ],
+    "warm run": [
+     0.19,
+     0.09
+    ],
+    "cold test": [
+     18.63,
+     11.84
+    ],
+    "test warm-up": [
+     7.1,
+     null
+    ],
+    "warm test": [
+     1.2,
+     0.7
+    ],
+    "edit build": [
+     0.76,
+     0.7
+    ],
+    "edit run": [
+     0.15,
+     0.09
+    ],
+    "edit test": [
+     2.79,
+     1.95
+    ],
+    "broken": [
+     0.88,
+     0.61
+    ],
+    "mended": [
+     0.78,
+     0.78
+    ],
+    "mended run": [
+     0.16,
+     0.09
+    ],
+    "tree build": [
+     11.13,
+     null
+    ],
+    "tree warm-up": [
+     6.68,
+     null
+    ],
+    "tree edit": [
+     0.49,
+     null
+    ],
+    "tree run": [
+     0.04,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (16s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "failed: `build` is not compiled by blaze and rustc's copy is from before the edit, build with cargo: unsupported: writable static `STARTING_MARKDOWN_REGEX` without a rustc symbol; ready; ready",
+    "warm test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-a17pv311/tokei/target/debug/build/tokei-446a60c178ab06d3/out/language_type.rs changed",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "cargo: `tokei`: `build` is not compiled by blaze and rustc's copy is from before the edit, build with cargo: unsupported: writable static `STARTING_MARKDOWN_REGEX` without a rustc symbol, and /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    87,
+    254
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2658750, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2682577, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-blaze/workers/39c4b8561d57e62eaa3134132cb07683/log\n    /dev/shm/blaze-cargo-a17pv311/tokei: failed: /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 2658753, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-blaze/workers/df5fe3f83525d16922a34eaf7466e19c/log\n    /dev/shm/blaze-cargo-a17pv311/tokei-worktree-blaze: ready\n    /dev/shm/blaze-cargo-a17pv311/tokei: ready\n  worker: pid 2682602, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-blaze/workers/b7ebd027d010101f5a1ce6a31e69e77d/log\n    /dev/shm/blaze-cargo-a17pv311/tokei: failed: /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed while cargo built or the daemon loaded\n/dev/shm/blaze-cargo-a17pv311/tokei (dev, fde8cb89a3c23385): 7 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-a17pv311/tokei (test, 5c7ca567b238c9d1): 0 builds by the daemon, 3 by cargo\n  1 x `build` is not compiled by blaze and rustc's copy is from before the edit, build with cargo: unsupported: writable static `STARTING_MARKDOWN_REGEX` without a rustc symbol\n  1 x `tokei`: `build` is not compiled by blaze and rustc's copy is from before the edit, build with cargo: unsupported: writable static `STARTING_MARKDOWN_REGEX` without a rustc symbol, and /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed\n  1 x a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-a17pv311/tokei/target/debug/build/tokei-446a60c178ab06d3/out/language_type.rs changed\n"
+  },
+  {
+   "project": "tokei",
+   "mode": "plain",
+   "tag": "v15.0.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     9.43,
+     15.83
+    ],
+    "cold run": [
+     0.08,
+     0.08
+    ],
+    "warm-up": [
+     12.83,
+     null
+    ],
+    "warm build": [
+     0.08,
+     0.08
+    ],
+    "warm run": [
+     0.08,
+     0.08
+    ],
+    "cold test": [
+     11.04,
+     15.31
+    ],
+    "test warm-up": [
+     13.63,
+     null
+    ],
+    "warm test": [
+     0.79,
+     0.82
+    ],
+    "edit build": [
+     1.23,
+     0.7
+    ],
+    "edit run": [
+     0.1,
+     0.08
+    ],
+    "edit test": [
+     1.75,
+     1.57
+    ],
+    "broken": [
+     1.19,
+     0.63
+    ],
+    "mended": [
+     1.13,
+     0.7
+    ],
+    "mended run": [
+     0.14,
+     0.1
+    ],
+    "tree build": [
+     11.06,
+     null
+    ],
+    "tree warm-up": [
+     6.74,
+     null
+    ],
+    "tree edit": [
+     0.65,
+     null
+    ],
+    "tree run": [
+     0.09,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "nothing to build",
+    "warm-up": "ready",
+    "warm build": "nothing to build",
+    "warm run": "nothing to build",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; failed: `build` is not compiled by blaze and rustc's copy is from before the edit, build with cargo: unsupported: writable static `STARTING_MARKDOWN_REGEX` without a rustc symbol; ready",
+    "warm test": "nothing to build",
+    "edit build": "daemon",
+    "edit run": "nothing to build",
+    "edit test": "cargo: a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-a17pv311/tokei/target/debug/build/tokei-446a60c178ab06d3/out/language_type.rs changed",
+    "broken": "cargo: rustc finds errors in the source",
+    "mended": "daemon",
+    "mended run": "nothing to build",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "nothing to build"
+   },
+   "share": [
+    87,
+    254
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-a17pv311/cargo-home/config.toml\n  3 programs linked by the daemon, 11 by rustc\n    4 x a library its unit tests are linked with as rustc built it: /dev/shm/blaze-cargo-a17pv311/tokei/target/debug/build/tokei-446a60c178ab06d3/out/language_type.rs changed\n    1 x rustc finds errors in the source\n    6 x the daemon had not loaded the build yet\ndaemon: pid 2694900, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2718600, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-plain/workers/585763fcad3b1ab8b49bcfd7bf344fb2/log\n    /dev/shm/blaze-cargo-a17pv311/tokei: failed: /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 2718590, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-plain/workers/def7c26b305caed3f9dc8a2b85bfed06/log\n    /dev/shm/blaze-cargo-a17pv311/tokei: failed: /dev/shm/blaze-cargo-a17pv311/tokei/src/main.rs changed while cargo built or the daemon loaded\n  worker: pid 2694904, /dev/shm/blaze-cargo-a17pv311/tokei/, log /dev/shm/blaze-cargo-a17pv311/home-plain/workers/9b663bd5fb0141f167635f11f740f414/log\n    /dev/shm/blaze-cargo-a17pv311/tokei-worktree-plain: ready\n    /dev/shm/blaze-cargo-a17pv311/tokei: ready\n/dev/shm/blaze-cargo-a17pv311/tokei (test, 5c7ca567b238c9d1): 0 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-a17pv311/tokei (dev, fde8cb89a3c23385): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "eza",
+   "mode": "blaze",
+   "tag": "v0.23.5",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     14.67,
+     21.46
+    ],
+    "cold run": [
+     0.02,
+     1.23
+    ],
+    "warm-up": [
+     0.29,
+     null
+    ],
+    "warm build": [
+     0.03,
+     1.46
+    ],
+    "warm run": [
+     0.03,
+     1.22
+    ],
+    "cold test": [
+     20.67,
+     15.58
+    ],
+    "test warm-up": [
+     0.02,
+     null
+    ],
+    "warm test": [
+     1.25,
+     1.83
+    ],
+    "edit build": [
+     0.94,
+     1.3
+    ],
+    "edit run": [
+     0.03,
+     1.37
+    ],
+    "edit test": [
+     1.14,
+     1.46
+    ],
+    "broken": [
+     0.86,
+     0.99
+    ],
+    "mended": [
+     0.87,
+     1.23
+    ],
+    "mended run": [
+     0.03,
+     1.21
+    ],
+    "tree build": [
+     15.21,
+     null
+    ],
+    "tree warm-up": [
+     9.49,
+     null
+    ],
+    "tree edit": [
+     0.87,
+     null
+    ],
+    "tree run": [
+     0.03,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (21s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    593,
+    1532
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2734135, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2734138, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-blaze/workers/5b0afa5aa84ebf4152ec0e3aa7379972/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n    /dev/shm/blaze-cargo-v3jf_r07/eza-worktree-blaze: ready\n  worker: pid 2745366, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-blaze/workers/e49580a3ef866e260c7fd7346949790c/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n  worker: pid 2745363, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-blaze/workers/be42c21a5e84c9b781cd546aa1e9f3fa/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n/dev/shm/blaze-cargo-v3jf_r07/eza (dev, a34b904536a819b6): 7 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-v3jf_r07/eza (test, cedce4e21b3e3b68): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "eza",
+   "mode": "plain",
+   "tag": "v0.23.5",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     13.97,
+     21.81
+    ],
+    "cold run": [
+     1.61,
+     1.22
+    ],
+    "warm-up": [
+     6.93,
+     null
+    ],
+    "warm build": [
+     0.99,
+     1.29
+    ],
+    "warm run": [
+     0.98,
+     1.2
+    ],
+    "cold test": [
+     14.3,
+     18.53
+    ],
+    "test warm-up": [
+     0.01,
+     null
+    ],
+    "warm test": [
+     1.68,
+     1.86
+    ],
+    "edit build": [
+     2.02,
+     1.32
+    ],
+    "edit run": [
+     1.01,
+     1.24
+    ],
+    "edit test": [
+     1.3,
+     1.46
+    ],
+    "broken": [
+     1.38,
+     0.97
+    ],
+    "mended": [
+     1.01,
+     1.23
+    ],
+    "mended run": [
+     1.0,
+     1.22
+    ],
+    "tree build": [
+     14.97,
+     null
+    ],
+    "tree warm-up": [
+     9.61,
+     null
+    ],
+    "tree edit": [
+     1.04,
+     null
+    ],
+    "tree run": [
+     0.07,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "cargo: the daemon is still loading the workspace (22s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready; ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: rustc finds errors in the source",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    593,
+    1540
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-v3jf_r07/cargo-home/config.toml\n  16 programs linked by the daemon, 8 by rustc\n    1 x rustc finds errors in the source\n    6 x the daemon had not loaded the build yet\n    1 x the daemon is still loading the workspace (22s so far)\ndaemon: pid 2769521, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2783670, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-plain/workers/7b2250f9b2c98f7b65bf1a7fac4ac1a9/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n  worker: pid 2776631, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-plain/workers/46e8f1fe435800f4526978a4561c1819/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n    /dev/shm/blaze-cargo-v3jf_r07/eza-worktree-plain: ready\n  worker: pid 2783673, /dev/shm/blaze-cargo-v3jf_r07/eza/, log /dev/shm/blaze-cargo-v3jf_r07/home-plain/workers/58b9468ca6df21531dd7d8c92d199e21/log\n    /dev/shm/blaze-cargo-v3jf_r07/eza: ready\n/dev/shm/blaze-cargo-v3jf_r07/eza (test, cedce4e21b3e3b68): 0 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-v3jf_r07/eza (dev, a34b904536a819b6): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "starship",
+   "tag": "v1.27.0",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     36.31,
+     39.05
+    ],
+    "cold run": [
+     0.04,
+     0.16
+    ],
+    "warm-up": [
+     75.4,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.15
+    ],
+    "warm run": [
+     0.04,
+     0.15
+    ],
+    "cold test": [
+     30.67,
+     18.48
+    ],
+    "test warm-up": [
+     63.63,
+     null
+    ],
+    "warm test": [
+     0.04,
+     0.17
+    ],
+    "edit build": [
+     0.28,
+     0.87
+    ],
+    "edit run": [
+     0.04,
+     0.32
+    ],
+    "edit test": [
+     0.15,
+     0.16
+    ],
+    "broken": [
+     0.66,
+     0.26
+    ],
+    "mended": [
+     1.48,
+     1.04
+    ],
+    "mended run": [
+     0.04,
+     0.18
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (39s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "daemon",
+    "broken": "cargo: `starship`: `create` has errors, `cargo check` shows them: frontend: const eval: MirLowerError(MissingFunctionDefinition(DefWithBodyId(ConstId(ConstId(9249c))), Idx::<Expr>(8))), and /dev/shm/blaze-cargo-o6h4xxui/starship/src/main.rs changed",
+    "mended": "cargo: `starship`: `create` has errors, `cargo check` shows them: frontend: const eval: MirLowerError(MissingFunctionDefinition(DefWithBodyId(ConstId(ConstId(9249c))), Idx::<Expr>(8))), and /dev/shm/blaze-cargo-o6h4xxui/starship/src/main.rs changed",
+    "mended run": "unchanged: the daemon is still loading the workspace (1s so far)"
+   },
+   "status": "daemon: pid 1070134, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1081134, /dev/shm/blaze-cargo-o6h4xxui/starship/, log /dev/shm/blaze-cargo-o6h4xxui/home/workers/c989a772fef41f44d4e8eaa8538dc8ad/log\n    /dev/shm/blaze-cargo-o6h4xxui/starship: ready\n  worker: pid 1086161, /dev/shm/blaze-cargo-o6h4xxui/starship/, log /dev/shm/blaze-cargo-o6h4xxui/home/workers/bda643c24ab9d0bf87cbc104075520b8/log\n    /dev/shm/blaze-cargo-o6h4xxui/starship: loading for 1s\n/dev/shm/blaze-cargo-o6h4xxui/starship (dev, 295c3e880aba504c): 4 builds by the daemon, 1 by cargo\n  1 x `starship`: `create` has errors, `cargo check` shows them: frontend: const eval: MirLowerError(MissingFunctionDefinition(DefWithBodyId(ConstId(ConstId(9249c))), Idx::<Expr>(8))), and /dev/shm/blaze-cargo-o6h4xxui/starship/src/main.rs changed\n/dev/shm/blaze-cargo-o6h4xxui/starship (test, 843ac59050606226): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "delta",
+   "mode": "blaze",
+   "tag": "0.20.1",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     15.54,
+     27.65
+    ],
+    "cold run": [
+     0.11,
+     0.17
+    ],
+    "warm-up": [
+     4.07,
+     null
+    ],
+    "warm build": [
+     0.02,
+     0.09
+    ],
+    "warm run": [
+     0.11,
+     0.17
+    ],
+    "cold test": [
+     40.88,
+     45.25
+    ],
+    "test warm-up": [
+     0.02,
+     null
+    ],
+    "warm test": [
+     0.39,
+     0.48
+    ],
+    "edit build": [
+     0.42,
+     0.76
+    ],
+    "edit run": [
+     0.11,
+     0.17
+    ],
+    "edit test": [
+     6.52,
+     5.41
+    ],
+    "broken": [
+     0.38,
+     0.39
+    ],
+    "mended": [
+     0.38,
+     0.7
+    ],
+    "mended run": [
+     0.11,
+     0.17
+    ],
+    "tree build": [
+     15.29,
+     null
+    ],
+    "tree warm-up": [
+     10.95,
+     null
+    ],
+    "tree edit": [
+     0.42,
+     null
+    ],
+    "tree run": [
+     0.11,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon is still loading the workspace (28s so far)",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "warm run": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready",
+    "warm test": "daemon",
+    "edit build": "daemon",
+    "edit run": "daemon",
+    "edit test": "cargo: `delta`: the tests of `delta` are built with opt-level 2, where rustc inlines them into its harness and changes how it calls their helpers, and /dev/shm/blaze-cargo-pniujcif/delta/src/main.rs changed",
+    "broken": "cargo",
+    "mended": "daemon",
+    "mended run": "daemon",
+    "tree build": "cargo",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "daemon"
+   },
+   "share": [
+    353,
+    353
+   ],
+   "status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 2810113, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2810116, /dev/shm/blaze-cargo-pniujcif/delta/, log /dev/shm/blaze-cargo-pniujcif/home-blaze/workers/153d0671662e88abd9fb04239fbe6ea3/log\n    /dev/shm/blaze-cargo-pniujcif/delta: ready\n    /dev/shm/blaze-cargo-pniujcif/delta-worktree-blaze: ready\n/dev/shm/blaze-cargo-pniujcif/delta (dev, 1b56704054c0b94b): 7 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-pniujcif/delta (test, 61cd3937a7d6a06c): 0 builds by the daemon, 1 by cargo\n  1 x `delta`: the tests of `delta` are built with opt-level 2, where rustc inlines them into its harness and changes how it calls their helpers, and /dev/shm/blaze-cargo-pniujcif/delta/src/main.rs changed\n"
+  },
+  {
+   "project": "delta",
+   "mode": "plain",
+   "tag": "0.20.1",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     15.15,
+     27.73
+    ],
+    "cold run": [
+     0.17,
+     0.17
+    ],
+    "warm-up": [
+     3.61,
+     null
+    ],
+    "warm build": [
+     0.09,
+     0.09
+    ],
+    "warm run": [
+     0.17,
+     0.17
+    ],
+    "cold test": [
+     42.4,
+     45.28
+    ],
+    "test warm-up": [
+     0.01,
+     null
+    ],
+    "warm test": [
+     0.5,
+     0.48
+    ],
+    "edit build": [
+     0.42,
+     0.76
+    ],
+    "edit run": [
+     0.18,
+     0.17
+    ],
+    "edit test": [
+     5.77,
+     5.4
+    ],
+    "broken": [
+     0.69,
+     0.38
+    ],
+    "mended": [
+     0.37,
+     0.71
+    ],
+    "mended run": [
+     0.18,
+     0.17
+    ],
+    "tree build": [
+     15.58,
+     null
+    ],
+    "tree warm-up": [
+     11.18,
+     null
+    ],
+    "tree edit": [
+     0.44,
+     null
+    ],
+    "tree run": [
+     0.18,
+     null
+    ]
+   },
+   "built": {
+    "cold build": "cargo: the daemon had not loaded the build yet",
+    "cold run": "nothing to build",
+    "warm-up": "ready",
+    "warm build": "nothing to build",
+    "warm run": "nothing to build",
+    "cold test": "cargo: the daemon had not loaded the build yet",
+    "test warm-up": "ready",
+    "warm test": "nothing to build",
+    "edit build": "daemon",
+    "edit run": "nothing to build",
+    "edit test": "cargo: the tests of `delta` are built with opt-level 2, where rustc inlines them into its harness and changes how it calls their helpers",
+    "broken": "cargo: rustc finds errors in the source",
+    "mended": "daemon",
+    "mended run": "nothing to build",
+    "tree build": "cargo: the daemon had not loaded the build yet",
+    "tree warm-up": "ready",
+    "tree edit": "daemon",
+    "tree run": "nothing to build"
+   },
+   "share": [
+    353,
+    353
+   ],
+   "status": "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /dev/shm/blaze-cargo-pniujcif/cargo-home/config.toml\n  3 programs linked by the daemon, 5 by rustc\n    1 x rustc finds errors in the source\n    3 x the daemon had not loaded the build yet\n    1 x the tests of `delta` are built with opt-level 2, where rustc inlines them into its harness and changes how it calls their helpers\ndaemon: pid 2842217, version 0.0.0-3dfbba8-18df80fef939b78f, exits after 1800s idle\n  worker: pid 2842229, /dev/shm/blaze-cargo-pniujcif/delta/, log /dev/shm/blaze-cargo-pniujcif/home-plain/workers/4276cdaa95d251a34cfb047b1be1535f/log\n    /dev/shm/blaze-cargo-pniujcif/delta: ready\n    /dev/shm/blaze-cargo-pniujcif/delta-worktree-plain: ready\n/dev/shm/blaze-cargo-pniujcif/delta (test, 61cd3937a7d6a06c): 0 builds by the daemon, 0 by cargo\n/dev/shm/blaze-cargo-pniujcif/delta (dev, 1b56704054c0b94b): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "helix",
+   "tag": "25.07.1",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     37.14,
+     34.87
+    ],
+    "cold run": [
+     0.04,
+     0.12
+    ],
+    "warm-up": [
+     0.03,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.12
+    ],
+    "warm run": [
+     0.04,
+     0.12
+    ],
+    "cold test": [
+     5.75,
+     3.54
+    ],
+    "test warm-up": [
+     0.04,
+     null
+    ],
+    "warm test": [
+     0.71,
+     0.53
+    ],
+    "edit build": [
+     3.1,
+     3.5
+    ],
+    "edit run": [
+     0.04,
+     0.13
+    ],
+    "edit test": [
+     0.77,
+     0.52
+    ],
+    "broken": [
+     1.85,
+     1.75
+    ],
+    "mended": [
+     4.12,
+     2.54
+    ],
+    "mended run": [
+     0.04,
+     0.13
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "warm-up": "failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "warm build": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "warm run": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "cold test": "cargo",
+    "test warm-up": "failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple); failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple); failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "warm test": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "edit build": "cargo: `hx`: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple), and /dev/shm/blaze-cargo-le24wp66/helix/helix-term/src/main.rs changed",
+    "edit run": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "edit test": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)",
+    "broken": "cargo: `hx`: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple), and /dev/shm/blaze-cargo-le24wp66/helix/helix-term/src/main.rs changed",
+    "mended": "cargo: `hx`: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple), and /dev/shm/blaze-cargo-le24wp66/helix/helix-term/src/main.rs changed",
+    "mended run": "unchanged: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)"
+   },
+   "status": "daemon: pid 1112040, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1123664, /dev/shm/blaze-cargo-le24wp66/helix/, log /dev/shm/blaze-cargo-le24wp66/home/workers/46f8611f2aba9c124e62b047f70d1498/log\n    /dev/shm/blaze-cargo-le24wp66/helix: failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)\n  worker: pid 1118772, /dev/shm/blaze-cargo-le24wp66/helix/helix-stdx, log /dev/shm/blaze-cargo-le24wp66/home/workers/019d0fff0ecedf2c2884d6c45752e314/log\n    /dev/shm/blaze-cargo-le24wp66/helix: failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)\n  worker: pid 1118769, /dev/shm/blaze-cargo-le24wp66/helix/helix-stdx, log /dev/shm/blaze-cargo-le24wp66/home/workers/2739ee138dd6fe021ceaf3704f15e5ef/log\n    /dev/shm/blaze-cargo-le24wp66/helix: failed: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple)\n/dev/shm/blaze-cargo-le24wp66/helix (dev, 6f43c990f465fd67): 0 builds by the daemon, 2 by cargo\n  2 x `hx`: the daemon could not load the workspace (exit status: 1: Error: rustflags of `[target.'cfg(all())']` in cargo's configuration: blaze does not tell which targets a cfg there is of, name the triple), and /dev/shm/blaze-cargo-le24wp66/helix/helix-term/src/main.rs changed\n/dev/shm/blaze-cargo-le24wp66/helix (test, 737031d705757c6e): 0 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "tonic",
+   "tag": "v0.14.5",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     13.79,
+     15.71
+    ],
+    "warm-up": [
+     0.03,
+     null
+    ],
+    "warm build": [
+     0.04,
+     0.1
+    ],
+    "cold test": [
+     3.06,
+     3.05
+    ],
+    "test warm-up": [
+     2.03,
+     null
+    ],
+    "warm test": [
+     1.04,
+     0.92
+    ],
+    "edit build": [
+     3.12,
+     1.11
+    ],
+    "edit test": [
+     1.06,
+     1.03
+    ],
+    "broken": [
+     0.8,
+     0.47
+    ],
+    "mended": [
+     1.08,
+     0.63
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "warm-up": "ready",
+    "warm build": "daemon",
+    "cold test": "cargo",
+    "test warm-up": "ready; ready",
+    "warm test": "daemon",
+    "edit build": "cargo: `helloworld-server`: the crate root has errors, `cargo check` shows them: no such method, and /dev/shm/blaze-cargo-hf8a0n18/tonic/examples/src/helloworld/server.rs changed",
+    "edit test": "daemon",
+    "broken": "cargo: `helloworld-server`: the daemon is still loading the workspace (4s so far), and /dev/shm/blaze-cargo-hf8a0n18/tonic/examples/src/helloworld/server.rs changed",
+    "mended": "cargo: `helloworld-server`: the daemon is still loading the workspace (5s so far), and /dev/shm/blaze-cargo-hf8a0n18/tonic/examples/src/helloworld/server.rs changed"
+   },
+   "status": "daemon: pid 1089641, version 0.0.0-2cd4228-18df679c3db1aecd, exits after 1800s idle\n  worker: pid 1105444, /dev/shm/blaze-cargo-hf8a0n18/tonic/examples, log /dev/shm/blaze-cargo-hf8a0n18/home/workers/119f68e7433a696a1384eab310166844/log\n    /dev/shm/blaze-cargo-hf8a0n18/tonic: loading for 997ms\n  worker: pid 1096160, /dev/shm/blaze-cargo-hf8a0n18/tonic/tonic-types, log /dev/shm/blaze-cargo-hf8a0n18/home/workers/85e6c83c54b4c2a7c51d64dd4f4bb4a9/log\n    /dev/shm/blaze-cargo-hf8a0n18/tonic: ready\n/dev/shm/blaze-cargo-hf8a0n18/tonic (dev, b916018254574022): 2 builds by the daemon, 2 by cargo\n  1 x `helloworld-server`: the crate root has errors, `cargo check` shows them: no such method, and /dev/shm/blaze-cargo-hf8a0n18/tonic/examples/src/helloworld/server.rs changed\n  1 x `helloworld-server`: the daemon is still loading the workspace (5s so far), and /dev/shm/blaze-cargo-hf8a0n18/tonic/examples/src/helloworld/server.rs changed\n/dev/shm/blaze-cargo-hf8a0n18/tonic (test, 344dc09a30ba8d63): 2 builds by the daemon, 0 by cargo\n"
+  },
+  {
+   "project": "wasmtime",
+   "tag": "v49.0.3",
+   "wrong": [],
+   "times": {
+    "cold build": [
+     85.72,
+     90.38
+    ],
+    "cold run": [
+     0.06,
+     0.21
+    ],
+    "warm-up": [
+     0.05,
+     null
+    ],
+    "warm build": [
+     0.03,
+     0.19
+    ],
+    "warm run": [
+     0.06,
+     0.2
+    ],
+    "cold test": [
+     11.05,
+     10.6
+    ],
+    "test warm-up": [
+     0.04,
+     null
+    ],
+    "warm test": [
+     1.76,
+     1.7
+    ],
+    "edit build": [
+     1.63,
+     1.38
+    ],
+    "edit run": [
+     0.06,
+     0.21
+    ],
+    "edit test": [
+     1.83,
+     1.73
+    ],
+    "broken": [
+     0.39,
+     0.31
+    ],
+    "mended": [
+     1.39,
+     1.33
+    ],
+    "mended run": [
+     0.05,
+     0.2
+    ]
+   },
+   "built": {
+    "cold build": "cargo",
+    "cold run": "unchanged: the daemon could not load the workspace (exit status: 101: a scoped thread panicked)",
+    "warm-up": "failed: the daemon could not load the workspace (exit status: 101: a scoped thread panicked)",
+    "warm build": "unchanged: the daemon could not load the workspace (exit status: 101: a scoped thread panicked)",
+    "warm run": "unchanged: the daemon could not load the workspace (exit status: 101: a scoped thread panicked)",
+    "cold test": "cargo",
+    "test warm-up": "ready; failed: the daemon could not load the workspace (exit status: 101: a scoped thread panicked)",
+    "warm test": "daemon",
+    "edit build": "cargo: `wasmtime`: the daemon could not load the workspace (exit status: 101: a scoped thread panicked), and /dev/shm/blaze-cargo-wib59ugo/wasmtime/src/bin/wasmtime.rs changed",
+    "edit run": "unchanged: the daemon is still loading the workspace (1s so far)",
+    "edit test": "daemon",
+    "broken": "cargo: `wasmtime`: the daemon is still loading the workspace (5s so far), and /dev/shm/blaze-cargo-wib59ugo/wasmtime/src/bin/wasmtime.rs changed",
+    "mended": "cargo: `wasmtime`: the daemon is still loading the workspace (6s so far), and /dev/shm/blaze-cargo-wib59ugo/wasmtime/src/bin/wasmtime.rs changed",
+    "mended run": "unchanged: the daemon is still loading the workspace (1s so far)"
+   },
+   "status": "daemon: pid 1370284, version 0.0.0-2cd4228-18df6bfde4e4a7bb, exits after 1800s idle\n  worker: pid 1387743, /dev/shm/blaze-cargo-wib59ugo/wasmtime/crates/environ, log /dev/shm/blaze-cargo-wib59ugo/home/workers/28a5757928a77e0eb7042b59f8e59db6/log\n    /dev/shm/blaze-cargo-wib59ugo/wasmtime: ready\n  worker: pid 1394241, /dev/shm/blaze-cargo-wib59ugo/wasmtime/, log /dev/shm/blaze-cargo-wib59ugo/home/workers/9444af188e4f20badc8c7a6254944762/log\n    /dev/shm/blaze-cargo-wib59ugo/wasmtime: loading for 2s\n/dev/shm/blaze-cargo-wib59ugo/wasmtime (dev, 9f3ed787d0756a93): 0 builds by the daemon, 2 by cargo\n  1 x `wasmtime`: the daemon could not load the workspace (exit status: 101: a scoped thread panicked), and /dev/shm/blaze-cargo-wib59ugo/wasmtime/src/bin/wasmtime.rs changed\n  1 x `wasmtime`: the daemon is still loading the workspace (6s so far), and /dev/shm/blaze-cargo-wib59ugo/wasmtime/src/bin/wasmtime.rs changed\n/dev/shm/blaze-cargo-wib59ugo/wasmtime (test, cc66ba0e019e72b8): 2 builds by the daemon, 0 by cargo\n"
+  }
+ ],
+ "flags": [
+  [
+   "cold",
+   "blaze run",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --release",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "cold",
+   "RUSTFLAGS=-C overflow-checks=off blaze run -- world",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 blaze run --release",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --no-default-features -p app",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --target x86_64-unknown-linux-gnu",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run -p app",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --features loud -p app",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --bin other",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --example demo",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --manifest-path app/Cargo.toml",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run --profile quick",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze run -q name",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "RUSTFLAGS=--cfg extra blaze run",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze build --workspace",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze build --all-features",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze check",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test --test it",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test -p util --lib",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test greets",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "FLAGS_FAIL=1 blaze test --no-fail-fast",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "cold",
+   "FLAGS_FAIL=1 blaze test",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test --no-run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test --doc",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "blaze test --doc --features loud -p util",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "cold",
+   "CARGO_INCREMENTAL=0 blaze test",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "warm",
+   "RUSTFLAGS=-C overflow-checks=off blaze run -- world",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 blaze run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --no-default-features -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --target x86_64-unknown-linux-gnu",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --features loud -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --bin other",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --example demo",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --manifest-path app/Cargo.toml",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run --profile quick",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze run -q name",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "RUSTFLAGS=--cfg extra blaze run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze build --workspace",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze build --all-features",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze check",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test --test it",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test -p util --lib",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test greets",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "FLAGS_FAIL=1 blaze test --no-fail-fast",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "warm",
+   "FLAGS_FAIL=1 blaze test",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test --no-run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test --doc",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "blaze test --doc --features loud -p util",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "warm",
+   "CARGO_INCREMENTAL=0 blaze test",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --release -- fail",
+   "daemon",
+   3,
+   "same"
+  ],
+  [
+   "edit",
+   "RUSTFLAGS=-C overflow-checks=off blaze run -- world",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "RUSTFLAGS=-C target-cpu=x86-64-v3 blaze run --release",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --no-default-features -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --target x86_64-unknown-linux-gnu",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --features loud -p app",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --bin other",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --example demo",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --manifest-path app/Cargo.toml",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze run --profile quick",
+   "cargo",
+   101,
+   "101 for 0"
+  ],
+  [
+   "edit",
+   "blaze run -q name",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "RUSTFLAGS=--cfg extra blaze run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze build --workspace",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze build --all-features",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze check",
+   "cargo",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test",
+   "cargo: a library its unit tests are linked with as rustc built it: /tmp/blaze-cargo-309llw__/flags/util/src/lib.rs changed",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test --test it",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test -p util --lib",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test greets",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "FLAGS_FAIL=1 blaze test --no-fail-fast",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "FLAGS_FAIL=1 blaze test",
+   "daemon",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test --no-run",
+   "daemon",
+   0,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test --doc",
+   "cargo",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "blaze test --doc --features loud -p util",
+   "cargo",
+   101,
+   "same"
+  ],
+  [
+   "edit",
+   "CARGO_INCREMENTAL=0 blaze test",
+   "cargo: `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/blaze-cargo-309llw__/flags/util/src/lib.rs changed",
+   101,
+   "same"
+  ]
+ ],
+ "daemon": [
+  [
+   "no daemon before the first build",
+   true,
+   ""
+  ],
+  [
+   "the first build starts one",
+   true,
+   "pid 1201700"
+  ],
+  [
+   "a program that runs cargo on its checkout builds, and the next run is right",
+   true,
+   "daemon, nested 0, then cargo"
+  ],
+  [
+   "a later build is the daemon's, by the same daemon",
+   true,
+   "daemon"
+  ],
+  [
+   "a worktree is loaded by the same daemon and the same worker",
+   true,
+   "workers [1201701]"
+  ],
+  [
+   "a build in the worktree is the daemon's",
+   true,
+   "daemon"
+  ],
+  [
+   "the daemon outlives a client that is killed",
+   true,
+   "daemon"
+  ],
+  [
+   "a client of another build replaces the daemon",
+   true,
+   "pid 1201700 then 1204575"
+  ],
+  [
+   "the workers of the daemon it replaced are gone",
+   true,
+   "[1201701]"
+  ],
+  [
+   "idle for BLAZE_IDLE_SECS, the daemon and its workers exit",
+   true,
+   "daemon 1204875, workers [1204876]"
+  ],
+  [
+   "workers exit when the daemon is killed",
+   true,
+   "workers [1206657]"
+  ],
+  [
+   "the build after that starts a daemon again and succeeds",
+   true,
+   ""
+  ],
+  [
+   "`blaze --help` lists the commands and exits 0",
+   true,
+   "exit 0"
+  ],
+  [
+   "`blaze -h` lists the commands and exits 0",
+   true,
+   "exit 0"
+  ],
+  [
+   "`blaze --help` lists the commands and exits 0",
+   true,
+   "exit 0"
+  ],
+  [
+   "`blaze -h` lists the commands and exits 0",
+   true,
+   "exit 0"
+  ],
+  [
+   "`blaze status` whose reader went away ends without a word",
+   true,
+   "exit -13 "
+  ],
+  [
+   "`blaze --help` whose reader went away ends without a word",
+   true,
+   "exit -13 "
+  ],
+  [
+   "`blaze status` whose reader went away ends without a word",
+   true,
+   "exit 1 "
+  ],
+  [
+   "`blaze --help` whose reader went away ends without a word",
+   true,
+   "exit 1 "
+  ],
+  [
+   "a build straight after `stop` starts a daemon and is not a fallback over the one leaving",
+   true,
+   "5 of 5"
+  ],
+  [
+   "a use after a move in the program's crate is the daemon's to build on a warm `blaze run`",
+   true,
+   "exit 101, daemon"
+  ],
+  [
+   "and `blaze check` of it",
+   true,
+   "exit 101"
+  ],
+  [
+   "and the build once it is mended is right",
+   true,
+   "daemon"
+  ],
+  [
+   "a use after a move in a library of the workspace is the daemon's to build on a warm `blaze run`",
+   true,
+   "exit 101, daemon"
+  ],
+  [
+   "and `blaze check` of it",
+   true,
+   "exit 101"
+  ],
+  [
+   "and the build once it is mended is right",
+   true,
+   "daemon"
+  ],
+  [
+   "16 clients at once on 4 worktrees each run their own tree's program",
+   true,
+   "16 of 16 right, 16 built by the daemon, 1 worker"
+  ],
+  [
+   "a client killed while its build is held leaves the daemon serving",
+   true,
+   "daemon"
+  ],
+  [
+   "the build whose daemon is killed is right, by a daemon started in its place",
+   true,
+   "exit 0, daemon,  Running `target/debug/app killed`\n\nthread 'main' (1228566) panicked at app/src/main.rs:7:43:\nattempt to add with overflow\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+  ],
+  [
+   "the workers of the killed daemon are gone",
+   true,
+   "[1223841]"
+  ],
+  [
+   "the build after that is a new daemon's",
+   true,
+   "daemon"
+  ],
+  [
+   "status by another build says the daemon is another build, and leaves it",
+   true,
+   "daemon: another build of blaze, version 0.0.0-4404588-18dff02a40568e29; the next build replaces it"
+  ],
+  [
+   "a build by another build of blaze is cargo's, says why, and replaces the daemon",
+   true,
+   "cargo: this build's state was written by another build of blaze"
+  ],
+  [
+   "and the first build of blaze replaces that one the same way",
+   true,
+   "cargo: this build's state was written by another build of blaze"
+  ],
+  [
+   "the user's own raw request is answered",
+   true,
+   "answer: {\"Status\":{\"pid\":1231869,\"version\":\"0.0.0-4404588-18"
+  ],
+  [
+   "a second user can't reach the socket",
+   true,
+   "modes 700 600, connect: Permission denied"
+  ],
+  [
+   "with the modes opened, the daemon turns the second user away by its uid",
+   true,
+   "'answer: [Errno 104] Connection reset by peer'"
+  ],
+  [
+   "and still answers its own user",
+   true,
+   "answer: {\"Status\":{\"pid\":1231869,\"version\":\"0.0.0-4404588-18"
+  ],
+  [
+   "the client says nothing to a socket a second user serves",
+   true,
+   "status 1, heard: 0"
+  ]
+ ],
+ "wrong": [],
+ "flags_status": "plain cargo: not through blaze (`blaze enable` turns it on)\ndaemon: pid 1168914, version 0.0.0-4404588-18dff02a40568e29, exits after 1800s idle\n  worker: pid 1175589, /tmp/blaze-cargo-309llw__/flags/app, log /tmp/blaze-cargo-309llw__/home-flags/workers/610770f3672aa1bedb9551d00307a06d/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1172954, /tmp/blaze-cargo-309llw__/flags/app, log /tmp/blaze-cargo-309llw__/home-flags/workers/e40e98738a76ae351c7e4044472b1e86/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1184757, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/spares/2/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n    /tmp/blaze-cargo-309llw__/flags: ready\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1171123, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/spares/1/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1178127, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/15ed376ad5588954f329093afb251617/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1171608, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/8cc043fb80c9ab265763e197db22f91f/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1176337, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/4e922e7f180474679117c6fa72512b27/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1194868, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/4ba50c62fc6daf9696747c72724924ea/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1170250, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/12fe75f259c2fdc5a2422989ac4a99fe/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1171955, /tmp/blaze-cargo-309llw__/flags/app, log /tmp/blaze-cargo-309llw__/home-flags/workers/c8edfaed8b104012c71fc85bfe77b2c4/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1173530, /tmp/blaze-cargo-309llw__/flags/app, log /tmp/blaze-cargo-309llw__/home-flags/workers/c3f279bade62f772aad48dbffc1d8a56/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1177504, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/cacdc85d98ea85a3cfad2d44dc7e83a0/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1168915, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/spares/0/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n    /tmp/blaze-cargo-309llw__/flags: ready\n    /tmp/blaze-cargo-309llw__/flags: ready\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1172356, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/c06ceb374c86bbabc2467a842351a8ba/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1178269, /tmp/blaze-cargo-309llw__/flags/, log /tmp/blaze-cargo-309llw__/home-flags/workers/e59fe20e8022559a0ac2b4df8e08dfa7/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n  worker: pid 1183381, /tmp/blaze-cargo-309llw__/flags/util, log /tmp/blaze-cargo-309llw__/home-flags/workers/5255487bef19fe9e983111da0cbe38e8/log\n    /tmp/blaze-cargo-309llw__/flags: ready\n/tmp/blaze-cargo-309llw__/flags (dev, 59052696b2966acc): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (test, 8cd5c4b856bb8f45): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 0b75f0a71ef60d33): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, efd3902bb8c50682): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 4a2b168cd5d4e1a7): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 4584e30f91dd911b): 5 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (test, dfa92b1efb227244): 1 builds by the daemon, 1 by cargo\n  1 x `app`: the tests of `app` are built without incremental compilation, where rustc keeps them private to its object, and /tmp/blaze-cargo-309llw__/flags/util/src/lib.rs changed\n/tmp/blaze-cargo-309llw__/flags (dev, 50e209dfadb270a5): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (release, e03702056c19f923): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (test, aae41127fa21340b): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, cb2ba48cc3cd1ddc): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 11874a865df8b4d2): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (quick, 1c07f5a870d70ea7): 1 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 2cc44a0de03db721): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 4398066533b79929): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, eb97826372e5caca): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, c2cf474918fe9394): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (dev, 2fdd7ecfdbab576a): 2 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (release, 5cf19c3127816c8c): 5 builds by the daemon, 0 by cargo\n/tmp/blaze-cargo-309llw__/flags (test, ea02f64729954d69): 13 builds by the daemon, 1 by cargo\n  1 x a library its unit tests are linked with as rustc built it: /tmp/blaze-cargo-309llw__/flags/util/src/lib.rs changed\n",
+ "plain": [
+  [
+   "enable and disable over no configuration leave it as it was",
+   true,
+   "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
+  ],
+  [
+   "enable and disable over a configuration with other settings leave it as it was",
+   true,
+   "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
+  ],
+  [
+   "enable and disable over a configuration in the old file name leave it as it was",
+   true,
+   "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
+  ],
+  [
+   "enable and disable over a dotted `build.rustc-wrapper` leave it as it was",
+   true,
+   "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
+  ],
+  [
+   "enable and disable over a workspace wrapper of the user's leave it as it was",
+   true,
+   "plain cargo: through blaze, by `build.rustc-workspace-wrapper` in /tmp; same bytes"
+  ],
+  [
+   "disable after the user edited the file takes blaze's line out and keeps the edit",
+   true,
+   "'[build]\\njobs = 2\\n\\n[net]\\noffline = false\\n'"
+  ],
+  [
+   "status says a project's own configuration has cargo not run blaze there",
+   true,
+   "  not below /tmp/blaze-cargo-309llw__/switch-project: its configuration sets `build.rustc-workspace-wrapper = \"/usr/bin/env\"`, which cargo reads first"
+  ],
+  [
+   "status says a RUSTC_WORKSPACE_WRAPPER of the shell has cargo not run blaze",
+   true,
+   ""
+  ],
+  [
+   "the first plain `cargo run` is rustc's and is right",
+   true,
+   "cargo: the daemon had not loaded the build yet; same as cargo"
+  ],
+  [
+   "the user's `rustc-wrapper` still runs, around blaze's wrapper",
+   true,
+   "23 calls"
+  ],
+  [
+   "the user's workspace wrapper still runs, under blaze's",
+   true,
+   "21 calls"
+  ],
+  [
+   "the daemon was started by that build and has loaded it",
+   true,
+   "pid 1233723, ready, 5.2s"
+  ],
+  [
+   "an edit of the program is linked by the daemon",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "an edit of a library of the workspace is built by the daemon into the program",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "a build with nothing changed runs nothing",
+   true,
+   "0.03s"
+  ],
+  [
+   "`cargo test`, first",
+   true,
+   "cargo: the daemon had not loaded the build yet; same as cargo"
+  ],
+  [
+   "`cargo test --doc`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo test --no-fail-fast FLAGS_FAIL=1`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --example demo`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --release`, first",
+   true,
+   "cargo: the daemon had not loaded the build yet; same as cargo"
+  ],
+  [
+   "`cargo run --target x86_64-unknown-linux-gnu`, first",
+   true,
+   "cargo: the daemon had not loaded the build yet; same as cargo"
+  ],
+  [
+   "`cargo run --bin other`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --features loud -p app`, first",
+   true,
+   "cargo: the daemon had not loaded the build yet; same as cargo"
+  ],
+  [
+   "`cargo run -- fail`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo check`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo check --all-targets`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo build --workspace --all-targets`, first",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo test`, edited",
+   true,
+   "cargo: a library its unit tests are linked with as rustc built it: /tmp/blaze-cargo-309llw; same as cargo"
+  ],
+  [
+   "`cargo test --doc`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo test --no-fail-fast FLAGS_FAIL=1`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --example demo`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --release`, edited",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "`cargo run --target x86_64-unknown-linux-gnu`, edited",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "`cargo run --bin other`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo run --features loud -p app`, edited",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "`cargo run -- fail`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo check`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo check --all-targets`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "`cargo build --workspace --all-targets`, edited",
+   true,
+   "nothing to build; same as cargo"
+  ],
+  [
+   "a build that does not compile fails with cargo's status",
+   true,
+   "exit 101"
+  ],
+  [
+   "and the build after it is mended is right",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "a use after a move in the program's crate on a warm `cargo run` ends as a build does",
+   true,
+   "exit 0"
+  ],
+  [
+   "and the build after it is mended is right",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "a use after a move in a library of the workspace on a warm `cargo run` ends as a build does",
+   true,
+   "exit 101"
+  ],
+  [
+   "and the build after it is mended is right",
+   true,
+   "daemon; same as cargo"
+  ],
+  [
+   "`cargo install` installs a program that runs",
+   true,
+   "edited first lib hello installed\nfalse false false\nSome(4)"
+  ],
+  [
+   "a `cargo check` with JSON messages at the same time as a build: both are right",
+   true,
+   "daemon; 11 messages; same as cargo"
+  ],
+  [
+   "the worktrees are loaded by the one daemon",
+   true,
+   "6 workers"
+  ],
+  [
+   "12 plain cargo builds at once on 3 worktrees each run their own tree's program",
+   true,
+   "12 of 12 right; daemon"
+  ],
+  [
+   "the build whose daemon is killed succeeds",
+   true,
+   "exit 0, daemon,  Running `target/debug/app killed`\n\nthread 'main' (1245320) panicked at app/src/main.rs:7:43:\nattempt to add with overflow\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+  ],
+  [
+   "the build after that is a new daemon's",
+   true,
+   "daemon"
+  ],
+  [
+   "plain cargo by another build of blaze is rustc's and replaces the daemon",
+   true,
+   "cargo: the daemon had not loaded the build yet; daemon 1245383 then 1246742"
+  ],
+  [
+   "and the build after that is the new daemon's",
+   true,
+   "daemon"
+  ],
+  [
+   "status counts what the daemon linked and why rustc linked the rest",
+   true,
+   "20 programs linked by the daemon, 21 by rustc"
+  ],
+  [
+   "after `blaze disable` the configuration is the user's again, byte for byte",
+   true,
+   ""
+  ],
+  [
+   "and plain cargo is cargo alone again, through the user's wrappers",
+   true,
+   "exit 0, same as cargo, 6 calls of the wrapper; Compiling util v0.1.0 (/tmp/blaze-cargo-309llw__/plain/util)\n   Compiling app v0.1.0 (/tmp/blaze-cargo-309llw__/plain/app)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running `target/debug/app off`"
+  ]
+ ]
+}

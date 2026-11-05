@@ -1,0 +1,43 @@
+[package]
+name = "blaze-codegen"
+description = "blaze v2's per-function codegen: the unit of codegen is one function instance, keyed by its code hash and the facts of its type arguments, compiled to a relocatable blob"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
+blaze-hashcons.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-kernel.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-store-check.workspace = true
+hashbrown.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[lints]
+workspace = true

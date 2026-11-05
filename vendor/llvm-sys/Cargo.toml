@@ -1,0 +1,74 @@
+# llvm-sys 231.0.1 from crates.io, patched for blaze: see SOURCE.md.
+
+[package]
+edition = "2021"
+# blaze: 1.77 for pin.rs's `cargo::` directives (upstream says 1.65.0).
+rust-version = "1.77.0"
+name = "llvm-sys"
+version = "231.0.1"
+authors = ["Peter Marheine <peter@taricorp.net>"]
+build = "build.rs"
+links = "llvm-23"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Bindings to LLVM's C API"
+readme = "README.md"
+keywords = [
+    "bindings",
+    "llvm",
+]
+categories = ["external-ffi-bindings"]
+license = "MIT"
+repository = "https://gitlab.com/taricorp/llvm-sys.rs"
+
+[badges.gitlab]
+repository = "taricorp/llvm-sys.rs"
+
+[badges.maintenance]
+status = "passively-maintained"
+
+[features]
+disable-alltargets-init = []
+force-dynamic = []
+force-static = []
+no-llvm-linking = []
+prefer-dynamic = []
+prefer-static = []
+strict-versioning = []
+
+[lib]
+name = "llvm_sys"
+path = "src/lib.rs"
+
+# blaze: the pin check build.rs includes, tested on its own (tests/pin.rs includes pin.rs).
+[[test]]
+name = "pin"
+path = "tests/pin.rs"
+
+[dependencies.clang-sys]
+version = "1.2.2"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+
+[dependencies.tempfile]
+version = "3.2.0"
+optional = true
+
+[build-dependencies.anyhow]
+version = "1.0"
+
+[build-dependencies.cc]
+version = "1.0"
+
+[build-dependencies.lazy_static]
+version = "1.0"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(LLVM_SYS_NOT_FOUND)"]

@@ -1,0 +1,12 @@
+[package]
+name = "site-serve"
+description = "The whole site as a wasi:http component (wasi:http/incoming-handler): static pages and assets, discussable pages with comments from a store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+site-render.workspace = true
+serde_json.workspace = true
+wstd = "0.6"

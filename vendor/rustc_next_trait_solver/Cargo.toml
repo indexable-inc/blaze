@@ -1,0 +1,33 @@
+# rustc's `compiler/rustc_next_trait_solver` at the rustc commit of `harness/toolchain`, as written
+# by `tools/v2/solver_sync.py`: `src` is upstream's with the series in `PATCHES.md` replayed on it,
+# and `Cargo.toml.orig` is upstream's manifest. This file is upstream's dependencies built as
+# rust-analyzer's `ra-ap-rustc_next_trait_solver` builds them: `nightly` off, so the dependencies
+# only it needs are left out.
+[package]
+name = "rustc_next_trait_solver"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/rust"
+publish = false
+
+[lib]
+name = "rustc_next_trait_solver"
+path = "src/lib.rs"
+
+[features]
+# Needs the compiler's own crates (`rustc_data_structures`, `rustc_macros`).
+nightly = []
+
+[dependencies]
+derive-where = "1.2.7"
+# Not upstream's: deep folds grow the stack as blaze's other recursions do (patch 0012).
+stdx.workspace = true
+rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
+rustc_type_ir = { path = "../rustc_type_ir", version = "0.0.0", default-features = false }
+rustc_type_ir_macros = { path = "../rustc_type_ir_macros", version = "0.0.0" }
+thin-vec = "0.2.21"
+tracing = "0.1"
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true

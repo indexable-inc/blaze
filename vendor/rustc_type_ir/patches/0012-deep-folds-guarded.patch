@@ -1,0 +1,42 @@
+diff --git a/src/fold.rs b/src/fold.rs
+index 8e093c6..73b68fe 100644
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -871,7 +871,8 @@ impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+             return t;
+         }
+ 
+-        match t.kind() {
++        // blaze: one guard per level of the type, which can nest as deep as a program writes it.
++        stdx::ensure_sufficient_stack(|| match t.kind() {
+             ty::Alias(is_rigid, alias_ty) => {
+                 let alias_ty = alias_ty.fold_with(self);
+                 match self.mode {
+@@ -891,7 +892,7 @@ impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+                 }
+             }
+             _ => t.super_fold_with(self),
+-        }
++        })
+     }
+ 
+     fn fold_const(&mut self, c: Const<I>) -> Const<I> {
+@@ -899,7 +900,8 @@ impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+             return c;
+         }
+ 
+-        match c.kind() {
++        // blaze: one guard per level of the constant, as for a type.
++        stdx::ensure_sufficient_stack(|| match c.kind() {
+             ty::ConstKind::Alias(is_rigid, alias_const) => {
+                 let alias_const = alias_const.fold_with(self);
+                 match self.mode {
+@@ -915,7 +917,7 @@ impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+                 }
+             }
+             _ => c.super_fold_with(self),
+-        }
++        })
+     }
+ 
+     fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {

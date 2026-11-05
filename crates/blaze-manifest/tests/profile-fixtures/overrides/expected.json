@@ -1,0 +1,5278 @@
+{
+ "host": "aarch64-apple-darwin",
+ "runs": [
+  {
+   "args": [
+    "build"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--release"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "test",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 10
+       },
+       {
+        "index": 11
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 10
+       },
+       {
+        "index": 11
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "doctest",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       },
+       {
+        "index": 10
+       },
+       {
+        "index": 11
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       },
+       {
+        "index": 10
+       },
+       {
+        "index": 11
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 8
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "args": [
+    "bench",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 9
+       },
+       {
+        "index": 10
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 9
+       },
+       {
+        "index": 10
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       },
+       {
+        "index": 9
+       },
+       {
+        "index": 10
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       },
+       {
+        "index": 8
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     2
+    ]
+   }
+  },
+  {
+   "args": [
+    "check"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--target",
+    "x86_64-unknown-linux-gnu"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "custom"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "custom",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "config-only"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": true,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": true,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": true,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "config-only",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--config",
+    "profile.dev.strip=true"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build"
+   ],
+   "env": {
+    "CARGO_PROFILE_DEV_DEBUG": "0"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build"
+   ],
+   "env": {
+    "CARGO_INCREMENTAL": "0"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build"
+   ],
+   "env": {
+    "CI": "1"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--release"
+   ],
+   "env": {
+    "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG": "true"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 3
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": 16,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "symbols"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "0",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  },
+  {
+   "args": [
+    "build"
+   ],
+   "env": {
+    "CARGO_PROFILE_DEV_PACKAGE_bonly_OPT_LEVEL": "s"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "app"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 0
+       },
+       {
+        "index": 2
+       },
+       {
+        "index": 8
+       },
+       {
+        "index": 9
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#app@0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       },
+       {
+        "index": 7
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "bonly"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 6
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/bonly#1.0.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/dep#0.2.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "dep"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "2",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 4,
+       "debuginfo": "line-tables-only",
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/pm#0.3.0",
+      "target": {
+       "kind": [
+        "proc-macro"
+       ],
+       "name": "pm"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     1
+    ]
+   }
+  }
+ ]
+}

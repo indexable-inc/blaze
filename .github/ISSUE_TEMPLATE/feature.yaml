@@ -1,0 +1,16 @@
+name: Feature
+description: Something blaze should do that it does not.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What you want
+      description: What you are trying to do, and where blaze gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: A project, a crate or a piece of code it should handle, if there is one.

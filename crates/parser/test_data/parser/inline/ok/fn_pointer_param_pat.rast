@@ -1,0 +1,74 @@
+SOURCE_FILE
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "A"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    FN_PTR_TYPE
+      FN_KW "fn"
+      PARAM_LIST
+        L_PAREN "("
+        PARAM
+          IDENT_PAT
+            MUT_KW "mut"
+            WHITESPACE " "
+            NAME
+              IDENT "a"
+          COLON ":"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        COMMA ","
+        WHITESPACE " "
+        PARAM
+          REF_PAT
+            AMP "&"
+            IDENT_PAT
+              NAME
+                IDENT "b"
+          COLON ":"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        COMMA ","
+        WHITESPACE " "
+        PARAM
+          REF_PAT
+            AMP "&"
+            REF_PAT
+              AMP "&"
+              IDENT_PAT
+                NAME
+                  IDENT "c"
+          COLON ":"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        COMMA ","
+        WHITESPACE " "
+        PARAM
+          IDENT_PAT
+            NAME
+              IDENT "r#ref"
+          COLON ":"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"

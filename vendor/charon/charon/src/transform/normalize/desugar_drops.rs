@@ -1,0 +1,63 @@
+use crate::{
+    transform::{
+        TransformCtx,
+        ctx::{BodyTransformCtx, UllbcPass, UllbcStatementTransformCtx},
+    },
+    ullbc_ast::*,
+};
+
+fn is_noop_destruct(glue: &FnPtr) -> bool {
+    match glue.kind.as_ref() {
+        FnPtrKind::Trait(tref, _) => matches!(
+            &tref.kind,
+            TraitRefKind::BuiltinOrAuto { builtin_data: BuiltinImplData::NoopDestruct, .. }
+        ),
+        _ => false,
+    }
+}
+
+impl<'a> UllbcStatementTransformCtx<'a> {
+    /// Transform a Drop to a Call that calls the drop_glue method.
+    /// If we cannot desugar this drop, we just leave it unchanged.
+    fn transform_drop_to_call(&mut self, term: &mut Terminator) {
+        if let TerminatorKind::Drop { kind: DropKind::Precise, place, fn_ptr, target, on_unwind } =
+            &mut term.kind
+        {
+            // check if this drop is noop
+            if is_noop_destruct(fn_ptr) {
+                term.kind = TerminatorKind::Goto { target: *target };
+                return;
+            }
+
+            // assign `&mut place` to a new variable
+            let drop_arg =
+                self.borrow_to_new_var(place.clone(), BorrowKind::Mut, Some("drop_arg".into()));
+
+            let drop_ret = self.fresh_var(Some("drop_ret".into()), Ty::mk_unit());
+            let call = Call {
+                func: FnOperand::Regular(fn_ptr.clone()),
+                args: Vec::from([Operand::Move(drop_arg)]),
+                safety: CallSafety::Safe, // drop_glue is unsafe, but here we know it's safe
+            };
+            term.kind = TerminatorKind::Call {
+                call,
+                dest: drop_ret,
+                target: *target,
+                on_unwind: *on_unwind,
+            };
+        }
+    }
+}
+
+pub struct Transform;
+
+impl UllbcPass for Transform {
+    fn should_run(&self, options: &crate::options::TranslateOptions) -> bool {
+        options.desugar_drops
+    }
+    fn transform_function(&self, ctx: &mut TransformCtx, decl: &mut FunDecl) {
+        decl.transform_ullbc_terminators(ctx, |ctx, term| {
+            ctx.transform_drop_to_call(term);
+        });
+    }
+}

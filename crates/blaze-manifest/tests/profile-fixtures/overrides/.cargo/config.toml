@@ -1,0 +1,5 @@
+[profile.release]
+codegen-units = 16
+[profile.config-only]
+inherits = "dev"
+rpath = true

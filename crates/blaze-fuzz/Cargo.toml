@@ -1,0 +1,21 @@
+[package]
+name = "blaze-fuzz"
+description = "Changed and made-up inputs for the tests of what reads the store, and how much memory a read asks for"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+
+[lints]
+workspace = true

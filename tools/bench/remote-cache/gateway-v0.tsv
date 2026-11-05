@@ -1,0 +1,22 @@
+# blaze-gateway v0 from rcache-worker (aarch64), edge colo PDX, 2026-10-27T11:04Z
+metric	value	unit	n	detail
+multipart_put_64MiB	5.490	MiB/s	1	8 parts of 8 MiB, sequential, incl. the hash-check copy
+get_1stream_64MiB	37.923	MiB/s	5	median; runs 31.6, 40.8, 37.9, 36.9, 68.5
+get_16ranged_64MiB	93.037	MiB/s	5	median aggregate; runs 59.6, 88.5, 93.0, 104.6, 98.1
+get_16x64MiB_aggregate	234.772	MiB/s	3	median; runs 220.6, 234.8, 247.7
+baseline_1stream_64MiB	155.902	MiB/s	3	speed.cloudflare.com; runs 155.9, 140.6, 156.1
+baseline_16x64MiB_aggregate	1350.280	MiB/s	1	speed.cloudflare.com
+head_ttfb_new_conn_p50	295.179	ms	50	DNS+TCP+TLS+request
+head_ttfb_new_conn_p95	339.437	ms	50	
+head_after_tls_p50	71.342	ms	50	first byte minus TLS done: Worker + KV + R2 + 1 RTT
+head_after_tls_p95	116.240	ms	50	
+head_ttfb_keepalive_p50	58.475	ms	49	reused connection
+head_ttfb_keepalive_p95	86.766	ms	49	
+get_ttfb_new_conn_p50	296.595	ms	50	DNS+TCP+TLS+request
+get_ttfb_new_conn_p95	348.507	ms	50	
+get_after_tls_p50	73.854	ms	50	first byte minus TLS done: Worker + KV + R2 + 1 RTT
+get_after_tls_p95	123.074	ms	50	
+get_ttfb_keepalive_p50	74.467	ms	49	reused connection
+get_ttfb_keepalive_p95	135.809	ms	49	
+put_32MiB	14.908	MiB/s	3	median, whole request; runs 14.9, 14.8, 20.0
+baseline_upload_32MiB	49.115	MiB/s	3	speed.cloudflare.com; runs 42.2, 50.3, 49.1

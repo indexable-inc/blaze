@@ -1,0 +1,35 @@
+[package]
+name = "tt"
+version = "0.0.0"
+repository.workspace = true
+description = "A `TokenTree` data structure for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+arrayvec.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-phf.workspace = true
+text-size.workspace = true
+
+span.workspace = true
+stdx.workspace = true
+intern.workspace = true
+rustc_lexer.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

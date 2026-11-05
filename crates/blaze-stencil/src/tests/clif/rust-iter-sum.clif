@@ -1,0 +1,112 @@
+; Shaped like what hir-ty-codegen makes for `<[i32]>::iter().sum::<i32>()` in a debug
+; build and for `bytes.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))`: the slice
+; (data pointer, length) becomes a `slice::Iter` pointer pair (`ptr`, `end = ptr + len *
+; size_of::<T>()`), `next` compares the pair and steps `ptr`, and the sum is a loop
+; carrying the accumulator in a block parameter. The checked `+` branches to a cold block
+; calling `panic_const_add_overflow`. The `_of` wrappers store their arguments to a stack
+; slot and pass it as the slice.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %panic_const_add_overflow(i64) {
+block0(v0: i64):
+    trap user1
+}
+
+function %sum(i64, i64) -> i32 {
+    fn0 = %panic_const_add_overflow(i64)
+
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 4
+    v3 = imul v1, v2
+    v4 = iadd v0, v3
+    v5 = iconst.i32 0
+    jump block1(v0, v5)
+
+block1(v6: i64, v7: i32):
+    v8 = icmp eq v6, v4
+    brif v8, block3, block2
+
+block2:
+    v9 = load.i32 notrap aligned v6
+    v10 = iconst.i64 4
+    v11 = iadd v6, v10
+    v12, v13 = sadd_overflow v7, v9
+    brif v13, block4, block1(v11, v12)
+
+block3:
+    return v7
+
+block4 cold:
+    v14 = iconst.i64 0
+    call fn0(v14)
+    trap user1
+}
+
+function %sum_of(i32, i32, i32, i32, i64) -> i32 {
+    ss0 = explicit_slot 16, align = 4
+    fn0 = %sum(i64, i64) -> i32
+
+block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i64):
+    v5 = stack_addr.i64 ss0
+    store notrap aligned v0, v5
+    store notrap aligned v1, v5+4
+    store notrap aligned v2, v5+8
+    store notrap aligned v3, v5+12
+    v6 = call fn0(v5, v4)
+    return v6
+}
+; run: %sum_of(1, 2, 3, 4, 4) == 10
+; run: %sum_of(1, 2, 3, 4, 0) == 0
+; run: %sum_of(1, 2, 3, 4, 1) == 1
+; run: %sum_of(1, 2, 3, 4, 3) == 6
+; run: %sum_of(-5, 5, 0x80000000, 0x7fffffff, 4) == -1
+; run: %sum_of(0x7fffffff, 0, 0, 0, 4) == 0x7fffffff
+; run: %sum_of(0x7fffffff, -1, 1, 0, 3) == 0x7fffffff
+; run: %sum_of(0x80000000, 1, -1, 0, 4) == 0x80000000
+; run: %sum_of(0x7fffffff, 1, 0, 0, 1) == 0x7fffffff
+; trap: %sum_of(0x7fffffff, 1, 0, 0, 2)
+; trap: %sum_of(0x80000000, -1, 0, 0, 2)
+; trap: %sum_of(0x40000000, 0x40000000, 0, 0, 2)
+; trap: %sum_of(0x40000000, 0x3fffffff, 1, 0, 3)
+; trap: %sum_of(0, 0, 0x80000000, 0x80000000, 4)
+
+function %sum_bytes(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = iadd v0, v1
+    v3 = iconst.i32 0
+    jump block1(v0, v3)
+
+block1(v4: i64, v5: i32):
+    v6 = icmp eq v4, v2
+    brif v6, block3, block2
+
+block2:
+    v7 = uload8.i32 notrap aligned v4
+    v8 = iconst.i64 1
+    v9 = iadd v4, v8
+    v10 = iadd v5, v7
+    jump block1(v9, v10)
+
+block3:
+    return v5
+}
+
+function %sum_bytes_of(i64, i64) -> i32 {
+    ss0 = explicit_slot 8, align = 8
+    fn0 = %sum_bytes(i64, i64) -> i32
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = call fn0(v2, v1)
+    return v3
+}
+; run: %sum_bytes_of(0x0807060504030201, 8) == 36
+; run: %sum_bytes_of(0x0807060504030201, 3) == 6
+; run: %sum_bytes_of(0x0807060504030201, 0) == 0
+; run: %sum_bytes_of(0x0807060504030201, 1) == 1
+; run: %sum_bytes_of(-1, 8) == 2040
+; run: %sum_bytes_of(0x80000000000000ff, 8) == 383

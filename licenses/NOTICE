@@ -1,0 +1,29 @@
+blaze
+Copyright (c) 2026 Indexable, Inc. and the blaze contributors
+Licensed under MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
+
+crates derived from rust-analyzer (MIT OR Apache-2.0): the front end's crates in crates/
+(hir-ty, hir-def, hir-expand, syntax, parser, base-db, syntax-tree and the rest), copyright the
+rust-analyzer developers; their license texts are licenses/rust-analyzer-LICENSE-MIT and
+licenses/rust-analyzer-LICENSE-APACHE.
+
+syntax-tree started as rowan 0.17.0 (MIT/Apache-2.0); its license texts are in crates/syntax-tree.
+
+Hegel (MIT), copyright Antithesis, LLC: vendor/hegeltest, vendor/hegeltest-macros and
+vendor/hegeltest-c, used only by blaze's tests; the license text is in each of those directories.
+
+Verus (MIT), copyright the Verus contributors: vendor/verus (air, vir, vir_macros, builtin, vstd),
+used by crates/hir-ty-verus; the license text is vendor/verus/LICENSE and vendor/verus/SOURCE.md
+says what blaze changed. The parser's Verus syntax follows verus-analyzer's grammar (MIT OR
+Apache-2.0), copyright the verus-analyzer and rust-analyzer developers.
+
+harness (crates/harness, its own cargo workspace; crates/harness/README.md) carries its own
+licenses: its crates say theirs in their Cargo.toml. Third-party code and data it vendors:
+- Flecs (MIT), copyright Sander Mertens: not copied in, but compiled into the app from the
+  indexable-inc/flecs fork at the rev pinned in crates/harness/vendor/hyperion-flecs-c/Cargo.toml
+  (that comment names the version and the patches); license text is the fork's LICENSE.
+- Inter (SIL OFL 1.1), copyright the Inter Project Authors: crates/harness/harness-native/fonts/inter.
+- JetBrains Mono (SIL OFL 1.1), copyright the JetBrains Mono Project Authors:
+  crates/harness/harness-native/fonts/jetbrains-mono.
+- Symbols Nerd Font (MIT), copyright Ryan L McIntyre: crates/harness/harness-native/fonts/nerd-symbols.
+Each font directory holds its license text.

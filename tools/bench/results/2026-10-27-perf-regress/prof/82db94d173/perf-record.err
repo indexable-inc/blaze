@@ -1,0 +1,4 @@
+[ perf record: Woken up 87 times to write data ]
+[ perf record: Captured and wrote 22.747 MB /root/perf/prof/82db94d173/perf-body.data (127753 samples) ]
+[ perf record: Woken up 6 times to write data ]
+[ perf record: Captured and wrote 2.449 MB /root/perf/prof/82db94d173/perf-noop.data (17634 samples) ]

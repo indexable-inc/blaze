@@ -1,0 +1,319 @@
+{
+ "packages": [
+  {
+   "name": "a",
+   "version": "1.2.3",
+   "id": "path+file://$ROOT/a#1.2.3",
+   "license": "MIT",
+   "license_file": null,
+   "description": "shared",
+   "source": null,
+   "dependencies": [
+    {
+     "name": "b",
+     "source": null,
+     "req": "*",
+     "kind": null,
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null,
+     "path": "$ROOT/b"
+    },
+    {
+     "name": "gitdep",
+     "source": "git+https://github.com/example/gitdep?branch=dev",
+     "req": "*",
+     "kind": null,
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "pinned-real",
+     "source": "git+https://github.com/example/pinned?rev=0123abcd",
+     "req": "*",
+     "kind": null,
+     "rename": "pinned",
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^1",
+     "kind": null,
+     "rename": null,
+     "optional": true,
+     "uses_default_features": true,
+     "features": [
+      "derive",
+      "rc"
+     ],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "tokio",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^1.0",
+     "kind": null,
+     "rename": null,
+     "optional": false,
+     "uses_default_features": false,
+     "features": [
+      "rt"
+     ],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "b",
+     "source": null,
+     "req": "*",
+     "kind": "dev",
+     "rename": "bee",
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null,
+     "path": "$ROOT/b"
+    },
+    {
+     "name": "rand",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^0.8",
+     "kind": "dev",
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "cc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^1.0.80",
+     "kind": "build",
+     "rename": null,
+     "optional": true,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null
+    },
+    {
+     "name": "libc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^0.2",
+     "kind": null,
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": "cfg(unix)",
+     "registry": null
+    },
+    {
+     "name": "cc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index",
+     "req": "^1",
+     "kind": "build",
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": "x86_64-pc-windows-msvc",
+     "registry": null
+    }
+   ],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "crate_types": [
+      "lib"
+     ],
+     "name": "a",
+     "src_path": "$ROOT/a/src/lib.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": true,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "a",
+     "src_path": "$ROOT/a/src/main.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "tool",
+     "src_path": "$ROOT/a/src/bin/tool/main.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "example"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "ex",
+     "src_path": "$ROOT/a/examples/ex.rs",
+     "edition": "2021",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    },
+    {
+     "kind": [
+      "custom-build"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "build-script-build",
+     "src_path": "$ROOT/a/build.rs",
+     "edition": "2021",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    }
+   ],
+   "features": {
+    "default": [
+     "x"
+    ],
+    "serde": [
+     "dep:serde"
+    ],
+    "x": [
+     "serde?/std",
+     "dep:cc"
+    ],
+    "y": [
+     "tokio/macros"
+    ]
+   },
+   "manifest_path": "$ROOT/a/Cargo.toml",
+   "metadata": {
+    "q": {
+     "k": "v",
+     "list": [
+      3,
+      1,
+      2
+     ]
+    }
+   },
+   "publish": [],
+   "authors": [
+    "Ada <ada@example.com>"
+   ],
+   "categories": [
+    "development-tools"
+   ],
+   "keywords": [
+    "one",
+    "two"
+   ],
+   "readme": "../README.md",
+   "repository": "https://example.com/repo",
+   "homepage": "https://example.com",
+   "documentation": "https://docs.example.com",
+   "edition": "2021",
+   "links": "a",
+   "default_run": "a",
+   "rust_version": "1.70"
+  },
+  {
+   "name": "b",
+   "version": "0.1.0",
+   "id": "path+file://$ROOT/b#0.1.0",
+   "license": null,
+   "license_file": null,
+   "description": null,
+   "source": null,
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "crate_types": [
+      "lib"
+     ],
+     "name": "b",
+     "src_path": "$ROOT/b/src/lib.rs",
+     "edition": "2015",
+     "doc": true,
+     "doctest": true,
+     "test": true
+    }
+   ],
+   "features": {},
+   "manifest_path": "$ROOT/b/Cargo.toml",
+   "metadata": null,
+   "publish": null,
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": null,
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2015",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  }
+ ],
+ "workspace_members": [
+  "path+file://$ROOT/a#1.2.3",
+  "path+file://$ROOT/b#0.1.0"
+ ],
+ "workspace_default_members": [
+  "path+file://$ROOT/a#1.2.3",
+  "path+file://$ROOT/b#0.1.0"
+ ],
+ "resolve": null,
+ "target_directory": "$BLAZE_HOME/build/inherit-ID",
+ "build_directory": "$BLAZE_HOME/build/inherit-ID",
+ "version": 1,
+ "workspace_root": "$ROOT",
+ "metadata": {
+  "foo": {
+   "z": 1,
+   "a": 2
+  }
+ }
+}

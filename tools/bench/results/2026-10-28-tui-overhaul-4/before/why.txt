@@ -1,0 +1,4 @@
+the last `blaze build` that compiled anything took 0.10s
+  search (rg): crates/core/main.rs edited
+  steps: building build scripts and proc macros (14/14 steps) 0.07s, compiling rg 0.02s, linking rg 0.00s
+  rg: 2 fns compiled, 31218 kept

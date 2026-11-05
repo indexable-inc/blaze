@@ -1,0 +1,16 @@
+[package]
+name = "rung2"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+futures-util = "0.3"
+futures-core = "0.3"
+tower-http = { version = "=0.6.11", features = ["fs"] }
+http = "1"
+tower = { version = "=0.5.3", features = ["util"] }
+
+[profile.dev]
+debug = 0

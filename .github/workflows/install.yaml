@@ -1,0 +1,246 @@
+name: install
+
+# site/install.sh, run as a user runs it, on each platform it installs on: from the newest release
+# (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
+# `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
+# `--version stable|canary|V`) against the release GitHub says it is. And this commit's build, installed in a Debian
+# container with no Rust at all, which runs `blaze run` in a project written by hand. On a
+# change to the script, on each release once it is published, weekly (a release's assets or
+# GitHub's redirects can change under it) and by hand. Not a check the merge queue requires.
+on:
+  push:
+    branches: [main]
+    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+  pull_request:
+    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+  release:
+    types: [published]
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "a release to install (empty: the newest)"
+        default: ""
+
+permissions:
+  contents: read
+
+# A newer push to the branch or the pull request cancels the run before it; a release, the
+# weekly run and a run by hand each have a group of their own, so nothing cancels or replaces them.
+concurrency:
+  group: install-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+  # The projects built here are new and throwaway, with no committed lock: their builds may
+  # write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+  BLAZE_LOCK: write
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck -s sh site/install.sh
+
+  install:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    env:
+      BLAZE_REPO: ${{ github.repository }}
+      # A release the workflow was started for, or the one just published.
+      BLAZE_VERSION: ${{ inputs.version || (github.event_name == 'release' && github.event.release.tag_name) || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      # Here and not in the job's env, which has no runner context.
+      - name: a CARGO_HOME of its own
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+      # Piped, as the README has it: no terminal, nothing asked. dash is Ubuntu's /bin/sh.
+      - name: install
+        run: sh < site/install.sh
+      - name: what it installed runs
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          # Until a release after the rename (#270), the newest has the programs' old names.
+          test -x "$CARGO_HOME/bin/blaze"
+          test -x "$CARGO_HOME/bin/blaze-engine" || test -x "$CARGO_HOME/bin/ra-jit" # rename: old name
+          for bin in cargo-blaze cargo-ra-jit; do if test -e "$CARGO_HOME/bin/$bin"; then exit 1; fi; done # rename: old name
+          blaze --help | head -n 3
+          blaze toolchain | tee /dev/stderr | grep -F "blaze's toolchain (Rust $(cat harness/toolchain))"
+      - name: again, which upgrades in place
+        run: sh site/install.sh --verbose
+      - name: blaze in a new project
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          cd "$RUNNER_TEMP"
+          blaze new --quiet hello
+          cd hello
+          blaze build
+          blaze run | grep -F "Hello, world!"
+          blaze stop
+      - name: a release that is not there says so
+        run: |
+          if sh site/install.sh --version 0.0.0-none > out.txt 2>&1; then cat out.txt; exit 1; fi
+          cat out.txt
+          grep -F "there is no blaze release 0.0.0-none" out.txt
+      # The channels (docs/release.md), each against the release GitHub's API says it is:
+      # stable is the latest release, canary the newest dated one, prerelease or not. Without
+      # the toolchain: what is checked is which release came.
+      - name: channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export PATH="$CARGO_HOME/bin:$PATH"
+          stable=$(gh release view -R "$BLAZE_REPO" --json tagName -q .tagName)
+          canary=$(gh release list -R "$BLAZE_REPO" --limit 100 --json tagName -q '.[].tagName' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          echo "stable $stable, canary v$canary"
+          # installs VERSION SAID COMMAND...: the command installs VERSION and says SAID.
+          installs() {
+            version="$1"; said="$2"; shift 2
+            env -u BLAZE_VERSION "$@" > out.txt 2>&1 || { cat out.txt; exit 1; }
+            cat out.txt
+            grep -Fx "$said is installed." out.txt
+            blaze --version | tee /dev/stderr | grep -F "blaze $version " > /dev/null
+          }
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel stable
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --version stable
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --channel canary
+          installs "$canary" "blaze $canary (canary)" env BLAZE_CHANNEL=canary sh site/install.sh --no-toolchain
+          installs "$canary" "blaze $canary (canary)" sh site/install.sh --no-toolchain --version canary
+          # A version is that release, whatever the channel.
+          installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel canary --version "$stable"
+          if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
+          grep -F "blaze has no channel nightly." out.txt
+
+  # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
+  # the glibc a release asks for, and with no PGO,
+  # as release.yaml builds it: with a profile older than the crates the build sat silent past
+  # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
+  # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
+  archive:
+    name: this commit's build
+    runs-on: ubuntu-22.04
+    # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+      # The release's own recipe, and the recipe is what it checks: the stage 0
+      # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
+      # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
+      - uses: ./.github/actions/blaze
+        with:
+          job: install-archive
+          llvm: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - run: |
+          uv run --frozen --no-dev python .github/scripts/build_release.py \
+            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+        timeout-minutes: 300
+      - name: archive
+        run: |
+          name=blaze-commit-x86_64-unknown-linux-gnu
+          mkdir "$name"
+          cp shipped/* "$name/"
+          "$name/blaze" --version
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive
+          path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+
+  # A machine with no Rust: blaze brings its own, and the first `blaze run` prints the program's
+  # output. The time is from the start of install.sh to that output. On the oldest systems a
+  # release runs on (RHEL 9's glibc is the floor build_release.py checks) and the newest Debian.
+  no-rust:
+    name: no Rust installed, ${{ matrix.system }}
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { system: Debian 13, image: "debian:trixie-slim", packages: apt }
+          - { system: Debian 12, image: "debian:bookworm-slim", packages: apt }
+          - { system: Ubuntu 22.04, image: "ubuntu:22.04", packages: apt }
+          - { system: RHEL 9, image: "registry.access.redhat.com/ubi9/ubi", packages: dnf }
+    container: ${{ matrix.image }}
+    # As in `docker run`: the runner's /github/home belongs to its own user, and the daemon
+    # keeps nothing in a directory another user can replace things in.
+    env:
+      HOME: /root
+    steps:
+      - if: matrix.packages == 'apt'
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates gcc libc6-dev
+      - if: matrix.packages == 'dnf'
+        run: dnf install -y -q gcc tar gzip && dnf clean all
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: archive
+      - name: no rustup, cargo or rustc
+        run: |
+          for tool in rustup cargo rustc; do
+            if command -v "$tool"; then echo "::error::$tool is on PATH"; exit 1; fi
+          done
+      - name: install, then blaze run in a project written by hand
+        shell: sh
+        run: |
+          set -eu
+          began=$(date +%s.%N)
+          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < site/install.sh
+          export PATH="$HOME/.cargo/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/hello/src"
+          cd "$RUNNER_TEMP/hello"
+          printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n' > Cargo.toml
+          printf 'fn main() {\n    println!("Hello, world!");\n}\n' > src/main.rs
+          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
+          ended=$(date +%s.%N)
+          cat err.txt out.txt
+          grep -Fx "Hello, world!" out.txt
+          if grep -e "blaze: bug:" -e "the daemon has no part" err.txt; then
+            echo "::error::the build was not blaze's"; exit 1
+          fi
+          echo "${{ matrix.system }}, from install.sh to Hello, world!: $(echo "$ended - $began" | awk '{ printf "%.1f s", $1 - $3 }')" | tee -a "$GITHUB_STEP_SUMMARY"
+          du -sh "$HOME/.blaze/toolchains" "$HOME/.cargo/bin" | tee -a "$GITHUB_STEP_SUMMARY"
+          for tool in rustup cargo rustc; do
+            if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
+          done
+          blaze stop
+      # A derive from crates.io: blaze builds it and expands it in process on its own evaluator
+      # (blaze-macro-eval), on this system's glibc; an edit after is the daemon's.
+      - name: proc macros, by blaze's evaluator
+        shell: sh
+        run: |
+          set -eu
+          export PATH="$HOME/.cargo/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/derive/src"
+          cd "$RUNNER_TEMP/derive"
+          printf '[package]\nname = "derive"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\n' > Cargo.toml
+          printf '#[derive(serde::Serialize)]\nstruct Point {\n    x: i32,\n}\n\nfn serializable<T: serde::Serialize>(_: &T) -> &str {\n    "derived"\n}\n\nfn main() {\n    println!("{} {}", serializable(&Point { x: 1 }), 1);\n}\n' > src/main.rs
+          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
+          cat err.txt out.txt
+          grep -Fx "derived 1" out.txt
+          sed -i 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs
+          blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
+          cat err.txt out.txt
+          grep -Fx "derived 2" out.txt
+          if grep -e "blaze: bug:" -e "the daemon has no part" -e "did not make the proc macro" err.txt; then
+            echo "::error::the proc macros were not blaze's"; exit 1
+          fi
+          blaze stop

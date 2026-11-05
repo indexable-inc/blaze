@@ -1,0 +1,220 @@
+//! A chat session's transcript, read from the daemon's agent-neutral chat events (harness/src/chat/mod.rs has the
+//! model): one JSON object a line, `ev` naming it. The attach replays the whole conversation, then streams what comes;
+//! partials (`block_start`, `delta`, `tool_start`, `tool_delta`) grow an item, and the final (`block`, `tool_call`)
+//! replaces what they grew. Nothing here knows which agent wrote it.
+use std::collections::HashMap;
+
+use serde_json::Value;
+
+/// One thing the transcript shows, in the order it happened.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Item {
+    /// What the person sent.
+    User { text: String },
+    /// The agent's words (markdown), streaming until `done`.
+    Text { block: String, text: String, done: bool },
+    /// The agent's reasoning, streaming until `done`.
+    Thinking { block: String, text: String, done: bool },
+    /// A tool call: its name, its input (JSON; partial text while it streams) and, once it came, its result.
+    Tool { block: String, name: String, input: Value, partial: String, result: Option<ToolResult>, done: bool },
+    /// Something said about the conversation (it was interrupted).
+    Note { text: String },
+    /// The agent failed.
+    Error { text: String },
+    /// A turn ended: how (`end_turn`, `interrupted`, `error`), how long it took and what it cost.
+    TurnEnd { ok: bool, stop: String, duration_ms: Option<u64>, cost_usd: Option<f64> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolResult {
+    pub text: String,
+    pub error: bool,
+}
+
+/// A session's transcript and what the status line shows.
+#[derive(Debug, Default)]
+pub struct Transcript {
+    pub items: Vec<Item>,
+    /// A turn is in flight.
+    pub busy: bool,
+    pub agent: String,
+    pub model: String,
+    /// Moves on every change (what the view redraws on).
+    pub rev: u64,
+    /// The item each block id is, for its deltas and its final form.
+    at: HashMap<String, usize>,
+    /// Bytes of a line not finished yet.
+    buf: Vec<u8>,
+}
+
+impl Transcript {
+    /// Bytes of the attach stream: whole lines are applied, a part line waits for the rest.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        let mut start = 0;
+        while let Some(n) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let line = &self.buf[start..start + n];
+            if let Ok(v) = serde_json::from_slice::<Value>(line) {
+                self.apply(&v);
+            }
+            start += n + 1;
+        }
+        self.buf.drain(..start);
+    }
+
+    fn push(&mut self, block: &str, item: Item) {
+        if !block.is_empty() {
+            self.at.insert(block.to_owned(), self.items.len());
+        }
+        self.items.push(item);
+    }
+
+    fn get(&mut self, block: &str) -> Option<&mut Item> {
+        let i = *self.at.get(block)?;
+        self.items.get_mut(i)
+    }
+
+    /// One event.
+    pub fn apply(&mut self, v: &Value) {
+        let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+        let block = s("block");
+        self.rev = self.rev.wrapping_add(1);
+        match v["ev"].as_str().unwrap_or("") {
+            "session" => {
+                self.agent = s("agent");
+                self.model = s("model");
+            }
+            "user" => self.push("", Item::User { text: s("text") }),
+            "busy" => self.busy = v["busy"].as_bool().unwrap_or(false),
+            "block_start" => {
+                let item = if v["kind"] == "thinking" {
+                    Item::Thinking { block: block.clone(), text: String::new(), done: false }
+                } else {
+                    Item::Text { block: block.clone(), text: String::new(), done: false }
+                };
+                self.push(&block, item);
+            }
+            "delta" => match self.get(&block) {
+                Some(Item::Text { text, done: false, .. } | Item::Thinking { text, done: false, .. }) => {
+                    text.push_str(v["text"].as_str().unwrap_or(""));
+                }
+                _ => {}
+            },
+            "block" => {
+                let (kind, text) = (s("kind"), s("text"));
+                let item = if kind == "thinking" {
+                    Item::Thinking { block: block.clone(), text, done: true }
+                } else {
+                    Item::Text { block: block.clone(), text, done: true }
+                };
+                match self.at.get(&block).copied() {
+                    Some(i) => self.items[i] = item,
+                    None => self.push(&block, item),
+                }
+            }
+            "tool_start" => {
+                let item = Item::Tool {
+                    block: block.clone(),
+                    name: s("name"),
+                    input: Value::Null,
+                    partial: String::new(),
+                    result: None,
+                    done: false,
+                };
+                self.push(&block, item);
+            }
+            "tool_delta" => {
+                if let Some(Item::Tool { partial, done: false, .. }) = self.get(&block) {
+                    partial.push_str(v["json"].as_str().unwrap_or(""));
+                }
+            }
+            "tool_call" => {
+                let (name, input) = (s("name"), v["input"].clone());
+                match self.get(&block) {
+                    Some(Item::Tool { name: n, input: i, done, .. }) => {
+                        *n = name;
+                        *i = input;
+                        *done = true;
+                    }
+                    _ => self.push(
+                        &block,
+                        Item::Tool { block: block.clone(), name, input, partial: String::new(), result: None, done: true },
+                    ),
+                }
+            }
+            "tool_result" => {
+                let r = ToolResult { text: s("text"), error: v["error"].as_bool().unwrap_or(false) };
+                match self.get(&block) {
+                    Some(Item::Tool { result, .. }) => *result = Some(r),
+                    _ => self.push("", Item::Note { text: r.text }),
+                }
+            }
+            "note" => self.push("", Item::Note { text: s("text") }),
+            "error" => self.push("", Item::Error { text: s("text") }),
+            "turn_end" => {
+                // A turn's partials that never came whole (the agent died mid-block) stop streaming.
+                for it in &mut self.items {
+                    match it {
+                        Item::Text { done, .. } | Item::Thinking { done, .. } | Item::Tool { done, .. } => *done = true,
+                        _ => {}
+                    }
+                }
+                self.push(
+                    "",
+                    Item::TurnEnd {
+                        ok: v["ok"].as_bool().unwrap_or(false),
+                        stop: s("stop"),
+                        duration_ms: v["duration_ms"].as_u64(),
+                        cost_usd: v["cost_usd"].as_f64(),
+                    },
+                );
+            }
+            _ => self.rev = self.rev.wrapping_sub(1),
+        }
+    }
+}
+
+/// A tool call's main argument, as one line: what a person reads first (a command, a path, the code's first line).
+#[must_use]
+pub fn main_arg(input: &Value) -> String {
+    let first = ["command", "code", "file_path", "path", "pattern", "query", "url", "prompt", "description"]
+        .iter()
+        .find_map(|k| input[*k].as_str())
+        .map(str::to_owned)
+        .or_else(|| input.as_object().and_then(|o| o.values().find_map(|v| v.as_str().map(str::to_owned))))
+        .unwrap_or_default();
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partials_grow_and_the_final_replaces_them() {
+        let mut t = Transcript::default();
+        let lines = [
+            r#"{"ev":"user","text":"hi"}"#,
+            r#"{"ev":"busy","busy":true}"#,
+            r#"{"ev":"block_start","block":"m:0","kind":"text"}"#,
+            r#"{"ev":"delta","block":"m:0","text":"Hel"}"#,
+            r#"{"ev":"delta","block":"m:0","text":"lo"}"#,
+            r#"{"ev":"tool_start","block":"t1","name":"ts"}"#,
+            r#"{"ev":"block","block":"m:0","kind":"text","text":"Hello!"}"#,
+            r#"{"ev":"tool_call","block":"t1","name":"ts","input":{"code":"1+1"}}"#,
+            r#"{"ev":"tool_result","block":"t1","text":"2","error":false}"#,
+            r#"{"ev":"turn_end","ok":true,"stop":"end_turn","duration_ms":1200,"cost_usd":0.01}"#,
+            r#"{"ev":"busy","busy":false}"#,
+        ];
+        let all = lines.join("\n") + "\n";
+        // Fed in two pieces cut mid-line.
+        let (a, b) = all.as_bytes().split_at(57);
+        t.feed(a);
+        t.feed(b);
+        assert_eq!(t.items.len(), 4);
+        assert_eq!(t.items[1], Item::Text { block: "m:0".into(), text: "Hello!".into(), done: true });
+        assert!(matches!(&t.items[2], Item::Tool { result: Some(r), done: true, .. } if r.text == "2"));
+        assert!(!t.busy);
+        assert_eq!(main_arg(&serde_json::json!({"code": "1 +\n 1"})), "1 + 1");
+    }
+}

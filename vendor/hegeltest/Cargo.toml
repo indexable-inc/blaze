@@ -1,0 +1,43 @@
+# hegeltest 0.50.3 from indexable-inc/hegel cae7cfa192 (frontends/rust), trimmed for blaze:
+# vendor/hegeltest/SOURCE.md lists what was left out and why.
+[package]
+name = "hegeltest"
+version = "0.50.3"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/indexable-inc/hegel"
+homepage = "http://hegel.dev"
+description = "Property-based testing for Rust, built on Hypothesis"
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+[lib]
+name = "hegel"
+
+[dependencies]
+parking_lot = "0.12"
+hegeltest-macros = { version = "=0.50.3", path = "../hegeltest-macros" }
+hegeltest-c = { version = "=0.48.0", path = "../hegeltest-c", default-features = false, optional = true }
+# optional feature dependencies
+serde_json = { version = "1.0.61", optional = true }
+rand = { version = "0.10", optional = true }
+chrono = { version = "0.4.41", default-features = false, features = ["std"], optional = true }
+jiff = { version = "0.2", default-features = false, features = ["std"], optional = true }
+
+[features]
+default = []
+rand = ["dep:rand"]
+chrono = ["dep:chrono"]
+jiff = ["dep:jiff"]
+serde_json = ["dep:serde_json"]
+serde_json_raw_value = ["serde_json", "serde_json/raw_value"]
+# The only engine mode blaze builds: the engine linked as a Rust dependency.
+static-engine = ["dep:hegeltest-c", "hegeltest-c/std"]

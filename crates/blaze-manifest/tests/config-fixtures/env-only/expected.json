@@ -1,0 +1,140 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "# The following environment variables may affect the loaded values.\n# CARGO_BUILD_TARGET=wasm32-unknown-unknown\n# CARGO_FOO_BAR=1\n# CARGO_FOO_BAZ_QUX='x y'\n# CARGO_HOME=$CARGO_HOME\n# CARGO_PROFILE_DEV_OPT_LEVEL=s\n# CARGO_TERM_VERBOSE=false\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# The following environment variables may affect the loaded values.\n# CARGO_BUILD_TARGET=wasm32-unknown-unknown\n# CARGO_FOO_BAR=1\n# CARGO_FOO_BAZ_QUX='x y'\n# CARGO_HOME=$CARGO_HOME\n# CARGO_PROFILE_DEV_OPT_LEVEL=s\n# CARGO_TERM_VERBOSE=false\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_BUILD_TARGET=wasm32-unknown-unknown\n# CARGO_FOO_BAR=1\n# CARGO_FOO_BAZ_QUX='x y'\n# CARGO_HOME=$CARGO_HOME\n# CARGO_PROFILE_DEV_OPT_LEVEL=s\n# CARGO_TERM_VERBOSE=false\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_BUILD_TARGET=wasm32-unknown-unknown\n# CARGO_FOO_BAR=1\n# CARGO_FOO_BAZ_QUX='x y'\n# CARGO_HOME=$CARGO_HOME\n# CARGO_PROFILE_DEV_OPT_LEVEL=s\n# CARGO_TERM_VERBOSE=false\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_BUILD_TARGET=wasm32-unknown-unknown\nCARGO_FOO_BAR=1\nCARGO_FOO_BAZ_QUX='x y'\nCARGO_HOME=$CARGO_HOME\nCARGO_PROFILE_DEV_OPT_LEVEL=s\nCARGO_TERM_VERBOSE=false\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_BUILD_TARGET=wasm32-unknown-unknown\nCARGO_FOO_BAR=1\nCARGO_FOO_BAZ_QUX='x y'\nCARGO_HOME=$CARGO_HOME\nCARGO_PROFILE_DEV_OPT_LEVEL=s\nCARGO_TERM_VERBOSE=false\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "foo"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: config value `foo` is not set\n"
+ },
+ {
+  "args": [
+   "foo.bar"
+  ],
+  "code": 0,
+  "stdout": "foo.bar = 1\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "foo.baz-qux"
+  ],
+  "code": 0,
+  "stdout": "foo.baz-qux = \"x y\"\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "build.target"
+  ],
+  "code": 0,
+  "stdout": "build.target = \"wasm32-unknown-unknown\"\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "build"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: config value `build` is not set\n"
+ },
+ {
+  "args": [
+   "profile.dev.opt-level",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "profile.dev.opt-level = \"s\" # environment variable `CARGO_PROFILE_DEV_OPT_LEVEL`\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "term.verbose"
+  ],
+  "code": 0,
+  "stdout": "term.verbose = false\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "foo"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: config value `foo` is not set\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value",
+   "foo.bar"
+  ],
+  "code": 0,
+  "stdout": "1\n",
+  "stderr": ""
+ }
+]

@@ -1,0 +1,30 @@
+the last `blaze build` that compiled anything took 32.5s
+  compiled nothing again
+  steps:
+    workspace                   0.41s  0.0/8 cores
+    std of build scripts        11.8s  4.0/8 cores
+    build scripts 14/14 steps   3.76s  2.8/8 cores
+    workspace                   0.07s  0.0/8 cores
+    names 56/56 crates          0.71s  2.1/8 cores
+    store the resolved names    0.03s  2.9/8 cores
+    std                         9.27s  3.1/8 cores
+    codegen rg                  3.87s  4.9/8 cores
+    check 74 files              0.31s  1.9/8 cores
+    link rg                     0.11s  2.8/8 cores
+    store the manifest          1.84s  1.0/8 cores
+    at no step                  0.08s  0.0/8 cores
+    build scripts 14/14 steps   0.08s  0.0/8 cores
+  cache: cold (the store is empty); 31256 compiled
+  regex_automata: 7318 fns compiled, 0 kept, busy 3.52s
+  std: 6275 fns compiled, 0 kept, busy 3.73s
+  rg: 5290 fns compiled, 0 kept, busy 4.29s
+  regex_syntax: 3368 fns compiled, 0 kept, busy 3.41s
+  aho_corasick: 2085 fns compiled, 0 kept, busy 3.24s
+  ignore: 1912 fns compiled, 0 kept, busy 3.79s
+  grep_printer: 940 fns compiled, 0 kept, busy 3.91s
+  globset: 499 fns compiled, 0 kept, busy 3.76s
+  anyhow: 411 fns compiled, 0 kept, busy 3.66s
+  serde_json: 396 fns compiled, 0 kept, busy 3.44s
+  grep_cli: 380 fns compiled, 0 kept, busy 3.63s
+  walkdir: 343 fns compiled, 0 kept, busy 3.55s
+  and 23 more crates (18 of them compiled something)

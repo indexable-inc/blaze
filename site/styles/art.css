@@ -1,0 +1,18 @@
+/* The goals' drawings (Art in content/schema.flecs, drawn by client/art.ts): a band of pixel cells in the page's own
+   inks, on the page's background. art.ts reads these tokens, so a theme change only touches them. The one accent is
+   the fire logo's orange (docs/brand/fire/gen.py, the dark and the light palette), for the one cell that matters. */
+.art {
+	--art-ink: var(--ink-1);
+	--art-mid: var(--ink-3);
+	--art-faint: var(--ink-4);
+	--art-fire: #e0461a;
+	height: 176px;
+	margin: 2px 0 14px;
+}
+.art canvas { display: block; width: 100%; height: 100%; }
+@media (prefers-color-scheme: light) {
+	.art { --art-fire: #d63c12; }
+}
+@media (max-width: 520px) {
+	.art { height: 160px; }
+}

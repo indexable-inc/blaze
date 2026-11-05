@@ -1,0 +1,7 @@
+total 4
+drwx------ 3 root root 102 Oct 27 23:36 .
+drwxr-xr-x 5 root root  76 Oct 27 23:36 ..
+-rw------- 1 root root 260 Oct 27 23:36 daemon.log
+srw------- 1 root root   0 Oct 27 23:36 daemon.sock
+-rw------- 1 root root   0 Oct 27 23:36 daemon.sock.lock
+drwx------ 3 root root  38 Oct 27 23:36 workers

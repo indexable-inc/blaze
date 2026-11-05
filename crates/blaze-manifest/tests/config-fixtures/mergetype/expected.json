@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to merge configuration at `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to merge key `build` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge key `rustflags` between $ROOT/inner/.cargo/config.toml and $ROOT/.cargo/config.toml\n\nCaused by:\n  failed to merge config value from `$ROOT/.cargo/config.toml` into `$ROOT/inner/.cargo/config.toml`: expected array, but found string\n"
+ }
+]

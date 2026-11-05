@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  expected a list of strings or a list of tables, but found integer at `include` in `$ROOT/.cargo/config.toml\n"
+ }
+]

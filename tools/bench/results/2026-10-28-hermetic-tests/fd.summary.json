@@ -1,0 +1,405 @@
+{
+  "v": 1,
+  "tests": 237,
+  "hermetic": 24,
+  "not_hermetic": 213,
+  "cached": {
+    "hit": 24,
+    "never": 213
+  },
+  "results": {
+    "cached": 24,
+    "passed": 213
+  },
+  "by_kind": {
+    "env": 103,
+    "ffi": 213,
+    "fs": 103,
+    "global-state": 187,
+    "indirect": 102,
+    "process": 102
+  },
+  "top_reasons": [
+    {
+      "kind": "ffi",
+      "what": "syscall",
+      "tests": 195,
+      "example": "fd-find bin:fd exec::tests::command_set_no_args"
+    },
+    {
+      "kind": "env",
+      "what": "getenv",
+      "tests": 102,
+      "example": "fd-find bin:fd filter::time::tests::is_time_filter_applicable"
+    },
+    {
+      "kind": "indirect",
+      "what": "getrandom::backends::linux_android_with_fallback::fill_inner",
+      "tests": 102,
+      "example": "fd-find test:tests format"
+    },
+    {
+      "kind": "process",
+      "what": "posix_spawnp",
+      "tests": 102,
+      "example": "fd-find test:tests format"
+    },
+    {
+      "kind": "global-state",
+      "what": "getrandom::backends::linux_android_with_fallback::GETRANDOM_FN",
+      "tests": 100,
+      "example": "fd-find test:tests format"
+    },
+    {
+      "kind": "global-state",
+      "what": "regex_automata::util::pool::inner::COUNTER",
+      "tests": 84,
+      "example": "fd-find bin:fd filter::size::tests::byte_minus"
+    },
+    {
+      "kind": "fs",
+      "what": "getcwd",
+      "tests": 74,
+      "example": "fd-find test:tests format"
+    },
+    {
+      "kind": "fs",
+      "what": "realpath",
+      "tests": 12,
+      "example": "fd-find test:tests test_absolute_path"
+    },
+    {
+      "kind": "ffi",
+      "what": "sysconf",
+      "tests": 11,
+      "example": "fd-find bin:fd filter::owner::owner_parsing::both_negate"
+    },
+    {
+      "kind": "fs",
+      "what": "open64",
+      "tests": 11,
+      "example": "fd-find bin:fd filter::time::tests::is_time_filter_applicable"
+    },
+    {
+      "kind": "ffi",
+      "what": "getuid",
+      "tests": 3,
+      "example": "fd-find test:tests test_owner_current_user"
+    },
+    {
+      "kind": "ffi",
+      "what": "utimensat",
+      "tests": 2,
+      "example": "fd-find test:tests test_modified_absolute"
+    },
+    {
+      "kind": "fs",
+      "what": "mkdir",
+      "tests": 2,
+      "example": "fd-find test:tests test_invalid_cwd"
+    },
+    {
+      "kind": "fs",
+      "what": "unlink",
+      "tests": 2,
+      "example": "fd-find test:tests test_modified_absolute"
+    },
+    {
+      "kind": "global-state",
+      "what": "filetime::imp::linux::INVALID",
+      "tests": 2,
+      "example": "fd-find test:tests test_modified_absolute"
+    },
+    {
+      "kind": "env",
+      "what": "environ",
+      "tests": 1,
+      "example": "fd-find test:tests test_invalid_cwd"
+    },
+    {
+      "kind": "ffi",
+      "what": "getgid",
+      "tests": 1,
+      "example": "fd-find test:tests test_owner_current_group"
+    },
+    {
+      "kind": "ffi",
+      "what": "gethostname",
+      "tests": 1,
+      "example": "fd-find test:tests test_hyperlink"
+    },
+    {
+      "kind": "fs",
+      "what": "rmdir",
+      "tests": 1,
+      "example": "fd-find test:tests test_respect_ignore_files"
+    },
+    {
+      "kind": "fs",
+      "what": "statx",
+      "tests": 1,
+      "example": "fd-find test:tests test_file_system_boundaries"
+    },
+    {
+      "kind": "global-state",
+      "what": "jiff::tz::system::CACHE",
+      "tests": 1,
+      "example": "fd-find bin:fd filter::time::tests::is_time_filter_applicable"
+    }
+  ],
+  "top_helpers": [
+    {
+      "fn": "std::sys::sync::futex::unix::futex_wait",
+      "file": "std/src/sys/sync/futex/unix.rs",
+      "line": 75,
+      "col": 21,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 97,
+      "only_through_it": 15
+    },
+    {
+      "fn": "nix::unistd::sysconf",
+      "file": "src/unistd.rs",
+      "line": 3172,
+      "col": 9,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 11,
+      "only_through_it": 11
+    },
+    {
+      "fn": "<std::sys::process::unix::common::Command>::posix_spawn",
+      "file": "std/src/sys/process/unix/unix.rs",
+      "line": 783,
+      "col": 28,
+      "kinds": [
+        "process"
+      ],
+      "tests": 102,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `std::sys::env::unix::getenv",
+      "file": "std/src/sys/env/unix.rs",
+      "line": 117,
+      "col": 26,
+      "kinds": [
+        "env"
+      ],
+      "tests": 102,
+      "only_through_it": 0
+    },
+    {
+      "fn": "getrandom::fill_uninit",
+      "file": "src/lib.rs",
+      "line": 99,
+      "col": 9,
+      "kinds": [
+        "indirect"
+      ],
+      "tests": 102,
+      "only_through_it": 0
+    },
+    {
+      "fn": "getrandom::backends::linux_android_with_fallback::init",
+      "file": "src/backends/linux_android_with_fallback.rs",
+      "line": 68,
+      "col": 5,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 100,
+      "only_through_it": 0
+    },
+    {
+      "fn": "regex_automata::util::pool::inner::THREAD_ID::__rust_std_internal_init_fn",
+      "file": "src/util/pool.rs",
+      "line": 336,
+      "col": 24,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 84,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::sync::futex::unix::futex_wake",
+      "file": "std/src/sys/sync/futex/unix.rs",
+      "line": 109,
+      "col": 14,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 84,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::paths::unix::getcwd",
+      "file": "std/src/sys/paths/unix.rs",
+      "line": 27,
+      "col": 17,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 74,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::try_statx::statx",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 157,
+      "col": 9,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 14,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::canonicalize",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2136,
+      "col": 22,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 12,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::File>::open_c",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1244,
+      "col": 36,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 11,
+      "only_through_it": 0
+    },
+    {
+      "fn": "nix::unistd::getuid",
+      "file": "src/unistd.rs",
+      "line": 1746,
+      "col": 18,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 3,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::DirBuilder>::mkdir",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1732,
+      "col": 49,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 2,
+      "only_through_it": 0
+    },
+    {
+      "fn": "filetime::imp::linux::set_times",
+      "file": "src/unix/linux.rs",
+      "line": 101,
+      "col": 9,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 2,
+      "only_through_it": 0
+    },
+    {
+      "fn": "filetime::imp::linux::set_times",
+      "file": "src/unix/linux.rs",
+      "line": 104,
+      "col": 27,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 2,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::unlink",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1887,
+      "col": 18,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 2,
+      "only_through_it": 0
+    },
+    {
+      "fn": "jiff::tz::system::get",
+      "file": "src/tz/system/mod.rs",
+      "line": 119,
+      "col": 21,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "nix::unistd::getgid",
+      "file": "src/unistd.rs",
+      "line": 1766,
+      "col": 18,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "nix::unistd::gethostname",
+      "file": "src/unistd.rs",
+      "line": 1330,
+      "col": 24,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::env::unix::environ",
+      "file": "std/src/sys/env/unix.rs",
+      "line": 62,
+      "col": 14,
+      "kinds": [
+        "env"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::rmdir",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2039,
+      "col": 18,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::try_statx::statx",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 158,
+      "col": 16,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    }
+  ]
+}

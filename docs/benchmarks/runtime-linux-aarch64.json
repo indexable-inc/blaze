@@ -1,0 +1,1119 @@
+{
+ "toolchain": "1.99.0",
+ "commit": "e8d8a63da4",
+ "date": "2026-10-23T20:44:16Z",
+ "host": {
+  "name": "AWS c8g.8xlarge (Graviton4), pinned to 16 cores with taskset",
+  "cpu": "Neoverse-V2",
+  "cores": 16,
+  "machine_cores": 32,
+  "load": "10.9, 9.0, 6.3",
+  "memory_gib": 62,
+  "os": "Linux",
+  "arch": "aarch64",
+  "kernel": "6.18.53",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "cc": "gcc (GCC) 16.2.0",
+  "ld": "GNU ld (GNU Binutils) 2.46",
+  "llvm": "20.1.8",
+  "incremental": "profile default (on for dev)",
+  "wrapper": null,
+  "linker": "the toolchain's default (cc)",
+  "library_dirs": 72
+ },
+ "runbench": {
+  "builds": [
+   "release",
+   "checked",
+   "blaze"
+  ],
+  "variants": {},
+  "programs": {
+   "kernels": {
+    "builds": {
+     "release": {
+      "build_s": 0.5,
+      "build_peak_mb": 187,
+      "build_largest_mb": 169,
+      "size_mb": 0.55
+     },
+     "checked": {
+      "build_s": 0.5,
+      "build_peak_mb": 189,
+      "build_largest_mb": 173,
+      "size_mb": 0.56
+     },
+     "blaze": {
+      "build_s": 4.5,
+      "cargo_s": 0.4,
+      "blaze_s": 3.8,
+      "link_s": 0.2,
+      "compiled": 10,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 1480,
+      "build_largest_mb": 1450,
+      "size_mb": 0.55
+     }
+    },
+    "benches": {
+     "sieve": {
+      "release": {
+       "median_s": 0.0503,
+       "ratio": 1.0,
+       "runs": [
+        0.05,
+        0.0502,
+        0.0499,
+        0.0512,
+        0.0485,
+        0.0493,
+        0.0516,
+        0.0527,
+        0.0505,
+        0.0528
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.0507,
+       "ratio": 1.008,
+       "runs": [
+        0.0494,
+        0.051,
+        0.0541,
+        0.0505,
+        0.0529,
+        0.0505,
+        0.0505,
+        0.0518,
+        0.0485,
+        0.0511
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.0539,
+       "ratio": 1.071,
+       "runs": [
+        0.054,
+        0.0538,
+        0.0537,
+        0.0513,
+        0.0521,
+        0.0555,
+        0.0555,
+        0.0562,
+        0.0545,
+        0.052
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "collatz": {
+      "release": {
+       "median_s": 0.1054,
+       "ratio": 1.0,
+       "runs": [
+        0.1054,
+        0.1054,
+        0.1053,
+        0.1054,
+        0.1054,
+        0.1055,
+        0.1055,
+        0.1054,
+        0.1054,
+        0.1053
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.2018,
+       "ratio": 1.914,
+       "runs": [
+        0.2016,
+        0.2017,
+        0.2015,
+        0.2016,
+        0.2016,
+        0.2019,
+        0.202,
+        0.2021,
+        0.2021,
+        0.2019
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.1054,
+       "ratio": 1.0,
+       "runs": [
+        0.1054,
+        0.1054,
+        0.1054,
+        0.1054,
+        0.1054,
+        0.1054,
+        0.1051,
+        0.1048,
+        0.1054,
+        0.1055
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "fnv": {
+      "release": {
+       "median_s": 0.0713,
+       "ratio": 1.0,
+       "runs": [
+        0.0713,
+        0.0714,
+        0.0713,
+        0.0713,
+        0.0714,
+        0.0715,
+        0.0713,
+        0.0713,
+        0.0714,
+        0.0713
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.0714,
+       "ratio": 1.0,
+       "runs": [
+        0.0714,
+        0.0715,
+        0.0714,
+        0.0713,
+        0.0713,
+        0.0714,
+        0.0714,
+        0.0714,
+        0.0714,
+        0.0713
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.0723,
+       "ratio": 1.013,
+       "runs": [
+        0.0724,
+        0.0723,
+        0.0724,
+        0.0723,
+        0.0713,
+        0.0723,
+        0.0723,
+        0.0723,
+        0.0723,
+        0.0723
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "qsort": {
+      "release": {
+       "median_s": 0.1983,
+       "ratio": 1.0,
+       "runs": [
+        0.1983,
+        0.1984,
+        0.1982,
+        0.1985,
+        0.1986,
+        0.1983,
+        0.1983,
+        0.1986,
+        0.1981,
+        0.1981
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.2097,
+       "ratio": 1.057,
+       "runs": [
+        0.2099,
+        0.2096,
+        0.2098,
+        0.2096,
+        0.2096,
+        0.2098,
+        0.2097,
+        0.2096,
+        0.21,
+        0.2095
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.2148,
+       "ratio": 1.083,
+       "runs": [
+        0.215,
+        0.2149,
+        0.2146,
+        0.215,
+        0.2148,
+        0.2148,
+        0.215,
+        0.2149,
+        0.2146,
+        0.2147
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "matmul": {
+      "release": {
+       "median_s": 0.0279,
+       "ratio": 1.0,
+       "runs": [
+        0.028,
+        0.0282,
+        0.028,
+        0.0279,
+        0.0279,
+        0.0278,
+        0.0279,
+        0.0278,
+        0.0279,
+        0.028
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.0279,
+       "ratio": 0.999,
+       "runs": [
+        0.028,
+        0.028,
+        0.028,
+        0.0279,
+        0.0279,
+        0.0279,
+        0.0279,
+        0.0279,
+        0.0279,
+        0.0279
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.0292,
+       "ratio": 1.045,
+       "runs": [
+        0.0293,
+        0.0289,
+        0.0307,
+        0.0291,
+        0.0288,
+        0.0288,
+        0.0293,
+        0.0296,
+        0.0286,
+        0.039
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "nbody": {
+      "release": {
+       "median_s": 0.0359,
+       "ratio": 1.0,
+       "runs": [
+        0.036,
+        0.036,
+        0.0359,
+        0.0359,
+        0.0359,
+        0.0359,
+        0.0359,
+        0.036,
+        0.0359,
+        0.0359
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.036,
+       "ratio": 1.001,
+       "runs": [
+        0.036,
+        0.036,
+        0.036,
+        0.036,
+        0.0359,
+        0.036,
+        0.036,
+        0.0359,
+        0.036,
+        0.0359
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.0374,
+       "ratio": 1.04,
+       "runs": [
+        0.0374,
+        0.0374,
+        0.0374,
+        0.0373,
+        0.0373,
+        0.0374,
+        0.0373,
+        0.0374,
+        0.0373,
+        0.0373
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "mandelbrot": {
+      "release": {
+       "median_s": 0.2695,
+       "ratio": 1.0,
+       "runs": [
+        0.2695,
+        0.2695,
+        0.2694,
+        0.2695,
+        0.2695,
+        0.2695,
+        0.2694,
+        0.2695,
+        0.2694,
+        0.2694
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.2694,
+       "ratio": 1.0,
+       "runs": [
+        0.2694,
+        0.2693,
+        0.2694,
+        0.2694,
+        0.2694,
+        0.2694,
+        0.2694,
+        0.2694,
+        0.2694,
+        0.2694
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.2693,
+       "ratio": 0.999,
+       "runs": [
+        0.2693,
+        0.2694,
+        0.2693,
+        0.2694,
+        0.2694,
+        0.2693,
+        0.2693,
+        0.2693,
+        0.2693,
+        0.2693
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     },
+     "words": {
+      "release": {
+       "median_s": 0.0607,
+       "ratio": 1.0,
+       "runs": [
+        0.0607,
+        0.0609,
+        0.0609,
+        0.0605,
+        0.0607,
+        0.0608,
+        0.0608,
+        0.0606,
+        0.0607,
+        0.0607
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "checked": {
+       "median_s": 0.0628,
+       "ratio": 1.034,
+       "runs": [
+        0.063,
+        0.0627,
+        0.0627,
+        0.0627,
+        0.0627,
+        0.0629,
+        0.0629,
+        0.0628,
+        0.0627,
+        0.0628
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      },
+      "blaze": {
+       "median_s": 0.0874,
+       "ratio": 1.439,
+       "runs": [
+        0.0873,
+        0.0874,
+        0.0876,
+        0.0875,
+        0.0874,
+        0.0875,
+        0.0876,
+        0.0873,
+        0.0873,
+        0.0872
+       ],
+       "peak_mb": 23,
+       "peak_max_mb": 23
+      }
+     }
+    }
+   },
+   "numeric": {
+    "builds": {
+     "release": {
+      "build_s": 3.6,
+      "build_peak_mb": 600,
+      "build_largest_mb": 311,
+      "size_mb": 0.88
+     },
+     "checked": {
+      "build_s": 3.6,
+      "build_peak_mb": 599,
+      "build_largest_mb": 311,
+      "size_mb": 0.92
+     },
+     "blaze": {
+      "build_s": 13.1,
+      "cargo_s": 0.9,
+      "blaze_s": 12.0,
+      "link_s": 0.2,
+      "compiled": 129,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 1836,
+      "build_largest_mb": 1807,
+      "size_mb": 0.72
+     }
+    },
+    "benches": {
+     "numeric": {
+      "release": {
+       "median_s": 0.0232,
+       "ratio": 1.0,
+       "runs": [
+        0.0229,
+        0.0228,
+        0.0227,
+        0.0235,
+        0.0235,
+        0.0235,
+        0.0229,
+        0.0231,
+        0.0233,
+        0.0237
+       ],
+       "peak_mb": 41,
+       "peak_max_mb": 41
+      },
+      "checked": {
+       "median_s": 0.0255,
+       "ratio": 1.1,
+       "runs": [
+        0.0251,
+        0.0255,
+        0.0252,
+        0.0261,
+        0.0254,
+        0.0261,
+        0.0257,
+        0.0254,
+        0.0254,
+        0.0272
+       ],
+       "peak_mb": 41,
+       "peak_max_mb": 41
+      },
+      "blaze": {
+       "median_s": 0.0284,
+       "ratio": 1.224,
+       "runs": [
+        0.0278,
+        0.0288,
+        0.0285,
+        0.028,
+        0.0281,
+        0.028,
+        0.0286,
+        0.0282,
+        0.0289,
+        0.0298
+       ],
+       "peak_mb": 41,
+       "peak_max_mb": 41
+      }
+     }
+    }
+   },
+   "jsonrt": {
+    "builds": {
+     "release": {
+      "build_s": 6.7,
+      "build_peak_mb": 2017,
+      "build_largest_mb": 441,
+      "size_mb": 1.09
+     },
+     "checked": {
+      "build_s": 6.9,
+      "build_peak_mb": 2044,
+      "build_largest_mb": 440,
+      "size_mb": 1.3
+     },
+     "blaze": {
+      "build_s": 21.1,
+      "cargo_s": 3.9,
+      "blaze_s": 16.9,
+      "link_s": 0.3,
+      "compiled": 282,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 2760,
+      "build_largest_mb": 2723,
+      "size_mb": 1.07
+     }
+    },
+    "benches": {
+     "jsonrt": {
+      "release": {
+       "median_s": 0.8649,
+       "ratio": 1.0,
+       "runs": [
+        0.8646,
+        0.8655,
+        0.864,
+        0.8651,
+        0.8656,
+        0.8652,
+        0.8646,
+        0.8648,
+        0.8659,
+        0.8642
+       ],
+       "peak_mb": 546,
+       "peak_max_mb": 546
+      },
+      "checked": {
+       "median_s": 0.9112,
+       "ratio": 1.053,
+       "runs": [
+        0.9111,
+        0.9112,
+        0.9108,
+        0.9116,
+        0.9135,
+        0.9112,
+        0.9113,
+        0.9123,
+        0.9108,
+        0.9103
+       ],
+       "peak_mb": 546,
+       "peak_max_mb": 546
+      },
+      "blaze": {
+       "median_s": 1.2264,
+       "ratio": 1.418,
+       "runs": [
+        1.2265,
+        1.2275,
+        1.2255,
+        1.2263,
+        1.2257,
+        1.2271,
+        1.2267,
+        1.2262,
+        1.2264,
+        1.2268
+       ],
+       "peak_mb": 546,
+       "peak_max_mb": 546
+      }
+     }
+    }
+   },
+   "ripgrep": {
+    "builds": {
+     "release": {
+      "build_s": 9.7,
+      "build_peak_mb": 2362,
+      "build_largest_mb": 716,
+      "size_mb": 32.23
+     },
+     "checked": {
+      "build_s": 9.6,
+      "build_peak_mb": 2362,
+      "build_largest_mb": 711,
+      "size_mb": 33.83
+     },
+     "blaze": {
+      "build_s": 57.3,
+      "cargo_s": 1.1,
+      "blaze_s": 55.6,
+      "link_s": 0.5,
+      "compiled": 3331,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 3625,
+      "build_largest_mb": 3595,
+      "size_mb": 16.06
+     }
+    },
+    "benches": {
+     "ripgrep": {
+      "release": {
+       "median_s": 0.0576,
+       "ratio": 1.0,
+       "runs": [
+        0.0579,
+        0.0577,
+        0.0576,
+        0.0574,
+        0.0575,
+        0.0575,
+        0.0577,
+        0.0574,
+        0.0576,
+        0.0578
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      },
+      "checked": {
+       "median_s": 0.0593,
+       "ratio": 1.03,
+       "runs": [
+        0.0592,
+        0.0593,
+        0.0595,
+        0.0595,
+        0.0594,
+        0.0593,
+        0.0595,
+        0.0591,
+        0.0593,
+        0.0596
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      },
+      "blaze": {
+       "median_s": 0.0751,
+       "ratio": 1.303,
+       "runs": [
+        0.075,
+        0.075,
+        0.075,
+        0.0754,
+        0.075,
+        0.0748,
+        0.0753,
+        0.0753,
+        0.0752,
+        0.0753
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      }
+     }
+    }
+   },
+   "fd": {
+    "builds": {
+     "release": {
+      "build_s": 49.1,
+      "build_peak_mb": 2276,
+      "build_largest_mb": 790,
+      "size_mb": 3.74
+     },
+     "checked": {
+      "build_s": 50.9,
+      "build_peak_mb": 2235,
+      "build_largest_mb": 863,
+      "size_mb": 4.07
+     },
+     "blaze": {
+      "build_s": 77.6,
+      "cargo_s": 27.2,
+      "blaze_s": 49.9,
+      "link_s": 0.6,
+      "compiled": 3098,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 3820,
+      "build_largest_mb": 3782,
+      "size_mb": 4.34
+     }
+    },
+    "benches": {
+     "fd": {
+      "release": {
+       "median_s": 0.0185,
+       "ratio": 1.0,
+       "runs": [
+        0.0186,
+        0.0184,
+        0.0186,
+        0.0185,
+        0.0185,
+        0.0187,
+        0.0184,
+        0.0188,
+        0.0186,
+        0.0184
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      },
+      "checked": {
+       "median_s": 0.0188,
+       "ratio": 1.013,
+       "runs": [
+        0.0186,
+        0.0192,
+        0.0189,
+        0.0187,
+        0.0186,
+        0.0188,
+        0.0188,
+        0.0188,
+        0.0188,
+        0.0187
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      },
+      "blaze": {
+       "median_s": 0.0228,
+       "ratio": 1.23,
+       "runs": [
+        0.0227,
+        0.0229,
+        0.0224,
+        0.0228,
+        0.0227,
+        0.0224,
+        0.0228,
+        0.0231,
+        0.0229,
+        0.0229
+       ],
+       "peak_mb": 26,
+       "peak_max_mb": 26
+      }
+     }
+    }
+   },
+   "tokei": {
+    "builds": {
+     "release": {
+      "build_s": 14.5,
+      "build_peak_mb": 3374,
+      "build_largest_mb": 539,
+      "size_mb": 5.43
+     },
+     "checked": {
+      "build_s": 15.0,
+      "build_peak_mb": 3383,
+      "build_largest_mb": 578,
+      "size_mb": 6.54
+     },
+     "blaze": {
+      "build_s": 63.3,
+      "cargo_s": 9.4,
+      "blaze_s": 53.5,
+      "link_s": 0.4,
+      "compiled": 2842,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 4521,
+      "build_largest_mb": 4478,
+      "size_mb": 5.55
+     }
+    },
+    "benches": {
+     "tokei": {
+      "release": {
+       "median_s": 0.0897,
+       "ratio": 1.0,
+       "runs": [
+        0.0893,
+        0.0898,
+        0.0899,
+        0.0886,
+        0.0897,
+        0.0945,
+        0.0894,
+        0.0902,
+        0.0897,
+        0.0895
+       ],
+       "peak_mb": 50,
+       "peak_max_mb": 53
+      },
+      "checked": {
+       "median_s": 0.0899,
+       "ratio": 1.002,
+       "runs": [
+        0.0892,
+        0.0897,
+        0.0891,
+        0.0898,
+        0.0903,
+        0.0903,
+        0.0901,
+        0.0899,
+        0.0902,
+        0.0896
+       ],
+       "peak_mb": 52,
+       "peak_max_mb": 54
+      },
+      "blaze": {
+       "median_s": 0.1083,
+       "ratio": 1.207,
+       "runs": [
+        0.1083,
+        0.1082,
+        0.1085,
+        0.1078,
+        0.1077,
+        0.1085,
+        0.1084,
+        0.1083,
+        0.1081,
+        0.1086
+       ],
+       "peak_mb": 52,
+       "peak_max_mb": 55
+      }
+     }
+    }
+   },
+   "eza": {
+    "builds": {
+     "release": {
+      "build_s": 37.9,
+      "build_peak_mb": 3404,
+      "build_largest_mb": 573,
+      "size_mb": 2.38
+     },
+     "checked": {
+      "build_s": 40.5,
+      "build_peak_mb": 3507,
+      "build_largest_mb": 623,
+      "size_mb": 2.71
+     },
+     "blaze": {
+      "build_s": 45.2,
+      "cargo_s": 8.8,
+      "blaze_s": 36.0,
+      "link_s": 0.4,
+      "compiled": 1546,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 3955,
+      "build_largest_mb": 3913,
+      "size_mb": 3.17
+     }
+    },
+    "benches": {
+     "eza": {
+      "release": {
+       "median_s": 0.2308,
+       "ratio": 1.0,
+       "runs": [
+        0.2105,
+        0.2397,
+        0.2197,
+        0.1909,
+        0.2608,
+        0.2323,
+        0.2337,
+        0.2405,
+        0.2205,
+        0.2293
+       ],
+       "peak_mb": 46,
+       "peak_max_mb": 46
+      },
+      "checked": {
+       "median_s": 0.228,
+       "ratio": 0.988,
+       "runs": [
+        0.2591,
+        0.2216,
+        0.2461,
+        0.2295,
+        0.2216,
+        0.2226,
+        0.2306,
+        0.2358,
+        0.2264,
+        0.2263
+       ],
+       "peak_mb": 45,
+       "peak_max_mb": 45
+      },
+      "blaze": {
+       "median_s": 0.2433,
+       "ratio": 1.054,
+       "runs": [
+        0.2544,
+        0.245,
+        0.2372,
+        0.2415,
+        0.2169,
+        0.2237,
+        0.2568,
+        0.2591,
+        0.245,
+        0.2324
+       ],
+       "peak_mb": 45,
+       "peak_max_mb": 45
+      }
+     }
+    }
+   },
+   "bat": {
+    "builds": {
+     "release": {
+      "build_s": 53.7,
+      "build_peak_mb": 3712,
+      "build_largest_mb": 1293,
+      "size_mb": 6.99
+     },
+     "checked": {
+      "build_s": 58.2,
+      "build_peak_mb": 3732,
+      "build_largest_mb": 1466,
+      "size_mb": 7.71
+     },
+     "blaze": {
+      "build_s": 127.9,
+      "cargo_s": 11.7,
+      "blaze_s": 115.5,
+      "link_s": 0.7,
+      "compiled": 5008,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 6168,
+      "build_largest_mb": 6154,
+      "size_mb": 8.51
+     }
+    },
+    "benches": {
+     "bat": {
+      "release": {
+       "median_s": 0.0879,
+       "ratio": 1.0,
+       "runs": [
+        0.0879,
+        0.0883,
+        0.0877,
+        0.0879,
+        0.0883,
+        0.0885,
+        0.0878,
+        0.0876,
+        0.0878,
+        0.0881
+       ],
+       "peak_mb": 30,
+       "peak_max_mb": 30
+      },
+      "checked": {
+       "median_s": 0.0911,
+       "ratio": 1.036,
+       "runs": [
+        0.0909,
+        0.0908,
+        0.0911,
+        0.0907,
+        0.0908,
+        0.0911,
+        0.0913,
+        0.0915,
+        0.091,
+        0.0915
+       ],
+       "peak_mb": 30,
+       "peak_max_mb": 30
+      },
+      "blaze": {
+       "median_s": 0.0991,
+       "ratio": 1.127,
+       "runs": [
+        0.0991,
+        0.0991,
+        0.0992,
+        0.0989,
+        0.0992,
+        0.0993,
+        0.099,
+        0.099,
+        0.0991,
+        0.0992
+       ],
+       "peak_mb": 30,
+       "peak_max_mb": 30
+      }
+     }
+    }
+   }
+  },
+  "geomean": {
+   "release": 1.0,
+   "checked": 1.0661459144877738,
+   "blaze": 1.1419282503487216
+  }
+ }
+}

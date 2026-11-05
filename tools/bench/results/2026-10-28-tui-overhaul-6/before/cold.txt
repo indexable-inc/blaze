@@ -1,0 +1,287 @@
+--- frame 0
+blaze build                                                                                             0.10s
+     Waiting for the daemon 0.10s
+--- frame 40
+blaze build · cold: the store is empty                                                                  3.40s
+✓ workspace 0.22s  ● std 3.17s
+cores              ▂▂▂█▅▂▂ 1.3/8 busy
+   Compiling the standard library of build scripts 3.17s
+--- frame 80
+blaze build · cold: the store is empty                                                                  7.42s
+✓ workspace 0.22s  ● std 7.19s
+cores      ▂▂▂█▅▂▂▇▇█▇█▇██ 7.6/8 busy
+   Compiling the standard library of build scripts 7.19s
+--- frame 120
+blaze build · cold: the store is empty                                                                  11.4s
+✓ workspace 0.22s  ● std 11.2s
+cores █▃▂▂▆▇█▇█▇▇█▇▇█▂▁▁▁▁ 0.0/8 busy
+   Compiling the standard library of build scripts 11.2s
+--- frame 160
+blaze build · cold: the store is empty                                                                  15.0s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ✓ std 11.7s
+cores ▇█▇▇█▇▇█▂▁▁▁▁▂▇▇▁▄▄▂ 0.7/8 busy
+     Loading workspace 0.14s
+--- frame 200
+blaze build · cold: the store is empty                                                                  15.0s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ✓ std 11.7s  ● names 0/56 crates 0.07s
+cores ▇█▇▇█▇▇█▂▁▁▁▁▂▇▇▁▄▄▂ 0.7/8 busy
+   Resolving names 0.07s · 0/56 crates
+             rg  resolving  0.01s
+             ├─ std  resolving  0.01s
+             ├─ lexopt waiting
+             ├─ anyhow waiting
+             ├─ log waiting
+             ├─ termcolor waiting
+             ├─ textwrap waiting
+             ├─ serde_json waiting
+             │  ├─ memchr waiting
+             │  ├─ ryu waiting
+             0 done · 2 under way · 33 waiting
+--- frame 240
+blaze build · cold: the store is empty                                                                  15.2s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ✓ std 11.7s  ● names 2/56 crates 0.27s
+cores ▇██▇█▇▇▅▁▁▁▁▁▂▆▇▁▇▄▃ 2.7/8 busy
+   Resolving names 0.27s · 2/56 crates · longest rg
+             rg  resolving  0.21s
+             └─ textwrap  resolving  0.21s
+             0 done · 2 under way · 33 waiting
+--- frame 280
+blaze build · cold: the store is empty                                                                  15.4s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ✓ std 11.7s  ● names 35/56 crates 0.47s
+cores █▇██▇▇█▂▁▁▁▁▂▇▆▁▄▇▂▃ 2.7/8 busy
+   Resolving names 0.47s · 35/56 crates · longest rg
+             rg  resolving  0.41s
+             ├─ ignore  resolving  0.28s
+             │  └─ globset  resolving  0.28s
+             │     └─ bstr  resolving  0.27s
+             └─ grep  resolving  0.24s
+                ├─ grep_regex  resolving  0.24s
+                ├─ grep_printer  resolving  0.19s
+                │  └─ grep_searcher waiting
+                └─ grep_cli waiting
+             0 done · 7 under way · 28 waiting
+--- frame 320
+blaze build · cold: the store is empty                                                                  15.7s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ✓ std 11.7s  ✓ names 56/56 crates 0.69s  ● store 0.08s
+cores ██▇█▇▇▅▁▁▁▁▁▂▆▇▁▇▄▃▄ 3.1/8 busy
+     Storing the resolved names 0.08s
+             0 done · 0 under way · 35 waiting
+--- frame 360
+blaze build · cold: the store is empty                                                                  19.2s
+✓ workspace 0.29s  ✓ build scripts 14/14 steps 2.87s  ● std 15.3s  ✓ names 56/56 crates 0.69s
+cores ▁▁▁▁▁▂▆▇▁▇▄▃▄▇▅▂▂▆▇▇ 6.9/8 busy
+   Compiling the standard library (once, kept in the store) 3.56s
+             0 done · 0 under way · 35 waiting
+--- frame 400
+blaze build · cold: the store is empty                                                                  23.0s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 0.17s
+cores ▁▄▄▂▄▇▂▃▂▅▇▇█▆▇▇▃▁▁▂ 1.5/8 busy
+   Compiling rg 0.17s
+             0 done · 0 under way · 35 waiting
+--- frame 440
+blaze build · cold: the store is empty                                                                  23.4s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 0.56s
+cores ▄▇▂▄▄▂▃▂▅▇▇█▆▇▇▃▁▁▂▅ 4.4/8 busy
+   Compiling rg 0.56s · 584 fns
+             rg  compiling 108 fns  0.36s
+             ├─ std  compiling 63 fns  0.36s
+             ├─ ignore  compiling 119 fns  0.26s
+             │  ├─ globset  compiling 35 fns  0.26s
+             │  │  ├─ bstr  compiling 4 fns  0.26s
+             │  │  │  ├─ regex_automata waiting
+             │  │  │  │  ├─ regex_syntax waiting
+             │  │  │  │  ├─ aho_corasick waiting
+             │  │  │  │  │  └─ memchr waiting
+             │  │  ├─ log  compiling 13 fns  0.26s
+             12 more under way
+             0 done · 18 under way · 17 waiting
+--- frame 480
+blaze build · cold: the store is empty                                                                  23.6s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 0.77s
+cores ▄▄▃▄▇▅▃▂▆▇▇▇▆▇▅▃▁▁▂▇ 6.8/8 busy
+   Compiling rg 0.76s · 3418 fns
+             rg  compiling 1664 fns  0.56s
+             ├─ std  compiling 412 fns  0.56s
+             ├─ ignore  compiling 202 fns  0.46s
+             │  ├─ globset  compiling 194 fns  0.46s
+             │  │  ├─ bstr  compiling 24 fns  0.46s
+             │  │  │  ├─ regex_automata  compiling 29 fns  0.26s
+             │  │  │  │  ├─ regex_syntax  compiling 137 fns  0.26s
+             │  │  │  │  ├─ memchr  compiling 1 fns  0.16s
+             │  │  │  │  └─ aho_corasick  compiling 10 fns  0.06s
+             │  │  ├─ log  compiling 43 fns  0.46s
+             15 more under way
+             0 done · 25 under way · 10 waiting
+--- frame 520
+blaze build · cold: the store is empty                                                                  23.8s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 0.97s
+cores ▇▂▃▄▂▅▂▅▆▇█▇▇▇▅▁▁▁▅▇ 6.8/8 busy
+   Compiling rg 0.97s · 5983 fns
+             rg  compiling 2016 fns  0.76s
+             ├─ std  compiling 1142 fns  0.76s
+             ├─ ignore  compiling 553 fns  0.66s
+             │  ├─ globset  compiling 280 fns  0.66s
+             │  │  ├─ bstr  compiling 35 fns  0.66s
+             │  │  │  ├─ regex_automata  compiling 530 fns  0.46s
+             │  │  │  │  ├─ regex_syntax  compiling 411 fns  0.46s
+             │  │  │  │  ├─ memchr  compiling 2 fns  0.36s
+             │  │  │  │  └─ aho_corasick  compiling 16 fns  0.26s
+             │  │  ├─ log  compiling 49 fns  0.66s
+             15 more under way
+             0 done · 25 under way · 10 waiting
+--- frame 560
+blaze build · cold: the store is empty                                                                  24.0s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 1.17s
+cores ▄▂▄▇▂▃▂▅▇▇█▆▇▇▃▁▁▂▇█ 7.7/8 busy
+   Compiling rg 1.16s · 8537 fns
+             rg  compiling 2278 fns  0.96s
+             ├─ std  compiling 1645 fns  0.96s
+             ├─ ignore  compiling 812 fns  0.86s
+             │  ├─ globset  compiling 361 fns  0.86s
+             │  │  ├─ bstr  compiling 40 fns  0.86s
+             │  │  │  ├─ regex_automata  compiling 1279 fns  0.66s
+             │  │  │  │  ├─ regex_syntax  compiling 616 fns  0.66s
+             │  │  │  │  ├─ memchr  compiling 12 fns  0.56s
+             │  │  │  │  └─ aho_corasick  compiling 154 fns  0.46s
+             │  │  ├─ log  compiling 49 fns  0.86s
+             15 more under way
+             0 done · 25 under way · 10 waiting
+--- frame 600
+blaze build · cold: the store is empty                                                                  24.2s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 1.37s
+cores ▄▃▄▇▅▂▂▆▇▇▇▇▇▅▁▁▁▅▇█ 7.5/8 busy
+   Compiling rg 1.37s · 11791 fns
+             rg  compiling 2704 fns  1.16s
+             ├─ std  compiling 2102 fns  1.16s
+             ├─ ignore  compiling 949 fns  1.06s
+             │  ├─ globset  compiling 371 fns  1.06s
+             │  │  ├─ bstr  compiling 44 fns  1.06s
+             │  │  │  ├─ regex_automata  compiling 2617 fns  0.86s
+             │  │  │  │  ├─ regex_syntax  compiling 1020 fns  0.86s
+             │  │  │  │  ├─ memchr  compiling 54 fns  0.76s
+             │  │  │  │  └─ aho_corasick  compiling 347 fns  0.66s
+             │  │  ├─ log  compiling 49 fns  1.06s
+             16 more under way
+             0 done · 26 under way · 9 waiting
+--- frame 640
+blaze build · cold: the store is empty                                                                  24.4s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 1.57s
+cores ▂▄▄▂▃▂▅▇▇█▆▇▇▃▁▁▂▅██ 7.5/8 busy
+   Compiling rg 1.57s · 15106 fns
+             rg  compiling 3160 fns  1.36s
+             ├─ std  compiling 2570 fns  1.36s
+             ├─ ignore  compiling 1133 fns  1.26s
+             │  ├─ globset  compiling 440 fns  1.26s
+             │  │  ├─ bstr  compiling 56 fns  1.26s
+             │  │  │  ├─ regex_automata  compiling 3562 fns  1.06s
+             │  │  │  │  ├─ regex_syntax  compiling 1495 fns  1.06s
+             │  │  │  │  ├─ memchr  compiling 75 fns  0.96s
+             │  │  │  │  └─ aho_corasick  compiling 618 fns  0.86s
+             │  │  ├─ log  compiling 49 fns  1.26s
+             18 more under way
+             0 done · 28 under way · 7 waiting
+--- frame 680
+blaze build · cold: the store is empty                                                                  24.6s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 1.77s
+cores ▃▄▇▅▃▂▆▇▇▇▆▇▅▃▁▁▂▇██ 7.6/8 busy
+   Compiling rg 1.77s · 17970 fns
+             rg  compiling 3556 fns  1.57s
+             ├─ std  compiling 3140 fns  1.57s
+             ├─ ignore  compiling 1249 fns  1.47s
+             │  ├─ globset  compiling 463 fns  1.47s
+             │  │  ├─ bstr  compiling 66 fns  1.47s
+             │  │  │  ├─ regex_automata  compiling 4311 fns  1.26s
+             │  │  │  │  ├─ regex_syntax  compiling 1835 fns  1.26s
+             │  │  │  │  ├─ memchr  compiling 91 fns  1.16s
+             │  │  │  │  └─ aho_corasick  compiling 883 fns  1.06s
+             │  │  ├─ log  compiling 49 fns  1.47s
+             18 more under way
+             0 done · 28 under way · 7 waiting
+--- frame 720
+blaze build · cold: the store is empty                                                                  24.8s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 1.97s
+cores ▃▄▂▅▂▅▆▇█▇▇▇▅▁▁▁▅███ 7.5/8 busy
+   Compiling rg 1.97s · 20329 fns
+             rg  compiling 3833 fns  1.77s
+             ├─ std  compiling 3847 fns  1.77s
+             ├─ ignore  compiling 1314 fns  1.67s
+             │  ├─ globset  compiling 480 fns  1.67s
+             │  │  ├─ bstr  compiling 79 fns  1.67s
+             │  │  │  ├─ regex_automata  compiling 4553 fns  1.46s
+             │  │  │  │  ├─ regex_syntax  compiling 2074 fns  1.46s
+             │  │  │  │  ├─ memchr  compiling 113 fns  1.36s
+             │  │  │  │  └─ aho_corasick  compiling 1295 fns  1.26s
+             │  │  ├─ log  compiling 49 fns  1.67s
+             19 more under way
+             0 done · 29 under way · 6 waiting
+--- frame 760
+blaze build · cold: the store is empty                                                                  25.0s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 2.17s
+cores ▄▇▂▃▂▅▇▇█▆▇▇▃▁▁▂▇███ 7.5/8 busy
+   Compiling rg 2.17s · 24327 fns
+             rg  compiling 4288 fns  1.97s
+             ├─ std  compiling 4613 fns  1.97s
+             ├─ ignore  compiling 1477 fns  1.87s
+             │  ├─ globset  compiling 497 fns  1.87s
+             │  │  ├─ bstr  compiling 79 fns  1.87s
+             │  │  │  ├─ regex_automata  compiling 5718 fns  1.67s
+             │  │  │  │  ├─ regex_syntax  compiling 2530 fns  1.67s
+             │  │  │  │  ├─ memchr  compiling 215 fns  1.57s
+             │  │  │  │  └─ aho_corasick  compiling 1646 fns  1.47s
+             │  │  ├─ log  compiling 49 fns  1.87s
+             19 more under way
+             0 done · 29 under way · 6 waiting
+--- frame 800
+blaze build · cold: the store is empty                                                                  25.2s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 2.37s
+cores ▄▇▅▂▂▆▇▇▇▇▇▅▁▁▁▅▇███ 7.8/8 busy
+   Compiling rg 2.37s · 29256 fns
+             rg  compiling 4864 fns  2.17s
+             ├─ std  compiling 5506 fns  2.17s
+             ├─ ignore  compiling 1797 fns  2.07s
+             │  ├─ globset  compiling 499 fns  2.07s
+             │  │  ├─ bstr  compiling 84 fns  2.07s
+             │  │  │  ├─ regex_automata  compiling 7117 fns  1.87s
+             │  │  │  │  ├─ regex_syntax  compiling 3006 fns  1.87s
+             │  │  │  │  ├─ memchr  compiling 240 fns  1.77s
+             │  │  │  │  └─ aho_corasick  compiling 2085 fns  1.67s
+             │  │  ├─ log  compiling 49 fns  2.07s
+             19 more under way
+             0 done · 29 under way · 6 waiting
+--- frame 840
+blaze build · cold: the store is empty                                                                  26.7s
+✓ 1 more  ✓ build scripts 14/14 steps 2.87s  ✓ std 18.9s  ✓ names 56/56 crates 0.69s  ● codegen 3.87s
+cores ▂▂▆▇▇▇▇▇▅▁▁▁▅▇███▅▁▁ 0.0/8 busy
+   Compiling rg 3.87s · 31268 fns
+             rg  compiling 5290 fns  3.67s
+             ├─ std  compiling 6275 fns  3.67s
+             ├─ ignore  compiling 1912 fns  3.57s
+             │  ├─ globset waiting
+             │  │  ├─ bstr waiting
+             │  │  │  ├─ regex_automata  compiling 7318 fns  3.37s
+             │  │  │  │  ├─ regex_syntax  compiling 3368 fns  3.37s
+             │  │  │  │  ├─ memchr  compiling 240 fns  3.27s
+             │  │  │  │  └─ aho_corasick waiting
+             │  │  ├─ log  compiling 49 fns  3.57s
+             13 more under way
+             10 done · 20 under way · 5 waiting
+--- frame 880
+blaze build · cold: the store is empty                                                                  27.3s
+✓ 3 more  ✓ names 56/56 crates 0.69s  ● store 0.24s  ✓ codegen 3.91s  ✓ check 74/74 files 0.23s  ✓ link 0.11s
+cores ▅▆▇█▇▇▇▅▁▁▁▅███▆▅▁▁▆ 5.3/8 busy
+     Storing the manifest 0.21s · 31268/31268 fns
+             35 done (5 up to date) · 0 under way · 0 waiting
+--- left on the screen (917 frames drawn)
+Downloading Rust nightly-2026-10-27 for blaze (144 MB, once)...
+Downloaded Rust nightly-2026-10-27 for blaze in 4.9s.
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.xFPPGadREz/ripgrep)
+    Compiled the standard library of build scripts in 11.7s
+       Built build scripts and proc macros in 2.86s
+    Resolved names in 0.69s
+    Compiled the standard library (once, kept in the store) in 7.19s
+      Stored the manifest in 3.30s
+    Compiled 31268 fns in 35 crates, 0 kept; 30.6s
+        Took 30.6s: std of build scripts 11.7s (4.1/8 cores), std 7.19s (4.2/8), codegen 3.91s (5.0/8)
+       Cache cold: the store is empty
+             `blaze why` says more
+    Finished `dev` profile [blaze] target(s) in 30.69s

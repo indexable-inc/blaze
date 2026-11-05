@@ -1,0 +1,47 @@
+{
+ "httparse": {
+  "apply_ms": 1.9,
+  "cargo_ms": 404.60026264190674,
+  "codegen_ms": 60.849999999999994,
+  "cold": {
+   "codegen_ms": 5100.0,
+   "load_ms": 347.0
+  },
+  "compiled": 17,
+  "first_edit_ms": 192.5,
+  "functions": 92,
+  "link_ms": 39.05,
+  "rss_mb": 887,
+  "total_ms": 101.25
+ },
+ "semver": {
+  "apply_ms": 0.41305000000000003,
+  "cargo_ms": 169.77381706237793,
+  "codegen_ms": 35.099999999999994,
+  "cold": {
+   "codegen_ms": 5100.0,
+   "load_ms": 348.5
+  },
+  "compiled": 26,
+  "first_edit_ms": 141.6,
+  "functions": 79,
+  "link_ms": 32.7,
+  "rss_mb": 850,
+  "total_ms": 69.4
+ },
+ "toy": {
+  "apply_ms": 0.10015,
+  "cargo_ms": 86.13049983978271,
+  "codegen_ms": 2.75,
+  "cold": {
+   "codegen_ms": 2700.0,
+   "load_ms": 319.3
+  },
+  "compiled": 5,
+  "first_edit_ms": 36.5,
+  "functions": 5,
+  "link_ms": 27.049999999999997,
+  "rss_mb": 526,
+  "total_ms": 30.299999999999997
+ }
+}

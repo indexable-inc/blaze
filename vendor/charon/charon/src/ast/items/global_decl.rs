@@ -1,0 +1,140 @@
+use derive_generic_visitor::{Drive, DriveMut, DriveTwo};
+use serde_state::{DeserializeState, SerializeState};
+
+use crate::ast::*;
+use enum_as_inner::EnumAsInner;
+
+/// A global variable definition (constant or static).
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+pub struct GlobalDecl {
+    pub def_id: GlobalDeclId,
+    /// The meta data associated with the declaration.
+    pub item_meta: ItemMeta,
+    /// Remark: constants can actually have generic parameters.
+    /// ```text
+    /// struct V<const N: usize, T> {
+    ///     x: [T; N],
+    /// }
+    ///
+    /// impl<const N: usize, T> V<N, T> {
+    ///     const LEN: usize = N; // This has generics <N, T>
+    /// }
+    ///
+    /// fn use_v<const N: usize, T>(v: V<N, T>) {
+    ///     let l = V::<N, T>::LEN; // We need to provided a substitution here
+    /// }
+    /// ```
+    pub generics: GenericParams,
+    pub ty: Ty,
+    /// The size in bytes of the global's allocation.
+    pub size: Size,
+    /// The alignment in bytes of the global's allocation.
+    pub align: Size,
+    /// The pointer metadata for references to this global (needed for unsized globals).
+    pub ptr_metadata: ConstantExpr,
+    /// The context of the global: distinguishes normal items from trait-associated items and
+    /// vtable instances.
+    pub src: GlobalSource,
+    /// The kind of global (static or const).
+    pub global_kind: GlobalKind,
+    /// The value of this constant/static. By default this is a [`ConstantExprKind::Call`] to the
+    /// initializer function that computes the value (the function uses the same generic parameters
+    /// as the global).
+    pub value: ConstantExpr,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+pub enum GlobalKind {
+    /// A static or thread-local static.
+    Static {
+        is_mut: bool,
+        /// `false` for statics declared in an `extern` block without the `safe` qualifier.
+        is_safe: bool,
+        /// `true` for thread-local statics (through `thread_local!` or `#[thread_local]`).
+        is_thread_local: bool,
+    },
+    /// A const with a name (either top-level or an associated const in a trait).
+    NamedConst,
+    /// A const without a name:
+    /// - An inline const expression (`const { 1 + 1 }`);
+    /// - A const expression in a type (`[u8; sizeof::<T>()]`);
+    /// - A promoted constant, automatically lifted from a body (`&0`).
+    AnonConst,
+    /// The VTable of a trait implementation. Such globals can only be accessed by the generated
+    /// code -- it is UB to access them from user code.
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("VTableGlobal"))]
+    VTable,
+}
+
+/// Where a given global came from.
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Global"))]
+pub enum GlobalSource {
+    /// A normal global.
+    Normal,
+    /// A default assoc const in a trait declaration.
+    TraitDefault {
+        /// The trait declaration the const belongs to.
+        trait_ref: TraitDeclRef,
+        /// The associated const this corresponds to.
+        item_id: AssocConstId,
+    },
+    /// An associated const in a trait implementation.
+    TraitImpl {
+        /// The trait implementation the const belongs to.
+        impl_ref: TraitImplRef,
+        /// The trait declaration that the impl block implements.
+        trait_ref: TraitDeclRef,
+        /// The associated const this corresponds to.
+        item_id: AssocConstId,
+        /// True if the trait decl had a default value for this const and this item is a copy of
+        /// the default item.
+        reuses_default: bool,
+    },
+    /// Defines the vtable for a trait impl.
+    VTableInstance {
+        /// The concrete type this vtable is for.
+        self_ty: Ty,
+        /// The originating impl. This is `None` in monomorphized mode: the vtable global itself
+        /// identifies the concrete instantiation, so we don't translate an impl reference solely
+        /// to record its provenance.
+        impl_ref: Option<TraitImplRef>,
+    },
+}
+
+impl GlobalDecl {
+    /// If this global's value is a call to its initializer function, returns the initializer's id.
+    pub fn init_fun_id(&self) -> Option<FunDeclId> {
+        match self.value.kind() {
+            ConstantExprKind::Call(fn_ptr, _) => match &*fn_ptr.kind {
+                FnPtrKind::Fun(id) => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether this global is unsafe to access, because it is a mutable or unsafe external static (safety.unsafe-static).
+    pub fn is_unsafe_to_access(&self, _krate: &TranslatedCrate) -> bool {
+        match self.global_kind {
+            GlobalKind::Static { is_mut, is_safe, is_thread_local: _ } => is_mut || !is_safe,
+            GlobalKind::NamedConst | GlobalKind::AnonConst | GlobalKind::VTable => false,
+        }
+    }
+
+    /// Whether this global is unsafe to declare.
+    pub fn is_unsafe_to_declare(&self, _krate: &TranslatedCrate) -> bool {
+        self.item_meta.is_unsafe_to_declare()
+    }
+}

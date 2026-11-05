@@ -1,0 +1,27 @@
+    75.21%  swapper
+            |
+             --75.12%--default_idle_call
+                       do_idle
+                       cpu_startup_entry
+                       |
+                       |--70.36%--secondary_start_kernel
+                       |          __secondary_switched
+                       |
+                        --4.76%--rest_init
+                                  start_kernel
+                                  __primary_switched
+    19.18%  blaze-engine
+            |
+             --6.37%--sha2::sha256::compress256
+                       |
+                       |--2.98%--<std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<bool>>::initialize<<std::sync::once_lock::OnceLock<bool>>::get_or_init<<blaze_store::Store>::checked::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+                       |          <std::sys::sync::once::futex::Once>::call
+                       |          <std::sync::once_lock::OnceLock<bool>>::initialize::<<std::sync::once_lock::OnceLock<bool>>::get_or_init<<blaze_store::Store>::checked::{closure#0}>::{closure#0}, !>
+                       |          std::sys::backtrace::__rust_begin_short_backtrace::<<blaze_store::Store>::check::{closure#0}, ()>
+    75.21%  swapper          [kernel.kallsyms]
+    15.60%  blaze-engine     blaze-engine
+     3.02%  blaze-engine     [kernel.kallsyms]
+     1.33%  VfsLoader        [kernel.kallsyms]
+     1.15%  rust-lld         rust-lld
+     6.37%  [.] sha2::sha256::compress256
+     0.83%  [.] <core::hash::sip::Hasher<core::hash::sip::Sip24Rounds> as core::hash::Hasher>::write

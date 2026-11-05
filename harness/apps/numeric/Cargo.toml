@@ -1,0 +1,9 @@
+[package]
+name = "numeric"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.10"
+
+[workspace]

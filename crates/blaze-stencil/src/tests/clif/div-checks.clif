@@ -1,0 +1,703 @@
+; Follows cranelift/filetests/filetests/runtests/div-checks.clif (and srem.clif, urem.clif,
+; sdiv.clif, udiv.clif), for the stencil set: `udiv`, `sdiv`, `urem` and `srem` of `i8` to
+; `i64`. Division by zero traps, `sdiv MIN, -1` traps, `srem MIN, -1` is 0, the quotient
+; truncates toward zero and the remainder takes the dividend's sign. The `*_by_*` functions
+; divide by a constant, which the stencil backend folds into an immediate: a constant 0
+; still traps, and -1 is the signed edge. `i128` is left out: the stencil set has no
+; division of it (the IR builder calls `__udivti3` and friends).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %udiv_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i8(7, 2) == 3
+; run: %udiv_i8(-7, 2) == 124
+; run: %udiv_i8(7, -2) == 0
+; run: %udiv_i8(-7, -2) == 0
+; run: %udiv_i8(-128, -1) == 0
+; run: %udiv_i8(-128, 1) == -128
+; run: %udiv_i8(-128, 2) == 64
+; run: %udiv_i8(-128, 3) == 42
+; run: %udiv_i8(127, -1) == 0
+; run: %udiv_i8(127, -128) == 0
+; run: %udiv_i8(-1, -1) == 1
+; run: %udiv_i8(-1, 2) == 127
+; run: %udiv_i8(0, 1) == 0
+; run: %udiv_i8(0, -1) == 0
+; trap: %udiv_i8(1, 0)
+; trap: %udiv_i8(0, 0)
+; trap: %udiv_i8(-128, 0)
+; trap: %udiv_i8(-1, 0)
+
+function %sdiv_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i8(7, 2) == 3
+; run: %sdiv_i8(-7, 2) == -3
+; run: %sdiv_i8(7, -2) == -3
+; run: %sdiv_i8(-7, -2) == 3
+; trap: %sdiv_i8(-128, -1)
+; run: %sdiv_i8(-128, 1) == -128
+; run: %sdiv_i8(-128, 2) == -64
+; run: %sdiv_i8(-128, 3) == -42
+; run: %sdiv_i8(127, -1) == -127
+; run: %sdiv_i8(127, -128) == 0
+; run: %sdiv_i8(-1, -1) == 1
+; run: %sdiv_i8(-1, 2) == 0
+; run: %sdiv_i8(0, 1) == 0
+; run: %sdiv_i8(0, -1) == 0
+; trap: %sdiv_i8(1, 0)
+; trap: %sdiv_i8(0, 0)
+; trap: %sdiv_i8(-128, 0)
+; trap: %sdiv_i8(-1, 0)
+
+function %urem_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i8(7, 2) == 1
+; run: %urem_i8(-7, 2) == 1
+; run: %urem_i8(7, -2) == 7
+; run: %urem_i8(-7, -2) == -7
+; run: %urem_i8(-128, -1) == -128
+; run: %urem_i8(-128, 1) == 0
+; run: %urem_i8(-128, 2) == 0
+; run: %urem_i8(-128, 3) == 2
+; run: %urem_i8(127, -1) == 127
+; run: %urem_i8(127, -128) == 127
+; run: %urem_i8(-1, -1) == 0
+; run: %urem_i8(-1, 2) == 1
+; run: %urem_i8(0, 1) == 0
+; run: %urem_i8(0, -1) == 0
+; trap: %urem_i8(1, 0)
+; trap: %urem_i8(0, 0)
+; trap: %urem_i8(-128, 0)
+; trap: %urem_i8(-1, 0)
+
+function %srem_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i8(7, 2) == 1
+; run: %srem_i8(-7, 2) == -1
+; run: %srem_i8(7, -2) == 1
+; run: %srem_i8(-7, -2) == -1
+; run: %srem_i8(-128, -1) == 0
+; run: %srem_i8(-128, 1) == 0
+; run: %srem_i8(-128, 2) == 0
+; run: %srem_i8(-128, 3) == -2
+; run: %srem_i8(127, -1) == 0
+; run: %srem_i8(127, -128) == 127
+; run: %srem_i8(-1, -1) == 0
+; run: %srem_i8(-1, 2) == -1
+; run: %srem_i8(0, 1) == 0
+; run: %srem_i8(0, -1) == 0
+; trap: %srem_i8(1, 0)
+; trap: %srem_i8(0, 0)
+; trap: %srem_i8(-128, 0)
+; trap: %srem_i8(-1, 0)
+
+function %udiv_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i16(7, 2) == 3
+; run: %udiv_i16(-7, 2) == 0x7ffc
+; run: %udiv_i16(7, -2) == 0
+; run: %udiv_i16(-7, -2) == 0
+; run: %udiv_i16(0x8000, -1) == 0
+; run: %udiv_i16(0x8000, 1) == 0x8000
+; run: %udiv_i16(0x8000, 2) == 0x4000
+; run: %udiv_i16(0x8000, 3) == 0x2aaa
+; run: %udiv_i16(0x7fff, -1) == 0
+; run: %udiv_i16(0x7fff, 0x8000) == 0
+; run: %udiv_i16(-1, -1) == 1
+; run: %udiv_i16(-1, 2) == 0x7fff
+; run: %udiv_i16(0, 1) == 0
+; run: %udiv_i16(0, -1) == 0
+; trap: %udiv_i16(1, 0)
+; trap: %udiv_i16(0, 0)
+; trap: %udiv_i16(0x8000, 0)
+; trap: %udiv_i16(-1, 0)
+
+function %sdiv_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i16(7, 2) == 3
+; run: %sdiv_i16(-7, 2) == -3
+; run: %sdiv_i16(7, -2) == -3
+; run: %sdiv_i16(-7, -2) == 3
+; trap: %sdiv_i16(0x8000, -1)
+; run: %sdiv_i16(0x8000, 1) == 0x8000
+; run: %sdiv_i16(0x8000, 2) == 0xc000
+; run: %sdiv_i16(0x8000, 3) == 0xd556
+; run: %sdiv_i16(0x7fff, -1) == 0x8001
+; run: %sdiv_i16(0x7fff, 0x8000) == 0
+; run: %sdiv_i16(-1, -1) == 1
+; run: %sdiv_i16(-1, 2) == 0
+; run: %sdiv_i16(0, 1) == 0
+; run: %sdiv_i16(0, -1) == 0
+; trap: %sdiv_i16(1, 0)
+; trap: %sdiv_i16(0, 0)
+; trap: %sdiv_i16(0x8000, 0)
+; trap: %sdiv_i16(-1, 0)
+
+function %urem_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i16(7, 2) == 1
+; run: %urem_i16(-7, 2) == 1
+; run: %urem_i16(7, -2) == 7
+; run: %urem_i16(-7, -2) == -7
+; run: %urem_i16(0x8000, -1) == 0x8000
+; run: %urem_i16(0x8000, 1) == 0
+; run: %urem_i16(0x8000, 2) == 0
+; run: %urem_i16(0x8000, 3) == 2
+; run: %urem_i16(0x7fff, -1) == 0x7fff
+; run: %urem_i16(0x7fff, 0x8000) == 0x7fff
+; run: %urem_i16(-1, -1) == 0
+; run: %urem_i16(-1, 2) == 1
+; run: %urem_i16(0, 1) == 0
+; run: %urem_i16(0, -1) == 0
+; trap: %urem_i16(1, 0)
+; trap: %urem_i16(0, 0)
+; trap: %urem_i16(0x8000, 0)
+; trap: %urem_i16(-1, 0)
+
+function %srem_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i16(7, 2) == 1
+; run: %srem_i16(-7, 2) == -1
+; run: %srem_i16(7, -2) == 1
+; run: %srem_i16(-7, -2) == -1
+; run: %srem_i16(0x8000, -1) == 0
+; run: %srem_i16(0x8000, 1) == 0
+; run: %srem_i16(0x8000, 2) == 0
+; run: %srem_i16(0x8000, 3) == -2
+; run: %srem_i16(0x7fff, -1) == 0
+; run: %srem_i16(0x7fff, 0x8000) == 0x7fff
+; run: %srem_i16(-1, -1) == 0
+; run: %srem_i16(-1, 2) == -1
+; run: %srem_i16(0, 1) == 0
+; run: %srem_i16(0, -1) == 0
+; trap: %srem_i16(1, 0)
+; trap: %srem_i16(0, 0)
+; trap: %srem_i16(0x8000, 0)
+; trap: %srem_i16(-1, 0)
+
+function %udiv_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i32(7, 2) == 3
+; run: %udiv_i32(-7, 2) == 0x7ffffffc
+; run: %udiv_i32(7, -2) == 0
+; run: %udiv_i32(-7, -2) == 0
+; run: %udiv_i32(0x80000000, -1) == 0
+; run: %udiv_i32(0x80000000, 1) == 0x80000000
+; run: %udiv_i32(0x80000000, 2) == 0x40000000
+; run: %udiv_i32(0x80000000, 3) == 0x2aaaaaaa
+; run: %udiv_i32(0x7fffffff, -1) == 0
+; run: %udiv_i32(0x7fffffff, 0x80000000) == 0
+; run: %udiv_i32(-1, -1) == 1
+; run: %udiv_i32(-1, 2) == 0x7fffffff
+; run: %udiv_i32(0, 1) == 0
+; run: %udiv_i32(0, -1) == 0
+; trap: %udiv_i32(1, 0)
+; trap: %udiv_i32(0, 0)
+; trap: %udiv_i32(0x80000000, 0)
+; trap: %udiv_i32(-1, 0)
+
+function %sdiv_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i32(7, 2) == 3
+; run: %sdiv_i32(-7, 2) == -3
+; run: %sdiv_i32(7, -2) == -3
+; run: %sdiv_i32(-7, -2) == 3
+; trap: %sdiv_i32(0x80000000, -1)
+; run: %sdiv_i32(0x80000000, 1) == 0x80000000
+; run: %sdiv_i32(0x80000000, 2) == 0xc0000000
+; run: %sdiv_i32(0x80000000, 3) == 0xd5555556
+; run: %sdiv_i32(0x7fffffff, -1) == 0x80000001
+; run: %sdiv_i32(0x7fffffff, 0x80000000) == 0
+; run: %sdiv_i32(-1, -1) == 1
+; run: %sdiv_i32(-1, 2) == 0
+; run: %sdiv_i32(0, 1) == 0
+; run: %sdiv_i32(0, -1) == 0
+; trap: %sdiv_i32(1, 0)
+; trap: %sdiv_i32(0, 0)
+; trap: %sdiv_i32(0x80000000, 0)
+; trap: %sdiv_i32(-1, 0)
+
+function %urem_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i32(7, 2) == 1
+; run: %urem_i32(-7, 2) == 1
+; run: %urem_i32(7, -2) == 7
+; run: %urem_i32(-7, -2) == -7
+; run: %urem_i32(0x80000000, -1) == 0x80000000
+; run: %urem_i32(0x80000000, 1) == 0
+; run: %urem_i32(0x80000000, 2) == 0
+; run: %urem_i32(0x80000000, 3) == 2
+; run: %urem_i32(0x7fffffff, -1) == 0x7fffffff
+; run: %urem_i32(0x7fffffff, 0x80000000) == 0x7fffffff
+; run: %urem_i32(-1, -1) == 0
+; run: %urem_i32(-1, 2) == 1
+; run: %urem_i32(0, 1) == 0
+; run: %urem_i32(0, -1) == 0
+; trap: %urem_i32(1, 0)
+; trap: %urem_i32(0, 0)
+; trap: %urem_i32(0x80000000, 0)
+; trap: %urem_i32(-1, 0)
+
+function %srem_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i32(7, 2) == 1
+; run: %srem_i32(-7, 2) == -1
+; run: %srem_i32(7, -2) == 1
+; run: %srem_i32(-7, -2) == -1
+; run: %srem_i32(0x80000000, -1) == 0
+; run: %srem_i32(0x80000000, 1) == 0
+; run: %srem_i32(0x80000000, 2) == 0
+; run: %srem_i32(0x80000000, 3) == -2
+; run: %srem_i32(0x7fffffff, -1) == 0
+; run: %srem_i32(0x7fffffff, 0x80000000) == 0x7fffffff
+; run: %srem_i32(-1, -1) == 0
+; run: %srem_i32(-1, 2) == -1
+; run: %srem_i32(0, 1) == 0
+; run: %srem_i32(0, -1) == 0
+; trap: %srem_i32(1, 0)
+; trap: %srem_i32(0, 0)
+; trap: %srem_i32(0x80000000, 0)
+; trap: %srem_i32(-1, 0)
+
+function %udiv_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i64(7, 2) == 3
+; run: %udiv_i64(-7, 2) == 0x7ffffffffffffffc
+; run: %udiv_i64(7, -2) == 0
+; run: %udiv_i64(-7, -2) == 0
+; run: %udiv_i64(0x8000000000000000, -1) == 0
+; run: %udiv_i64(0x8000000000000000, 1) == 0x8000000000000000
+; run: %udiv_i64(0x8000000000000000, 2) == 0x4000000000000000
+; run: %udiv_i64(0x8000000000000000, 3) == 0x2aaaaaaaaaaaaaaa
+; run: %udiv_i64(0x7fffffffffffffff, -1) == 0
+; run: %udiv_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %udiv_i64(-1, -1) == 1
+; run: %udiv_i64(-1, 2) == 0x7fffffffffffffff
+; run: %udiv_i64(0, 1) == 0
+; run: %udiv_i64(0, -1) == 0
+; trap: %udiv_i64(1, 0)
+; trap: %udiv_i64(0, 0)
+; trap: %udiv_i64(0x8000000000000000, 0)
+; trap: %udiv_i64(-1, 0)
+
+function %sdiv_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i64(7, 2) == 3
+; run: %sdiv_i64(-7, 2) == -3
+; run: %sdiv_i64(7, -2) == -3
+; run: %sdiv_i64(-7, -2) == 3
+; trap: %sdiv_i64(0x8000000000000000, -1)
+; run: %sdiv_i64(0x8000000000000000, 1) == 0x8000000000000000
+; run: %sdiv_i64(0x8000000000000000, 2) == 0xc000000000000000
+; run: %sdiv_i64(0x8000000000000000, 3) == 0xd555555555555556
+; run: %sdiv_i64(0x7fffffffffffffff, -1) == 0x8000000000000001
+; run: %sdiv_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %sdiv_i64(-1, -1) == 1
+; run: %sdiv_i64(-1, 2) == 0
+; run: %sdiv_i64(0, 1) == 0
+; run: %sdiv_i64(0, -1) == 0
+; trap: %sdiv_i64(1, 0)
+; trap: %sdiv_i64(0, 0)
+; trap: %sdiv_i64(0x8000000000000000, 0)
+; trap: %sdiv_i64(-1, 0)
+
+function %urem_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i64(7, 2) == 1
+; run: %urem_i64(-7, 2) == 1
+; run: %urem_i64(7, -2) == 7
+; run: %urem_i64(-7, -2) == -7
+; run: %urem_i64(0x8000000000000000, -1) == 0x8000000000000000
+; run: %urem_i64(0x8000000000000000, 1) == 0
+; run: %urem_i64(0x8000000000000000, 2) == 0
+; run: %urem_i64(0x8000000000000000, 3) == 2
+; run: %urem_i64(0x7fffffffffffffff, -1) == 0x7fffffffffffffff
+; run: %urem_i64(0x7fffffffffffffff, 0x8000000000000000) == 0x7fffffffffffffff
+; run: %urem_i64(-1, -1) == 0
+; run: %urem_i64(-1, 2) == 1
+; run: %urem_i64(0, 1) == 0
+; run: %urem_i64(0, -1) == 0
+; trap: %urem_i64(1, 0)
+; trap: %urem_i64(0, 0)
+; trap: %urem_i64(0x8000000000000000, 0)
+; trap: %urem_i64(-1, 0)
+
+function %srem_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i64(7, 2) == 1
+; run: %srem_i64(-7, 2) == -1
+; run: %srem_i64(7, -2) == 1
+; run: %srem_i64(-7, -2) == -1
+; run: %srem_i64(0x8000000000000000, -1) == 0
+; run: %srem_i64(0x8000000000000000, 1) == 0
+; run: %srem_i64(0x8000000000000000, 2) == 0
+; run: %srem_i64(0x8000000000000000, 3) == -2
+; run: %srem_i64(0x7fffffffffffffff, -1) == 0
+; run: %srem_i64(0x7fffffffffffffff, 0x8000000000000000) == 0x7fffffffffffffff
+; run: %srem_i64(-1, -1) == 0
+; run: %srem_i64(-1, 2) == -1
+; run: %srem_i64(0, 1) == 0
+; run: %srem_i64(0, -1) == 0
+; trap: %srem_i64(1, 0)
+; trap: %srem_i64(0, 0)
+; trap: %srem_i64(0x8000000000000000, 0)
+; trap: %srem_i64(-1, 0)
+
+function %udiv_i8_by_3(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 3
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i8_by_3(7) == 2
+; run: %udiv_i8_by_3(-7) == 83
+; run: %udiv_i8_by_3(0) == 0
+; run: %udiv_i8_by_3(1) == 0
+; run: %udiv_i8_by_3(-1) == 85
+; run: %udiv_i8_by_3(-128) == 42
+; run: %udiv_i8_by_3(127) == 42
+
+function %udiv_i32_by_7(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 7
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i32_by_7(7) == 1
+; run: %udiv_i32_by_7(-7) == 0x24924923
+; run: %udiv_i32_by_7(0) == 0
+; run: %udiv_i32_by_7(1) == 0
+; run: %udiv_i32_by_7(-1) == 0x24924924
+; run: %udiv_i32_by_7(0x80000000) == 0x12492492
+; run: %udiv_i32_by_7(0x7fffffff) == 0x12492492
+
+function %urem_i16_by_10(i16) -> i16 {
+block0(v0: i16):
+    v1 = iconst.i16 10
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i16_by_10(7) == 7
+; run: %urem_i16_by_10(-7) == 9
+; run: %urem_i16_by_10(0) == 0
+; run: %urem_i16_by_10(1) == 1
+; run: %urem_i16_by_10(-1) == 5
+; run: %urem_i16_by_10(0x8000) == 8
+; run: %urem_i16_by_10(0x7fff) == 7
+
+function %sdiv_i16_by_m2(i16) -> i16 {
+block0(v0: i16):
+    v1 = iconst.i16 -2
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i16_by_m2(7) == -3
+; run: %sdiv_i16_by_m2(-7) == 3
+; run: %sdiv_i16_by_m2(0) == 0
+; run: %sdiv_i16_by_m2(1) == 0
+; run: %sdiv_i16_by_m2(-1) == 0
+; run: %sdiv_i16_by_m2(0x8000) == 0x4000
+; run: %sdiv_i16_by_m2(0x7fff) == 0xc001
+
+function %sdiv_i64_by_3(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 3
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i64_by_3(7) == 2
+; run: %sdiv_i64_by_3(-7) == -2
+; run: %sdiv_i64_by_3(0) == 0
+; run: %sdiv_i64_by_3(1) == 0
+; run: %sdiv_i64_by_3(-1) == 0
+; run: %sdiv_i64_by_3(0x8000000000000000) == 0xd555555555555556
+; run: %sdiv_i64_by_3(0x7fffffffffffffff) == 0x2aaaaaaaaaaaaaaa
+
+function %srem_i64_by_3(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 3
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i64_by_3(7) == 1
+; run: %srem_i64_by_3(-7) == -1
+; run: %srem_i64_by_3(0) == 0
+; run: %srem_i64_by_3(1) == 1
+; run: %srem_i64_by_3(-1) == -1
+; run: %srem_i64_by_3(0x8000000000000000) == -2
+; run: %srem_i64_by_3(0x7fffffffffffffff) == 1
+
+function %srem_i8_by_m3(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -3
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i8_by_m3(7) == 1
+; run: %srem_i8_by_m3(-7) == -1
+; run: %srem_i8_by_m3(0) == 0
+; run: %srem_i8_by_m3(1) == 1
+; run: %srem_i8_by_m3(-1) == -1
+; run: %srem_i8_by_m3(-128) == -2
+; run: %srem_i8_by_m3(127) == 1
+
+function %sdiv_i8_by_m1(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -1
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i8_by_m1(7) == -7
+; run: %sdiv_i8_by_m1(-7) == 7
+; run: %sdiv_i8_by_m1(0) == 0
+; run: %sdiv_i8_by_m1(1) == -1
+; run: %sdiv_i8_by_m1(-1) == 1
+; trap: %sdiv_i8_by_m1(-128)
+; run: %sdiv_i8_by_m1(127) == -127
+
+function %sdiv_i32_by_m1(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 -1
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i32_by_m1(7) == -7
+; run: %sdiv_i32_by_m1(-7) == 7
+; run: %sdiv_i32_by_m1(0) == 0
+; run: %sdiv_i32_by_m1(1) == -1
+; run: %sdiv_i32_by_m1(-1) == 1
+; trap: %sdiv_i32_by_m1(0x80000000)
+; run: %sdiv_i32_by_m1(0x7fffffff) == 0x80000001
+
+function %sdiv_i64_by_m1(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -1
+    v2 = sdiv v0, v1
+    return v2
+}
+; run: %sdiv_i64_by_m1(7) == -7
+; run: %sdiv_i64_by_m1(-7) == 7
+; run: %sdiv_i64_by_m1(0) == 0
+; run: %sdiv_i64_by_m1(1) == -1
+; run: %sdiv_i64_by_m1(-1) == 1
+; trap: %sdiv_i64_by_m1(0x8000000000000000)
+; run: %sdiv_i64_by_m1(0x7fffffffffffffff) == 0x8000000000000001
+
+function %srem_i8_by_m1(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 -1
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i8_by_m1(7) == 0
+; run: %srem_i8_by_m1(-7) == 0
+; run: %srem_i8_by_m1(0) == 0
+; run: %srem_i8_by_m1(1) == 0
+; run: %srem_i8_by_m1(-1) == 0
+; run: %srem_i8_by_m1(-128) == 0
+; run: %srem_i8_by_m1(127) == 0
+
+function %srem_i32_by_m1(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 -1
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i32_by_m1(7) == 0
+; run: %srem_i32_by_m1(-7) == 0
+; run: %srem_i32_by_m1(0) == 0
+; run: %srem_i32_by_m1(1) == 0
+; run: %srem_i32_by_m1(-1) == 0
+; run: %srem_i32_by_m1(0x80000000) == 0
+; run: %srem_i32_by_m1(0x7fffffff) == 0
+
+function %srem_i64_by_m1(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -1
+    v2 = srem v0, v1
+    return v2
+}
+; run: %srem_i64_by_m1(7) == 0
+; run: %srem_i64_by_m1(-7) == 0
+; run: %srem_i64_by_m1(0) == 0
+; run: %srem_i64_by_m1(1) == 0
+; run: %srem_i64_by_m1(-1) == 0
+; run: %srem_i64_by_m1(0x8000000000000000) == 0
+; run: %srem_i64_by_m1(0x7fffffffffffffff) == 0
+
+function %udiv_i64_by_m1(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 -1
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i64_by_m1(7) == 0
+; run: %udiv_i64_by_m1(-7) == 0
+; run: %udiv_i64_by_m1(0) == 0
+; run: %udiv_i64_by_m1(1) == 0
+; run: %udiv_i64_by_m1(-1) == 1
+; run: %udiv_i64_by_m1(0x8000000000000000) == 0
+; run: %udiv_i64_by_m1(0x7fffffffffffffff) == 0
+
+function %urem_i32_by_m1(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 -1
+    v2 = urem v0, v1
+    return v2
+}
+; run: %urem_i32_by_m1(7) == 7
+; run: %urem_i32_by_m1(-7) == -7
+; run: %urem_i32_by_m1(0) == 0
+; run: %urem_i32_by_m1(1) == 1
+; run: %urem_i32_by_m1(-1) == 0
+; run: %urem_i32_by_m1(0x80000000) == 0x80000000
+; run: %urem_i32_by_m1(0x7fffffff) == 0x7fffffff
+
+function %udiv_i16_by_m1(i16) -> i16 {
+block0(v0: i16):
+    v1 = iconst.i16 -1
+    v2 = udiv v0, v1
+    return v2
+}
+; run: %udiv_i16_by_m1(7) == 0
+; run: %udiv_i16_by_m1(-7) == 0
+; run: %udiv_i16_by_m1(0) == 0
+; run: %udiv_i16_by_m1(1) == 0
+; run: %udiv_i16_by_m1(-1) == 1
+; run: %udiv_i16_by_m1(0x8000) == 0
+; run: %udiv_i16_by_m1(0x7fff) == 0
+
+function %udiv_i8_by_0(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 0
+    v2 = udiv v0, v1
+    return v2
+}
+; trap: %udiv_i8_by_0(7)
+; trap: %udiv_i8_by_0(-7)
+; trap: %udiv_i8_by_0(0)
+; trap: %udiv_i8_by_0(1)
+; trap: %udiv_i8_by_0(-1)
+; trap: %udiv_i8_by_0(-128)
+; trap: %udiv_i8_by_0(127)
+
+function %udiv_i32_by_0(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = udiv v0, v1
+    return v2
+}
+; trap: %udiv_i32_by_0(7)
+; trap: %udiv_i32_by_0(-7)
+; trap: %udiv_i32_by_0(0)
+; trap: %udiv_i32_by_0(1)
+; trap: %udiv_i32_by_0(-1)
+; trap: %udiv_i32_by_0(0x80000000)
+; trap: %udiv_i32_by_0(0x7fffffff)
+
+function %sdiv_i64_by_0(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = sdiv v0, v1
+    return v2
+}
+; trap: %sdiv_i64_by_0(7)
+; trap: %sdiv_i64_by_0(-7)
+; trap: %sdiv_i64_by_0(0)
+; trap: %sdiv_i64_by_0(1)
+; trap: %sdiv_i64_by_0(-1)
+; trap: %sdiv_i64_by_0(0x8000000000000000)
+; trap: %sdiv_i64_by_0(0x7fffffffffffffff)
+
+function %sdiv_i16_by_0(i16) -> i16 {
+block0(v0: i16):
+    v1 = iconst.i16 0
+    v2 = sdiv v0, v1
+    return v2
+}
+; trap: %sdiv_i16_by_0(7)
+; trap: %sdiv_i16_by_0(-7)
+; trap: %sdiv_i16_by_0(0)
+; trap: %sdiv_i16_by_0(1)
+; trap: %sdiv_i16_by_0(-1)
+; trap: %sdiv_i16_by_0(0x8000)
+; trap: %sdiv_i16_by_0(0x7fff)
+
+function %urem_i64_by_0(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = urem v0, v1
+    return v2
+}
+; trap: %urem_i64_by_0(7)
+; trap: %urem_i64_by_0(-7)
+; trap: %urem_i64_by_0(0)
+; trap: %urem_i64_by_0(1)
+; trap: %urem_i64_by_0(-1)
+; trap: %urem_i64_by_0(0x8000000000000000)
+; trap: %urem_i64_by_0(0x7fffffffffffffff)
+
+function %srem_i32_by_0(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = srem v0, v1
+    return v2
+}
+; trap: %srem_i32_by_0(7)
+; trap: %srem_i32_by_0(-7)
+; trap: %srem_i32_by_0(0)
+; trap: %srem_i32_by_0(1)
+; trap: %srem_i32_by_0(-1)
+; trap: %srem_i32_by_0(0x80000000)
+; trap: %srem_i32_by_0(0x7fffffff)

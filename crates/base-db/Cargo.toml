@@ -1,0 +1,50 @@
+[package]
+name = "base-db"
+version = "0.0.0"
+repository.workspace = true
+description = "Basic database trait and infra for rust-analyzer's crate and source root inputs. The concrete DB is defined by `ide` (aka `ra_ap_ide`)."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+crossbeam-queue.workspace = true
+la-arena.workspace = true
+blaze-query.workspace = true
+parking_lot.workspace = true
+hashbrown.workspace = true
+smallvec.workspace = true
+triomphe.workspace = true
+semver.workspace = true
+tracing.workspace = true
+indexmap.workspace = true
+inventory.workspace = true
+
+# local deps
+blaze-bytes.workspace = true
+blaze-dbsp.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-lint-defs.workspace = true
+blaze-mem.workspace = true
+blaze-vfs.workspace = true
+cfg.workspace = true
+syntax.workspace = true
+paths.workspace = true
+span.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+crossbeam-channel.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

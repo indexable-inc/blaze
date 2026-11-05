@@ -1,0 +1,148 @@
+// The sidebar's rows as templates (flecs script reactivity): the host sets an instance's props (src/app.rs sync_view,
+// harness_native_ui_view::View::props) and flecs re-runs only the parts that read a prop that changed. Every tree row
+// implements hn.Row (scene/widgets/row.flecs); each kind adds its own props. Parts the host animates (a chevron's Fold, a row's HoverAmt) keep
+// their runtime state across a re-run: a re-run sets components, it does not remake entities.
+using flecs.script
+
+@tree ChildOf
+hn {
+  // A session (padded in by its depth, its disclosure hanging left of its icon): its kind's mark in the kind's colour
+  // (hn.Kind), its name (13 medium), and on the right its shortcut (on hover) and a failure's badge (`badge`: the exit
+  // code, or a cross for a kill; empty for none).
+  @tree ChildOf
+  template ObjRow : Row {
+    prop kind: string = "shell"
+    prop badge: string = ""
+    prop hint: string = ""
+    (IsA, hn.TreeRowLook)
+    Action: {name: "select:{obj}"}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $row_pad, $indent_step), r: $row_pad, t: 0, b: 0}
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
+    glyph : ui.Symbol {
+      Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      // The kind's prefab holds its look: a vector Mark (Claude, Codex, Cursor) or a Nerd Font Icon (a shell).
+      const k = match $kind { "claude": hn.Kind.claude; "codex": hn.Kind.codex; "cursor": hn.Kind.cursor; "shell": hn.Kind.shell; _: hn.Kind.other }
+      Fill: k[Fill]
+      if k?[Mark] {
+        Mark: k[Mark]
+      } else {
+        Icon: k[Icon]
+      }
+    }
+    name : ui.Lead, Ink {
+      TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
+      Text: {s: $name}
+    }
+    spacer : ui.Spacer {}
+    // Room goes by priority: the hover-only shortcut gives way first, then the name (ui.Lead, -1); the badge never does.
+    meta : ui.Line, Faint {
+      LayoutPriority: {value: -2}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      Text: {s: $hint}
+      HoverShow: {row: 0, keep: false}
+    }
+    badge : hn.Badge {
+      LayoutPriority: {value: 1}
+      if $badge != "" {
+        Fill: $tone_failed_wash
+        Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
+      } else {
+        Fill: $tone_clear
+        Padding: {l: 0, r: 0, t: 0, b: 0}
+      }
+      code { Text: {s: $badge} }
+    }
+    if $selected {
+      pill : hn.Selection {}
+    }
+  }
+
+  // A shell run (or one of its pipeline stages) under its session (padded in by depth): a small dot tinted by how it
+  // went (`state`: running breathes in the accent, lost, failed, else faint), its command (12 regular, secondary), and on
+  // the right how long it took (`meta`; on hover, or always when `keep`: a failure, lost, pending, skipped).
+  @tree ChildOf
+  template RunRow : Row {
+    prop state: string = ""
+    prop meta: string = ""
+    prop keep: bool = false
+    (IsA, hn.TreeRowLook)
+    Action: {name: "select:{obj}"}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $run_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $row_pad, $indent_step), r: $row_pad, t: 0, b: 0}
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
+    glyph : ui.Symbol, Faint {
+      Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      Icon: {glyph: ""}
+      Fill: match $state { "running": $tone_accent; "lost": $tone_lost; "failed": $tone_failed; _: $tone_ink_4 }
+      if $state == "running" {
+        Breath: {spring: {x: 1, v: 0}, up: false}
+      }
+    }
+    name : ui.Lead, Muted {
+      TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+      Text: {s: $name}
+    }
+    spacer : ui.Spacer {}
+    // Room goes as on a session row: how long it took gives way first, then the command (ui.Lead, -1).
+    meta : ui.Line, Faint {
+      LayoutPriority: {value: -2}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      Text: {s: $meta}
+      HoverShow: {row: 0, keep: $keep}
+    }
+    if $selected {
+      pill : hn.Selection {}
+    }
+  }
+
+  // The fold of a session's older runs (`obj` the session): a quiet "Show 5 more" (or "Show fewer"), lined up with the
+  // runs' commands.
+  @tree ChildOf
+  template MoreRow : Row {
+    prop hidden: i32 = 0
+    prop unfolded: bool = false
+    (IsA, hn.TreeRowLook)
+    Action: {name: "fold:{obj}"}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $more_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $row_pad, $indent_step), r: $row_pad, t: 0, b: 0}
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
+    glyph : ui.Node {
+      Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    name : ui.Lead, Faint {
+      TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+      if $unfolded {
+        Text: {s: "Show fewer"}
+      } else {
+        Text: {s: "Show {hidden} more"}
+      }
+    }
+  }
+
+  // The archive row at the sidebar's bottom (`selected`: lit while the Archive, or an object opened from it, is
+  // selected): an archive box that rises and grows on the row's hover (its HoverAmt spring) and bounces when an object is
+  // archived (its Bump, kicked by the host). Clicked, the Archive pane (hn.ArchivePane) takes the main card.
+  @tree ChildOf
+  template ArchiveRow : Row {
+    (IsA, ui.IconButton)
+    Tooltip: {text: "Archive"}
+    if $selected {
+      Fill: $tone_select
+    } else {
+      Fill: $tone_clear
+    }
+    icon : ui.Symbol {
+      Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      Icon: {glyph: ""}
+      HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
+      Bump: {spring: {x: 0, v: 0}}
+    }
+    async {
+      while true {
+        const e = await on.click(this)
+        await hn.act("archive:open", e.alt)
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+ "cwd": "a",
+ "env": {"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-Cenv1 -Cenv2", "CARGO_REGISTRY_CREDENTIAL_PROVIDER": "cargo:wincred"},
+ "runs": [["target", "--show-origin"], ["target.aarch64-apple-darwin.runner", "--show-origin"], ["target.x86_64-unknown-linux-gnu.rustflags", "--show-origin"], ["registry.credential-provider", "--show-origin"], ["--config", "target.aarch64-apple-darwin.runner=[\"cli\"]", "target.aarch64-apple-darwin.runner", "--show-origin"], ["--config", "registry.credential-provider=[\"cli\"]", "registry", "--show-origin"]]
+}

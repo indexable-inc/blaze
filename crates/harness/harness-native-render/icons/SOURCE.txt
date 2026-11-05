@@ -1,0 +1,14 @@
+Brand marks harness-native draws as vector outlines (src/icons.rs parses the path data at load, src/slug.rs packs it
+for the Slug outline draw in shaders/harness.slang).
+
+Source: Simple Icons (https://simpleicons.org, https://github.com/simple-icons/simple-icons), the simple-icons npm package.
+Licence: CC0 1.0 Universal for the Simple Icons collection (the SVG files as published). The marks themselves are
+trademarks of their owners (Anthropic, OpenAI, Anysphere) and are used here only to name each agent kind.
+Fetched: 2026-11-03.
+
+claude.svg  https://cdn.jsdelivr.net/npm/simple-icons@16.36.0/icons/claude.svg  (simple-icons 16.36.0, brand hex D97757)
+cursor.svg  https://cdn.jsdelivr.net/npm/simple-icons@16.36.0/icons/cursor.svg  (simple-icons 16.36.0)
+openai.svg  https://cdn.jsdelivr.net/npm/simple-icons@15.22.0/icons/openai.svg  (simple-icons 15.22.0: the openai slug was
+            removed in 16.0.0, so this is its last published version; it is not on simpleicons.org today)
+
+The files are unmodified.

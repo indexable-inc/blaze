@@ -1,0 +1,47 @@
+[package]
+name = "blaze-ids"
+description = "blaze v2's two kinds of IDs: content IDs (BLAKE3) for identity, dense u32 indices per arena for speed, and the interners that map one to the other"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blake3.workspace = true
+blaze-hash.workspace = true
+blaze-radix.workspace = true
+blaze-rng.workspace = true
+blaze-mem.workspace = true
+blaze-serde.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+smallvec.workspace = true
+thin-vec.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+postcard.workspace = true
+hegeltest.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+# The targets blake3-servil's build script builds for (`src/b3.rs` chooses the same).
+[target.'cfg(all(target_endian = "little", any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))))'.dependencies]
+blake3-servil.workspace = true
+
+# blake3-servil against official BLAKE3 on blaze's shapes; prints both, run by hand.
+[[bench]]
+name = "blake3"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[package]
+name = "mbe"
+version = "0.0.0"
+repository.workspace = true
+description = "Handling of `macro_rules` macros for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+cov-mark.workspace = true
+smallvec.workspace = true
+arrayvec.workspace = true
+rustc_lexer.workspace = true
+bitflags.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-mem.workspace = true
+parser.workspace = true
+tt.workspace = true
+stdx.workspace = true
+span.workspace = true
+intern.workspace = true
+syntax-bridge.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+test-utils.workspace = true
+expect-test.workspace = true
+syntax.workspace = true
+syntax-bridge = { workspace = true, features = ["reference"] }
+
+[lints]
+workspace = true

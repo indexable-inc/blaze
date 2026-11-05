@@ -1,0 +1,28 @@
+[package]
+name = "blaze-metadata"
+description = "cargo metadata with its resolve, made by blaze: the workspace read by blaze-manifest, the lock file's packages fetched by blaze-registry, resolved by blaze-resolve"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blaze-hash.workspace = true
+blaze-manifest.workspace = true
+blaze-registry = { workspace = true, features = ["net"] }
+blaze-resolve.workspace = true
+blaze-serde.workspace = true
+blaze-units.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

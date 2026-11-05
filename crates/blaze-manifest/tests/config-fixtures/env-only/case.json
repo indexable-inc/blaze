@@ -1,0 +1,4 @@
+{
+ "env": {"CARGO_FOO_BAR": "1", "CARGO_FOO_BAZ_QUX": "x y", "CARGO_BUILD_TARGET": "wasm32-unknown-unknown", "CARGO_PROFILE_DEV_OPT_LEVEL": "s", "CARGO_TERM_VERBOSE": "false"},
+ "runs": [["foo"], ["foo.bar"], ["foo.baz-qux"], ["build.target"], ["build"], ["profile.dev.opt-level", "--show-origin"], ["term.verbose"], ["--format", "json", "foo"], ["--format", "json-value", "foo.bar"]]
+}

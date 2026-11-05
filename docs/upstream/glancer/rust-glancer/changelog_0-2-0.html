@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>#1: v0.2.0 · Rust Glancer</title>
+    <meta name="description" content="Rust LSP that doesn&#39;t eat memory for breakfast">
+    <link rel="icon" href="https://rust-glancer.github.io/logo.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="https://rust-glancer.github.io/site.css?h=73df4c0618a7661febe1">
+    <link rel="alternate" href="https://rust-glancer.github.io/atom.xml" type="application/atom+xml" title="Rust Glancer">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+
+    <header class="site-header page-width">
+      <a class="brand" href="https://rust-glancer.github.io" aria-label="rust-glancer home">
+        <img src="https://rust-glancer.github.io/logo.svg" width="48" height="30" alt="">
+        <span>rust-glancer</span>
+      </a>
+
+      <nav aria-label="Primary">
+        <ul>
+          <li><a href="https://rust-glancer.github.io#about">About</a></li>
+          <li><a href="https://rust-glancer.github.io#quick-start">Quick start</a></li>
+          <li><a href="https://rust-glancer.github.io/docs">Docs</a></li>
+          <li><a href="https://rust-glancer.github.io/blog">Blog</a></li>
+          <li><a href="https://rust-glancer.github.io/changelog">Changelog</a></li>
+          <li><a href="https://github.com/rust-glancer/rust-glancer">Source</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="content" class="page-width">
+      
+  <article class="article">
+    <header class="page-heading">
+      <h1>#1: v0.2.0</h1>
+      <time datetime="2026-08-31">2026-08-31</time>
+    </header>
+    <div class="prose">
+      <ul>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/172">#172: Optimize indexing for packages with many targets</a> — Split indexes into reusable per-crate shards and made auxiliary-target analysis lazy, drastically reducing indexing time, memory use, and cache size for workspaces such as Tokio and Bevy.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/176">#176: Model extern items and the <code>proc_macro</code> crate</a> — Added indexing for extern blocks and functions and included the <code>proc_macro</code> sysroot crate, resolving more imports and symbols.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/178">#178: Support macro-generated modules</a> — Added support for modules declared by macros, with stronger <code>#[path]</code> handling and protection against expansion and lowering cycles.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/180">#180: Support build scripts</a> — Added support for generated sources by discovering and reusing existing Cargo build-script outputs without running build scripts itself.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/181">#181: Use an older glibc for releases</a> — Built Linux release binaries against an older glibc baseline for compatibility with the platforms supported by VS Code.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/183">#183: Add Windows support</a> — Added Windows support across path handling, caching, formatting, editing, CRLF line endings, and LSP comparison tests.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/186">#186: Add a Zed extension</a> — Added a Zed extension that downloads the prebuilt server and reports server health and indexing progress.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/187">#187: Add code actions and improve dirty-buffer analysis</a> — Added initial code actions and taught live overlays to understand newly written impl items, trait context, associated items, and const/static initializers.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/188">#188: Fix primitive method resolution</a> — Added resolution for inherent and associated methods on primitive types, including macro-generated impl items, while making trait lookup scope-aware and faster.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/189">#189: Add the VS Code extension icon</a> — Added the rust-glancer project icon to the VS Code extension.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/190">#190: Add a VS Code extension menu</a> — Replaced the status-bar click-to-restart behavior with a menu for starting or stopping the server, opening logs, and reindexing the workspace.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/191">#191: Shard def-map and semantic artifacts per crate</a> — Split def-map and semantic artifacts into per-crate shards so queries in packages with many targets no longer need to load enormous shared artifacts.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/192">#192: Reduce memory fragmentation after initial indexing</a> — Reduced memory retained through fragmentation after cold indexing, bringing post-index idle RSS closer to a fresh warm-cache process.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/196">#196: Report the server version correctly</a> — Fixed LSP initialization so clients receive the actual rust-glancer server version.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/193">#193: Disable jemalloc on OpenBSD</a> — Disabled the unsupported jemalloc integration on OpenBSD so rust-glancer can build and run there using the platform allocator.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/197">#197: Fix CI comments for forked pull requests</a> — Fixed the CI workflow so pull requests from forks no longer fail while attempting to publish sticky comments.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/199">#199: Lower peak memory and optimize indexing</a> — Added lower-peak-memory batch indexing, compacted def-map scope bindings, and replaced fixed-point scans with a worklist to reduce peak RSS and accelerate indexing.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/201">#201: Make mimalloc the default allocator</a> — Switched the default allocator from jemalloc to arena-free mimalloc, substantially accelerating indexing and editor queries while preserving low idle memory.</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/203">#203: Do not include generated sources to defmap artifacts</a> - Optimized defmap artifacts</li>
+<li><a rel="external" href="https://github.com/rust-glancer/rust-glancer/pull/204">#204: More candidate filtering and cancellation</a> - Optimized filtering candidates for trait solving and improved query cancellation.</li>
+</ul>
+
+    </div>
+  </article>
+
+    </main>
+
+    <footer class="site-footer page-width">
+      <span aria-hidden="true">©</span>
+      <a href="https://github.com/popzxc">@popzxc</a>
+      <span aria-hidden="true">·</span>
+      <a href="https://github.com/rust-glancer/rust-glancer.github.io">Site source</a>
+      <span aria-hidden="true">·</span>
+      <a href="https://rust-glancer.github.io/atom.xml">Atom</a>
+    </footer>
+  </body>
+</html>

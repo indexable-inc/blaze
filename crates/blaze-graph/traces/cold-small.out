@@ -1,0 +1,53 @@
+0 node #1 Manifest Cargo.toml deps []
+0 #1 Ready
+0 node #2 Std std deps []
+0 #2 Ready
+0 node #3 Names memchr deps [1]
+0 #3 Waiting
+0 node #4 Names regex deps [3]
+0 #4 Waiting
+0 node #5 Names rg deps [4]
+0 #5 Waiting
+0 node #6 Codegen rg deps [5, 2]
+0 #6 Waiting
+0 node #7 Link rg deps [6]
+0 #7 Waiting
+0 #1 Running
+  run #1 on Io
+0 #2 Running
+  run #2 on Io
+1000 #1 Built
+1000 #3 Ready
+1000 node #8 Names aho-corasick deps [1]
+1000 #8 Ready
+1000 node #9 Names grep deps [8, 3]
+1000 #9 Waiting
+1000 #3 Running
+  run #3 on Work
+1000 #8 Running
+  run #8 on Work
+1500 #2 Cached { remote: true }
+2000 #3 Built
+2000 #4 Ready
+2000 #4 Running
+  run #4 on Work
+2600 #8 Cached { remote: false }
+2600 #9 Ready
+2600 #9 Running
+  run #9 on Work
+3000 #9 Built
+5000 #4 Built
+5000 #5 Ready
+5000 #5 Running
+  run #5 on Work
+6000 #5 Built
+6000 #6 Ready
+6000 #6 Running
+  run #6 on Work
+9000 #6 Built
+9000 #7 Ready
+9000 #7 Running
+  run #7 on Io
+9500 #7 Built
+9500 critical [1, 3, 4, 5, 6, 7]
+  finished ok=true

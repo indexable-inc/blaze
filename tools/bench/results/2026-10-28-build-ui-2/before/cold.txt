@@ -1,0 +1,31 @@
+--- frame 0
+     Waiting for the daemon 0.10s
+--- frame 40
+     Loading workspace 4.15s
+--- frame 80
+     Loading workspace 8.31s
+--- frame 120
+     Loading workspace 12.4s
+--- frame 160
+     Loading workspace 16.6s
+--- frame 200
+   Compiling the standard library (once, kept in the store) 3.00s
+--- frame 240
+   Compiling rg 0.17s
+--- frame 280
+   Compiling rg 4.22s · 0/1 crates
+            └─ rg  31268 fns  4.02s
+--- frame 320
+     Linking rg 3.32s · 1/1 crates · 31220/31220 fns
+             1 built, 0 up to date
+--- left on the screen (332 frames drawn)
+Downloading Rust nightly-2026-10-27 for blaze (144 MB, once)...
+Downloaded Rust nightly-2026-10-27 for blaze in 5.6s.
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.uD9IEwecVE/ripgrep)
+      Loaded workspace in 16.8s
+    Resolved names in 0.74s
+    Compiled the standard library (once, kept in the store) in 6.82s
+    Compiled rg: 31220 fns compiled, 0 kept in 4.48s
+      Linked rg in 4.24s
+    Compiled 31220 fns in 1 crate, 0 kept; 33.5s
+    Finished `dev` profile [blaze] target(s) in 33.56s

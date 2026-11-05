@@ -1,0 +1,36 @@
+[package]
+name = "proc-macro-api"
+version = "0.0.0"
+repository.workspace = true
+description = "The store of proc-macro expansions and the token bridge blaze-macro-eval's in-process server speaks"
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
+rustc_lexer.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+hir-expand.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
+tt.workspace = true
+span.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

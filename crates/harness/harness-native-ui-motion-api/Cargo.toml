@@ -1,0 +1,20 @@
+[package]
+name = "harness-native-ui-motion-api"
+description = "Visibility and transition components shared by native views and motion systems (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"

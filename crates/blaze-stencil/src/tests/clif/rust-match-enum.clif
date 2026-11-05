@@ -1,0 +1,118 @@
+; Shaped like what hir-ty-codegen makes for a `match` (MIR `SwitchInt`), which it emits
+; through cranelift-frontend's `Switch`: the dense cases become a `br_table` on the
+; discriminant widened to `i32`, sparse ones compares, and the `otherwise` of a match
+; covering every variant an unreachable `trap user2`. `%classify` matches a fieldless
+; six-variant `#[repr(u8)] enum Op { Const, Double, Neg, Square, Not, Rotate }` with
+; `x: i64` (wrapping arithmetic); `%sparse` is
+; `match x { 0 => 10, 1 => 11, 2 => 12, 100 => 13, 1000 => 14, _ => 15 }` on a `u64`.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %classify(i8, i64) -> i64 {
+block0(v0: i8, v1: i64):
+    v2 = uextend.i32 v0
+    br_table v2, block7, [block1, block2, block3, block4, block5, block6]
+
+block1:
+    v3 = iconst.i64 100
+    return v3
+
+block2:
+    v4 = iadd v1, v1
+    return v4
+
+block3:
+    v5 = ineg v1
+    return v5
+
+block4:
+    v6 = imul v1, v1
+    return v6
+
+block5:
+    v7 = bnot v1
+    return v7
+
+block6:
+    v8 = iconst.i32 8
+    v9 = rotl v1, v8
+    return v9
+
+block7 cold:
+    trap user2
+}
+; run: %classify(0, 7) == 100
+; run: %classify(1, 7) == 14
+; run: %classify(1, 0x4000000000000000) == 0x8000000000000000
+; run: %classify(2, 7) == -7
+; run: %classify(2, 0) == 0
+; run: %classify(2, 0x8000000000000000) == 0x8000000000000000
+; run: %classify(3, -3) == 9
+; run: %classify(3, 0x100000000) == 0
+; run: %classify(3, 0x100000001) == 0x200000001
+; run: %classify(4, 0) == -1
+; run: %classify(4, 0x0f0f0f0f0f0f0f0f) == 0xf0f0f0f0f0f0f0f0
+; run: %classify(5, 0x0102030405060708) == 0x0203040506070801
+; run: %classify(5, 0xff00000000000000) == 0xff
+; trap: %classify(6, 7)
+; trap: %classify(0x7f, 7)
+; trap: %classify(0xff, 7)
+
+function %sparse(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 3
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = ireduce.i32 v0
+    br_table v3, block9, [block3, block4, block5]
+
+block2:
+    v4 = iconst.i64 100
+    v5 = icmp eq v0, v4
+    brif v5, block6, block7
+
+block7:
+    v6 = iconst.i64 1000
+    v7 = icmp eq v0, v6
+    brif v7, block8, block9
+
+block3:
+    v8 = iconst.i32 10
+    return v8
+
+block4:
+    v9 = iconst.i32 11
+    return v9
+
+block5:
+    v10 = iconst.i32 12
+    return v10
+
+block6:
+    v11 = iconst.i32 13
+    return v11
+
+block8:
+    v12 = iconst.i32 14
+    return v12
+
+block9:
+    v13 = iconst.i32 15
+    return v13
+}
+; run: %sparse(0) == 10
+; run: %sparse(1) == 11
+; run: %sparse(2) == 12
+; run: %sparse(3) == 15
+; run: %sparse(99) == 15
+; run: %sparse(100) == 13
+; run: %sparse(101) == 15
+; run: %sparse(1000) == 14
+; run: %sparse(-1) == 15
+; run: %sparse(0x100000000) == 15
+; run: %sparse(0x100000001) == 15
+; run: %sparse(0x10000000000003e8) == 15

@@ -1,0 +1,17 @@
+[package]
+name = "tlsfetch"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2", "server-auto"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12"] }
+rcgen = "0.13"
+bytes = "1"
+
+[workspace]

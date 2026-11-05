@@ -1,0 +1,30 @@
+# rustc's `compiler/rustc_transmute` at the rustc commit of `harness/toolchain`, as written by
+# `tools/v2/solver_sync.py`: `src` is upstream's with the series in `PATCHES.md` replayed on it, and
+# `Cargo.toml.orig` is upstream's manifest. This file is upstream's dependencies with `rustc` off,
+# so the compiler's own crates are left out: `rustc_data_structures`' maps are `indexmap` with
+# `rustc-hash` (patch 0001), and `Answer` comes from our `rustc_type_ir`.
+[package]
+name = "rustc_transmute"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/rust"
+publish = false
+
+[lib]
+name = "rustc_transmute"
+path = "src/lib.rs"
+
+[features]
+# Needs the compiler's own crates (`rustc_abi`, `rustc_attr_ir`, `rustc_middle`, `rustc_span`).
+rustc = []
+
+[dependencies]
+indexmap = "2.0.0"
+rustc-hash = "2.0.0"
+rustc_type_ir = { path = "../rustc_type_ir", version = "0.0.0", default-features = false }
+smallvec = "1.8.1"
+tracing = "0.1"
+
+[dev-dependencies]
+itertools = "0.15"

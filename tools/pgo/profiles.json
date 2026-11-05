@@ -1,0 +1,27 @@
+{
+  "toolchain": "nightly-2026-10-27",
+  "release": "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "name": "blaze-nightly-2026-10-27-aarch64-apple-darwin-a04ccd02056d375d.profdata",
+      "sha256": "a04ccd02056d375d3b39b69b11ce77eee5eacd2aab719d89ceca51e1f8aa2d33",
+      "commit": "e740bba271ab0543a542686216555d012a0ae067",
+      "count": 344489424492,
+      "crate": null
+    },
+    "aarch64-unknown-linux-gnu": {
+      "name": "blaze-nightly-2026-10-27-aarch64-unknown-linux-gnu-15a1d5d6a818ae85.profdata",
+      "sha256": "15a1d5d6a818ae85bafb90e0ca16c4a0460c33f132acaa56990a946fc26e2f03",
+      "commit": "e740bba271ab0543a542686216555d012a0ae067",
+      "count": 361239783781,
+      "crate": null
+    },
+    "x86_64-unknown-linux-gnu": {
+      "name": "blaze-nightly-2026-10-27-x86_64-unknown-linux-gnu-2c90482f059afd28.profdata",
+      "sha256": "2c90482f059afd28674a014064f7557e98d2b31462768143bc3ac4aa26d732fe",
+      "commit": "e740bba271ab0543a542686216555d012a0ae067",
+      "count": 342014150924,
+      "crate": null
+    }
+  }
+}

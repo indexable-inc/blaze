@@ -1,0 +1,5 @@
+[target."cfg(all(unix, target_os = \"linux\"))"]
+rustflags = ["a b"]
+"weird key" = 1
+[env]
+"A.B" = "1"

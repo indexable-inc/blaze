@@ -1,0 +1,66 @@
+[package]
+name = "blaze-registry"
+description = "blaze's reading of registries and fetching of sources as cargo 1.99 does them, into cargo's directories and blaze's store, with no cargo"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-resolve.workspace = true
+blaze-serde.workspace = true
+blaze-source.workspace = true
+# The index's lines and `[source]` replacement, read as the load reads them.
+blaze-units.workspace = true
+parking_lot.workspace = true
+# `PackageCacheLock`'s file lock, let go of as it drops.
+stdx.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+semver = { workspace = true, features = ["serde"] }
+url.workspace = true
+percent-encoding.workspace = true
+blaze-sha256.workspace = true
+flate2 = { workspace = true, features = ["default"] }
+tar.workspace = true
+filetime.workspace = true
+# Where `.crate` files are kept: blaze-fetch's objects in the store, found by their sha256.
+blaze-cas.workspace = true
+blaze-fetch.workspace = true
+# The configuration credentials are read from, as cargo's `GlobalContext` holds it.
+blaze-manifest.workspace = true
+toml.workspace = true
+# The method, status and header names `api` asks with, which the seed has without the client.
+http.workspace = true
+# `http::HyperHttp`: blaze's sans-IO HTTP/1.1 client and its tokio driver (sockets, DNS, timers),
+# TLS through rustls on ring with the machine's roots.
+blaze-http = { workspace = true, optional = true, features = ["tokio"] }
+# The runtime `HyperHttp` drives its client on and asks it from.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[features]
+default = ["net"]
+# `http::HyperHttp` over blaze-http, rustls on ring. Without it (the seed profile, which builds
+# offline from vendored sources) every request is `http::NoNet`, naming its URL.
+net = ["dep:blaze-http", "dep:tokio"]
+
+[dev-dependencies]
+# The keep-alive server `http::client`'s test of the tokio driver asks.
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,82 @@
+[
+ {
+  "name": "axum",
+  "round": 0,
+  "mode": "all",
+  "build": 15.6,
+  "run": 0.2,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 6
+ },
+ {
+  "name": "axum",
+  "round": 0,
+  "mode": "affected",
+  "build": 21.3,
+  "run": 0.6,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 6
+ },
+ {
+  "name": "axum",
+  "round": 1,
+  "mode": "all",
+  "build": 11.5,
+  "run": 0.2,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 6
+ },
+ {
+  "name": "axum",
+  "round": 1,
+  "mode": "affected",
+  "build": 18.2,
+  "run": 0.5,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 6
+ },
+ {
+  "name": "nushell",
+  "round": 0,
+  "mode": "all",
+  "build": 7.2,
+  "run": 14.3,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 124
+ },
+ {
+  "name": "nushell",
+  "round": 0,
+  "mode": "affected",
+  "build": 7.9,
+  "run": 12.0,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 111
+ },
+ {
+  "name": "nushell",
+  "round": 1,
+  "mode": "all",
+  "build": 4.3,
+  "run": 10.2,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 124
+ },
+ {
+  "name": "nushell",
+  "round": 1,
+  "mode": "affected",
+  "build": 5.0,
+  "run": 9.0,
+  "build_rc": 0,
+  "rc": 0,
+  "ran": 111
+ }
+]

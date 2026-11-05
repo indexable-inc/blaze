@@ -1,0 +1,28 @@
+[workspace]
+members = ["a", "b"]
+resolver = "2"
+
+[workspace.package]
+version = "1.2.3"
+edition = "2021"
+license = "MIT"
+authors = ["Ada <ada@example.com>"]
+description = "shared"
+homepage = "https://example.com"
+repository = "https://example.com/repo"
+documentation = "https://docs.example.com"
+keywords = ["one", "two"]
+categories = ["development-tools"]
+rust-version = "1.70"
+readme = "README.md"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.0", default-features = false }
+b = { path = "b" }
+gitdep = { git = "https://github.com/example/gitdep", branch = "dev" }
+
+[workspace.metadata.foo]
+z = 1
+a = 2

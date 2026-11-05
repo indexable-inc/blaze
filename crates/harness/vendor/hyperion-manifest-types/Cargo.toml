@@ -1,0 +1,11 @@
+[package]
+name = "hyperion-manifest-types"
+description = "The data-only module manifest (schema 3, HYPEMAN1) the host reads before any module code runs, from hyperion."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+hyperion-layout = { path = "../hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-api-layouts = { path = "../hyperion-api-layouts" }

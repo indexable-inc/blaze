@@ -1,0 +1,447 @@
+{
+  "v": 1,
+  "tests": 1443,
+  "hermetic": 31,
+  "not_hermetic": 1412,
+  "cached": {
+    "hit": 31,
+    "never": 1412
+  },
+  "results": {
+    "cached": 31,
+    "failed": 3,
+    "passed": 1409
+  },
+  "by_kind": {
+    "asm": 373,
+    "env": 1316,
+    "ffi": 1317,
+    "fs": 1301,
+    "global-state": 1385,
+    "indirect": 1385,
+    "process": 1199
+  },
+  "top_reasons": [
+    {
+      "kind": "process",
+      "what": "posix_spawnp",
+      "tests": 1199,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "indirect",
+      "what": "<yansi::condition::AtomicCondition>::read",
+      "tests": 1113,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "env",
+      "what": "environ",
+      "tests": 880,
+      "example": "just test:integration alias::alias_in_submodule"
+    },
+    {
+      "kind": "global-state",
+      "what": "regex_automata::util::pool::inner::COUNTER",
+      "tests": 871,
+      "example": "just test:integration alias::alias_in_submodule"
+    },
+    {
+      "kind": "fs",
+      "what": "open64",
+      "tests": 725,
+      "example": "just lib completions::tests::scripts"
+    },
+    {
+      "kind": "ffi",
+      "what": "close",
+      "tests": 718,
+      "example": "just lib search::tests::found"
+    },
+    {
+      "kind": "ffi",
+      "what": "syscall",
+      "tests": 598,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "env",
+      "what": "getenv",
+      "tests": 436,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "indirect",
+      "what": "getrandom::backends::linux_android_with_fallback::fill_inner",
+      "tests": 272,
+      "example": "just lib argument_parser::tests::complex_grouping"
+    },
+    {
+      "kind": "asm",
+      "what": "<crossbeam_utils::backoff::Backoff>::snooze",
+      "tests": 249,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "fs",
+      "what": "statx",
+      "tests": 240,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "global-state",
+      "what": "yansi::global::ENABLED",
+      "tests": 239,
+      "example": "just lib analyzer::tests::alias_shadows_recipe_after"
+    },
+    {
+      "kind": "global-state",
+      "what": "memmap2::os::PAGE_SIZE",
+      "tests": 181,
+      "example": "just lib argument_parser::tests::complex_grouping"
+    },
+    {
+      "kind": "fs",
+      "what": "mkdir",
+      "tests": 165,
+      "example": "just test:integration alias::alias_in_submodule"
+    },
+    {
+      "kind": "fs",
+      "what": "getcwd",
+      "tests": 160,
+      "example": "just lib argument_parser::tests::default_recipe_requires_arguments"
+    },
+    {
+      "kind": "asm",
+      "what": "rustix::backend::arch::asm::syscall3",
+      "tests": 122,
+      "example": "just lib config::tests::arguments"
+    },
+    {
+      "kind": "global-state",
+      "what": "getrandom::backends::linux_android_with_fallback::GETRANDOM_FN",
+      "tests": 77,
+      "example": "just lib argument_parser::tests::default_recipe_requires_arguments"
+    },
+    {
+      "kind": "global-state",
+      "what": "just::signal_handler::INSTANCE",
+      "tests": 14,
+      "example": "just lib evaluator::tests::backtick_code"
+    },
+    {
+      "kind": "fs",
+      "what": "readlink",
+      "tests": 5,
+      "example": "just test:integration completions::bash"
+    },
+    {
+      "kind": "fs",
+      "what": "realpath",
+      "tests": 5,
+      "example": "just test:integration functions::test_absolute_path_resolves"
+    },
+    {
+      "kind": "global-state",
+      "what": "num_cpus::linux::CGROUPS_CPUS",
+      "tests": 3,
+      "example": "just test:integration functions::test_os_arch_functions_in_default"
+    },
+    {
+      "kind": "asm",
+      "what": "rustix::backend::arch::asm::syscall2_readonly",
+      "tests": 2,
+      "example": "just test:integration choose::default"
+    },
+    {
+      "kind": "ffi",
+      "what": "getuid",
+      "tests": 1,
+      "example": "just test:integration format::write_error"
+    },
+    {
+      "kind": "fs",
+      "what": "opendir",
+      "tests": 1,
+      "example": "just test:integration examples::examples"
+    }
+  ],
+  "top_helpers": [
+    {
+      "fn": "<std::sys::process::unix::common::Command>::posix_spawn",
+      "file": "std/src/sys/process/unix/unix.rs",
+      "line": 783,
+      "col": 28,
+      "kinds": [
+        "process"
+      ],
+      "tests": 1199,
+      "only_through_it": 0
+    },
+    {
+      "fn": "yansi::global::is_enabled",
+      "file": "src/global.rs",
+      "line": 109,
+      "col": 13,
+      "kinds": [
+        "indirect"
+      ],
+      "tests": 1113,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::env::unix::environ",
+      "file": "std/src/sys/env/unix.rs",
+      "line": 62,
+      "col": 14,
+      "kinds": [
+        "env"
+      ],
+      "tests": 880,
+      "only_through_it": 0
+    },
+    {
+      "fn": "regex_automata::util::pool::inner::THREAD_ID::__rust_std_internal_init_fn",
+      "file": "src/util/pool.rs",
+      "line": 336,
+      "col": 24,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 871,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::File>::open_c",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1244,
+      "col": 36,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 725,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<std::os::fd::owned::OwnedFd as core::ops::drop::Drop>::drop",
+      "file": "std/src/os/fd/owned.rs",
+      "line": 246,
+      "col": 25,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 718,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `std::sys::env::unix::getenv",
+      "file": "std/src/sys/env/unix.rs",
+      "line": 117,
+      "col": 26,
+      "kinds": [
+        "env"
+      ],
+      "tests": 436,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::sync::futex::unix::futex_wait",
+      "file": "std/src/sys/sync/futex/unix.rs",
+      "line": 75,
+      "col": 21,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 430,
+      "only_through_it": 0
+    },
+    {
+      "fn": "getrandom::fill_uninit",
+      "file": "src/lib.rs",
+      "line": 99,
+      "col": 9,
+      "kinds": [
+        "indirect"
+      ],
+      "tests": 272,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<crossbeam_deque::deque::Injector<rayon_core::job::JobRef>>::push",
+      "file": "src/deque.rs",
+      "line": 1383,
+      "col": 25,
+      "kinds": [
+        "asm"
+      ],
+      "tests": 249,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::try_statx::statx",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 158,
+      "col": 16,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 240,
+      "only_through_it": 0
+    },
+    {
+      "fn": "yansi::global::is_enabled",
+      "file": "src/global.rs",
+      "line": 109,
+      "col": 5,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 239,
+      "only_through_it": 0
+    },
+    {
+      "fn": "memmap2::os::page_size",
+      "file": "src/unix.rs",
+      "line": 493,
+      "col": 11,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 181,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::try_statx::statx",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 157,
+      "col": 9,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 168,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::DirBuilder>::mkdir",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1732,
+      "col": 49,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 165,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::paths::unix::getcwd",
+      "file": "std/src/sys/paths/unix.rs",
+      "line": 27,
+      "col": 17,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 160,
+      "only_through_it": 0
+    },
+    {
+      "fn": "rustix::backend::termios::syscalls::tcgetwinsize",
+      "file": "src/backend/linux_raw/termios/syscalls.rs",
+      "line": 28,
+      "col": 13,
+      "kinds": [
+        "asm"
+      ],
+      "tests": 122,
+      "only_through_it": 0
+    },
+    {
+      "fn": "getrandom::backends::linux_android_with_fallback::init",
+      "file": "src/backends/linux_android_with_fallback.rs",
+      "line": 68,
+      "col": 5,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 77,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<just::signal_handler::SignalHandler>::instance",
+      "file": "src/signal_handler.rs",
+      "line": 19,
+      "col": 11,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 14,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::canonicalize",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2136,
+      "col": 22,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 5,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::readlink",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2049,
+      "col": 26,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 5,
+      "only_through_it": 0
+    },
+    {
+      "fn": "num_cpus::linux::init_cgroups",
+      "file": "src/linux.rs",
+      "line": 127,
+      "col": 19,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 3,
+      "only_through_it": 0
+    },
+    {
+      "fn": "rustix::backend::fs::syscalls::access",
+      "file": "src/backend/linux_raw/fs/syscalls.rs",
+      "line": 1393,
+      "col": 13,
+      "kinds": [
+        "asm"
+      ],
+      "tests": 2,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `std::sys::fs::unix::readdir",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1876,
+      "col": 57,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    },
+    {
+      "fn": "nix::unistd::getuid",
+      "file": "src/unistd.rs",
+      "line": 1746,
+      "col": 18,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    }
+  ]
+}

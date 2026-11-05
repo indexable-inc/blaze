@@ -1,0 +1,1264 @@
+{
+ "axum": {
+  "polonius": {
+   "bodies": 1616,
+   "infer_ms": 7164.534,
+   "infer_warm_ms": 3724.65,
+   "first_check_ms": 8108.154,
+   "borrowck_ms": 1012.961,
+   "borrowck_excl_mir_ms": 1012.679,
+   "ratio_to_infer": 0.2718856805337414,
+   "per_body_us": {
+    "p50": 80,
+    "p99": 9732,
+    "max": 14789
+   },
+   "phases_ms": {
+    "constraints": 474.595,
+    "entry_sets": 19.842,
+    "errors": 2.854,
+    "infer": 9.377,
+    "liveness": 291.819,
+    "loans": 8.52,
+    "mir": 0.282,
+    "moves": 105.798,
+    "scopes": 29.05,
+    "setup": 1.105,
+    "walk": 44.693
+   },
+   "slowest": [
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 14789,
+     "infer_us": 34201,
+     "phases_us": {
+      "constraints": 5310,
+      "entry_sets": 213,
+      "errors": 24,
+      "infer": 52,
+      "liveness": 7167,
+      "loans": 63,
+      "mir": 1,
+      "moves": 1097,
+      "scopes": 343,
+      "setup": 7,
+      "walk": 402
+     },
+     "counts": {
+      "blocks": 1887,
+      "bodies": 2,
+      "constraints": 887,
+      "loans": 89,
+      "localized": 887,
+      "locals": 350,
+      "points": 3757,
+      "regions": 614,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum_macros::from_request::extract_fields",
+     "path": "/root/bp/apps/axum/axum-macros/src/from_request/mod.rs",
+     "us": 14609,
+     "infer_us": 17464,
+     "phases_us": {
+      "constraints": 3437,
+      "entry_sets": 690,
+      "errors": 76,
+      "infer": 364,
+      "liveness": 5089,
+      "loans": 287,
+      "mir": 1,
+      "moves": 2230,
+      "scopes": 792,
+      "setup": 12,
+      "walk": 1285
+     },
+     "counts": {
+      "blocks": 2636,
+      "bodies": 2,
+      "constraints": 3174,
+      "loans": 1063,
+      "localized": 3174,
+      "locals": 2819,
+      "points": 11070,
+      "regions": 4074,
+      "universals": 11
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 13855,
+     "infer_us": 31314,
+     "phases_us": {
+      "constraints": 4806,
+      "entry_sets": 195,
+      "errors": 23,
+      "infer": 52,
+      "liveness": 6793,
+      "loans": 59,
+      "mir": 1,
+      "moves": 1056,
+      "scopes": 347,
+      "setup": 6,
+      "walk": 404
+     },
+     "counts": {
+      "blocks": 1848,
+      "bodies": 2,
+      "constraints": 908,
+      "loans": 91,
+      "localized": 908,
+      "locals": 349,
+      "points": 3695,
+      "regions": 627,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 13506,
+     "infer_us": 31825,
+     "phases_us": {
+      "constraints": 5008,
+      "entry_sets": 186,
+      "errors": 23,
+      "infer": 56,
+      "liveness": 6329,
+      "loans": 61,
+      "mir": 1,
+      "moves": 1037,
+      "scopes": 318,
+      "setup": 7,
+      "walk": 378
+     },
+     "counts": {
+      "blocks": 1782,
+      "bodies": 2,
+      "constraints": 833,
+      "loans": 84,
+      "localized": 833,
+      "locals": 332,
+      "points": 3549,
+      "regions": 578,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 12991,
+     "infer_us": 28492,
+     "phases_us": {
+      "constraints": 4483,
+      "entry_sets": 192,
+      "errors": 23,
+      "infer": 55,
+      "liveness": 6364,
+      "loans": 59,
+      "mir": 1,
+      "moves": 1009,
+      "scopes": 328,
+      "setup": 6,
+      "walk": 370
+     },
+     "counts": {
+      "blocks": 1745,
+      "bodies": 2,
+      "constraints": 854,
+      "loans": 86,
+      "localized": 854,
+      "locals": 331,
+      "points": 3490,
+      "regions": 591,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 12712,
+     "infer_us": 28115,
+     "phases_us": {
+      "constraints": 4737,
+      "entry_sets": 220,
+      "errors": 23,
+      "infer": 48,
+      "liveness": 5869,
+      "loans": 64,
+      "mir": 1,
+      "moves": 954,
+      "scopes": 299,
+      "setup": 7,
+      "walk": 394
+     },
+     "counts": {
+      "blocks": 1677,
+      "bodies": 2,
+      "constraints": 779,
+      "loans": 79,
+      "localized": 779,
+      "locals": 314,
+      "points": 3341,
+      "regions": 542,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::serve::handle_connection",
+     "path": "/root/bp/apps/axum/axum/src/serve/mod.rs",
+     "us": 12318,
+     "infer_us": 96818,
+     "phases_us": {
+      "constraints": 7870,
+      "entry_sets": 224,
+      "errors": 50,
+      "infer": 135,
+      "liveness": 1702,
+      "loans": 97,
+      "mir": 3,
+      "moves": 905,
+      "scopes": 770,
+      "setup": 17,
+      "walk": 411
+     },
+     "counts": {
+      "blocks": 1288,
+      "bodies": 13,
+      "constraints": 1231,
+      "loans": 57,
+      "localized": 1212,
+      "locals": 515,
+      "points": 3440,
+      "regions": 1155,
+      "universals": 72
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 12223,
+     "infer_us": 26545,
+     "phases_us": {
+      "constraints": 4415,
+      "entry_sets": 190,
+      "errors": 22,
+      "infer": 53,
+      "liveness": 5772,
+      "loans": 55,
+      "mir": 2,
+      "moves": 944,
+      "scopes": 310,
+      "setup": 7,
+      "walk": 361
+     },
+     "counts": {
+      "blocks": 1642,
+      "bodies": 2,
+      "constraints": 800,
+      "loans": 81,
+      "localized": 800,
+      "locals": 313,
+      "points": 3285,
+      "regions": 555,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 11468,
+     "infer_us": 25504,
+     "phases_us": {
+      "constraints": 4303,
+      "entry_sets": 185,
+      "errors": 20,
+      "infer": 49,
+      "liveness": 5216,
+      "loans": 56,
+      "mir": 1,
+      "moves": 891,
+      "scopes": 303,
+      "setup": 6,
+      "walk": 341
+     },
+     "counts": {
+      "blocks": 1572,
+      "bodies": 2,
+      "constraints": 725,
+      "loans": 74,
+      "localized": 725,
+      "locals": 296,
+      "points": 3133,
+      "regions": 506,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 11221,
+     "infer_us": 23410,
+     "phases_us": {
+      "constraints": 3998,
+      "entry_sets": 182,
+      "errors": 20,
+      "infer": 45,
+      "liveness": 5284,
+      "loans": 55,
+      "mir": 1,
+      "moves": 893,
+      "scopes": 287,
+      "setup": 6,
+      "walk": 353
+     },
+     "counts": {
+      "blocks": 1539,
+      "bodies": 2,
+      "constraints": 746,
+      "loans": 76,
+      "localized": 746,
+      "locals": 295,
+      "points": 3080,
+      "regions": 519,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 10728,
+     "infer_us": 23220,
+     "phases_us": {
+      "constraints": 4092,
+      "entry_sets": 180,
+      "errors": 20,
+      "infer": 50,
+      "liveness": 4809,
+      "loans": 52,
+      "mir": 1,
+      "moves": 862,
+      "scopes": 257,
+      "setup": 6,
+      "walk": 313
+     },
+     "counts": {
+      "blocks": 1467,
+      "bodies": 2,
+      "constraints": 671,
+      "loans": 69,
+      "localized": 671,
+      "locals": 278,
+      "points": 2925,
+      "regions": 470,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 10704,
+     "infer_us": 33678,
+     "phases_us": {
+      "constraints": 5426,
+      "entry_sets": 207,
+      "errors": 20,
+      "infer": 51,
+      "liveness": 2942,
+      "loans": 67,
+      "mir": 1,
+      "moves": 1186,
+      "scopes": 276,
+      "setup": 5,
+      "walk": 415
+     },
+     "counts": {
+      "blocks": 1949,
+      "bodies": 2,
+      "constraints": 901,
+      "loans": 72,
+      "localized": 901,
+      "locals": 379,
+      "points": 3991,
+      "regions": 618,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::from_fn::<FromFn<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/from_fn.rs",
+     "us": 10656,
+     "infer_us": 29651,
+     "phases_us": {
+      "constraints": 3745,
+      "entry_sets": 194,
+      "errors": 24,
+      "infer": 52,
+      "liveness": 4580,
+      "loans": 60,
+      "mir": 2,
+      "moves": 1088,
+      "scopes": 373,
+      "setup": 8,
+      "walk": 421
+     },
+     "counts": {
+      "blocks": 1772,
+      "bodies": 2,
+      "constraints": 873,
+      "loans": 86,
+      "localized": 873,
+      "locals": 340,
+      "points": 3561,
+      "regions": 601,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum_macros::from_request::impl_struct_by_extracting_all_at_once",
+     "path": "/root/bp/apps/axum/axum-macros/src/from_request/mod.rs",
+     "us": 10636,
+     "infer_us": 11908,
+     "phases_us": {
+      "constraints": 2511,
+      "entry_sets": 457,
+      "errors": 44,
+      "infer": 265,
+      "liveness": 3792,
+      "loans": 208,
+      "mir": 1,
+      "moves": 1537,
+      "scopes": 595,
+      "setup": 10,
+      "walk": 968
+     },
+     "counts": {
+      "blocks": 1993,
+      "bodies": 3,
+      "constraints": 2681,
+      "loans": 866,
+      "localized": 2681,
+      "locals": 2050,
+      "points": 8125,
+      "regions": 3371,
+      "universals": 19
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 10238,
+     "infer_us": 20957,
+     "phases_us": {
+      "constraints": 3713,
+      "entry_sets": 181,
+      "errors": 20,
+      "infer": 46,
+      "liveness": 4762,
+      "loans": 51,
+      "mir": 1,
+      "moves": 808,
+      "scopes": 266,
+      "setup": 6,
+      "walk": 301
+     },
+     "counts": {
+      "blocks": 1436,
+      "bodies": 2,
+      "constraints": 692,
+      "loans": 71,
+      "localized": 692,
+      "locals": 277,
+      "points": 2875,
+      "regions": 483,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 9960,
+     "infer_us": 30371,
+     "phases_us": {
+      "constraints": 5089,
+      "entry_sets": 223,
+      "errors": 19,
+      "infer": 49,
+      "liveness": 2657,
+      "loans": 64,
+      "mir": 1,
+      "moves": 1083,
+      "scopes": 254,
+      "setup": 5,
+      "walk": 412
+     },
+     "counts": {
+      "blocks": 1840,
+      "bodies": 2,
+      "constraints": 847,
+      "loans": 68,
+      "localized": 847,
+      "locals": 359,
+      "points": 3768,
+      "regions": 582,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::from_fn::<FromFn<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/from_fn.rs",
+     "us": 9732,
+     "infer_us": 26898,
+     "phases_us": {
+      "constraints": 3397,
+      "entry_sets": 206,
+      "errors": 22,
+      "infer": 49,
+      "liveness": 4237,
+      "loans": 59,
+      "mir": 1,
+      "moves": 941,
+      "scopes": 320,
+      "setup": 6,
+      "walk": 396
+     },
+     "counts": {
+      "blocks": 1671,
+      "bodies": 2,
+      "constraints": 819,
+      "loans": 81,
+      "localized": 819,
+      "locals": 322,
+      "points": 3359,
+      "regions": 565,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 9541,
+     "infer_us": 20074,
+     "phases_us": {
+      "constraints": 3711,
+      "entry_sets": 143,
+      "errors": 18,
+      "infer": 38,
+      "liveness": 4185,
+      "loans": 48,
+      "mir": 2,
+      "moves": 770,
+      "scopes": 241,
+      "setup": 6,
+      "walk": 299
+     },
+     "counts": {
+      "blocks": 1362,
+      "bodies": 2,
+      "constraints": 617,
+      "loans": 64,
+      "localized": 617,
+      "locals": 260,
+      "points": 2717,
+      "regions": 434,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 9523,
+     "infer_us": 18597,
+     "phases_us": {
+      "constraints": 3498,
+      "entry_sets": 227,
+      "errors": 18,
+      "infer": 44,
+      "liveness": 4293,
+      "loans": 46,
+      "mir": 2,
+      "moves": 760,
+      "scopes": 257,
+      "setup": 7,
+      "walk": 289
+     },
+     "counts": {
+      "blocks": 1333,
+      "bodies": 2,
+      "constraints": 638,
+      "loans": 66,
+      "localized": 638,
+      "locals": 259,
+      "points": 2670,
+      "regions": 447,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 9386,
+     "infer_us": 27330,
+     "phases_us": {
+      "constraints": 4678,
+      "entry_sets": 308,
+      "errors": 18,
+      "infer": 50,
+      "liveness": 2543,
+      "loans": 60,
+      "mir": 1,
+      "moves": 1006,
+      "scopes": 234,
+      "setup": 6,
+      "walk": 384
+     },
+     "counts": {
+      "blocks": 1731,
+      "bodies": 2,
+      "constraints": 793,
+      "loans": 64,
+      "localized": 793,
+      "locals": 339,
+      "points": 3545,
+      "regions": 546,
+      "universals": 8
+     }
+    }
+   ],
+   "secs": 28
+  },
+  "nll": {
+   "bodies": 1616,
+   "infer_ms": 7164.534,
+   "infer_warm_ms": 3724.65,
+   "first_check_ms": 8108.154,
+   "borrowck_ms": 945.298,
+   "borrowck_excl_mir_ms": 945.143,
+   "ratio_to_infer": 0.25375350704093,
+   "per_body_us": {
+    "p50": 66,
+    "p99": 9321,
+    "max": 14256
+   },
+   "phases_ms": {
+    "constraints": 454.346,
+    "entry_sets": 20.596,
+    "errors": 2.623,
+    "infer": 9.212,
+    "liveness": 282.521,
+    "loans": 8.026,
+    "mir": 0.155,
+    "moves": 100.007,
+    "scopes": 2.451,
+    "setup": 0.963,
+    "walk": 42.847
+   },
+   "slowest": [
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 14256,
+     "infer_us": 34201,
+     "phases_us": {
+      "constraints": 5195,
+      "entry_sets": 207,
+      "errors": 25,
+      "infer": 56,
+      "liveness": 7072,
+      "loans": 62,
+      "mir": 1,
+      "moves": 1112,
+      "scopes": 22,
+      "setup": 6,
+      "walk": 397
+     },
+     "counts": {
+      "blocks": 1887,
+      "bodies": 2,
+      "constraints": 887,
+      "loans": 89,
+      "localized": 887,
+      "locals": 350,
+      "points": 3757,
+      "regions": 614,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum_macros::from_request::extract_fields",
+     "path": "/root/bp/apps/axum/axum-macros/src/from_request/mod.rs",
+     "us": 13917,
+     "infer_us": 17464,
+     "phases_us": {
+      "constraints": 3380,
+      "entry_sets": 764,
+      "errors": 72,
+      "infer": 361,
+      "liveness": 5044,
+      "loans": 283,
+      "mir": 1,
+      "moves": 2186,
+      "scopes": 149,
+      "setup": 12,
+      "walk": 1346
+     },
+     "counts": {
+      "blocks": 2636,
+      "bodies": 2,
+      "constraints": 3174,
+      "loans": 1063,
+      "localized": 3174,
+      "locals": 2819,
+      "points": 11070,
+      "regions": 4074,
+      "universals": 11
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 13563,
+     "infer_us": 31314,
+     "phases_us": {
+      "constraints": 4721,
+      "entry_sets": 194,
+      "errors": 23,
+      "infer": 57,
+      "liveness": 6861,
+      "loans": 59,
+      "mir": 1,
+      "moves": 1128,
+      "scopes": 23,
+      "setup": 6,
+      "walk": 393
+     },
+     "counts": {
+      "blocks": 1848,
+      "bodies": 2,
+      "constraints": 908,
+      "loans": 91,
+      "localized": 908,
+      "locals": 349,
+      "points": 3695,
+      "regions": 627,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 13053,
+     "infer_us": 31825,
+     "phases_us": {
+      "constraints": 4905,
+      "entry_sets": 179,
+      "errors": 22,
+      "infer": 54,
+      "liveness": 6325,
+      "loans": 63,
+      "mir": 1,
+      "moves": 1014,
+      "scopes": 20,
+      "setup": 6,
+      "walk": 366
+     },
+     "counts": {
+      "blocks": 1782,
+      "bodies": 2,
+      "constraints": 833,
+      "loans": 84,
+      "localized": 833,
+      "locals": 332,
+      "points": 3549,
+      "regions": 578,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 12521,
+     "infer_us": 28492,
+     "phases_us": {
+      "constraints": 4460,
+      "entry_sets": 176,
+      "errors": 22,
+      "infer": 54,
+      "liveness": 6208,
+      "loans": 57,
+      "mir": 1,
+      "moves": 1044,
+      "scopes": 20,
+      "setup": 6,
+      "walk": 372
+     },
+     "counts": {
+      "blocks": 1745,
+      "bodies": 2,
+      "constraints": 854,
+      "loans": 86,
+      "localized": 854,
+      "locals": 331,
+      "points": 3490,
+      "regions": 591,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 12334,
+     "infer_us": 28115,
+     "phases_us": {
+      "constraints": 4685,
+      "entry_sets": 241,
+      "errors": 23,
+      "infer": 51,
+      "liveness": 5775,
+      "loans": 60,
+      "mir": 1,
+      "moves": 997,
+      "scopes": 19,
+      "setup": 7,
+      "walk": 384
+     },
+     "counts": {
+      "blocks": 1677,
+      "bodies": 2,
+      "constraints": 779,
+      "loans": 79,
+      "localized": 779,
+      "locals": 314,
+      "points": 3341,
+      "regions": 542,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 11523,
+     "infer_us": 26545,
+     "phases_us": {
+      "constraints": 4197,
+      "entry_sets": 176,
+      "errors": 21,
+      "infer": 49,
+      "liveness": 5669,
+      "loans": 54,
+      "mir": 1,
+      "moves": 899,
+      "scopes": 19,
+      "setup": 6,
+      "walk": 345
+     },
+     "counts": {
+      "blocks": 1642,
+      "bodies": 2,
+      "constraints": 800,
+      "loans": 81,
+      "localized": 800,
+      "locals": 313,
+      "points": 3285,
+      "regions": 555,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::serve::handle_connection",
+     "path": "/root/bp/apps/axum/axum/src/serve/mod.rs",
+     "us": 11398,
+     "infer_us": 96818,
+     "phases_us": {
+      "constraints": 7752,
+      "entry_sets": 220,
+      "errors": 50,
+      "infer": 131,
+      "liveness": 1659,
+      "loans": 96,
+      "mir": 3,
+      "moves": 898,
+      "scopes": 42,
+      "setup": 16,
+      "walk": 409
+     },
+     "counts": {
+      "blocks": 1288,
+      "bodies": 13,
+      "constraints": 1231,
+      "loans": 57,
+      "localized": 1212,
+      "locals": 515,
+      "points": 3440,
+      "regions": 1155,
+      "universals": 72
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 11021,
+     "infer_us": 25504,
+     "phases_us": {
+      "constraints": 4231,
+      "entry_sets": 169,
+      "errors": 26,
+      "infer": 50,
+      "liveness": 5192,
+      "loans": 55,
+      "mir": 1,
+      "moves": 856,
+      "scopes": 17,
+      "setup": 6,
+      "walk": 335
+     },
+     "counts": {
+      "blocks": 1572,
+      "bodies": 2,
+      "constraints": 725,
+      "loans": 74,
+      "localized": 725,
+      "locals": 296,
+      "points": 3133,
+      "regions": 506,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 10737,
+     "infer_us": 23410,
+     "phases_us": {
+      "constraints": 3903,
+      "entry_sets": 178,
+      "errors": 20,
+      "infer": 50,
+      "liveness": 5206,
+      "loans": 54,
+      "mir": 1,
+      "moves": 860,
+      "scopes": 18,
+      "setup": 6,
+      "walk": 355
+     },
+     "counts": {
+      "blocks": 1539,
+      "bodies": 2,
+      "constraints": 746,
+      "loans": 76,
+      "localized": 746,
+      "locals": 295,
+      "points": 3080,
+      "regions": 519,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 10399,
+     "infer_us": 23220,
+     "phases_us": {
+      "constraints": 3988,
+      "entry_sets": 253,
+      "errors": 20,
+      "infer": 47,
+      "liveness": 4828,
+      "loans": 52,
+      "mir": 1,
+      "moves": 794,
+      "scopes": 16,
+      "setup": 6,
+      "walk": 313
+     },
+     "counts": {
+      "blocks": 1467,
+      "bodies": 2,
+      "constraints": 671,
+      "loans": 69,
+      "localized": 671,
+      "locals": 278,
+      "points": 2925,
+      "regions": 470,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 10305,
+     "infer_us": 33678,
+     "phases_us": {
+      "constraints": 5406,
+      "entry_sets": 214,
+      "errors": 19,
+      "infer": 56,
+      "liveness": 2790,
+      "loans": 65,
+      "mir": 1,
+      "moves": 1207,
+      "scopes": 18,
+      "setup": 5,
+      "walk": 419
+     },
+     "counts": {
+      "blocks": 1949,
+      "bodies": 2,
+      "constraints": 901,
+      "loans": 72,
+      "localized": 901,
+      "locals": 379,
+      "points": 3991,
+      "regions": 618,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum_macros::from_request::impl_struct_by_extracting_all_at_once",
+     "path": "/root/bp/apps/axum/axum-macros/src/from_request/mod.rs",
+     "us": 10021,
+     "infer_us": 11908,
+     "phases_us": {
+      "constraints": 2488,
+      "entry_sets": 427,
+      "errors": 44,
+      "infer": 286,
+      "liveness": 3764,
+      "loans": 207,
+      "mir": 1,
+      "moves": 1545,
+      "scopes": 112,
+      "setup": 10,
+      "walk": 912
+     },
+     "counts": {
+      "blocks": 1993,
+      "bodies": 3,
+      "constraints": 2681,
+      "loans": 866,
+      "localized": 2681,
+      "locals": 2050,
+      "points": 8125,
+      "regions": 3371,
+      "universals": 19
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 9874,
+     "infer_us": 20957,
+     "phases_us": {
+      "constraints": 3543,
+      "entry_sets": 166,
+      "errors": 19,
+      "infer": 46,
+      "liveness": 4777,
+      "loans": 50,
+      "mir": 1,
+      "moves": 871,
+      "scopes": 17,
+      "setup": 5,
+      "walk": 304
+     },
+     "counts": {
+      "blocks": 1436,
+      "bodies": 2,
+      "constraints": 692,
+      "loans": 71,
+      "localized": 692,
+      "locals": 277,
+      "points": 2875,
+      "regions": 483,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::from_fn::<FromFn<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/from_fn.rs",
+     "us": 9865,
+     "infer_us": 29651,
+     "phases_us": {
+      "constraints": 3511,
+      "entry_sets": 181,
+      "errors": 22,
+      "infer": 55,
+      "liveness": 4506,
+      "loans": 59,
+      "mir": 1,
+      "moves": 1028,
+      "scopes": 21,
+      "setup": 6,
+      "walk": 375
+     },
+     "counts": {
+      "blocks": 1772,
+      "bodies": 2,
+      "constraints": 873,
+      "loans": 86,
+      "localized": 873,
+      "locals": 340,
+      "points": 3561,
+      "regions": 601,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 9775,
+     "infer_us": 30371,
+     "phases_us": {
+      "constraints": 5016,
+      "entry_sets": 363,
+      "errors": 18,
+      "infer": 59,
+      "liveness": 2608,
+      "loans": 61,
+      "mir": 1,
+      "moves": 1119,
+      "scopes": 16,
+      "setup": 5,
+      "walk": 408
+     },
+     "counts": {
+      "blocks": 1840,
+      "bodies": 2,
+      "constraints": 847,
+      "loans": 68,
+      "localized": 847,
+      "locals": 359,
+      "points": 3768,
+      "regions": 582,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::from_fn::<FromFn<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/from_fn.rs",
+     "us": 9321,
+     "infer_us": 26898,
+     "phases_us": {
+      "constraints": 3317,
+      "entry_sets": 198,
+      "errors": 23,
+      "infer": 53,
+      "liveness": 4262,
+      "loans": 59,
+      "mir": 1,
+      "moves": 899,
+      "scopes": 19,
+      "setup": 6,
+      "walk": 388
+     },
+     "counts": {
+      "blocks": 1671,
+      "bodies": 2,
+      "constraints": 819,
+      "loans": 81,
+      "localized": 819,
+      "locals": 322,
+      "points": 3359,
+      "regions": 565,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_request::<MapRequest<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_request.rs",
+     "us": 9118,
+     "infer_us": 20074,
+     "phases_us": {
+      "constraints": 3566,
+      "entry_sets": 168,
+      "errors": 17,
+      "infer": 38,
+      "liveness": 4162,
+      "loans": 46,
+      "mir": 1,
+      "moves": 734,
+      "scopes": 15,
+      "setup": 6,
+      "walk": 289
+     },
+     "counts": {
+      "blocks": 1362,
+      "bodies": 2,
+      "constraints": 617,
+      "loans": 64,
+      "localized": 617,
+      "locals": 260,
+      "points": 2717,
+      "regions": 434,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::middleware::map_response::<MapResponse<F, S, I, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/middleware/map_response.rs",
+     "us": 9024,
+     "infer_us": 18597,
+     "phases_us": {
+      "constraints": 3371,
+      "entry_sets": 226,
+      "errors": 17,
+      "infer": 44,
+      "liveness": 4207,
+      "loans": 45,
+      "mir": 1,
+      "moves": 734,
+      "scopes": 16,
+      "setup": 6,
+      "walk": 282
+     },
+     "counts": {
+      "blocks": 1333,
+      "bodies": 2,
+      "constraints": 638,
+      "loans": 66,
+      "localized": 638,
+      "locals": 259,
+      "points": 2670,
+      "regions": 447,
+      "universals": 8
+     }
+    },
+    {
+     "name": "axum::error_handling::<HandleError<S, F, (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14)>>::call",
+     "path": "/root/bp/apps/axum/axum/src/error_handling/mod.rs",
+     "us": 9003,
+     "infer_us": 27330,
+     "phases_us": {
+      "constraints": 4636,
+      "entry_sets": 306,
+      "errors": 18,
+      "infer": 50,
+      "liveness": 2394,
+      "loans": 59,
+      "mir": 1,
+      "moves": 1028,
+      "scopes": 15,
+      "setup": 5,
+      "walk": 385
+     },
+     "counts": {
+      "blocks": 1731,
+      "bodies": 2,
+      "constraints": 793,
+      "loans": 64,
+      "localized": 793,
+      "locals": 339,
+      "points": 3545,
+      "regions": 546,
+      "universals": 8
+     }
+    }
+   ],
+   "secs": 28
+  }
+ }
+}

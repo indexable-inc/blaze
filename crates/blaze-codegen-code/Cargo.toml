@@ -1,0 +1,33 @@
+[package]
+name = "blaze-codegen-code"
+description = "The content identities of blaze's code generator and of its front end (the trait solver included), worked out by the program's build script over the checkout or a shipped tree: what stored templates and stored front-end answers are keyed by"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# A build-dependency of the programs (blaze-engine, which works out the code generator's and the
+# front end's identities, and blaze-wasm), and a dev-dependency of the coverage checks
+# (hir-ty-codegen, blaze-cargo) and hir-ty's store tests: nothing of it is linked into blaze.
+# It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
+# runs no cargo, whose `$CARGO` is blaze under blaze.
+[dependencies]
+blake3.workspace = true
+glob.workspace = true
+toml.workspace = true
+# The request of `ship-code-identity`.
+serde_json.workspace = true
+
+# What a checkout ships with a package cut from it (.github/scripts/publish_crates.py).
+[[bin]]
+name = "ship-code-identity"
+
+[lints]
+workspace = true

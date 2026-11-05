@@ -1,0 +1,9 @@
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+object = { version = "=0.39.1", default-features = false, features = ["read_core", "coff"] }
+
+[workspace]

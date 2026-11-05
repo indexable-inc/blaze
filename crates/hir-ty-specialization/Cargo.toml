@@ -1,0 +1,34 @@
+[package]
+name = "hir-ty-specialization"
+version = "0.0.0"
+repository.workspace = true
+description = "rustc's min_specialization checks and blaze's sound specialization subset, over rust-analyzer's types."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+tracing.workspace = true
+
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-query.workspace = true
+blaze-mem.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-wfcheck.workspace = true
+
+[dev-dependencies]
+# The tests' database links hir-ty-mir for the MIR providers.
+hir-ty-mir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+{
+ "env": {"CARGO_ENV_X": "it's $HOME and \"q\" !bang"},
+ "runs": [["env"], ["env.WITH SPACE"], ["target"], ["--format", "json", "env"], ["env", "--show-origin"]]
+}

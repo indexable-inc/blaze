@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "build.empty = []\nbuild.target.a = 1\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.empty = [\n]\nbuild.target.a = 1 # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nbuild.empty = []\nbuild.target.a = 1\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nbuild.empty = [\n]\nbuild.target.a = 1 # $ROOT/.cargo/config.toml\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"empty\":[],\"emptyt\":{},\"target\":{\"a\":1}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"empty\":[],\"emptyt\":{},\"target\":{\"a\":1}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ }
+]

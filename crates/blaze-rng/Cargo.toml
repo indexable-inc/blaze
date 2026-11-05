@@ -1,0 +1,23 @@
+[package]
+name = "blaze-rng"
+description = "blaze v2's one seeded SplitMix64, for tests, simulations and jitter; no dependencies, so the crates below blaze-ids use it too"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

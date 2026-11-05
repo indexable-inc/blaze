@@ -1,0 +1,20 @@
+[package]
+name = "rung"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "=0.8.9", features = ["ws"] }
+tower = "=0.5.3"
+tower-http = { version = "=0.6.11", features = ["full"] }
+tokio = { version = "=1.52.3", features = ["full"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["std", "env-filter", "json", "registry", "fmt"] }
+wasmparser = "=0.245.1"
+lightningcss = { version = "=1.0.0-alpha.72", features = ["browserslist", "into_owned"] }
+
+[profile.dev]
+debug = 0

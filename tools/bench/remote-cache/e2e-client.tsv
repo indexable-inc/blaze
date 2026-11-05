@@ -1,0 +1,17 @@
+# blaze's Place::Gateway end to end, 2026-10-27. Gateway: https://blaze-gateway.indexable.workers.dev,
+# tenant rcache-test (private). Push from ix VM rcache-client (arm64, us-west-2); every other row on a
+# fresh ix VM rcache-client2 (arm64, us-west-2, 16 vCPU, 16 GiB --memory-commit), the same blaze binary
+# (sha256 f6a743d1...), each run with an empty store and target directory of its own.
+# Project: ripgrep 15.1.0, `blaze build` (debug), BLAZE_PROJECT=ripgrep, manifests signed by
+# the pusher's key (BLAZE_REMOTE_SIGN) and checked by the reader (BLAZE_REMOTE_TRUST).
+# first_build_s is the first `blaze build` in a fresh store, up to the daemon ready;
+# second_build_s the next one, served by the daemon. fns_compiled is the worker log's
+# "store: N functions found, M compiled and added" summed. Rounds alternate cold, pull, lazy.
+round	mode	objects	bytes	transfer_s	mib_s	first_build_s	second_build_s	std	fns_found	fns_compiled	notes
+1	push	59	89088207	4.43	19.2					29 packs (84015442 bytes) with keys and manifest, from rcache-client
+1	cold	0	0			33.26	1.21	compiled 27350 fns	45159	30	no remote; the log was read before the build's second store line (round 2 has it)
+1	pull	30	84020335	2.21	36.2	7.91	0.05	from the store	7555	0	blaze-engine cache pull, BLAZE_REMOTE_REQUIRED=1, then no remote
+1	lazy	37	58516892			26.00	0.10	from the store	7555	0	BLAZE_REMOTE_LAZY=1 READONLY REQUIRED: 5077658 bytes of keys, then 6 of 29 packs (53439234 bytes) as the build asked
+2	cold	0	0			31.83	0.09	compiled 27350 fns	63110	13389	no remote
+2	pull	30	84020335	2.07	38.7	8.18	0.05	from the store	7555	0	as round 1
+2	lazy	37	58516892			27.76	0.09	from the store	7555	0	as round 1

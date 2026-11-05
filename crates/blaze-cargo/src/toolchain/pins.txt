@@ -1,0 +1,25 @@
+# The Rust nightly blaze downloads as its own toolchain: written by
+# harness/toolchain_pins.py '{"write": true}' from https://static.rust-lang.org/dist/2026-10-27/channel-rust-nightly.toml.
+# release <toolchain> <date> <channel>; rustc <what `rustc -V` says after `rustc `>;
+# commit <rust-lang/rust commit>; manifest <sha256> <bytes>; then per host
+# <host> <package> <target> <sha256 of the .tar.xz> <bytes>.
+release nightly-2026-10-27 2026-10-27 nightly
+rustc 1.101.0-nightly (16d1ffac1 2026-10-26)
+commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977
+manifest 34f3d9bf04640a082e561310f3f258846397f4cf64a2bcfebcea96ebf18e2572 923466
+aarch64-apple-darwin rustc aarch64-apple-darwin af85a40276f7d603a92d53beccb91ba7bc3002a1d1c359d22271677606cf3ad0 51536192
+aarch64-apple-darwin cargo aarch64-apple-darwin 49b555c9a3311e3966e0207a1d2472da6aa9daa2755820ec7e598051aaf88112 8881356
+aarch64-apple-darwin rust-std aarch64-apple-darwin 2166fc613da615fdbaabda16cd71f670f70d70a41ed63014de3ac36aa1c741a7 30907328
+aarch64-apple-darwin rust-std wasm32-wasip1 f432839777f3d69b68116d3b175097856bd9085f26f78d35f990f1de3847bead 24669600
+x86_64-unknown-linux-gnu rustc x86_64-unknown-linux-gnu 23364ff3e720e67d008d34e28bc0e1ea98e9c2b83837828248dd1c047ec4905f 85183536
+x86_64-unknown-linux-gnu cargo x86_64-unknown-linux-gnu b741cb5b0f1d75d83b52412a8565b13fcf69afef6e73d7b1d57d15c3c2d327ec 10900904
+x86_64-unknown-linux-gnu rust-std x86_64-unknown-linux-gnu 3c43042ff1f1d67b2a8192ebf3439de1964789e844044cc9383171e7ab1d71d3 31721028
+x86_64-unknown-linux-gnu rust-std wasm32-wasip1 f432839777f3d69b68116d3b175097856bd9085f26f78d35f990f1de3847bead 24669600
+aarch64-unknown-linux-gnu rustc aarch64-unknown-linux-gnu 31c9d3011998df2f723d60781b034d7c0a2af7532eca3358fd8814726dc051be 69729344
+aarch64-unknown-linux-gnu cargo aarch64-unknown-linux-gnu dc1616c2739dd67476c27438520f28e4103bd9efb3e21128964afb29a3d8ec13 10551720
+aarch64-unknown-linux-gnu rust-std aarch64-unknown-linux-gnu 2915637b8c604460823e53906f74015b2c87244d5e6a2e52113de0b823703c2a 31919532
+aarch64-unknown-linux-gnu rust-std wasm32-wasip1 f432839777f3d69b68116d3b175097856bd9085f26f78d35f990f1de3847bead 24669600
+x86_64-pc-windows-msvc rustc x86_64-pc-windows-msvc 9d78f0d532d703d529d31034536866d6d8cfb556c7751cd96f1562d9679e821f 78049116
+x86_64-pc-windows-msvc cargo x86_64-pc-windows-msvc 7e934747f7be67803e0dc58d361496e5e878b80357150363b09f2abe2812c654 9798264
+x86_64-pc-windows-msvc rust-std x86_64-pc-windows-msvc 71fcdf9474b212c1069e7c6f72fed912a999b9f8451d5e28b795d6af1ba3927a 23653400
+x86_64-pc-windows-msvc rust-std wasm32-wasip1 f432839777f3d69b68116d3b175097856bd9085f26f78d35f990f1de3847bead 24669600

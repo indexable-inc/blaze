@@ -1,0 +1,6 @@
+[package]
+name = "bad-toml"
+version = 1
+edition = "2021"
+
+[workspace]

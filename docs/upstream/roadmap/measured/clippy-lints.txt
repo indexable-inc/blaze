@@ -1,0 +1,16 @@
+rust-lang/rust-clippy 43c0efca149bb15b9cd2bbf2ef34771cefa70a7e 2026-10-24: declare_clippy_lint! blocks in clippy_lints/src by group
+total 840
+style 159
+pedantic 148
+complexity 146
+restriction 137
+suspicious 86
+correctness 67
+nursery 52
+perf 40
+cargo 5
+default-on (correctness+suspicious+style+complexity+perf): 498
+files under clippy_lints/src naming MachineApplicable: 354 of 748
+impl ... LateLintPass: 318
+impl ... EarlyLintPass: 53
+files using rustc_middle::mir: 20

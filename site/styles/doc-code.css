@@ -1,0 +1,45 @@
+/* Syntax colours for code blocks, copied from ix packages/web/src/styles/doc-code.css (dark, and light below).
+   Roles: keyword red, string green, call purple, type and name blue, number orange, comment grey. */
+.code-roles {
+	--syn-keyword: #ff7b72;
+	--syn-string: #7ee2a8;
+	--syn-title: #d2a8ff;
+	--syn-attr: #79c0ff;
+	--syn-number: #ffb86b;
+	--syn-comment: #7d8590;
+}
+
+@media (prefers-color-scheme: light) {
+	.code-roles {
+		--syn-keyword: #cf222e;
+		--syn-string: #0a7d4f;
+		--syn-title: #6639ba;
+		--syn-attr: #0b5fc4;
+		--syn-number: #b35900;
+		--syn-comment: #8a8a85;
+	}
+}
+
+.hljs { color: var(--code-ink); background: transparent; }
+.code-roles .hljs-keyword,
+.code-roles .hljs-literal,
+.code-roles .hljs-selector-tag { color: var(--syn-keyword); font-weight: 600; }
+.code-roles .hljs-string,
+.code-roles .hljs-regexp { color: var(--syn-string); }
+.code-roles .hljs-title,
+.code-roles .hljs-title.function_,
+.code-roles .hljs-section,
+.code-roles .hljs-name { color: var(--syn-title); font-weight: 500; }
+.code-roles .hljs-attr,
+.code-roles .hljs-attribute,
+.code-roles .hljs-property,
+.code-roles .hljs-variable,
+.code-roles .hljs-built_in,
+.code-roles .hljs-title.class_,
+.code-roles .hljs-type { color: var(--syn-attr); font-weight: 400; font-style: normal; }
+.code-roles .hljs-number,
+.code-roles .hljs-symbol,
+.code-roles .hljs-meta { color: var(--syn-number); font-style: normal; }
+.code-roles .hljs-comment { color: var(--syn-comment); }
+.code-roles .hljs-punctuation,
+.code-roles .hljs-operator { color: var(--ink-3); }

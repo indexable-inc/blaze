@@ -1,0 +1,5 @@
+daemon 0.1.0-5dc1e0bf-648f0a8-18e24686b39f4400 (blaze 0.1.0 (da138e1)) of pid 398751 listens on /root/perf/noop-ws/da138e119c/home/daemon.sock
+worker f0fc0f8bb7455621 of pid 398754 for /root/perf/noop-ws/da138e119c/rg/
+/root/perf/noop-ws/da138e119c/rg: ready
+worker 9cf270b59db90820 of pid 400420 for /root/perf/noop-ws/da138e119c/rg/
+/root/perf/noop-ws/da138e119c/rg: ready

@@ -1,0 +1,80 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 296K of event 'cpu-clock:ppp'
+# Event count (approx.): 59290455720
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  .................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+     4.52%  [.] sha2::sha256::compress256
+     1.13%  [.] __aarch64_ldadd8_relax
+     1.12%  [.] __memcpy_generic
+     0.95%  [k] __arch_copy_to_user
+     0.82%  [.] __aarch64_ldadd8_rel
+     0.79%  [.] <intern::intern_slice::InternedSlice<hir_ty::next_solver::generic_arg::GenericArgsStorage>>::from_header_and_slice
+     0.78%  [.] <hir_ty::next_solver::ty::Ty>::new
+     0.66%  [.] <hir_ty::next_solver::predicate::Predicate>::new
+     0.63%  [.] _rjem_malloc
+     0.56%  [.] __aarch64_cas1_rel
+     0.41%  [k] _raw_spin_unlock_irqrestore
+     0.40%  [.] __aarch64_cas8_acq
+     0.40%  [.] <indexmap::map::IndexMap<salsa::zalsa_local::QueryEdge, (), core::hash::BuildHasherDefault<rustc_hash::FxHasher>>>::insert_full
+     0.39%  [.] _rjem_sdallocx
+     0.38%  [k] __pi_clear_page
+     0.34%  [.] <regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::aarch64::lower::isle::generated_code::MInst>>>::init
+     0.33%  [.] <salsa::interned::IngredientImpl<hir_ty_codegen::places::_::row_place_Configuration_>>::intern_id::<(hir_def::DefWithBodyId, core::option::Option<la_arena::Idx<hir_def::hir::Expr>>, hir_ty::mir::MirSpan)>
+     0.29%  [.] <rustc_type_ir::ty_kind::TyKind<hir_ty::next_solver::interner::DbInterner> as core::cmp::PartialEq>::eq
+     0.28%  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.28%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<core::result::Result<triomphe::arc::Arc<rustc_abi::LayoutData<hir_ty::layout::RustcFieldIdx, hir_ty::layout::RustcEnumVariantIdx>>, hir_ty::layout::LayoutError>, dyn hir_ty::db::HirDatabase, hir_ty::layout::layout_of_ty_query::{closure#0}>::{closure#0}, core::result::Result<triomphe::arc::Arc<rustc_abi::LayoutData<hir_ty::layout::RustcFieldIdx, hir_ty::layout::RustcEnumVariantIdx>>, hir_ty::layout::LayoutError>>
+     0.28%  [.] <intern::symbol::Symbol>::intern
+     0.28%  [.] do_rallocx
+     0.28%  [.] __memset_zva64
+     0.25%  [.] <hir_ty::next_solver::predicate::PredicateInterned as core::cmp::PartialEq>::eq
+     0.24%  [.] <hir_ty::mir::MirBody>::frame_storage_conflicts::<<hir_ty_codegen::FunctionCx>::note_shareable::{closure#7}>
+     0.22%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&[hir_ty::next_solver::def_id::AnyImplId], dyn hir_ty::db::HirDatabase, <hir_ty::method_resolution::TraitImpls>::in_crate_and_deps_for_trait_and_self_ty::in_crate_and_deps_for_trait_and_self_ty_::{closure#0}>::{closure#0}, &[hir_ty::next_solver::def_id::AnyImplId]>
+     0.22%  [.] __memcmpeq
+     0.22%  [k] __arch_copy_from_user
+     0.20%  [.] <blaze_store::Store>::found
+     0.20%  [.] _rjem_je_arena_ralloc_no_move
+     0.20%  [.] <syntax_tree::flat::FlatTree>::node_at_range
+     0.20%  [.] hir_ty_codegen::promote::promote::<core::iter::adapters::map::Map<core::slice::iter::Iter<hir_ty_codegen::fragment::Named>, <hir_ty_codegen::fragment::Recorder>::named_slots::{closure#0}>>
+     0.20%  [.] _rjem_je_arena_ralloc
+     0.18%  [.] <hir_ty::mir::MirBody>::frame_storage_conflicts::<<hir_ty_codegen::FunctionCx>::note_shareable::{closure#7}>::{closure#8}
+     0.17%  [.] <salsa::function::sync::SyncTable>::try_claim
+     0.17%  [.] <core::hash::sip::Hasher<core::hash::sip::Sip24Rounds> as core::hash::Hasher>::write
+     0.17%  [.] <salsa::function::eviction::lru::Lru>::insert
+     0.17%  [.] <salsa::interned::IngredientImpl<span::hygiene::imp::SyntaxContextImpl>>::intern_id::<span::hygiene::imp::_::StructKey<span::hygiene::imp::SyntaxContextData>>
+     0.16%  [.] <salsa::interned::IngredientImpl<<hir_def::nameres::ModuleScope>::name::_::name__Configuration_>>::intern_id::<(hir_def::nameres::ModuleScope, hir_expand::name::Name)>
+     0.16%  [.] parser::event::process
+     0.16%  [.] <tt::storage::TopSubtreeBuilder>::push
+     0.15%  [.] <regalloc2::ion::data_structures::Env<cranelift_codegen::machinst::vcode::VCode<cranelift_codegen::isa::aarch64::lower::isle::generated_code::MInst>>>::run
+     0.14%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&hir_ty::lower::TyLoweringResult<hir_ty::lower::FieldTypes>, dyn hir_ty::db::HirDatabase, hir_ty::lower::field_types_with_diagnostics::{closure#0}>::{closure#0}, &hir_ty::lower::TyLoweringResult<hir_ty::lower::FieldTypes>>
+     0.14%  [.] <alloc::vec::Vec<hir_ty::mir::BasicBlock> as core::clone::Clone>::clone
+     0.14%  [.] <ra_ap_rustc_lexer::Cursor>::advance_token
+     0.14%  [.] <parser::lexed_str::LexedStr>::new
+     0.14%  [.] <syntax_tree::flat::FlatTreeBuilder>::push
+     0.13%  [.] <rustc_type_ir::flags::FlagComputation<hir_ty::next_solver::interner::DbInterner>>::add_kind
+     0.13%  [.] <salsa::interned::IngredientImpl<<hir_def::nameres::Modules>::module::_::module__Configuration_>>::intern_id::<(hir_def::nameres::Modules, hir_def::ModuleIdLt)>
+     0.13%  [.] cranelift_codegen::machinst::compile::compile::<cranelift_codegen::isa::aarch64::AArch64Backend>
+     0.13%  [.] <intern::intern_slice::InternedSlice<hir_ty::next_solver::generic_arg::GenericArgsStorage>>::from_header_and_slice
+     0.13%  [.] syntax_bridge::token_tree_to_syntax_node
+     0.12%  [k] filemap_get_read_batch
+     0.12%  [.] syntax_bridge::to_parser_input::convert
+     0.11%  [.] <cranelift_codegen::ir::layout::Insts as core::iter::traits::iterator::Iterator>::next
+     0.11%  [.] <salsa::function::IngredientImpl<<hir_def::signatures::TraitSignature>::of::_::of__Configuration_>>::get_memo_from_table_for
+     0.11%  [.] tt::storage::encode_all
+     0.11%  [.] <cranelift_codegen::ir::dfg::DataFlowGraph>::make_inst_results
+     0.11%  [.] _rjem_je_arena_cache_bin_fill_small
+     0.11%  [.] <core::slice::iter::Iter<la_arena::Idx<hir_ty::mir::Local>> as core::iter::traits::iterator::Iterator>::partition::<alloc::vec::Vec<la_arena::Idx<hir_ty::mir::Local>>, <hir_ty::mir::lower::MirLowerCtx>::declare_operands_last<core::iter::adapters::flatten::Flatten<core::slice::iter::Iter<core::option::Option<hir_ty::mir::Operand>>>>::{closure#0}>
+     0.11%  [.] <hir_ty::next_solver::allocation::Allocation>::new
+     0.11%  [.] <parser::parser::Parser>::nth_at
+     0.10%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&[hir_def::ImplId], dyn hir_ty::db::HirDatabase, <hir_ty::method_resolution::TraitImpls>::blanket_in_crate_and_deps::blanket_in_crate_and_deps_::{closure#0}>::{closure#0}, &[hir_def::ImplId]>
+     0.10%  [k] __rmqueue_pcplist
+     0.10%  [.] tt::storage::decode
+     0.10%  [.] <salsa::function::IngredientImpl<<hir_def::signatures::FunctionSignature>::of::_::of__Configuration_>>::get_memo_from_table_for
+     0.10%  [.] <hir_ty::next_solver::region::Region>::new_without_interner
+     0.10%  [.] <parser::lexed_str::Converter>::extend_token
+     0.10%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&hir_def::signatures::TraitSignature, dyn base_db::SourceDatabase, <hir_def::signatures::TraitSignature>::of::of_::{closure#0}>::{closure#0}, &hir_def::signatures::TraitSignature>

@@ -1,0 +1,16 @@
+[package]
+name = "shapes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata.blaze]
+const-macros = "src/macros.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(blaze_const_macros)"] }
+
+[workspace]
+
+[workspace.metadata.blaze]
+experimental = ["const-macros"]

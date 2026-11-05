@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "env.\"A.B\" = \"1\"\ntarget.'cfg(all(unix, target_os = \"linux\"))'.rustflags = [\"a b\"]\ntarget.'cfg(all(unix, target_os = \"linux\"))'.\"weird key\" = 1\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "env.\"A.B\" = \"1\" # $ROOT/.cargo/config.toml\ntarget.'cfg(all(unix, target_os = \"linux\"))'.rustflags = [\n    \"a b\", # $ROOT/.cargo/config.toml\n]\ntarget.'cfg(all(unix, target_os = \"linux\"))'.\"weird key\" = 1 # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nenv.\"A.B\" = \"1\"\ntarget.'cfg(all(unix, target_os = \"linux\"))'.rustflags = [\"a b\"]\ntarget.'cfg(all(unix, target_os = \"linux\"))'.\"weird key\" = 1\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nenv.\"A.B\" = \"1\" # $ROOT/.cargo/config.toml\ntarget.'cfg(all(unix, target_os = \"linux\"))'.rustflags = [\n    \"a b\", # $ROOT/.cargo/config.toml\n]\ntarget.'cfg(all(unix, target_os = \"linux\"))'.\"weird key\" = 1 # $ROOT/.cargo/config.toml\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"env\":{\"A.B\":\"1\"},\"target\":{\"cfg(all(unix, target_os = \\\"linux\\\"))\":{\"rustflags\":[\"a b\"],\"weird key\":1}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"env\":{\"A.B\":\"1\"},\"target\":{\"cfg(all(unix, target_os = \\\"linux\\\"))\":{\"rustflags\":[\"a b\"],\"weird key\":1}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ }
+]

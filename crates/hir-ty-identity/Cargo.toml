@@ -1,0 +1,39 @@
+[package]
+name = "hir-ty-identity"
+description = "The identity of an instance's compiled code, the same across processes, machines and checkouts, and the CodeId of a compute step: its own code and everything it can run"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-query.workspace = true
+either.workspace = true
+smallvec.workspace = true
+stdx.workspace = true
+
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+hir-ty-share.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

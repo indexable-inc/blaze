@@ -1,0 +1,1134 @@
+//! Index/slot allocator policies for the pooling allocator.
+
+use super::ShardId;
+use crate::hash_map::{Entry, HashMap};
+use crate::prelude::*;
+use crate::runtime::vm::CompiledModuleId;
+use std::mem;
+use std::sync::Mutex;
+use wasmtime_environ::DefinedMemoryIndex;
+
+/// A slot index.
+#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotId(pub u32);
+
+impl SlotId {
+    /// The index of this slot.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A simple index allocator.
+///
+/// This index allocator doesn't do any module affinity or anything like that,
+/// however it is built on top of the `ModuleAffinityIndexAllocator` to save
+/// code (and code size).
+#[derive(Debug)]
+pub struct SimpleIndexAllocator(ModuleAffinityIndexAllocator);
+
+impl SimpleIndexAllocator {
+    pub fn new(capacity: u32) -> Result<Self, OutOfMemory> {
+        Ok(SimpleIndexAllocator(ModuleAffinityIndexAllocator::new(
+            capacity, 0,
+        )?))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn alloc(&self) -> Option<SlotId> {
+        self.0.alloc(None)
+    }
+
+    /// Frees the `index` slot to be available for allocation elsewhere.
+    ///
+    /// The `bytes_resident` argument is a counter to keep track of how many
+    /// bytse are still resident in this slot, if any, for reporting later via
+    /// the [`Self::unused_bytes_resident`] method.
+    pub(crate) fn free(&self, index: SlotId, bytes_resident: usize) {
+        self.0.free(index, bytes_resident);
+    }
+
+    /// Same as [`Self::free`], but frees many slots under a single lock
+    /// acquisition.
+    pub(crate) fn free_many(&self, items: impl IntoIterator<Item = (SlotId, usize)>) {
+        self.0.free_many(items);
+    }
+
+    /// Returns the number of previously-used slots in this allocator which are
+    /// not currently in use.
+    ///
+    /// Note that this acquires a `Mutex` for synchronization at this time to
+    /// read the internal counter information.
+    pub fn unused_warm_slots(&self) -> u32 {
+        self.0.unused_warm_slots()
+    }
+
+    /// Returns the number of bytes that are resident in previously-used slots
+    /// in this allocator which are not currently in use.
+    ///
+    /// Note that this acquires a `Mutex` for synchronization at this time to
+    /// read the internal counter information.
+    pub fn unused_bytes_resident(&self) -> usize {
+        self.0.unused_bytes_resident()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_freelist(&self) -> Vec<SlotId> {
+        self.0.testing_freelist()
+    }
+}
+
+/// A particular defined memory within a particular module.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryInModule(pub CompiledModuleId, pub DefinedMemoryIndex);
+
+/// An index allocator that has configurable affinity between slots and modules
+/// so that slots are often reused for the same module again.
+#[derive(Debug)]
+pub struct ModuleAffinityIndexAllocator {
+    /// The slot space is partitioned into shards, each protected by its own
+    /// mutex, to avoid contention on a single lock when many threads
+    /// allocate and free slots concurrently. Each shard owns a contiguous
+    /// range of `slots_per_shard` slot indices and manages them with local
+    /// indices; translation to global `SlotId`s happens at this type's
+    /// public boundary.
+    ///
+    /// Threads have a "home" shard (the same thread-local, round-robin
+    /// assignment used for the sharded decommit queue) which they try
+    /// first for allocation, falling back to probing the other shards, so
+    /// in steady state each thread allocates and frees from its own shard
+    /// without cross-thread lock traffic. Pool exhaustion is only reported
+    /// after all shards have been consulted.
+    shards: Box<[super::CachePadded<Mutex<Inner>>]>,
+    slots_per_shard: u32,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Maximum number of "unused warm slots" which will be allowed during
+    /// allocation.
+    ///
+    /// This is a user-configurable knob which can be used to influence the
+    /// maximum number of unused slots at any one point in time. A "warm slot"
+    /// is one that's considered having been previously allocated.
+    max_unused_warm_slots: u32,
+
+    /// Current count of "warm slots", or those that were previously allocated
+    /// which are now no longer in use.
+    ///
+    /// This is the size of the `warm` list.
+    unused_warm_slots: u32,
+
+    /// A linked list (via indices) which enumerates all "warm and unused"
+    /// slots, or those which have previously been allocated and then free'd.
+    warm: List,
+
+    /// Last slot that was allocated for the first time ever.
+    ///
+    /// This is initially 0 and is incremented during `pick_cold`. If this
+    /// matches `max_cold`, there are no more cold slots left.
+    last_cold: u32,
+
+    /// The state of any given slot.
+    ///
+    /// Records indices in the above list (empty) or two lists (with affinity),
+    /// and these indices are kept up-to-date to allow fast removal.
+    slot_state: Vec<SlotState>,
+
+    /// Affine slot management which tracks which slots are free and were last
+    /// used with the specified `CompiledModuleId`.
+    ///
+    /// The `List` here is appended to during deallocation and removal happens
+    /// from the tail during allocation.
+    module_affine: HashMap<MemoryInModule, List>,
+
+    /// Cache for the sum of the `bytes_resident` of all `UnusedWarm` slots.
+    unused_bytes_resident: usize,
+}
+
+/// A helper "linked list" data structure which is based on indices.
+#[derive(Default, Debug)]
+struct List {
+    head: Option<SlotId>,
+    tail: Option<SlotId>,
+}
+
+/// A helper data structure for an intrusive linked list, coupled with the
+/// `List` type.
+#[derive(Default, Debug, Copy, Clone)]
+struct Link {
+    prev: Option<SlotId>,
+    next: Option<SlotId>,
+}
+
+#[derive(Clone, Debug)]
+enum SlotState {
+    /// This slot is currently in use and is affine to the specified module's memory.
+    Used(Option<MemoryInModule>),
+
+    /// This slot is not currently used, and has never been used.
+    UnusedCold,
+
+    /// This slot is not currently used, but was previously allocated.
+    ///
+    /// The payload here is metadata about the lists that this slot is contained
+    /// within.
+    UnusedWarm(Unused),
+}
+
+impl SlotState {
+    fn unwrap_unused(&mut self) -> &mut Unused {
+        match self {
+            SlotState::UnusedWarm(u) => u,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Default, Copy, Clone, Debug)]
+struct Unused {
+    /// Which module this slot was historically affine to, if any.
+    affinity: Option<MemoryInModule>,
+
+    /// Number of bytes that are part of `UnusedWarm` slots and are currently
+    /// kept resident (vs paged out).
+    bytes_resident: usize,
+
+    /// Metadata about the linked list for all slots affine to `affinity`.
+    affine_list_link: Link,
+
+    /// Metadata within the `warm` list of the main allocator.
+    unused_list_link: Link,
+}
+
+enum AllocMode {
+    ForceAffineAndClear,
+    AnySlot,
+    AnyWarm,
+}
+
+/// The division of an allocator's slot space and unused-warm-slot budget
+/// into shards.
+#[derive(Debug, PartialEq, Eq)]
+struct ShardLayout {
+    /// Number of slots in each shard except possibly the last, which may be
+    /// smaller when `requested_shards` doesn't evenly divide the capacity.
+    slots_per_shard: u32,
+    /// Per-shard `(capacity, max_unused_warm_slots)`.
+    shards: Box<[(u32, u32)]>,
+}
+
+impl ShardLayout {
+    fn new(
+        capacity: u32,
+        max_unused_warm_slots: u32,
+        requested_shards: u32,
+    ) -> Result<ShardLayout, OutOfMemory> {
+        // N.B. we limit the pool sharding (via `default_shard_count`, whose
+        // cap `requested_shards` reflects) regardless of CPU count to
+        // balance reduced lock-contention with the downsides of slot
+        // sharding. In particular, on many-core systems, scaling with the
+        // number of cores can lead to:
+        // - very small shards, increasing the likelihood of running out of
+        //   slots in a shard and falling off the fast path.
+        // - warm-slot budget dilution, where `max_unused_warm_slots` is low
+        //   enough that many shards don't get warm slots at all.
+        // - affinity dilution, where some threads may have slots with the
+        //   right instance type affinity available, but the thread handling
+        //   the request doesn't, so the slower instantiation path has to be
+        //   taken.
+        //
+        // Additionally, we don't shard at all for small pools, as the
+        // downsides of sharding are too pronounced.
+        let nshards = if capacity >= 128 {
+            requested_shards.max(1)
+        } else {
+            1
+        };
+        let slots_per_shard = capacity.div_ceil(nshards).max(1);
+        let nshards = capacity.div_ceil(slots_per_shard).max(1);
+
+        let shards = (0..nshards)
+            .map(|i| {
+                let base = i * slots_per_shard;
+                let shard_capacity = capacity.saturating_sub(base).min(slots_per_shard);
+                // Distribute the unused-warm budget across shards,
+                // spreading the remainder over the leading shards.
+                let shard_warm = max_unused_warm_slots / nshards
+                    + u32::from(i < max_unused_warm_slots % nshards);
+                (shard_capacity, shard_warm)
+            })
+            .try_collect()?;
+
+        Ok(ShardLayout {
+            slots_per_shard,
+            shards,
+        })
+    }
+}
+
+impl ModuleAffinityIndexAllocator {
+    /// Create the default state for this strategy.
+    pub fn new(capacity: u32, max_unused_warm_slots: u32) -> Result<Self, OutOfMemory> {
+        Self::new_with_shard_count(
+            capacity,
+            max_unused_warm_slots,
+            super::default_shard_count(),
+        )
+    }
+
+    /// Same as [`Self::new`], but with an explicit shard count (which is
+    /// capped as described in [`ShardLayout::new`]).
+    fn new_with_shard_count(
+        capacity: u32,
+        max_unused_warm_slots: u32,
+        requested_shards: u32,
+    ) -> Result<Self, OutOfMemory> {
+        let layout = ShardLayout::new(capacity, max_unused_warm_slots, requested_shards)?;
+        let shards = layout
+            .shards
+            .iter()
+            .map(|&(shard_capacity, shard_warm)| {
+                super::CachePadded(Mutex::new(Inner {
+                    last_cold: 0,
+                    max_unused_warm_slots: shard_warm,
+                    unused_warm_slots: 0,
+                    module_affine: HashMap::new(),
+                    slot_state: (0..shard_capacity).map(|_| SlotState::UnusedCold).collect(),
+                    warm: List::default(),
+                    unused_bytes_resident: 0,
+                }))
+            })
+            .try_collect()?;
+
+        Ok(ModuleAffinityIndexAllocator {
+            shards,
+            slots_per_shard: layout.slots_per_shard,
+        })
+    }
+
+    /// Translate a shard-local slot index to a global `SlotId`.
+    fn global_id(&self, shard: ShardId, local: SlotId) -> SlotId {
+        SlotId(u32::try_from(shard.index()).unwrap() * self.slots_per_shard + local.0)
+    }
+
+    /// Translate a global `SlotId` to its shard and shard-local index.
+    fn shard_of(&self, global: SlotId) -> (ShardId, SlotId) {
+        let shard = ShardId::from_index((global.0 / self.slots_per_shard) as usize);
+        (shard, SlotId(global.0 % self.slots_per_shard))
+    }
+
+    /// Returns the [`Inner`] state of the given shard.
+    fn shard(&self, shard: ShardId) -> &Mutex<Inner> {
+        &self.shards[shard.index()].0
+    }
+
+    /// Enumerate all shard ids of this allocator.
+    fn shard_ids(&self) -> impl Iterator<Item = ShardId> + use<> {
+        (0..self.shards.len()).map(ShardId::from_index)
+    }
+
+    /// How many slots can this allocator allocate?
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.0.lock().unwrap().slot_state.len())
+            .sum()
+    }
+
+    /// Are zero slots in use right now?
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| {
+            !s.0.lock()
+                .unwrap()
+                .slot_state
+                .iter()
+                .any(|state| matches!(state, SlotState::Used(_)))
+        })
+    }
+
+    /// Allocate a new index from this allocator optionally using `id` as an
+    /// affinity request if the allocation strategy supports it.
+    ///
+    /// Returns `None` if no more slots are available.
+    pub fn alloc(&self, for_memory: Option<MemoryInModule>) -> Option<SlotId> {
+        // Start at this thread's home shard and probe the others only if
+        // it's fully allocated. In steady state this means each thread
+        // stays on its own shard.
+        for shard in super::shard_ids_from_home(self.shards.len()) {
+            let mut inner = self.shard(shard).lock().unwrap();
+            if let Some((local, _)) = Self::alloc_within(&mut inner, for_memory, AllocMode::AnySlot)
+            {
+                return Some(self.global_id(shard, local));
+            }
+        }
+        None
+    }
+
+    /// Attempts to allocate a guaranteed-affine slot to the module `id`
+    /// specified.
+    ///
+    /// Returns `None` if there are no slots affine to `id`. The allocation of
+    /// this slot will not record the affinity to `id`, instead simply listing
+    /// it as taken. This is intended to be used for clearing out all affine
+    /// slots to a module.
+    pub fn alloc_affine_and_clear_affinity(
+        &self,
+        module_id: CompiledModuleId,
+        memory_index: DefinedMemoryIndex,
+    ) -> Option<SlotId> {
+        // Affine slots for this module may live in any shard, so consult
+        // them all. This is a module-teardown path, not a hot path.
+        for shard in self.shard_ids() {
+            let mut inner = self.shard(shard).lock().unwrap();
+            if let Some((local, _)) = Self::alloc_within(
+                &mut inner,
+                Some(MemoryInModule(module_id, memory_index)),
+                AllocMode::ForceAffineAndClear,
+            ) {
+                return Some(self.global_id(shard, local));
+            }
+        }
+        None
+    }
+
+    /// Allocates a slot within `inner`, returning the slot along with the
+    /// number of bytes it had resident if it was previously a warm slot.
+    fn alloc_within(
+        inner: &mut Inner,
+        for_memory: Option<MemoryInModule>,
+        mode: AllocMode,
+    ) -> Option<(SlotId, usize)> {
+        // As a first-pass always attempt an affine allocation. This will
+        // succeed if any slots are considered affine to `module_id` (if it's
+        // specified). Failing that something else is attempted to be chosen.
+        let slot_id = inner.pick_affine(for_memory).or_else(|| {
+            match mode {
+                // If any slot is requested then this is a normal instantiation
+                // looking for an index. Without any affine candidates there are
+                // two options here:
+                //
+                // 1. Pick a slot amongst previously allocated slots
+                // 2. Pick a slot that's never been used before
+                //
+                // The choice here is guided by the initial configuration of
+                // `max_unused_warm_slots`. If our unused warm slots, which are
+                // likely all affine, is below this threshold then the affinity
+                // of the warm slots isn't tampered with and first a cold slot
+                // is chosen. If the cold slot allocation fails, however, a warm
+                // slot is evicted.
+                //
+                // The opposite happens when we're above our threshold for the
+                // maximum number of warm slots, meaning that a warm slot is
+                // attempted to be picked from first with a cold slot following
+                // that. Note that the warm slot allocation in this case should
+                // only fail of `max_unused_warm_slots` is 0, otherwise
+                // `pick_warm` will always succeed.
+                AllocMode::AnySlot => {
+                    if inner.unused_warm_slots < inner.max_unused_warm_slots {
+                        inner.pick_cold().or_else(|| inner.pick_warm())
+                    } else {
+                        inner.pick_warm().or_else(|| {
+                            debug_assert!(inner.max_unused_warm_slots == 0);
+                            inner.pick_cold()
+                        })
+                    }
+                }
+
+                // In this mode an affinity-based allocation is always performed
+                // as the purpose here is to clear out slots relevant to
+                // `module_id` during module teardown. This means that there's
+                // no consulting non-affine slots in this path.
+                AllocMode::ForceAffineAndClear => None,
+
+                // In this mode only warm slots are taken.
+                AllocMode::AnyWarm => inner.pick_warm(),
+            }
+        })?;
+
+        let slot = &mut inner.slot_state[slot_id.index()];
+        let (affinity, bytes_resident) = match slot {
+            SlotState::UnusedWarm(u) => (u.affinity, u.bytes_resident),
+            _ => (None, 0),
+        };
+        inner.unused_bytes_resident -= bytes_resident;
+        *slot = SlotState::Used(match mode {
+            AllocMode::ForceAffineAndClear => None,
+            AllocMode::AnySlot => for_memory,
+            AllocMode::AnyWarm => {
+                debug_assert!(for_memory.is_none());
+                affinity
+            }
+        });
+
+        Some((slot_id, bytes_resident))
+    }
+
+    pub(crate) fn free(&self, index: SlotId, bytes_resident: usize) {
+        let (shard, local) = self.shard_of(index);
+        let mut inner = self.shard(shard).lock().unwrap();
+        Self::free_locked(&mut inner, local, bytes_resident);
+    }
+
+    /// Same as [`Self::free`], but frees many slots under a single lock
+    /// acquisition per shard to reduce contention when a decommit-queue
+    /// flush returns a whole batch of slots at once.
+    pub(crate) fn free_many(&self, items: impl IntoIterator<Item = (SlotId, usize)>) {
+        let mut per_shard: smallvec::SmallVec<[smallvec::SmallVec<[(SlotId, usize); 8]>; 16]> =
+            (0..self.shards.len()).map(|_| Default::default()).collect();
+        for (index, bytes_resident) in items {
+            let (shard, local) = self.shard_of(index);
+            per_shard[shard.index()].push((local, bytes_resident));
+        }
+        for (shard, items) in per_shard.into_iter().enumerate() {
+            if items.is_empty() {
+                continue;
+            }
+            let mut inner = self.shard(ShardId::from_index(shard)).lock().unwrap();
+            for (local, bytes_resident) in items {
+                Self::free_locked(&mut inner, local, bytes_resident);
+            }
+        }
+    }
+
+    fn free_locked(inner: &mut Inner, index: SlotId, bytes_resident: usize) {
+        let module_memory = match inner.slot_state[index.index()] {
+            SlotState::Used(module_memory) => module_memory,
+            _ => unreachable!(),
+        };
+
+        // Bump the number of warm slots since this slot is now considered
+        // previously used. Afterwards append it to the linked list of all
+        // unused and warm slots.
+        inner.unused_warm_slots += 1;
+        let unused_list_link = inner
+            .warm
+            .append(index, &mut inner.slot_state, |s| &mut s.unused_list_link);
+
+        let affine_list_link = match module_memory {
+            // If this slot is affine to a particular module then append this
+            // index to the linked list for the affine module. Otherwise insert
+            // a new one-element linked list.
+            Some(module) => match inner.module_affine.entry(module) {
+                Entry::Occupied(mut e) => e
+                    .get_mut()
+                    .append(index, &mut inner.slot_state, |s| &mut s.affine_list_link),
+                Entry::Vacant(v) => {
+                    v.insert(List::new(index));
+                    Link::default()
+                }
+            },
+
+            // If this slot has no affinity then the affine link is empty.
+            None => Link::default(),
+        };
+
+        inner.unused_bytes_resident += bytes_resident;
+        inner.slot_state[index.index()] = SlotState::UnusedWarm(Unused {
+            affinity: module_memory,
+            bytes_resident,
+            affine_list_link,
+            unused_list_link,
+        });
+    }
+
+    /// Return the number of empty slots available in this allocator.
+    #[cfg(test)]
+    pub fn num_empty_slots(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                let inner = s.0.lock().unwrap();
+                let total_slots = inner.slot_state.len();
+                (total_slots - inner.last_cold as usize) + inner.unused_warm_slots as usize
+            })
+            .sum()
+    }
+
+    /// For testing only, we want to be able to assert what is on the single
+    /// freelist, for the policies that keep just one.
+    #[cfg(test)]
+    pub(crate) fn testing_freelist(&self) -> Vec<SlotId> {
+        self.shard_ids()
+            .flat_map(|shard| {
+                let inner = self.shard(shard).lock().unwrap();
+                inner
+                    .warm
+                    .iter(&inner.slot_state, |s| &s.unused_list_link)
+                    .map(|local| self.global_id(shard, local))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// For testing only, get the list of all modules with at least one slot
+    /// with affinity for that module.
+    #[cfg(test)]
+    pub(crate) fn testing_module_affinity_list(&self) -> Vec<MemoryInModule> {
+        let mut ret = Vec::new();
+        for s in self.shards.iter() {
+            let inner = s.0.lock().unwrap();
+            for key in inner.module_affine.keys() {
+                if !ret.contains(key) {
+                    ret.push(*key);
+                }
+            }
+        }
+        ret
+    }
+
+    /// Returns the number of previously-used slots in this allocator which are
+    /// not currently in use.
+    ///
+    /// Note that this acquires a `Mutex` for synchronization at this time to
+    /// read the internal counter information.
+    pub fn unused_warm_slots(&self) -> u32 {
+        self.shards
+            .iter()
+            .map(|s| s.0.lock().unwrap().unused_warm_slots)
+            .sum()
+    }
+
+    /// Takes every warm slot out of the free lists, returning each slot and
+    /// the number of bytes it has resident (which may be zero).
+    ///
+    /// The slots are marked used so that nothing can allocate them while
+    /// their memory is being released; the caller frees each one again
+    /// afterwards.
+    ///
+    /// Shards are locked one at a time rather than all at once, since this
+    /// is reclaiming memory rather than taking a snapshot.
+    pub(crate) fn take_resident_warm_slots(&self) -> Vec<(SlotId, usize)> {
+        let mut taken = Vec::new();
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            let mut inner = shard.0.lock().unwrap();
+            while let Some((slot, bytes_resident)) =
+                Self::alloc_within(&mut inner, None, AllocMode::AnyWarm)
+            {
+                taken.push((
+                    self.global_id(ShardId::from_index(shard_index), slot),
+                    bytes_resident,
+                ));
+            }
+        }
+        taken
+    }
+
+    /// Returns the number of bytes that are resident in previously-used slots
+    /// in this allocator which are not currently in use.
+    ///
+    /// Note that this acquires a `Mutex` for synchronization at this time to
+    /// read the internal counter information.
+    pub fn unused_bytes_resident(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.0.lock().unwrap().unused_bytes_resident)
+            .sum()
+    }
+}
+
+impl Inner {
+    /// Attempts to allocate a slot already affine to `id`, returning `None` if
+    /// `id` is `None` or if there are no affine slots.
+    fn pick_affine(&mut self, for_memory: Option<MemoryInModule>) -> Option<SlotId> {
+        // Note that the `tail` is chosen here of the affine list as it's the
+        // most recently used, which for affine allocations is what we want --
+        // maximizing temporal reuse.
+        let ret = self.module_affine.get(&for_memory?)?.tail?;
+        self.remove(ret);
+        Some(ret)
+    }
+
+    fn pick_warm(&mut self) -> Option<SlotId> {
+        // Insertions into the `unused` list happen at the `tail`, so the
+        // least-recently-used item will be at the head. That's our goal here,
+        // pick the least-recently-used slot since something "warm" is being
+        // evicted anyway.
+        let head = self.warm.head?;
+        self.remove(head);
+        Some(head)
+    }
+
+    fn remove(&mut self, slot: SlotId) {
+        // Decrement the size of the warm list, and additionally remove it from
+        // the `warm` linked list.
+        self.unused_warm_slots -= 1;
+        self.warm
+            .remove(slot, &mut self.slot_state, |u| &mut u.unused_list_link);
+
+        // If this slot is affine to a module then additionally remove it from
+        // that module's affinity linked list. Note that if the module's affine
+        // list is empty then the module's entry in the map is completely
+        // removed as well.
+        let module = self.slot_state[slot.index()].unwrap_unused().affinity;
+        if let Some(module) = module {
+            let mut list = match self.module_affine.entry(module) {
+                Entry::Occupied(e) => e,
+                Entry::Vacant(_) => unreachable!(),
+            };
+            list.get_mut()
+                .remove(slot, &mut self.slot_state, |u| &mut u.affine_list_link);
+
+            if list.get_mut().head.is_none() {
+                list.remove();
+            }
+        }
+    }
+
+    fn pick_cold(&mut self) -> Option<SlotId> {
+        if (self.last_cold as usize) == self.slot_state.len() {
+            None
+        } else {
+            let ret = Some(SlotId(self.last_cold));
+            self.last_cold += 1;
+            ret
+        }
+    }
+}
+
+impl List {
+    /// Creates a new one-element list pointing at `id`.
+    fn new(id: SlotId) -> List {
+        List {
+            head: Some(id),
+            tail: Some(id),
+        }
+    }
+
+    /// Appends the `id` to this list whose links are determined by `link`.
+    fn append(
+        &mut self,
+        id: SlotId,
+        states: &mut [SlotState],
+        link: fn(&mut Unused) -> &mut Link,
+    ) -> Link {
+        // This `id` is the new tail...
+        let tail = mem::replace(&mut self.tail, Some(id));
+
+        // If the tail was present, then update its `next` field to ourselves as
+        // we've been appended, otherwise update the `head` since the list was
+        // previously empty.
+        match tail {
+            Some(tail) => link(states[tail.index()].unwrap_unused()).next = Some(id),
+            None => self.head = Some(id),
+        }
+        Link {
+            prev: tail,
+            next: None,
+        }
+    }
+
+    /// Removes `id` from this list whose links are determined by `link`.
+    fn remove(
+        &mut self,
+        id: SlotId,
+        slot_state: &mut [SlotState],
+        link: fn(&mut Unused) -> &mut Link,
+    ) -> Unused {
+        let mut state = *slot_state[id.index()].unwrap_unused();
+        let next = link(&mut state).next;
+        let prev = link(&mut state).prev;
+
+        // If a `next` node is present for this link, then its previous was our
+        // own previous now. Otherwise we are the tail so the new tail is our
+        // previous.
+        match next {
+            Some(next) => link(slot_state[next.index()].unwrap_unused()).prev = prev,
+            None => self.tail = prev,
+        }
+
+        // Same as the `next` node, except everything is in reverse.
+        match prev {
+            Some(prev) => link(slot_state[prev.index()].unwrap_unused()).next = next,
+            None => self.head = next,
+        }
+        state
+    }
+
+    #[cfg(test)]
+    fn iter<'a>(
+        &'a self,
+        states: &'a [SlotState],
+        link: fn(&Unused) -> &Link,
+    ) -> impl Iterator<Item = SlotId> + 'a {
+        let mut cur = self.head;
+        let mut prev = None;
+        std::iter::from_fn(move || {
+            if cur.is_none() {
+                assert_eq!(prev, self.tail);
+            }
+            let ret = cur?;
+            match &states[ret.index()] {
+                SlotState::UnusedWarm(u) => {
+                    assert_eq!(link(u).prev, prev);
+                    prev = Some(ret);
+                    cur = link(u).next
+                }
+                _ => unreachable!(),
+            }
+            Some(ret)
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rand::RngExt;
+    use wasmtime_environ::EntityRef;
+
+    #[test]
+    fn test_next_available_allocation_strategy() {
+        for size in 0..20 {
+            let state = ModuleAffinityIndexAllocator::new(size, 0).unwrap();
+            assert_eq!(state.num_empty_slots(), usize::try_from(size).unwrap());
+            for i in 0..size {
+                assert_eq!(state.num_empty_slots(), usize::try_from(size - i).unwrap());
+                assert_eq!(state.alloc(None).unwrap().index(), i as usize);
+            }
+            assert!(state.alloc(None).is_none());
+        }
+    }
+
+    /// Taking slots out to release their memory must not cost them their
+    /// affinity: `free` reads the module back out of the `Used` payload to
+    /// re-file the slot on its module's affine list.
+    #[test]
+    fn take_resident_warm_slots_keeps_affinity() {
+        let id = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let state = ModuleAffinityIndexAllocator::new(4, 4).unwrap();
+
+        let index = state.alloc(Some(id)).unwrap();
+        state.free(index, 4096);
+        assert_eq!(state.unused_bytes_resident(), 4096);
+
+        let taken = state.take_resident_warm_slots();
+        assert_eq!(taken, vec![(index, 4096)]);
+        // While taken, the slot is neither warm nor counted as resident.
+        assert_eq!(state.unused_bytes_resident(), 0);
+        assert_eq!(state.unused_warm_slots(), 0);
+
+        state.free(index, 0);
+        assert_eq!(state.unused_bytes_resident(), 0);
+        assert_eq!(state.unused_warm_slots(), 1);
+        assert!(state.testing_module_affinity_list().contains(&id));
+        // And the affinity is real: the same module gets the same slot back.
+        assert_eq!(state.alloc(Some(id)).unwrap(), index);
+    }
+
+    #[test]
+    fn test_affinity_allocation_strategy() {
+        let id1 = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let id2 = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let state = ModuleAffinityIndexAllocator::new(100, 100).unwrap();
+
+        let index1 = state.alloc(Some(id1)).unwrap();
+        assert_eq!(index1.index(), 0);
+        let index2 = state.alloc(Some(id2)).unwrap();
+        assert_eq!(index2.index(), 1);
+        assert_ne!(index1, index2);
+
+        state.free(index1, 0);
+        assert_eq!(state.num_empty_slots(), 99);
+
+        // Allocate to the same `index1` slot again.
+        let index3 = state.alloc(Some(id1)).unwrap();
+        assert_eq!(index3, index1);
+        state.free(index3, 0);
+
+        state.free(index2, 0);
+
+        // Both id1 and id2 should have some slots with affinity.
+        let affinity_modules = state.testing_module_affinity_list();
+        assert_eq!(2, affinity_modules.len());
+        assert!(affinity_modules.contains(&id1));
+        assert!(affinity_modules.contains(&id2));
+
+        // Now there is 1 free instance for id2 and 1 free instance
+        // for id1, and 98 empty. Allocate 100 for id2. The first
+        // should be equal to the one we know was previously used for
+        // id2. The next 99 are arbitrary.
+        assert_eq!(state.num_empty_slots(), 100);
+        let mut indices = vec![];
+        for _ in 0..100 {
+            indices.push(state.alloc(Some(id2)).unwrap());
+        }
+        assert!(state.alloc(None).is_none());
+        assert_eq!(indices[0], index2);
+        assert_eq!(state.num_empty_slots(), 0);
+
+        for i in indices {
+            state.free(i, 0);
+        }
+
+        // Now there should be no slots left with affinity for id1.
+        let affinity_modules = state.testing_module_affinity_list();
+        assert_eq!(1, affinity_modules.len());
+        assert!(affinity_modules.contains(&id2));
+
+        // Allocate an index we know previously had an instance but
+        // now does not (list ran empty).
+        let index = state.alloc(Some(id1)).unwrap();
+        state.free(index, 0);
+    }
+
+    #[test]
+    fn clear_affine() {
+        let id = CompiledModuleId::new();
+        let memory_index = DefinedMemoryIndex::new(0);
+
+        for max_unused_warm_slots in [0, 1, 2] {
+            let state = ModuleAffinityIndexAllocator::new(100, max_unused_warm_slots).unwrap();
+
+            let index1 = state.alloc(Some(MemoryInModule(id, memory_index))).unwrap();
+            let index2 = state.alloc(Some(MemoryInModule(id, memory_index))).unwrap();
+            state.free(index2, 0);
+            state.free(index1, 0);
+            assert!(
+                state
+                    .alloc_affine_and_clear_affinity(id, memory_index)
+                    .is_some()
+            );
+            assert!(
+                state
+                    .alloc_affine_and_clear_affinity(id, memory_index)
+                    .is_some()
+            );
+            assert_eq!(
+                state.alloc_affine_and_clear_affinity(id, memory_index),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_affinity_allocation_strategy_random() {
+        let mut rng = rand::rng();
+
+        let ids = std::iter::repeat_with(|| {
+            MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0))
+        })
+        .take(10)
+        .collect::<Vec<_>>();
+        // Pin the allocator to a single shard: with multiple shards a
+        // thread's alloc probing finds any free slot in its home shard
+        // before consulting the shard holding the affine slot, making the
+        // hit-rate statistics below depend on the host's CPU count.
+        // Sharded allocation is covered by the proptests at the bottom of
+        // this module.
+        let state = ModuleAffinityIndexAllocator::new_with_shard_count(1000, 1000, 1).unwrap();
+        let mut allocated: Vec<SlotId> = vec![];
+        let mut last_id = vec![None; 1000];
+
+        let mut hits = 0;
+        let amt = if cfg!(miri) { 100 } else { 100_000 };
+        for _ in 0..amt {
+            loop {
+                if !allocated.is_empty() && rng.random_bool(0.5) {
+                    let i = rng.random_range(0..allocated.len());
+                    let to_free_idx = allocated.swap_remove(i);
+                    state.free(to_free_idx, 0);
+                } else {
+                    let id = ids[rng.random_range(0..ids.len())];
+                    let index = match state.alloc(Some(id)) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    if last_id[index.index()] == Some(id) {
+                        hits += 1;
+                    }
+                    last_id[index.index()] = Some(id);
+                    allocated.push(index);
+                }
+                break;
+            }
+        }
+
+        // 10% reuse would be random chance (because we have 10 module
+        // IDs). Check for at least double that to ensure some sort of
+        // affinity is occurring.
+        assert!(
+            hits > (amt / 5),
+            "expected at least 20000 (20%) ID-reuses but got {hits}"
+        );
+    }
+
+    #[test]
+    fn test_affinity_threshold() {
+        let id1 = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let id2 = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let id3 = MemoryInModule(CompiledModuleId::new(), DefinedMemoryIndex::new(0));
+        let state = ModuleAffinityIndexAllocator::new(10, 2).unwrap();
+
+        // Set some slot affinities
+        assert_eq!(state.alloc(Some(id1)), Some(SlotId(0)));
+        state.free(SlotId(0), 0);
+        assert_eq!(state.alloc(Some(id2)), Some(SlotId(1)));
+        state.free(SlotId(1), 0);
+
+        // Only 2 slots are allowed to be unused and warm, so we're at our
+        // threshold, meaning one must now be evicted.
+        assert_eq!(state.alloc(Some(id3)), Some(SlotId(0)));
+        state.free(SlotId(0), 0);
+
+        // pickup `id2` again, it should be affine.
+        assert_eq!(state.alloc(Some(id2)), Some(SlotId(1)));
+
+        // with only one warm slot available allocation for `id1` should pick a
+        // fresh slot
+        assert_eq!(state.alloc(Some(id1)), Some(SlotId(2)));
+
+        state.free(SlotId(1), 0);
+        state.free(SlotId(2), 0);
+
+        // ensure everything stays affine
+        assert_eq!(state.alloc(Some(id1)), Some(SlotId(2)));
+        assert_eq!(state.alloc(Some(id2)), Some(SlotId(1)));
+        assert_eq!(state.alloc(Some(id3)), Some(SlotId(0)));
+
+        state.free(SlotId(1), 0);
+        state.free(SlotId(2), 0);
+        state.free(SlotId(0), 0);
+
+        // LRU is 1, so that should be picked
+        assert_eq!(
+            state.alloc(Some(MemoryInModule(
+                CompiledModuleId::new(),
+                DefinedMemoryIndex::new(0)
+            ))),
+            Some(SlotId(1))
+        );
+
+        // Pick another LRU entry, this time 2
+        assert_eq!(
+            state.alloc(Some(MemoryInModule(
+                CompiledModuleId::new(),
+                DefinedMemoryIndex::new(0)
+            ))),
+            Some(SlotId(2))
+        );
+
+        // This should preserve slot `0` and pick up something new
+        assert_eq!(
+            state.alloc(Some(MemoryInModule(
+                CompiledModuleId::new(),
+                DefinedMemoryIndex::new(0)
+            ))),
+            Some(SlotId(3))
+        );
+
+        state.free(SlotId(1), 0);
+        state.free(SlotId(2), 0);
+        state.free(SlotId(3), 0);
+
+        // for good measure make sure id3 is still affine
+        assert_eq!(state.alloc(Some(id3)), Some(SlotId(0)));
+    }
+
+    #[test]
+    fn test_freelist() {
+        let allocator = SimpleIndexAllocator::new(10).unwrap();
+        assert_eq!(allocator.testing_freelist(), []);
+        let a = allocator.alloc().unwrap();
+        assert_eq!(allocator.testing_freelist(), []);
+        allocator.free(a, 0);
+        assert_eq!(allocator.testing_freelist(), [a]);
+        assert_eq!(allocator.alloc(), Some(a));
+        assert_eq!(allocator.testing_freelist(), []);
+        let b = allocator.alloc().unwrap();
+        assert_eq!(allocator.testing_freelist(), []);
+        allocator.free(b, 0);
+        assert_eq!(allocator.testing_freelist(), [b]);
+        allocator.free(a, 0);
+        assert_eq!(allocator.testing_freelist(), [b, a]);
+    }
+
+    #[test]
+    // proptest reads the current directory for its persistence file, which
+    // miri doesn't support with isolation enabled.
+    #[cfg_attr(miri, ignore)]
+    fn shard_layout_is_exhaustive_and_exact() {
+        use proptest::prelude::*;
+
+        proptest!(|(
+            capacity in 0u32..100_000,
+            max_unused_warm_slots in 0u32..10_000,
+            requested_shards in 1u32..64,
+        )| {
+            let layout = ShardLayout::new(capacity, max_unused_warm_slots, requested_shards)
+                .unwrap();
+
+            // Shard capacities partition the whole slot space, and the
+            // warm-slot budgets sum to the configured total, no matter how
+            // unevenly the capacity divides.
+            prop_assert_eq!(
+                layout.shards.iter().map(|(c, _)| *c).sum::<u32>(),
+                capacity
+            );
+            prop_assert_eq!(
+                layout.shards.iter().map(|(_, w)| *w).sum::<u32>(),
+                max_unused_warm_slots
+            );
+
+            // Every shard except possibly the last is exactly
+            // `slots_per_shard` large, which the global<->local `SlotId`
+            // translation relies on.
+            let (last, rest) = layout.shards.split_last().unwrap();
+            for (c, _) in rest {
+                prop_assert_eq!(*c, layout.slots_per_shard);
+            }
+            prop_assert!(last.0 <= layout.slots_per_shard);
+
+            // The requested shard count is an upper bound, and small pools
+            // are never sharded.
+            prop_assert!(layout.shards.len() <= requested_shards as usize);
+            if capacity < 128 {
+                prop_assert_eq!(layout.shards.len(), 1);
+            }
+        });
+    }
+
+    #[test]
+    // proptest reads the current directory for its persistence file, which
+    // miri doesn't support with isolation enabled.
+    #[cfg_attr(miri, ignore)]
+    fn sharded_alloc_is_exhaustive_and_unique() {
+        use proptest::prelude::*;
+
+        proptest!(|(
+            capacity in 0u32..2048,
+            max_unused_warm_slots in 0u32..100,
+            requested_shards in 1u32..64,
+        )| {
+            let allocator = ModuleAffinityIndexAllocator::new_with_shard_count(
+                capacity,
+                max_unused_warm_slots,
+                requested_shards,
+            )
+            .unwrap();
+
+            // Regardless of shard layout, we can allocate exactly
+            // `capacity` slots, all distinct and in-bounds, ...
+            let mut ids = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..capacity {
+                let id = allocator.alloc(None).unwrap();
+                prop_assert!(id.0 < capacity);
+                prop_assert!(seen.insert(id.0));
+                ids.push(id);
+            }
+            // ... after which the pool reports exhaustion, ...
+            prop_assert!(allocator.alloc(None).is_none());
+
+            // ... and freeing everything makes it all allocatable again.
+            allocator.free_many(ids.into_iter().map(|id| (id, 0)));
+            for _ in 0..capacity {
+                prop_assert!(allocator.alloc(None).is_some());
+            }
+            prop_assert!(allocator.alloc(None).is_none());
+        });
+    }
+}

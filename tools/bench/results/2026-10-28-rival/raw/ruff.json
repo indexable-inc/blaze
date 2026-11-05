@@ -1,0 +1,214 @@
+{
+ "project": "ruff",
+ "repo": "astral-sh/ruff",
+ "rev": "07872adbafa7c00f42f1174d8aa3c3e324033009",
+ "arms": {
+  "cargo": {
+   "kind": "cargo",
+   "phases": {
+    "cold": {
+     "build_s": 199.127,
+     "ready_s": 0.0,
+     "wall_s": 199.127,
+     "built": "cargo",
+     "states": [
+      "cargo"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.236,
+     "samples_s": [
+      0.24,
+      0.234,
+      0.239,
+      0.236,
+      0.231
+     ],
+     "built": [
+      "cargo"
+     ]
+    },
+    "body": {
+     "wall_s": 7.239,
+     "samples_s": [
+      9.242,
+      7.399,
+      7.239,
+      7.216,
+      7.218
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 7.274
+    },
+    "signature": {
+     "wall_s": 66.316,
+     "samples_s": [
+      66.078,
+      64.933,
+      66.316,
+      66.412,
+      66.668
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 66.112
+    },
+    "tests_first": {
+     "wall_s": 42.949
+    },
+    "tests": {
+     "wall_s": 1.664,
+     "status": 0,
+     "passed": 864,
+     "failed": 0,
+     "ignored": 1,
+     "built": "cargo"
+    }
+   },
+   "wrong": [],
+   "failed": null
+  },
+  "ours": {
+   "kind": "blaze",
+   "phases": {
+    "cold": {
+     "build_s": 527.585,
+     "ready_s": 0.426,
+     "wall_s": 528.011,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.063,
+     "samples_s": [
+      0.063,
+      0.063,
+      0.062,
+      0.062,
+      0.063
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 75.224,
+     "samples_s": [
+      76.638,
+      75.48,
+      75.129,
+      75.026,
+      75.224
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 75.115
+    },
+    "signature": {
+     "wall_s": 27.384,
+     "samples_s": [
+      27.614,
+      27.247,
+      27.516,
+      27.317,
+      27.384
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 27.43
+    },
+    "tests_first": {
+     "wall_s": 211.279
+    },
+    "tests": {
+     "wall_s": 13.942,
+     "status": 0,
+     "passed": 864,
+     "failed": 0,
+     "ignored": 1,
+     "built": "daemon",
+     "differs": "tests differ: blaze only [(('token::tokens::tests::tokens_after_offset_inside_token', 'ran'), 1), (('token::tokens::tests::tokens_before_offset_inside_token', 'ran'), 1), (('token::tokens::tests::tokens_in_range_end_offset_inside_token', 'ran'), 1)], cargo only [(('token::tokens::tests::tokens_after_offset_inside_token - should panic', 'ran'), 1), (('token::tokens::tests::tokens_before_offset_insi"
+    }
+   },
+   "wrong": [
+    "tests: tests differ: blaze only [(('token::tokens::tests::tokens_after_offset_inside_token', 'ran'), 1), (('token::tokens::tests::tokens_before_offset_inside_token', 'ran'), 1), (('token::tokens::tests::tokens_in_range_end_offset_inside_token', 'ran'), 1)], cargo only [(('token::tokens::tests::tokens_after_offset_inside_token - should panic', 'ran'), 1), (('token::tokens::tests::tokens_before_offs"
+   ],
+   "failed": null
+  },
+  "astral": {
+   "kind": "astral",
+   "phases": {
+    "cold": {
+     "build_s": 332.311,
+     "ready_s": 0.042,
+     "wall_s": 332.353,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.047,
+     "samples_s": [
+      0.047,
+      0.046,
+      0.047,
+      0.045,
+      0.05
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 0.251,
+     "samples_s": [
+      0.365,
+      0.255,
+      0.251,
+      0.246,
+      0.251
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.237
+    },
+    "signature": {
+     "wall_s": 122.14,
+     "samples_s": [
+      84.789,
+      122.358,
+      123.162,
+      122.14,
+      120.787
+     ],
+     "built": [
+      "cargo: `ruff`: `into_settings` is not compiled by ra-jit and rustc's copy is from before the edit: unsupported: callee `unwrap_or_else`: callee `{closure}`: unsupporte"
+     ],
+     "back_s": 121.722
+    },
+    "tests_first": {
+     "wall_s": 87.888
+    },
+    "tests": {
+     "wall_s": 7.085,
+     "status": 0,
+     "passed": 864,
+     "failed": 0,
+     "ignored": 1,
+     "built": "daemon"
+    }
+   },
+   "wrong": [],
+   "failed": null
+  }
+ }
+}

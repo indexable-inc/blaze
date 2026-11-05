@@ -1,0 +1,57 @@
+[package]
+name = "rsasm"
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.89"
+description = "A multi-syntax, multi-architecture assembler"
+license = "MIT"
+repository = "https://github.com/KarpelesLab/rsasm"
+readme = "README.md"
+keywords = ["assembler", "asm", "x86", "codegen"]
+categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+# Document every architecture backend, not just the default set. Mirrors the
+# CI docs job.
+all-features = true
+
+[dependencies]
+# The crate's only dependency, and an optional one: with
+# --no-default-features rsasm has none at all, which is a property worth
+# keeping. qld's own default feature is an LTO plugin host that dlopen()s
+# the compiler's plugin — the single part of qld that uses FFI, and nothing
+# an assembler has any use for — so it is left off.
+qld = { version = "0.1.1", optional = true, default-features = false }
+
+[features]
+# One feature per CPU architecture backend, plus `link`. All are enabled by
+# default; build with --no-default-features --features <arch> for a slimmer
+# binary. The core must keep building with every one of them off, which CI
+# checks.
+default = ["x86", "aarch64", "arm", "riscv", "powerpc", "mips", "sparc", "retro", "m68k", "v850", "rl78", "rx", "superh", "k78", "avr", "msp430", "link"]
+x86 = []
+aarch64 = []
+arm = []
+riscv = []
+powerpc = []
+mips = []
+sparc = []
+retro = []
+m68k = []
+v850 = []
+rl78 = []
+rx = []
+superh = []
+k78 = []
+avr = []
+msp430 = []
+
+# Linking assembled objects into a program, in the same process, through the
+# qld linker. It is in the default set because a `rsasm` that can only write
+# object files leaves the last step to another tool; a library consumer that
+# wants the dependency-free crate asks for `default-features = false`.
+link = ["dep:qld"]
+
+[lib]
+name = "rsasm"
+path = "src/lib.rs"

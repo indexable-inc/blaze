@@ -1,0 +1,9 @@
+{
+ "project": "bun",
+ "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+ "status": 101,
+ "seconds": 0.13,
+ "failed": [],
+ "stderr_tail": "    Updating crates.io index\nerror: no matching package named `lol_html` found\nlocation searched: /root/bs/cl/work/src/bun/vendor/lolhtml\nrequired by package `bun_bundler v0.0.0 (/root/bs/cl/work/src/bun/src/bundler)`\n",
+ "scripts": []
+}

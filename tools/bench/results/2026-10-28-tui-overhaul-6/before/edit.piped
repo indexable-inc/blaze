@@ -1,0 +1,3 @@
+     Rebuilt 1 fn: search (crates/core/main.rs edited); 0.11s
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.xFPPGadREz/ripgrep)
+    Finished `dev` profile [blaze] target(s) in 0.12s

@@ -1,0 +1,76 @@
+[package]
+name = "hir-def"
+version = "0.0.0"
+repository.workspace = true
+description = "Early name and import resolution for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["unicode-ident"]
+
+[lib]
+doctest = false
+
+[dependencies]
+arrayvec.workspace = true
+bitflags.workspace = true
+blaze-hash.workspace = true
+cov-mark.workspace = true
+drop_bomb.workspace = true
+either.workspace = true
+hashbrown.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+la-arena.workspace = true
+parking_lot.workspace = true
+tracing = { workspace = true, features = ["attributes"] }
+smallvec.workspace = true
+triomphe.workspace = true
+rustc_apfloat.workspace = true
+
+rustc_parse_format.workspace = true
+rustc_abi.workspace = true
+# The integer widths of `#![blaze::arbitrary_ints]`.
+ra-ap-rustc_ast_ir.workspace = true
+
+# local deps
+stdx.workspace = true
+intern.workspace = true
+base-db.workspace = true
+syntax.workspace = true
+hir-expand.workspace = true
+cfg.workspace = true
+tt.workspace = true
+span.workspace = true
+thin-vec.workspace = true
+syntax-bridge.workspace = true
+blaze-format.workspace = true
+blaze-dbsp.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+inventory.workspace = true
+blaze-phf.workspace = true
+blaze-query.workspace = true
+
+# This is a transitive dep, but we need to specify this
+# for the workspace-wide pinning
+unicode-ident.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
+crossbeam-channel.workspace = true
+expect-test.workspace = true
+fst.workspace = true
+hegeltest.workspace = true
+
+# local deps
+test-utils.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

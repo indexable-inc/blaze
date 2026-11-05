@@ -1,0 +1,94 @@
+; Follows cranelift/filetests/filetests/runtests/bitrev.clif, for the stencil set: `bitrev` of
+; `i8` to `i64`. The `i128` form is i128-bitops.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %bitrev_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = bitrev v0
+    return v1
+}
+; run: %bitrev_i8(0) == 0
+; run: %bitrev_i8(1) == -128
+; run: %bitrev_i8(-1) == -1
+; run: %bitrev_i8(-128) == 1
+; run: %bitrev_i8(127) == -2
+; run: %bitrev_i8(-127) == -127
+; run: %bitrev_i8(126) == 126
+; run: %bitrev_i8(2) == 64
+; run: %bitrev_i8(100) == 38
+; run: %bitrev_i8(-77) == -51
+; run: %bitrev_i8(8) == 16
+; run: %bitrev_i8(16) == 8
+; run: %bitrev_i8(64) == 2
+; run: %bitrev_i8(15) == -16
+; run: %bitrev_i8(-16) == 15
+; run: %bitrev_i8(120) == 30
+
+function %bitrev_i16(i16) -> i16 {
+block0(v0: i16):
+    v1 = bitrev v0
+    return v1
+}
+; run: %bitrev_i16(0) == 0
+; run: %bitrev_i16(1) == 0x8000
+; run: %bitrev_i16(-1) == -1
+; run: %bitrev_i16(0x8000) == 1
+; run: %bitrev_i16(0x7fff) == -2
+; run: %bitrev_i16(0x8001) == 0x8001
+; run: %bitrev_i16(0x7ffe) == 0x7ffe
+; run: %bitrev_i16(2) == 0x4000
+; run: %bitrev_i16(0x3039) == 0x9c0c
+; run: %bitrev_i16(0xa460) == 0x0625
+; run: %bitrev_i16(128) == 256
+; run: %bitrev_i16(256) == 128
+; run: %bitrev_i16(0x4000) == 2
+; run: %bitrev_i16(255) == -256
+; run: %bitrev_i16(-256) == 255
+; run: %bitrev_i16(0x5678) == 0x1e6a
+
+function %bitrev_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = bitrev v0
+    return v1
+}
+; run: %bitrev_i32(0) == 0
+; run: %bitrev_i32(1) == 0x80000000
+; run: %bitrev_i32(-1) == -1
+; run: %bitrev_i32(0x80000000) == 1
+; run: %bitrev_i32(0x7fffffff) == -2
+; run: %bitrev_i32(0x80000001) == 0x80000001
+; run: %bitrev_i32(0x7ffffffe) == 0x7ffffffe
+; run: %bitrev_i32(2) == 0x40000000
+; run: %bitrev_i32(0x075bcd15) == 0xa8b3dae0
+; run: %bitrev_i32(0xc521974f) == 0xf2e984a3
+; run: %bitrev_i32(0x00008000) == 0x00010000
+; run: %bitrev_i32(0x00010000) == 0x00008000
+; run: %bitrev_i32(0x40000000) == 2
+; run: %bitrev_i32(0x0000ffff) == 0xffff0000
+; run: %bitrev_i32(0xffff0000) == 0x0000ffff
+; run: %bitrev_i32(0x12345678) == 0x1e6a2c48
+
+function %bitrev_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = bitrev v0
+    return v1
+}
+; run: %bitrev_i64(0) == 0
+; run: %bitrev_i64(1) == 0x8000000000000000
+; run: %bitrev_i64(-1) == -1
+; run: %bitrev_i64(0x8000000000000000) == 1
+; run: %bitrev_i64(0x7fffffffffffffff) == -2
+; run: %bitrev_i64(0x8000000000000001) == 0x8000000000000001
+; run: %bitrev_i64(0x7ffffffffffffffe) == 0x7ffffffffffffffe
+; run: %bitrev_i64(2) == 0x4000000000000000
+; run: %bitrev_i64(0x123456789abcdef0) == 0x0f7b3d591e6a2c48
+; run: %bitrev_i64(0xf0123456789abcdf) == 0xfb3d591e6a2c480f
+; run: %bitrev_i64(0x0000000080000000) == 0x0000000100000000
+; run: %bitrev_i64(0x0000000100000000) == 0x0000000080000000
+; run: %bitrev_i64(0x4000000000000000) == 2
+; run: %bitrev_i64(0x00000000ffffffff) == 0xffffffff00000000
+; run: %bitrev_i64(0xffffffff00000000) == 0x00000000ffffffff
+; run: %bitrev_i64(0x1234567812345678) == 0x1e6a2c481e6a2c48

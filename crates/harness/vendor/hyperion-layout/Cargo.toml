@@ -1,0 +1,14 @@
+[package]
+name = "hyperion-abi-layout"
+description = "Layout recipes and the layout hash from hyperion, trimmed for stable Rust (no Shape reflection, migrations or persist specs)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "hyperion_layout"
+
+[dependencies]
+hyperion-abi = { path = "../hyperion-abi" }
+hyperion-wyhash = { path = "../hyperion-wyhash" }

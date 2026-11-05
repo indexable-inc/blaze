@@ -1,0 +1,55 @@
+[package]
+name = "ix-prof"
+description = "A profiler for any Rust program, like Go's pprof: CPU samples, a tracing span tree with self CPU time, allocations by stack, named waits; one deterministic .ixprof file, pprof and Chrome exports, a net/http/pprof-style endpoint and a live stream"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# A library other projects link too (docs/ix-prof.md), each taking what it needs; blaze-engine
+# takes `sampler` alone.
+default = ["sampler", "layer"]
+# The CPU sampler thread (perf_event_open on Linux, thread_suspend on arm64 macOS).
+sampler = []
+# `ix_prof::layer()`, a `tracing_subscriber::Layer`.
+layer = ["dep:tracing-subscriber"]
+# `/debug/pprof/*` and `/debug/pprof/live` on a loopback port.
+http = []
+
+[dependencies]
+addr2line.workspace = true
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+blake3.workspace = true
+# The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
+# stub, which only the jump table ties to its function (symbols.rs).
+blaze-inproc-rt.workspace = true
+crossbeam-queue.workspace = true
+flate2 = { workspace = true, features = ["rust_backend"] }
+# `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
+gimli = { workspace = true, features = ["endian-reader"] }
+object.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+rustc-demangle.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

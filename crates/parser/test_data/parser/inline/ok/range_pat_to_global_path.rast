@@ -1,0 +1,49 @@
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    WHITESPACE " "
+    NAME
+      IDENT "f"
+    PARAM_LIST
+      L_PAREN "("
+      R_PAREN ")"
+    WHITESPACE " "
+    BLOCK_EXPR
+      STMT_LIST
+        L_CURLY "{"
+        WHITESPACE "\n    "
+        IF_EXPR
+          IF_KW "if"
+          WHITESPACE " "
+          LET_EXPR
+            LET_KW "let"
+            WHITESPACE " "
+            RANGE_PAT
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "0"
+              DOT2EQ "..="
+              PATH_PAT
+                PATH
+                  PATH
+                    PATH_SEGMENT
+                      COLON2 "::"
+                      NAME_REF
+                        IDENT "m"
+                  COLON2 "::"
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "MAX"
+            WHITESPACE " "
+            EQ "="
+            WHITESPACE " "
+            LITERAL
+              INT_NUMBER "1"
+          WHITESPACE " "
+          BLOCK_EXPR
+            STMT_LIST
+              L_CURLY "{"
+              R_CURLY "}"
+        WHITESPACE "\n"
+        R_CURLY "}"
+  WHITESPACE "\n"

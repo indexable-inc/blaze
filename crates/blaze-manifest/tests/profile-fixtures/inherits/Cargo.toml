@@ -1,0 +1,26 @@
+[package]
+name = "inh"
+version = "0.1.0"
+edition = "2021"
+
+[profile.test]
+opt-level = 1
+
+[profile.bench]
+debug = true
+codegen-units = 1
+
+[profile.one]
+inherits = "release"
+lto = "fat"
+panic = "abort"
+
+[profile.two]
+inherits = "one"
+opt-level = "s"
+debug-assertions = true
+overflow-checks = true
+
+[profile.three]
+inherits = "test"
+rpath = true

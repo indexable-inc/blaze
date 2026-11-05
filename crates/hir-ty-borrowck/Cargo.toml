@@ -1,0 +1,45 @@
+[package]
+name = "hir-ty-borrowck"
+version = "0.0.0"
+repository.workspace = true
+description = "rustc's NLL and Polonius borrow checker over rust-analyzer's MIR."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+la-arena.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+
+ra-ap-rustc_ast_ir.workspace = true
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-ids.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-linear.workspace = true
+hir-ty-matchck.workspace = true
+hir-ty-mir.workspace = true
+hir-ty-tailck.workspace = true
+hir-ty-wfcheck.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+blaze-alloc-count.workspace = true
+blaze-format.workspace = true
+
+[lints]
+workspace = true

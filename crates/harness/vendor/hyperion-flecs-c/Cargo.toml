@@ -1,0 +1,37 @@
+[package]
+name = "hyperion-flecs-c"
+description = "Compiles flecs v4.2.0 (the indexable-inc/flecs fork's amalgamation, pinned below; custom build: core plus log, addons by feature) with cc, -O2, for the host and for wasm32-unknown-unknown (with the small C library in wasm-libc/)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+links = "denflecs"
+build = "build.rs"
+
+[features]
+# Core features that flecs 4.2 moved out of the core into addons (all were core in 4.1).
+prefab = []
+constraint_traits = []
+cached_queries = []
+query_plans = []
+system = []
+pipeline = ["system", "cached_queries", "query_plans"]
+meta = []
+script = ["meta"]
+json = ["meta"]
+# flecs.script.input (the on.click / on.enter async events) and the async/await it needs.
+script_input = ["script"]
+# The REST API (flecs.dev/explorer, the Flecs Shell) with the world and pipeline statistics it reports, and the script shell
+# it runs commands in. Compiled in only; a host turns it on at run time.
+rest = ["pipeline", "json", "script"]
+
+[build-dependencies]
+cc = "1"
+# The flecs this app runs: github.com/indexable-inc/flecs, branch `indexable/v4.2`. Its `flecs-distr` crate only names
+# distr/flecs.{c,h}; build.rs compiles them. To move flecs: commit to the fork's branch (distr/ rebuilt with `bake build .`),
+# set `rev` here, regenerate hyperion-ecs-sys's bindings if flecs.h changed (gen-bindings.py).
+# This rev is upstream v4.2.0 (6566d4b7bdc597d0b74d5e0a4104d4ae6ac49402) plus the fork's fixes: per-component column
+# allocator, shortest round-trip JSON floats, query-cache notification while quitting, refusing pairs that break
+# relationship constraints under FLECS_SOFT_ASSERT, copying OrderedChildren to prefab instances, two script scoping fixes,
+# deleting a parent before its Parent-storage children (upstream flecs#2384, PR #2385), and the flecs-distr crate.
+flecs-distr = { git = "https://github.com/indexable-inc/flecs", rev = "ab8b8e051c6f8ac014557136c97847941bd3caa0" }

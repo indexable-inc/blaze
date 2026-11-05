@@ -1,0 +1,6 @@
+30 noops 1059ms
+30 noops 1053ms
+30 noops 1068ms
+30 rustup cargo --version 316ms
+30 rustup cargo --version 335ms
+30 rustup cargo --version 328ms

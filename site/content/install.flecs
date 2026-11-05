@@ -1,0 +1,41 @@
+// /install: getting blaze, trimmed from docs/install.md (the full version, with every detail, stays there).
+site {
+  install : Page {
+    Title: {"Install"}
+    Nav: {"Install", 1}
+    Icon: {"download"}
+    (InGroup, nav.reference)
+    Description: {"Install blaze with one line on macOS on Apple silicon or Linux, or with Nix."}
+
+    Lede lede("One line, on macOS on Apple silicon or Linux, with or without Rust installed:")
+    Command curl("curl -fsSL https://ix.dev/blaze | sh")
+    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).")
+    Code first(lang: "bash", text: "blaze run")
+
+    Section needs(title: "What you need") {
+      Ul list {
+        Li platform("**macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs are not supported, and neither is Windows yet ([platforms](https://github.com/indexable-inc/blaze/blob/main/docs/platforms.md#windows-x86-64-msvc)).")
+        Li glibc("**On Linux, glibc 2.34 or newer:** RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Alpine and other musl systems are not supported; the installer says so.")
+        Li cc("**A C compiler for linking:** `gcc` or `cc` on Linux, Apple's command line tools on macOS (`xcode-select --install`).")
+        Li container("**In a container, user namespaces.** Build scripts and proc macros run in a sandbox made of Linux namespaces, which Docker's default seccomp profile refuses: run the container with `--security-opt seccomp=unconfined`, or set `BLAZE_SANDBOX=off` to run them outside a sandbox, as cargo does.")
+        Li memory("**Memory to spare.** blaze's background process holds a few GB for a small project and tens of GB for the largest ([numbers](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md#how-much-memory-and-disk-it-takes)).")
+      }
+      P rust("You do not need Rust or rustup. blaze is its own toolchain: it downloads its pinned nightly once into `~/.blaze` (rustc, cargo, the standard library and its source, about 100 to 130 MB), or uses rustup's copy of that nightly when it has one. It builds your project with that nightly whatever its `rust-toolchain.toml` says, so stable code and `#![feature(...)]` code both build ([why](https://github.com/indexable-inc/blaze/blob/main/docs/toolchain.md)).")
+    }
+
+    Section installer(title: "What the installer does") {
+      P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze` and the programs it runs in `~/.cargo/bin`, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
+      P versions("Releases are dated, `0.YYYYMMDD.N`. A canary is published whenever main has changed and main's build of it passes; a canary whose commit then passes main's unit tests on every platform and the heavy tests (building and testing bun, servo, cargo, zed and others, and beating cargo on them) becomes the stable release, which the installer installs. End the line with `| sh -s -- --channel canary` for the newest canary, or `| sh -s -- --version 0.YYYYMMDD.N` for a given release; `--help` says what else it takes.")
+    }
+
+    Section nix(title: "With Nix") {
+      Code profile(lang: "bash", text: `nix profile install github:indexable-inc/blaze
+        nix run github:indexable-inc/blaze -- build   # try it without installing`)
+      Dim cache("Nix compiles blaze from source; there is no binary cache yet. In a flake, take `blaze.packages.\$\{system}.blaze` from the input `github:indexable-inc/blaze`.")
+    }
+
+    Section from_source(title: "Building blaze itself") {
+      P what("Every way to build blaze itself: [contributing](https://github.com/indexable-inc/blaze/blob/main/docs/contributing.md).")
+    }
+  }
+}

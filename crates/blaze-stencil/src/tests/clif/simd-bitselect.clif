@@ -1,0 +1,92 @@
+; Follows cranelift/filetests/filetests/runtests/simd-bitselect.clif (and
+; simd-bitselect-to-vselect.clif, simd-fmin-max-pseudo.clif), for the stencil set:
+; `bitselect` of each 128-bit vector type with masks of whole lanes and of mixed bits, and the
+; IR builder's `minps`/`maxps` shape, `bitselect (bitcast (fcmp lt x y)), x, y`, which x86-64
+; fuses. Left out: the `fast` flag (no flags in this corpus).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %bitselect_i8x16(i8x16, i8x16, i8x16) -> i8x16 {
+block0(v0: i8x16, v1: i8x16, v2: i8x16):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_i8x16([0xff 0 0xff 0 0x0f 0xf0 0x55 0 0 0 0 0 0 0 0 0xff], [1 2 3 4 0xff 0xff 0xff 0 0 0 0 0 0 0 0 42], [5 6 7 8 0 0 0xaa 0 0 0 0 0 0 0 0 7]) == [1 6 3 8 0x0f 0xf0 0xff 0 0 0 0 0 0 0 0 42]
+; run: %bitselect_i8x16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 255], [127 0 0 0 0 0 0 0 0 0 0 0 0 0 0 42], [42 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127]) == [42 0 0 0 0 0 0 0 0 0 0 0 0 0 0 42]
+
+function %bitselect_i16x8(i16x8, i16x8, i16x8) -> i16x8 {
+block0(v0: i16x8, v1: i16x8, v2: i16x8):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_i16x8([0xffff 0 0xff00 0x00ff 0xffff 0 0x8000 0x7fff], [1 2 0x1234 0x1234 -1 -1 0xffff 0xffff], [3 4 0x5678 0x5678 0 0 0 0]) == [1 4 0x1278 0x5634 -1 0 0x8000 0x7fff]
+
+function %bitselect_i32x4(i32x4, i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4, v2: i32x4):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_i32x4([-1 0 -1 0], [1 2 3 4], [5 6 7 8]) == [1 6 3 8]
+; run: %bitselect_i32x4([0xffff0000 0x0000ffff 0xf0f0f0f0 0x80000000], [0x11111111 0x11111111 0xffffffff 0xffffffff], [0x22222222 0x22222222 0 0x7fffffff]) == [0x11112222 0x22221111 0xf0f0f0f0 0xffffffff]
+
+function %bitselect_i64x2(i64x2, i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2, v2: i64x2):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_i64x2(0x00000000000000000000000000000000, 0x11111111111111111111111111111111, 0x00000000000000000000000000000000) == 0x00000000000000000000000000000000
+; run: %bitselect_i64x2(0x11111111111111111111111111111111, 0x11111111111111111111111111111111, 0x00000000000000000000000000000000) == 0x11111111111111111111111111111111
+; run: %bitselect_i64x2(0x01010011000011110000000011111111, 0x11111111111111111111111111111111, 0x00000000000000000000000000000000) == 0x01010011000011110000000011111111
+; run: %bitselect_i64x2(0x00000000000000001111111111111111, 0x00000000000000000000000000000000, 0x11111111111111111111111111111111) == 0x11111111111111110000000000000000
+; run: %bitselect_i64x2([-1 0], [0x8000000000000001 2], [3 0x7ffffffffffffffe]) == [0x8000000000000001 0x7ffffffffffffffe]
+
+function %bitselect_f32x4(f32x4, f32x4) -> f32x4 {
+block0(v0: f32x4, v1: f32x4):
+    v2 = vconst.f32x4 0xffffffff00000000800000007fffffff
+    v3 = bitselect v2, v0, v1
+    return v3
+}
+; Lane 0 takes the magnitude of the first and the sign of the second, lane 1 the reverse,
+; lane 2 the second and lane 3 the first.
+; run: %bitselect_f32x4([-0x1.0p0 0x1.0p1 0x1.0p2 0x1.8p1], [0x1.0p3 -0x1.0p4 0x1.0p5 0x1.0p6]) == [0x1.0p0 0x1.0p4 0x1.0p5 0x1.8p1]
+; run: %bitselect_f32x4([0x1.0p0 -0x1.0p1 0x0.0 0x0.0], [-0x0.0 0x1.0p4 +NaN -0x1.0p0]) == [-0x1.0p0 -0x1.0p4 +NaN 0x0.0]
+
+function %bitselect_f64x2(f64x2, f64x2, f64x2) -> f64x2 {
+block0(v0: f64x2, v1: f64x2, v2: f64x2):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_f64x2(0xffffffffffffffff0000000000000000, [0x1.0p0 0x1.0p1], [0x1.0p2 0x1.0p3]) == [0x1.0p2 0x1.0p1]
+; run: %bitselect_f64x2(0x80000000000000007fffffffffffffff, [-0x1.0p0 0x1.0p1], [0x1.0p3 -0x1.0p3]) == [0x1.0p0 0x1.0p3]
+; run: %bitselect_f64x2(0xFF00000000000000FF00000000000000, 0x11111111111111111111111111111111, 0x00000000000000000000000000000000) == 0x11000000000000001100000000000000
+
+function %bitselect_fcmp_lt_f32x4(f32x4, f32x4) -> f32x4 {
+block0(v0: f32x4, v1: f32x4):
+    v2 = fcmp lt v0, v1
+    v3 = bitcast.f32x4 little v2
+    v4 = bitselect v3, v0, v1
+    return v4
+}
+; run: %bitselect_fcmp_lt_f32x4([0x1.0p0 0x1.0p1 -0x0.0 +NaN], [0x1.0p1 0x1.0p0 0x0.0 0x1.0p0]) == [0x1.0p0 0x1.0p0 0x0.0 0x1.0p0]
+; run: %bitselect_fcmp_lt_f32x4([0x1.0p0 -Inf 0x0.0 0x1.0p0], [+NaN +Inf -0x0.0 0x1.0p0]) == [+NaN -Inf -0x0.0 0x1.0p0]
+
+function %bitselect_fcmp_gt_f32x4(f32x4, f32x4) -> f32x4 {
+block0(v0: f32x4, v1: f32x4):
+    v2 = fcmp lt v1, v0
+    v3 = bitcast.f32x4 little v2
+    v4 = bitselect v3, v0, v1
+    return v4
+}
+; run: %bitselect_fcmp_gt_f32x4([0x1.0p0 0x1.0p1 0x0.0 +NaN], [0x1.0p1 0x1.0p0 -0x0.0 0x1.0p0]) == [0x1.0p1 0x1.0p1 -0x0.0 0x1.0p0]
+
+function %bitselect_fcmp_lt_f64x2(f64x2, f64x2) -> f64x2 {
+block0(v0: f64x2, v1: f64x2):
+    v2 = fcmp lt v0, v1
+    v3 = bitcast.f64x2 little v2
+    v4 = bitselect v3, v0, v1
+    return v4
+}
+; run: %bitselect_fcmp_lt_f64x2([0x1.0p0 +NaN], [-0x1.0p0 0x1.0p0]) == [-0x1.0p0 0x1.0p0]
+; run: %bitselect_fcmp_lt_f64x2([-0x1.0p0 -0x0.0], [0x1.0p0 0x0.0]) == [-0x1.0p0 0x0.0]

@@ -1,0 +1,24 @@
+include = [{ path = "extra.toml", optional = true }, "more.toml"]
+[build]
+rustflags = ["-C", "opt-level=1"]
+target-dir = "tgt"
+jobs = 4
+[env]
+FOO = "bar"
+REL = { value = "x/y", relative = true }
+[target.x86_64-unknown-linux-gnu]
+runner = ["qemu", "-L"]
+linker = "cc"
+[target.'cfg(unix)']
+rustflags = ["-Dwarnings"]
+[source.crates-io]
+replace-with = "vendored"
+[source.vendored]
+directory = "vendor"
+[registries.mine]
+index = "sparse+https://example.com/index/"
+[alias]
+b = "build"
+[net]
+retry = 3
+offline = false

@@ -1,0 +1,37 @@
+diff --git a/src/function/execute.rs b/src/function/execute.rs
+index e9fc6196ac..f792d823ce 100644
+--- a/src/function/execute.rs
++++ b/src/function/execute.rs
+@@ -368,6 +368,18 @@ impl MemoHeader {
+         cancellation_count: u8,
+         has_value: bool,
+     ) -> Option<PreviousIteration> {
++        // A memo whose value an LRU evicted, and that a later revision deep-verified, is also
++        // verified in this revision without a value. It is not a cycle head that panicked:
++        // the memo a panic leaves (`PoisonProvisionalIfPanicking`) is provisional and is its own
++        // cycle head, where an evicted memo is final. It comes from an earlier revision, so it is
++        // kept as the old memo for output bookkeeping, as one verified earlier would be.
++        if !has_value && !self.cycle_heads().contains(&database_key_index) {
++            return Some(PreviousIteration {
++                iteration: IterationStamp::initial(cancellation_count),
++                reuse_as_provisional: false,
++            });
++        }
++
+         if self.revisions.iteration().cancellation_count() != cancellation_count {
+             return None;
+         }
+diff --git a/src/function/memo.rs b/src/function/memo.rs
+index 2592f91a8c..b679c03ed6 100644
+--- a/src/function/memo.rs
++++ b/src/function/memo.rs
+@@ -234,7 +234,8 @@ impl MemoHeader {
+         // assigned as output of another query
+         // or those with untracked inputs
+         // as their values cannot be reconstructed.
+-        matches!(self.origin(), QueryOriginRef::Derived(_))
++        // Nor a provisional memo: fixpoint iteration reads its value.
++        matches!(self.origin(), QueryOriginRef::Derived(_)) && !self.may_be_provisional()
+     }
+ 
+     /// True if this may be a provisional cycle-iteration result.

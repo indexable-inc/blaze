@@ -1,0 +1,2 @@
+# Vendored code stays as upstream wrote (or bindgen generated) it.
+disable_all_formatting = true

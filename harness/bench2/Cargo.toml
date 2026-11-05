@@ -1,0 +1,13 @@
+[package]
+name = "bench2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex-syntax = { path = "../vendor/regex-syntax" }
+regex-automata = { path = "../vendor/regex-automata" }
+
+[workspace]
+
+[patch.crates-io]
+regex-syntax = { path = "../vendor/regex-syntax" }

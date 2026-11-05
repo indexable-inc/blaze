@@ -1,0 +1,64 @@
+/* Page base and docs prose, after ix site.css (.site, .s-prose) and lib/docs/Blocks.svelte (.doc, .ref). */
+* { box-sizing: border-box; }
+html {
+	background: var(--bg);
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	font-synthesis: none;
+}
+/* No rubber band on a desk: the chat, the rail and the bar are fixed while the page bounced under them, and nothing on
+   the page is worth pulling past its ends. Phones keep it (and pull to refresh). Only y: x is the swipe back. */
+@media (pointer: fine) { html { overscroll-behavior-y: none; } }
+body {
+	margin: 0;
+	font-family: var(--font-sans);
+	font-size: 16px;
+	line-height: 1.6;
+	letter-spacing: -0.011em;
+	color: var(--ink-2);
+	background: var(--bg);
+	overflow-wrap: break-word;
+	text-rendering: optimizeLegibility;
+}
+::selection { background: color-mix(in srgb, var(--ink-1) 22%, transparent); color: var(--ink-1); }
+:focus-visible { outline: 1.5px solid var(--ink-1); outline-offset: 2px; border-radius: 4px; }
+code, pre, .mono { font-family: var(--font-mono); letter-spacing: 0; }
+
+.doc { font-size: 16px; line-height: 1.7; color: var(--ink-2); }
+.doc h2, .doc h3 { color: var(--ink-1); line-height: 1.25; font-weight: 600; letter-spacing: -0.02em; scroll-margin-top: 24px; }
+.doc h2 { margin: 2.4em 0 0.6em; font-size: 24px; }
+.doc h3 { margin: 1.7em 0 0.45em; font-size: 18px; }
+.doc p, .doc ul, .doc ol { margin: 0 0 1.1em; }
+.doc strong { color: var(--ink-1); font-weight: 600; }
+.doc ul, .doc ol { padding-left: 1.4em; }
+.doc li { margin: 0 0 0.45em; }
+.doc li::marker { color: var(--ink-4); }
+.doc :not(pre) > code {
+	padding: 0.12em 0.4em;
+	border-radius: 6px;
+	background: var(--s-tint);
+	color: var(--doc-code-ink);
+	font-size: 0.88em;
+	overflow-wrap: break-word;
+}
+.doc a { color: var(--ink-1); text-decoration: underline; text-decoration-color: var(--line-2); text-decoration-thickness: 1px; text-underline-offset: 3px; transition: text-decoration-color 0.15s; }
+.doc a:hover { text-decoration-color: currentColor; }
+.doc .dim { color: var(--ink-3); }
+
+/* A reference table: the wrapper scrolls on a narrow screen instead of squeezing it. */
+.ref { margin: 0 0 1.3em; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line); overflow-x: auto; }
+.ref table { font-variant-numeric: tabular-nums; width: 100%; margin: 0; border-collapse: collapse; font-size: 14px; line-height: 1.5; }
+.ref th { padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--s-tint); text-align: left; font-size: 12px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+.ref td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink-2); }
+.ref tr:last-child td { border-bottom: 0; }
+.ref td:first-child { color: var(--ink-1); }
+
+/* A diagram: its own tone and a hairline, like the docs' code blocks. */
+.figure { margin: 0 0 1.5em; padding: 18px 18px 14px; border-radius: 12px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); }
+.figure svg { display: block; width: 100%; height: auto; }
+.figure figcaption { margin-top: 10px; font-size: 13px; line-height: 1.5; color: var(--ink-3); }
+.figure .scroll { overflow-x: auto; }
+.doc em { font-style: italic; }
+[hidden] { display: none !important; }

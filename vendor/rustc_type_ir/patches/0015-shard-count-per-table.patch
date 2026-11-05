@@ -1,0 +1,20 @@
+diff --git a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
+index c15fd97..89f560f 100644
+--- a/src/search_graph/global_cache.rs
++++ b/src/search_graph/global_cache.rs
+@@ -327,12 +327,10 @@ impl Writer {
+ const _: () = assert!(size_of::<Writer>() == 128);
+ 
+ /// A power of two at least 4 times the cores, at least 4, so writers rarely meet on one lock.
++/// Asked once per table, as it is first written.
+ fn shard_count() -> usize {
+-    static COUNT: OnceLock<usize> = OnceLock::new();
+-    *COUNT.get_or_init(|| {
+-        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+-        (cores * 4).next_power_of_two().max(4)
+-    })
++    let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
++    (cores * 4).next_power_of_two().max(4)
+ }
+ 
+ /// Table `k` of a shard has `TABLE << k` places: 28 hold more than a `u32` of entries.

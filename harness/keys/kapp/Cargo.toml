@@ -1,0 +1,14 @@
+[package]
+name = "kapp"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+extra = ["klib/extra"]
+
+[dependencies]
+klib = { path = "../klib" }
+kdep = { path = "../kdep" }
+
+[lints]
+workspace = true

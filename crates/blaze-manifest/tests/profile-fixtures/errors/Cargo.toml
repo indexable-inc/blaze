@@ -1,0 +1,16 @@
+[package]
+name = "e"
+version = "0.1.0"
+edition = "2021"
+
+[profile.test]
+panic = "abort"
+
+[profile.doc]
+opt-level = 1
+
+[profile.dev.package.nomatch]
+opt-level = 1
+
+[profile.dev.package."e@9"]
+opt-level = 2

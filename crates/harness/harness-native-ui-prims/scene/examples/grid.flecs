@@ -1,0 +1,54 @@
+// ui.Grid: columns as wide as their widest cell; the second end-aligned, the third centred; a Divider spans the row.
+
+@tree ChildOf
+ex {
+  prefab GridDemo : ex.Card {
+    label : ui.Label { Text: {s: "GRID, GRIDROW, GRIDCOLUMN"} }
+    table : ui.Grid {
+      Grid: {hgap: 16, vgap: 6, align: Start, valign: Center}
+      c0 : ui.GridColumn {}
+      c1 : ui.GridColumn { GridColumn: {align: End, w: {kind: Fit, value: 0, min: 0, max: 0}} }
+      c2 : ui.GridColumn { GridColumn: {align: Center, w: {kind: Fit, value: 0, min: 0, max: 0}} }
+      head : ui.GridRow {
+        a : ui.Label { Text: {s: "SESSION"} }
+        b : ui.Label { Text: {s: "RUNS"} }
+        c : ui.Label { Text: {s: "STATE"} }
+      }
+      rule : ui.Divider {}
+      r1 : ui.GridRow {
+        a : ui.Words { Text: {s: "hydra"} }
+        b : ui.Words { Text: {s: "128"} }
+        c : ui.Symbol, Accent { Icon: {glyph: "✓"} }
+      }
+      r2 : ui.GridRow {
+        a : ui.Words { Text: {s: "fold-lane"} }
+        b : ui.Words { Text: {s: "7"} }
+        c : ui.Symbol { Icon: {glyph: "✕"} }
+      }
+      r3 : ui.GridRow {
+        a : ui.Words { Text: {s: "swiftui"} }
+        b : ui.Words { Text: {s: "12 004"} }
+        c : ui.Symbol, Accent { Icon: {glyph: "✓"} }
+      }
+    }
+  }
+
+  // ui.AdaptiveGrid: as many 52-point columns as fit across, each up to 80 points.
+  prefab AdaptiveDemo : ex.Card {
+    label : ui.Label { Text: {s: "GRIDCOLUMNS MIN 52, MAX 80"} }
+    tiles : ui.AdaptiveGrid {
+      GridColumns: {min: 52, max: 80}
+      Flex: {axis: Column, gap: 6, align: Stretch, justify: Start, wrap: false}
+      t1 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "1"} } }
+      t2 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "2"} } }
+      t3 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "3"} } }
+      t4 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "4"} } }
+      t5 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "5"} } }
+      t6 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "6"} } }
+      t7 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "7"} } }
+      t8 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "8"} } }
+      t9 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "9"} } }
+      t10 : ex.Pill { Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}; words { Text: {s: "10"} } }
+    }
+  }
+}

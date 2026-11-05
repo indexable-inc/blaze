@@ -1,0 +1,28 @@
+{
+  "name": "flecs-content-mapper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript 7.1 content mapper for the site's Flecs scripts (.flecs)",
+  "type": "module",
+  "files": [
+    "src",
+    "prelude.d.ts"
+  ],
+  "typescript": {
+    "contentMapper": {
+      "exec": [
+        "node",
+        "--no-warnings",
+        "src/server.ts"
+      ],
+      "compilerOptions": [],
+      "dynamicConfig": true
+    }
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "devDependencies": {
+    "typescript": "7.1.0-beta"
+  }
+}

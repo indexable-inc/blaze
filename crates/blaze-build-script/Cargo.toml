@@ -1,0 +1,30 @@
+[package]
+name = "blaze-build-script"
+description = "Build scripts run as cargo runs them: the environment cargo 1.99 gives a script, what it prints read as cargo reads it, and who receives what"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-hash.workspace = true
+blaze-mem.workspace = true
+blaze-serde.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+
+[lints]
+workspace = true

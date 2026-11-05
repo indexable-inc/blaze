@@ -1,0 +1,6 @@
+// Flecs rejects an unknown tag.
+site {
+  tagged : Doc {
+    Ull list {}
+  }
+}

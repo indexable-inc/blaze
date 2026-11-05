@@ -1,0 +1,30 @@
+# Ubuntu packages for a job, with the .deb files kept in the Actions cache per runner image.
+# The runners' Ubuntu mirror sometimes serves at a few tens of kB/s: valgrind and gdb (27 MB)
+# once took 11 minutes, longer than the harness they are for. Only main writes the cache.
+name: apt
+description: apt-get install, with the downloaded packages cached per runner image
+inputs:
+  packages:
+    description: the packages, space separated
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: echo "key=apt-$ImageOS-$ImageVersion-$RUNNER_ARCH-$(echo '${{ inputs.packages }}' | tr ' ' '+')" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/apt-archives
+        key: ${{ steps.key.outputs.key }}
+    - shell: bash
+      run: |
+        mkdir -p ~/apt-archives/partial
+        sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true ${{ inputs.packages }}
+        sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
+    - if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/apt-archives
+        key: ${{ steps.key.outputs.key }}

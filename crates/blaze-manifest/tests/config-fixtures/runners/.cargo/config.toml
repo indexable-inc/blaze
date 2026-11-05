@@ -1,0 +1,7 @@
+[target.aarch64-apple-darwin]
+runner = ["outer", "-x"]
+[target.x86_64-unknown-linux-gnu]
+runner = "outer-str"
+rustflags = ["-Couter"]
+[registry]
+credential-provider = ["cargo:token"]

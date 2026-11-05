@@ -1,0 +1,11 @@
+[package]
+name = "merkle-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8"
+sha1_smol = "1"
+
+[profile.release]
+debug = false

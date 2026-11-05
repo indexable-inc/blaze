@@ -1,0 +1,2 @@
+[ perf record: Woken up 56 times to write data ]
+[ perf record: Captured and wrote 14.406 MB /root/perf/noopperf2/noopfix/perf.data (89048 samples) ]

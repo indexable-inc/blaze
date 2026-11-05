@@ -1,0 +1,1264 @@
+{
+ "bat": {
+  "polonius": {
+   "bodies": 576,
+   "infer_ms": 2982.631,
+   "infer_warm_ms": 284.998,
+   "first_check_ms": 550.423,
+   "borrowck_ms": 255.327,
+   "borrowck_excl_mir_ms": 255.193,
+   "ratio_to_infer": 0.8954203187390789,
+   "per_body_us": {
+    "p50": 106,
+    "p99": 3725,
+    "max": 66175
+   },
+   "phases_ms": {
+    "constraints": 100.126,
+    "entry_sets": 2.846,
+    "errors": 0.813,
+    "infer": 3.389,
+    "liveness": 51.857,
+    "loans": 2.508,
+    "mir": 0.134,
+    "moves": 33.881,
+    "scopes": 4.982,
+    "setup": 0.538,
+    "walk": 46.338
+   },
+   "slowest": [
+    {
+     "name": "bat::syntax_mapping::builtin::BUILTIN_MAPPINGS",
+     "path": "/root/bp/apps/bat/src/syntax_mapping/builtin.rs",
+     "us": 66175,
+     "infer_us": 7606,
+     "phases_us": {
+      "constraints": 8741,
+      "entry_sets": 9,
+      "errors": 81,
+      "infer": 191,
+      "liveness": 22148,
+      "loans": 455,
+      "mir": 25,
+      "moves": 4144,
+      "scopes": 181,
+      "setup": 133,
+      "walk": 29358
+     },
+     "counts": {
+      "blocks": 8548,
+      "bodies": 123,
+      "constraints": 1487,
+      "loans": 0,
+      "localized": 1487,
+      "locals": 1607,
+      "points": 12513,
+      "regions": 2209,
+      "universals": 368
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'_>>::print_line",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 9689,
+     "infer_us": 11049,
+     "phases_us": {
+      "constraints": 4111,
+      "entry_sets": 218,
+      "errors": 34,
+      "infer": 179,
+      "liveness": 2015,
+      "loans": 132,
+      "mir": 3,
+      "moves": 1217,
+      "scopes": 535,
+      "setup": 13,
+      "walk": 1088
+     },
+     "counts": {
+      "blocks": 946,
+      "bodies": 5,
+      "constraints": 1419,
+      "loans": 117,
+      "localized": 1419,
+      "locals": 818,
+      "points": 3678,
+      "regions": 1306,
+      "universals": 29
+     }
+    },
+    {
+     "name": "bat::app::<App>::config",
+     "path": "/root/bp/apps/bat/src/bin/bat/app.rs",
+     "us": 8203,
+     "infer_us": 16793,
+     "phases_us": {
+      "constraints": 4505,
+      "entry_sets": 105,
+      "errors": 35,
+      "infer": 120,
+      "liveness": 1360,
+      "loans": 79,
+      "mir": 5,
+      "moves": 1033,
+      "scopes": 100,
+      "setup": 23,
+      "walk": 686
+     },
+     "counts": {
+      "blocks": 671,
+      "bodies": 25,
+      "constraints": 1173,
+      "loans": 35,
+      "localized": 1171,
+      "locals": 648,
+      "points": 2440,
+      "regions": 1265,
+      "universals": 92
+     }
+    },
+    {
+     "name": "bat::clap_app::build_app",
+     "path": "/root/bp/apps/bat/src/bin/bat/clap_app.rs",
+     "us": 7761,
+     "infer_us": 23152,
+     "phases_us": {
+      "constraints": 3587,
+      "entry_sets": 123,
+      "errors": 20,
+      "infer": 124,
+      "liveness": 1055,
+      "loans": 38,
+      "mir": 4,
+      "moves": 926,
+      "scopes": 81,
+      "setup": 17,
+      "walk": 1651
+     },
+     "counts": {
+      "blocks": 1111,
+      "bodies": 16,
+      "constraints": 1037,
+      "loans": 15,
+      "localized": 1027,
+      "locals": 717,
+      "points": 2667,
+      "regions": 1301,
+      "universals": 58
+     }
+    },
+    {
+     "name": "bat::get_languages",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 3990,
+     "infer_us": 6031,
+     "phases_us": {
+      "constraints": 2085,
+      "entry_sets": 61,
+      "errors": 15,
+      "infer": 59,
+      "liveness": 646,
+      "loans": 41,
+      "mir": 1,
+      "moves": 568,
+      "scopes": 115,
+      "setup": 9,
+      "walk": 322
+     },
+     "counts": {
+      "blocks": 324,
+      "bodies": 5,
+      "constraints": 556,
+      "loans": 46,
+      "localized": 556,
+      "locals": 300,
+      "points": 1187,
+      "regions": 572,
+      "universals": 40
+     }
+    },
+    {
+     "name": "bat::run",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 3725,
+     "infer_us": 3462,
+     "phases_us": {
+      "constraints": 1520,
+      "entry_sets": 95,
+      "errors": 11,
+      "infer": 54,
+      "liveness": 724,
+      "loans": 43,
+      "mir": 0,
+      "moves": 497,
+      "scopes": 158,
+      "setup": 4,
+      "walk": 559
+     },
+     "counts": {
+      "blocks": 471,
+      "bodies": 1,
+      "constraints": 497,
+      "loans": 44,
+      "localized": 495,
+      "locals": 335,
+      "points": 1584,
+      "regions": 565,
+      "universals": 2
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'_>>::print_header",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 3622,
+     "infer_us": 7408,
+     "phases_us": {
+      "constraints": 1748,
+      "entry_sets": 54,
+      "errors": 14,
+      "infer": 57,
+      "liveness": 513,
+      "loans": 48,
+      "mir": 2,
+      "moves": 562,
+      "scopes": 71,
+      "setup": 10,
+      "walk": 468
+     },
+     "counts": {
+      "blocks": 383,
+      "bodies": 9,
+      "constraints": 583,
+      "loans": 39,
+      "localized": 583,
+      "locals": 322,
+      "points": 1350,
+      "regions": 570,
+      "universals": 52
+     }
+    },
+    {
+     "name": "bat::list_themes",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 3284,
+     "infer_us": 2706,
+     "phases_us": {
+      "constraints": 1198,
+      "entry_sets": 64,
+      "errors": 12,
+      "infer": 42,
+      "liveness": 705,
+      "loans": 35,
+      "mir": 0,
+      "moves": 502,
+      "scopes": 156,
+      "setup": 3,
+      "walk": 516
+     },
+     "counts": {
+      "blocks": 354,
+      "bodies": 1,
+      "constraints": 391,
+      "loans": 39,
+      "localized": 391,
+      "locals": 237,
+      "points": 1156,
+      "regions": 406,
+      "universals": 6
+     }
+    },
+    {
+     "name": "bat::line_range::<LineRange>::parse_range",
+     "path": "/root/bp/apps/bat/src/line_range.rs",
+     "us": 3264,
+     "infer_us": 6467,
+     "phases_us": {
+      "constraints": 1937,
+      "entry_sets": 49,
+      "errors": 12,
+      "infer": 38,
+      "liveness": 506,
+      "loans": 40,
+      "mir": 2,
+      "moves": 366,
+      "scopes": 37,
+      "setup": 6,
+      "walk": 202
+     },
+     "counts": {
+      "blocks": 362,
+      "bodies": 8,
+      "constraints": 387,
+      "loans": 24,
+      "localized": 385,
+      "locals": 351,
+      "points": 1527,
+      "regions": 401,
+      "universals": 24
+     }
+    },
+    {
+     "name": "bat::app::<App>::inputs",
+     "path": "/root/bp/apps/bat/src/bin/bat/app.rs",
+     "us": 3000,
+     "infer_us": 5691,
+     "phases_us": {
+      "constraints": 2039,
+      "entry_sets": 24,
+      "errors": 12,
+      "infer": 50,
+      "liveness": 227,
+      "loans": 19,
+      "mir": 2,
+      "moves": 310,
+      "scopes": 49,
+      "setup": 6,
+      "walk": 216
+     },
+     "counts": {
+      "blocks": 169,
+      "bodies": 8,
+      "constraints": 531,
+      "loans": 14,
+      "localized": 519,
+      "locals": 138,
+      "points": 517,
+      "regions": 478,
+      "universals": 35
+     }
+    },
+    {
+     "name": "bat::input::<Input<'a>>::open",
+     "path": "/root/bp/apps/bat/src/input.rs",
+     "us": 2719,
+     "infer_us": 3782,
+     "phases_us": {
+      "constraints": 1371,
+      "entry_sets": 45,
+      "errors": 10,
+      "infer": 27,
+      "liveness": 482,
+      "loans": 21,
+      "mir": 1,
+      "moves": 488,
+      "scopes": 39,
+      "setup": 5,
+      "walk": 179
+     },
+     "counts": {
+      "blocks": 364,
+      "bodies": 4,
+      "constraints": 271,
+      "loans": 21,
+      "localized": 271,
+      "locals": 220,
+      "points": 1027,
+      "regions": 299,
+      "universals": 15
+     }
+    },
+    {
+     "name": "bat::controller::<Controller<'_>>::run_with_error_handler",
+     "path": "/root/bp/apps/bat/src/controller.rs",
+     "us": 2619,
+     "infer_us": 2246,
+     "phases_us": {
+      "constraints": 1082,
+      "entry_sets": 51,
+      "errors": 9,
+      "infer": 35,
+      "liveness": 500,
+      "loans": 31,
+      "mir": 1,
+      "moves": 401,
+      "scopes": 226,
+      "setup": 3,
+      "walk": 237
+     },
+     "counts": {
+      "blocks": 284,
+      "bodies": 2,
+      "constraints": 342,
+      "loans": 32,
+      "localized": 342,
+      "locals": 155,
+      "points": 797,
+      "regions": 286,
+      "universals": 12
+     }
+    },
+    {
+     "name": "bat::diff::get_git_diff",
+     "path": "/root/bp/apps/bat/src/diff.rs",
+     "us": 2598,
+     "infer_us": 2077,
+     "phases_us": {
+      "constraints": 1139,
+      "entry_sets": 37,
+      "errors": 7,
+      "infer": 17,
+      "liveness": 628,
+      "loans": 21,
+      "mir": 0,
+      "moves": 340,
+      "scopes": 48,
+      "setup": 2,
+      "walk": 324
+     },
+     "counts": {
+      "blocks": 251,
+      "bodies": 1,
+      "constraints": 140,
+      "loans": 22,
+      "localized": 140,
+      "locals": 161,
+      "points": 781,
+      "regions": 158,
+      "universals": 3
+     }
+    },
+    {
+     "name": "snapshot_tests::tester::create_sample_directory",
+     "path": "/root/bp/apps/bat/tests/tester/mod.rs",
+     "us": 2368,
+     "infer_us": 1862,
+     "phases_us": {
+      "constraints": 1134,
+      "entry_sets": 29,
+      "errors": 6,
+      "infer": 18,
+      "liveness": 496,
+      "loans": 17,
+      "mir": 0,
+      "moves": 302,
+      "scopes": 71,
+      "setup": 2,
+      "walk": 259
+     },
+     "counts": {
+      "blocks": 196,
+      "bodies": 1,
+      "constraints": 165,
+      "loans": 12,
+      "localized": 165,
+      "locals": 124,
+      "points": 579,
+      "regions": 189,
+      "universals": 2
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'a>>::new",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 2275,
+     "infer_us": 3398,
+     "phases_us": {
+      "constraints": 1110,
+      "entry_sets": 33,
+      "errors": 11,
+      "infer": 33,
+      "liveness": 377,
+      "loans": 29,
+      "mir": 1,
+      "moves": 388,
+      "scopes": 35,
+      "setup": 6,
+      "walk": 202
+     },
+     "counts": {
+      "blocks": 245,
+      "bodies": 6,
+      "constraints": 378,
+      "loans": 13,
+      "localized": 376,
+      "locals": 201,
+      "points": 824,
+      "regions": 356,
+      "universals": 33
+     }
+    },
+    {
+     "name": "build_script_main::application::gen_man_and_comp",
+     "path": "/root/bp/apps/bat/build/application.rs",
+     "us": 2074,
+     "infer_us": 2541,
+     "phases_us": {
+      "constraints": 1092,
+      "entry_sets": 43,
+      "errors": 7,
+      "infer": 35,
+      "liveness": 347,
+      "loans": 19,
+      "mir": 1,
+      "moves": 321,
+      "scopes": 44,
+      "setup": 3,
+      "walk": 117
+     },
+     "counts": {
+      "blocks": 269,
+      "bodies": 2,
+      "constraints": 350,
+      "loans": 30,
+      "localized": 350,
+      "locals": 247,
+      "points": 1000,
+      "regions": 444,
+      "universals": 4
+     }
+    },
+    {
+     "name": "bat::assets::<HighlightingAssets>::get_syntax",
+     "path": "/root/bp/apps/bat/src/assets.rs",
+     "us": 1928,
+     "infer_us": 2888,
+     "phases_us": {
+      "constraints": 880,
+      "entry_sets": 23,
+      "errors": 11,
+      "infer": 26,
+      "liveness": 293,
+      "loans": 18,
+      "mir": 2,
+      "moves": 360,
+      "scopes": 26,
+      "setup": 9,
+      "walk": 232
+     },
+     "counts": {
+      "blocks": 214,
+      "bodies": 8,
+      "constraints": 238,
+      "loans": 8,
+      "localized": 238,
+      "locals": 144,
+      "points": 622,
+      "regions": 248,
+      "universals": 36
+     }
+    },
+    {
+     "name": "bat::output::<OutputType>::try_pager",
+     "path": "/root/bp/apps/bat/src/output.rs",
+     "us": 1903,
+     "infer_us": 2361,
+     "phases_us": {
+      "constraints": 898,
+      "entry_sets": 50,
+      "errors": 8,
+      "infer": 28,
+      "liveness": 347,
+      "loans": 34,
+      "mir": 1,
+      "moves": 307,
+      "scopes": 41,
+      "setup": 6,
+      "walk": 141
+     },
+     "counts": {
+      "blocks": 224,
+      "bodies": 3,
+      "constraints": 250,
+      "loans": 34,
+      "localized": 250,
+      "locals": 197,
+      "points": 799,
+      "regions": 318,
+      "universals": 9
+     }
+    },
+    {
+     "name": "bat::controller::<Controller<'_>>::print_file_ranges",
+     "path": "/root/bp/apps/bat/src/controller.rs",
+     "us": 1790,
+     "infer_us": 1597,
+     "phases_us": {
+      "constraints": 752,
+      "entry_sets": 35,
+      "errors": 8,
+      "infer": 15,
+      "liveness": 337,
+      "loans": 39,
+      "mir": 1,
+      "moves": 309,
+      "scopes": 26,
+      "setup": 4,
+      "walk": 226
+     },
+     "counts": {
+      "blocks": 229,
+      "bodies": 3,
+      "constraints": 150,
+      "loans": 25,
+      "localized": 150,
+      "locals": 178,
+      "points": 832,
+      "regions": 153,
+      "universals": 18
+     }
+    },
+    {
+     "name": "build_script_main::syntax_mapping::parse_glob",
+     "path": "/root/bp/apps/bat/build/syntax_mapping.rs",
+     "us": 1679,
+     "infer_us": 3591,
+     "phases_us": {
+      "constraints": 957,
+      "entry_sets": 21,
+      "errors": 7,
+      "infer": 29,
+      "liveness": 216,
+      "loans": 19,
+      "mir": 2,
+      "moves": 271,
+      "scopes": 34,
+      "setup": 4,
+      "walk": 83
+     },
+     "counts": {
+      "blocks": 130,
+      "bodies": 5,
+      "constraints": 271,
+      "loans": 23,
+      "localized": 271,
+      "locals": 168,
+      "points": 559,
+      "regions": 290,
+      "universals": 18
+     }
+    }
+   ],
+   "secs": 11
+  },
+  "nll": {
+   "bodies": 576,
+   "infer_ms": 2982.631,
+   "infer_warm_ms": 284.998,
+   "first_check_ms": 550.423,
+   "borrowck_ms": 236.473,
+   "borrowck_excl_mir_ms": 236.402,
+   "ratio_to_infer": 0.82948652271244,
+   "per_body_us": {
+    "p50": 89,
+    "p99": 3500,
+    "max": 64764
+   },
+   "phases_ms": {
+    "constraints": 94.082,
+    "entry_sets": 2.779,
+    "errors": 0.763,
+    "infer": 3.278,
+    "liveness": 48.843,
+    "loans": 2.303,
+    "mir": 0.071,
+    "moves": 30.839,
+    "scopes": 0.372,
+    "setup": 0.438,
+    "walk": 45.65
+   },
+   "slowest": [
+    {
+     "name": "bat::syntax_mapping::builtin::BUILTIN_MAPPINGS",
+     "path": "/root/bp/apps/bat/src/syntax_mapping/builtin.rs",
+     "us": 64764,
+     "infer_us": 7606,
+     "phases_us": {
+      "constraints": 8675,
+      "entry_sets": 9,
+      "errors": 78,
+      "infer": 192,
+      "liveness": 21232,
+      "loans": 458,
+      "mir": 27,
+      "moves": 3987,
+      "scopes": 5,
+      "setup": 125,
+      "walk": 29301
+     },
+     "counts": {
+      "blocks": 8548,
+      "bodies": 123,
+      "constraints": 1487,
+      "loans": 0,
+      "localized": 1487,
+      "locals": 1607,
+      "points": 12513,
+      "regions": 2209,
+      "universals": 368
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'_>>::print_line",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 9184,
+     "infer_us": 11049,
+     "phases_us": {
+      "constraints": 4191,
+      "entry_sets": 216,
+      "errors": 34,
+      "infer": 179,
+      "liveness": 1985,
+      "loans": 120,
+      "mir": 3,
+      "moves": 1166,
+      "scopes": 39,
+      "setup": 15,
+      "walk": 1090
+     },
+     "counts": {
+      "blocks": 946,
+      "bodies": 5,
+      "constraints": 1419,
+      "loans": 117,
+      "localized": 1419,
+      "locals": 818,
+      "points": 3678,
+      "regions": 1306,
+      "universals": 29
+     }
+    },
+    {
+     "name": "bat::app::<App>::config",
+     "path": "/root/bp/apps/bat/src/bin/bat/app.rs",
+     "us": 7894,
+     "infer_us": 16793,
+     "phases_us": {
+      "constraints": 4399,
+      "entry_sets": 107,
+      "errors": 36,
+      "infer": 121,
+      "liveness": 1273,
+      "loans": 76,
+      "mir": 4,
+      "moves": 1019,
+      "scopes": 5,
+      "setup": 23,
+      "walk": 684
+     },
+     "counts": {
+      "blocks": 671,
+      "bodies": 25,
+      "constraints": 1173,
+      "loans": 35,
+      "localized": 1171,
+      "locals": 648,
+      "points": 2440,
+      "regions": 1265,
+      "universals": 92
+     }
+    },
+    {
+     "name": "bat::clap_app::build_app",
+     "path": "/root/bp/apps/bat/src/bin/bat/clap_app.rs",
+     "us": 7470,
+     "infer_us": 23152,
+     "phases_us": {
+      "constraints": 3478,
+      "entry_sets": 123,
+      "errors": 20,
+      "infer": 101,
+      "liveness": 964,
+      "loans": 36,
+      "mir": 4,
+      "moves": 890,
+      "scopes": 2,
+      "setup": 17,
+      "walk": 1673
+     },
+     "counts": {
+      "blocks": 1111,
+      "bodies": 16,
+      "constraints": 1037,
+      "loans": 15,
+      "localized": 1027,
+      "locals": 717,
+      "points": 2667,
+      "regions": 1301,
+      "universals": 58
+     }
+    },
+    {
+     "name": "bat::get_languages",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 3866,
+     "infer_us": 6031,
+     "phases_us": {
+      "constraints": 2085,
+      "entry_sets": 59,
+      "errors": 14,
+      "infer": 65,
+      "liveness": 644,
+      "loans": 41,
+      "mir": 1,
+      "moves": 560,
+      "scopes": 10,
+      "setup": 10,
+      "walk": 317
+     },
+     "counts": {
+      "blocks": 324,
+      "bodies": 5,
+      "constraints": 556,
+      "loans": 46,
+      "localized": 556,
+      "locals": 300,
+      "points": 1187,
+      "regions": 572,
+      "universals": 40
+     }
+    },
+    {
+     "name": "bat::run",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 3500,
+     "infer_us": 3462,
+     "phases_us": {
+      "constraints": 1476,
+      "entry_sets": 86,
+      "errors": 11,
+      "infer": 53,
+      "liveness": 730,
+      "loans": 43,
+      "mir": 0,
+      "moves": 473,
+      "scopes": 15,
+      "setup": 4,
+      "walk": 553
+     },
+     "counts": {
+      "blocks": 471,
+      "bodies": 1,
+      "constraints": 497,
+      "loans": 44,
+      "localized": 495,
+      "locals": 335,
+      "points": 1584,
+      "regions": 565,
+      "universals": 2
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'_>>::print_header",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 3444,
+     "infer_us": 7408,
+     "phases_us": {
+      "constraints": 1662,
+      "entry_sets": 54,
+      "errors": 14,
+      "infer": 56,
+      "liveness": 544,
+      "loans": 47,
+      "mir": 2,
+      "moves": 526,
+      "scopes": 6,
+      "setup": 10,
+      "walk": 453
+     },
+     "counts": {
+      "blocks": 383,
+      "bodies": 9,
+      "constraints": 583,
+      "loans": 39,
+      "localized": 583,
+      "locals": 322,
+      "points": 1350,
+      "regions": 570,
+      "universals": 52
+     }
+    },
+    {
+     "name": "bat::line_range::<LineRange>::parse_range",
+     "path": "/root/bp/apps/bat/src/line_range.rs",
+     "us": 3091,
+     "infer_us": 6467,
+     "phases_us": {
+      "constraints": 1889,
+      "entry_sets": 47,
+      "errors": 12,
+      "infer": 37,
+      "liveness": 445,
+      "loans": 39,
+      "mir": 2,
+      "moves": 343,
+      "scopes": 2,
+      "setup": 6,
+      "walk": 197
+     },
+     "counts": {
+      "blocks": 362,
+      "bodies": 8,
+      "constraints": 387,
+      "loans": 24,
+      "localized": 385,
+      "locals": 351,
+      "points": 1527,
+      "regions": 401,
+      "universals": 24
+     }
+    },
+    {
+     "name": "bat::list_themes",
+     "path": "/root/bp/apps/bat/src/bin/bat/main.rs",
+     "us": 2997,
+     "infer_us": 2706,
+     "phases_us": {
+      "constraints": 1145,
+      "entry_sets": 61,
+      "errors": 11,
+      "infer": 40,
+      "liveness": 688,
+      "loans": 34,
+      "mir": 0,
+      "moves": 445,
+      "scopes": 12,
+      "setup": 3,
+      "walk": 513
+     },
+     "counts": {
+      "blocks": 354,
+      "bodies": 1,
+      "constraints": 391,
+      "loans": 39,
+      "localized": 391,
+      "locals": 237,
+      "points": 1156,
+      "regions": 406,
+      "universals": 6
+     }
+    },
+    {
+     "name": "bat::app::<App>::inputs",
+     "path": "/root/bp/apps/bat/src/bin/bat/app.rs",
+     "us": 2938,
+     "infer_us": 5691,
+     "phases_us": {
+      "constraints": 2041,
+      "entry_sets": 23,
+      "errors": 12,
+      "infer": 49,
+      "liveness": 217,
+      "loans": 18,
+      "mir": 2,
+      "moves": 310,
+      "scopes": 3,
+      "setup": 6,
+      "walk": 217
+     },
+     "counts": {
+      "blocks": 169,
+      "bodies": 8,
+      "constraints": 531,
+      "loans": 14,
+      "localized": 519,
+      "locals": 138,
+      "points": 517,
+      "regions": 478,
+      "universals": 35
+     }
+    },
+    {
+     "name": "bat::input::<Input<'a>>::open",
+     "path": "/root/bp/apps/bat/src/input.rs",
+     "us": 2553,
+     "infer_us": 3782,
+     "phases_us": {
+      "constraints": 1301,
+      "entry_sets": 44,
+      "errors": 9,
+      "infer": 26,
+      "liveness": 465,
+      "loans": 19,
+      "mir": 1,
+      "moves": 467,
+      "scopes": 3,
+      "setup": 6,
+      "walk": 163
+     },
+     "counts": {
+      "blocks": 364,
+      "bodies": 4,
+      "constraints": 271,
+      "loans": 21,
+      "localized": 271,
+      "locals": 220,
+      "points": 1027,
+      "regions": 299,
+      "universals": 15
+     }
+    },
+    {
+     "name": "bat::diff::get_git_diff",
+     "path": "/root/bp/apps/bat/src/diff.rs",
+     "us": 2418,
+     "infer_us": 2077,
+     "phases_us": {
+      "constraints": 1104,
+      "entry_sets": 34,
+      "errors": 6,
+      "infer": 16,
+      "liveness": 594,
+      "loans": 20,
+      "mir": 0,
+      "moves": 289,
+      "scopes": 8,
+      "setup": 3,
+      "walk": 310
+     },
+     "counts": {
+      "blocks": 251,
+      "bodies": 1,
+      "constraints": 140,
+      "loans": 22,
+      "localized": 140,
+      "locals": 161,
+      "points": 781,
+      "regions": 158,
+      "universals": 3
+     }
+    },
+    {
+     "name": "bat::controller::<Controller<'_>>::run_with_error_handler",
+     "path": "/root/bp/apps/bat/src/controller.rs",
+     "us": 2291,
+     "infer_us": 2246,
+     "phases_us": {
+      "constraints": 1025,
+      "entry_sets": 39,
+      "errors": 9,
+      "infer": 34,
+      "liveness": 510,
+      "loans": 30,
+      "mir": 1,
+      "moves": 358,
+      "scopes": 15,
+      "setup": 3,
+      "walk": 228
+     },
+     "counts": {
+      "blocks": 284,
+      "bodies": 2,
+      "constraints": 342,
+      "loans": 32,
+      "localized": 342,
+      "locals": 155,
+      "points": 797,
+      "regions": 286,
+      "universals": 12
+     }
+    },
+    {
+     "name": "snapshot_tests::tester::create_sample_directory",
+     "path": "/root/bp/apps/bat/tests/tester/mod.rs",
+     "us": 2155,
+     "infer_us": 1862,
+     "phases_us": {
+      "constraints": 1076,
+      "entry_sets": 37,
+      "errors": 5,
+      "infer": 17,
+      "liveness": 468,
+      "loans": 16,
+      "mir": 0,
+      "moves": 257,
+      "scopes": 5,
+      "setup": 3,
+      "walk": 239
+     },
+     "counts": {
+      "blocks": 196,
+      "bodies": 1,
+      "constraints": 165,
+      "loans": 12,
+      "localized": 165,
+      "locals": 124,
+      "points": 579,
+      "regions": 189,
+      "universals": 2
+     }
+    },
+    {
+     "name": "bat::printer::<InteractivePrinter<'a>>::new",
+     "path": "/root/bp/apps/bat/src/printer.rs",
+     "us": 2150,
+     "infer_us": 3398,
+     "phases_us": {
+      "constraints": 1065,
+      "entry_sets": 42,
+      "errors": 11,
+      "infer": 52,
+      "liveness": 338,
+      "loans": 29,
+      "mir": 1,
+      "moves": 371,
+      "scopes": 2,
+      "setup": 7,
+      "walk": 188
+     },
+     "counts": {
+      "blocks": 245,
+      "bodies": 6,
+      "constraints": 378,
+      "loans": 13,
+      "localized": 376,
+      "locals": 201,
+      "points": 824,
+      "regions": 356,
+      "universals": 33
+     }
+    },
+    {
+     "name": "build_script_main::application::gen_man_and_comp",
+     "path": "/root/bp/apps/bat/build/application.rs",
+     "us": 1886,
+     "infer_us": 2541,
+     "phases_us": {
+      "constraints": 1044,
+      "entry_sets": 42,
+      "errors": 8,
+      "infer": 34,
+      "liveness": 281,
+      "loans": 17,
+      "mir": 1,
+      "moves": 263,
+      "scopes": 4,
+      "setup": 3,
+      "walk": 150
+     },
+     "counts": {
+      "blocks": 269,
+      "bodies": 2,
+      "constraints": 350,
+      "loans": 30,
+      "localized": 350,
+      "locals": 247,
+      "points": 1000,
+      "regions": 444,
+      "universals": 4
+     }
+    },
+    {
+     "name": "bat::output::<OutputType>::try_pager",
+     "path": "/root/bp/apps/bat/src/output.rs",
+     "us": 1805,
+     "infer_us": 2361,
+     "phases_us": {
+      "constraints": 873,
+      "entry_sets": 40,
+      "errors": 8,
+      "infer": 27,
+      "liveness": 339,
+      "loans": 33,
+      "mir": 1,
+      "moves": 298,
+      "scopes": 5,
+      "setup": 6,
+      "walk": 134
+     },
+     "counts": {
+      "blocks": 224,
+      "bodies": 3,
+      "constraints": 250,
+      "loans": 34,
+      "localized": 250,
+      "locals": 197,
+      "points": 799,
+      "regions": 318,
+      "universals": 9
+     }
+    },
+    {
+     "name": "bat::assets::<HighlightingAssets>::get_syntax",
+     "path": "/root/bp/apps/bat/src/assets.rs",
+     "us": 1764,
+     "infer_us": 2888,
+     "phases_us": {
+      "constraints": 810,
+      "entry_sets": 21,
+      "errors": 10,
+      "infer": 61,
+      "liveness": 263,
+      "loans": 18,
+      "mir": 2,
+      "moves": 301,
+      "scopes": 2,
+      "setup": 6,
+      "walk": 230
+     },
+     "counts": {
+      "blocks": 214,
+      "bodies": 8,
+      "constraints": 238,
+      "loans": 8,
+      "localized": 238,
+      "locals": 144,
+      "points": 622,
+      "regions": 248,
+      "universals": 36
+     }
+    },
+    {
+     "name": "bat::controller::<Controller<'_>>::print_file_ranges",
+     "path": "/root/bp/apps/bat/src/controller.rs",
+     "us": 1626,
+     "infer_us": 1597,
+     "phases_us": {
+      "constraints": 711,
+      "entry_sets": 34,
+      "errors": 7,
+      "infer": 15,
+      "liveness": 325,
+      "loans": 24,
+      "mir": 1,
+      "moves": 247,
+      "scopes": 2,
+      "setup": 4,
+      "walk": 221
+     },
+     "counts": {
+      "blocks": 229,
+      "bodies": 3,
+      "constraints": 150,
+      "loans": 25,
+      "localized": 150,
+      "locals": 178,
+      "points": 832,
+      "regions": 153,
+      "universals": 18
+     }
+    },
+    {
+     "name": "build_script_main::syntax_mapping::parse_glob",
+     "path": "/root/bp/apps/bat/build/syntax_mapping.rs",
+     "us": 1582,
+     "infer_us": 3591,
+     "phases_us": {
+      "constraints": 894,
+      "entry_sets": 20,
+      "errors": 6,
+      "infer": 28,
+      "liveness": 239,
+      "loans": 27,
+      "mir": 1,
+      "moves": 241,
+      "scopes": 4,
+      "setup": 4,
+      "walk": 83
+     },
+     "counts": {
+      "blocks": 130,
+      "bodies": 5,
+      "constraints": 271,
+      "loans": 23,
+      "localized": 271,
+      "locals": 168,
+      "points": 559,
+      "regions": 290,
+      "universals": 18
+     }
+    }
+   ],
+   "secs": 11
+  }
+ }
+}

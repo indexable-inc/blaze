@@ -1,0 +1,71 @@
+// Background and Overlay: children laid out to their parent's whole frame, out of its flow, drawn behind and in front.
+// SafeAreaInset and SafeAreaPadding: a small window whose top 26 points are a title strip; its content pads itself out
+// of the strip (its frame still reaches under it, as the band behind shows).
+
+@tree ChildOf
+ex {
+  prefab ComposeDemo : ex.Card {
+    label : ui.Label { Text: {s: "BACKGROUND, OVERLAY"} }
+    tag : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      Padding: {l: 10, r: 12, t: 6, b: 6}
+      background : ex.Plate { Background }
+      icon : ui.Symbol, Accent { Icon: {glyph: "✓"} }
+      words : ui.Words { Text: {s: "background ex.Plate"} }
+    }
+    ring : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      Padding: {l: 10, r: 12, t: 6, b: 6}
+      words : ui.Words { Text: {s: "overlay ex.Outline"} }
+      overlay : ex.Outline { Overlay }
+    }
+  }
+
+  prefab SafeAreaDemo : ex.Card {
+    label : ui.Label { Text: {s: "SAFEAREAINSET T 26, SAFEAREAPADDING"} }
+    window : ui.Column {
+      SafeAreaInset: {l: 0, r: 0, t: 26, b: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 96, min: 0, max: 0}}
+      Fill: $tone_wash
+      Shape: {radius: 8, n: 4, border: 0, feather: 0}
+      // The title strip, drawn behind: a band as tall as the inset.
+      strip : ui.Column {
+        Background
+        band : ex.Plate {
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+          title : ui.Label { Text: {s: "  title bar"}; Padding: {l: 8, r: 0, t: 6, b: 0} }
+        }
+      }
+      content : ui.Column {
+        SafeAreaPadding: {l: false, r: false, t: true, b: false}
+        Padding: {l: 10, r: 10, t: 6, b: 0}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        one : ui.Words { Text: {s: "Content starts under the strip"} }
+        two : ui.Words, Muted { Text: {s: "with no hardcoded top padding."} }
+      }
+    }
+  }
+
+  // ViewThatFits: the same three variants (wide, medium, an icon) in 250, 130 and 34 points.
+  prefab Fits : ui.ViewThatFits {
+    Size: {w: {kind: Fixed, value: 250, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    wide : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      icon : ui.Symbol, Accent { Icon: {glyph: "◆"} }
+      words : ui.Words { Text: {s: "Wide icon, title and detail"} }
+    }
+    medium : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      icon : ui.Symbol, Accent { Icon: {glyph: "◆"} }
+      words : ui.Words { Text: {s: "Medium title"} }
+    }
+    narrow : ui.Symbol, Accent { Icon: {glyph: "◆"} }
+  }
+
+  prefab FitsDemo : ex.Card {
+    label : ui.Label { Text: {s: "VIEWTHATFITS IN 250, 130, 34"} }
+    w300 : ex.Fits { overlay : ex.Outline { Overlay } }
+    w150 : ex.Fits { Size: {w: {kind: Fixed, value: 130, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}; overlay : ex.Outline { Overlay } }
+    w40 : ex.Fits { Size: {w: {kind: Fixed, value: 34, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}; overlay : ex.Outline { Overlay } }
+  }
+}

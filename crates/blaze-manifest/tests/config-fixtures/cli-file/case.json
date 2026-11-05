@@ -1,0 +1,3 @@
+{
+ "runs": [["--config", "conf/cli.toml", "build", "--show-origin"], ["--config", "conf/cli.toml", "--merged", "no"], ["--config", "conf/missing.toml"], ["--config", "conf/cli.toml", "--config", "build.jobs=9", "build", "--show-origin"], ["--config", "include=\"conf/inc.toml\"", "build", "--show-origin"]]
+}

@@ -1,0 +1,90 @@
+{
+ "project": "ripgrep",
+ "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+ "status": 0,
+ "seconds": 3.65,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.100",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.177",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "pcre2-sys",
+   "version": "0.2.10",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.101",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "quote",
+   "version": "1.0.41",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "ripgrep",
+   "version": "15.1.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.228",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_core",
+   "version": "1.0.228",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.145",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

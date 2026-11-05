@@ -1,0 +1,9 @@
+stat of every file (one polling pass), page cache warm: 1.78 ms
+read of every file, page cache warm, one thread: 24.52 ms
+files 2240 bytes 15131649 max depth 8
+whole tree, blake3, one thread: 9.83 ms
+whole tree, git blob sha1 (blobs only), one thread: 14.23 ms
+transaction of 3 files, 233099 bytes: 130.9 us (median of 2001)
+  of which hashing the file bytes: 106.2 us
+diff of the two roots: 10.7 us, 225 nodes visited, changed ["crates/nu-command/src/filters/each.rs", "crates/nu-protocol/src/value/mod.rs", "src/main.rs"]
+blake3 64 MiB one thread: 2.0 GiB/s

@@ -1,0 +1,59 @@
+(SOURCE_FILE, 0..671): metas []; kept [], stopped false
+(MACRO_RULES, 1..59): metas [(3..22, 1..23)]; kept [(3..22, 1..23)], stopped false
+(MACRO_RULES, 60..113): metas [(62..81, 60..82)]; kept [(62..81, 60..82)], stopped false
+(MACRO_RULES, 114..169): metas [(116..135, 114..136)]; kept [(116..135, 114..136)], stopped false
+(STRUCT, 171..317): metas [(215..228, 197..248), (230..246, 197..248), (251..258, 249..259), (262..274, 260..275)]; kept [(215..228, 197..248)], stopped false
+  attribute 0: 197..248, meta 215..228, with its source 215..228
+(LITERAL, 268..274): metas []; kept [], stopped false
+(RECORD_FIELD, 291..301): metas []; kept [], stopped false
+(RECORD_FIELD, 303..315): metas []; kept [], stopped false
+(MODULE, 319..397): metas [(330..343, 327..344)]; kept [], stopped false
+(ITEM_LIST, 325..397): metas []; kept [], stopped false
+(MODULE, 345..395): metas []; kept [], stopped false
+(ITEM_LIST, 355..395): metas []; kept [], stopped false
+(FN, 357..393): metas []; kept [], stopped false
+(TYPE_PARAM, 370..371): metas []; kept [], stopped false
+(PARAM, 373..379): metas []; kept [], stopped false
+(IDENT_PAT, 373..374): metas []; kept [], stopped false
+(BLOCK_EXPR, 388..393): metas []; kept [], stopped false
+(STMT_LIST, 388..393): metas []; kept [], stopped false
+(PATH_EXPR, 390..391): metas []; kept [], stopped false
+(FN, 399..670): metas []; kept [], stopped false
+(PARAM, 404..410): metas []; kept [], stopped false
+(IDENT_PAT, 404..405): metas []; kept [], stopped false
+(PARAM, 412..416): metas []; kept [], stopped false
+(IDENT_PAT, 412..413): metas []; kept [], stopped false
+(BLOCK_EXPR, 425..670): metas []; kept [], stopped false
+(STMT_LIST, 425..670): metas []; kept [], stopped false
+(LET_STMT, 431..461): metas []; kept [], stopped false
+(IDENT_PAT, 435..436): metas []; kept [], stopped false
+(MACRO_CALL, 439..460): metas []; kept [], stopped false
+(LET_STMT, 466..482): metas []; kept [], stopped false
+(IDENT_PAT, 470..471): metas []; kept [], stopped false
+(MACRO_CALL, 474..481): metas []; kept [], stopped false
+(LET_STMT, 487..558): metas []; kept [], stopped false
+(IDENT_PAT, 491..492): metas []; kept [], stopped false
+(MACRO_CALL, 495..557): metas []; kept [], stopped false
+(LET_STMT, 563..590): metas []; kept [], stopped false
+(RECORD_PAT_FIELD, 571..572): metas []; kept [], stopped false
+(IDENT_PAT, 571..572): metas []; kept [], stopped false
+(RECORD_PAT_FIELD, 574..583): metas []; kept [], stopped false
+(IDENT_PAT, 578..579): metas []; kept [], stopped false
+(PATH_EXPR, 588..589): metas []; kept [], stopped false
+(BIN_EXPR, 595..668): metas []; kept [], stopped false
+(BIN_EXPR, 595..655): metas []; kept [], stopped false
+(BIN_EXPR, 595..640): metas []; kept [], stopped false
+(BIN_EXPR, 595..634): metas []; kept [], stopped false
+(CALL_EXPR, 595..622): metas []; kept [], stopped false
+(PATH_EXPR, 595..619): metas []; kept [], stopped false
+(PATH_EXPR, 620..621): metas []; kept [], stopped false
+(CALL_EXPR, 625..634): metas []; kept [], stopped false
+(PATH_EXPR, 625..632): metas []; kept [], stopped false
+(FIELD_EXPR, 637..640): metas []; kept [], stopped false
+(PATH_EXPR, 637..638): metas []; kept [], stopped false
+(CAST_EXPR, 643..655): metas []; kept [], stopped false
+(FIELD_EXPR, 643..648): metas []; kept [], stopped false
+(FIELD_EXPR, 643..646): metas []; kept [], stopped false
+(PATH_EXPR, 643..644): metas []; kept [], stopped false
+(CALL_EXPR, 658..668): metas []; kept [], stopped false
+(PATH_EXPR, 658..666): metas []; kept [], stopped false

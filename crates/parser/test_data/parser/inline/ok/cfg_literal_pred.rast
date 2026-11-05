@@ -1,0 +1,45 @@
+SOURCE_FILE
+  ATTR
+    POUND "#"
+    BANG "!"
+    L_BRACK "["
+    CFG_META
+      CFG_KW "cfg"
+      L_PAREN "("
+      CFG_COMPOSITE
+        IDENT "version"
+        L_PAREN "("
+        CFG_ATOM
+          LITERAL
+            STRING "\"1.42\""
+        R_PAREN ")"
+      R_PAREN ")"
+    R_BRACK "]"
+  WHITESPACE "\n"
+  ATTR
+    POUND "#"
+    BANG "!"
+    L_BRACK "["
+    CFG_META
+      CFG_KW "cfg"
+      L_PAREN "("
+      CFG_COMPOSITE
+        IDENT "any"
+        L_PAREN "("
+        CFG_ATOM
+          LITERAL
+            INT_NUMBER "1"
+        COMMA ","
+        WHITESPACE " "
+        CFG_ATOM
+          LITERAL
+            STRING "\"a\""
+        COMMA ","
+        WHITESPACE " "
+        CFG_ATOM
+          LITERAL
+            BYTE "b'c'"
+        R_PAREN ")"
+      R_PAREN ")"
+    R_BRACK "]"
+  WHITESPACE "\n"

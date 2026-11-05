@@ -1,0 +1,14 @@
+// The code graph page: main.ts and what it imports run in the browser; build.ts, sample.ts and serve.ts under Bun.
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"lib": ["es2023", "dom", "dom.iterable"],
+		"types": ["bun"],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true
+	},
+	"include": ["*.ts"]
+}

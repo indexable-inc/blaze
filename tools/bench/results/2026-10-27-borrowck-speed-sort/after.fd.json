@@ -1,0 +1,1264 @@
+{
+ "fd": {
+  "polonius": {
+   "bodies": 267,
+   "infer_ms": 299.771,
+   "infer_warm_ms": 177.17,
+   "first_check_ms": 1187.996,
+   "borrowck_ms": 78.001,
+   "borrowck_excl_mir_ms": 77.968,
+   "ratio_to_infer": 0.44007450471298754,
+   "per_body_us": {
+    "p50": 73,
+    "p99": 7744,
+    "max": 11825
+   },
+   "phases_ms": {
+    "constraints": 33.059,
+    "entry_sets": 2.124,
+    "errors": 0.332,
+    "infer": 1.736,
+    "liveness": 17.335,
+    "loans": 1.085,
+    "mir": 0.033,
+    "moves": 10.877,
+    "scopes": 2.272,
+    "setup": 0.198,
+    "walk": 5.103
+   },
+   "slowest": [
+    {
+     "name": "fd::cli::<Opts>::augment_args_for_update",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 11825,
+     "infer_us": 19465,
+     "phases_us": {
+      "constraints": 4896,
+      "entry_sets": 535,
+      "errors": 36,
+      "infer": 287,
+      "liveness": 2950,
+      "loans": 117,
+      "mir": 1,
+      "moves": 1714,
+      "scopes": 388,
+      "setup": 13,
+      "walk": 660
+     },
+     "counts": {
+      "blocks": 2331,
+      "bodies": 4,
+      "constraints": 4612,
+      "loans": 317,
+      "localized": 4606,
+      "locals": 1643,
+      "points": 6699,
+      "regions": 3298,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::augment_args",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 11404,
+     "infer_us": 18889,
+     "phases_us": {
+      "constraints": 4912,
+      "entry_sets": 394,
+      "errors": 35,
+      "infer": 287,
+      "liveness": 2741,
+      "loans": 120,
+      "mir": 1,
+      "moves": 1633,
+      "scopes": 395,
+      "setup": 14,
+      "walk": 648
+     },
+     "counts": {
+      "blocks": 2217,
+      "bodies": 4,
+      "constraints": 4612,
+      "loans": 317,
+      "localized": 4606,
+      "locals": 1586,
+      "points": 6471,
+      "regions": 3298,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::update_from_arg_matches_mut",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 7744,
+     "infer_us": 25989,
+     "phases_us": {
+      "constraints": 3713,
+      "entry_sets": 170,
+      "errors": 23,
+      "infer": 132,
+      "liveness": 1712,
+      "loans": 99,
+      "mir": 6,
+      "moves": 918,
+      "scopes": 161,
+      "setup": 35,
+      "walk": 539
+     },
+     "counts": {
+      "blocks": 1271,
+      "bodies": 37,
+      "constraints": 933,
+      "loans": 172,
+      "localized": 933,
+      "locals": 1016,
+      "points": 4424,
+      "regions": 1288,
+      "universals": 76
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::from_arg_matches_mut",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 6427,
+     "infer_us": 24811,
+     "phases_us": {
+      "constraints": 2730,
+      "entry_sets": 170,
+      "errors": 21,
+      "infer": 52,
+      "liveness": 1901,
+      "loans": 75,
+      "mir": 6,
+      "moves": 735,
+      "scopes": 72,
+      "setup": 24,
+      "walk": 435
+     },
+     "counts": {
+      "blocks": 1192,
+      "bodies": 37,
+      "constraints": 415,
+      "loans": 56,
+      "localized": 415,
+      "locals": 614,
+      "points": 3585,
+      "regions": 654,
+      "universals": 75
+     }
+    },
+    {
+     "name": "fd::construct_config",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 2213,
+     "infer_us": 5620,
+     "phases_us": {
+      "constraints": 894,
+      "entry_sets": 49,
+      "errors": 14,
+      "infer": 30,
+      "liveness": 585,
+      "loans": 39,
+      "mir": 2,
+      "moves": 303,
+      "scopes": 45,
+      "setup": 8,
+      "walk": 169
+     },
+     "counts": {
+      "blocks": 415,
+      "bodies": 11,
+      "constraints": 267,
+      "loans": 35,
+      "localized": 267,
+      "locals": 295,
+      "points": 1318,
+      "regions": 293,
+      "universals": 36
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::spawn_senders",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 1502,
+     "infer_us": 4365,
+     "phases_us": {
+      "constraints": 614,
+      "entry_sets": 38,
+      "errors": 14,
+      "infer": 35,
+      "liveness": 292,
+      "loans": 30,
+      "mir": 2,
+      "moves": 232,
+      "scopes": 54,
+      "setup": 8,
+      "walk": 130
+     },
+     "counts": {
+      "blocks": 255,
+      "bodies": 9,
+      "constraints": 369,
+      "loans": 24,
+      "localized": 369,
+      "locals": 288,
+      "points": 1127,
+      "regions": 384,
+      "universals": 41
+     }
+    },
+    {
+     "name": "fd::run",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 1035,
+     "infer_us": 2145,
+     "phases_us": {
+      "constraints": 462,
+      "entry_sets": 27,
+      "errors": 5,
+      "infer": 13,
+      "liveness": 240,
+      "loans": 10,
+      "mir": 1,
+      "moves": 141,
+      "scopes": 29,
+      "setup": 3,
+      "walk": 70
+     },
+     "counts": {
+      "blocks": 219,
+      "bodies": 3,
+      "constraints": 140,
+      "loans": 14,
+      "localized": 140,
+      "locals": 136,
+      "points": 639,
+      "regions": 144,
+      "universals": 11
+     }
+    },
+    {
+     "name": "fd::output::print_entry_colorized",
+     "path": "/root/bp/apps/fd/src/output.rs",
+     "us": 935,
+     "infer_us": 1812,
+     "phases_us": {
+      "constraints": 348,
+      "entry_sets": 38,
+      "errors": 5,
+      "infer": 25,
+      "liveness": 214,
+      "loans": 20,
+      "mir": 0,
+      "moves": 126,
+      "scopes": 42,
+      "setup": 1,
+      "walk": 82
+     },
+     "counts": {
+      "blocks": 171,
+      "bodies": 1,
+      "constraints": 260,
+      "loans": 20,
+      "localized": 260,
+      "locals": 174,
+      "points": 724,
+      "regions": 270,
+      "universals": 6
+     }
+    },
+    {
+     "name": "tests::testenv::create_working_directory",
+     "path": "/root/bp/apps/fd/tests/testenv/mod.rs",
+     "us": 904,
+     "infer_us": 1011,
+     "phases_us": {
+      "constraints": 317,
+      "entry_sets": 32,
+      "errors": 5,
+      "infer": 15,
+      "liveness": 250,
+      "loans": 15,
+      "mir": 0,
+      "moves": 145,
+      "scopes": 26,
+      "setup": 1,
+      "walk": 69
+     },
+     "counts": {
+      "blocks": 285,
+      "bodies": 1,
+      "constraints": 175,
+      "loans": 9,
+      "localized": 175,
+      "locals": 121,
+      "points": 721,
+      "regions": 146,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::build_walker",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 901,
+     "infer_us": 1238,
+     "phases_us": {
+      "constraints": 275,
+      "entry_sets": 31,
+      "errors": 5,
+      "infer": 18,
+      "liveness": 263,
+      "loans": 21,
+      "mir": 0,
+      "moves": 141,
+      "scopes": 41,
+      "setup": 1,
+      "walk": 70
+     },
+     "counts": {
+      "blocks": 214,
+      "bodies": 1,
+      "constraints": 184,
+      "loans": 29,
+      "localized": 184,
+      "locals": 147,
+      "points": 670,
+      "regions": 205,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::filter::owner::<OwnerFilter>::from_string",
+     "path": "/root/bp/apps/fd/src/filter/owner.rs",
+     "us": 851,
+     "infer_us": 3238,
+     "phases_us": {
+      "constraints": 396,
+      "entry_sets": 19,
+      "errors": 6,
+      "infer": 21,
+      "liveness": 139,
+      "loans": 14,
+      "mir": 1,
+      "moves": 136,
+      "scopes": 20,
+      "setup": 5,
+      "walk": 59
+     },
+     "counts": {
+      "blocks": 156,
+      "bodies": 7,
+      "constraints": 176,
+      "loans": 10,
+      "localized": 176,
+      "locals": 139,
+      "points": 537,
+      "regions": 195,
+      "universals": 23
+     }
+    },
+    {
+     "name": "fd::exec::<CommandSet>::execute_batch",
+     "path": "/root/bp/apps/fd/src/exec/mod.rs",
+     "us": 723,
+     "infer_us": 1597,
+     "phases_us": {
+      "constraints": 265,
+      "entry_sets": 23,
+      "errors": 4,
+      "infer": 13,
+      "liveness": 190,
+      "loans": 13,
+      "mir": 1,
+      "moves": 105,
+      "scopes": 28,
+      "setup": 2,
+      "walk": 52
+     },
+     "counts": {
+      "blocks": 183,
+      "bodies": 3,
+      "constraints": 128,
+      "loans": 15,
+      "localized": 128,
+      "locals": 87,
+      "points": 455,
+      "regions": 129,
+      "universals": 13
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::receive",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 702,
+     "infer_us": 2693,
+     "phases_us": {
+      "constraints": 368,
+      "entry_sets": 10,
+      "errors": 8,
+      "infer": 17,
+      "liveness": 118,
+      "loans": 10,
+      "mir": 1,
+      "moves": 87,
+      "scopes": 16,
+      "setup": 3,
+      "walk": 40
+     },
+     "counts": {
+      "blocks": 101,
+      "bodies": 4,
+      "constraints": 180,
+      "loans": 6,
+      "localized": 180,
+      "locals": 89,
+      "points": 319,
+      "regions": 157,
+      "universals": 22
+     }
+    },
+    {
+     "name": "fd::fmt::<FormatTemplate>::parse",
+     "path": "/root/bp/apps/fd/src/fmt/mod.rs",
+     "us": 663,
+     "infer_us": 1160,
+     "phases_us": {
+      "constraints": 231,
+      "entry_sets": 20,
+      "errors": 5,
+      "infer": 15,
+      "liveness": 157,
+      "loans": 16,
+      "mir": 1,
+      "moves": 112,
+      "scopes": 17,
+      "setup": 3,
+      "walk": 58
+     },
+     "counts": {
+      "blocks": 119,
+      "bodies": 2,
+      "constraints": 157,
+      "loans": 23,
+      "localized": 157,
+      "locals": 153,
+      "points": 575,
+      "regions": 187,
+      "universals": 5
+     }
+    },
+    {
+     "name": "fd::walk::<ReceiverBuffer<'a, W>>::poll",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 616,
+     "infer_us": 967,
+     "phases_us": {
+      "constraints": 211,
+      "entry_sets": 23,
+      "errors": 4,
+      "infer": 8,
+      "liveness": 169,
+      "loans": 16,
+      "mir": 0,
+      "moves": 97,
+      "scopes": 13,
+      "setup": 1,
+      "walk": 50
+     },
+     "counts": {
+      "blocks": 161,
+      "bodies": 1,
+      "constraints": 99,
+      "loans": 16,
+      "localized": 99,
+      "locals": 101,
+      "points": 513,
+      "regions": 91,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::determine_ls_command",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 614,
+     "infer_us": 956,
+     "phases_us": {
+      "constraints": 290,
+      "entry_sets": 14,
+      "errors": 5,
+      "infer": 18,
+      "liveness": 108,
+      "loans": 11,
+      "mir": 1,
+      "moves": 76,
+      "scopes": 27,
+      "setup": 2,
+      "walk": 39
+     },
+     "counts": {
+      "blocks": 109,
+      "bodies": 2,
+      "constraints": 180,
+      "loans": 15,
+      "localized": 178,
+      "locals": 90,
+      "points": 353,
+      "regions": 201,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::filter::size::<SizeFilter>::parse_opt",
+     "path": "/root/bp/apps/fd/src/filter/size.rs",
+     "us": 612,
+     "infer_us": 1354,
+     "phases_us": {
+      "constraints": 244,
+      "entry_sets": 16,
+      "errors": 6,
+      "infer": 17,
+      "liveness": 113,
+      "loans": 8,
+      "mir": 1,
+      "moves": 90,
+      "scopes": 24,
+      "setup": 9,
+      "walk": 53
+     },
+     "counts": {
+      "blocks": 123,
+      "bodies": 5,
+      "constraints": 168,
+      "loans": 15,
+      "localized": 168,
+      "locals": 116,
+      "points": 455,
+      "regions": 192,
+      "universals": 16
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::scan",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 562,
+     "infer_us": 2173,
+     "phases_us": {
+      "constraints": 240,
+      "entry_sets": 2,
+      "errors": 5,
+      "infer": 11,
+      "liveness": 143,
+      "loans": 7,
+      "mir": 1,
+      "moves": 77,
+      "scopes": 13,
+      "setup": 3,
+      "walk": 35
+     },
+     "counts": {
+      "blocks": 92,
+      "bodies": 4,
+      "constraints": 114,
+      "loans": 2,
+      "localized": 114,
+      "locals": 91,
+      "points": 309,
+      "regions": 104,
+      "universals": 19
+     }
+    },
+    {
+     "name": "fd::output::print_entry",
+     "path": "/root/bp/apps/fd/src/output.rs",
+     "us": 506,
+     "infer_us": 828,
+     "phases_us": {
+      "constraints": 175,
+      "entry_sets": 18,
+      "errors": 3,
+      "infer": 8,
+      "liveness": 127,
+      "loans": 11,
+      "mir": 0,
+      "moves": 89,
+      "scopes": 10,
+      "setup": 1,
+      "walk": 43
+     },
+     "counts": {
+      "blocks": 144,
+      "bodies": 1,
+      "constraints": 88,
+      "loans": 9,
+      "localized": 88,
+      "locals": 87,
+      "points": 465,
+      "regions": 102,
+      "universals": 5
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::build_overrides",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 426,
+     "infer_us": 1047,
+     "phases_us": {
+      "constraints": 186,
+      "entry_sets": 8,
+      "errors": 3,
+      "infer": 8,
+      "liveness": 86,
+      "loans": 7,
+      "mir": 1,
+      "moves": 64,
+      "scopes": 12,
+      "setup": 2,
+      "walk": 27
+     },
+     "counts": {
+      "blocks": 83,
+      "bodies": 3,
+      "constraints": 68,
+      "loans": 6,
+      "localized": 68,
+      "locals": 58,
+      "points": 250,
+      "regions": 81,
+      "universals": 8
+     }
+    }
+   ],
+   "secs": 5
+  },
+  "nll": {
+   "bodies": 267,
+   "infer_ms": 299.771,
+   "infer_warm_ms": 177.17,
+   "first_check_ms": 1187.996,
+   "borrowck_ms": 70.03,
+   "borrowck_excl_mir_ms": 70.011,
+   "ratio_to_infer": 0.39516283795224927,
+   "per_body_us": {
+    "p50": 60,
+    "p99": 7573,
+    "max": 11292
+   },
+   "phases_ms": {
+    "constraints": 30.007,
+    "entry_sets": 2.186,
+    "errors": 0.289,
+    "infer": 1.602,
+    "liveness": 16.425,
+    "loans": 1.001,
+    "mir": 0.019,
+    "moves": 10.124,
+    "scopes": 0.188,
+    "setup": 0.16,
+    "walk": 4.757
+   },
+   "slowest": [
+    {
+     "name": "fd::cli::<Opts>::augment_args_for_update",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 11292,
+     "infer_us": 19465,
+     "phases_us": {
+      "constraints": 4872,
+      "entry_sets": 512,
+      "errors": 36,
+      "infer": 297,
+      "liveness": 2901,
+      "loans": 116,
+      "mir": 1,
+      "moves": 1664,
+      "scopes": 20,
+      "setup": 13,
+      "walk": 652
+     },
+     "counts": {
+      "blocks": 2331,
+      "bodies": 4,
+      "constraints": 4612,
+      "loans": 317,
+      "localized": 4606,
+      "locals": 1643,
+      "points": 6699,
+      "regions": 3298,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::augment_args",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 10941,
+     "infer_us": 18889,
+     "phases_us": {
+      "constraints": 4858,
+      "entry_sets": 506,
+      "errors": 34,
+      "infer": 288,
+      "liveness": 2607,
+      "loans": 113,
+      "mir": 2,
+      "moves": 1663,
+      "scopes": 20,
+      "setup": 13,
+      "walk": 640
+     },
+     "counts": {
+      "blocks": 2217,
+      "bodies": 4,
+      "constraints": 4612,
+      "loans": 317,
+      "localized": 4606,
+      "locals": 1586,
+      "points": 6471,
+      "regions": 3298,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::update_from_arg_matches_mut",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 7573,
+     "infer_us": 25989,
+     "phases_us": {
+      "constraints": 3713,
+      "entry_sets": 169,
+      "errors": 24,
+      "infer": 132,
+      "liveness": 1697,
+      "loans": 100,
+      "mir": 6,
+      "moves": 906,
+      "scopes": 25,
+      "setup": 36,
+      "walk": 541
+     },
+     "counts": {
+      "blocks": 1271,
+      "bodies": 37,
+      "constraints": 933,
+      "loans": 172,
+      "localized": 933,
+      "locals": 1016,
+      "points": 4424,
+      "regions": 1288,
+      "universals": 76
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::from_arg_matches_mut",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 6410,
+     "infer_us": 24811,
+     "phases_us": {
+      "constraints": 2719,
+      "entry_sets": 179,
+      "errors": 21,
+      "infer": 55,
+      "liveness": 1986,
+      "loans": 74,
+      "mir": 5,
+      "moves": 719,
+      "scopes": 7,
+      "setup": 25,
+      "walk": 421
+     },
+     "counts": {
+      "blocks": 1192,
+      "bodies": 37,
+      "constraints": 415,
+      "loans": 56,
+      "localized": 415,
+      "locals": 614,
+      "points": 3585,
+      "regions": 654,
+      "universals": 75
+     }
+    },
+    {
+     "name": "fd::construct_config",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 2008,
+     "infer_us": 5620,
+     "phases_us": {
+      "constraints": 835,
+      "entry_sets": 50,
+      "errors": 13,
+      "infer": 27,
+      "liveness": 485,
+      "loans": 38,
+      "mir": 2,
+      "moves": 313,
+      "scopes": 5,
+      "setup": 8,
+      "walk": 162
+     },
+     "counts": {
+      "blocks": 415,
+      "bodies": 11,
+      "constraints": 267,
+      "loans": 35,
+      "localized": 267,
+      "locals": 295,
+      "points": 1318,
+      "regions": 293,
+      "universals": 36
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::spawn_senders",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 1306,
+     "infer_us": 4365,
+     "phases_us": {
+      "constraints": 515,
+      "entry_sets": 36,
+      "errors": 13,
+      "infer": 33,
+      "liveness": 292,
+      "loans": 28,
+      "mir": 1,
+      "moves": 213,
+      "scopes": 5,
+      "setup": 7,
+      "walk": 114
+     },
+     "counts": {
+      "blocks": 255,
+      "bodies": 9,
+      "constraints": 369,
+      "loans": 24,
+      "localized": 369,
+      "locals": 288,
+      "points": 1127,
+      "regions": 384,
+      "universals": 41
+     }
+    },
+    {
+     "name": "fd::run",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 905,
+     "infer_us": 2145,
+     "phases_us": {
+      "constraints": 422,
+      "entry_sets": 25,
+      "errors": 4,
+      "infer": 12,
+      "liveness": 209,
+      "loans": 9,
+      "mir": 0,
+      "moves": 126,
+      "scopes": 3,
+      "setup": 3,
+      "walk": 64
+     },
+     "counts": {
+      "blocks": 219,
+      "bodies": 3,
+      "constraints": 140,
+      "loans": 14,
+      "localized": 140,
+      "locals": 136,
+      "points": 639,
+      "regions": 144,
+      "universals": 11
+     }
+    },
+    {
+     "name": "fd::output::print_entry_colorized",
+     "path": "/root/bp/apps/fd/src/output.rs",
+     "us": 847,
+     "infer_us": 1812,
+     "phases_us": {
+      "constraints": 329,
+      "entry_sets": 35,
+      "errors": 5,
+      "infer": 24,
+      "liveness": 204,
+      "loans": 18,
+      "mir": 0,
+      "moves": 123,
+      "scopes": 4,
+      "setup": 1,
+      "walk": 76
+     },
+     "counts": {
+      "blocks": 171,
+      "bodies": 1,
+      "constraints": 260,
+      "loans": 20,
+      "localized": 260,
+      "locals": 174,
+      "points": 724,
+      "regions": 270,
+      "universals": 6
+     }
+    },
+    {
+     "name": "tests::testenv::create_working_directory",
+     "path": "/root/bp/apps/fd/tests/testenv/mod.rs",
+     "us": 812,
+     "infer_us": 1011,
+     "phases_us": {
+      "constraints": 262,
+      "entry_sets": 31,
+      "errors": 4,
+      "infer": 14,
+      "liveness": 257,
+      "loans": 13,
+      "mir": 0,
+      "moves": 137,
+      "scopes": 3,
+      "setup": 1,
+      "walk": 64
+     },
+     "counts": {
+      "blocks": 285,
+      "bodies": 1,
+      "constraints": 175,
+      "loans": 9,
+      "localized": 175,
+      "locals": 121,
+      "points": 721,
+      "regions": 146,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::build_walker",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 753,
+     "infer_us": 1238,
+     "phases_us": {
+      "constraints": 223,
+      "entry_sets": 30,
+      "errors": 4,
+      "infer": 18,
+      "liveness": 241,
+      "loans": 19,
+      "mir": 0,
+      "moves": 119,
+      "scopes": 6,
+      "setup": 1,
+      "walk": 65
+     },
+     "counts": {
+      "blocks": 214,
+      "bodies": 1,
+      "constraints": 184,
+      "loans": 29,
+      "localized": 184,
+      "locals": 147,
+      "points": 670,
+      "regions": 205,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::filter::owner::<OwnerFilter>::from_string",
+     "path": "/root/bp/apps/fd/src/filter/owner.rs",
+     "us": 723,
+     "infer_us": 3238,
+     "phases_us": {
+      "constraints": 341,
+      "entry_sets": 17,
+      "errors": 5,
+      "infer": 17,
+      "liveness": 134,
+      "loans": 12,
+      "mir": 1,
+      "moves": 107,
+      "scopes": 1,
+      "setup": 4,
+      "walk": 54
+     },
+     "counts": {
+      "blocks": 156,
+      "bodies": 7,
+      "constraints": 176,
+      "loans": 10,
+      "localized": 176,
+      "locals": 139,
+      "points": 537,
+      "regions": 195,
+      "universals": 23
+     }
+    },
+    {
+     "name": "fd::exec::<CommandSet>::execute_batch",
+     "path": "/root/bp/apps/fd/src/exec/mod.rs",
+     "us": 634,
+     "infer_us": 1597,
+     "phases_us": {
+      "constraints": 217,
+      "entry_sets": 21,
+      "errors": 4,
+      "infer": 12,
+      "liveness": 179,
+      "loans": 12,
+      "mir": 0,
+      "moves": 108,
+      "scopes": 3,
+      "setup": 2,
+      "walk": 49
+     },
+     "counts": {
+      "blocks": 183,
+      "bodies": 3,
+      "constraints": 128,
+      "loans": 15,
+      "localized": 128,
+      "locals": 87,
+      "points": 455,
+      "regions": 129,
+      "universals": 13
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::receive",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 610,
+     "infer_us": 2693,
+     "phases_us": {
+      "constraints": 306,
+      "entry_sets": 9,
+      "errors": 7,
+      "infer": 16,
+      "liveness": 110,
+      "loans": 21,
+      "mir": 1,
+      "moves": 78,
+      "scopes": 1,
+      "setup": 3,
+      "walk": 38
+     },
+     "counts": {
+      "blocks": 101,
+      "bodies": 4,
+      "constraints": 180,
+      "loans": 6,
+      "localized": 180,
+      "locals": 89,
+      "points": 319,
+      "regions": 157,
+      "universals": 22
+     }
+    },
+    {
+     "name": "fd::fmt::<FormatTemplate>::parse",
+     "path": "/root/bp/apps/fd/src/fmt/mod.rs",
+     "us": 563,
+     "infer_us": 1160,
+     "phases_us": {
+      "constraints": 178,
+      "entry_sets": 19,
+      "errors": 4,
+      "infer": 15,
+      "liveness": 147,
+      "loans": 15,
+      "mir": 0,
+      "moves": 102,
+      "scopes": 3,
+      "setup": 2,
+      "walk": 54
+     },
+     "counts": {
+      "blocks": 119,
+      "bodies": 2,
+      "constraints": 157,
+      "loans": 23,
+      "localized": 157,
+      "locals": 153,
+      "points": 575,
+      "regions": 187,
+      "universals": 5
+     }
+    },
+    {
+     "name": "fd::walk::<ReceiverBuffer<'a, W>>::poll",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 553,
+     "infer_us": 967,
+     "phases_us": {
+      "constraints": 178,
+      "entry_sets": 22,
+      "errors": 4,
+      "infer": 7,
+      "liveness": 170,
+      "loans": 15,
+      "mir": 0,
+      "moves": 88,
+      "scopes": 2,
+      "setup": 1,
+      "walk": 46
+     },
+     "counts": {
+      "blocks": 161,
+      "bodies": 1,
+      "constraints": 99,
+      "loans": 16,
+      "localized": 99,
+      "locals": 101,
+      "points": 513,
+      "regions": 91,
+      "universals": 4
+     }
+    },
+    {
+     "name": "fd::filter::size::<SizeFilter>::parse_opt",
+     "path": "/root/bp/apps/fd/src/filter/size.rs",
+     "us": 510,
+     "infer_us": 1354,
+     "phases_us": {
+      "constraints": 192,
+      "entry_sets": 15,
+      "errors": 5,
+      "infer": 17,
+      "liveness": 106,
+      "loans": 8,
+      "mir": 0,
+      "moves": 81,
+      "scopes": 2,
+      "setup": 9,
+      "walk": 48
+     },
+     "counts": {
+      "blocks": 123,
+      "bodies": 5,
+      "constraints": 168,
+      "loans": 15,
+      "localized": 168,
+      "locals": 116,
+      "points": 455,
+      "regions": 192,
+      "universals": 16
+     }
+    },
+    {
+     "name": "fd::walk::<WorkerState>::scan",
+     "path": "/root/bp/apps/fd/src/walk.rs",
+     "us": 486,
+     "infer_us": 2173,
+     "phases_us": {
+      "constraints": 215,
+      "entry_sets": 1,
+      "errors": 5,
+      "infer": 10,
+      "liveness": 126,
+      "loans": 6,
+      "mir": 0,
+      "moves": 68,
+      "scopes": 0,
+      "setup": 3,
+      "walk": 30
+     },
+     "counts": {
+      "blocks": 92,
+      "bodies": 4,
+      "constraints": 114,
+      "loans": 2,
+      "localized": 114,
+      "locals": 91,
+      "points": 309,
+      "regions": 104,
+      "universals": 19
+     }
+    },
+    {
+     "name": "fd::determine_ls_command",
+     "path": "/root/bp/apps/fd/src/main.rs",
+     "us": 474,
+     "infer_us": 956,
+     "phases_us": {
+      "constraints": 215,
+      "entry_sets": 13,
+      "errors": 5,
+      "infer": 16,
+      "liveness": 88,
+      "loans": 10,
+      "mir": 0,
+      "moves": 66,
+      "scopes": 4,
+      "setup": 1,
+      "walk": 35
+     },
+     "counts": {
+      "blocks": 109,
+      "bodies": 2,
+      "constraints": 180,
+      "loans": 15,
+      "localized": 178,
+      "locals": 90,
+      "points": 353,
+      "regions": 201,
+      "universals": 8
+     }
+    },
+    {
+     "name": "fd::output::print_entry",
+     "path": "/root/bp/apps/fd/src/output.rs",
+     "us": 458,
+     "infer_us": 828,
+     "phases_us": {
+      "constraints": 162,
+      "entry_sets": 16,
+      "errors": 3,
+      "infer": 8,
+      "liveness": 119,
+      "loans": 10,
+      "mir": 0,
+      "moves": 81,
+      "scopes": 1,
+      "setup": 1,
+      "walk": 40
+     },
+     "counts": {
+      "blocks": 144,
+      "bodies": 1,
+      "constraints": 88,
+      "loans": 9,
+      "localized": 88,
+      "locals": 87,
+      "points": 465,
+      "regions": 102,
+      "universals": 5
+     }
+    },
+    {
+     "name": "fd::cli::<Opts>::search_paths",
+     "path": "/root/bp/apps/fd/src/cli.rs",
+     "us": 360,
+     "infer_us": 1260,
+     "phases_us": {
+      "constraints": 177,
+      "entry_sets": 3,
+      "errors": 3,
+      "infer": 11,
+      "liveness": 58,
+      "loans": 5,
+      "mir": 0,
+      "moves": 62,
+      "scopes": 0,
+      "setup": 1,
+      "walk": 24
+     },
+     "counts": {
+      "blocks": 68,
+      "bodies": 2,
+      "constraints": 121,
+      "loans": 3,
+      "localized": 121,
+      "locals": 74,
+      "points": 271,
+      "regions": 127,
+      "universals": 8
+     }
+    }
+   ],
+   "secs": 5
+  }
+ }
+}

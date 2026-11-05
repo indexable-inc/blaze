@@ -1,0 +1,28 @@
+syntax = "proto3";
+package ledger;
+
+service Ledger {
+  rpc Deposit (Entry) returns (Balance);
+  rpc Statement (Account) returns (stream Entry);
+  rpc Batch (stream Entry) returns (Balance);
+  rpc Exchange (stream Entry) returns (stream Balance);
+}
+
+message Account { string name = 1; }
+
+message Entry {
+  string account = 1;
+  sint64 amount = 2;
+  string memo = 3;
+  repeated string tags = 4;
+  oneof source {
+    string teller = 5;
+    uint32 machine = 6;
+  }
+}
+
+message Balance {
+  string account = 1;
+  sint64 total = 2;
+  uint32 entries = 3;
+}

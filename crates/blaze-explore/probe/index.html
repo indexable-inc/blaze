@@ -1,0 +1,154 @@
+<!doctype html>
+<!--
+  The WebTransport probe page (crates/blaze-explore/probe/index.html). Served from an https
+  origin, never from localhost or file://; opened as the link `blaze-explore-probe` prints:
+  <this page>#127.0.0.1:<port>/<certhash>. It connects pinning the certificate by hash, then
+  checks a bidirectional echo, a unidirectional echo and datagrams, and shows the result as
+  JSON to paste into the results table of the explorer's wire document.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blaze explore: WebTransport probe</title>
+<style>
+  body { font: 14px/1.4 ui-monospace, Menlo, monospace; margin: 2em; max-width: 60em; }
+  td, th { padding: 0.2em 1em 0.2em 0; text-align: left; vertical-align: top; }
+  .pass { color: #186a1e; } .fail { color: #a31515; }
+  pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>blaze explore: WebTransport probe</h1>
+<p id="where"></p>
+<table><thead><tr><th>check</th><th>result</th><th>detail</th></tr></thead><tbody id="checks"></tbody></table>
+<h2>result</h2>
+<pre id="result">running…</pre>
+<script>
+"use strict";
+
+const checks = document.getElementById("checks");
+const result = { userAgent: navigator.userAgent, page: location.origin + location.pathname, checks: {} };
+
+function row(name, ok, detail) {
+  result.checks[name] = { ok, detail };
+  const tr = checks.insertRow();
+  tr.insertCell().textContent = name;
+  const cell = tr.insertCell();
+  cell.textContent = ok ? "pass" : "fail";
+  cell.className = ok ? "pass" : "fail";
+  tr.insertCell().textContent = detail;
+}
+
+function hashBytes(text) {
+  const base64 = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - text.length % 4) % 4);
+  return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+}
+
+async function readAll(readable) {
+  const reader = readable.getReader();
+  const parts = [];
+  let length = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    length += value.length;
+  }
+  const all = new Uint8Array(length);
+  let at = 0;
+  for (const part of parts) { all.set(part, at); at += part.length; }
+  return all;
+}
+
+function pattern(length) {
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; i++) bytes[i] = (i * 31 + 7) & 0xff;
+  return bytes;
+}
+
+function same(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function within(ms, promise, what) {
+  return Promise.race([promise, new Promise((_, no) => setTimeout(() => no(new Error(what + ": nothing in " + ms + " ms")), ms))]);
+}
+
+async function bidi(transport) {
+  const sent = pattern(1 << 20);
+  const started = performance.now();
+  const stream = await transport.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const echoed = readAll(stream.readable);
+  await writer.write(sent);
+  await writer.close();
+  const back = await within(10000, echoed, "bidirectional echo");
+  const ms = (performance.now() - started).toFixed(1);
+  row("bidirectional stream, 1 MiB", same(sent, back), back.length + " bytes back in " + ms + " ms");
+}
+
+async function uni(transport) {
+  const sent = pattern(64 * 1024);
+  const incoming = transport.incomingUnidirectionalStreams.getReader();
+  const stream = await transport.createUnidirectionalStream();
+  const writer = stream.getWriter();
+  await writer.write(sent);
+  await writer.close();
+  const { value } = await within(10000, incoming.read(), "a unidirectional stream from the server");
+  const back = await within(10000, readAll(value), "unidirectional echo");
+  row("unidirectional streams, 64 KiB each way", same(sent, back), back.length + " bytes back on the server's stream");
+}
+
+async function datagrams(transport) {
+  const count = 20;
+  const writer = transport.datagrams.writable.getWriter();
+  const reader = transport.datagrams.readable.getReader();
+  let back = 0;
+  const reading = (async () => { for (;;) { const { done } = await reader.read(); if (done) return; back++; if (back === count) return; } })();
+  for (let i = 0; i < count; i++) await writer.write(new Uint8Array([i, 1, 2, 3]));
+  await Promise.race([reading, new Promise((ok) => setTimeout(ok, 2000))]);
+  row("datagrams", back > 0, back + " of " + count + " echoed in 2 s (datagrams may be lost; any back passes)");
+}
+
+async function main() {
+  const where = document.getElementById("where");
+  const fragment = decodeURIComponent(location.hash.slice(1));
+  const match = /^(127\.0\.0\.1:\d+)\/([A-Za-z0-9_-]{43})$/.exec(fragment);
+  if (!match) {
+    where.textContent = "Open this page from the link blaze-explore-probe prints: …#127.0.0.1:<port>/<certhash>.";
+    row("link", false, "fragment `" + fragment + "` is not 127.0.0.1:<port>/<certhash>");
+    return;
+  }
+  const [, authority, certhash] = match;
+  result.server = authority;
+  where.textContent = "server " + authority + ", certificate " + certhash;
+  if (typeof WebTransport === "undefined") {
+    row("WebTransport", false, "this browser has no WebTransport");
+    return;
+  }
+  row("WebTransport", true, "present");
+  let transport;
+  const started = performance.now();
+  try {
+    transport = new WebTransport("https://" + authority + "/probe", {
+      serverCertificateHashes: [{ algorithm: "sha-256", value: hashBytes(certhash) }],
+    });
+    await within(10000, transport.ready, "the session");
+  } catch (error) {
+    row("session with a certificate pinned by hash", false, String(error));
+    return;
+  }
+  row("session with a certificate pinned by hash", true, "ready in " + (performance.now() - started).toFixed(1) + " ms");
+  for (const check of [bidi, uni, datagrams]) {
+    try { await check(transport); } catch (error) { row(check.name, false, String(error)); }
+  }
+  transport.close({ closeCode: 0, reason: "probe done" });
+}
+
+main().finally(() => { document.getElementById("result").textContent = JSON.stringify(result, null, 2); });
+</script>
+</body>
+</html>

@@ -1,0 +1,215 @@
+{
+    "project": "blaze",
+    "steps": [
+        {
+            "step": "seed",
+            "build_s": 1370.464,
+            "ready_s": 0.927,
+            "states": [
+                "ready"
+            ],
+            "built": "daemon",
+            "peak_mb": 27949,
+            "resident_mb": 13272,
+            "compiled": 862448,
+            "steps_s": {
+                "load": 307.4,
+                "resolve": 47.3,
+                "compile": 325.7,
+                "emit": 0.0,
+                "link": 13.9
+            },
+            "threads_s": {
+                "infer": 108.8,
+                "mir": 177.2,
+                "monomorphize": 93.7,
+                "translate": 467.8,
+                "describe": 0.0,
+                "store read": 9.4,
+                "store write": 134.109,
+                "llvm": 1340.1,
+                "cranelift": 42.0
+            },
+            "phases": [
+                "compile 692.2ms, resolve 5.2s, define 1.6s, fallback 60.9\u00b5s, object 4.8s, 1 rounds",
+                "compile 357.1ms, resolve 9.2ms, define 28.1s, fallback 298.7\u00b5s, object 4.8s, 1 rounds",
+                "compile 9.3s, resolve 44.0s, define 62.7s, fallback 69.8\u00b5s, object 15.4s, 1 rounds"
+            ],
+            "store": {
+                "found": 324777,
+                "added": 541806,
+                "frozen": 22,
+                "frozen_written": 981
+            },
+            "manifest": [
+                "none used, the store has none of this build (34.0ms)",
+                "kept, 2 files, 232720464 bytes (505.4ms read, 4.1s kept beside what came next)"
+            ],
+            "pull": null,
+            "push": [
+                6.097,
+                [
+                    "remote: 509 requests (0 tried again, 0 transfers resumed), 0 bytes received, 343940187 sent, 0 objects rejected"
+                ]
+            ],
+            "store_mb": 1275.0
+        },
+        {
+            "step": "fresh-none",
+            "build_s": 451.052,
+            "ready_s": 0.272,
+            "states": [
+                "ready"
+            ],
+            "built": "daemon",
+            "peak_mb": 27825,
+            "resident_mb": 9468,
+            "compiled": 355042,
+            "steps_s": {
+                "load": 72.9,
+                "resolve": 9.2,
+                "compile": 94.0,
+                "emit": 0.0,
+                "link": 19.1
+            },
+            "threads_s": {
+                "infer": 36.546,
+                "mir": 47.913,
+                "monomorphize": 14.414,
+                "translate": 121.613,
+                "describe": 0.0,
+                "store read": 23.724,
+                "store write": 0.0,
+                "llvm": 13.903,
+                "cranelift": 3.1
+            },
+            "phases": [
+                "compile 4.4ms, resolve 2.8ms, define 115.9\u00b5s, fallback 0.0ns, object 2.3ms, 1 rounds",
+                "compile 25.2ms, resolve 2.7ms, define 20.8s, fallback 47.5\u00b5s, object 3.6s, 1 rounds",
+                "compile 272.1ms, resolve 9.5ms, define 58.2s, fallback 26.6\u00b5s, object 6.1s, 1 rounds"
+            ],
+            "store": {
+                "found": 359178,
+                "added": 0,
+                "frozen": 349,
+                "frozen_written": 87
+            },
+            "manifest": [
+                "none used, the store has none of this build (34.4ms)",
+                "not kept, the build loaded files its key was made without"
+            ],
+            "pull": [
+                6.66,
+                [
+                    "remote: 110 requests (0 tried again, 0 transfers resumed), 559295154 bytes received, 0 sent, 0 objects rejected"
+                ]
+            ],
+            "store_mb": 1285.5,
+            "right": true
+        },
+        {
+            "step": "fresh-top",
+            "build_s": 461.203,
+            "ready_s": 0.242,
+            "states": [
+                "ready"
+            ],
+            "built": "daemon",
+            "peak_mb": 27481,
+            "resident_mb": 9499,
+            "compiled": 376421,
+            "steps_s": {
+                "load": 75.9,
+                "resolve": 9.2,
+                "compile": 91.4,
+                "emit": 0.0,
+                "link": 16.8
+            },
+            "threads_s": {
+                "infer": 41.076,
+                "mir": 52.392,
+                "monomorphize": 20.474,
+                "translate": 162.301,
+                "describe": 0.0,
+                "store read": 23.638,
+                "store write": 1.569,
+                "llvm": 18.953,
+                "cranelift": 3.887
+            },
+            "phases": [
+                "compile 5.2ms, resolve 2.7ms, define 130.9\u00b5s, fallback 0.0ns, object 2.0ms, 1 rounds",
+                "compile 110.7ms, resolve 56.9ms, define 32.6s, fallback 278.3\u00b5s, object 4.6s, 1 rounds",
+                "compile 804.6ms, resolve 1.5s, define 82.9s, fallback 43.3\u00b5s, object 8.5s, 1 rounds"
+            ],
+            "store": {
+                "found": 381377,
+                "added": 2,
+                "frozen": 349,
+                "frozen_written": 87
+            },
+            "manifest": [
+                "none used, the store has none of this build (35.7ms)",
+                "not kept, the build loaded files its key was made without"
+            ],
+            "pull": [
+                7.327,
+                [
+                    "remote: 110 requests (0 tried again, 0 transfers resumed), 559295154 bytes received, 0 sent, 0 objects rejected"
+                ]
+            ],
+            "store_mb": 1294.4
+        },
+        {
+            "step": "fresh-body",
+            "build_s": 481.397,
+            "ready_s": 0.283,
+            "states": [
+                "ready"
+            ],
+            "built": "daemon",
+            "peak_mb": 28196,
+            "resident_mb": 10433,
+            "compiled": 264471,
+            "steps_s": {
+                "load": 68.8,
+                "resolve": 8.5,
+                "compile": 48.6,
+                "emit": 0.0,
+                "link": 14.3
+            },
+            "threads_s": {
+                "infer": 44.314,
+                "mir": 79.312,
+                "monomorphize": 79.019,
+                "translate": 266.096,
+                "describe": 0.0,
+                "store read": 20.47,
+                "store write": 27.802,
+                "llvm": 25.022,
+                "cranelift": 4.694
+            },
+            "phases": [
+                "compile 1.6ms, resolve 338.9\u00b5s, define 16.8\u00b5s, fallback 0.0ns, object 222.9\u00b5s, 1 rounds",
+                "compile 799.0ms, resolve 5.3ms, define 44.8s, fallback 350.7\u00b5s, object 8.8s, 1 rounds",
+                "compile 2.2s, resolve 22.2s, define 95.2s, fallback 21.6ms, object 9.7s, 1 rounds"
+            ],
+            "store": {
+                "found": 508411,
+                "added": 2,
+                "frozen": 349,
+                "frozen_written": 87
+            },
+            "manifest": [
+                "none used, the store has none of this build (35.6ms)",
+                "not kept, the build loaded files its key was made without"
+            ],
+            "pull": [
+                6.821,
+                [
+                    "remote: 110 requests (0 tried again, 0 transfers resumed), 559295154 bytes received, 0 sent, 0 objects rejected"
+                ]
+            ],
+            "store_mb": 1395.2
+        }
+    ]
+}

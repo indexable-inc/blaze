@@ -1,0 +1,214 @@
+// RFC 0003: Rust and Lean.
+site {
+  rfcs {
+    // lean.flecs runs before linear-types.flecs (path order), so RFC 0002 is opened here for the
+    // DependsOn pair at the end of this file to name it. Its own file fills it in.
+    "linear-types" {}
+
+    lean : Rfc {
+      Title: {"Rust and Lean"}
+      Description: {"Rust is the program language and Lean is the proof language. blaze owns the compiler, so it joins them at MIR: each function becomes a Lean definition as it compiles, and its spec becomes a theorem."}
+      Number: {3}
+      (DependsOn, site.charter)
+      (DependsOn, site.rfcs.capabilities)
+
+      Lede summary("In the new edition, a function can say what it does, not only what it touches: `requires` and `ensures`, written in Rust. blaze translates each function's MIR to Lean as it compiles it, and Lean checks the claim. Easy claims are proved by tactics with no help. Hard ones carry a Lean proof next to the code, in the same file. Rust stays the language programs are written in; Lean is the language proofs are written in.")
+
+      Section motivation(title: "Motivation") {
+        P charter("The charter says checkable over short: a few more words are a good trade when they let the compiler prove something. Types and capabilities prove a lot, but not that `sort` sorts or that an index is in bounds. Proofs do.")
+        P cheap("Proofs used to be the expensive part. Language models change that. They write tactic proofs well, and Lean tells them exactly what is left to prove, so they can try, read the goal and try again. Writing a proof is becoming as cheap as writing a test, and a proof covers every input.")
+        P today("Today, proving things about Rust means a separate tool: a fork of the compiler, a translator run by hand, a different spec language, proofs in another repository. The proof drifts from the code, and almost nobody runs it.") { (Cites, refs.verus); (Cites, refs.aeneas); (Cites, refs.creusot) }
+        P ours("blaze owns the compiler. It already lowers every function to MIR and compiles it one function at a time. It can translate each function to Lean at the same point, keep the result in the same cache, and check the proof in the same edit loop as the type check.")
+      }
+
+      Section design(title: "Design sketch") {
+        P specs("Specs are Rust. `requires` and `ensures` clauses go after the signature. A `spec fn` is ordinary Rust that may only be used in specs: it is never compiled to machine code, so it may use unbounded integers and quantifiers. Syntax is illustrative; see the open issues.") {
+          (Cites, refs.verus)
+        }
+        P auto("Each clause becomes a Lean theorem about the function's Lean definition. blaze first tries a fixed list of tactics: `omega` for integer arithmetic, `bv_decide` for bit operations, `simp` and `grind` for the rest. Most obligations in ordinary code end there, and the author writes nothing.")
+        Code max(lang: "rust", text: `fn max(a: u32, b: u32) -> u32
+            ensures result >= a, result >= b, result == a || result == b
+        \{
+            if a >= b \{ a } else \{ b }
+        }
+        // blaze generates three theorems; omega proves each one.`)
+        P inline("When the tactics fail, the function carries a proof: a `proof by lean \{ ... }` block after its body, in the same `.rs` file. Inside it is plain Lean, with the obligation as the goal. The proof moves with the code, is reviewed in the same diff, and fails the build when the code changes under it.")
+        Code merge(lang: "rust", text: `spec fn sorted(v: &[i32]) -> bool \{
+            forall |i: usize, j: usize| i < j && j < v.len() ==> v[i] <= v[j]
+        }
+
+        fn merge(a: &[i32], b: &[i32]) -> Vec<i32>
+            requires sorted(a), sorted(b)
+            ensures sorted(&result), result.len() == a.len() + b.len()
+        \{
+            let (mut i, mut j, mut out) = (0, 0, Vec::with_capacity(a.len() + b.len()));
+            while i < a.len() || j < b.len()
+                invariant sorted(&out), out.len() == i + j,
+                    forall |k: usize| k < out.len() ==> (i < a.len() ==> out[k] <= a[i])
+                                                    && (j < b.len() ==> out[k] <= b[j])
+            \{
+                if j == b.len() || (i < a.len() && a[i] <= b[j]) \{ out.push(a[i]); i += 1; }
+                else \{ out.push(b[j]); j += 1; }
+            }
+            out
+        }
+        proof by lean \{
+          -- the goal: the loop invariant holds after each push
+          intro i j out hinv hcond
+          unfold sorted at *
+          split <;> grind [List.getElem_append]
+        }`)
+
+        H3 imports("Import both ways")
+        P lean_to_rust("Specs can name existing Lean definitions and theorems. `use lean::...` brings a Lean name into scope for specs only, so a spec can say \"sorted\" the way Mathlib says it and a proof can use every lemma Mathlib already has about it.") {
+          (Cites, refs.mathlib)
+        }
+        Code sort(lang: "rust", text: `use lean::List::SortedLE;   // Mathlib.Data.List.Sort
+        use lean::List::Perm;       // Lean core
+
+        pub fn sort(v: &mut Vec<i32>)
+            ensures SortedLE(view(v)), Perm(view(v), view(old(v)))
+        \{
+            // ...
+        }`)
+        P rust_to_lean("The other way, every Rust function appears in Lean as a definition, under its crate and module path. A Lean proof can unfold it, rewrite with it and prove lemmas about it, and other proofs can use those lemmas. `max` from the first example becomes this:")
+        Code max_lean(lang: "", text: `def max (a b : U32) : Result U32 :=
+          if a >= b then ok a else ok b`)
+        P runtime("Optionally, Lean code compiled to C could be called from Rust at run time, through a capability (RFC 0001), so a verified Lean decision procedure could run inside a Rust program. This is an open question, below.") {
+          (Cites, refs.lean_ffi)
+        }
+
+        H3 translation("MIR to Lean, one function at a time")
+        P aeneas("The translation follows Aeneas. Safe Rust's ownership rules make it possible to translate without a model of the heap: a shared borrow becomes the value, and a mutation becomes a functional update. A `&mut` argument becomes a value passed in plus a backward function that returns its new value to the caller. Loops become recursive functions. A panic becomes `Result.fail`.") {
+          (Cites, refs.aeneas)
+          (Cites, refs.charon)
+        }
+        P model("What MIR means is defined once, in Lean, starting from MiniRust, Ralf Jung's precise specification of a Rust core close to MIR. The translation for each kind of MIR statement is then checked against that model, so the Lean definition of a function is known to mean what its MIR means. Without the model, the translation would be one more thing to trust.") {
+          (Cites, refs.minirust)
+        }
+
+        H3 obligations("Obligations the compiler adds")
+        P generated("Some theorems are generated without a spec:")
+        Ul generated_list {
+          Li panics("**No panics where none are allowed.** A function that says it cannot panic gets an obligation at each arithmetic operation that can overflow and each index that can be out of bounds.")
+          Li loops("**Loop invariants.** An `invariant` clause holds on entry and is preserved by each iteration.")
+          Li effects("**Effect claims** from RFC 0001. A function with no `Alloc` gets a theorem that no path reaches the allocator, which the translation can state because calls to it are explicit in MIR.")
+        }
+
+        H3 cache("The proof cache")
+        P key("A proof is cached under the hash of the function's MIR plus the specs of the functions it calls, not their bodies. Changing a callee's body without changing its spec does not recheck its callers. This is the same unit as blaze's function cache, and it uses the same store.") {
+          (Cites, refs.fn_cache)
+        }
+
+        H3 process("Lean inside the compiler")
+        P embedded("blaze embeds Lean from the start. Lean 4 is written in Lean and compiles to C, and its runtime is a C library with a C header, `lean.h`. blaze links Lean's runtime and elaborator into its own binary, the way a C program links any library.") {
+          (Cites, refs.lean_ffi)
+        }
+        P warm("At startup, blaze initializes the Lean runtime and the modules it needs, Lean's own and Mathlib's, once. The environment they build, every definition and theorem Mathlib has, then stays in memory for as long as blaze runs. Each obligation is a call into the elaborator and the kernel: no process boundary, no pipe and no JSON, and nothing to load again between edits.")
+        P repl("The community `repl`, which runs Lean as a subprocess and talks JSON on stdin, stays useful as a debugging fallback: an obligation can be written out and replayed there by hand. It is not how blaze checks proofs.") {
+          (Cites, refs.lean_repl)
+        }
+
+        H3 editor("In the editor")
+        P lsp("blaze's language server shows the proof state inline: the goal at the cursor inside a `proof by lean` block, which obligations were proved automatically and by which tactic, and which ones failed. A failed obligation is a diagnostic on the clause it came from.")
+
+        H3 trust("What a proof rests on")
+        P boundary("`unsafe` functions and `extern` functions cannot be translated. They state an assumed `ensures` instead, which is trusted, like `unsafe impl Send`. For every proof, the compiler lists every assumption it rests on: assumed specs, axioms used by the Lean proof, and the MIR model itself. A reviewer reads that list, not the proof.")
+
+        H3 terms("Terms")
+        P backend("Lean here is the verification backend, not a code-generation backend. It checks claims and produces nothing that runs. Machine code still comes from blaze's normal backends, from the same MIR, and a function with a spec is compiled the same way as one without.")
+      }
+
+      Section buys(title: "What it buys") {
+        Ul list {
+          Li proofs("Claims about behaviour, checked on every build: sorted, in bounds, never overflows, never allocates.")
+          Li one_file("Specs and proofs in the same file and the same diff as the code, so they cannot drift.")
+          Li mathlib("Mathlib's definitions and lemmas, usable in Rust specs, instead of writing a new library of facts.")
+          Li incremental("Incremental proof checking: an edit rechecks the functions whose MIR or callee specs changed, and nothing else.")
+          Li llm("A loop language models are good at: write the proof, read the goal Lean shows, fix it. The compiler is the referee.")
+          Li review("Review by assumptions: a diff that adds an assumed spec or an axiom shows up in the list a proof rests on.")
+        }
+      }
+
+      Section prior(title: "Prior art") {
+        Ul list {
+          Li verus("[[verus]]: specs and proofs in the Rust file, `spec fn`, `requires` and `ensures`, checked by an SMT solver. The surface syntax here follows it.")
+          Li aeneas("[[aeneas]] and [[charon]]: Rust to Lean from MIR, with backward functions for `&mut`. The translation here follows it.")
+          Li creusot("[[creusot]]: Rust specs in a Rust-like language, proved through Why3.")
+          Li prusti("[[prusti]]: Rust specs checked by the Viper verifier.")
+          Li kani("[[kani]]: bounded model checking of Rust, used on std.")
+          Li flux("[[flux]]: refinement types for Rust: the checkable claim lives in the type.")
+          Li hax("[[hax]]: Rust to F*, Lean and Rocq, for cryptographic code.")
+          Li minirust("[[minirust]]: a precise specification of a Rust core close to MIR, the model the translation is checked against.")
+          Li std("[[verify_std]]: the AWS-led challenge to verify Rust's standard library, and the specs it has written so far.")
+          Li lean("[[lean_ffi]] and [[mathlib]]: the Lean side. [[lean_repl]]: Lean as a subprocess that answers JSON, the usual way tools drive Lean today.")
+        }
+      }
+
+      Section issues(title: "Open issues") {
+        Issue interior(title: "Interior mutability and dyn") {
+          (Status, Open)
+          P q("The Aeneas translation needs ownership to be visible. `Cell`, `RefCell`, `Mutex` and `dyn Trait` hide it: the first three mutate through a shared borrow, and a trait object hides which function is called. Options: a heap model for these types only, specs on each trait method, or no proofs through them.")
+        }
+        Issue closures(title: "Closures that capture &mut") {
+          (Status, Open)
+          P q("A closure that captures a `&mut` needs a backward function of its own, and a higher-order function that calls it an unknown number of times needs a spec that says what it may do to its captures. Aeneas does not support this in general yet.")
+        }
+        Issue concurrency(title: "Concurrency") {
+          (Status, Open)
+          P q("Threads, atomics and channels are outside a sequential translation. Proving things about concurrent code needs a separation logic, as Verus and Iris do, and is out of scope for the first version. Sequential functions called from threads are still provable.")
+        }
+        Issue std_specs(title: "Specs for std") {
+          (Status, Open)
+          P q("Every proof that calls `Vec::push` needs a spec for it. How much of std gets specs, who writes them, and are they proved or assumed? The verify-rust-std challenge is writing some; Aeneas ships a Lean model of parts of std. Start with what those already have.") { (Cites, refs.verify_std) }
+        }
+        Issue stability(title: "Proofs across Lean and Mathlib versions") {
+          (Status, Open)
+          P q("Lean and Mathlib change often, rename lemmas and change what `simp` does. A proof that passes today can fail after an upgrade. Pin a Lean toolchain and a Mathlib commit per edition, as the issue on one Lean version per blaze release asks? And who fixes broken proofs in dependencies?")
+        }
+        Issue time(title: "Proof checking time in the edit loop") {
+          (Status, Open)
+          P q("`grind` and `bv_decide` can take seconds; blaze's rebuilds take milliseconds. Proofs probably run in the background after the type check, with results shown when they arrive, and block only the final build. Needs measuring on real code.")
+        }
+        Issue syntax(title: "Lean syntax inside Rust files") {
+          (Status, Open)
+          P q("A `proof by lean \{ ... }` block is not Rust tokens: Lean has its own comments, Unicode operators and indentation rules. The tokenizer has to treat the block as one opaque token, found by matching braces, and editors need to highlight it as Lean. Alternatives: a raw string, or a `.lean` file next to the `.rs` file.")
+        }
+        Issue runtime(title: "Calling Lean code at run time") {
+          (Status, Open)
+          P q("Lean compiles to C and has an FFI, so Rust could call Lean functions, gated by a capability. That pulls in Lean's runtime and reference counting. Is it worth it, and is it this RFC or another?") { (Cites, refs.lean_ffi) }
+        }
+        Issue semantics(title: "Trusting the MIR semantics") {
+          (Status, Open)
+          P q("The proofs are only as good as the Lean model of MIR. MiniRust is precise but not finished, and MIR changes between Rust versions. Who maintains the model, and how is it tested against what blaze's backends actually generate?") { (Cites, refs.minirust) }
+        }
+        Issue unsafe_code(title: "unsafe") {
+          (Status, Open)
+          P q("Assumed specs make `unsafe` code usable from proofs but prove nothing about it. Proving `unsafe` code correct needs a memory model in Lean, which MiniRust has. Start with assumed specs, listed in every proof that uses them, and add proofs for `unsafe` later.")
+        }
+        Issue link_size(title: "Binary size and build time") {
+          (Status, Open)
+          P q("Embedding Lean puts its toolchain inside blaze, and the proofs need Mathlib's compiled `.olean` files, several gigabytes of them. Is Lean linked into every blaze binary, or loaded only when a crate uses specs? Are Mathlib's files downloaded prebuilt, as Mathlib's own cache does, and how much does that add to installing blaze and to building it?")
+        }
+        Issue lean_threads(title: "Lean's runtime and blaze's threads") {
+          (Status, Open)
+          P q("Lean's objects are reference counted, and an object shared between threads has to be marked for atomic counts first. Each thread that calls into Lean has to be set up for it. blaze compiles on many threads. Which threads may call Lean, how a shared environment is handed to them, and what happens to the compiler when Lean panics or runs out of memory?")
+        }
+        Issue lean_version(title: "One Lean version per blaze release") {
+          (Status, Open)
+          P q("With Lean linked in, the Lean version is the one blaze was built with, and Mathlib has to match it exactly. Upgrading blaze upgrades Lean and Mathlib for every crate at once. Does each blaze release pin one Lean and one Mathlib, tied to the edition, and how do crates keep proofs that an upgrade breaks?")
+        }
+        Issue olean_mmap(title: "Loading .olean files") {
+          (Status, Open)
+          P q("Lean loads a module's compiled `.olean` file by mapping it into memory. With Mathlib that is a large part of startup. Can blaze map them once and share them across its processes and across restarts, and does the mapping need a fixed address that a host process may already be using?")
+        }
+      }
+
+      References refs
+    }
+
+    // (DependsOn, RFC 0002). The content mapper takes only plain names as pair targets and
+    // "linear-types" has a hyphen, so the pair is added here, in a form the mapper skips.
+    with (DependsOn, "site.rfcs.linear-types") { lean {} }
+  }
+}

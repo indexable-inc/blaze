@@ -1,0 +1,223 @@
+--- frame 0
+     Waiting for the daemon 0.10s
+--- frame 40
+   Compiling the standard library of build scripts 3.54s
+--- frame 80
+   Compiling the standard library of build scripts 7.70s
+--- frame 120
+   Compiling the standard library of build scripts 11.8s
+--- frame 160
+   Finishing 15.7s
+--- frame 200
+   Resolving names 0.11s · 0/56 crates
+             rg  resolving  0.04s
+             0 done · 1 under way · 34 waiting · longest chain 0.04s: rg ← grep ← grep_cli ← globset ← bstr …
+--- frame 240
+   Resolving names 0.21s · 2/56 crates · longest rg
+             rg  resolving  0.14s
+             ├─ textwrap  resolving  0.14s
+             │  └─ std  resolving  0.03s
+             ├─ lexopt waiting
+             ├─ anyhow waiting
+             ├─ log waiting
+             ├─ termcolor waiting
+             ├─ serde_json waiting
+             │  ├─ memchr waiting
+             │  ├─ ryu waiting
+             0 done · 3 under way · 32 waiting · longest chain 0.44s: rg ← textwrap ← std
+--- frame 280
+   Resolving names 0.41s · 35/56 crates · longest rg
+             rg  resolving  0.35s
+             ├─ ignore  resolving  0.23s
+             │  ├─ globset  resolving  0.22s
+             │  │  ├─ bstr  resolving  0.21s
+             │  │  │  └─ regex_automata  resolving  0.20s
+             └─ grep  resolving  0.17s
+                ├─ grep_regex  resolving  0.17s
+                ├─ grep_printer  resolving  0.11s
+                │  └─ grep_searcher waiting
+                └─ grep_cli waiting
+             0 done · 8 under way · 27 waiting · longest chain 1.39s: rg ← ignore ← globset ← bstr ← regex_a…
+--- frame 320
+     Storing the resolved names 0.08s
+             0 done · 0 under way · 35 waiting · longest chain 2.33s: rg ← grep ← grep_printer ← grep_search…
+--- frame 360
+   Compiling the standard library (once, kept in the store) 3.78s
+             0 done · 0 under way · 35 waiting · longest chain 2.33s: rg ← grep ← grep_printer ← grep_search…
+--- frame 400
+   Compiling the standard library (once, kept in the store) 7.95s
+             0 done · 0 under way · 35 waiting · longest chain 2.33s: rg ← grep ← grep_printer ← grep_search…
+--- frame 440
+   Compiling rg 0.58s
+             rg  compiling 176 fns  0.38s
+             ├─ ignore  compiling 51 fns  0.28s
+             │  ├─ globset  compiling 1 fns  0.28s
+             │  │  ├─ std  compiling 67 fns  0.38s
+             │  │  ├─ bstr  compiling 6 fns  0.28s
+             │  │  │  ├─ regex_automata waiting
+             │  │  │  │  ├─ regex_syntax waiting
+             │  │  │  │  ├─ aho_corasick waiting
+             │  │  │  │  │  └─ memchr waiting
+             │  │  ├─ log  compiling 13 fns  0.28s
+             11 more under way
+             0 done · 17 under way · 18 waiting · longest chain 3.98s: rg ← grep ← grep_printer ← grep_searc…
+--- frame 480
+   Compiling rg 0.69s
+             rg  compiling 1749 fns  0.49s
+             ├─ ignore  compiling 279 fns  0.39s
+             │  ├─ globset  compiling 108 fns  0.39s
+             │  │  ├─ std  compiling 520 fns  0.49s
+             │  │  ├─ bstr  compiling 15 fns  0.39s
+             │  │  │  ├─ regex_automata  compiling 32 fns  0.19s
+             │  │  │  │  ├─ regex_syntax  compiling 137 fns  0.19s
+             │  │  │  │  ├─ memchr  compiling 1 fns  0.09s
+             │  │  │  │  └─ aho_corasick waiting
+             │  │  ├─ log  compiling 46 fns  0.39s
+             15 more under way
+             0 done · 24 under way · 11 waiting · longest chain 4.87s: rg ← grep ← grep_printer ← grep_searc…
+--- frame 520
+   Compiling rg 0.99s
+             rg  compiling 2016 fns  0.79s
+             ├─ ignore  compiling 553 fns  0.69s
+             │  ├─ globset  compiling 280 fns  0.69s
+             │  │  ├─ std  compiling 1130 fns  0.79s
+             │  │  ├─ bstr  compiling 35 fns  0.69s
+             │  │  │  ├─ regex_automata  compiling 593 fns  0.49s
+             │  │  │  │  ├─ regex_syntax  compiling 341 fns  0.49s
+             │  │  │  │  ├─ memchr  compiling 2 fns  0.39s
+             │  │  │  │  └─ aho_corasick  compiling 16 fns  0.29s
+             │  │  ├─ log  compiling 49 fns  0.69s
+             15 more under way
+             0 done · 25 under way · 10 waiting · longest chain 7.13s: rg ← grep ← grep_printer ← grep_searc…
+--- frame 560
+   Compiling rg 1.19s
+             rg  compiling 2278 fns  0.99s
+             ├─ ignore  compiling 773 fns  0.89s
+             │  ├─ globset  compiling 361 fns  0.89s
+             │  │  ├─ std  compiling 1649 fns  0.99s
+             │  │  ├─ bstr  compiling 40 fns  0.89s
+             │  │  │  ├─ regex_automata  compiling 1314 fns  0.69s
+             │  │  │  │  ├─ regex_syntax  compiling 566 fns  0.69s
+             │  │  │  │  ├─ memchr  compiling 12 fns  0.59s
+             │  │  │  │  └─ aho_corasick  compiling 154 fns  0.49s
+             │  │  ├─ log  compiling 49 fns  0.89s
+             15 more under way
+             0 done · 25 under way · 10 waiting · longest chain 8.74s: rg ← grep ← grep_printer ← grep_searc…
+--- frame 600
+   Compiling rg 1.39s
+             rg  compiling 2501 fns  1.19s
+             ├─ ignore  compiling 949 fns  1.09s
+             │  ├─ globset  compiling 371 fns  1.09s
+             │  │  ├─ std  compiling 2052 fns  1.19s
+             │  │  ├─ bstr  compiling 44 fns  1.09s
+             │  │  │  ├─ regex_automata  compiling 2446 fns  0.89s
+             │  │  │  │  ├─ regex_syntax  compiling 876 fns  0.89s
+             │  │  │  │  ├─ memchr  compiling 41 fns  0.79s
+             │  │  │  │  └─ aho_corasick  compiling 347 fns  0.69s
+             │  │  ├─ log  compiling 49 fns  1.09s
+             16 more under way
+             0 done · 26 under way · 9 waiting · longest chain 10.3s: rg ← grep ← grep_printer ← grep_search…
+--- frame 640
+   Compiling rg 1.59s
+             rg  compiling 3136 fns  1.39s
+             ├─ ignore  compiling 1113 fns  1.29s
+             │  ├─ globset  compiling 427 fns  1.29s
+             │  │  ├─ std  compiling 2534 fns  1.39s
+             │  │  ├─ bstr  compiling 56 fns  1.29s
+             │  │  │  ├─ regex_automata  compiling 3523 fns  1.09s
+             │  │  │  │  ├─ regex_syntax  compiling 1397 fns  1.09s
+             │  │  │  │  ├─ memchr  compiling 73 fns  0.99s
+             │  │  │  │  └─ aho_corasick  compiling 618 fns  0.89s
+             │  │  ├─ log  compiling 49 fns  1.29s
+             17 more under way
+             0 done · 27 under way · 8 waiting · longest chain 11.9s: rg ← grep ← grep_printer ← grep_search…
+--- frame 680
+   Compiling rg 1.79s
+             rg  compiling 3527 fns  1.59s
+             ├─ ignore  compiling 1229 fns  1.49s
+             │  ├─ globset  compiling 447 fns  1.49s
+             │  │  ├─ std  compiling 3044 fns  1.59s
+             │  │  ├─ bstr  compiling 66 fns  1.49s
+             │  │  │  ├─ regex_automata  compiling 4144 fns  1.29s
+             │  │  │  │  ├─ regex_syntax  compiling 1764 fns  1.29s
+             │  │  │  │  ├─ memchr  compiling 87 fns  1.19s
+             │  │  │  │  └─ aho_corasick  compiling 883 fns  1.09s
+             │  │  ├─ log  compiling 49 fns  1.49s
+             18 more under way
+             0 done · 28 under way · 7 waiting · longest chain 13.5s: rg ← grep ← grep_printer ← grep_search…
+--- frame 720
+   Compiling rg 1.99s
+             rg  compiling 3774 fns  1.79s
+             ├─ ignore  compiling 1379 fns  1.69s
+             │  ├─ globset  compiling 480 fns  1.69s
+             │  │  ├─ std  compiling 3768 fns  1.79s
+             │  │  ├─ bstr  compiling 71 fns  1.69s
+             │  │  │  ├─ regex_automata  compiling 4344 fns  1.49s
+             │  │  │  │  ├─ regex_syntax  compiling 1995 fns  1.49s
+             │  │  │  │  ├─ memchr  compiling 104 fns  1.39s
+             │  │  │  │  └─ aho_corasick  compiling 1225 fns  1.29s
+             │  │  ├─ log  compiling 49 fns  1.69s
+             18 more under way
+             0 done · 28 under way · 7 waiting · longest chain 15.1s: rg ← grep ← grep_printer ← grep_search…
+--- frame 760
+   Compiling rg 2.19s
+             rg  compiling 4263 fns  1.99s
+             ├─ ignore  compiling 1444 fns  1.89s
+             │  ├─ globset  compiling 495 fns  1.89s
+             │  │  ├─ std  compiling 4500 fns  1.99s
+             │  │  ├─ bstr  compiling 79 fns  1.89s
+             │  │  │  ├─ regex_automata  compiling 5586 fns  1.69s
+             │  │  │  │  ├─ regex_syntax  compiling 2457 fns  1.69s
+             │  │  │  │  ├─ memchr  compiling 196 fns  1.59s
+             │  │  │  │  └─ aho_corasick  compiling 1646 fns  1.49s
+             │  │  ├─ log  compiling 49 fns  1.89s
+             19 more under way
+             0 done · 29 under way · 6 waiting · longest chain 16.7s: rg ← grep ← grep_printer ← grep_search…
+--- frame 800
+   Compiling rg 2.39s
+             rg  compiling 4768 fns  2.19s
+             ├─ ignore  compiling 1757 fns  2.09s
+             │  ├─ globset  compiling 499 fns  2.09s
+             │  │  ├─ std  compiling 5326 fns  2.19s
+             │  │  ├─ bstr  compiling 83 fns  2.09s
+             │  │  │  ├─ regex_automata  compiling 7014 fns  1.89s
+             │  │  │  │  ├─ regex_syntax  compiling 2872 fns  1.89s
+             │  │  │  │  ├─ memchr  compiling 240 fns  1.79s
+             │  │  │  │  └─ aho_corasick  compiling 2085 fns  1.69s
+             │  │  ├─ log  compiling 49 fns  2.09s
+             19 more under way
+             0 done · 29 under way · 6 waiting · longest chain 18.3s: rg ← grep ← grep_printer ← grep_search…
+--- frame 840
+   Compiling rg 4.00s · 31268/2923 fns
+             rg  compiling 5290 fns  3.79s
+             ├─ ignore  compiling 1912 fns  3.69s
+             │  ├─ globset  compiling 499 fns  3.69s
+             │  │  ├─ std  compiling 6275 fns  3.79s
+             │  │  ├─ bstr waiting
+             │  │  │  ├─ regex_automata  compiling 7318 fns  3.49s
+             │  │  │  │  ├─ regex_syntax  compiling 3368 fns  3.49s
+             │  │  │  │  ├─ memchr  compiling 240 fns  3.39s
+             │  │  │  │  └─ aho_corasick waiting
+             │  │  ├─ log  compiling 49 fns  3.69s
+             17 more under way
+             5 done · 25 under way · 5 waiting · longest chain 31.0s: rg ← grep ← grep_printer ← grep_search…
+--- frame 880
+     Linking rg 0.13s · 31268/31268 fns
+             35 done (5 up to date) · 0 under way · 0 waiting · longest chain 30.6s: rg ← grep ← grep_printe…
+--- frame 920
+   Finishing 33.2s · 31268/31268 fns
+             35 done (5 up to date) · 0 under way · 0 waiting · longest chain 30.6s: rg ← grep ← grep_printe…
+--- left on the screen (921 frames drawn)
+Downloading Rust nightly-2026-10-27 for blaze (144 MB, once)...
+Downloaded Rust nightly-2026-10-27 for blaze in 5.0s.
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.ZOTyZV7zQT/ripgrep)
+    Compiled the standard library of build scripts in 11.9s
+       Built build scripts and proc macros in 3.58s
+    Resolved names in 0.73s
+    Compiled the standard library (once, kept in the store) in 8.67s
+      Linked rg in 0.82s
+      Stored the manifest in 2.82s
+    Compiled 31268 fns in 35 crates, 0 kept; 33.2s
+        Took 33.2s: compiling the standard library (once, kept in the store) 20.6s, compiling functions 3.97s, building build scripts and proc macros 3.71s
+       Cache cold: the store is empty
+    Finished `dev` profile [blaze] target(s) in 33.32s

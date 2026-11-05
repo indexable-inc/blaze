@@ -1,0 +1,6 @@
+len 100
+sum 338350
+keys [25, 50, 75, 100]
+get 7 Some(49), get 101 None
+words [("and", 2), ("bat", 1), ("cat", 1), ("hat", 1), ("the", 3)]
+set 7

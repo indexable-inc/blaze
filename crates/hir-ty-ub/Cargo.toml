@@ -1,0 +1,39 @@
+[package]
+name = "hir-ty-ub"
+description = "blaze's checker of undefined behavior: Miri's Tree Borrows, alignment, uninitialized bytes, provenance, bounds, invalid values, use after free, leaks and data races, over hir-ty-mir's MIR evaluator (`blaze test --ub`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+either.workspace = true
+smallvec.workspace = true
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+base-db.workspace = true
+blaze-query.workspace = true
+blaze-ids.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-print.workspace = true
+hir-ty-mir.workspace = true
+intern.workspace = true
+span.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

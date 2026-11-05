@@ -1,0 +1,3 @@
+{
+ "error": "error: failed to parse manifest at `$ROOT/Cargo.toml`\nCaused by:\n  `lto` setting of string `\"false\"` for `release` profile is not a valid setting, must be a boolean (`true`/`false`) or a string (`\"thin\"`/`\"fat\"`/`\"off\"`) or omitted."
+}

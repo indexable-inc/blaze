@@ -1,0 +1,31 @@
+[package]
+name = "blaze-check"
+description = "blaze's model checker for lock-free code: std's atomics, locks and threads as coroutines on one OS thread, explored under every interleaving to a preemption bound (loom's bounded DPOR) and every value a load may read under C11 (docs/v2/plan/lanes/safety/model.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-rng.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

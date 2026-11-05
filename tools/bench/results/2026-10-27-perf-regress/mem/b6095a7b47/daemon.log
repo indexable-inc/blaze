@@ -1,0 +1,3 @@
+daemon 0.1.0-c0e270bb-75840a0-18e288fd7042006f (blaze 0.1.0 (b6095a7)) of pid 432256 listens on /root/perf/mem-ws/b6095a7b47/home/daemon.sock
+worker ee56cce433746851 of pid 432270 for /root/perf/mem-ws/b6095a7b47/rg/
+/root/perf/mem-ws/b6095a7b47/rg: ready

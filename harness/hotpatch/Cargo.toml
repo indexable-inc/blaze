@@ -1,0 +1,14 @@
+[package]
+name = "hotprobe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A program that runs `answer()` through subsecond::call and says when it changes; harness/hotpatch.py edits it"
+
+[dependencies]
+# The versions of the dx that patches it (Dioxus 0.7.10, the bench shell's).
+dioxus-devtools = "=0.7.10"
+subsecond = "=0.7.10"
+
+# Its own workspace and lock, like harness/live.
+[workspace]

@@ -1,0 +1,8 @@
+var Ok("smoke")
+unset true
+args ["one", "two words"]
+cwd has Cargo.toml true
+entries ["b.txt", "sub"]
+b.txt "hello\nworld\n"
+c.txt 3 bytes
+removed true

@@ -1,0 +1,25 @@
+# rustc's `rustc_abi`, as it is at the toolchain in `harness/toolchain` (nightly-2026-10-25,
+# rustc 1.101.0-nightly 12433c307 2026-10-24): `src` is `compiler/rustc_abi/src` of
+# rust-lang/rust at commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0, unchanged. It takes the
+# place of the crates.io `ra-ap-rustc_abi`, whose snapshots are of no stable release.
+[package]
+name = "rustc_abi"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rustc_abi"
+
+[features]
+# rustc's own, which `src` (copied unchanged from rust-lang/rust at each toolchain bump) names.
+# Both need the compiler's own crates, so nothing in blaze turns them on.
+nightly = []
+randomize = []
+
+[dependencies]
+bitflags.workspace = true
+rustc_hashes.workspace = true
+rustc_index.workspace = true
+tracing = { workspace = true, features = ["default"] }

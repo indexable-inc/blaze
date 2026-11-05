@@ -1,0 +1,17 @@
+[package]
+name = "wasi_rt"
+version = "0.0.0"
+license = "MIT OR Apache-2.0"
+description = "The C runtime of blaze's wasm64-blaze-wasip1 target, in Rust, in place of wasi-libc"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+doc = false
+
+[dependencies]
+core = { path = "../rustc-std-workspace-core", package = "rustc-std-workspace-core" }
+libc = { version = "0.2.191", default-features = false, features = ['rustc-dep-of-std'] }
+wasip1 = { version = "1.0.0", default-features = false, features = ['rustc-dep-of-std'] }
+dlmalloc = { version = "0.2.10", features = ['rustc-dep-of-std'] }

@@ -1,0 +1,2001 @@
+abs.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	abs z0.b, p0/m, z1.b
+abs.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	abs z0.d, p0/m, z1.d
+abs.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	abs z0.s, p0/m, z1.s
+abs.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	abs z0.h, p0/m, z1.h
+adclb.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	adclb z0.d, z1.d, z2.d
+adclb.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	adclb z0.s, z1.s, z2.s
+adclt.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	adclt z0.d, z1.d, z2.d
+adclt.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	adclt z0.s, z1.s, z2.s
+add.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	add z0.b, p0/m, z0.b, z1.b
+add.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	add z0.d, p0/m, z0.d, z1.d
+add.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	add z0.s, p0/m, z0.s, z1.s
+add.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	add z0.h, p0/m, z0.h, z1.h
+addhnb.nxv2i64	nxv2i64,nxv2i64	nxv4i32	addhnb z0.s, z0.d, z1.d
+addhnb.nxv4i32	nxv4i32,nxv4i32	nxv8i16	addhnb z0.h, z0.s, z1.s
+addhnb.nxv8i16	nxv8i16,nxv8i16	nxv16i8	addhnb z0.b, z0.h, z1.h
+addhnt.nxv2i64	nxv4i32,nxv2i64,nxv2i64	nxv4i32	addhnt z0.s, z1.d, z2.d
+addhnt.nxv4i32	nxv8i16,nxv4i32,nxv4i32	nxv8i16	addhnt z0.h, z1.s, z2.s
+addhnt.nxv8i16	nxv16i8,nxv8i16,nxv8i16	nxv16i8	addhnt z0.b, z1.h, z2.h
+addp.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	addp z0.b, p0/m, z0.b, z1.b
+addp.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	addp z0.d, p0/m, z0.d, z1.d
+addp.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	addp z0.s, p0/m, z0.s, z1.s
+addp.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	addp z0.h, p0/m, z0.h, z1.h
+adrb.nxv2i64	nxv2i64,nxv2i64	nxv2i64	adr z0.d, [z0.d, z1.d]
+adrb.nxv4i32	nxv4i32,nxv4i32	nxv4i32	adr z0.s, [z0.s, z1.s]
+adrd.nxv2i64	nxv2i64,nxv2i64	nxv2i64	adr z0.d, [z0.d, z1.d, lsl #3]
+adrd.nxv4i32	nxv4i32,nxv4i32	nxv4i32	adr z0.s, [z0.s, z1.s, lsl #3]
+adrh.nxv2i64	nxv2i64,nxv2i64	nxv2i64	adr z0.d, [z0.d, z1.d, lsl #1]
+adrh.nxv4i32	nxv4i32,nxv4i32	nxv4i32	adr z0.s, [z0.s, z1.s, lsl #1]
+adrw.nxv2i64	nxv2i64,nxv2i64	nxv2i64	adr z0.d, [z0.d, z1.d, lsl #2]
+adrw.nxv4i32	nxv4i32,nxv4i32	nxv4i32	adr z0.s, [z0.s, z1.s, lsl #2]
+aesd	nxv16i8,nxv16i8	nxv16i8	aesd z0.b, z0.b, z1.b
+aese	nxv16i8,nxv16i8	nxv16i8	aese z0.b, z0.b, z1.b
+aesimc	nxv16i8	nxv16i8	aesimc z0.b, z0.b
+aesmc	nxv16i8	nxv16i8	aesmc z0.b, z0.b
+and.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	and z0.b, p0/m, z0.b, z1.b
+and.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	and z0.d, p0/m, z0.d, z1.d
+and.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	and z0.s, p0/m, z0.s, z1.s
+and.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	and z0.h, p0/m, z0.h, z1.h
+and.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	and p0.b, p0/z, p1.b, p2.b
+andv.nxv16i8	nxv16i1,nxv16i8	i8	andv b0, p0, z0.b; fmov w0, s0
+andv.nxv2i64	nxv2i1,nxv2i64	i64	andv d0, p0, z0.d; fmov x0, d0
+andv.nxv4i32	nxv4i1,nxv4i32	i32	andv s0, p0, z0.s; fmov w0, s0
+andv.nxv8i16	nxv8i1,nxv8i16	i16	andv h0, p0, z0.h; fmov w0, s0
+asr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	asr z0.b, p0/m, z0.b, z1.b
+asr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	asr z0.d, p0/m, z0.d, z1.d
+asr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	asr z0.s, p0/m, z0.s, z1.s
+asr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	asr z0.h, p0/m, z0.h, z1.h
+asr.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i8	asr z0.b, p0/m, z0.b, z1.d
+asr.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i32	asr z0.s, p0/m, z0.s, z1.d
+asr.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i16	asr z0.h, p0/m, z0.h, z1.d
+asrd.nxv16i8	nxv16i1,nxv16i8,i32=1	nxv16i8	asrd z0.b, p0/m, z0.b, #1
+asrd.nxv16i8	nxv16i1,nxv16i8,i32=8	nxv16i8	asrd z0.b, p0/m, z0.b, #8
+asrd.nxv2i64	nxv2i1,nxv2i64,i32=1	nxv2i64	asrd z0.d, p0/m, z0.d, #1
+asrd.nxv2i64	nxv2i1,nxv2i64,i32=64	nxv2i64	asrd z0.d, p0/m, z0.d, #64
+asrd.nxv4i32	nxv4i1,nxv4i32,i32=1	nxv4i32	asrd z0.s, p0/m, z0.s, #1
+asrd.nxv4i32	nxv4i1,nxv4i32,i32=32	nxv4i32	asrd z0.s, p0/m, z0.s, #32
+asrd.nxv8i16	nxv8i1,nxv8i16,i32=1	nxv8i16	asrd z0.h, p0/m, z0.h, #1
+asrd.nxv8i16	nxv8i1,nxv8i16,i32=16	nxv8i16	asrd z0.h, p0/m, z0.h, #16
+bcax.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	bcax z0.d, z0.d, z1.d, z2.d
+bcax.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	bcax z0.d, z0.d, z1.d, z2.d
+bcax.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	bcax z0.d, z0.d, z1.d, z2.d
+bcax.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	bcax z0.d, z0.d, z1.d, z2.d
+bdep.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	bdep z0.b, z0.b, z1.b
+bdep.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	bdep z0.d, z0.d, z1.d
+bdep.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	bdep z0.s, z0.s, z1.s
+bdep.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	bdep z0.h, z0.h, z1.h
+bext.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	bext z0.b, z0.b, z1.b
+bext.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	bext z0.d, z0.d, z1.d
+bext.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	bext z0.s, z0.s, z1.s
+bext.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	bext z0.h, z0.h, z1.h
+bgrp.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	bgrp z0.b, z0.b, z1.b
+bgrp.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	bgrp z0.d, z0.d, z1.d
+bgrp.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	bgrp z0.s, z0.s, z1.s
+bgrp.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	bgrp z0.h, z0.h, z1.h
+bic.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	bic z0.b, p0/m, z0.b, z1.b
+bic.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	bic z0.d, p0/m, z0.d, z1.d
+bic.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	bic z0.s, p0/m, z0.s, z1.s
+bic.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	bic z0.h, p0/m, z0.h, z1.h
+bic.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	bic p0.b, p0/z, p1.b, p2.b
+brka.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	brka p0.b, p1/m, p2.b
+brka.z.nxv16i1	nxv16i1,nxv16i1	nxv16i1	brka p0.b, p0/z, p1.b
+brkb.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	brkb p0.b, p1/m, p2.b
+brkb.z.nxv16i1	nxv16i1,nxv16i1	nxv16i1	brkb p0.b, p0/z, p1.b
+brkn.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	brkn p2.b, p0/z, p1.b, p2.b; mov p0.b, p2.b
+brkpa.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	brkpa p0.b, p0/z, p1.b, p2.b
+brkpb.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	brkpb p0.b, p0/z, p1.b, p2.b
+bsl.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	bsl z0.d, z0.d, z1.d, z2.d
+bsl.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	bsl z0.d, z0.d, z1.d, z2.d
+bsl.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	bsl z0.d, z0.d, z1.d, z2.d
+bsl.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	bsl z0.d, z0.d, z1.d, z2.d
+bsl1n.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	bsl1n z0.d, z0.d, z1.d, z2.d
+bsl1n.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	bsl1n z0.d, z0.d, z1.d, z2.d
+bsl1n.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	bsl1n z0.d, z0.d, z1.d, z2.d
+bsl1n.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	bsl1n z0.d, z0.d, z1.d, z2.d
+bsl2n.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	bsl2n z0.d, z0.d, z1.d, z2.d
+bsl2n.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	bsl2n z0.d, z0.d, z1.d, z2.d
+bsl2n.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	bsl2n z0.d, z0.d, z1.d, z2.d
+bsl2n.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	bsl2n z0.d, z0.d, z1.d, z2.d
+cadd.x.nxv16i8	nxv16i8,nxv16i8,i32=90	nxv16i8	cadd z0.b, z0.b, z1.b, #90
+cadd.x.nxv2i64	nxv2i64,nxv2i64,i32=90	nxv2i64	cadd z0.d, z0.d, z1.d, #90
+cadd.x.nxv4i32	nxv4i32,nxv4i32,i32=90	nxv4i32	cadd z0.s, z0.s, z1.s, #90
+cadd.x.nxv8i16	nxv8i16,nxv8i16,i32=90	nxv8i16	cadd z0.h, z0.h, z1.h, #90
+cdot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=0,i32=0	nxv2i64	cdot z0.d, z1.h, z2.h[0], #0
+cdot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=1,i32=0	nxv2i64	cdot z0.d, z1.h, z2.h[1], #0
+cdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0,i32=0	nxv4i32	cdot z0.s, z1.b, z2.b[0], #0
+cdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=3,i32=0	nxv4i32	cdot z0.s, z1.b, z2.b[3], #0
+cdot.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=0	nxv2i64	cdot z0.d, z1.h, z2.h, #0
+cdot.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0	nxv4i32	cdot z0.s, z1.b, z2.b, #0
+clasta.n.nxv16i8	nxv16i1,i8,nxv16i8	i8	clasta w0, p0, w0, z0.b
+clasta.n.nxv2f64	nxv2i1,f64,nxv2f64	f64	clasta d0, p0, d0, z1.d
+clasta.n.nxv2i64	nxv2i1,i64,nxv2i64	i64	fmov d1, x0; clasta d1, p0, d1, z0.d; fmov x0, d1
+clasta.n.nxv4f32	nxv4i1,f32,nxv4f32	f32	clasta s0, p0, s0, z1.s
+clasta.n.nxv4i32	nxv4i1,i32,nxv4i32	i32	fmov s1, w0; clasta s1, p0, s1, z0.s; fmov w0, s1
+clasta.n.nxv8i16	nxv8i1,i16,nxv8i16	i16	fmov s1, w0; clasta h1, p0, h1, z0.h; fmov w0, s1
+clasta.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	clasta z0.b, p0, z0.b, z1.b
+clasta.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	clasta z0.d, p0, z0.d, z1.d
+clasta.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	clasta z0.d, p0, z0.d, z1.d
+clasta.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	clasta z0.s, p0, z0.s, z1.s
+clasta.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	clasta z0.s, p0, z0.s, z1.s
+clasta.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	clasta z0.h, p0, z0.h, z1.h
+clastb.n.nxv16i8	nxv16i1,i8,nxv16i8	i8	clastb w0, p0, w0, z0.b
+clastb.n.nxv2f64	nxv2i1,f64,nxv2f64	f64	clastb d0, p0, d0, z1.d
+clastb.n.nxv2i64	nxv2i1,i64,nxv2i64	i64	fmov d1, x0; clastb d1, p0, d1, z0.d; fmov x0, d1
+clastb.n.nxv4f32	nxv4i1,f32,nxv4f32	f32	clastb s0, p0, s0, z1.s
+clastb.n.nxv4i32	nxv4i1,i32,nxv4i32	i32	fmov s1, w0; clastb s1, p0, s1, z0.s; fmov w0, s1
+clastb.n.nxv8i16	nxv8i1,i16,nxv8i16	i16	fmov s1, w0; clastb h1, p0, h1, z0.h; fmov w0, s1
+clastb.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	clastb z0.b, p0, z0.b, z1.b
+clastb.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	clastb z0.d, p0, z0.d, z1.d
+clastb.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	clastb z0.d, p0, z0.d, z1.d
+clastb.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	clastb z0.s, p0, z0.s, z1.s
+clastb.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	clastb z0.s, p0, z0.s, z1.s
+clastb.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	clastb z0.h, p0, z0.h, z1.h
+cls.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	cls z0.b, p0/m, z1.b
+cls.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	cls z0.d, p0/m, z1.d
+cls.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	cls z0.s, p0/m, z1.s
+cls.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	cls z0.h, p0/m, z1.h
+clz.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	clz z0.b, p0/m, z1.b
+clz.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	clz z0.d, p0/m, z1.d
+clz.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	clz z0.s, p0/m, z1.s
+clz.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	clz z0.h, p0/m, z1.h
+cmla.lane.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0,i32=0	nxv4i32	cmla z0.s, z1.s, z2.s[0], #0
+cmla.lane.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=1,i32=0	nxv4i32	cmla z0.s, z1.s, z2.s[1], #0
+cmla.lane.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0,i32=0	nxv8i16	cmla z0.h, z1.h, z2.h[0], #0
+cmla.lane.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=3,i32=0	nxv8i16	cmla z0.h, z1.h, z2.h[3], #0
+cmla.x.nxv16i8	nxv16i8,nxv16i8,nxv16i8,i32=0	nxv16i8	cmla z0.b, z1.b, z2.b, #0
+cmla.x.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	cmla z0.d, z1.d, z2.d, #0
+cmla.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	cmla z0.s, z1.s, z2.s, #0
+cmla.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	cmla z0.h, z1.h, z2.h, #0
+cmpeq.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmpeq p0.b, p0/z, z0.b, z1.b
+cmpeq.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmpeq p0.d, p0/z, z0.d, z1.d
+cmpeq.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmpeq p0.s, p0/z, z0.s, z1.s
+cmpeq.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmpeq p0.h, p0/z, z0.h, z1.h
+cmpeq.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmpeq p0.b, p0/z, z0.b, z1.d
+cmpeq.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmpeq p0.s, p0/z, z0.s, z1.d
+cmpeq.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmpeq p0.h, p0/z, z0.h, z1.d
+cmpge.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmpge p0.b, p0/z, z0.b, z1.b
+cmpge.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmpge p0.d, p0/z, z0.d, z1.d
+cmpge.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmpge p0.s, p0/z, z0.s, z1.s
+cmpge.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmpge p0.h, p0/z, z0.h, z1.h
+cmpge.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmpge p0.b, p0/z, z0.b, z1.d
+cmpge.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmpge p0.s, p0/z, z0.s, z1.d
+cmpge.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmpge p0.h, p0/z, z0.h, z1.d
+cmpgt.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmpgt p0.b, p0/z, z0.b, z1.b
+cmpgt.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmpgt p0.d, p0/z, z0.d, z1.d
+cmpgt.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmpgt p0.s, p0/z, z0.s, z1.s
+cmpgt.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmpgt p0.h, p0/z, z0.h, z1.h
+cmpgt.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmpgt p0.b, p0/z, z0.b, z1.d
+cmpgt.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmpgt p0.s, p0/z, z0.s, z1.d
+cmpgt.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmpgt p0.h, p0/z, z0.h, z1.d
+cmphi.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmphi p0.b, p0/z, z0.b, z1.b
+cmphi.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmphi p0.d, p0/z, z0.d, z1.d
+cmphi.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmphi p0.s, p0/z, z0.s, z1.s
+cmphi.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmphi p0.h, p0/z, z0.h, z1.h
+cmphi.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmphi p0.b, p0/z, z0.b, z1.d
+cmphi.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmphi p0.s, p0/z, z0.s, z1.d
+cmphi.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmphi p0.h, p0/z, z0.h, z1.d
+cmphs.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmphs p0.b, p0/z, z0.b, z1.b
+cmphs.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmphs p0.d, p0/z, z0.d, z1.d
+cmphs.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmphs p0.s, p0/z, z0.s, z1.s
+cmphs.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmphs p0.h, p0/z, z0.h, z1.h
+cmphs.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmphs p0.b, p0/z, z0.b, z1.d
+cmphs.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmphs p0.s, p0/z, z0.s, z1.d
+cmphs.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmphs p0.h, p0/z, z0.h, z1.d
+cmple.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmple p0.b, p0/z, z0.b, z1.d
+cmple.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmple p0.s, p0/z, z0.s, z1.d
+cmple.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmple p0.h, p0/z, z0.h, z1.d
+cmplo.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmplo p0.b, p0/z, z0.b, z1.d
+cmplo.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmplo p0.s, p0/z, z0.s, z1.d
+cmplo.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmplo p0.h, p0/z, z0.h, z1.d
+cmpls.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmpls p0.b, p0/z, z0.b, z1.d
+cmpls.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmpls p0.s, p0/z, z0.s, z1.d
+cmpls.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmpls p0.h, p0/z, z0.h, z1.d
+cmplt.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmplt p0.b, p0/z, z0.b, z1.d
+cmplt.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmplt p0.s, p0/z, z0.s, z1.d
+cmplt.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmplt p0.h, p0/z, z0.h, z1.d
+cmpne.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	cmpne p0.b, p0/z, z0.b, z1.b
+cmpne.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i1	cmpne p0.d, p0/z, z0.d, z1.d
+cmpne.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i1	cmpne p0.s, p0/z, z0.s, z1.s
+cmpne.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	cmpne p0.h, p0/z, z0.h, z1.h
+cmpne.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i1	cmpne p0.b, p0/z, z0.b, z1.d
+cmpne.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i1	cmpne p0.s, p0/z, z0.s, z1.d
+cmpne.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i1	cmpne p0.h, p0/z, z0.h, z1.d
+cnot.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	cnot z0.b, p0/m, z1.b
+cnot.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	cnot z0.d, p0/m, z1.d
+cnot.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	cnot z0.s, p0/m, z1.s
+cnot.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	cnot z0.h, p0/m, z1.h
+cnt.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	cnt z0.b, p0/m, z1.b
+cnt.nxv2f64	nxv2i64,nxv2i1,nxv2f64	nxv2i64	cnt z0.d, p0/m, z1.d
+cnt.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	cnt z0.d, p0/m, z1.d
+cnt.nxv4f32	nxv4i32,nxv4i1,nxv4f32	nxv4i32	cnt z0.s, p0/m, z1.s
+cnt.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	cnt z0.s, p0/m, z1.s
+cnt.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	cnt z0.h, p0/m, z1.h
+cntb	i32=30	i64	cntb x0, mul3
+cntb	i32=7	i64	mov w0, #7
+cntd	i32=30	i64	cntd x0, mul3
+cntd	i32=7	i64	cntd x0, vl7
+cnth	i32=30	i64	cnth x0, mul3
+cnth	i32=7	i64	mov w0, #7
+cntp.nxv16i1	nxv16i1,nxv16i1	i64	cntp x0, p0, p1.b
+cntp.nxv2i1	nxv2i1,nxv2i1	i64	cntp x0, p0, p1.d
+cntp.nxv4i1	nxv4i1,nxv4i1	i64	cntp x0, p0, p1.s
+cntp.nxv8i1	nxv8i1,nxv8i1	i64	cntp x0, p0, p1.h
+cntw	i32=30	i64	cntw x0, mul3
+cntw	i32=7	i64	cntw x0, vl7
+compact.nxv2f64	nxv2i1,nxv2f64	nxv2f64	compact z0.d, p0, z0.d
+compact.nxv2i64	nxv2i1,nxv2i64	nxv2i64	compact z0.d, p0, z0.d
+compact.nxv4f32	nxv4i1,nxv4f32	nxv4f32	compact z0.s, p0, z0.s
+compact.nxv4i32	nxv4i1,nxv4i32	nxv4i32	compact z0.s, p0, z0.s
+dup.nxv16i8	nxv16i8,nxv16i1,i8	nxv16i8	mov z0.b, p0/m, w0
+dup.nxv2f64	nxv2f64,nxv2i1,f64	nxv2f64	mov z0.d, p0/m, d1
+dup.nxv2i64	nxv2i64,nxv2i1,i64	nxv2i64	mov z0.d, p0/m, x0
+dup.nxv4f32	nxv4f32,nxv4i1,f32	nxv4f32	mov z0.s, p0/m, s1
+dup.nxv4i32	nxv4i32,nxv4i1,i32	nxv4i32	mov z0.s, p0/m, w0
+dup.nxv8i16	nxv8i16,nxv8i1,i16	nxv8i16	mov z0.h, p0/m, w0
+dup.x.nxv16i1	i8	nxv16i1	sbfx x8, x0, #0, #1; whilelo p0.b, xzr, x8
+dup.x.nxv16i8	i8	nxv16i8	mov z0.b, w0
+dup.x.nxv2f64	f64	nxv2f64	mov z0.d, d0
+dup.x.nxv2i1	i8	nxv2i1	sbfx x8, x0, #0, #1; whilelo p0.d, xzr, x8
+dup.x.nxv2i64	i64	nxv2i64	mov z0.d, x0
+dup.x.nxv4f32	f32	nxv4f32	mov z0.s, s0
+dup.x.nxv4i1	i8	nxv4i1	sbfx x8, x0, #0, #1; whilelo p0.s, xzr, x8
+dup.x.nxv4i32	i32	nxv4i32	mov z0.s, w0
+dup.x.nxv8i1	i8	nxv8i1	sbfx x8, x0, #0, #1; whilelo p0.h, xzr, x8
+dup.x.nxv8i16	i16	nxv8i16	mov z0.h, w0
+dupq.lane.nxv16i8	nxv16i8,i64	nxv16i8	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+dupq.lane.nxv2f64	nxv2f64,i64	nxv2f64	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+dupq.lane.nxv2i64	nxv2i64,i64	nxv2i64	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+dupq.lane.nxv4f32	nxv4f32,i64	nxv4f32	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+dupq.lane.nxv4i32	nxv4i32,i64	nxv4i32	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+dupq.lane.nxv8i16	nxv8i16,i64	nxv8i16	index z1.d, #0, #1; add x8, x0, x0; mov z2.d, x8; and z1.d, z1.d, #0x1; orr z1.d, z1.d, z2.d; tbl z0.d, { z0.d }, z1.d
+eor.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	eor z0.b, p0/m, z0.b, z1.b
+eor.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	eor z0.d, p0/m, z0.d, z1.d
+eor.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	eor z0.s, p0/m, z0.s, z1.s
+eor.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	eor z0.h, p0/m, z0.h, z1.h
+eor.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	eor p0.b, p0/z, p1.b, p2.b
+eor3.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	eor3 z0.d, z0.d, z1.d, z2.d
+eor3.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	eor3 z0.d, z0.d, z1.d, z2.d
+eor3.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	eor3 z0.d, z0.d, z1.d, z2.d
+eor3.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	eor3 z0.d, z0.d, z1.d, z2.d
+eorbt.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	eorbt z0.b, z1.b, z2.b
+eorbt.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	eorbt z0.d, z1.d, z2.d
+eorbt.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	eorbt z0.s, z1.s, z2.s
+eorbt.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	eorbt z0.h, z1.h, z2.h
+eortb.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	eortb z0.b, z1.b, z2.b
+eortb.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	eortb z0.d, z1.d, z2.d
+eortb.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	eortb z0.s, z1.s, z2.s
+eortb.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	eortb z0.h, z1.h, z2.h
+eorv.nxv16i8	nxv16i1,nxv16i8	i8	eorv b0, p0, z0.b; fmov w0, s0
+eorv.nxv2i64	nxv2i1,nxv2i64	i64	eorv d0, p0, z0.d; fmov x0, d0
+eorv.nxv4i32	nxv4i1,nxv4i32	i32	eorv s0, p0, z0.s; fmov w0, s0
+eorv.nxv8i16	nxv8i1,nxv8i16	i16	eorv h0, p0, z0.h; fmov w0, s0
+ext.nxv16i8	nxv16i8,nxv16i8,i32=0	nxv16i8	ext z0.b, z0.b, z1.b, #0
+ext.nxv16i8	nxv16i8,nxv16i8,i32=255	nxv16i8	ext z0.b, z0.b, z1.b, #255
+ext.nxv2f64	nxv2f64,nxv2f64,i32=0	nxv2f64	ext z0.b, z0.b, z1.b, #0
+ext.nxv2f64	nxv2f64,nxv2f64,i32=31	nxv2f64	ext z0.b, z0.b, z1.b, #248
+ext.nxv2i64	nxv2i64,nxv2i64,i32=0	nxv2i64	ext z0.b, z0.b, z1.b, #0
+ext.nxv2i64	nxv2i64,nxv2i64,i32=31	nxv2i64	ext z0.b, z0.b, z1.b, #248
+ext.nxv4f32	nxv4f32,nxv4f32,i32=0	nxv4f32	ext z0.b, z0.b, z1.b, #0
+ext.nxv4f32	nxv4f32,nxv4f32,i32=63	nxv4f32	ext z0.b, z0.b, z1.b, #252
+ext.nxv4i32	nxv4i32,nxv4i32,i32=0	nxv4i32	ext z0.b, z0.b, z1.b, #0
+ext.nxv4i32	nxv4i32,nxv4i32,i32=63	nxv4i32	ext z0.b, z0.b, z1.b, #252
+ext.nxv8i16	nxv8i16,nxv8i16,i32=0	nxv8i16	ext z0.b, z0.b, z1.b, #0
+ext.nxv8i16	nxv8i16,nxv8i16,i32=127	nxv8i16	ext z0.b, z0.b, z1.b, #254
+fabd.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fabd z0.d, p0/m, z0.d, z1.d
+fabd.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fabd z0.s, p0/m, z0.s, z1.s
+fabs.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	fabs z0.d, p0/m, z1.d
+fabs.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	fabs z0.s, p0/m, z1.s
+facge.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	facge p0.d, p0/z, z0.d, z1.d
+facge.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	facge p0.s, p0/z, z0.s, z1.s
+facgt.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	facgt p0.d, p0/z, z0.d, z1.d
+facgt.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	facgt p0.s, p0/z, z0.s, z1.s
+fadd.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fadd z0.d, p0/m, z0.d, z1.d
+fadd.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fadd z0.s, p0/m, z0.s, z1.s
+fadda.nxv2f64	nxv2i1,f64,nxv2f64	f64	fadda d0, p0, d0, z1.d
+fadda.nxv4f32	nxv4i1,f32,nxv4f32	f32	fadda s0, p0, s0, z1.s
+faddp.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	faddp z0.d, p0/m, z0.d, z1.d
+faddp.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	faddp z0.s, p0/m, z0.s, z1.s
+faddv.nxv2f64	nxv2i1,nxv2f64	f64	faddv d0, p0, z0.d
+faddv.nxv4f32	nxv4i1,nxv4f32	f32	faddv s0, p0, z0.s
+fcadd.nxv2f64	nxv2i1,nxv2f64,nxv2f64,i32=90	nxv2f64	fcadd z0.d, p0/m, z0.d, z1.d, #90
+fcadd.nxv4f32	nxv4i1,nxv4f32,nxv4f32,i32=90	nxv4f32	fcadd z0.s, p0/m, z0.s, z1.s, #90
+fcmla.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=0,i32=0	nxv4f32	fcmla z0.s, z1.s, z2.s[0], #0
+fcmla.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=1,i32=0	nxv4f32	fcmla z0.s, z1.s, z2.s[1], #0
+fcmla.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64,i32=0	nxv2f64	fcmla z0.d, p0/m, z1.d, z2.d, #0
+fcmla.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32,i32=0	nxv4f32	fcmla z0.s, p0/m, z1.s, z2.s, #0
+fcmpeq.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	fcmeq p0.d, p0/z, z0.d, z1.d
+fcmpeq.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	fcmeq p0.s, p0/z, z0.s, z1.s
+fcmpge.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	fcmge p0.d, p0/z, z0.d, z1.d
+fcmpge.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	fcmge p0.s, p0/z, z0.s, z1.s
+fcmpgt.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	fcmgt p0.d, p0/z, z0.d, z1.d
+fcmpgt.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	fcmgt p0.s, p0/z, z0.s, z1.s
+fcmpne.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	fcmne p0.d, p0/z, z0.d, z1.d
+fcmpne.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	fcmne p0.s, p0/z, z0.s, z1.s
+fcmpuo.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2i1	fcmuo p0.d, p0/z, z0.d, z1.d
+fcmpuo.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4i1	fcmuo p0.s, p0/z, z0.s, z1.s
+fcvt.f32f64	nxv4f32,nxv2i1,nxv2f64	nxv4f32	fcvt z0.s, p0/m, z1.d
+fcvt.f64f32	nxv2f64,nxv2i1,nxv4f32	nxv2f64	fcvt z0.d, p0/m, z1.s
+fcvtlt.f64f32	nxv2f64,nxv2i1,nxv4f32	nxv2f64	fcvtlt z0.d, p0/m, z1.s
+fcvtnt.f32f64	nxv4f32,nxv2i1,nxv2f64	nxv4f32	fcvtnt z0.s, p0/m, z1.d
+fcvtx.f32f64	nxv4f32,nxv2i1,nxv2f64	nxv4f32	fcvtx z0.s, p0/m, z1.d
+fcvtxnt.f32f64	nxv4f32,nxv2i1,nxv2f64	nxv4f32	fcvtxnt z0.s, p0/m, z1.d
+fcvtzs.i32f64	nxv4i32,nxv2i1,nxv2f64	nxv4i32	fcvtzs z0.s, p0/m, z1.d
+fcvtzs.i64f32	nxv2i64,nxv2i1,nxv4f32	nxv2i64	fcvtzs z0.d, p0/m, z1.s
+fcvtzs.nxv2i64.nxv2f64	nxv2i64,nxv2i1,nxv2f64	nxv2i64	fcvtzs z0.d, p0/m, z1.d
+fcvtzs.nxv4i32.nxv4f32	nxv4i32,nxv4i1,nxv4f32	nxv4i32	fcvtzs z0.s, p0/m, z1.s
+fcvtzu.i32f64	nxv4i32,nxv2i1,nxv2f64	nxv4i32	fcvtzu z0.s, p0/m, z1.d
+fcvtzu.i64f32	nxv2i64,nxv2i1,nxv4f32	nxv2i64	fcvtzu z0.d, p0/m, z1.s
+fcvtzu.nxv2i64.nxv2f64	nxv2i64,nxv2i1,nxv2f64	nxv2i64	fcvtzu z0.d, p0/m, z1.d
+fcvtzu.nxv4i32.nxv4f32	nxv4i32,nxv4i1,nxv4f32	nxv4i32	fcvtzu z0.s, p0/m, z1.s
+fdiv.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fdiv z0.d, p0/m, z0.d, z1.d
+fdiv.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fdiv z0.s, p0/m, z0.s, z1.s
+fdivr.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fdivr z0.d, p0/m, z0.d, z1.d
+fdivr.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fdivr z0.s, p0/m, z0.s, z1.s
+fexpa.x.nxv2f64	nxv2i64	nxv2f64	fexpa z0.d, z0.d
+fexpa.x.nxv4f32	nxv4i32	nxv4f32	fexpa z0.s, z0.s
+flogb.nxv2f64	nxv2i64,nxv2i1,nxv2f64	nxv2i64	flogb z0.d, p0/m, z1.d
+flogb.nxv4f32	nxv4i32,nxv4i1,nxv4f32	nxv4i32	flogb z0.s, p0/m, z1.s
+fmad.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fmad z0.d, p0/m, z1.d, z2.d
+fmad.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fmad z0.s, p0/m, z1.s, z2.s
+fmax.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmax z0.d, p0/m, z0.d, z1.d
+fmax.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmax z0.s, p0/m, z0.s, z1.s
+fmaxnm.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmaxnm z0.d, p0/m, z0.d, z1.d
+fmaxnm.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmaxnm z0.s, p0/m, z0.s, z1.s
+fmaxnmp.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmaxnmp z0.d, p0/m, z0.d, z1.d
+fmaxnmp.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmaxnmp z0.s, p0/m, z0.s, z1.s
+fmaxnmv.nxv2f64	nxv2i1,nxv2f64	f64	fmaxnmv d0, p0, z0.d
+fmaxnmv.nxv4f32	nxv4i1,nxv4f32	f32	fmaxnmv s0, p0, z0.s
+fmaxp.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmaxp z0.d, p0/m, z0.d, z1.d
+fmaxp.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmaxp z0.s, p0/m, z0.s, z1.s
+fmaxv.nxv2f64	nxv2i1,nxv2f64	f64	fmaxv d0, p0, z0.d
+fmaxv.nxv4f32	nxv4i1,nxv4f32	f32	fmaxv s0, p0, z0.s
+fmin.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmin z0.d, p0/m, z0.d, z1.d
+fmin.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmin z0.s, p0/m, z0.s, z1.s
+fminnm.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fminnm z0.d, p0/m, z0.d, z1.d
+fminnm.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fminnm z0.s, p0/m, z0.s, z1.s
+fminnmp.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fminnmp z0.d, p0/m, z0.d, z1.d
+fminnmp.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fminnmp z0.s, p0/m, z0.s, z1.s
+fminnmv.nxv2f64	nxv2i1,nxv2f64	f64	fminnmv d0, p0, z0.d
+fminnmv.nxv4f32	nxv4i1,nxv4f32	f32	fminnmv s0, p0, z0.s
+fminp.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fminp z0.d, p0/m, z0.d, z1.d
+fminp.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fminp z0.s, p0/m, z0.s, z1.s
+fminv.nxv2f64	nxv2i1,nxv2f64	f64	fminv d0, p0, z0.d
+fminv.nxv4f32	nxv4i1,nxv4f32	f32	fminv s0, p0, z0.s
+fmla.lane.nxv2f64	nxv2f64,nxv2f64,nxv2f64,i32=0	nxv2f64	fmla z0.d, z1.d, z2.d[0]
+fmla.lane.nxv2f64	nxv2f64,nxv2f64,nxv2f64,i32=1	nxv2f64	fmla z0.d, z1.d, z2.d[1]
+fmla.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=0	nxv4f32	fmla z0.s, z1.s, z2.s[0]
+fmla.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=3	nxv4f32	fmla z0.s, z1.s, z2.s[3]
+fmla.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fmla z0.d, p0/m, z1.d, z2.d
+fmla.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fmla z0.s, p0/m, z1.s, z2.s
+fmls.lane.nxv2f64	nxv2f64,nxv2f64,nxv2f64,i32=0	nxv2f64	fmls z0.d, z1.d, z2.d[0]
+fmls.lane.nxv2f64	nxv2f64,nxv2f64,nxv2f64,i32=1	nxv2f64	fmls z0.d, z1.d, z2.d[1]
+fmls.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=0	nxv4f32	fmls z0.s, z1.s, z2.s[0]
+fmls.lane.nxv4f32	nxv4f32,nxv4f32,nxv4f32,i32=3	nxv4f32	fmls z0.s, z1.s, z2.s[3]
+fmls.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fmls z0.d, p0/m, z1.d, z2.d
+fmls.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fmls z0.s, p0/m, z1.s, z2.s
+fmmla.nxv2f64.nxv2f64	nxv2f64,nxv2f64,nxv2f64	nxv2f64	fmmla z0.d, z1.d, z2.d
+fmmla.nxv4f32.nxv4f32	nxv4f32,nxv4f32,nxv4f32	nxv4f32	fmmla z0.s, z1.s, z2.s
+fmsb.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fmsb z0.d, p0/m, z1.d, z2.d
+fmsb.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fmsb z0.s, p0/m, z1.s, z2.s
+fmul.lane.nxv2f64	nxv2f64,nxv2f64,i32=0	nxv2f64	fmul z0.d, z0.d, z1.d[0]
+fmul.lane.nxv2f64	nxv2f64,nxv2f64,i32=1	nxv2f64	fmul z0.d, z0.d, z1.d[1]
+fmul.lane.nxv4f32	nxv4f32,nxv4f32,i32=0	nxv4f32	fmul z0.s, z0.s, z1.s[0]
+fmul.lane.nxv4f32	nxv4f32,nxv4f32,i32=3	nxv4f32	fmul z0.s, z0.s, z1.s[3]
+fmul.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmul z0.d, p0/m, z0.d, z1.d
+fmul.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmul z0.s, p0/m, z0.s, z1.s
+fmulx.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fmulx z0.d, p0/m, z0.d, z1.d
+fmulx.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fmulx z0.s, p0/m, z0.s, z1.s
+fneg.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	fneg z0.d, p0/m, z1.d
+fneg.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	fneg z0.s, p0/m, z1.s
+fnmad.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fnmad z0.d, p0/m, z1.d, z2.d
+fnmad.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fnmad z0.s, p0/m, z1.s, z2.s
+fnmla.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fnmla z0.d, p0/m, z1.d, z2.d
+fnmla.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fnmla z0.s, p0/m, z1.s, z2.s
+fnmls.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fnmls z0.d, p0/m, z1.d, z2.d
+fnmls.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fnmls z0.s, p0/m, z1.s, z2.s
+fnmsb.nxv2f64	nxv2i1,nxv2f64,nxv2f64,nxv2f64	nxv2f64	fnmsb z0.d, p0/m, z1.d, z2.d
+fnmsb.nxv4f32	nxv4i1,nxv4f32,nxv4f32,nxv4f32	nxv4f32	fnmsb z0.s, p0/m, z1.s, z2.s
+frecpe.x.nxv2f64	nxv2f64	nxv2f64	frecpe z0.d, z0.d
+frecpe.x.nxv4f32	nxv4f32	nxv4f32	frecpe z0.s, z0.s
+frecps.x.nxv2f64	nxv2f64,nxv2f64	nxv2f64	frecps z0.d, z0.d, z1.d
+frecps.x.nxv4f32	nxv4f32,nxv4f32	nxv4f32	frecps z0.s, z0.s, z1.s
+frecpx.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frecpx z0.d, p0/m, z1.d
+frecpx.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frecpx z0.s, p0/m, z1.s
+frinta.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frinta z0.d, p0/m, z1.d
+frinta.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frinta z0.s, p0/m, z1.s
+frinti.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frinti z0.d, p0/m, z1.d
+frinti.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frinti z0.s, p0/m, z1.s
+frintm.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frintm z0.d, p0/m, z1.d
+frintm.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frintm z0.s, p0/m, z1.s
+frintn.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frintn z0.d, p0/m, z1.d
+frintn.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frintn z0.s, p0/m, z1.s
+frintp.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frintp z0.d, p0/m, z1.d
+frintp.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frintp z0.s, p0/m, z1.s
+frintx.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frintx z0.d, p0/m, z1.d
+frintx.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frintx z0.s, p0/m, z1.s
+frintz.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	frintz z0.d, p0/m, z1.d
+frintz.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	frintz z0.s, p0/m, z1.s
+frsqrte.x.nxv2f64	nxv2f64	nxv2f64	frsqrte z0.d, z0.d
+frsqrte.x.nxv4f32	nxv4f32	nxv4f32	frsqrte z0.s, z0.s
+frsqrts.x.nxv2f64	nxv2f64,nxv2f64	nxv2f64	frsqrts z0.d, z0.d, z1.d
+frsqrts.x.nxv4f32	nxv4f32,nxv4f32	nxv4f32	frsqrts z0.s, z0.s, z1.s
+fscale.nxv2f64	nxv2i1,nxv2f64,nxv2i64	nxv2f64	fscale z0.d, p0/m, z0.d, z1.d
+fscale.nxv4f32	nxv4i1,nxv4f32,nxv4i32	nxv4f32	fscale z0.s, p0/m, z0.s, z1.s
+fsqrt.nxv2f64	nxv2f64,nxv2i1,nxv2f64	nxv2f64	fsqrt z0.d, p0/m, z1.d
+fsqrt.nxv4f32	nxv4f32,nxv4i1,nxv4f32	nxv4f32	fsqrt z0.s, p0/m, z1.s
+fsub.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fsub z0.d, p0/m, z0.d, z1.d
+fsub.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fsub z0.s, p0/m, z0.s, z1.s
+fsubr.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	fsubr z0.d, p0/m, z0.d, z1.d
+fsubr.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	fsubr z0.s, p0/m, z0.s, z1.s
+ftmad.x.nxv2f64	nxv2f64,nxv2f64,i32=0	nxv2f64	ftmad z0.d, z0.d, z1.d, #0
+ftmad.x.nxv2f64	nxv2f64,nxv2f64,i32=7	nxv2f64	ftmad z0.d, z0.d, z1.d, #7
+ftmad.x.nxv4f32	nxv4f32,nxv4f32,i32=0	nxv4f32	ftmad z0.s, z0.s, z1.s, #0
+ftmad.x.nxv4f32	nxv4f32,nxv4f32,i32=7	nxv4f32	ftmad z0.s, z0.s, z1.s, #7
+ftsmul.x.nxv2f64	nxv2f64,nxv2i64	nxv2f64	ftsmul z0.d, z0.d, z1.d
+ftsmul.x.nxv4f32	nxv4f32,nxv4i32	nxv4f32	ftsmul z0.s, z0.s, z1.s
+ftssel.x.nxv2f64	nxv2f64,nxv2i64	nxv2f64	ftssel z0.d, z0.d, z1.d
+ftssel.x.nxv4f32	nxv4f32,nxv4i32	nxv4f32	ftssel z0.s, z0.s, z1.s
+histcnt.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	histcnt z0.d, p0/z, z0.d, z1.d
+histcnt.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	histcnt z0.s, p0/z, z0.s, z1.s
+histseg.nxv16i8	nxv16i8,nxv16i8	nxv16i8	histseg z0.b, z0.b, z1.b
+index.nxv16i8	i8,i8	nxv16i8	index z0.b, w0, w1
+index.nxv2i64	i64,i64	nxv2i64	index z0.d, x0, x1
+index.nxv4i32	i32,i32	nxv4i32	index z0.s, w0, w1
+index.nxv8i16	i16,i16	nxv8i16	index z0.h, w0, w1
+insr.nxv16i8	nxv16i8,i8	nxv16i8	insr z0.b, w0
+insr.nxv2f64	nxv2f64,f64	nxv2f64	insr z0.d, d1
+insr.nxv2i64	nxv2i64,i64	nxv2i64	insr z0.d, x0
+insr.nxv4f32	nxv4f32,f32	nxv4f32	insr z0.s, s1
+insr.nxv4i32	nxv4i32,i32	nxv4i32	insr z0.s, w0
+insr.nxv8i16	nxv8i16,i16	nxv8i16	insr z0.h, w0
+lasta.nxv16i8	nxv16i1,nxv16i8	i8	lasta w0, p0, z0.b
+lasta.nxv2f64	nxv2i1,nxv2f64	f64	lasta d0, p0, z0.d
+lasta.nxv2i64	nxv2i1,nxv2i64	i64	lasta x0, p0, z0.d
+lasta.nxv4f32	nxv4i1,nxv4f32	f32	lasta s0, p0, z0.s
+lasta.nxv4i32	nxv4i1,nxv4i32	i32	lasta w0, p0, z0.s
+lasta.nxv8i16	nxv8i1,nxv8i16	i16	lasta w0, p0, z0.h
+lastb.nxv16i8	nxv16i1,nxv16i8	i8	lastb w0, p0, z0.b
+lastb.nxv2f64	nxv2i1,nxv2f64	f64	lastb d0, p0, z0.d
+lastb.nxv2i64	nxv2i1,nxv2i64	i64	lastb x0, p0, z0.d
+lastb.nxv4f32	nxv4i1,nxv4f32	f32	lastb s0, p0, z0.s
+lastb.nxv4i32	nxv4i1,nxv4i32	i32	lastb w0, p0, z0.s
+lastb.nxv8i16	nxv8i1,nxv8i16	i16	lastb w0, p0, z0.h
+ld1.gather.index.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	ld1d { z0.d }, p0/z, [x0, z0.d, lsl #3]
+ld1.gather.index.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	ld1h { z0.d }, p0/z, [x0, z0.d, lsl #1]
+ld1.gather.index.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	ld1w { z0.d }, p0/z, [x0, z0.d, lsl #2]
+ld1.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	ld1d { z0.d }, p0/z, [x0, z0.d, lsl #3]
+ld1.gather.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	ld1d { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	ld1h { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	ld1w { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	ld1d { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.nxv2i8	nxv2i1,ptr,nxv2i64	nxv2i8	ld1b { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv2f64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2f64	ld1d { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv2i16.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i16	ld1h { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv2i32.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i32	ld1w { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv2i64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i64	ld1d { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv2i8.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i8	ld1b { z0.d }, p0/z, [x0, z0.d]
+ld1.gather.scalar.offset.nxv4f32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4f32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.scalar.offset.nxv4i16.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i16	ld1h { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.scalar.offset.nxv4i32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.scalar.offset.nxv4i8.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i8	ld1b { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.sxtw.index.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ld1w { z0.s }, p0/z, [x0, z0.s, sxtw #2]
+ld1.gather.sxtw.index.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ld1h { z0.s }, p0/z, [x0, z0.s, sxtw #1]
+ld1.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ld1w { z0.s }, p0/z, [x0, z0.s, sxtw #2]
+ld1.gather.sxtw.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ld1w { z0.s }, p0/z, [x0, z0.s, sxtw]
+ld1.gather.sxtw.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ld1h { z0.s }, p0/z, [x0, z0.s, sxtw]
+ld1.gather.sxtw.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ld1w { z0.s }, p0/z, [x0, z0.s, sxtw]
+ld1.gather.sxtw.nxv4i8	nxv4i1,ptr,nxv4i32	nxv4i8	ld1b { z0.s }, p0/z, [x0, z0.s, sxtw]
+ld1.gather.uxtw.index.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw #2]
+ld1.gather.uxtw.index.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ld1h { z0.s }, p0/z, [x0, z0.s, uxtw #1]
+ld1.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw #2]
+ld1.gather.uxtw.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.uxtw.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ld1h { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.uxtw.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ld1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.gather.uxtw.nxv4i8	nxv4i1,ptr,nxv4i32	nxv4i8	ld1b { z0.s }, p0/z, [x0, z0.s, uxtw]
+ld1.nxv16i8	nxv16i1,ptr	nxv16i8	ld1b { z0.b }, p0/z, [x0]
+ld1.nxv2f64	nxv2i1,ptr	nxv2f64	ld1d { z0.d }, p0/z, [x0]
+ld1.nxv2i16	nxv2i1,ptr	nxv2i16	ld1h { z0.d }, p0/z, [x0]
+ld1.nxv2i32	nxv2i1,ptr	nxv2i32	ld1w { z0.d }, p0/z, [x0]
+ld1.nxv2i64	nxv2i1,ptr	nxv2i64	ld1d { z0.d }, p0/z, [x0]
+ld1.nxv2i8	nxv2i1,ptr	nxv2i8	ld1b { z0.d }, p0/z, [x0]
+ld1.nxv4f32	nxv4i1,ptr	nxv4f32	ld1w { z0.s }, p0/z, [x0]
+ld1.nxv4i16	nxv4i1,ptr	nxv4i16	ld1h { z0.s }, p0/z, [x0]
+ld1.nxv4i32	nxv4i1,ptr	nxv4i32	ld1w { z0.s }, p0/z, [x0]
+ld1.nxv4i8	nxv4i1,ptr	nxv4i8	ld1b { z0.s }, p0/z, [x0]
+ld1.nxv8i16	nxv8i1,ptr	nxv8i16	ld1h { z0.h }, p0/z, [x0]
+ld1.nxv8i8	nxv8i1,ptr	nxv8i8	ld1b { z0.h }, p0/z, [x0]
+ld1ro.nxv16i8	nxv16i1,ptr	nxv16i8	ld1rob { z0.b }, p0/z, [x0]
+ld1ro.nxv2f64	nxv2i1,ptr	nxv2f64	ld1rod { z0.d }, p0/z, [x0]
+ld1ro.nxv2i64	nxv2i1,ptr	nxv2i64	ld1rod { z0.d }, p0/z, [x0]
+ld1ro.nxv4f32	nxv4i1,ptr	nxv4f32	ld1row { z0.s }, p0/z, [x0]
+ld1ro.nxv4i32	nxv4i1,ptr	nxv4i32	ld1row { z0.s }, p0/z, [x0]
+ld1ro.nxv8i16	nxv8i1,ptr	nxv8i16	ld1roh { z0.h }, p0/z, [x0]
+ld1rq.nxv16i8	nxv16i1,ptr	nxv16i8	ld1rqb { z0.b }, p0/z, [x0]
+ld1rq.nxv2f64	nxv2i1,ptr	nxv2f64	ld1rqd { z0.d }, p0/z, [x0]
+ld1rq.nxv2i64	nxv2i1,ptr	nxv2i64	ld1rqd { z0.d }, p0/z, [x0]
+ld1rq.nxv4f32	nxv4i1,ptr	nxv4f32	ld1rqw { z0.s }, p0/z, [x0]
+ld1rq.nxv4i32	nxv4i1,ptr	nxv4i32	ld1rqw { z0.s }, p0/z, [x0]
+ld1rq.nxv8i16	nxv8i1,ptr	nxv8i16	ld1rqh { z0.h }, p0/z, [x0]
+ld2.sret.nxv16i8	nxv16i1,ptr	nxv16i8x2	ld2b { z0.b, z1.b }, p0/z, [x0]
+ld2.sret.nxv2f64	nxv2i1,ptr	nxv2f64x2	ld2d { z0.d, z1.d }, p0/z, [x0]
+ld2.sret.nxv2i64	nxv2i1,ptr	nxv2i64x2	ld2d { z0.d, z1.d }, p0/z, [x0]
+ld2.sret.nxv4f32	nxv4i1,ptr	nxv4f32x2	ld2w { z0.s, z1.s }, p0/z, [x0]
+ld2.sret.nxv4i32	nxv4i1,ptr	nxv4i32x2	ld2w { z0.s, z1.s }, p0/z, [x0]
+ld2.sret.nxv8i16	nxv8i1,ptr	nxv8i16x2	ld2h { z0.h, z1.h }, p0/z, [x0]
+ld3.sret.nxv16i8	nxv16i1,ptr	nxv16i8x3	ld3b { z0.b - z2.b }, p0/z, [x0]
+ld3.sret.nxv2f64	nxv2i1,ptr	nxv2f64x3	ld3d { z0.d - z2.d }, p0/z, [x0]
+ld3.sret.nxv2i64	nxv2i1,ptr	nxv2i64x3	ld3d { z0.d - z2.d }, p0/z, [x0]
+ld3.sret.nxv4f32	nxv4i1,ptr	nxv4f32x3	ld3w { z0.s - z2.s }, p0/z, [x0]
+ld3.sret.nxv4i32	nxv4i1,ptr	nxv4i32x3	ld3w { z0.s - z2.s }, p0/z, [x0]
+ld3.sret.nxv8i16	nxv8i1,ptr	nxv8i16x3	ld3h { z0.h - z2.h }, p0/z, [x0]
+ld4.sret.nxv16i8	nxv16i1,ptr	nxv16i8x4	ld4b { z0.b - z3.b }, p0/z, [x0]
+ld4.sret.nxv2f64	nxv2i1,ptr	nxv2f64x4	ld4d { z0.d - z3.d }, p0/z, [x0]
+ld4.sret.nxv2i64	nxv2i1,ptr	nxv2i64x4	ld4d { z0.d - z3.d }, p0/z, [x0]
+ld4.sret.nxv4f32	nxv4i1,ptr	nxv4f32x4	ld4w { z0.s - z3.s }, p0/z, [x0]
+ld4.sret.nxv4i32	nxv4i1,ptr	nxv4i32x4	ld4w { z0.s - z3.s }, p0/z, [x0]
+ld4.sret.nxv8i16	nxv8i1,ptr	nxv8i16x4	ld4h { z0.h - z3.h }, p0/z, [x0]
+ldff1.gather.index.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	ldff1d { z0.d }, p0/z, [x0, z0.d, lsl #3]
+ldff1.gather.index.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	ldff1h { z0.d }, p0/z, [x0, z0.d, lsl #1]
+ldff1.gather.index.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	ldff1w { z0.d }, p0/z, [x0, z0.d, lsl #2]
+ldff1.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	ldff1d { z0.d }, p0/z, [x0, z0.d, lsl #3]
+ldff1.gather.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	ldff1d { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	ldff1h { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	ldff1w { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	ldff1d { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.nxv2i8	nxv2i1,ptr,nxv2i64	nxv2i8	ldff1b { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv2f64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2f64	ldff1d { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv2i16.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i16	ldff1h { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv2i32.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i32	ldff1w { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv2i64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i64	ldff1d { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv2i8.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i8	ldff1b { z0.d }, p0/z, [x0, z0.d]
+ldff1.gather.scalar.offset.nxv4f32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4f32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.scalar.offset.nxv4i16.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i16	ldff1h { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.scalar.offset.nxv4i32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.scalar.offset.nxv4i8.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i8	ldff1b { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.sxtw.index.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ldff1w { z0.s }, p0/z, [x0, z0.s, sxtw #2]
+ldff1.gather.sxtw.index.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ldff1h { z0.s }, p0/z, [x0, z0.s, sxtw #1]
+ldff1.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ldff1w { z0.s }, p0/z, [x0, z0.s, sxtw #2]
+ldff1.gather.sxtw.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ldff1w { z0.s }, p0/z, [x0, z0.s, sxtw]
+ldff1.gather.sxtw.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ldff1h { z0.s }, p0/z, [x0, z0.s, sxtw]
+ldff1.gather.sxtw.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ldff1w { z0.s }, p0/z, [x0, z0.s, sxtw]
+ldff1.gather.sxtw.nxv4i8	nxv4i1,ptr,nxv4i32	nxv4i8	ldff1b { z0.s }, p0/z, [x0, z0.s, sxtw]
+ldff1.gather.uxtw.index.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw #2]
+ldff1.gather.uxtw.index.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ldff1h { z0.s }, p0/z, [x0, z0.s, uxtw #1]
+ldff1.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw #2]
+ldff1.gather.uxtw.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.uxtw.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ldff1h { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.uxtw.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ldff1w { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.gather.uxtw.nxv4i8	nxv4i1,ptr,nxv4i32	nxv4i8	ldff1b { z0.s }, p0/z, [x0, z0.s, uxtw]
+ldff1.nxv16i8	nxv16i1,ptr	nxv16i8	ldff1b { z0.b }, p0/z, [x0]
+ldff1.nxv2f64	nxv2i1,ptr	nxv2f64	ldff1d { z0.d }, p0/z, [x0]
+ldff1.nxv2i16	nxv2i1,ptr	nxv2i16	ldff1h { z0.d }, p0/z, [x0]
+ldff1.nxv2i32	nxv2i1,ptr	nxv2i32	ldff1w { z0.d }, p0/z, [x0]
+ldff1.nxv2i64	nxv2i1,ptr	nxv2i64	ldff1d { z0.d }, p0/z, [x0]
+ldff1.nxv2i8	nxv2i1,ptr	nxv2i8	ldff1b { z0.d }, p0/z, [x0]
+ldff1.nxv4f32	nxv4i1,ptr	nxv4f32	ldff1w { z0.s }, p0/z, [x0]
+ldff1.nxv4i16	nxv4i1,ptr	nxv4i16	ldff1h { z0.s }, p0/z, [x0]
+ldff1.nxv4i32	nxv4i1,ptr	nxv4i32	ldff1w { z0.s }, p0/z, [x0]
+ldff1.nxv4i8	nxv4i1,ptr	nxv4i8	ldff1b { z0.s }, p0/z, [x0]
+ldff1.nxv8i16	nxv8i1,ptr	nxv8i16	ldff1h { z0.h }, p0/z, [x0]
+ldff1.nxv8i8	nxv8i1,ptr	nxv8i8	ldff1b { z0.h }, p0/z, [x0]
+ldnf1.nxv16i8	nxv16i1,ptr	nxv16i8	ldnf1b { z0.b }, p0/z, [x0]
+ldnf1.nxv2f64	nxv2i1,ptr	nxv2f64	ldnf1d { z0.d }, p0/z, [x0]
+ldnf1.nxv2i16	nxv2i1,ptr	nxv2i16	ldnf1h { z0.d }, p0/z, [x0]
+ldnf1.nxv2i32	nxv2i1,ptr	nxv2i32	ldnf1w { z0.d }, p0/z, [x0]
+ldnf1.nxv2i64	nxv2i1,ptr	nxv2i64	ldnf1d { z0.d }, p0/z, [x0]
+ldnf1.nxv2i8	nxv2i1,ptr	nxv2i8	ldnf1b { z0.d }, p0/z, [x0]
+ldnf1.nxv4f32	nxv4i1,ptr	nxv4f32	ldnf1w { z0.s }, p0/z, [x0]
+ldnf1.nxv4i16	nxv4i1,ptr	nxv4i16	ldnf1h { z0.s }, p0/z, [x0]
+ldnf1.nxv4i32	nxv4i1,ptr	nxv4i32	ldnf1w { z0.s }, p0/z, [x0]
+ldnf1.nxv4i8	nxv4i1,ptr	nxv4i8	ldnf1b { z0.s }, p0/z, [x0]
+ldnf1.nxv8i16	nxv8i1,ptr	nxv8i16	ldnf1h { z0.h }, p0/z, [x0]
+ldnf1.nxv8i8	nxv8i1,ptr	nxv8i8	ldnf1b { z0.h }, p0/z, [x0]
+ldnt1.gather.index.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	lsl z0.d, z0.d, #3; ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.index.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	lsl z0.d, z0.d, #1; ldnt1h { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.index.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	lsl z0.d, z0.d, #2; ldnt1w { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	lsl z0.d, z0.d, #3; ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.nxv2f64	nxv2i1,ptr,nxv2i64	nxv2f64	ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.nxv2i16	nxv2i1,ptr,nxv2i64	nxv2i16	ldnt1h { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.nxv2i32	nxv2i1,ptr,nxv2i64	nxv2i32	ldnt1w { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.nxv2i64	nxv2i1,ptr,nxv2i64	nxv2i64	ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.nxv2i8	nxv2i1,ptr,nxv2i64	nxv2i8	ldnt1b { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv2f64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2f64	ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv2i16.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i16	ldnt1h { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv2i32.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i32	ldnt1w { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv2i64.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i64	ldnt1d { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv2i8.nxv2i64	nxv2i1,nxv2i64,i64	nxv2i8	ldnt1b { z0.d }, p0/z, [z0.d, x0]
+ldnt1.gather.scalar.offset.nxv4f32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4f32	ldnt1w { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.scalar.offset.nxv4i16.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i16	ldnt1h { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.scalar.offset.nxv4i32.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i32	ldnt1w { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.scalar.offset.nxv4i8.nxv4i32	nxv4i1,nxv4i32,i64	nxv4i8	ldnt1b { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.uxtw.nxv4f32	nxv4i1,ptr,nxv4i32	nxv4f32	ldnt1w { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.uxtw.nxv4i16	nxv4i1,ptr,nxv4i32	nxv4i16	ldnt1h { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.uxtw.nxv4i32	nxv4i1,ptr,nxv4i32	nxv4i32	ldnt1w { z0.s }, p0/z, [z0.s, x0]
+ldnt1.gather.uxtw.nxv4i8	nxv4i1,ptr,nxv4i32	nxv4i8	ldnt1b { z0.s }, p0/z, [z0.s, x0]
+ldnt1.nxv16i8	nxv16i1,ptr	nxv16i8	ldnt1b { z0.b }, p0/z, [x0]
+ldnt1.nxv2f64	nxv2i1,ptr	nxv2f64	ldnt1d { z0.d }, p0/z, [x0]
+ldnt1.nxv2i64	nxv2i1,ptr	nxv2i64	ldnt1d { z0.d }, p0/z, [x0]
+ldnt1.nxv4f32	nxv4i1,ptr	nxv4f32	ldnt1w { z0.s }, p0/z, [x0]
+ldnt1.nxv4i32	nxv4i1,ptr	nxv4i32	ldnt1w { z0.s }, p0/z, [x0]
+ldnt1.nxv8i16	nxv8i1,ptr	nxv8i16	ldnt1h { z0.h }, p0/z, [x0]
+lsl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	lsl z0.b, p0/m, z0.b, z1.b
+lsl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	lsl z0.d, p0/m, z0.d, z1.d
+lsl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	lsl z0.s, p0/m, z0.s, z1.s
+lsl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	lsl z0.h, p0/m, z0.h, z1.h
+lsl.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i8	lsl z0.b, p0/m, z0.b, z1.d
+lsl.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i32	lsl z0.s, p0/m, z0.s, z1.d
+lsl.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i16	lsl z0.h, p0/m, z0.h, z1.d
+lsr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	lsr z0.b, p0/m, z0.b, z1.b
+lsr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	lsr z0.d, p0/m, z0.d, z1.d
+lsr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	lsr z0.s, p0/m, z0.s, z1.s
+lsr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	lsr z0.h, p0/m, z0.h, z1.h
+lsr.wide.nxv16i8	nxv16i1,nxv16i8,nxv2i64	nxv16i8	lsr z0.b, p0/m, z0.b, z1.d
+lsr.wide.nxv4i32	nxv4i1,nxv4i32,nxv2i64	nxv4i32	lsr z0.s, p0/m, z0.s, z1.d
+lsr.wide.nxv8i16	nxv8i1,nxv8i16,nxv2i64	nxv8i16	lsr z0.h, p0/m, z0.h, z1.d
+mad.nxv16i8	nxv16i1,nxv16i8,nxv16i8,nxv16i8	nxv16i8	mad z0.b, p0/m, z1.b, z2.b
+mad.nxv2i64	nxv2i1,nxv2i64,nxv2i64,nxv2i64	nxv2i64	mad z0.d, p0/m, z1.d, z2.d
+mad.nxv4i32	nxv4i1,nxv4i32,nxv4i32,nxv4i32	nxv4i32	mad z0.s, p0/m, z1.s, z2.s
+mad.nxv8i16	nxv8i1,nxv8i16,nxv8i16,nxv8i16	nxv8i16	mad z0.h, p0/m, z1.h, z2.h
+match.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	match p0.b, p0/z, z0.b, z1.b
+match.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	match p0.h, p0/z, z0.h, z1.h
+mla.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	mla z0.d, z1.d, z2.d[0]
+mla.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=1	nxv2i64	mla z0.d, z1.d, z2.d[1]
+mla.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	mla z0.s, z1.s, z2.s[0]
+mla.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=3	nxv4i32	mla z0.s, z1.s, z2.s[3]
+mla.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	mla z0.h, z1.h, z2.h[0]
+mla.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=7	nxv8i16	mla z0.h, z1.h, z2.h[7]
+mla.nxv16i8	nxv16i1,nxv16i8,nxv16i8,nxv16i8	nxv16i8	mla z0.b, p0/m, z1.b, z2.b
+mla.nxv2i64	nxv2i1,nxv2i64,nxv2i64,nxv2i64	nxv2i64	mla z0.d, p0/m, z1.d, z2.d
+mla.nxv4i32	nxv4i1,nxv4i32,nxv4i32,nxv4i32	nxv4i32	mla z0.s, p0/m, z1.s, z2.s
+mla.nxv8i16	nxv8i1,nxv8i16,nxv8i16,nxv8i16	nxv8i16	mla z0.h, p0/m, z1.h, z2.h
+mls.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	mls z0.d, z1.d, z2.d[0]
+mls.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=1	nxv2i64	mls z0.d, z1.d, z2.d[1]
+mls.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	mls z0.s, z1.s, z2.s[0]
+mls.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=3	nxv4i32	mls z0.s, z1.s, z2.s[3]
+mls.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	mls z0.h, z1.h, z2.h[0]
+mls.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=7	nxv8i16	mls z0.h, z1.h, z2.h[7]
+mls.nxv16i8	nxv16i1,nxv16i8,nxv16i8,nxv16i8	nxv16i8	mls z0.b, p0/m, z1.b, z2.b
+mls.nxv2i64	nxv2i1,nxv2i64,nxv2i64,nxv2i64	nxv2i64	mls z0.d, p0/m, z1.d, z2.d
+mls.nxv4i32	nxv4i1,nxv4i32,nxv4i32,nxv4i32	nxv4i32	mls z0.s, p0/m, z1.s, z2.s
+mls.nxv8i16	nxv8i1,nxv8i16,nxv8i16,nxv8i16	nxv8i16	mls z0.h, p0/m, z1.h, z2.h
+msb.nxv16i8	nxv16i1,nxv16i8,nxv16i8,nxv16i8	nxv16i8	msb z0.b, p0/m, z1.b, z2.b
+msb.nxv2i64	nxv2i1,nxv2i64,nxv2i64,nxv2i64	nxv2i64	msb z0.d, p0/m, z1.d, z2.d
+msb.nxv4i32	nxv4i1,nxv4i32,nxv4i32,nxv4i32	nxv4i32	msb z0.s, p0/m, z1.s, z2.s
+msb.nxv8i16	nxv8i1,nxv8i16,nxv8i16,nxv8i16	nxv8i16	msb z0.h, p0/m, z1.h, z2.h
+mul.lane.nxv2i64	nxv2i64,nxv2i64,i32=0	nxv2i64	mul z0.d, z0.d, z1.d[0]
+mul.lane.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	mul z0.d, z0.d, z1.d[1]
+mul.lane.nxv4i32	nxv4i32,nxv4i32,i32=0	nxv4i32	mul z0.s, z0.s, z1.s[0]
+mul.lane.nxv4i32	nxv4i32,nxv4i32,i32=3	nxv4i32	mul z0.s, z0.s, z1.s[3]
+mul.lane.nxv8i16	nxv8i16,nxv8i16,i32=0	nxv8i16	mul z0.h, z0.h, z1.h[0]
+mul.lane.nxv8i16	nxv8i16,nxv8i16,i32=7	nxv8i16	mul z0.h, z0.h, z1.h[7]
+mul.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	mul z0.b, p0/m, z0.b, z1.b
+mul.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	mul z0.d, p0/m, z0.d, z1.d
+mul.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	mul z0.s, p0/m, z0.s, z1.s
+mul.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	mul z0.h, p0/m, z0.h, z1.h
+nand.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	nand p0.b, p0/z, p1.b, p2.b
+nbsl.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	nbsl z0.d, z0.d, z1.d, z2.d
+nbsl.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	nbsl z0.d, z0.d, z1.d, z2.d
+nbsl.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	nbsl z0.d, z0.d, z1.d, z2.d
+nbsl.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	nbsl z0.d, z0.d, z1.d, z2.d
+neg.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	neg z0.b, p0/m, z1.b
+neg.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	neg z0.d, p0/m, z1.d
+neg.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	neg z0.s, p0/m, z1.s
+neg.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	neg z0.h, p0/m, z1.h
+nmatch.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i1	nmatch p0.b, p0/z, z0.b, z1.b
+nmatch.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i1	nmatch p0.h, p0/z, z0.h, z1.h
+nor.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	nor p0.b, p0/z, p1.b, p2.b
+not.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	not z0.b, p0/m, z1.b
+not.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	not z0.d, p0/m, z1.d
+not.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	not z0.s, p0/m, z1.s
+not.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	not z0.h, p0/m, z1.h
+orn.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	orn p0.b, p0/z, p1.b, p2.b
+orr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	orr z0.b, p0/m, z0.b, z1.b
+orr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	orr z0.d, p0/m, z0.d, z1.d
+orr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	orr z0.s, p0/m, z0.s, z1.s
+orr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	orr z0.h, p0/m, z0.h, z1.h
+orr.z.nxv16i1	nxv16i1,nxv16i1,nxv16i1	nxv16i1	orr p0.b, p0/z, p1.b, p2.b
+orv.nxv16i8	nxv16i1,nxv16i8	i8	orv b0, p0, z0.b; fmov w0, s0
+orv.nxv2i64	nxv2i1,nxv2i64	i64	orv d0, p0, z0.d; fmov x0, d0
+orv.nxv4i32	nxv4i1,nxv4i32	i32	orv s0, p0, z0.s; fmov w0, s0
+orv.nxv8i16	nxv8i1,nxv8i16	i16	orv h0, p0, z0.h; fmov w0, s0
+pfirst.nxv16i1	nxv16i1,nxv16i1	nxv16i1	pfirst p1.b, p0, p1.b; mov p0.b, p1.b
+pmul.nxv16i8	nxv16i8,nxv16i8	nxv16i8	pmul z0.b, z0.b, z1.b
+pmullb.pair.nxv16i8	nxv16i8,nxv16i8	nxv16i8	pmullb z0.h, z0.b, z1.b
+pmullb.pair.nxv2i64	nxv2i64,nxv2i64	nxv2i64	pmullb z0.q, z0.d, z1.d
+pmullb.pair.nxv4i32	nxv4i32,nxv4i32	nxv4i32	pmullb z0.d, z0.s, z1.s
+pmullt.pair.nxv16i8	nxv16i8,nxv16i8	nxv16i8	pmullt z0.h, z0.b, z1.b
+pmullt.pair.nxv2i64	nxv2i64,nxv2i64	nxv2i64	pmullt z0.q, z0.d, z1.d
+pmullt.pair.nxv4i32	nxv4i32,nxv4i32	nxv4i32	pmullt z0.d, z0.s, z1.s
+pnext.nxv16i1	nxv16i1,nxv16i1	nxv16i1	pnext p1.b, p0, p1.b; mov p0.b, p1.b
+pnext.nxv2i1	nxv2i1,nxv2i1	nxv2i1	pnext p1.d, p0, p1.d; mov p0.b, p1.b
+pnext.nxv4i1	nxv4i1,nxv4i1	nxv4i1	pnext p1.s, p0, p1.s; mov p0.b, p1.b
+pnext.nxv8i1	nxv8i1,nxv8i1	nxv8i1	pnext p1.h, p0, p1.h; mov p0.b, p1.b
+prf.nxv16i1	nxv16i1,ptr,i32=13	void	prfb pstl3strm, p0, [x0]
+prf.nxv16i1	nxv16i1,ptr,i32=3	void	prfb pldl2strm, p0, [x0]
+prf.nxv2i1	nxv2i1,ptr,i32=13	void	prfd pstl3strm, p0, [x0]
+prf.nxv2i1	nxv2i1,ptr,i32=3	void	prfd pldl2strm, p0, [x0]
+prf.nxv4i1	nxv4i1,ptr,i32=13	void	prfw pstl3strm, p0, [x0]
+prf.nxv4i1	nxv4i1,ptr,i32=3	void	prfw pldl2strm, p0, [x0]
+prf.nxv8i1	nxv8i1,ptr,i32=13	void	prfh pstl3strm, p0, [x0]
+prf.nxv8i1	nxv8i1,ptr,i32=3	void	prfh pldl2strm, p0, [x0]
+prfb.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.d]
+prfb.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.d]
+prfb.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.d, uxtw]
+prfb.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.d, uxtw]
+prfb.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=13	void	prfb pstl3strm, p0, [z0.d]
+prfb.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=3	void	prfb pldl2strm, p0, [z0.d]
+prfb.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, uxtw]
+prfb.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, uxtw]
+prfb.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=13	void	prfb pstl3strm, p0, [z0.s]
+prfb.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=3	void	prfb pldl2strm, p0, [z0.s]
+prfb.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, sxtw]
+prfb.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, sxtw]
+prfb.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, uxtw]
+prfb.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, uxtw]
+prfd.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=13	void	prfd pstl3strm, p0, [x0, z0.d, lsl #3]
+prfd.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=3	void	prfd pldl2strm, p0, [x0, z0.d, lsl #3]
+prfd.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.d, uxtw]
+prfd.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.d, uxtw]
+prfd.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=13	void	prfd pstl3strm, p0, [z0.d]
+prfd.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=3	void	prfd pldl2strm, p0, [z0.d]
+prfd.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, uxtw]
+prfd.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, uxtw]
+prfd.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=13	void	prfd pstl3strm, p0, [z0.s]
+prfd.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=3	void	prfd pldl2strm, p0, [z0.s]
+prfd.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfd pstl3strm, p0, [x0, z0.s, sxtw #3]
+prfd.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfd pldl2strm, p0, [x0, z0.s, sxtw #3]
+prfd.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfd pstl3strm, p0, [x0, z0.s, uxtw #3]
+prfd.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfd pldl2strm, p0, [x0, z0.s, uxtw #3]
+prfh.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=13	void	prfh pstl3strm, p0, [x0, z0.d, lsl #1]
+prfh.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=3	void	prfh pldl2strm, p0, [x0, z0.d, lsl #1]
+prfh.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.d, uxtw]
+prfh.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.d, uxtw]
+prfh.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=13	void	prfh pstl3strm, p0, [z0.d]
+prfh.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=3	void	prfh pldl2strm, p0, [z0.d]
+prfh.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, uxtw]
+prfh.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, uxtw]
+prfh.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=13	void	prfh pstl3strm, p0, [z0.s]
+prfh.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=3	void	prfh pldl2strm, p0, [z0.s]
+prfh.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfh pstl3strm, p0, [x0, z0.s, sxtw #1]
+prfh.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfh pldl2strm, p0, [x0, z0.s, sxtw #1]
+prfh.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfh pstl3strm, p0, [x0, z0.s, uxtw #1]
+prfh.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfh pldl2strm, p0, [x0, z0.s, uxtw #1]
+prfw.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=13	void	prfw pstl3strm, p0, [x0, z0.d, lsl #2]
+prfw.gather.index.nxv2i64	nxv2i1,ptr,nxv2i64,i32=3	void	prfw pldl2strm, p0, [x0, z0.d, lsl #2]
+prfw.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.d, uxtw]
+prfw.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.d, uxtw]
+prfw.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=13	void	prfw pstl3strm, p0, [z0.d]
+prfw.gather.scalar.offset.nxv2i64	nxv2i1,nxv2i64,i64=0,i32=3	void	prfw pldl2strm, p0, [z0.d]
+prfw.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=13	void	prfb pstl3strm, p0, [x0, z0.s, uxtw]
+prfw.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64,i32=3	void	prfb pldl2strm, p0, [x0, z0.s, uxtw]
+prfw.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=13	void	prfw pstl3strm, p0, [z0.s]
+prfw.gather.scalar.offset.nxv4i32	nxv4i1,nxv4i32,i64=0,i32=3	void	prfw pldl2strm, p0, [z0.s]
+prfw.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfw pstl3strm, p0, [x0, z0.s, sxtw #2]
+prfw.gather.sxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfw pldl2strm, p0, [x0, z0.s, sxtw #2]
+prfw.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=13	void	prfw pstl3strm, p0, [x0, z0.s, uxtw #2]
+prfw.gather.uxtw.index.nxv4i32	nxv4i1,ptr,nxv4i32,i32=3	void	prfw pldl2strm, p0, [x0, z0.s, uxtw #2]
+ptest.any.nxv16i1	nxv16i1,nxv16i1	i8	ptest p0, p1.b; cset w0, ne
+ptest.first.nxv16i1	nxv16i1,nxv16i1	i8	ptest p0, p1.b; cset w0, mi
+ptest.last.nxv16i1	nxv16i1,nxv16i1	i8	ptest p0, p1.b; cset w0, lo
+ptrue.nxv16i1	i32=30	nxv16i1	ptrue p0.b, mul3
+ptrue.nxv16i1	i32=7	nxv16i1	ptrue p0.b, vl7
+ptrue.nxv2i1	i32=30	nxv2i1	ptrue p0.d, mul3
+ptrue.nxv2i1	i32=7	nxv2i1	ptrue p0.d, vl7
+ptrue.nxv4i1	i32=30	nxv4i1	ptrue p0.s, mul3
+ptrue.nxv4i1	i32=7	nxv4i1	ptrue p0.s, vl7
+ptrue.nxv8i1	i32=30	nxv8i1	ptrue p0.h, mul3
+ptrue.nxv8i1	i32=7	nxv8i1	ptrue p0.h, vl7
+punpkhi.nxv16i1	nxv16i1	nxv8i1	punpkhi p0.h, p0.b
+punpklo.nxv16i1	nxv16i1	nxv8i1	punpklo p0.h, p0.b
+raddhnb.nxv2i64	nxv2i64,nxv2i64	nxv4i32	raddhnb z0.s, z0.d, z1.d
+raddhnb.nxv4i32	nxv4i32,nxv4i32	nxv8i16	raddhnb z0.h, z0.s, z1.s
+raddhnb.nxv8i16	nxv8i16,nxv8i16	nxv16i8	raddhnb z0.b, z0.h, z1.h
+raddhnt.nxv2i64	nxv4i32,nxv2i64,nxv2i64	nxv4i32	raddhnt z0.s, z1.d, z2.d
+raddhnt.nxv4i32	nxv8i16,nxv4i32,nxv4i32	nxv8i16	raddhnt z0.h, z1.s, z2.s
+raddhnt.nxv8i16	nxv16i8,nxv8i16,nxv8i16	nxv16i8	raddhnt z0.b, z1.h, z2.h
+rax1	nxv2i64,nxv2i64	nxv2i64	rax1 z0.d, z0.d, z1.d
+rbit.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	rbit z0.b, p0/m, z1.b
+rbit.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	rbit z0.d, p0/m, z1.d
+rbit.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	rbit z0.s, p0/m, z1.s
+rbit.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	rbit z0.h, p0/m, z1.h
+rdffr.z	nxv16i1	nxv16i1	rdffr p0.b, p0/z
+rev.b16	nxv16i1	nxv16i1	rev p0.h, p0.h
+rev.b32	nxv16i1	nxv16i1	rev p0.s, p0.s
+rev.b64	nxv16i1	nxv16i1	rev p0.d, p0.d
+revb.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	revb z0.d, p0/m, z1.d
+revb.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	revb z0.s, p0/m, z1.s
+revb.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	revb z0.h, p0/m, z1.h
+revh.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	revh z0.d, p0/m, z1.d
+revh.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	revh z0.s, p0/m, z1.s
+revw.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	revw z0.d, p0/m, z1.d
+rshrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	rshrnb z0.s, z0.d, #1
+rshrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	rshrnb z0.s, z0.d, #32
+rshrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	rshrnb z0.h, z0.s, #1
+rshrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	rshrnb z0.h, z0.s, #16
+rshrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	rshrnb z0.b, z0.h, #1
+rshrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	rshrnb z0.b, z0.h, #8
+rshrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	rshrnt z0.s, z1.d, #1
+rshrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	rshrnt z0.s, z1.d, #32
+rshrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	rshrnt z0.h, z1.s, #1
+rshrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	rshrnt z0.h, z1.s, #16
+rshrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	rshrnt z0.b, z1.h, #1
+rshrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	rshrnt z0.b, z1.h, #8
+rsubhnb.nxv2i64	nxv2i64,nxv2i64	nxv4i32	rsubhnb z0.s, z0.d, z1.d
+rsubhnb.nxv4i32	nxv4i32,nxv4i32	nxv8i16	rsubhnb z0.h, z0.s, z1.s
+rsubhnb.nxv8i16	nxv8i16,nxv8i16	nxv16i8	rsubhnb z0.b, z0.h, z1.h
+rsubhnt.nxv2i64	nxv4i32,nxv2i64,nxv2i64	nxv4i32	rsubhnt z0.s, z1.d, z2.d
+rsubhnt.nxv4i32	nxv8i16,nxv4i32,nxv4i32	nxv8i16	rsubhnt z0.h, z1.s, z2.s
+rsubhnt.nxv8i16	nxv16i8,nxv8i16,nxv8i16	nxv16i8	rsubhnt z0.b, z1.h, z2.h
+saba.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	saba z0.b, z1.b, z2.b
+saba.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	saba z0.d, z1.d, z2.d
+saba.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	saba z0.s, z1.s, z2.s
+saba.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	saba z0.h, z1.h, z2.h
+sabalb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sabalb z0.d, z1.s, z2.s
+sabalb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sabalb z0.s, z1.h, z2.h
+sabalb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sabalb z0.h, z1.b, z2.b
+sabalt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sabalt z0.d, z1.s, z2.s
+sabalt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sabalt z0.s, z1.h, z2.h
+sabalt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sabalt z0.h, z1.b, z2.b
+sabd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sabd z0.b, p0/m, z0.b, z1.b
+sabd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sabd z0.d, p0/m, z0.d, z1.d
+sabd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sabd z0.s, p0/m, z0.s, z1.s
+sabd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sabd z0.h, p0/m, z0.h, z1.h
+sabdlb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	sabdlb z0.d, z0.s, z1.s
+sabdlb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	sabdlb z0.s, z0.h, z1.h
+sabdlb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	sabdlb z0.h, z0.b, z1.b
+sabdlt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	sabdlt z0.d, z0.s, z1.s
+sabdlt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	sabdlt z0.s, z0.h, z1.h
+sabdlt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	sabdlt z0.h, z0.b, z1.b
+sadalp.nxv2i64	nxv2i1,nxv2i64,nxv4i32	nxv2i64	sadalp z0.d, p0/m, z1.s
+sadalp.nxv4i32	nxv4i1,nxv4i32,nxv8i16	nxv4i32	sadalp z0.s, p0/m, z1.h
+sadalp.nxv8i16	nxv8i1,nxv8i16,nxv16i8	nxv8i16	sadalp z0.h, p0/m, z1.b
+saddlb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	saddlb z0.d, z0.s, z1.s
+saddlb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	saddlb z0.s, z0.h, z1.h
+saddlb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	saddlb z0.h, z0.b, z1.b
+saddlbt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	saddlbt z0.d, z0.s, z1.s
+saddlbt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	saddlbt z0.s, z0.h, z1.h
+saddlbt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	saddlbt z0.h, z0.b, z1.b
+saddlt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	saddlt z0.d, z0.s, z1.s
+saddlt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	saddlt z0.s, z0.h, z1.h
+saddlt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	saddlt z0.h, z0.b, z1.b
+saddv.nxv16i8	nxv16i1,nxv16i8	i64	saddv d0, p0, z0.b; fmov x0, d0
+saddv.nxv2i64	nxv2i1,nxv2i64	i64	uaddv d0, p0, z0.d; fmov x0, d0
+saddv.nxv4i32	nxv4i1,nxv4i32	i64	saddv d0, p0, z0.s; fmov x0, d0
+saddv.nxv8i16	nxv8i1,nxv8i16	i64	saddv d0, p0, z0.h; fmov x0, d0
+saddwb.nxv2i64	nxv2i64,nxv4i32	nxv2i64	saddwb z0.d, z0.d, z1.s
+saddwb.nxv4i32	nxv4i32,nxv8i16	nxv4i32	saddwb z0.s, z0.s, z1.h
+saddwb.nxv8i16	nxv8i16,nxv16i8	nxv8i16	saddwb z0.h, z0.h, z1.b
+saddwt.nxv2i64	nxv2i64,nxv4i32	nxv2i64	saddwt z0.d, z0.d, z1.s
+saddwt.nxv4i32	nxv4i32,nxv8i16	nxv4i32	saddwt z0.s, z0.s, z1.h
+saddwt.nxv8i16	nxv8i16,nxv16i8	nxv8i16	saddwt z0.h, z0.h, z1.b
+sbclb.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	sbclb z0.d, z1.d, z2.d
+sbclb.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	sbclb z0.s, z1.s, z2.s
+sbclt.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	sbclt z0.d, z1.d, z2.d
+sbclt.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	sbclt z0.s, z1.s, z2.s
+scvtf.f32i64	nxv4f32,nxv2i1,nxv2i64	nxv4f32	scvtf z0.s, p0/m, z1.d
+scvtf.f64i32	nxv2f64,nxv2i1,nxv4i32	nxv2f64	scvtf z0.d, p0/m, z1.s
+scvtf.nxv2f64.nxv2i64	nxv2f64,nxv2i1,nxv2i64	nxv2f64	scvtf z0.d, p0/m, z1.d
+scvtf.nxv4f32.nxv4i32	nxv4f32,nxv4i1,nxv4i32	nxv4f32	scvtf z0.s, p0/m, z1.s
+sdiv.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sdiv z0.d, p0/m, z0.d, z1.d
+sdiv.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sdiv z0.s, p0/m, z0.s, z1.s
+sdivr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sdivr z0.d, p0/m, z0.d, z1.d
+sdivr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sdivr z0.s, p0/m, z0.s, z1.s
+sdot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=0	nxv2i64	sdot z0.d, z1.h, z2.h[0]
+sdot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=1	nxv2i64	sdot z0.d, z1.h, z2.h[1]
+sdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0	nxv4i32	sdot z0.s, z1.b, z2.b[0]
+sdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=3	nxv4i32	sdot z0.s, z1.b, z2.b[3]
+sdot.nxv2i64	nxv2i64,nxv8i16,nxv8i16	nxv2i64	sdot z0.d, z1.h, z2.h
+sdot.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	sdot z0.s, z1.b, z2.b
+setffr		void	setffr
+shadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	shadd z0.b, p0/m, z0.b, z1.b
+shadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	shadd z0.d, p0/m, z0.d, z1.d
+shadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	shadd z0.s, p0/m, z0.s, z1.s
+shadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	shadd z0.h, p0/m, z0.h, z1.h
+shrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	shrnb z0.s, z0.d, #1
+shrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	shrnb z0.s, z0.d, #32
+shrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	shrnb z0.h, z0.s, #1
+shrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	shrnb z0.h, z0.s, #16
+shrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	shrnb z0.b, z0.h, #1
+shrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	shrnb z0.b, z0.h, #8
+shrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	shrnt z0.s, z1.d, #1
+shrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	shrnt z0.s, z1.d, #32
+shrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	shrnt z0.h, z1.s, #1
+shrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	shrnt z0.h, z1.s, #16
+shrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	shrnt z0.b, z1.h, #1
+shrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	shrnt z0.b, z1.h, #8
+shsub.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	shsub z0.b, p0/m, z0.b, z1.b
+shsub.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	shsub z0.d, p0/m, z0.d, z1.d
+shsub.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	shsub z0.s, p0/m, z0.s, z1.s
+shsub.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	shsub z0.h, p0/m, z0.h, z1.h
+shsubr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	shsubr z0.b, p0/m, z0.b, z1.b
+shsubr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	shsubr z0.d, p0/m, z0.d, z1.d
+shsubr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	shsubr z0.s, p0/m, z0.s, z1.s
+shsubr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	shsubr z0.h, p0/m, z0.h, z1.h
+sli.nxv16i8	nxv16i8,nxv16i8,i32=0	nxv16i8	sli z0.b, z1.b, #0
+sli.nxv16i8	nxv16i8,nxv16i8,i32=7	nxv16i8	sli z0.b, z1.b, #7
+sli.nxv2i64	nxv2i64,nxv2i64,i32=0	nxv2i64	sli z0.d, z1.d, #0
+sli.nxv2i64	nxv2i64,nxv2i64,i32=63	nxv2i64	sli z0.d, z1.d, #63
+sli.nxv4i32	nxv4i32,nxv4i32,i32=0	nxv4i32	sli z0.s, z1.s, #0
+sli.nxv4i32	nxv4i32,nxv4i32,i32=31	nxv4i32	sli z0.s, z1.s, #31
+sli.nxv8i16	nxv8i16,nxv8i16,i32=0	nxv8i16	sli z0.h, z1.h, #0
+sli.nxv8i16	nxv8i16,nxv8i16,i32=15	nxv8i16	sli z0.h, z1.h, #15
+sm4e	nxv4i32,nxv4i32	nxv4i32	sm4e z0.s, z0.s, z1.s
+sm4ekey	nxv4i32,nxv4i32	nxv4i32	sm4ekey z0.s, z0.s, z1.s
+smax.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	smax z0.b, p0/m, z0.b, z1.b
+smax.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	smax z0.d, p0/m, z0.d, z1.d
+smax.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	smax z0.s, p0/m, z0.s, z1.s
+smax.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	smax z0.h, p0/m, z0.h, z1.h
+smaxp.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	smaxp z0.b, p0/m, z0.b, z1.b
+smaxp.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	smaxp z0.d, p0/m, z0.d, z1.d
+smaxp.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	smaxp z0.s, p0/m, z0.s, z1.s
+smaxp.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	smaxp z0.h, p0/m, z0.h, z1.h
+smaxv.nxv16i8	nxv16i1,nxv16i8	i8	smaxv b0, p0, z0.b; fmov w0, s0
+smaxv.nxv2i64	nxv2i1,nxv2i64	i64	smaxv d0, p0, z0.d; fmov x0, d0
+smaxv.nxv4i32	nxv4i1,nxv4i32	i32	smaxv s0, p0, z0.s; fmov w0, s0
+smaxv.nxv8i16	nxv8i1,nxv8i16	i16	smaxv h0, p0, z0.h; fmov w0, s0
+smin.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	smin z0.b, p0/m, z0.b, z1.b
+smin.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	smin z0.d, p0/m, z0.d, z1.d
+smin.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	smin z0.s, p0/m, z0.s, z1.s
+smin.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	smin z0.h, p0/m, z0.h, z1.h
+sminp.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sminp z0.b, p0/m, z0.b, z1.b
+sminp.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sminp z0.d, p0/m, z0.d, z1.d
+sminp.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sminp z0.s, p0/m, z0.s, z1.s
+sminp.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sminp z0.h, p0/m, z0.h, z1.h
+sminv.nxv16i8	nxv16i1,nxv16i8	i8	sminv b0, p0, z0.b; fmov w0, s0
+sminv.nxv2i64	nxv2i1,nxv2i64	i64	sminv d0, p0, z0.d; fmov x0, d0
+sminv.nxv4i32	nxv4i1,nxv4i32	i32	sminv s0, p0, z0.s; fmov w0, s0
+sminv.nxv8i16	nxv8i1,nxv8i16	i16	sminv h0, p0, z0.h; fmov w0, s0
+smlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	smlalb z0.d, z1.s, z2.s[0]
+smlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	smlalb z0.d, z1.s, z2.s[3]
+smlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	smlalb z0.s, z1.h, z2.h[0]
+smlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	smlalb z0.s, z1.h, z2.h[7]
+smlalb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	smlalb z0.d, z1.s, z2.s
+smlalb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	smlalb z0.s, z1.h, z2.h
+smlalb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	smlalb z0.h, z1.b, z2.b
+smlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	smlalt z0.d, z1.s, z2.s[0]
+smlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	smlalt z0.d, z1.s, z2.s[3]
+smlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	smlalt z0.s, z1.h, z2.h[0]
+smlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	smlalt z0.s, z1.h, z2.h[7]
+smlalt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	smlalt z0.d, z1.s, z2.s
+smlalt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	smlalt z0.s, z1.h, z2.h
+smlalt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	smlalt z0.h, z1.b, z2.b
+smlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	smlslb z0.d, z1.s, z2.s[0]
+smlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	smlslb z0.d, z1.s, z2.s[3]
+smlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	smlslb z0.s, z1.h, z2.h[0]
+smlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	smlslb z0.s, z1.h, z2.h[7]
+smlslb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	smlslb z0.d, z1.s, z2.s
+smlslb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	smlslb z0.s, z1.h, z2.h
+smlslb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	smlslb z0.h, z1.b, z2.b
+smlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	smlslt z0.d, z1.s, z2.s[0]
+smlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	smlslt z0.d, z1.s, z2.s[3]
+smlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	smlslt z0.s, z1.h, z2.h[0]
+smlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	smlslt z0.s, z1.h, z2.h[7]
+smlslt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	smlslt z0.d, z1.s, z2.s
+smlslt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	smlslt z0.s, z1.h, z2.h
+smlslt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	smlslt z0.h, z1.b, z2.b
+smmla.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	smmla z0.s, z1.b, z2.b
+smulh.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	smulh z0.b, p0/m, z0.b, z1.b
+smulh.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	smulh z0.d, p0/m, z0.d, z1.d
+smulh.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	smulh z0.s, p0/m, z0.s, z1.s
+smulh.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	smulh z0.h, p0/m, z0.h, z1.h
+smullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	smullb z0.d, z0.s, z1.s[0]
+smullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	smullb z0.d, z0.s, z1.s[3]
+smullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	smullb z0.s, z0.h, z1.h[0]
+smullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	smullb z0.s, z0.h, z1.h[7]
+smullb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	smullb z0.d, z0.s, z1.s
+smullb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	smullb z0.s, z0.h, z1.h
+smullb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	smullb z0.h, z0.b, z1.b
+smullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	smullt z0.d, z0.s, z1.s[0]
+smullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	smullt z0.d, z0.s, z1.s[3]
+smullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	smullt z0.s, z0.h, z1.h[0]
+smullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	smullt z0.s, z0.h, z1.h[7]
+smullt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	smullt z0.d, z0.s, z1.s
+smullt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	smullt z0.s, z0.h, z1.h
+smullt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	smullt z0.h, z0.b, z1.b
+splice.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	splice z0.b, p0, z0.b, z1.b
+splice.nxv2f64	nxv2i1,nxv2f64,nxv2f64	nxv2f64	splice z0.d, p0, z0.d, z1.d
+splice.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	splice z0.d, p0, z0.d, z1.d
+splice.nxv4f32	nxv4i1,nxv4f32,nxv4f32	nxv4f32	splice z0.s, p0, z0.s, z1.s
+splice.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	splice z0.s, p0, z0.s, z1.s
+splice.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	splice z0.h, p0, z0.h, z1.h
+sqabs.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	sqabs z0.b, p0/m, z1.b
+sqabs.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	sqabs z0.d, p0/m, z1.d
+sqabs.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	sqabs z0.s, p0/m, z1.s
+sqabs.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	sqabs z0.h, p0/m, z1.h
+sqadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sqadd z0.b, p0/m, z0.b, z1.b
+sqadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sqadd z0.d, p0/m, z0.d, z1.d
+sqadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sqadd z0.s, p0/m, z0.s, z1.s
+sqadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sqadd z0.h, p0/m, z0.h, z1.h
+sqadd.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	sqadd z0.b, z0.b, z1.b
+sqadd.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	sqadd z0.d, z0.d, z1.d
+sqadd.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	sqadd z0.s, z0.s, z1.s
+sqadd.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	sqadd z0.h, z0.h, z1.h
+sqcadd.x.nxv16i8	nxv16i8,nxv16i8,i32=90	nxv16i8	sqcadd z0.b, z0.b, z1.b, #90
+sqcadd.x.nxv2i64	nxv2i64,nxv2i64,i32=90	nxv2i64	sqcadd z0.d, z0.d, z1.d, #90
+sqcadd.x.nxv4i32	nxv4i32,nxv4i32,i32=90	nxv4i32	sqcadd z0.s, z0.s, z1.s, #90
+sqcadd.x.nxv8i16	nxv8i16,nxv8i16,i32=90	nxv8i16	sqcadd z0.h, z0.h, z1.h, #90
+sqdecb.n32	i32,i32=30,i32=1	i32	sqdecb x0, w0, mul3
+sqdecb.n32	i32,i32=7,i32=16	i32	sqdecb x0, w0, vl7, mul #16
+sqdecb.n64	i64,i32=30,i32=1	i64	sqdecb x0, mul3
+sqdecb.n64	i64,i32=7,i32=16	i64	sqdecb x0, vl7, mul #16
+sqdecd.n32	i32,i32=30,i32=1	i32	sqdecd x0, w0, mul3
+sqdecd.n32	i32,i32=7,i32=16	i32	sqdecd x0, w0, vl7, mul #16
+sqdecd.n64	i64,i32=30,i32=1	i64	sqdecd x0, mul3
+sqdecd.n64	i64,i32=7,i32=16	i64	sqdecd x0, vl7, mul #16
+sqdecd.nxv2i64	nxv2i64,i32=30,i32=1	nxv2i64	sqdecd z0.d, mul3
+sqdecd.nxv2i64	nxv2i64,i32=7,i32=16	nxv2i64	sqdecd z0.d, vl7, mul #16
+sqdech.n32	i32,i32=30,i32=1	i32	sqdech x0, w0, mul3
+sqdech.n32	i32,i32=7,i32=16	i32	sqdech x0, w0, vl7, mul #16
+sqdech.n64	i64,i32=30,i32=1	i64	sqdech x0, mul3
+sqdech.n64	i64,i32=7,i32=16	i64	sqdech x0, vl7, mul #16
+sqdech.nxv8i16	nxv8i16,i32=30,i32=1	nxv8i16	sqdech z0.h, mul3
+sqdech.nxv8i16	nxv8i16,i32=7,i32=16	nxv8i16	sqdech z0.h, vl7, mul #16
+sqdecp.n32.nxv16i1	i32,nxv16i1	i32	sqdecp x0, p0.b, w0
+sqdecp.n32.nxv2i1	i32,nxv2i1	i32	sqdecp x0, p0.d, w0
+sqdecp.n32.nxv4i1	i32,nxv4i1	i32	sqdecp x0, p0.s, w0
+sqdecp.n32.nxv8i1	i32,nxv8i1	i32	sqdecp x0, p0.h, w0
+sqdecp.n64.nxv16i1	i64,nxv16i1	i64	sqdecp x0, p0.b
+sqdecp.n64.nxv2i1	i64,nxv2i1	i64	sqdecp x0, p0.d
+sqdecp.n64.nxv4i1	i64,nxv4i1	i64	sqdecp x0, p0.s
+sqdecp.n64.nxv8i1	i64,nxv8i1	i64	sqdecp x0, p0.h
+sqdecp.nxv2i64	nxv2i64,nxv2i1	nxv2i64	sqdecp z0.d, p0.d
+sqdecp.nxv4i32	nxv4i32,nxv4i1	nxv4i32	sqdecp z0.s, p0.s
+sqdecp.nxv8i16	nxv8i16,nxv8i1	nxv8i16	sqdecp z0.h, p0.h
+sqdecw.n32	i32,i32=30,i32=1	i32	sqdecw x0, w0, mul3
+sqdecw.n32	i32,i32=7,i32=16	i32	sqdecw x0, w0, vl7, mul #16
+sqdecw.n64	i64,i32=30,i32=1	i64	sqdecw x0, mul3
+sqdecw.n64	i64,i32=7,i32=16	i64	sqdecw x0, vl7, mul #16
+sqdecw.nxv4i32	nxv4i32,i32=30,i32=1	nxv4i32	sqdecw z0.s, mul3
+sqdecw.nxv4i32	nxv4i32,i32=7,i32=16	nxv4i32	sqdecw z0.s, vl7, mul #16
+sqdmlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmlalb z0.d, z1.s, z2.s[0]
+sqdmlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmlalb z0.d, z1.s, z2.s[3]
+sqdmlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmlalb z0.s, z1.h, z2.h[0]
+sqdmlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmlalb z0.s, z1.h, z2.h[7]
+sqdmlalb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlalb z0.d, z1.s, z2.s
+sqdmlalb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlalb z0.s, z1.h, z2.h
+sqdmlalb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlalb z0.h, z1.b, z2.b
+sqdmlalbt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlalbt z0.d, z1.s, z2.s
+sqdmlalbt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlalbt z0.s, z1.h, z2.h
+sqdmlalbt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlalbt z0.h, z1.b, z2.b
+sqdmlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmlalt z0.d, z1.s, z2.s[0]
+sqdmlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmlalt z0.d, z1.s, z2.s[3]
+sqdmlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmlalt z0.s, z1.h, z2.h[0]
+sqdmlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmlalt z0.s, z1.h, z2.h[7]
+sqdmlalt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlalt z0.d, z1.s, z2.s
+sqdmlalt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlalt z0.s, z1.h, z2.h
+sqdmlalt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlalt z0.h, z1.b, z2.b
+sqdmlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmlslb z0.d, z1.s, z2.s[0]
+sqdmlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmlslb z0.d, z1.s, z2.s[3]
+sqdmlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmlslb z0.s, z1.h, z2.h[0]
+sqdmlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmlslb z0.s, z1.h, z2.h[7]
+sqdmlslb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlslb z0.d, z1.s, z2.s
+sqdmlslb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlslb z0.s, z1.h, z2.h
+sqdmlslb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlslb z0.h, z1.b, z2.b
+sqdmlslbt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlslbt z0.d, z1.s, z2.s
+sqdmlslbt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlslbt z0.s, z1.h, z2.h
+sqdmlslbt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlslbt z0.h, z1.b, z2.b
+sqdmlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmlslt z0.d, z1.s, z2.s[0]
+sqdmlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmlslt z0.d, z1.s, z2.s[3]
+sqdmlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmlslt z0.s, z1.h, z2.h[0]
+sqdmlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmlslt z0.s, z1.h, z2.h[7]
+sqdmlslt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	sqdmlslt z0.d, z1.s, z2.s
+sqdmlslt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	sqdmlslt z0.s, z1.h, z2.h
+sqdmlslt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	sqdmlslt z0.h, z1.b, z2.b
+sqdmulh.lane.nxv2i64	nxv2i64,nxv2i64,i32=0	nxv2i64	sqdmulh z0.d, z0.d, z1.d[0]
+sqdmulh.lane.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	sqdmulh z0.d, z0.d, z1.d[1]
+sqdmulh.lane.nxv4i32	nxv4i32,nxv4i32,i32=0	nxv4i32	sqdmulh z0.s, z0.s, z1.s[0]
+sqdmulh.lane.nxv4i32	nxv4i32,nxv4i32,i32=3	nxv4i32	sqdmulh z0.s, z0.s, z1.s[3]
+sqdmulh.lane.nxv8i16	nxv8i16,nxv8i16,i32=0	nxv8i16	sqdmulh z0.h, z0.h, z1.h[0]
+sqdmulh.lane.nxv8i16	nxv8i16,nxv8i16,i32=7	nxv8i16	sqdmulh z0.h, z0.h, z1.h[7]
+sqdmulh.nxv16i8	nxv16i8,nxv16i8	nxv16i8	sqdmulh z0.b, z0.b, z1.b
+sqdmulh.nxv2i64	nxv2i64,nxv2i64	nxv2i64	sqdmulh z0.d, z0.d, z1.d
+sqdmulh.nxv4i32	nxv4i32,nxv4i32	nxv4i32	sqdmulh z0.s, z0.s, z1.s
+sqdmulh.nxv8i16	nxv8i16,nxv8i16	nxv8i16	sqdmulh z0.h, z0.h, z1.h
+sqdmullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmullb z0.d, z0.s, z1.s[0]
+sqdmullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmullb z0.d, z0.s, z1.s[3]
+sqdmullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmullb z0.s, z0.h, z1.h[0]
+sqdmullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmullb z0.s, z0.h, z1.h[7]
+sqdmullb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	sqdmullb z0.d, z0.s, z1.s
+sqdmullb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	sqdmullb z0.s, z0.h, z1.h
+sqdmullb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	sqdmullb z0.h, z0.b, z1.b
+sqdmullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	sqdmullt z0.d, z0.s, z1.s[0]
+sqdmullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	sqdmullt z0.d, z0.s, z1.s[3]
+sqdmullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	sqdmullt z0.s, z0.h, z1.h[0]
+sqdmullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	sqdmullt z0.s, z0.h, z1.h[7]
+sqdmullt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	sqdmullt z0.d, z0.s, z1.s
+sqdmullt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	sqdmullt z0.s, z0.h, z1.h
+sqdmullt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	sqdmullt z0.h, z0.b, z1.b
+sqincb.n32	i32,i32=30,i32=1	i32	sqincb x0, w0, mul3
+sqincb.n32	i32,i32=7,i32=16	i32	sqincb x0, w0, vl7, mul #16
+sqincb.n64	i64,i32=30,i32=1	i64	sqincb x0, mul3
+sqincb.n64	i64,i32=7,i32=16	i64	sqincb x0, vl7, mul #16
+sqincd.n32	i32,i32=30,i32=1	i32	sqincd x0, w0, mul3
+sqincd.n32	i32,i32=7,i32=16	i32	sqincd x0, w0, vl7, mul #16
+sqincd.n64	i64,i32=30,i32=1	i64	sqincd x0, mul3
+sqincd.n64	i64,i32=7,i32=16	i64	sqincd x0, vl7, mul #16
+sqincd.nxv2i64	nxv2i64,i32=30,i32=1	nxv2i64	sqincd z0.d, mul3
+sqincd.nxv2i64	nxv2i64,i32=7,i32=16	nxv2i64	sqincd z0.d, vl7, mul #16
+sqinch.n32	i32,i32=30,i32=1	i32	sqinch x0, w0, mul3
+sqinch.n32	i32,i32=7,i32=16	i32	sqinch x0, w0, vl7, mul #16
+sqinch.n64	i64,i32=30,i32=1	i64	sqinch x0, mul3
+sqinch.n64	i64,i32=7,i32=16	i64	sqinch x0, vl7, mul #16
+sqinch.nxv8i16	nxv8i16,i32=30,i32=1	nxv8i16	sqinch z0.h, mul3
+sqinch.nxv8i16	nxv8i16,i32=7,i32=16	nxv8i16	sqinch z0.h, vl7, mul #16
+sqincp.n32.nxv16i1	i32,nxv16i1	i32	sqincp x0, p0.b, w0
+sqincp.n32.nxv2i1	i32,nxv2i1	i32	sqincp x0, p0.d, w0
+sqincp.n32.nxv4i1	i32,nxv4i1	i32	sqincp x0, p0.s, w0
+sqincp.n32.nxv8i1	i32,nxv8i1	i32	sqincp x0, p0.h, w0
+sqincp.n64.nxv16i1	i64,nxv16i1	i64	sqincp x0, p0.b
+sqincp.n64.nxv2i1	i64,nxv2i1	i64	sqincp x0, p0.d
+sqincp.n64.nxv4i1	i64,nxv4i1	i64	sqincp x0, p0.s
+sqincp.n64.nxv8i1	i64,nxv8i1	i64	sqincp x0, p0.h
+sqincp.nxv2i64	nxv2i64,nxv2i1	nxv2i64	sqincp z0.d, p0.d
+sqincp.nxv4i32	nxv4i32,nxv4i1	nxv4i32	sqincp z0.s, p0.s
+sqincp.nxv8i16	nxv8i16,nxv8i1	nxv8i16	sqincp z0.h, p0.h
+sqincw.n32	i32,i32=30,i32=1	i32	sqincw x0, w0, mul3
+sqincw.n32	i32,i32=7,i32=16	i32	sqincw x0, w0, vl7, mul #16
+sqincw.n64	i64,i32=30,i32=1	i64	sqincw x0, mul3
+sqincw.n64	i64,i32=7,i32=16	i64	sqincw x0, vl7, mul #16
+sqincw.nxv4i32	nxv4i32,i32=30,i32=1	nxv4i32	sqincw z0.s, mul3
+sqincw.nxv4i32	nxv4i32,i32=7,i32=16	nxv4i32	sqincw z0.s, vl7, mul #16
+sqneg.nxv16i8	nxv16i8,nxv16i1,nxv16i8	nxv16i8	sqneg z0.b, p0/m, z1.b
+sqneg.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	sqneg z0.d, p0/m, z1.d
+sqneg.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	sqneg z0.s, p0/m, z1.s
+sqneg.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	sqneg z0.h, p0/m, z1.h
+sqrdcmlah.lane.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0,i32=0	nxv4i32	sqrdcmlah z0.s, z1.s, z2.s[0], #0
+sqrdcmlah.lane.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=1,i32=0	nxv4i32	sqrdcmlah z0.s, z1.s, z2.s[1], #0
+sqrdcmlah.lane.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0,i32=0	nxv8i16	sqrdcmlah z0.h, z1.h, z2.h[0], #0
+sqrdcmlah.lane.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=3,i32=0	nxv8i16	sqrdcmlah z0.h, z1.h, z2.h[3], #0
+sqrdcmlah.x.nxv16i8	nxv16i8,nxv16i8,nxv16i8,i32=0	nxv16i8	sqrdcmlah z0.b, z1.b, z2.b, #0
+sqrdcmlah.x.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	sqrdcmlah z0.d, z1.d, z2.d, #0
+sqrdcmlah.x.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	sqrdcmlah z0.s, z1.s, z2.s, #0
+sqrdcmlah.x.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	sqrdcmlah z0.h, z1.h, z2.h, #0
+sqrdmlah.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	sqrdmlah z0.d, z1.d, z2.d[0]
+sqrdmlah.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=1	nxv2i64	sqrdmlah z0.d, z1.d, z2.d[1]
+sqrdmlah.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	sqrdmlah z0.s, z1.s, z2.s[0]
+sqrdmlah.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=3	nxv4i32	sqrdmlah z0.s, z1.s, z2.s[3]
+sqrdmlah.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	sqrdmlah z0.h, z1.h, z2.h[0]
+sqrdmlah.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=7	nxv8i16	sqrdmlah z0.h, z1.h, z2.h[7]
+sqrdmlah.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	sqrdmlah z0.b, z1.b, z2.b
+sqrdmlah.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	sqrdmlah z0.d, z1.d, z2.d
+sqrdmlah.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	sqrdmlah z0.s, z1.s, z2.s
+sqrdmlah.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	sqrdmlah z0.h, z1.h, z2.h
+sqrdmlsh.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=0	nxv2i64	sqrdmlsh z0.d, z1.d, z2.d[0]
+sqrdmlsh.lane.nxv2i64	nxv2i64,nxv2i64,nxv2i64,i32=1	nxv2i64	sqrdmlsh z0.d, z1.d, z2.d[1]
+sqrdmlsh.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=0	nxv4i32	sqrdmlsh z0.s, z1.s, z2.s[0]
+sqrdmlsh.lane.nxv4i32	nxv4i32,nxv4i32,nxv4i32,i32=3	nxv4i32	sqrdmlsh z0.s, z1.s, z2.s[3]
+sqrdmlsh.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=0	nxv8i16	sqrdmlsh z0.h, z1.h, z2.h[0]
+sqrdmlsh.lane.nxv8i16	nxv8i16,nxv8i16,nxv8i16,i32=7	nxv8i16	sqrdmlsh z0.h, z1.h, z2.h[7]
+sqrdmlsh.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	sqrdmlsh z0.b, z1.b, z2.b
+sqrdmlsh.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	sqrdmlsh z0.d, z1.d, z2.d
+sqrdmlsh.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	sqrdmlsh z0.s, z1.s, z2.s
+sqrdmlsh.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	sqrdmlsh z0.h, z1.h, z2.h
+sqrdmulh.lane.nxv2i64	nxv2i64,nxv2i64,i32=0	nxv2i64	sqrdmulh z0.d, z0.d, z1.d[0]
+sqrdmulh.lane.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	sqrdmulh z0.d, z0.d, z1.d[1]
+sqrdmulh.lane.nxv4i32	nxv4i32,nxv4i32,i32=0	nxv4i32	sqrdmulh z0.s, z0.s, z1.s[0]
+sqrdmulh.lane.nxv4i32	nxv4i32,nxv4i32,i32=3	nxv4i32	sqrdmulh z0.s, z0.s, z1.s[3]
+sqrdmulh.lane.nxv8i16	nxv8i16,nxv8i16,i32=0	nxv8i16	sqrdmulh z0.h, z0.h, z1.h[0]
+sqrdmulh.lane.nxv8i16	nxv8i16,nxv8i16,i32=7	nxv8i16	sqrdmulh z0.h, z0.h, z1.h[7]
+sqrdmulh.nxv16i8	nxv16i8,nxv16i8	nxv16i8	sqrdmulh z0.b, z0.b, z1.b
+sqrdmulh.nxv2i64	nxv2i64,nxv2i64	nxv2i64	sqrdmulh z0.d, z0.d, z1.d
+sqrdmulh.nxv4i32	nxv4i32,nxv4i32	nxv4i32	sqrdmulh z0.s, z0.s, z1.s
+sqrdmulh.nxv8i16	nxv8i16,nxv8i16	nxv8i16	sqrdmulh z0.h, z0.h, z1.h
+sqrshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sqrshl z0.b, p0/m, z0.b, z1.b
+sqrshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sqrshl z0.d, p0/m, z0.d, z1.d
+sqrshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sqrshl z0.s, p0/m, z0.s, z1.s
+sqrshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sqrshl z0.h, p0/m, z0.h, z1.h
+sqrshrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	sqrshrnb z0.s, z0.d, #1
+sqrshrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	sqrshrnb z0.s, z0.d, #32
+sqrshrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	sqrshrnb z0.h, z0.s, #1
+sqrshrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	sqrshrnb z0.h, z0.s, #16
+sqrshrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	sqrshrnb z0.b, z0.h, #1
+sqrshrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	sqrshrnb z0.b, z0.h, #8
+sqrshrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	sqrshrnt z0.s, z1.d, #1
+sqrshrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	sqrshrnt z0.s, z1.d, #32
+sqrshrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	sqrshrnt z0.h, z1.s, #1
+sqrshrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	sqrshrnt z0.h, z1.s, #16
+sqrshrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	sqrshrnt z0.b, z1.h, #1
+sqrshrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	sqrshrnt z0.b, z1.h, #8
+sqrshrunb.nxv2i64	nxv2i64,i32=1	nxv4i32	sqrshrunb z0.s, z0.d, #1
+sqrshrunb.nxv2i64	nxv2i64,i32=32	nxv4i32	sqrshrunb z0.s, z0.d, #32
+sqrshrunb.nxv4i32	nxv4i32,i32=1	nxv8i16	sqrshrunb z0.h, z0.s, #1
+sqrshrunb.nxv4i32	nxv4i32,i32=16	nxv8i16	sqrshrunb z0.h, z0.s, #16
+sqrshrunb.nxv8i16	nxv8i16,i32=1	nxv16i8	sqrshrunb z0.b, z0.h, #1
+sqrshrunb.nxv8i16	nxv8i16,i32=8	nxv16i8	sqrshrunb z0.b, z0.h, #8
+sqrshrunt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	sqrshrunt z0.s, z1.d, #1
+sqrshrunt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	sqrshrunt z0.s, z1.d, #32
+sqrshrunt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	sqrshrunt z0.h, z1.s, #1
+sqrshrunt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	sqrshrunt z0.h, z1.s, #16
+sqrshrunt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	sqrshrunt z0.b, z1.h, #1
+sqrshrunt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	sqrshrunt z0.b, z1.h, #8
+sqshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sqshl z0.b, p0/m, z0.b, z1.b
+sqshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sqshl z0.d, p0/m, z0.d, z1.d
+sqshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sqshl z0.s, p0/m, z0.s, z1.s
+sqshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sqshl z0.h, p0/m, z0.h, z1.h
+sqshlu.nxv16i8	nxv16i1,nxv16i8,i32=0	nxv16i8	sqshlu z0.b, p0/m, z0.b, #0
+sqshlu.nxv16i8	nxv16i1,nxv16i8,i32=7	nxv16i8	sqshlu z0.b, p0/m, z0.b, #7
+sqshlu.nxv2i64	nxv2i1,nxv2i64,i32=0	nxv2i64	sqshlu z0.d, p0/m, z0.d, #0
+sqshlu.nxv2i64	nxv2i1,nxv2i64,i32=63	nxv2i64	sqshlu z0.d, p0/m, z0.d, #63
+sqshlu.nxv4i32	nxv4i1,nxv4i32,i32=0	nxv4i32	sqshlu z0.s, p0/m, z0.s, #0
+sqshlu.nxv4i32	nxv4i1,nxv4i32,i32=31	nxv4i32	sqshlu z0.s, p0/m, z0.s, #31
+sqshlu.nxv8i16	nxv8i1,nxv8i16,i32=0	nxv8i16	sqshlu z0.h, p0/m, z0.h, #0
+sqshlu.nxv8i16	nxv8i1,nxv8i16,i32=15	nxv8i16	sqshlu z0.h, p0/m, z0.h, #15
+sqshrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	sqshrnb z0.s, z0.d, #1
+sqshrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	sqshrnb z0.s, z0.d, #32
+sqshrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	sqshrnb z0.h, z0.s, #1
+sqshrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	sqshrnb z0.h, z0.s, #16
+sqshrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	sqshrnb z0.b, z0.h, #1
+sqshrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	sqshrnb z0.b, z0.h, #8
+sqshrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	sqshrnt z0.s, z1.d, #1
+sqshrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	sqshrnt z0.s, z1.d, #32
+sqshrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	sqshrnt z0.h, z1.s, #1
+sqshrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	sqshrnt z0.h, z1.s, #16
+sqshrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	sqshrnt z0.b, z1.h, #1
+sqshrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	sqshrnt z0.b, z1.h, #8
+sqshrunb.nxv2i64	nxv2i64,i32=1	nxv4i32	sqshrunb z0.s, z0.d, #1
+sqshrunb.nxv2i64	nxv2i64,i32=32	nxv4i32	sqshrunb z0.s, z0.d, #32
+sqshrunb.nxv4i32	nxv4i32,i32=1	nxv8i16	sqshrunb z0.h, z0.s, #1
+sqshrunb.nxv4i32	nxv4i32,i32=16	nxv8i16	sqshrunb z0.h, z0.s, #16
+sqshrunb.nxv8i16	nxv8i16,i32=1	nxv16i8	sqshrunb z0.b, z0.h, #1
+sqshrunb.nxv8i16	nxv8i16,i32=8	nxv16i8	sqshrunb z0.b, z0.h, #8
+sqshrunt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	sqshrunt z0.s, z1.d, #1
+sqshrunt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	sqshrunt z0.s, z1.d, #32
+sqshrunt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	sqshrunt z0.h, z1.s, #1
+sqshrunt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	sqshrunt z0.h, z1.s, #16
+sqshrunt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	sqshrunt z0.b, z1.h, #1
+sqshrunt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	sqshrunt z0.b, z1.h, #8
+sqsub.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sqsub z0.b, p0/m, z0.b, z1.b
+sqsub.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sqsub z0.d, p0/m, z0.d, z1.d
+sqsub.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sqsub z0.s, p0/m, z0.s, z1.s
+sqsub.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sqsub z0.h, p0/m, z0.h, z1.h
+sqsub.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	sqsub z0.b, z0.b, z1.b
+sqsub.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	sqsub z0.d, z0.d, z1.d
+sqsub.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	sqsub z0.s, z0.s, z1.s
+sqsub.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	sqsub z0.h, z0.h, z1.h
+sqsubr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sqsubr z0.b, p0/m, z0.b, z1.b
+sqsubr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sqsubr z0.d, p0/m, z0.d, z1.d
+sqsubr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sqsubr z0.s, p0/m, z0.s, z1.s
+sqsubr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sqsubr z0.h, p0/m, z0.h, z1.h
+sqxtnb.nxv2i64	nxv2i64	nxv4i32	sqxtnb z0.s, z0.d
+sqxtnb.nxv4i32	nxv4i32	nxv8i16	sqxtnb z0.h, z0.s
+sqxtnb.nxv8i16	nxv8i16	nxv16i8	sqxtnb z0.b, z0.h
+sqxtnt.nxv2i64	nxv4i32,nxv2i64	nxv4i32	sqxtnt z0.s, z1.d
+sqxtnt.nxv4i32	nxv8i16,nxv4i32	nxv8i16	sqxtnt z0.h, z1.s
+sqxtnt.nxv8i16	nxv16i8,nxv8i16	nxv16i8	sqxtnt z0.b, z1.h
+sqxtunb.nxv2i64	nxv2i64	nxv4i32	sqxtunb z0.s, z0.d
+sqxtunb.nxv4i32	nxv4i32	nxv8i16	sqxtunb z0.h, z0.s
+sqxtunb.nxv8i16	nxv8i16	nxv16i8	sqxtunb z0.b, z0.h
+sqxtunt.nxv2i64	nxv4i32,nxv2i64	nxv4i32	sqxtunt z0.s, z1.d
+sqxtunt.nxv4i32	nxv8i16,nxv4i32	nxv8i16	sqxtunt z0.h, z1.s
+sqxtunt.nxv8i16	nxv16i8,nxv8i16	nxv16i8	sqxtunt z0.b, z1.h
+srhadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	srhadd z0.b, p0/m, z0.b, z1.b
+srhadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	srhadd z0.d, p0/m, z0.d, z1.d
+srhadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	srhadd z0.s, p0/m, z0.s, z1.s
+srhadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	srhadd z0.h, p0/m, z0.h, z1.h
+sri.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	sri z0.b, z1.b, #1
+sri.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	sri z0.b, z1.b, #8
+sri.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	sri z0.d, z1.d, #1
+sri.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	sri z0.d, z1.d, #64
+sri.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	sri z0.s, z1.s, #1
+sri.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	sri z0.s, z1.s, #32
+sri.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	sri z0.h, z1.h, #1
+sri.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	sri z0.h, z1.h, #16
+srshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	srshl z0.b, p0/m, z0.b, z1.b
+srshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	srshl z0.d, p0/m, z0.d, z1.d
+srshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	srshl z0.s, p0/m, z0.s, z1.s
+srshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	srshl z0.h, p0/m, z0.h, z1.h
+srshr.nxv16i8	nxv16i1,nxv16i8,i32=1	nxv16i8	srshr z0.b, p0/m, z0.b, #1
+srshr.nxv16i8	nxv16i1,nxv16i8,i32=8	nxv16i8	srshr z0.b, p0/m, z0.b, #8
+srshr.nxv2i64	nxv2i1,nxv2i64,i32=1	nxv2i64	srshr z0.d, p0/m, z0.d, #1
+srshr.nxv2i64	nxv2i1,nxv2i64,i32=64	nxv2i64	srshr z0.d, p0/m, z0.d, #64
+srshr.nxv4i32	nxv4i1,nxv4i32,i32=1	nxv4i32	srshr z0.s, p0/m, z0.s, #1
+srshr.nxv4i32	nxv4i1,nxv4i32,i32=32	nxv4i32	srshr z0.s, p0/m, z0.s, #32
+srshr.nxv8i16	nxv8i1,nxv8i16,i32=1	nxv8i16	srshr z0.h, p0/m, z0.h, #1
+srshr.nxv8i16	nxv8i1,nxv8i16,i32=16	nxv8i16	srshr z0.h, p0/m, z0.h, #16
+srsra.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	srsra z0.b, z1.b, #1
+srsra.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	srsra z0.b, z1.b, #8
+srsra.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	srsra z0.d, z1.d, #1
+srsra.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	srsra z0.d, z1.d, #64
+srsra.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	srsra z0.s, z1.s, #1
+srsra.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	srsra z0.s, z1.s, #32
+srsra.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	srsra z0.h, z1.h, #1
+srsra.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	srsra z0.h, z1.h, #16
+sshllb.nxv2i64	nxv4i32,i32=0	nxv2i64	sshllb z0.d, z0.s, #0
+sshllb.nxv2i64	nxv4i32,i32=31	nxv2i64	sshllb z0.d, z0.s, #31
+sshllb.nxv4i32	nxv8i16,i32=0	nxv4i32	sshllb z0.s, z0.h, #0
+sshllb.nxv4i32	nxv8i16,i32=15	nxv4i32	sshllb z0.s, z0.h, #15
+sshllb.nxv8i16	nxv16i8,i32=0	nxv8i16	sshllb z0.h, z0.b, #0
+sshllb.nxv8i16	nxv16i8,i32=7	nxv8i16	sshllb z0.h, z0.b, #7
+sshllt.nxv2i64	nxv4i32,i32=0	nxv2i64	sshllt z0.d, z0.s, #0
+sshllt.nxv2i64	nxv4i32,i32=31	nxv2i64	sshllt z0.d, z0.s, #31
+sshllt.nxv4i32	nxv8i16,i32=0	nxv4i32	sshllt z0.s, z0.h, #0
+sshllt.nxv4i32	nxv8i16,i32=15	nxv4i32	sshllt z0.s, z0.h, #15
+sshllt.nxv8i16	nxv16i8,i32=0	nxv8i16	sshllt z0.h, z0.b, #0
+sshllt.nxv8i16	nxv16i8,i32=7	nxv8i16	sshllt z0.h, z0.b, #7
+ssra.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	ssra z0.b, z1.b, #1
+ssra.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	ssra z0.b, z1.b, #8
+ssra.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	ssra z0.d, z1.d, #1
+ssra.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	ssra z0.d, z1.d, #64
+ssra.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	ssra z0.s, z1.s, #1
+ssra.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	ssra z0.s, z1.s, #32
+ssra.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	ssra z0.h, z1.h, #1
+ssra.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	ssra z0.h, z1.h, #16
+ssublb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	ssublb z0.d, z0.s, z1.s
+ssublb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	ssublb z0.s, z0.h, z1.h
+ssublb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	ssublb z0.h, z0.b, z1.b
+ssublbt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	ssublbt z0.d, z0.s, z1.s
+ssublbt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	ssublbt z0.s, z0.h, z1.h
+ssublbt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	ssublbt z0.h, z0.b, z1.b
+ssublt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	ssublt z0.d, z0.s, z1.s
+ssublt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	ssublt z0.s, z0.h, z1.h
+ssublt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	ssublt z0.h, z0.b, z1.b
+ssubltb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	ssubltb z0.d, z0.s, z1.s
+ssubltb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	ssubltb z0.s, z0.h, z1.h
+ssubltb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	ssubltb z0.h, z0.b, z1.b
+ssubwb.nxv2i64	nxv2i64,nxv4i32	nxv2i64	ssubwb z0.d, z0.d, z1.s
+ssubwb.nxv4i32	nxv4i32,nxv8i16	nxv4i32	ssubwb z0.s, z0.s, z1.h
+ssubwb.nxv8i16	nxv8i16,nxv16i8	nxv8i16	ssubwb z0.h, z0.h, z1.b
+ssubwt.nxv2i64	nxv2i64,nxv4i32	nxv2i64	ssubwt z0.d, z0.d, z1.s
+ssubwt.nxv4i32	nxv4i32,nxv8i16	nxv4i32	ssubwt z0.s, z0.s, z1.h
+ssubwt.nxv8i16	nxv8i16,nxv16i8	nxv8i16	ssubwt z0.h, z0.h, z1.b
+st1.nxv16i8	nxv16i8,nxv16i1,ptr	void	st1b { z0.b }, p0, [x0]
+st1.nxv2f64	nxv2f64,nxv2i1,ptr	void	st1d { z0.d }, p0, [x0]
+st1.nxv2i16	nxv2i16,nxv2i1,ptr	void	st1h { z0.d }, p0, [x0]
+st1.nxv2i32	nxv2i32,nxv2i1,ptr	void	st1w { z0.d }, p0, [x0]
+st1.nxv2i64	nxv2i64,nxv2i1,ptr	void	st1d { z0.d }, p0, [x0]
+st1.nxv2i8	nxv2i8,nxv2i1,ptr	void	st1b { z0.d }, p0, [x0]
+st1.nxv4f32	nxv4f32,nxv4i1,ptr	void	st1w { z0.s }, p0, [x0]
+st1.nxv4i16	nxv4i16,nxv4i1,ptr	void	st1h { z0.s }, p0, [x0]
+st1.nxv4i32	nxv4i32,nxv4i1,ptr	void	st1w { z0.s }, p0, [x0]
+st1.nxv4i8	nxv4i8,nxv4i1,ptr	void	st1b { z0.s }, p0, [x0]
+st1.nxv8i16	nxv8i16,nxv8i1,ptr	void	st1h { z0.h }, p0, [x0]
+st1.nxv8i8	nxv8i8,nxv8i1,ptr	void	st1b { z0.h }, p0, [x0]
+st1.scatter.index.nxv2f64	nxv2f64,nxv2i1,ptr,nxv2i64	void	st1d { z0.d }, p0, [x0, z1.d, lsl #3]
+st1.scatter.index.nxv2i16	nxv2i16,nxv2i1,ptr,nxv2i64	void	st1h { z0.d }, p0, [x0, z1.d, lsl #1]
+st1.scatter.index.nxv2i32	nxv2i32,nxv2i1,ptr,nxv2i64	void	st1w { z0.d }, p0, [x0, z1.d, lsl #2]
+st1.scatter.index.nxv2i64	nxv2i64,nxv2i1,ptr,nxv2i64	void	st1d { z0.d }, p0, [x0, z1.d, lsl #3]
+st1.scatter.nxv2f64	nxv2f64,nxv2i1,ptr,nxv2i64	void	st1d { z0.d }, p0, [x0, z1.d]
+st1.scatter.nxv2i16	nxv2i16,nxv2i1,ptr,nxv2i64	void	st1h { z0.d }, p0, [x0, z1.d]
+st1.scatter.nxv2i32	nxv2i32,nxv2i1,ptr,nxv2i64	void	st1w { z0.d }, p0, [x0, z1.d]
+st1.scatter.nxv2i64	nxv2i64,nxv2i1,ptr,nxv2i64	void	st1d { z0.d }, p0, [x0, z1.d]
+st1.scatter.nxv2i8	nxv2i8,nxv2i1,ptr,nxv2i64	void	st1b { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv2f64.nxv2i64	nxv2f64,nxv2i1,nxv2i64,i64	void	st1d { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv2i16.nxv2i64	nxv2i16,nxv2i1,nxv2i64,i64	void	st1h { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv2i32.nxv2i64	nxv2i32,nxv2i1,nxv2i64,i64	void	st1w { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv2i64.nxv2i64	nxv2i64,nxv2i1,nxv2i64,i64	void	st1d { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv2i8.nxv2i64	nxv2i8,nxv2i1,nxv2i64,i64	void	st1b { z0.d }, p0, [x0, z1.d]
+st1.scatter.scalar.offset.nxv4f32.nxv4i32	nxv4f32,nxv4i1,nxv4i32,i64	void	st1w { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.scalar.offset.nxv4i16.nxv4i32	nxv4i16,nxv4i1,nxv4i32,i64	void	st1h { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.scalar.offset.nxv4i32.nxv4i32	nxv4i32,nxv4i1,nxv4i32,i64	void	st1w { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.scalar.offset.nxv4i8.nxv4i32	nxv4i8,nxv4i1,nxv4i32,i64	void	st1b { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.sxtw.index.nxv4f32	nxv4f32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, sxtw #2]
+st1.scatter.sxtw.index.nxv4i16	nxv4i16,nxv4i1,ptr,nxv4i32	void	st1h { z0.s }, p0, [x0, z1.s, sxtw #1]
+st1.scatter.sxtw.index.nxv4i32	nxv4i32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, sxtw #2]
+st1.scatter.sxtw.nxv4f32	nxv4f32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, sxtw]
+st1.scatter.sxtw.nxv4i16	nxv4i16,nxv4i1,ptr,nxv4i32	void	st1h { z0.s }, p0, [x0, z1.s, sxtw]
+st1.scatter.sxtw.nxv4i32	nxv4i32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, sxtw]
+st1.scatter.sxtw.nxv4i8	nxv4i8,nxv4i1,ptr,nxv4i32	void	st1b { z0.s }, p0, [x0, z1.s, sxtw]
+st1.scatter.uxtw.index.nxv4f32	nxv4f32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, uxtw #2]
+st1.scatter.uxtw.index.nxv4i16	nxv4i16,nxv4i1,ptr,nxv4i32	void	st1h { z0.s }, p0, [x0, z1.s, uxtw #1]
+st1.scatter.uxtw.index.nxv4i32	nxv4i32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, uxtw #2]
+st1.scatter.uxtw.nxv4f32	nxv4f32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.uxtw.nxv4i16	nxv4i16,nxv4i1,ptr,nxv4i32	void	st1h { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.uxtw.nxv4i32	nxv4i32,nxv4i1,ptr,nxv4i32	void	st1w { z0.s }, p0, [x0, z1.s, uxtw]
+st1.scatter.uxtw.nxv4i8	nxv4i8,nxv4i1,ptr,nxv4i32	void	st1b { z0.s }, p0, [x0, z1.s, uxtw]
+st2.nxv16i8	nxv16i8,nxv16i8,nxv16i1,ptr	void	st2b { z0.b, z1.b }, p0, [x0]
+st2.nxv2f64	nxv2f64,nxv2f64,nxv2i1,ptr	void	st2d { z0.d, z1.d }, p0, [x0]
+st2.nxv2i64	nxv2i64,nxv2i64,nxv2i1,ptr	void	st2d { z0.d, z1.d }, p0, [x0]
+st2.nxv4f32	nxv4f32,nxv4f32,nxv4i1,ptr	void	st2w { z0.s, z1.s }, p0, [x0]
+st2.nxv4i32	nxv4i32,nxv4i32,nxv4i1,ptr	void	st2w { z0.s, z1.s }, p0, [x0]
+st2.nxv8i16	nxv8i16,nxv8i16,nxv8i1,ptr	void	st2h { z0.h, z1.h }, p0, [x0]
+st3.nxv16i8	nxv16i8,nxv16i8,nxv16i8,nxv16i1,ptr	void	st3b { z0.b - z2.b }, p0, [x0]
+st3.nxv2f64	nxv2f64,nxv2f64,nxv2f64,nxv2i1,ptr	void	st3d { z0.d - z2.d }, p0, [x0]
+st3.nxv2i64	nxv2i64,nxv2i64,nxv2i64,nxv2i1,ptr	void	st3d { z0.d - z2.d }, p0, [x0]
+st3.nxv4f32	nxv4f32,nxv4f32,nxv4f32,nxv4i1,ptr	void	st3w { z0.s - z2.s }, p0, [x0]
+st3.nxv4i32	nxv4i32,nxv4i32,nxv4i32,nxv4i1,ptr	void	st3w { z0.s - z2.s }, p0, [x0]
+st3.nxv8i16	nxv8i16,nxv8i16,nxv8i16,nxv8i1,ptr	void	st3h { z0.h - z2.h }, p0, [x0]
+st4.nxv16i8	nxv16i8,nxv16i8,nxv16i8,nxv16i8,nxv16i1,ptr	void	st4b { z0.b - z3.b }, p0, [x0]
+st4.nxv2f64	nxv2f64,nxv2f64,nxv2f64,nxv2f64,nxv2i1,ptr	void	st4d { z0.d - z3.d }, p0, [x0]
+st4.nxv2i64	nxv2i64,nxv2i64,nxv2i64,nxv2i64,nxv2i1,ptr	void	st4d { z0.d - z3.d }, p0, [x0]
+st4.nxv4f32	nxv4f32,nxv4f32,nxv4f32,nxv4f32,nxv4i1,ptr	void	st4w { z0.s - z3.s }, p0, [x0]
+st4.nxv4i32	nxv4i32,nxv4i32,nxv4i32,nxv4i32,nxv4i1,ptr	void	st4w { z0.s - z3.s }, p0, [x0]
+st4.nxv8i16	nxv8i16,nxv8i16,nxv8i16,nxv8i16,nxv8i1,ptr	void	st4h { z0.h - z3.h }, p0, [x0]
+stnt1.nxv16i8	nxv16i8,nxv16i1,ptr	void	stnt1b { z0.b }, p0, [x0]
+stnt1.nxv2f64	nxv2f64,nxv2i1,ptr	void	stnt1d { z0.d }, p0, [x0]
+stnt1.nxv2i64	nxv2i64,nxv2i1,ptr	void	stnt1d { z0.d }, p0, [x0]
+stnt1.nxv4f32	nxv4f32,nxv4i1,ptr	void	stnt1w { z0.s }, p0, [x0]
+stnt1.nxv4i32	nxv4i32,nxv4i1,ptr	void	stnt1w { z0.s }, p0, [x0]
+stnt1.nxv8i16	nxv8i16,nxv8i1,ptr	void	stnt1h { z0.h }, p0, [x0]
+stnt1.scatter.index.nxv2f64	nxv2f64,nxv2i1,ptr,nxv2i64	void	lsl z1.d, z1.d, #3; stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.index.nxv2i16	nxv2i16,nxv2i1,ptr,nxv2i64	void	lsl z1.d, z1.d, #1; stnt1h { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.index.nxv2i32	nxv2i32,nxv2i1,ptr,nxv2i64	void	lsl z1.d, z1.d, #2; stnt1w { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.index.nxv2i64	nxv2i64,nxv2i1,ptr,nxv2i64	void	lsl z1.d, z1.d, #3; stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.nxv2f64	nxv2f64,nxv2i1,ptr,nxv2i64	void	stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.nxv2i16	nxv2i16,nxv2i1,ptr,nxv2i64	void	stnt1h { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.nxv2i32	nxv2i32,nxv2i1,ptr,nxv2i64	void	stnt1w { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.nxv2i64	nxv2i64,nxv2i1,ptr,nxv2i64	void	stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.nxv2i8	nxv2i8,nxv2i1,ptr,nxv2i64	void	stnt1b { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv2f64.nxv2i64	nxv2f64,nxv2i1,nxv2i64,i64	void	stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv2i16.nxv2i64	nxv2i16,nxv2i1,nxv2i64,i64	void	stnt1h { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv2i32.nxv2i64	nxv2i32,nxv2i1,nxv2i64,i64	void	stnt1w { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv2i64.nxv2i64	nxv2i64,nxv2i1,nxv2i64,i64	void	stnt1d { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv2i8.nxv2i64	nxv2i8,nxv2i1,nxv2i64,i64	void	stnt1b { z0.d }, p0, [z1.d, x0]
+stnt1.scatter.scalar.offset.nxv4f32.nxv4i32	nxv4f32,nxv4i1,nxv4i32,i64	void	stnt1w { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.scalar.offset.nxv4i16.nxv4i32	nxv4i16,nxv4i1,nxv4i32,i64	void	stnt1h { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.scalar.offset.nxv4i32.nxv4i32	nxv4i32,nxv4i1,nxv4i32,i64	void	stnt1w { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.scalar.offset.nxv4i8.nxv4i32	nxv4i8,nxv4i1,nxv4i32,i64	void	stnt1b { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.uxtw.nxv4f32	nxv4f32,nxv4i1,ptr,nxv4i32	void	stnt1w { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.uxtw.nxv4i16	nxv4i16,nxv4i1,ptr,nxv4i32	void	stnt1h { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.uxtw.nxv4i32	nxv4i32,nxv4i1,ptr,nxv4i32	void	stnt1w { z0.s }, p0, [z1.s, x0]
+stnt1.scatter.uxtw.nxv4i8	nxv4i8,nxv4i1,ptr,nxv4i32	void	stnt1b { z0.s }, p0, [z1.s, x0]
+sub.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	sub z0.b, p0/m, z0.b, z1.b
+sub.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	sub z0.d, p0/m, z0.d, z1.d
+sub.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	sub z0.s, p0/m, z0.s, z1.s
+sub.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	sub z0.h, p0/m, z0.h, z1.h
+subhnb.nxv2i64	nxv2i64,nxv2i64	nxv4i32	subhnb z0.s, z0.d, z1.d
+subhnb.nxv4i32	nxv4i32,nxv4i32	nxv8i16	subhnb z0.h, z0.s, z1.s
+subhnb.nxv8i16	nxv8i16,nxv8i16	nxv16i8	subhnb z0.b, z0.h, z1.h
+subhnt.nxv2i64	nxv4i32,nxv2i64,nxv2i64	nxv4i32	subhnt z0.s, z1.d, z2.d
+subhnt.nxv4i32	nxv8i16,nxv4i32,nxv4i32	nxv8i16	subhnt z0.h, z1.s, z2.s
+subhnt.nxv8i16	nxv16i8,nxv8i16,nxv8i16	nxv16i8	subhnt z0.b, z1.h, z2.h
+subr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	subr z0.b, p0/m, z0.b, z1.b
+subr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	subr z0.d, p0/m, z0.d, z1.d
+subr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	subr z0.s, p0/m, z0.s, z1.s
+subr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	subr z0.h, p0/m, z0.h, z1.h
+sudot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0	nxv4i32	sudot z0.s, z1.b, z2.b[0]
+sudot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=3	nxv4i32	sudot z0.s, z1.b, z2.b[3]
+sunpkhi.nxv2i64	nxv4i32	nxv2i64	sunpkhi z0.d, z0.s
+sunpkhi.nxv4i32	nxv8i16	nxv4i32	sunpkhi z0.s, z0.h
+sunpkhi.nxv8i16	nxv16i8	nxv8i16	sunpkhi z0.h, z0.b
+sunpklo.nxv2i64	nxv4i32	nxv2i64	sunpklo z0.d, z0.s
+sunpklo.nxv4i32	nxv8i16	nxv4i32	sunpklo z0.s, z0.h
+sunpklo.nxv8i16	nxv16i8	nxv8i16	sunpklo z0.h, z0.b
+suqadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	suqadd z0.b, p0/m, z0.b, z1.b
+suqadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	suqadd z0.d, p0/m, z0.d, z1.d
+suqadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	suqadd z0.s, p0/m, z0.s, z1.s
+suqadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	suqadd z0.h, p0/m, z0.h, z1.h
+sxtb.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	sxtb z0.d, p0/m, z1.d
+sxtb.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	sxtb z0.s, p0/m, z1.s
+sxtb.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	sxtb z0.h, p0/m, z1.h
+sxth.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	sxth z0.d, p0/m, z1.d
+sxth.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	sxth z0.s, p0/m, z1.s
+sxtw.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	sxtw z0.d, p0/m, z1.d
+tbl.nxv16i8	nxv16i8,nxv16i8	nxv16i8	tbl z0.b, { z0.b }, z1.b
+tbl.nxv2f64	nxv2f64,nxv2i64	nxv2f64	tbl z0.d, { z0.d }, z1.d
+tbl.nxv2i64	nxv2i64,nxv2i64	nxv2i64	tbl z0.d, { z0.d }, z1.d
+tbl.nxv4f32	nxv4f32,nxv4i32	nxv4f32	tbl z0.s, { z0.s }, z1.s
+tbl.nxv4i32	nxv4i32,nxv4i32	nxv4i32	tbl z0.s, { z0.s }, z1.s
+tbl.nxv8i16	nxv8i16,nxv8i16	nxv8i16	tbl z0.h, { z0.h }, z1.h
+tbl2.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	tbl z0.b, { z0.b, z1.b }, z2.b
+tbl2.nxv2f64	nxv2f64,nxv2f64,nxv2i64	nxv2f64	tbl z0.d, { z0.d, z1.d }, z2.d
+tbl2.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	tbl z0.d, { z0.d, z1.d }, z2.d
+tbl2.nxv4f32	nxv4f32,nxv4f32,nxv4i32	nxv4f32	tbl z0.s, { z0.s, z1.s }, z2.s
+tbl2.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	tbl z0.s, { z0.s, z1.s }, z2.s
+tbl2.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	tbl z0.h, { z0.h, z1.h }, z2.h
+tbx.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	tbx z0.b, z1.b, z2.b
+tbx.nxv2f64	nxv2f64,nxv2f64,nxv2i64	nxv2f64	tbx z0.d, z1.d, z2.d
+tbx.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	tbx z0.d, z1.d, z2.d
+tbx.nxv4f32	nxv4f32,nxv4f32,nxv4i32	nxv4f32	tbx z0.s, z1.s, z2.s
+tbx.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	tbx z0.s, z1.s, z2.s
+tbx.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	tbx z0.h, z1.h, z2.h
+trn1.b16	nxv16i1,nxv16i1	nxv16i1	trn1 p0.h, p0.h, p1.h
+trn1.b32	nxv16i1,nxv16i1	nxv16i1	trn1 p0.s, p0.s, p1.s
+trn1.b64	nxv16i1,nxv16i1	nxv16i1	trn1 p0.d, p0.d, p1.d
+trn1.nxv16i1	nxv16i1,nxv16i1	nxv16i1	trn1 p0.b, p0.b, p1.b
+trn1.nxv16i8	nxv16i8,nxv16i8	nxv16i8	trn1 z0.b, z0.b, z1.b
+trn1.nxv2f64	nxv2f64,nxv2f64	nxv2f64	trn1 z0.d, z0.d, z1.d
+trn1.nxv2i64	nxv2i64,nxv2i64	nxv2i64	trn1 z0.d, z0.d, z1.d
+trn1.nxv4f32	nxv4f32,nxv4f32	nxv4f32	trn1 z0.s, z0.s, z1.s
+trn1.nxv4i32	nxv4i32,nxv4i32	nxv4i32	trn1 z0.s, z0.s, z1.s
+trn1.nxv8i16	nxv8i16,nxv8i16	nxv8i16	trn1 z0.h, z0.h, z1.h
+trn1q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	trn1 z0.q, z0.q, z1.q
+trn1q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	trn1 z0.q, z0.q, z1.q
+trn1q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	trn1 z0.q, z0.q, z1.q
+trn1q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	trn1 z0.q, z0.q, z1.q
+trn1q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	trn1 z0.q, z0.q, z1.q
+trn1q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	trn1 z0.q, z0.q, z1.q
+trn2.b16	nxv16i1,nxv16i1	nxv16i1	trn2 p0.h, p0.h, p1.h
+trn2.b32	nxv16i1,nxv16i1	nxv16i1	trn2 p0.s, p0.s, p1.s
+trn2.b64	nxv16i1,nxv16i1	nxv16i1	trn2 p0.d, p0.d, p1.d
+trn2.nxv16i1	nxv16i1,nxv16i1	nxv16i1	trn2 p0.b, p0.b, p1.b
+trn2.nxv16i8	nxv16i8,nxv16i8	nxv16i8	trn2 z0.b, z0.b, z1.b
+trn2.nxv2f64	nxv2f64,nxv2f64	nxv2f64	trn2 z0.d, z0.d, z1.d
+trn2.nxv2i64	nxv2i64,nxv2i64	nxv2i64	trn2 z0.d, z0.d, z1.d
+trn2.nxv4f32	nxv4f32,nxv4f32	nxv4f32	trn2 z0.s, z0.s, z1.s
+trn2.nxv4i32	nxv4i32,nxv4i32	nxv4i32	trn2 z0.s, z0.s, z1.s
+trn2.nxv8i16	nxv8i16,nxv8i16	nxv8i16	trn2 z0.h, z0.h, z1.h
+trn2q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	trn2 z0.q, z0.q, z1.q
+trn2q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	trn2 z0.q, z0.q, z1.q
+trn2q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	trn2 z0.q, z0.q, z1.q
+trn2q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	trn2 z0.q, z0.q, z1.q
+trn2q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	trn2 z0.q, z0.q, z1.q
+trn2q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	trn2 z0.q, z0.q, z1.q
+uaba.nxv16i8	nxv16i8,nxv16i8,nxv16i8	nxv16i8	uaba z0.b, z1.b, z2.b
+uaba.nxv2i64	nxv2i64,nxv2i64,nxv2i64	nxv2i64	uaba z0.d, z1.d, z2.d
+uaba.nxv4i32	nxv4i32,nxv4i32,nxv4i32	nxv4i32	uaba z0.s, z1.s, z2.s
+uaba.nxv8i16	nxv8i16,nxv8i16,nxv8i16	nxv8i16	uaba z0.h, z1.h, z2.h
+uabalb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	uabalb z0.d, z1.s, z2.s
+uabalb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	uabalb z0.s, z1.h, z2.h
+uabalb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	uabalb z0.h, z1.b, z2.b
+uabalt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	uabalt z0.d, z1.s, z2.s
+uabalt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	uabalt z0.s, z1.h, z2.h
+uabalt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	uabalt z0.h, z1.b, z2.b
+uabd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uabd z0.b, p0/m, z0.b, z1.b
+uabd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uabd z0.d, p0/m, z0.d, z1.d
+uabd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uabd z0.s, p0/m, z0.s, z1.s
+uabd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uabd z0.h, p0/m, z0.h, z1.h
+uabdlb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	uabdlb z0.d, z0.s, z1.s
+uabdlb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	uabdlb z0.s, z0.h, z1.h
+uabdlb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	uabdlb z0.h, z0.b, z1.b
+uabdlt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	uabdlt z0.d, z0.s, z1.s
+uabdlt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	uabdlt z0.s, z0.h, z1.h
+uabdlt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	uabdlt z0.h, z0.b, z1.b
+uadalp.nxv2i64	nxv2i1,nxv2i64,nxv4i32	nxv2i64	uadalp z0.d, p0/m, z1.s
+uadalp.nxv4i32	nxv4i1,nxv4i32,nxv8i16	nxv4i32	uadalp z0.s, p0/m, z1.h
+uadalp.nxv8i16	nxv8i1,nxv8i16,nxv16i8	nxv8i16	uadalp z0.h, p0/m, z1.b
+uaddlb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	uaddlb z0.d, z0.s, z1.s
+uaddlb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	uaddlb z0.s, z0.h, z1.h
+uaddlb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	uaddlb z0.h, z0.b, z1.b
+uaddlt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	uaddlt z0.d, z0.s, z1.s
+uaddlt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	uaddlt z0.s, z0.h, z1.h
+uaddlt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	uaddlt z0.h, z0.b, z1.b
+uaddv.nxv16i8	nxv16i1,nxv16i8	i64	uaddv d0, p0, z0.b; fmov x0, d0
+uaddv.nxv2i64	nxv2i1,nxv2i64	i64	uaddv d0, p0, z0.d; fmov x0, d0
+uaddv.nxv4i32	nxv4i1,nxv4i32	i64	uaddv d0, p0, z0.s; fmov x0, d0
+uaddv.nxv8i16	nxv8i1,nxv8i16	i64	uaddv d0, p0, z0.h; fmov x0, d0
+uaddwb.nxv2i64	nxv2i64,nxv4i32	nxv2i64	uaddwb z0.d, z0.d, z1.s
+uaddwb.nxv4i32	nxv4i32,nxv8i16	nxv4i32	uaddwb z0.s, z0.s, z1.h
+uaddwb.nxv8i16	nxv8i16,nxv16i8	nxv8i16	uaddwb z0.h, z0.h, z1.b
+uaddwt.nxv2i64	nxv2i64,nxv4i32	nxv2i64	uaddwt z0.d, z0.d, z1.s
+uaddwt.nxv4i32	nxv4i32,nxv8i16	nxv4i32	uaddwt z0.s, z0.s, z1.h
+uaddwt.nxv8i16	nxv8i16,nxv16i8	nxv8i16	uaddwt z0.h, z0.h, z1.b
+ucvtf.f32i64	nxv4f32,nxv2i1,nxv2i64	nxv4f32	ucvtf z0.s, p0/m, z1.d
+ucvtf.f64i32	nxv2f64,nxv2i1,nxv4i32	nxv2f64	ucvtf z0.d, p0/m, z1.s
+ucvtf.nxv2f64.nxv2i64	nxv2f64,nxv2i1,nxv2i64	nxv2f64	ucvtf z0.d, p0/m, z1.d
+ucvtf.nxv4f32.nxv4i32	nxv4f32,nxv4i1,nxv4i32	nxv4f32	ucvtf z0.s, p0/m, z1.s
+udiv.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	udiv z0.d, p0/m, z0.d, z1.d
+udiv.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	udiv z0.s, p0/m, z0.s, z1.s
+udivr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	udivr z0.d, p0/m, z0.d, z1.d
+udivr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	udivr z0.s, p0/m, z0.s, z1.s
+udot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=0	nxv2i64	udot z0.d, z1.h, z2.h[0]
+udot.lane.nxv2i64	nxv2i64,nxv8i16,nxv8i16,i32=1	nxv2i64	udot z0.d, z1.h, z2.h[1]
+udot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0	nxv4i32	udot z0.s, z1.b, z2.b[0]
+udot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=3	nxv4i32	udot z0.s, z1.b, z2.b[3]
+udot.nxv2i64	nxv2i64,nxv8i16,nxv8i16	nxv2i64	udot z0.d, z1.h, z2.h
+udot.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	udot z0.s, z1.b, z2.b
+uhadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uhadd z0.b, p0/m, z0.b, z1.b
+uhadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uhadd z0.d, p0/m, z0.d, z1.d
+uhadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uhadd z0.s, p0/m, z0.s, z1.s
+uhadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uhadd z0.h, p0/m, z0.h, z1.h
+uhsub.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uhsub z0.b, p0/m, z0.b, z1.b
+uhsub.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uhsub z0.d, p0/m, z0.d, z1.d
+uhsub.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uhsub z0.s, p0/m, z0.s, z1.s
+uhsub.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uhsub z0.h, p0/m, z0.h, z1.h
+uhsubr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uhsubr z0.b, p0/m, z0.b, z1.b
+uhsubr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uhsubr z0.d, p0/m, z0.d, z1.d
+uhsubr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uhsubr z0.s, p0/m, z0.s, z1.s
+uhsubr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uhsubr z0.h, p0/m, z0.h, z1.h
+umax.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	umax z0.b, p0/m, z0.b, z1.b
+umax.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	umax z0.d, p0/m, z0.d, z1.d
+umax.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	umax z0.s, p0/m, z0.s, z1.s
+umax.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	umax z0.h, p0/m, z0.h, z1.h
+umaxp.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	umaxp z0.b, p0/m, z0.b, z1.b
+umaxp.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	umaxp z0.d, p0/m, z0.d, z1.d
+umaxp.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	umaxp z0.s, p0/m, z0.s, z1.s
+umaxp.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	umaxp z0.h, p0/m, z0.h, z1.h
+umaxv.nxv16i8	nxv16i1,nxv16i8	i8	umaxv b0, p0, z0.b; fmov w0, s0
+umaxv.nxv2i64	nxv2i1,nxv2i64	i64	umaxv d0, p0, z0.d; fmov x0, d0
+umaxv.nxv4i32	nxv4i1,nxv4i32	i32	umaxv s0, p0, z0.s; fmov w0, s0
+umaxv.nxv8i16	nxv8i1,nxv8i16	i16	umaxv h0, p0, z0.h; fmov w0, s0
+umin.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	umin z0.b, p0/m, z0.b, z1.b
+umin.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	umin z0.d, p0/m, z0.d, z1.d
+umin.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	umin z0.s, p0/m, z0.s, z1.s
+umin.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	umin z0.h, p0/m, z0.h, z1.h
+uminp.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uminp z0.b, p0/m, z0.b, z1.b
+uminp.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uminp z0.d, p0/m, z0.d, z1.d
+uminp.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uminp z0.s, p0/m, z0.s, z1.s
+uminp.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uminp z0.h, p0/m, z0.h, z1.h
+uminv.nxv16i8	nxv16i1,nxv16i8	i8	uminv b0, p0, z0.b; fmov w0, s0
+uminv.nxv2i64	nxv2i1,nxv2i64	i64	uminv d0, p0, z0.d; fmov x0, d0
+uminv.nxv4i32	nxv4i1,nxv4i32	i32	uminv s0, p0, z0.s; fmov w0, s0
+uminv.nxv8i16	nxv8i1,nxv8i16	i16	uminv h0, p0, z0.h; fmov w0, s0
+umlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	umlalb z0.d, z1.s, z2.s[0]
+umlalb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	umlalb z0.d, z1.s, z2.s[3]
+umlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	umlalb z0.s, z1.h, z2.h[0]
+umlalb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	umlalb z0.s, z1.h, z2.h[7]
+umlalb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	umlalb z0.d, z1.s, z2.s
+umlalb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	umlalb z0.s, z1.h, z2.h
+umlalb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	umlalb z0.h, z1.b, z2.b
+umlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	umlalt z0.d, z1.s, z2.s[0]
+umlalt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	umlalt z0.d, z1.s, z2.s[3]
+umlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	umlalt z0.s, z1.h, z2.h[0]
+umlalt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	umlalt z0.s, z1.h, z2.h[7]
+umlalt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	umlalt z0.d, z1.s, z2.s
+umlalt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	umlalt z0.s, z1.h, z2.h
+umlalt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	umlalt z0.h, z1.b, z2.b
+umlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	umlslb z0.d, z1.s, z2.s[0]
+umlslb.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	umlslb z0.d, z1.s, z2.s[3]
+umlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	umlslb z0.s, z1.h, z2.h[0]
+umlslb.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	umlslb z0.s, z1.h, z2.h[7]
+umlslb.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	umlslb z0.d, z1.s, z2.s
+umlslb.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	umlslb z0.s, z1.h, z2.h
+umlslb.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	umlslb z0.h, z1.b, z2.b
+umlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=0	nxv2i64	umlslt z0.d, z1.s, z2.s[0]
+umlslt.lane.nxv2i64	nxv2i64,nxv4i32,nxv4i32,i32=3	nxv2i64	umlslt z0.d, z1.s, z2.s[3]
+umlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=0	nxv4i32	umlslt z0.s, z1.h, z2.h[0]
+umlslt.lane.nxv4i32	nxv4i32,nxv8i16,nxv8i16,i32=7	nxv4i32	umlslt z0.s, z1.h, z2.h[7]
+umlslt.nxv2i64	nxv2i64,nxv4i32,nxv4i32	nxv2i64	umlslt z0.d, z1.s, z2.s
+umlslt.nxv4i32	nxv4i32,nxv8i16,nxv8i16	nxv4i32	umlslt z0.s, z1.h, z2.h
+umlslt.nxv8i16	nxv8i16,nxv16i8,nxv16i8	nxv8i16	umlslt z0.h, z1.b, z2.b
+ummla.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	ummla z0.s, z1.b, z2.b
+umulh.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	umulh z0.b, p0/m, z0.b, z1.b
+umulh.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	umulh z0.d, p0/m, z0.d, z1.d
+umulh.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	umulh z0.s, p0/m, z0.s, z1.s
+umulh.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	umulh z0.h, p0/m, z0.h, z1.h
+umullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	umullb z0.d, z0.s, z1.s[0]
+umullb.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	umullb z0.d, z0.s, z1.s[3]
+umullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	umullb z0.s, z0.h, z1.h[0]
+umullb.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	umullb z0.s, z0.h, z1.h[7]
+umullb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	umullb z0.d, z0.s, z1.s
+umullb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	umullb z0.s, z0.h, z1.h
+umullb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	umullb z0.h, z0.b, z1.b
+umullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=0	nxv2i64	umullt z0.d, z0.s, z1.s[0]
+umullt.lane.nxv2i64	nxv4i32,nxv4i32,i32=3	nxv2i64	umullt z0.d, z0.s, z1.s[3]
+umullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=0	nxv4i32	umullt z0.s, z0.h, z1.h[0]
+umullt.lane.nxv4i32	nxv8i16,nxv8i16,i32=7	nxv4i32	umullt z0.s, z0.h, z1.h[7]
+umullt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	umullt z0.d, z0.s, z1.s
+umullt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	umullt z0.s, z0.h, z1.h
+umullt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	umullt z0.h, z0.b, z1.b
+uqadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uqadd z0.b, p0/m, z0.b, z1.b
+uqadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uqadd z0.d, p0/m, z0.d, z1.d
+uqadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uqadd z0.s, p0/m, z0.s, z1.s
+uqadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uqadd z0.h, p0/m, z0.h, z1.h
+uqadd.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uqadd z0.b, z0.b, z1.b
+uqadd.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uqadd z0.d, z0.d, z1.d
+uqadd.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uqadd z0.s, z0.s, z1.s
+uqadd.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uqadd z0.h, z0.h, z1.h
+uqdecb.n32	i32,i32=30,i32=1	i32	uqdecb w0, mul3
+uqdecb.n32	i32,i32=7,i32=16	i32	uqdecb w0, vl7, mul #16
+uqdecb.n64	i64,i32=30,i32=1	i64	uqdecb x0, mul3
+uqdecb.n64	i64,i32=7,i32=16	i64	uqdecb x0, vl7, mul #16
+uqdecd.n32	i32,i32=30,i32=1	i32	uqdecd w0, mul3
+uqdecd.n32	i32,i32=7,i32=16	i32	uqdecd w0, vl7, mul #16
+uqdecd.n64	i64,i32=30,i32=1	i64	uqdecd x0, mul3
+uqdecd.n64	i64,i32=7,i32=16	i64	uqdecd x0, vl7, mul #16
+uqdecd.nxv2i64	nxv2i64,i32=30,i32=1	nxv2i64	uqdecd z0.d, mul3
+uqdecd.nxv2i64	nxv2i64,i32=7,i32=16	nxv2i64	uqdecd z0.d, vl7, mul #16
+uqdech.n32	i32,i32=30,i32=1	i32	uqdech w0, mul3
+uqdech.n32	i32,i32=7,i32=16	i32	uqdech w0, vl7, mul #16
+uqdech.n64	i64,i32=30,i32=1	i64	uqdech x0, mul3
+uqdech.n64	i64,i32=7,i32=16	i64	uqdech x0, vl7, mul #16
+uqdech.nxv8i16	nxv8i16,i32=30,i32=1	nxv8i16	uqdech z0.h, mul3
+uqdech.nxv8i16	nxv8i16,i32=7,i32=16	nxv8i16	uqdech z0.h, vl7, mul #16
+uqdecp.n32.nxv16i1	i32,nxv16i1	i32	uqdecp w0, p0.b
+uqdecp.n32.nxv2i1	i32,nxv2i1	i32	uqdecp w0, p0.d
+uqdecp.n32.nxv4i1	i32,nxv4i1	i32	uqdecp w0, p0.s
+uqdecp.n32.nxv8i1	i32,nxv8i1	i32	uqdecp w0, p0.h
+uqdecp.n64.nxv16i1	i64,nxv16i1	i64	uqdecp x0, p0.b
+uqdecp.n64.nxv2i1	i64,nxv2i1	i64	uqdecp x0, p0.d
+uqdecp.n64.nxv4i1	i64,nxv4i1	i64	uqdecp x0, p0.s
+uqdecp.n64.nxv8i1	i64,nxv8i1	i64	uqdecp x0, p0.h
+uqdecp.nxv2i64	nxv2i64,nxv2i1	nxv2i64	uqdecp z0.d, p0.d
+uqdecp.nxv4i32	nxv4i32,nxv4i1	nxv4i32	uqdecp z0.s, p0.s
+uqdecp.nxv8i16	nxv8i16,nxv8i1	nxv8i16	uqdecp z0.h, p0.h
+uqdecw.n32	i32,i32=30,i32=1	i32	uqdecw w0, mul3
+uqdecw.n32	i32,i32=7,i32=16	i32	uqdecw w0, vl7, mul #16
+uqdecw.n64	i64,i32=30,i32=1	i64	uqdecw x0, mul3
+uqdecw.n64	i64,i32=7,i32=16	i64	uqdecw x0, vl7, mul #16
+uqdecw.nxv4i32	nxv4i32,i32=30,i32=1	nxv4i32	uqdecw z0.s, mul3
+uqdecw.nxv4i32	nxv4i32,i32=7,i32=16	nxv4i32	uqdecw z0.s, vl7, mul #16
+uqincb.n32	i32,i32=30,i32=1	i32	uqincb w0, mul3
+uqincb.n32	i32,i32=7,i32=16	i32	uqincb w0, vl7, mul #16
+uqincb.n64	i64,i32=30,i32=1	i64	uqincb x0, mul3
+uqincb.n64	i64,i32=7,i32=16	i64	uqincb x0, vl7, mul #16
+uqincd.n32	i32,i32=30,i32=1	i32	uqincd w0, mul3
+uqincd.n32	i32,i32=7,i32=16	i32	uqincd w0, vl7, mul #16
+uqincd.n64	i64,i32=30,i32=1	i64	uqincd x0, mul3
+uqincd.n64	i64,i32=7,i32=16	i64	uqincd x0, vl7, mul #16
+uqincd.nxv2i64	nxv2i64,i32=30,i32=1	nxv2i64	uqincd z0.d, mul3
+uqincd.nxv2i64	nxv2i64,i32=7,i32=16	nxv2i64	uqincd z0.d, vl7, mul #16
+uqinch.n32	i32,i32=30,i32=1	i32	uqinch w0, mul3
+uqinch.n32	i32,i32=7,i32=16	i32	uqinch w0, vl7, mul #16
+uqinch.n64	i64,i32=30,i32=1	i64	uqinch x0, mul3
+uqinch.n64	i64,i32=7,i32=16	i64	uqinch x0, vl7, mul #16
+uqinch.nxv8i16	nxv8i16,i32=30,i32=1	nxv8i16	uqinch z0.h, mul3
+uqinch.nxv8i16	nxv8i16,i32=7,i32=16	nxv8i16	uqinch z0.h, vl7, mul #16
+uqincp.n32.nxv16i1	i32,nxv16i1	i32	uqincp w0, p0.b
+uqincp.n32.nxv2i1	i32,nxv2i1	i32	uqincp w0, p0.d
+uqincp.n32.nxv4i1	i32,nxv4i1	i32	uqincp w0, p0.s
+uqincp.n32.nxv8i1	i32,nxv8i1	i32	uqincp w0, p0.h
+uqincp.n64.nxv16i1	i64,nxv16i1	i64	uqincp x0, p0.b
+uqincp.n64.nxv2i1	i64,nxv2i1	i64	uqincp x0, p0.d
+uqincp.n64.nxv4i1	i64,nxv4i1	i64	uqincp x0, p0.s
+uqincp.n64.nxv8i1	i64,nxv8i1	i64	uqincp x0, p0.h
+uqincp.nxv2i64	nxv2i64,nxv2i1	nxv2i64	uqincp z0.d, p0.d
+uqincp.nxv4i32	nxv4i32,nxv4i1	nxv4i32	uqincp z0.s, p0.s
+uqincp.nxv8i16	nxv8i16,nxv8i1	nxv8i16	uqincp z0.h, p0.h
+uqincw.n32	i32,i32=30,i32=1	i32	uqincw w0, mul3
+uqincw.n32	i32,i32=7,i32=16	i32	uqincw w0, vl7, mul #16
+uqincw.n64	i64,i32=30,i32=1	i64	uqincw x0, mul3
+uqincw.n64	i64,i32=7,i32=16	i64	uqincw x0, vl7, mul #16
+uqincw.nxv4i32	nxv4i32,i32=30,i32=1	nxv4i32	uqincw z0.s, mul3
+uqincw.nxv4i32	nxv4i32,i32=7,i32=16	nxv4i32	uqincw z0.s, vl7, mul #16
+uqrshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uqrshl z0.b, p0/m, z0.b, z1.b
+uqrshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uqrshl z0.d, p0/m, z0.d, z1.d
+uqrshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uqrshl z0.s, p0/m, z0.s, z1.s
+uqrshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uqrshl z0.h, p0/m, z0.h, z1.h
+uqrshrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	uqrshrnb z0.s, z0.d, #1
+uqrshrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	uqrshrnb z0.s, z0.d, #32
+uqrshrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	uqrshrnb z0.h, z0.s, #1
+uqrshrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	uqrshrnb z0.h, z0.s, #16
+uqrshrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	uqrshrnb z0.b, z0.h, #1
+uqrshrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	uqrshrnb z0.b, z0.h, #8
+uqrshrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	uqrshrnt z0.s, z1.d, #1
+uqrshrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	uqrshrnt z0.s, z1.d, #32
+uqrshrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	uqrshrnt z0.h, z1.s, #1
+uqrshrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	uqrshrnt z0.h, z1.s, #16
+uqrshrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	uqrshrnt z0.b, z1.h, #1
+uqrshrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	uqrshrnt z0.b, z1.h, #8
+uqshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uqshl z0.b, p0/m, z0.b, z1.b
+uqshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uqshl z0.d, p0/m, z0.d, z1.d
+uqshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uqshl z0.s, p0/m, z0.s, z1.s
+uqshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uqshl z0.h, p0/m, z0.h, z1.h
+uqshrnb.nxv2i64	nxv2i64,i32=1	nxv4i32	uqshrnb z0.s, z0.d, #1
+uqshrnb.nxv2i64	nxv2i64,i32=32	nxv4i32	uqshrnb z0.s, z0.d, #32
+uqshrnb.nxv4i32	nxv4i32,i32=1	nxv8i16	uqshrnb z0.h, z0.s, #1
+uqshrnb.nxv4i32	nxv4i32,i32=16	nxv8i16	uqshrnb z0.h, z0.s, #16
+uqshrnb.nxv8i16	nxv8i16,i32=1	nxv16i8	uqshrnb z0.b, z0.h, #1
+uqshrnb.nxv8i16	nxv8i16,i32=8	nxv16i8	uqshrnb z0.b, z0.h, #8
+uqshrnt.nxv2i64	nxv4i32,nxv2i64,i32=1	nxv4i32	uqshrnt z0.s, z1.d, #1
+uqshrnt.nxv2i64	nxv4i32,nxv2i64,i32=32	nxv4i32	uqshrnt z0.s, z1.d, #32
+uqshrnt.nxv4i32	nxv8i16,nxv4i32,i32=1	nxv8i16	uqshrnt z0.h, z1.s, #1
+uqshrnt.nxv4i32	nxv8i16,nxv4i32,i32=16	nxv8i16	uqshrnt z0.h, z1.s, #16
+uqshrnt.nxv8i16	nxv16i8,nxv8i16,i32=1	nxv16i8	uqshrnt z0.b, z1.h, #1
+uqshrnt.nxv8i16	nxv16i8,nxv8i16,i32=8	nxv16i8	uqshrnt z0.b, z1.h, #8
+uqsub.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uqsub z0.b, p0/m, z0.b, z1.b
+uqsub.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uqsub z0.d, p0/m, z0.d, z1.d
+uqsub.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uqsub z0.s, p0/m, z0.s, z1.s
+uqsub.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uqsub z0.h, p0/m, z0.h, z1.h
+uqsub.x.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uqsub z0.b, z0.b, z1.b
+uqsub.x.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uqsub z0.d, z0.d, z1.d
+uqsub.x.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uqsub z0.s, z0.s, z1.s
+uqsub.x.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uqsub z0.h, z0.h, z1.h
+uqsubr.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	uqsubr z0.b, p0/m, z0.b, z1.b
+uqsubr.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	uqsubr z0.d, p0/m, z0.d, z1.d
+uqsubr.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	uqsubr z0.s, p0/m, z0.s, z1.s
+uqsubr.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	uqsubr z0.h, p0/m, z0.h, z1.h
+uqxtnb.nxv2i64	nxv2i64	nxv4i32	uqxtnb z0.s, z0.d
+uqxtnb.nxv4i32	nxv4i32	nxv8i16	uqxtnb z0.h, z0.s
+uqxtnb.nxv8i16	nxv8i16	nxv16i8	uqxtnb z0.b, z0.h
+uqxtnt.nxv2i64	nxv4i32,nxv2i64	nxv4i32	uqxtnt z0.s, z1.d
+uqxtnt.nxv4i32	nxv8i16,nxv4i32	nxv8i16	uqxtnt z0.h, z1.s
+uqxtnt.nxv8i16	nxv16i8,nxv8i16	nxv16i8	uqxtnt z0.b, z1.h
+urecpe.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	urecpe z0.s, p0/m, z1.s
+urhadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	urhadd z0.b, p0/m, z0.b, z1.b
+urhadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	urhadd z0.d, p0/m, z0.d, z1.d
+urhadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	urhadd z0.s, p0/m, z0.s, z1.s
+urhadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	urhadd z0.h, p0/m, z0.h, z1.h
+urshl.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	urshl z0.b, p0/m, z0.b, z1.b
+urshl.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	urshl z0.d, p0/m, z0.d, z1.d
+urshl.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	urshl z0.s, p0/m, z0.s, z1.s
+urshl.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	urshl z0.h, p0/m, z0.h, z1.h
+urshr.nxv16i8	nxv16i1,nxv16i8,i32=1	nxv16i8	urshr z0.b, p0/m, z0.b, #1
+urshr.nxv16i8	nxv16i1,nxv16i8,i32=8	nxv16i8	urshr z0.b, p0/m, z0.b, #8
+urshr.nxv2i64	nxv2i1,nxv2i64,i32=1	nxv2i64	urshr z0.d, p0/m, z0.d, #1
+urshr.nxv2i64	nxv2i1,nxv2i64,i32=64	nxv2i64	urshr z0.d, p0/m, z0.d, #64
+urshr.nxv4i32	nxv4i1,nxv4i32,i32=1	nxv4i32	urshr z0.s, p0/m, z0.s, #1
+urshr.nxv4i32	nxv4i1,nxv4i32,i32=32	nxv4i32	urshr z0.s, p0/m, z0.s, #32
+urshr.nxv8i16	nxv8i1,nxv8i16,i32=1	nxv8i16	urshr z0.h, p0/m, z0.h, #1
+urshr.nxv8i16	nxv8i1,nxv8i16,i32=16	nxv8i16	urshr z0.h, p0/m, z0.h, #16
+ursqrte.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	ursqrte z0.s, p0/m, z1.s
+ursra.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	ursra z0.b, z1.b, #1
+ursra.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	ursra z0.b, z1.b, #8
+ursra.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	ursra z0.d, z1.d, #1
+ursra.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	ursra z0.d, z1.d, #64
+ursra.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	ursra z0.s, z1.s, #1
+ursra.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	ursra z0.s, z1.s, #32
+ursra.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	ursra z0.h, z1.h, #1
+ursra.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	ursra z0.h, z1.h, #16
+usdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=0	nxv4i32	usdot z0.s, z1.b, z2.b[0]
+usdot.lane.nxv4i32	nxv4i32,nxv16i8,nxv16i8,i32=3	nxv4i32	usdot z0.s, z1.b, z2.b[3]
+usdot.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	usdot z0.s, z1.b, z2.b
+ushllb.nxv2i64	nxv4i32,i32=0	nxv2i64	ushllb z0.d, z0.s, #0
+ushllb.nxv2i64	nxv4i32,i32=31	nxv2i64	ushllb z0.d, z0.s, #31
+ushllb.nxv4i32	nxv8i16,i32=0	nxv4i32	ushllb z0.s, z0.h, #0
+ushllb.nxv4i32	nxv8i16,i32=15	nxv4i32	ushllb z0.s, z0.h, #15
+ushllb.nxv8i16	nxv16i8,i32=0	nxv8i16	ushllb z0.h, z0.b, #0
+ushllb.nxv8i16	nxv16i8,i32=7	nxv8i16	ushllb z0.h, z0.b, #7
+ushllt.nxv2i64	nxv4i32,i32=0	nxv2i64	ushllt z0.d, z0.s, #0
+ushllt.nxv2i64	nxv4i32,i32=31	nxv2i64	ushllt z0.d, z0.s, #31
+ushllt.nxv4i32	nxv8i16,i32=0	nxv4i32	ushllt z0.s, z0.h, #0
+ushllt.nxv4i32	nxv8i16,i32=15	nxv4i32	ushllt z0.s, z0.h, #15
+ushllt.nxv8i16	nxv16i8,i32=0	nxv8i16	ushllt z0.h, z0.b, #0
+ushllt.nxv8i16	nxv16i8,i32=7	nxv8i16	ushllt z0.h, z0.b, #7
+usmmla.nxv4i32	nxv4i32,nxv16i8,nxv16i8	nxv4i32	usmmla z0.s, z1.b, z2.b
+usqadd.nxv16i8	nxv16i1,nxv16i8,nxv16i8	nxv16i8	usqadd z0.b, p0/m, z0.b, z1.b
+usqadd.nxv2i64	nxv2i1,nxv2i64,nxv2i64	nxv2i64	usqadd z0.d, p0/m, z0.d, z1.d
+usqadd.nxv4i32	nxv4i1,nxv4i32,nxv4i32	nxv4i32	usqadd z0.s, p0/m, z0.s, z1.s
+usqadd.nxv8i16	nxv8i1,nxv8i16,nxv8i16	nxv8i16	usqadd z0.h, p0/m, z0.h, z1.h
+usra.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	usra z0.b, z1.b, #1
+usra.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	usra z0.b, z1.b, #8
+usra.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	usra z0.d, z1.d, #1
+usra.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	usra z0.d, z1.d, #64
+usra.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	usra z0.s, z1.s, #1
+usra.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	usra z0.s, z1.s, #32
+usra.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	usra z0.h, z1.h, #1
+usra.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	usra z0.h, z1.h, #16
+usublb.nxv2i64	nxv4i32,nxv4i32	nxv2i64	usublb z0.d, z0.s, z1.s
+usublb.nxv4i32	nxv8i16,nxv8i16	nxv4i32	usublb z0.s, z0.h, z1.h
+usublb.nxv8i16	nxv16i8,nxv16i8	nxv8i16	usublb z0.h, z0.b, z1.b
+usublt.nxv2i64	nxv4i32,nxv4i32	nxv2i64	usublt z0.d, z0.s, z1.s
+usublt.nxv4i32	nxv8i16,nxv8i16	nxv4i32	usublt z0.s, z0.h, z1.h
+usublt.nxv8i16	nxv16i8,nxv16i8	nxv8i16	usublt z0.h, z0.b, z1.b
+usubwb.nxv2i64	nxv2i64,nxv4i32	nxv2i64	usubwb z0.d, z0.d, z1.s
+usubwb.nxv4i32	nxv4i32,nxv8i16	nxv4i32	usubwb z0.s, z0.s, z1.h
+usubwb.nxv8i16	nxv8i16,nxv16i8	nxv8i16	usubwb z0.h, z0.h, z1.b
+usubwt.nxv2i64	nxv2i64,nxv4i32	nxv2i64	usubwt z0.d, z0.d, z1.s
+usubwt.nxv4i32	nxv4i32,nxv8i16	nxv4i32	usubwt z0.s, z0.s, z1.h
+usubwt.nxv8i16	nxv8i16,nxv16i8	nxv8i16	usubwt z0.h, z0.h, z1.b
+uunpkhi.nxv2i64	nxv4i32	nxv2i64	uunpkhi z0.d, z0.s
+uunpkhi.nxv4i32	nxv8i16	nxv4i32	uunpkhi z0.s, z0.h
+uunpkhi.nxv8i16	nxv16i8	nxv8i16	uunpkhi z0.h, z0.b
+uunpklo.nxv2i64	nxv4i32	nxv2i64	uunpklo z0.d, z0.s
+uunpklo.nxv4i32	nxv8i16	nxv4i32	uunpklo z0.s, z0.h
+uunpklo.nxv8i16	nxv16i8	nxv8i16	uunpklo z0.h, z0.b
+uxtb.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	uxtb z0.d, p0/m, z1.d
+uxtb.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	uxtb z0.s, p0/m, z1.s
+uxtb.nxv8i16	nxv8i16,nxv8i1,nxv8i16	nxv8i16	uxtb z0.h, p0/m, z1.h
+uxth.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	uxth z0.d, p0/m, z1.d
+uxth.nxv4i32	nxv4i32,nxv4i1,nxv4i32	nxv4i32	uxth z0.s, p0/m, z1.s
+uxtw.nxv2i64	nxv2i64,nxv2i1,nxv2i64	nxv2i64	uxtw z0.d, p0/m, z1.d
+uzp1.b16	nxv16i1,nxv16i1	nxv16i1	uzp1 p0.h, p0.h, p1.h
+uzp1.b32	nxv16i1,nxv16i1	nxv16i1	uzp1 p0.s, p0.s, p1.s
+uzp1.b64	nxv16i1,nxv16i1	nxv16i1	uzp1 p0.d, p0.d, p1.d
+uzp1.nxv16i1	nxv16i1,nxv16i1	nxv16i1	uzp1 p0.b, p0.b, p1.b
+uzp1.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uzp1 z0.b, z0.b, z1.b
+uzp1.nxv2f64	nxv2f64,nxv2f64	nxv2f64	uzp1 z0.d, z0.d, z1.d
+uzp1.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uzp1 z0.d, z0.d, z1.d
+uzp1.nxv4f32	nxv4f32,nxv4f32	nxv4f32	uzp1 z0.s, z0.s, z1.s
+uzp1.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uzp1 z0.s, z0.s, z1.s
+uzp1.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uzp1 z0.h, z0.h, z1.h
+uzp1q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uzp1 z0.q, z0.q, z1.q
+uzp1q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	uzp1 z0.q, z0.q, z1.q
+uzp1q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uzp1 z0.q, z0.q, z1.q
+uzp1q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	uzp1 z0.q, z0.q, z1.q
+uzp1q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uzp1 z0.q, z0.q, z1.q
+uzp1q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uzp1 z0.q, z0.q, z1.q
+uzp2.b16	nxv16i1,nxv16i1	nxv16i1	uzp2 p0.h, p0.h, p1.h
+uzp2.b32	nxv16i1,nxv16i1	nxv16i1	uzp2 p0.s, p0.s, p1.s
+uzp2.b64	nxv16i1,nxv16i1	nxv16i1	uzp2 p0.d, p0.d, p1.d
+uzp2.nxv16i1	nxv16i1,nxv16i1	nxv16i1	uzp2 p0.b, p0.b, p1.b
+uzp2.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uzp2 z0.b, z0.b, z1.b
+uzp2.nxv2f64	nxv2f64,nxv2f64	nxv2f64	uzp2 z0.d, z0.d, z1.d
+uzp2.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uzp2 z0.d, z0.d, z1.d
+uzp2.nxv4f32	nxv4f32,nxv4f32	nxv4f32	uzp2 z0.s, z0.s, z1.s
+uzp2.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uzp2 z0.s, z0.s, z1.s
+uzp2.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uzp2 z0.h, z0.h, z1.h
+uzp2q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	uzp2 z0.q, z0.q, z1.q
+uzp2q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	uzp2 z0.q, z0.q, z1.q
+uzp2q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	uzp2 z0.q, z0.q, z1.q
+uzp2q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	uzp2 z0.q, z0.q, z1.q
+uzp2q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	uzp2 z0.q, z0.q, z1.q
+uzp2q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	uzp2 z0.q, z0.q, z1.q
+vector.insert.nxv16i8.v16i8	nxv16i8,v16i8,i64=0	nxv16i8	ptrue p0.b, vl16; mov z0.b, p0/m, z1.b
+vector.insert.nxv2f64.v2f64	nxv2f64,v2f64,i64=0	nxv2f64	ptrue p0.d, vl2; mov z0.d, p0/m, z1.d
+vector.insert.nxv2i64.v2i64	nxv2i64,v2i64,i64=0	nxv2i64	ptrue p0.d, vl2; mov z0.d, p0/m, z1.d
+vector.insert.nxv4f32.v4f32	nxv4f32,v4f32,i64=0	nxv4f32	ptrue p0.s, vl4; mov z0.s, p0/m, z1.s
+vector.insert.nxv4i32.v4i32	nxv4i32,v4i32,i64=0	nxv4i32	ptrue p0.s, vl4; mov z0.s, p0/m, z1.s
+vector.insert.nxv8i16.v8i16	nxv8i16,v8i16,i64=0	nxv8i16	ptrue p0.h, vl8; mov z0.h, p0/m, z1.h
+vector.reverse.nxv16i1	nxv16i1	nxv16i1	rev p0.b, p0.b
+vector.reverse.nxv16i8	nxv16i8	nxv16i8	rev z0.b, z0.b
+vector.reverse.nxv2f64	nxv2f64	nxv2f64	rev z0.d, z0.d
+vector.reverse.nxv2i64	nxv2i64	nxv2i64	rev z0.d, z0.d
+vector.reverse.nxv4f32	nxv4f32	nxv4f32	rev z0.s, z0.s
+vector.reverse.nxv4i32	nxv4i32	nxv4i32	rev z0.s, z0.s
+vector.reverse.nxv8i16	nxv8i16	nxv8i16	rev z0.h, z0.h
+whilege.nxv16i1.i32	i32,i32	nxv16i1	whilege p0.b, w0, w1
+whilege.nxv16i1.i64	i64,i64	nxv16i1	whilege p0.b, x0, x1
+whilege.nxv2i1.i32	i32,i32	nxv2i1	whilege p0.d, w0, w1
+whilege.nxv2i1.i64	i64,i64	nxv2i1	whilege p0.d, x0, x1
+whilege.nxv4i1.i32	i32,i32	nxv4i1	whilege p0.s, w0, w1
+whilege.nxv4i1.i64	i64,i64	nxv4i1	whilege p0.s, x0, x1
+whilege.nxv8i1.i32	i32,i32	nxv8i1	whilege p0.h, w0, w1
+whilege.nxv8i1.i64	i64,i64	nxv8i1	whilege p0.h, x0, x1
+whilegt.nxv16i1.i32	i32,i32	nxv16i1	whilegt p0.b, w0, w1
+whilegt.nxv16i1.i64	i64,i64	nxv16i1	whilegt p0.b, x0, x1
+whilegt.nxv2i1.i32	i32,i32	nxv2i1	whilegt p0.d, w0, w1
+whilegt.nxv2i1.i64	i64,i64	nxv2i1	whilegt p0.d, x0, x1
+whilegt.nxv4i1.i32	i32,i32	nxv4i1	whilegt p0.s, w0, w1
+whilegt.nxv4i1.i64	i64,i64	nxv4i1	whilegt p0.s, x0, x1
+whilegt.nxv8i1.i32	i32,i32	nxv8i1	whilegt p0.h, w0, w1
+whilegt.nxv8i1.i64	i64,i64	nxv8i1	whilegt p0.h, x0, x1
+whilehi.nxv16i1.i32	i32,i32	nxv16i1	whilehi p0.b, w0, w1
+whilehi.nxv16i1.i64	i64,i64	nxv16i1	whilehi p0.b, x0, x1
+whilehi.nxv2i1.i32	i32,i32	nxv2i1	whilehi p0.d, w0, w1
+whilehi.nxv2i1.i64	i64,i64	nxv2i1	whilehi p0.d, x0, x1
+whilehi.nxv4i1.i32	i32,i32	nxv4i1	whilehi p0.s, w0, w1
+whilehi.nxv4i1.i64	i64,i64	nxv4i1	whilehi p0.s, x0, x1
+whilehi.nxv8i1.i32	i32,i32	nxv8i1	whilehi p0.h, w0, w1
+whilehi.nxv8i1.i64	i64,i64	nxv8i1	whilehi p0.h, x0, x1
+whilehs.nxv16i1.i32	i32,i32	nxv16i1	whilehs p0.b, w0, w1
+whilehs.nxv16i1.i64	i64,i64	nxv16i1	whilehs p0.b, x0, x1
+whilehs.nxv2i1.i32	i32,i32	nxv2i1	whilehs p0.d, w0, w1
+whilehs.nxv2i1.i64	i64,i64	nxv2i1	whilehs p0.d, x0, x1
+whilehs.nxv4i1.i32	i32,i32	nxv4i1	whilehs p0.s, w0, w1
+whilehs.nxv4i1.i64	i64,i64	nxv4i1	whilehs p0.s, x0, x1
+whilehs.nxv8i1.i32	i32,i32	nxv8i1	whilehs p0.h, w0, w1
+whilehs.nxv8i1.i64	i64,i64	nxv8i1	whilehs p0.h, x0, x1
+whilele.nxv16i1.i32	i32,i32	nxv16i1	whilele p0.b, w0, w1
+whilele.nxv16i1.i64	i64,i64	nxv16i1	whilele p0.b, x0, x1
+whilele.nxv2i1.i32	i32,i32	nxv2i1	whilele p0.d, w0, w1
+whilele.nxv2i1.i64	i64,i64	nxv2i1	whilele p0.d, x0, x1
+whilele.nxv4i1.i32	i32,i32	nxv4i1	whilele p0.s, w0, w1
+whilele.nxv4i1.i64	i64,i64	nxv4i1	whilele p0.s, x0, x1
+whilele.nxv8i1.i32	i32,i32	nxv8i1	whilele p0.h, w0, w1
+whilele.nxv8i1.i64	i64,i64	nxv8i1	whilele p0.h, x0, x1
+whilelo.nxv16i1.i32	i32,i32	nxv16i1	whilelo p0.b, w0, w1
+whilelo.nxv16i1.i64	i64,i64	nxv16i1	whilelo p0.b, x0, x1
+whilelo.nxv2i1.i32	i32,i32	nxv2i1	whilelo p0.d, w0, w1
+whilelo.nxv2i1.i64	i64,i64	nxv2i1	whilelo p0.d, x0, x1
+whilelo.nxv4i1.i32	i32,i32	nxv4i1	whilelo p0.s, w0, w1
+whilelo.nxv4i1.i64	i64,i64	nxv4i1	whilelo p0.s, x0, x1
+whilelo.nxv8i1.i32	i32,i32	nxv8i1	whilelo p0.h, w0, w1
+whilelo.nxv8i1.i64	i64,i64	nxv8i1	whilelo p0.h, x0, x1
+whilels.nxv16i1.i32	i32,i32	nxv16i1	whilels p0.b, w0, w1
+whilels.nxv16i1.i64	i64,i64	nxv16i1	whilels p0.b, x0, x1
+whilels.nxv2i1.i32	i32,i32	nxv2i1	whilels p0.d, w0, w1
+whilels.nxv2i1.i64	i64,i64	nxv2i1	whilels p0.d, x0, x1
+whilels.nxv4i1.i32	i32,i32	nxv4i1	whilels p0.s, w0, w1
+whilels.nxv4i1.i64	i64,i64	nxv4i1	whilels p0.s, x0, x1
+whilels.nxv8i1.i32	i32,i32	nxv8i1	whilels p0.h, w0, w1
+whilels.nxv8i1.i64	i64,i64	nxv8i1	whilels p0.h, x0, x1
+whilelt.nxv16i1.i32	i32,i32	nxv16i1	whilelt p0.b, w0, w1
+whilelt.nxv16i1.i64	i64,i64	nxv16i1	whilelt p0.b, x0, x1
+whilelt.nxv2i1.i32	i32,i32	nxv2i1	whilelt p0.d, w0, w1
+whilelt.nxv2i1.i64	i64,i64	nxv2i1	whilelt p0.d, x0, x1
+whilelt.nxv4i1.i32	i32,i32	nxv4i1	whilelt p0.s, w0, w1
+whilelt.nxv4i1.i64	i64,i64	nxv4i1	whilelt p0.s, x0, x1
+whilelt.nxv8i1.i32	i32,i32	nxv8i1	whilelt p0.h, w0, w1
+whilelt.nxv8i1.i64	i64,i64	nxv8i1	whilelt p0.h, x0, x1
+whilewr.b.nxv16i1.p0	ptr,ptr	nxv16i1	whilewr p0.b, x0, x1
+wrffr	nxv16i1	void	wrffr p0.b
+xar.nxv16i8	nxv16i8,nxv16i8,i32=1	nxv16i8	xar z0.b, z0.b, z1.b, #1
+xar.nxv16i8	nxv16i8,nxv16i8,i32=8	nxv16i8	xar z0.b, z0.b, z1.b, #8
+xar.nxv2i64	nxv2i64,nxv2i64,i32=1	nxv2i64	xar z0.d, z0.d, z1.d, #1
+xar.nxv2i64	nxv2i64,nxv2i64,i32=64	nxv2i64	xar z0.d, z0.d, z1.d, #64
+xar.nxv4i32	nxv4i32,nxv4i32,i32=1	nxv4i32	xar z0.s, z0.s, z1.s, #1
+xar.nxv4i32	nxv4i32,nxv4i32,i32=32	nxv4i32	xar z0.s, z0.s, z1.s, #32
+xar.nxv8i16	nxv8i16,nxv8i16,i32=1	nxv8i16	xar z0.h, z0.h, z1.h, #1
+xar.nxv8i16	nxv8i16,nxv8i16,i32=16	nxv8i16	xar z0.h, z0.h, z1.h, #16
+zip1.b16	nxv16i1,nxv16i1	nxv16i1	zip1 p0.h, p0.h, p1.h
+zip1.b32	nxv16i1,nxv16i1	nxv16i1	zip1 p0.s, p0.s, p1.s
+zip1.b64	nxv16i1,nxv16i1	nxv16i1	zip1 p0.d, p0.d, p1.d
+zip1.nxv16i1	nxv16i1,nxv16i1	nxv16i1	zip1 p0.b, p0.b, p1.b
+zip1.nxv16i8	nxv16i8,nxv16i8	nxv16i8	zip1 z0.b, z0.b, z1.b
+zip1.nxv2f64	nxv2f64,nxv2f64	nxv2f64	zip1 z0.d, z0.d, z1.d
+zip1.nxv2i64	nxv2i64,nxv2i64	nxv2i64	zip1 z0.d, z0.d, z1.d
+zip1.nxv4f32	nxv4f32,nxv4f32	nxv4f32	zip1 z0.s, z0.s, z1.s
+zip1.nxv4i32	nxv4i32,nxv4i32	nxv4i32	zip1 z0.s, z0.s, z1.s
+zip1.nxv8i16	nxv8i16,nxv8i16	nxv8i16	zip1 z0.h, z0.h, z1.h
+zip1q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	zip1 z0.q, z0.q, z1.q
+zip1q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	zip1 z0.q, z0.q, z1.q
+zip1q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	zip1 z0.q, z0.q, z1.q
+zip1q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	zip1 z0.q, z0.q, z1.q
+zip1q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	zip1 z0.q, z0.q, z1.q
+zip1q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	zip1 z0.q, z0.q, z1.q
+zip2.b16	nxv16i1,nxv16i1	nxv16i1	zip2 p0.h, p0.h, p1.h
+zip2.b32	nxv16i1,nxv16i1	nxv16i1	zip2 p0.s, p0.s, p1.s
+zip2.b64	nxv16i1,nxv16i1	nxv16i1	zip2 p0.d, p0.d, p1.d
+zip2.nxv16i1	nxv16i1,nxv16i1	nxv16i1	zip2 p0.b, p0.b, p1.b
+zip2.nxv16i8	nxv16i8,nxv16i8	nxv16i8	zip2 z0.b, z0.b, z1.b
+zip2.nxv2f64	nxv2f64,nxv2f64	nxv2f64	zip2 z0.d, z0.d, z1.d
+zip2.nxv2i64	nxv2i64,nxv2i64	nxv2i64	zip2 z0.d, z0.d, z1.d
+zip2.nxv4f32	nxv4f32,nxv4f32	nxv4f32	zip2 z0.s, z0.s, z1.s
+zip2.nxv4i32	nxv4i32,nxv4i32	nxv4i32	zip2 z0.s, z0.s, z1.s
+zip2.nxv8i16	nxv8i16,nxv8i16	nxv8i16	zip2 z0.h, z0.h, z1.h
+zip2q.nxv16i8	nxv16i8,nxv16i8	nxv16i8	zip2 z0.q, z0.q, z1.q
+zip2q.nxv2f64	nxv2f64,nxv2f64	nxv2f64	zip2 z0.q, z0.q, z1.q
+zip2q.nxv2i64	nxv2i64,nxv2i64	nxv2i64	zip2 z0.q, z0.q, z1.q
+zip2q.nxv4f32	nxv4f32,nxv4f32	nxv4f32	zip2 z0.q, z0.q, z1.q
+zip2q.nxv4i32	nxv4i32,nxv4i32	nxv4i32	zip2 z0.q, z0.q, z1.q
+zip2q.nxv8i16	nxv8i16,nxv8i16	nxv8i16	zip2 z0.q, z0.q, z1.q

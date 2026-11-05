@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "build.jobs = 2\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.jobs = 2 # $ROOT/.cargo/config\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config\nbuild.jobs = 2\n\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\nwarning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config\nbuild.jobs = 2 # $ROOT/.cargo/config\n\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\nwarning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"jobs\":2}}\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"jobs\":2}}\n",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "warning: both `$ROOT/.cargo/config` and `$ROOT/.cargo/config.toml` exist. Using `$ROOT/.cargo/config`\nerror: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ }
+]

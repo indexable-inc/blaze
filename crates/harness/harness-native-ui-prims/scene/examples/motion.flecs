@@ -1,0 +1,96 @@
+// Motion. The gallery (harness-native's gallery.rs) changes each of these one second in, so a shot a little after shows
+// them mid-spring:
+// - MatchedGeometry: the selection pill (a Background with MatchedGeometry {id: "ex.selection"}) moves from the first
+//   row to the third; the new pill springs from where the old one was drawn.
+// - Transition: one chip of each kind is inserted (Opacity, Slide, Scale, Move from the top) and the first chip leaves.
+// - Animate: the bar's Size, Padding and Fill are set to new values; it eases to them.
+// - Removal: the second row of a column leaves on an Opacity transition; it folds away as it fades (Collapse) and the rows
+//   below slide up into its space, as in a SwiftUI List.
+
+@tree ChildOf
+ex {
+  // The selection pill: put one under the selected row.
+  prefab Selection : ui.Node {
+    Background
+    MatchedGeometry: {id: "ex.selection"}
+    Fill: $tone_select
+    Shape: {radius: 6, n: 4, border: 0, feather: 0}
+  }
+
+  prefab SelRow : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+    Padding: {l: 8, r: 8, t: 0, b: 0}
+    icon : ui.Symbol { Icon: {glyph: "◆"} }
+    name : ui.Words { Text: {s: "row"} }
+  }
+
+  prefab MatchedDemo : ex.Card {
+    label : ui.Label { Text: {s: "MATCHEDGEOMETRY ID EX.SELECTION"} }
+    rows : ui.Column {
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      r0 : ex.SelRow { name { Text: {s: "hydra"} }; pill : ex.Selection {} }
+      r1 : ex.SelRow { name { Text: {s: "fold-lane"} } }
+      r2 : ex.SelRow { name { Text: {s: "archive-live"} } }
+      r3 : ex.SelRow { name { Text: {s: "swiftui"} } }
+    }
+  }
+
+  // Chips that come in and go out on a transition of each kind.
+  prefab Chip : ex.Pill {
+    Transition: {kind: Opacity, from: Top, scale: 1, fade: false}
+  }
+  prefab ChipSlide : ex.Chip {
+    Transition: {kind: Slide, from: Top, scale: 1, fade: false}
+  }
+  prefab ChipScale : ex.Chip {
+    Transition: {kind: Scale, from: Top, scale: 0.2, fade: true}
+  }
+  prefab ChipMove : ex.Chip {
+    Transition: {kind: Move, from: Top, scale: 1, fade: true}
+  }
+
+  prefab TransitionDemo : ex.Card {
+    label : ui.Label { Text: {s: "TRANSITION OPACITY, SLIDE, SCALE, MOVE"} }
+    chips : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: true}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Clip
+      first : ex.Chip { words { Text: {s: "leaving"} } }
+      kept : ex.Chip { words { Text: {s: "kept"} } }
+    }
+  }
+
+  prefab AnimateDemo : ex.Card {
+    label : ui.Label { Text: {s: "ANIMATE SIZE, PADDING, FILL"} }
+    bar : ui.Row {
+      Animate
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: 60, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
+      Padding: {l: 6, r: 6, t: 0, b: 0}
+      Fill: $tone_wash
+      Shape: {radius: 8, n: 4, border: 0, feather: 0}
+      words : ui.Line { Text: {s: "eases"} }
+    }
+    after : ui.Words, Muted { Text: {s: "a sibling below moves with it"} }
+  }
+
+  // A list row that fades out when removed, on a plate so its fold shows.
+  prefab ListRow : ex.SelRow {
+    Transition: {kind: Opacity, from: Top, scale: 1, fade: false}
+    bg : ex.Plate { Background }
+  }
+
+  prefab RemovalDemo : ex.Card {
+    label : ui.Label { Text: {s: "REMOVAL FOLDS AWAY, NEIGHBOURS SLIDE"} }
+    rows : ui.Column {
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      a : ex.ListRow { name { Text: {s: "above"} } }
+      b : ex.ListRow { name { Text: {s: "removed"} } }
+      c : ex.ListRow { name { Text: {s: "below one"} } }
+      d : ex.ListRow { name { Text: {s: "below two"} } }
+    }
+  }
+}

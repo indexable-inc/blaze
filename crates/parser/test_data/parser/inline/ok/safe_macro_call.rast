@@ -1,0 +1,29 @@
+SOURCE_FILE
+  MACRO_CALL
+    PATH
+      PATH_SEGMENT
+        NAME_REF
+          IDENT "safe"
+    BANG "!"
+    TOKEN_TREE
+      L_PAREN "("
+      IDENT "A"
+      R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"
+  MACRO_CALL
+    PATH
+      PATH
+        PATH_SEGMENT
+          NAME_REF
+            IDENT "safe"
+      COLON2 "::"
+      PATH_SEGMENT
+        NAME_REF
+          IDENT "b"
+    BANG "!"
+    TOKEN_TREE
+      L_PAREN "("
+      R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"

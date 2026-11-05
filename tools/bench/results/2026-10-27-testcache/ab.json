@@ -1,0 +1,296 @@
+{
+ "nushell before": {
+  "main": {
+   "code": 0,
+   "secs": 42.5,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    47590
+   ]
+  },
+  "all 0": {
+   "code": 0,
+   "secs": 17.5,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 0,
+   "secs": 17.3,
+   "ran": 42,
+   "failed": 0,
+   "cached": 25,
+   "reach_us": [
+    521359
+   ]
+  },
+  "all 1": {
+   "code": 0,
+   "secs": 17.2,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 0,
+   "secs": 19.4,
+   "ran": 42,
+   "failed": 0,
+   "cached": 25,
+   "reach_us": [
+    529202
+   ]
+  }
+ },
+ "nushell after": {
+  "main": {
+   "code": 0,
+   "secs": 43.4,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    68832
+   ]
+  },
+  "all 0": {
+   "code": 0,
+   "secs": 18.9,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 0,
+   "secs": 18.9,
+   "ran": 42,
+   "failed": 0,
+   "cached": 25,
+   "reach_us": [
+    567154
+   ]
+  },
+  "all 1": {
+   "code": 0,
+   "secs": 17.7,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 0,
+   "secs": 17.0,
+   "ran": 42,
+   "failed": 0,
+   "cached": 25,
+   "reach_us": [
+    571790
+   ]
+  }
+ },
+ "axum before": {
+  "main": {
+   "code": 0,
+   "secs": 43.2,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    2439260
+   ]
+  },
+  "all 0": {
+   "code": 0,
+   "secs": 12.2,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 0,
+   "secs": 19.1,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    6250720
+   ]
+  },
+  "all 1": {
+   "code": 0,
+   "secs": 11.5,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 0,
+   "secs": 18.9,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    6144316
+   ]
+  }
+ },
+ "axum after": {
+  "main": {
+   "code": 0,
+   "secs": 44.9,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    2574743
+   ]
+  },
+  "all 0": {
+   "code": 0,
+   "secs": 11.9,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 0,
+   "secs": 13.3,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    937706
+   ]
+  },
+  "all 1": {
+   "code": 0,
+   "secs": 11.9,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 0,
+   "secs": 13.7,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "reach_us": [
+    937983
+   ]
+  }
+ },
+ "just before": {
+  "main": {
+   "code": 101,
+   "secs": 66.8,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": [
+    4960456,
+    1425855
+   ]
+  },
+  "all 0": {
+   "code": 101,
+   "secs": 29.5,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 101,
+   "secs": 38.8,
+   "ran": 1272,
+   "failed": 928,
+   "cached": 171,
+   "reach_us": [
+    4624310,
+    2893123
+   ]
+  },
+  "all 1": {
+   "code": 101,
+   "secs": 28.2,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 101,
+   "secs": 38.9,
+   "ran": 1272,
+   "failed": 928,
+   "cached": 171,
+   "reach_us": [
+    4890417,
+    2812385
+   ]
+  }
+ },
+ "just after": {
+  "main": {
+   "code": 101,
+   "secs": 61.4,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": [
+    2278252,
+    1438288
+   ]
+  },
+  "all 0": {
+   "code": 101,
+   "secs": 28.7,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 0": {
+   "code": 101,
+   "secs": 32.4,
+   "ran": 1272,
+   "failed": 928,
+   "cached": 171,
+   "reach_us": [
+    337393,
+    123818
+   ]
+  },
+  "all 1": {
+   "code": 101,
+   "secs": 28.9,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "reach_us": []
+  },
+  "affected 1": {
+   "code": 101,
+   "secs": 32.1,
+   "ran": 1272,
+   "failed": 928,
+   "cached": 171,
+   "reach_us": [
+    322855,
+    121796
+   ]
+  }
+ }
+}

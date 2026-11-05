@@ -1,0 +1,18 @@
+# The release train's issue: opened or commented on when a train is red, with the jobs that
+# failed and the commits since the last green train; closed when a train is green
+# (.github/scripts/train_issue.py). The job that uses it needs `issues: write` and
+# `actions: read` (the failed jobs' logs).
+name: train issue
+description: Open, add to or close the release train's issue
+inputs:
+  verdict:
+    description: "`red` or `green`"
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERDICT: ${{ inputs.verdict }}
+      run: python3 .github/scripts/train_issue.py "$VERDICT"

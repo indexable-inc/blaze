@@ -1,0 +1,37 @@
+[package]
+name = "hir-ty-wfcheck"
+version = "0.0.0"
+repository.workspace = true
+description = "rustc's item well-formedness checks of what outlives what, over rust-analyzer's types."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+intern.workspace = true
+la-arena.workspace = true
+blaze-query.workspace = true
+smallvec.workspace = true
+
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-format.workspace = true
+blaze-mem.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+# The tests' database links hir-ty-mir for the MIR providers.
+hir-ty-mir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

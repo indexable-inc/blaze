@@ -1,0 +1,101 @@
+; Shaped like what hir-ty-codegen makes for `Option<NonZeroU32>::map`: the option is one
+; `u32` with zero as the `None` niche, so the discriminant is `x != 0` and the `match` a
+; `brif`; the closure is its own function (its environment is a zero-sized type, which the
+; Rust ABI leaves out of the signature). `%map` maps to `Option<u32>` (a scalar pair
+; (discriminant, value), `None` as (0, 0)) with `|n| n.get().count_ones()`; `%map_nonzero`
+; maps back into the niche with `|n| n.saturating_mul(NonZeroU32::new(3).unwrap())`;
+; `%map_or` is `.map(|n| n.leading_zeros()).unwrap_or(d)`.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %count_ones_closure(i32) -> i32 {
+block0(v0: i32):
+    v1 = popcnt v0
+    return v1
+}
+
+function %map(i32) -> i32, i32 {
+    fn0 = %count_ones_closure(i32) -> i32
+
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = icmp ne v0, v1
+    v3 = uextend.i64 v2
+    brif v3, block1, block2
+
+block1:
+    v4 = call fn0(v0)
+    v5 = iconst.i32 1
+    return v5, v4
+
+block2:
+    v6 = iconst.i32 0
+    return v6, v6
+}
+; run: %map(0) == [0, 0]
+; run: %map(1) == [1, 1]
+; run: %map(7) == [1, 3]
+; run: %map(0x80000000) == [1, 1]
+; run: %map(0x55555555) == [1, 16]
+; run: %map(0xffffffff) == [1, 32]
+
+function %triple_closure(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 3
+    v2, v3 = umul_overflow v0, v1
+    v4 = iconst.i32 -1
+    v5 = select v3, v4, v2
+    return v5
+}
+
+function %map_nonzero(i32) -> i32 {
+    fn0 = %triple_closure(i32) -> i32
+
+block0(v0: i32):
+    brif v0, block1, block2
+
+block1:
+    v1 = call fn0(v0)
+    return v1
+
+block2:
+    v2 = iconst.i32 0
+    return v2
+}
+; run: %map_nonzero(0) == 0
+; run: %map_nonzero(1) == 3
+; run: %map_nonzero(0x10000000) == 0x30000000
+; run: %map_nonzero(0x55555555) == 0xffffffff
+; run: %map_nonzero(0x55555556) == 0xffffffff
+; run: %map_nonzero(0x80000000) == 0xffffffff
+; run: %map_nonzero(0xffffffff) == 0xffffffff
+
+function %leading_zeros_closure(i32) -> i32 {
+block0(v0: i32):
+    v1 = clz v0
+    return v1
+}
+
+function %map_or(i32, i32) -> i32 {
+    fn0 = %leading_zeros_closure(i32) -> i32
+
+block0(v0: i32, v1: i32):
+    v2 = iconst.i32 0
+    v3 = icmp eq v0, v2
+    brif v3, block2(v1), block1
+
+block1:
+    v4 = call fn0(v0)
+    jump block2(v4)
+
+block2(v5: i32):
+    return v5
+}
+; run: %map_or(0, 99) == 99
+; run: %map_or(0, 0xffffffff) == 0xffffffff
+; run: %map_or(1, 99) == 31
+; run: %map_or(0x00010000, 99) == 15
+; run: %map_or(0x80000000, 99) == 0
+; run: %map_or(0xffffffff, 99) == 0

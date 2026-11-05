@@ -1,0 +1,12 @@
+[package]
+name = "liveprobe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "harness/live with a nightly feature: allocator_api, a bump arena its loop allocates in; harness/live_e2e.py edits it (LIVE_PROGRAM=live-alloc)"
+
+[dependencies]
+blaze-live = { path = "../../crates/blaze-live" }
+
+# Its own workspace and lock, like demo/life.
+[workspace]

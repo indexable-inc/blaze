@@ -1,0 +1,241 @@
+{
+ "project": "bat",
+ "rev": "c734087e1d15fb730d7653389c841fd9e3016556",
+ "status": 0,
+ "seconds": 11.8,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.97",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "assert_cmd",
+   "version": "2.0.16",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "bat",
+   "version": "0.26.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "bugreport",
+   "version": "0.5.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "doc-comment",
+   "version": "0.3.3",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.3.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.175",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.175",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libgit2-sys",
+   "version": "0.18.0+1.9.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libz-sys",
+   "version": "1.1.21",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "lock_api",
+   "version": "0.4.12",
+   "ok": true,
+   "kept": false,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_e1267590ba39b7c7_0 --crate-type=lib --out-dir /root/bs/cl/work/target/bat/debug/build/lock_api/a7c085a04b20c8eb/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_e1267590ba39b7c7_1 --crate-type=lib --out-dir /root/bs/cl/work/target/bat/debug/build/lock_api/a7c085a04b20c8eb/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "nix",
+   "version": "0.30.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": false,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_a90e320c6d6f91d5_0 --crate-type=lib --out-dir /root/bs/cl/work/target/bat/debug/build/num-traits/ab92ae87c294e799/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_a90e320c6d6f91d5_1 --crate-type=lib --out-dir /root/bs/cl/work/target/bat/debug/build/num-traits/ab92ae87c294e799/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_a90e320c6d6f91d5_2 --crate-type=lib --out-dir /root/bs/cl/work/target/bat/debug/build/num-traits/ab92ae87c294e799/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "onig_sys",
+   "version": "69.9.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "parking_lot_core",
+   "version": "0.9.10",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "prettyplease",
+   "version": "0.2.35",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.95",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rayon-core",
+   "version": "1.12.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "0.38.43",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "0.38.43",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "semver",
+   "version": "1.0.25",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.217",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.217",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.135",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "signal-hook",
+   "version": "0.3.18",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "1.0.69",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "2.0.16",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

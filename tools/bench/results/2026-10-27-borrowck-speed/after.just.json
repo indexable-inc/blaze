@@ -1,0 +1,1264 @@
+{
+ "just": {
+  "polonius": {
+   "bodies": 1417,
+   "infer_ms": 1660.179,
+   "infer_warm_ms": 1068.67,
+   "first_check_ms": 3593.509,
+   "borrowck_ms": 715.405,
+   "borrowck_excl_mir_ms": 715.264,
+   "ratio_to_infer": 0.6693029653681679,
+   "per_body_us": {
+    "p50": 94,
+    "p99": 8984,
+    "max": 20569
+   },
+   "phases_ms": {
+    "constraints": 306.336,
+    "entry_sets": 12.493,
+    "errors": 3.009,
+    "infer": 17.296,
+    "liveness": 148.715,
+    "loans": 7.933,
+    "mir": 0.141,
+    "moves": 103.872,
+    "scopes": 19.553,
+    "setup": 1.072,
+    "walk": 72.878
+   },
+   "slowest": [
+    {
+     "name": "just::analyzer::<Analyzer<'run, 'src>>::justfile",
+     "path": "/root/bp/apps/just/src/analyzer.rs",
+     "us": 20569,
+     "infer_us": 23205,
+     "phases_us": {
+      "constraints": 8472,
+      "entry_sets": 269,
+      "errors": 89,
+      "infer": 495,
+      "liveness": 6009,
+      "loans": 172,
+      "mir": 3,
+      "moves": 2451,
+      "scopes": 749,
+      "setup": 23,
+      "walk": 1556
+     },
+     "counts": {
+      "blocks": 1630,
+      "bodies": 9,
+      "constraints": 4679,
+      "loans": 163,
+      "localized": 4665,
+      "locals": 1059,
+      "points": 5092,
+      "regions": 3166,
+      "universals": 103
+     }
+    },
+    {
+     "name": "just::error::<Error<'_>>::fmt",
+     "path": "/root/bp/apps/just/src/error.rs",
+     "us": 20344,
+     "infer_us": 31743,
+     "phases_us": {
+      "constraints": 7686,
+      "entry_sets": 727,
+      "errors": 80,
+      "infer": 647,
+      "liveness": 4742,
+      "loans": 308,
+      "mir": 0,
+      "moves": 3308,
+      "scopes": 690,
+      "setup": 16,
+      "walk": 1774
+     },
+     "counts": {
+      "blocks": 2118,
+      "bodies": 1,
+      "constraints": 6966,
+      "loans": 445,
+      "localized": 6966,
+      "locals": 2848,
+      "points": 12141,
+      "regions": 6749,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::subcommand::<Subcommand>::list_module",
+     "path": "/root/bp/apps/just/src/subcommand.rs",
+     "us": 14920,
+     "infer_us": 18942,
+     "phases_us": {
+      "constraints": 7406,
+      "entry_sets": 245,
+      "errors": 34,
+      "infer": 459,
+      "liveness": 3002,
+      "loans": 133,
+      "mir": 2,
+      "moves": 1587,
+      "scopes": 344,
+      "setup": 11,
+      "walk": 1517
+     },
+     "counts": {
+      "blocks": 1080,
+      "bodies": 5,
+      "constraints": 3208,
+      "loans": 119,
+      "localized": 3205,
+      "locals": 866,
+      "points": 3831,
+      "regions": 2261,
+      "universals": 48
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::augment_args_for_update",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 13266,
+     "infer_us": 22479,
+     "phases_us": {
+      "constraints": 4669,
+      "entry_sets": 351,
+      "errors": 33,
+      "infer": 246,
+      "liveness": 2581,
+      "loans": 114,
+      "mir": 0,
+      "moves": 1510,
+      "scopes": 394,
+      "setup": 9,
+      "walk": 3164
+     },
+     "counts": {
+      "blocks": 2002,
+      "bodies": 1,
+      "constraints": 4284,
+      "loans": 329,
+      "localized": 4284,
+      "locals": 1431,
+      "points": 5868,
+      "regions": 2927,
+      "universals": 2
+     }
+    },
+    {
+     "name": "just::recipe::<Recipe<'src, Dependency<'src>>>::run_script",
+     "path": "/root/bp/apps/just/src/recipe.rs",
+     "us": 13109,
+     "infer_us": 19824,
+     "phases_us": {
+      "constraints": 5742,
+      "entry_sets": 180,
+      "errors": 49,
+      "infer": 193,
+      "liveness": 2799,
+      "loans": 113,
+      "mir": 4,
+      "moves": 1674,
+      "scopes": 220,
+      "setup": 25,
+      "walk": 1916
+     },
+     "counts": {
+      "blocks": 1040,
+      "bodies": 16,
+      "constraints": 1815,
+      "loans": 71,
+      "localized": 1813,
+      "locals": 749,
+      "points": 3304,
+      "regions": 1576,
+      "universals": 116
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::augment_args",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 12904,
+     "infer_us": 21709,
+     "phases_us": {
+      "constraints": 4686,
+      "entry_sets": 375,
+      "errors": 32,
+      "infer": 262,
+      "liveness": 2387,
+      "loans": 114,
+      "mir": 0,
+      "moves": 1518,
+      "scopes": 381,
+      "setup": 8,
+      "walk": 2950
+     },
+     "counts": {
+      "blocks": 1902,
+      "bodies": 1,
+      "constraints": 4284,
+      "loans": 329,
+      "localized": 4284,
+      "locals": 1381,
+      "points": 5668,
+      "regions": 2927,
+      "universals": 2
+     }
+    },
+    {
+     "name": "just::error::<Error<'src>>::fmt",
+     "path": "/root/bp/apps/just/src/error.rs",
+     "us": 12060,
+     "infer_us": 18823,
+     "phases_us": {
+      "constraints": 3648,
+      "entry_sets": 542,
+      "errors": 59,
+      "infer": 764,
+      "liveness": 3046,
+      "loans": 230,
+      "mir": 0,
+      "moves": 1555,
+      "scopes": 850,
+      "setup": 11,
+      "walk": 1051
+     },
+     "counts": {
+      "blocks": 1805,
+      "bodies": 1,
+      "constraints": 11785,
+      "loans": 759,
+      "localized": 11785,
+      "locals": 2021,
+      "points": 7953,
+      "regions": 7722,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::unresolved_recipe::<Recipe<'src, UnresolvedDependency<'src>>>::resolve",
+     "path": "/root/bp/apps/just/src/unresolved_recipe.rs",
+     "us": 11544,
+     "infer_us": 13857,
+     "phases_us": {
+      "constraints": 4851,
+      "entry_sets": 187,
+      "errors": 156,
+      "infer": 224,
+      "liveness": 3123,
+      "loans": 122,
+      "mir": 1,
+      "moves": 1489,
+      "scopes": 373,
+      "setup": 18,
+      "walk": 833
+     },
+     "counts": {
+      "blocks": 1407,
+      "bodies": 5,
+      "constraints": 2452,
+      "loans": 157,
+      "localized": 2452,
+      "locals": 672,
+      "points": 3693,
+      "regions": 1770,
+      "universals": 65
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::from_arg_matches_mut",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 10577,
+     "infer_us": 31932,
+     "phases_us": {
+      "constraints": 3569,
+      "entry_sets": 298,
+      "errors": 28,
+      "infer": 66,
+      "liveness": 3804,
+      "loans": 94,
+      "mir": 7,
+      "moves": 1352,
+      "scopes": 76,
+      "setup": 30,
+      "walk": 981
+     },
+     "counts": {
+      "blocks": 2143,
+      "bodies": 41,
+      "constraints": 392,
+      "loans": 52,
+      "localized": 392,
+      "locals": 634,
+      "points": 4791,
+      "regions": 641,
+      "universals": 83
+     }
+    },
+    {
+     "name": "just::justfile::<Justfile<'src>>::run",
+     "path": "/root/bp/apps/just/src/justfile.rs",
+     "us": 10411,
+     "infer_us": 10671,
+     "phases_us": {
+      "constraints": 3901,
+      "entry_sets": 113,
+      "errors": 28,
+      "infer": 215,
+      "liveness": 2237,
+      "loans": 119,
+      "mir": 2,
+      "moves": 1183,
+      "scopes": 1126,
+      "setup": 10,
+      "walk": 1359
+     },
+     "counts": {
+      "blocks": 734,
+      "bodies": 5,
+      "constraints": 1959,
+      "loans": 70,
+      "localized": 1959,
+      "locals": 528,
+      "points": 2480,
+      "regions": 1332,
+      "universals": 50
+     }
+    },
+    {
+     "name": "just::compile_error::<CompileError<'_>>::fmt",
+     "path": "/root/bp/apps/just/src/compile_error.rs",
+     "us": 10161,
+     "infer_us": 20801,
+     "phases_us": {
+      "constraints": 4172,
+      "entry_sets": 289,
+      "errors": 39,
+      "infer": 590,
+      "liveness": 1896,
+      "loans": 176,
+      "mir": 0,
+      "moves": 1505,
+      "scopes": 451,
+      "setup": 8,
+      "walk": 825
+     },
+     "counts": {
+      "blocks": 898,
+      "bodies": 1,
+      "constraints": 5112,
+      "loans": 327,
+      "localized": 5112,
+      "locals": 1567,
+      "points": 5464,
+      "regions": 4895,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::update_from_arg_matches_mut",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 9192,
+     "infer_us": 33909,
+     "phases_us": {
+      "constraints": 4587,
+      "entry_sets": 180,
+      "errors": 27,
+      "infer": 123,
+      "liveness": 1653,
+      "loans": 102,
+      "mir": 6,
+      "moves": 1198,
+      "scopes": 162,
+      "setup": 41,
+      "walk": 837
+     },
+     "counts": {
+      "blocks": 1364,
+      "bodies": 41,
+      "constraints": 847,
+      "loans": 154,
+      "localized": 847,
+      "locals": 987,
+      "points": 4417,
+      "regions": 1198,
+      "universals": 84
+     }
+    },
+    {
+     "name": "just::attribute::<Attribute<'src>>::new_arg",
+     "path": "/root/bp/apps/just/src/attribute.rs",
+     "us": 9161,
+     "infer_us": 12832,
+     "phases_us": {
+      "constraints": 4038,
+      "entry_sets": 98,
+      "errors": 115,
+      "infer": 148,
+      "liveness": 2035,
+      "loans": 61,
+      "mir": 2,
+      "moves": 1287,
+      "scopes": 132,
+      "setup": 20,
+      "walk": 1077
+     },
+     "counts": {
+      "blocks": 815,
+      "bodies": 10,
+      "constraints": 1754,
+      "loans": 55,
+      "localized": 1754,
+      "locals": 571,
+      "points": 2571,
+      "regions": 1475,
+      "universals": 103
+     }
+    },
+    {
+     "name": "just::compile_error_kind::<CompileErrorKind<'src>>::fmt",
+     "path": "/root/bp/apps/just/src/compile_error_kind.rs",
+     "us": 9120,
+     "infer_us": 14746,
+     "phases_us": {
+      "constraints": 2711,
+      "entry_sets": 345,
+      "errors": 35,
+      "infer": 675,
+      "liveness": 2270,
+      "loans": 166,
+      "mir": 0,
+      "moves": 1209,
+      "scopes": 673,
+      "setup": 8,
+      "walk": 802
+     },
+     "counts": {
+      "blocks": 1484,
+      "bodies": 1,
+      "constraints": 9039,
+      "loans": 586,
+      "localized": 9039,
+      "locals": 1533,
+      "points": 6167,
+      "regions": 5933,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::evaluator::<Evaluator<'src, 'run>>::evaluate_builtin_function",
+     "path": "/root/bp/apps/just/src/evaluator.rs",
+     "us": 8984,
+     "infer_us": 7510,
+     "phases_us": {
+      "constraints": 2713,
+      "entry_sets": 130,
+      "errors": 24,
+      "infer": 135,
+      "liveness": 2428,
+      "loans": 69,
+      "mir": 1,
+      "moves": 855,
+      "scopes": 109,
+      "setup": 8,
+      "walk": 2404
+     },
+     "counts": {
+      "blocks": 857,
+      "bodies": 3,
+      "constraints": 1426,
+      "loans": 37,
+      "localized": 1426,
+      "locals": 579,
+      "points": 2757,
+      "regions": 1123,
+      "universals": 23
+     }
+    },
+    {
+     "name": "just::invocation_parser::<InvocationParser<'src, 'run>>::parse_invocation",
+     "path": "/root/bp/apps/just/src/invocation_parser.rs",
+     "us": 8067,
+     "infer_us": 16101,
+     "phases_us": {
+      "constraints": 4115,
+      "entry_sets": 99,
+      "errors": 27,
+      "infer": 149,
+      "liveness": 1553,
+      "loans": 71,
+      "mir": 2,
+      "moves": 965,
+      "scopes": 141,
+      "setup": 14,
+      "walk": 816
+     },
+     "counts": {
+      "blocks": 565,
+      "bodies": 11,
+      "constraints": 1610,
+      "loans": 39,
+      "localized": 1610,
+      "locals": 483,
+      "points": 2109,
+      "regions": 1155,
+      "universals": 90
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_recipe",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 7629,
+     "infer_us": 9397,
+     "phases_us": {
+      "constraints": 3416,
+      "entry_sets": 96,
+      "errors": 25,
+      "infer": 128,
+      "liveness": 1958,
+      "loans": 83,
+      "mir": 2,
+      "moves": 885,
+      "scopes": 199,
+      "setup": 11,
+      "walk": 707
+     },
+     "counts": {
+      "blocks": 702,
+      "bodies": 8,
+      "constraints": 1427,
+      "loans": 73,
+      "localized": 1427,
+      "locals": 496,
+      "points": 2280,
+      "regions": 1090,
+      "universals": 48
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_set",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 7483,
+     "infer_us": 5914,
+     "phases_us": {
+      "constraints": 2877,
+      "entry_sets": 133,
+      "errors": 22,
+      "infer": 121,
+      "liveness": 2298,
+      "loans": 63,
+      "mir": 1,
+      "moves": 777,
+      "scopes": 94,
+      "setup": 8,
+      "walk": 986
+     },
+     "counts": {
+      "blocks": 1053,
+      "bodies": 3,
+      "constraints": 1334,
+      "loans": 54,
+      "localized": 1334,
+      "locals": 464,
+      "points": 2657,
+      "regions": 989,
+      "universals": 22
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_item",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 7212,
+     "infer_us": 5426,
+     "phases_us": {
+      "constraints": 2859,
+      "entry_sets": 97,
+      "errors": 19,
+      "infer": 138,
+      "liveness": 2192,
+      "loans": 116,
+      "mir": 2,
+      "moves": 810,
+      "scopes": 200,
+      "setup": 8,
+      "walk": 675
+     },
+     "counts": {
+      "blocks": 789,
+      "bodies": 3,
+      "constraints": 1652,
+      "loans": 64,
+      "localized": 1652,
+      "locals": 452,
+      "points": 2388,
+      "regions": 1173,
+      "universals": 22
+     }
+    },
+    {
+     "name": "just::justfile::<Justfile<'src>>::run_dependencies",
+     "path": "/root/bp/apps/just/src/justfile.rs",
+     "us": 6971,
+     "infer_us": 8640,
+     "phases_us": {
+      "constraints": 3462,
+      "entry_sets": 63,
+      "errors": 101,
+      "infer": 103,
+      "liveness": 1425,
+      "loans": 43,
+      "mir": 2,
+      "moves": 915,
+      "scopes": 96,
+      "setup": 14,
+      "walk": 663
+     },
+     "counts": {
+      "blocks": 446,
+      "bodies": 4,
+      "constraints": 1167,
+      "loans": 34,
+      "localized": 1165,
+      "locals": 274,
+      "points": 1319,
+      "regions": 871,
+      "universals": 75
+     }
+    }
+   ],
+   "secs": 13
+  },
+  "nll": {
+   "bodies": 1417,
+   "infer_ms": 1660.179,
+   "infer_warm_ms": 1068.67,
+   "first_check_ms": 3593.509,
+   "borrowck_ms": 659.401,
+   "borrowck_excl_mir_ms": 659.299,
+   "ratio_to_infer": 0.6169341330813066,
+   "per_body_us": {
+    "p50": 79,
+    "p99": 8444,
+    "max": 19366
+   },
+   "phases_ms": {
+    "constraints": 287.425,
+    "entry_sets": 12.548,
+    "errors": 2.566,
+    "infer": 17.142,
+    "liveness": 142.221,
+    "loans": 7.553,
+    "mir": 0.102,
+    "moves": 97.858,
+    "scopes": 1.483,
+    "setup": 0.928,
+    "walk": 70.652
+   },
+   "slowest": [
+    {
+     "name": "just::analyzer::<Analyzer<'run, 'src>>::justfile",
+     "path": "/root/bp/apps/just/src/analyzer.rs",
+     "us": 19366,
+     "infer_us": 23205,
+     "phases_us": {
+      "constraints": 8192,
+      "entry_sets": 262,
+      "errors": 77,
+      "infer": 525,
+      "liveness": 5806,
+      "loans": 169,
+      "mir": 3,
+      "moves": 2445,
+      "scopes": 73,
+      "setup": 23,
+      "walk": 1547
+     },
+     "counts": {
+      "blocks": 1630,
+      "bodies": 9,
+      "constraints": 4679,
+      "loans": 163,
+      "localized": 4665,
+      "locals": 1059,
+      "points": 5092,
+      "regions": 3166,
+      "universals": 103
+     }
+    },
+    {
+     "name": "just::error::<Error<'_>>::fmt",
+     "path": "/root/bp/apps/just/src/error.rs",
+     "us": 18977,
+     "infer_us": 31743,
+     "phases_us": {
+      "constraints": 7536,
+      "entry_sets": 707,
+      "errors": 79,
+      "infer": 806,
+      "liveness": 4308,
+      "loans": 302,
+      "mir": 0,
+      "moves": 3074,
+      "scopes": 52,
+      "setup": 15,
+      "walk": 1758
+     },
+     "counts": {
+      "blocks": 2118,
+      "bodies": 1,
+      "constraints": 6966,
+      "loans": 445,
+      "localized": 6966,
+      "locals": 2848,
+      "points": 12141,
+      "regions": 6749,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::subcommand::<Subcommand>::list_module",
+     "path": "/root/bp/apps/just/src/subcommand.rs",
+     "us": 14478,
+     "infer_us": 18942,
+     "phases_us": {
+      "constraints": 7291,
+      "entry_sets": 246,
+      "errors": 35,
+      "infer": 525,
+      "liveness": 2996,
+      "loans": 131,
+      "mir": 2,
+      "moves": 1549,
+      "scopes": 26,
+      "setup": 12,
+      "walk": 1496
+     },
+     "counts": {
+      "blocks": 1080,
+      "bodies": 5,
+      "constraints": 3208,
+      "loans": 119,
+      "localized": 3205,
+      "locals": 866,
+      "points": 3831,
+      "regions": 2261,
+      "universals": 48
+     }
+    },
+    {
+     "name": "just::recipe::<Recipe<'src, Dependency<'src>>>::run_script",
+     "path": "/root/bp/apps/just/src/recipe.rs",
+     "us": 12846,
+     "infer_us": 19824,
+     "phases_us": {
+      "constraints": 5637,
+      "entry_sets": 173,
+      "errors": 49,
+      "infer": 211,
+      "liveness": 2826,
+      "loans": 103,
+      "mir": 3,
+      "moves": 1687,
+      "scopes": 20,
+      "setup": 26,
+      "walk": 1915
+     },
+     "counts": {
+      "blocks": 1040,
+      "bodies": 16,
+      "constraints": 1815,
+      "loans": 71,
+      "localized": 1813,
+      "locals": 749,
+      "points": 3304,
+      "regions": 1576,
+      "universals": 116
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::augment_args_for_update",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 12744,
+     "infer_us": 22479,
+     "phases_us": {
+      "constraints": 4640,
+      "entry_sets": 356,
+      "errors": 32,
+      "infer": 268,
+      "liveness": 2441,
+      "loans": 116,
+      "mir": 0,
+      "moves": 1584,
+      "scopes": 31,
+      "setup": 9,
+      "walk": 3093
+     },
+     "counts": {
+      "blocks": 2002,
+      "bodies": 1,
+      "constraints": 4284,
+      "loans": 329,
+      "localized": 4284,
+      "locals": 1431,
+      "points": 5868,
+      "regions": 2927,
+      "universals": 2
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::augment_args",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 12551,
+     "infer_us": 21709,
+     "phases_us": {
+      "constraints": 4708,
+      "entry_sets": 432,
+      "errors": 31,
+      "infer": 258,
+      "liveness": 2400,
+      "loans": 116,
+      "mir": 0,
+      "moves": 1474,
+      "scopes": 20,
+      "setup": 9,
+      "walk": 2929
+     },
+     "counts": {
+      "blocks": 1902,
+      "bodies": 1,
+      "constraints": 4284,
+      "loans": 329,
+      "localized": 4284,
+      "locals": 1381,
+      "points": 5668,
+      "regions": 2927,
+      "universals": 2
+     }
+    },
+    {
+     "name": "just::error::<Error<'src>>::fmt",
+     "path": "/root/bp/apps/just/src/error.rs",
+     "us": 11261,
+     "infer_us": 18823,
+     "phases_us": {
+      "constraints": 3536,
+      "entry_sets": 654,
+      "errors": 58,
+      "infer": 758,
+      "liveness": 3073,
+      "loans": 225,
+      "mir": 0,
+      "moves": 1548,
+      "scopes": 75,
+      "setup": 10,
+      "walk": 1070
+     },
+     "counts": {
+      "blocks": 1805,
+      "bodies": 1,
+      "constraints": 11785,
+      "loans": 759,
+      "localized": 11785,
+      "locals": 2021,
+      "points": 7953,
+      "regions": 7722,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::unresolved_recipe::<Recipe<'src, UnresolvedDependency<'src>>>::resolve",
+     "path": "/root/bp/apps/just/src/unresolved_recipe.rs",
+     "us": 10935,
+     "infer_us": 13857,
+     "phases_us": {
+      "constraints": 4751,
+      "entry_sets": 187,
+      "errors": 155,
+      "infer": 226,
+      "liveness": 2989,
+      "loans": 129,
+      "mir": 1,
+      "moves": 1450,
+      "scopes": 43,
+      "setup": 18,
+      "walk": 828
+     },
+     "counts": {
+      "blocks": 1407,
+      "bodies": 5,
+      "constraints": 2452,
+      "loans": 157,
+      "localized": 2452,
+      "locals": 672,
+      "points": 3693,
+      "regions": 1770,
+      "universals": 65
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::from_arg_matches_mut",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 10588,
+     "infer_us": 31932,
+     "phases_us": {
+      "constraints": 3589,
+      "entry_sets": 393,
+      "errors": 29,
+      "infer": 66,
+      "liveness": 3821,
+      "loans": 94,
+      "mir": 7,
+      "moves": 1291,
+      "scopes": 8,
+      "setup": 30,
+      "walk": 988
+     },
+     "counts": {
+      "blocks": 2143,
+      "bodies": 41,
+      "constraints": 392,
+      "loans": 52,
+      "localized": 392,
+      "locals": 634,
+      "points": 4791,
+      "regions": 641,
+      "universals": 83
+     }
+    },
+    {
+     "name": "just::compile_error::<CompileError<'_>>::fmt",
+     "path": "/root/bp/apps/just/src/compile_error.rs",
+     "us": 9231,
+     "infer_us": 20801,
+     "phases_us": {
+      "constraints": 3987,
+      "entry_sets": 285,
+      "errors": 33,
+      "infer": 485,
+      "liveness": 1726,
+      "loans": 168,
+      "mir": 0,
+      "moves": 1454,
+      "scopes": 39,
+      "setup": 9,
+      "walk": 833
+     },
+     "counts": {
+      "blocks": 898,
+      "bodies": 1,
+      "constraints": 5112,
+      "loans": 327,
+      "localized": 5112,
+      "locals": 1567,
+      "points": 5464,
+      "regions": 4895,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::justfile::<Justfile<'src>>::run",
+     "path": "/root/bp/apps/just/src/justfile.rs",
+     "us": 9127,
+     "infer_us": 10671,
+     "phases_us": {
+      "constraints": 3835,
+      "entry_sets": 111,
+      "errors": 27,
+      "infer": 206,
+      "liveness": 2181,
+      "loans": 82,
+      "mir": 1,
+      "moves": 1176,
+      "scopes": 27,
+      "setup": 10,
+      "walk": 1348
+     },
+     "counts": {
+      "blocks": 734,
+      "bodies": 5,
+      "constraints": 1959,
+      "loans": 70,
+      "localized": 1959,
+      "locals": 528,
+      "points": 2480,
+      "regions": 1332,
+      "universals": 50
+     }
+    },
+    {
+     "name": "just::arguments::<Arguments>::update_from_arg_matches_mut",
+     "path": "/root/bp/apps/just/src/arguments.rs",
+     "us": 8956,
+     "infer_us": 33909,
+     "phases_us": {
+      "constraints": 4577,
+      "entry_sets": 177,
+      "errors": 27,
+      "infer": 123,
+      "liveness": 1606,
+      "loans": 107,
+      "mir": 6,
+      "moves": 1187,
+      "scopes": 25,
+      "setup": 39,
+      "walk": 812
+     },
+     "counts": {
+      "blocks": 1364,
+      "bodies": 41,
+      "constraints": 847,
+      "loans": 154,
+      "localized": 847,
+      "locals": 987,
+      "points": 4417,
+      "regions": 1198,
+      "universals": 84
+     }
+    },
+    {
+     "name": "just::attribute::<Attribute<'src>>::new_arg",
+     "path": "/root/bp/apps/just/src/attribute.rs",
+     "us": 8849,
+     "infer_us": 12832,
+     "phases_us": {
+      "constraints": 4004,
+      "entry_sets": 97,
+      "errors": 85,
+      "infer": 143,
+      "liveness": 1974,
+      "loans": 60,
+      "mir": 2,
+      "moves": 1251,
+      "scopes": 9,
+      "setup": 20,
+      "walk": 1069
+     },
+     "counts": {
+      "blocks": 815,
+      "bodies": 10,
+      "constraints": 1754,
+      "loans": 55,
+      "localized": 1754,
+      "locals": 571,
+      "points": 2571,
+      "regions": 1475,
+      "universals": 103
+     }
+    },
+    {
+     "name": "just::evaluator::<Evaluator<'src, 'run>>::evaluate_builtin_function",
+     "path": "/root/bp/apps/just/src/evaluator.rs",
+     "us": 8610,
+     "infer_us": 7510,
+     "phases_us": {
+      "constraints": 2673,
+      "entry_sets": 138,
+      "errors": 21,
+      "infer": 160,
+      "liveness": 2417,
+      "loans": 67,
+      "mir": 1,
+      "moves": 841,
+      "scopes": 6,
+      "setup": 9,
+      "walk": 2177
+     },
+     "counts": {
+      "blocks": 857,
+      "bodies": 3,
+      "constraints": 1426,
+      "loans": 37,
+      "localized": 1426,
+      "locals": 579,
+      "points": 2757,
+      "regions": 1123,
+      "universals": 23
+     }
+    },
+    {
+     "name": "just::compile_error_kind::<CompileErrorKind<'src>>::fmt",
+     "path": "/root/bp/apps/just/src/compile_error_kind.rs",
+     "us": 8444,
+     "infer_us": 14746,
+     "phases_us": {
+      "constraints": 2691,
+      "entry_sets": 435,
+      "errors": 34,
+      "infer": 674,
+      "liveness": 2219,
+      "loans": 163,
+      "mir": 0,
+      "moves": 1186,
+      "scopes": 68,
+      "setup": 7,
+      "walk": 779
+     },
+     "counts": {
+      "blocks": 1484,
+      "bodies": 1,
+      "constraints": 9039,
+      "loans": 586,
+      "localized": 9039,
+      "locals": 1533,
+      "points": 6167,
+      "regions": 5933,
+      "universals": 6
+     }
+    },
+    {
+     "name": "just::invocation_parser::<InvocationParser<'src, 'run>>::parse_invocation",
+     "path": "/root/bp/apps/just/src/invocation_parser.rs",
+     "us": 7755,
+     "infer_us": 16101,
+     "phases_us": {
+      "constraints": 4031,
+      "entry_sets": 98,
+      "errors": 27,
+      "infer": 147,
+      "liveness": 1485,
+      "loans": 72,
+      "mir": 2,
+      "moves": 958,
+      "scopes": 12,
+      "setup": 13,
+      "walk": 805
+     },
+     "counts": {
+      "blocks": 565,
+      "bodies": 11,
+      "constraints": 1610,
+      "loans": 39,
+      "localized": 1610,
+      "locals": 483,
+      "points": 2109,
+      "regions": 1155,
+      "universals": 90
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_recipe",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 7279,
+     "infer_us": 9397,
+     "phases_us": {
+      "constraints": 3340,
+      "entry_sets": 95,
+      "errors": 25,
+      "infer": 147,
+      "liveness": 1946,
+      "loans": 84,
+      "mir": 2,
+      "moves": 871,
+      "scopes": 13,
+      "setup": 12,
+      "walk": 641
+     },
+     "counts": {
+      "blocks": 702,
+      "bodies": 8,
+      "constraints": 1427,
+      "loans": 73,
+      "localized": 1427,
+      "locals": 496,
+      "points": 2280,
+      "regions": 1090,
+      "universals": 48
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_set",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 7214,
+     "infer_us": 5914,
+     "phases_us": {
+      "constraints": 2725,
+      "entry_sets": 153,
+      "errors": 20,
+      "infer": 119,
+      "liveness": 2282,
+      "loans": 61,
+      "mir": 1,
+      "moves": 793,
+      "scopes": 7,
+      "setup": 8,
+      "walk": 948
+     },
+     "counts": {
+      "blocks": 1053,
+      "bodies": 3,
+      "constraints": 1334,
+      "loans": 54,
+      "localized": 1334,
+      "locals": 464,
+      "points": 2657,
+      "regions": 989,
+      "universals": 22
+     }
+    },
+    {
+     "name": "just::parser::<Parser<'run, 'src>>::parse_item",
+     "path": "/root/bp/apps/just/src/parser.rs",
+     "us": 6797,
+     "infer_us": 5426,
+     "phases_us": {
+      "constraints": 2794,
+      "entry_sets": 97,
+      "errors": 19,
+      "infer": 146,
+      "liveness": 2119,
+      "loans": 117,
+      "mir": 1,
+      "moves": 729,
+      "scopes": 16,
+      "setup": 9,
+      "walk": 663
+     },
+     "counts": {
+      "blocks": 789,
+      "bodies": 3,
+      "constraints": 1652,
+      "loans": 64,
+      "localized": 1652,
+      "locals": 452,
+      "points": 2388,
+      "regions": 1173,
+      "universals": 22
+     }
+    },
+    {
+     "name": "just::expression::<Expression<'_>>::serialize",
+     "path": "/root/bp/apps/just/src/expression.rs",
+     "us": 6475,
+     "infer_us": 10271,
+     "phases_us": {
+      "constraints": 2596,
+      "entry_sets": 249,
+      "errors": 41,
+      "infer": 65,
+      "liveness": 1481,
+      "loans": 72,
+      "mir": 0,
+      "moves": 845,
+      "scopes": 5,
+      "setup": 6,
+      "walk": 1019
+     },
+     "counts": {
+      "blocks": 1267,
+      "bodies": 1,
+      "constraints": 541,
+      "loans": 47,
+      "localized": 541,
+      "locals": 583,
+      "points": 3297,
+      "regions": 513,
+      "universals": 4
+     }
+    }
+   ],
+   "secs": 13
+  }
+ }
+}

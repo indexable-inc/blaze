@@ -1,0 +1,4 @@
+[build]
+target = { a = 1 }
+empty = []
+emptyt = {}

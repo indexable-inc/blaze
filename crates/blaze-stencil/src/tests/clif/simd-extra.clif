@@ -1,0 +1,331 @@
+; Follows cranelift/filetests/filetests/runtests/simd-min-max.clif (and simd-icmp-ugt.clif,
+; simd-icmp-uge.clif, simd-icmp-ult.clif, simd-icmp-ule.clif, simd-uaddsat-aarch64.clif,
+; simd-saddsat-aarch64.clif, simd-usubsat-aarch64.clif, simd-ssubsat-aarch64.clif,
+; simd-uunarrow.clif, simd-sqmulroundsat-aarch64.clif, simd-fma.clif, simd-imul.clif,
+; simd-scalartovector-aarch64.clif), for the stencil set: the vector ops it has that wasm
+; SIMD lacks. `smin`, `umin`, `smax`, `umax` and the unsigned `icmp`s of `i64x2`;
+; `sadd_sat`, `ssub_sat`, `uadd_sat`, `usub_sat` of `i32x4` and `i64x2`; `uunarrow` of
+; `i16x8`, `i32x4`, `i64x2`; `sqmul_round_sat.i32x4`; `fma` of `f32x4` and `f64x2` (fused:
+; one rounding); `imul.i64x2` with lanes past 32 bits; `scalar_to_vector.i8x16`. Cranelift
+; 0.136 refuses some of these on x86-64's baseline (SSE2), so on x86-64 hosts the file may
+; be run by the interpreter only; AArch64 lowers all of them. Left out: `avg_round.i32x4`, which
+; the interpreter adds as one scalar and panics on; and `umulhi`/`smulhi` of `i16x8` (no
+; backend lowers them) and `vhigh_bits` of `f32x4`/`f64x2` (AArch64 does not), which would
+; stop this file's code on AArch64 too.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %smin_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = smin v0, v1
+    return v2
+}
+; run: %smin_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0x8000000000000000 0x8000000000000000]
+; run: %smin_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0xffffffffffffffff 0xffffffffffffffff]
+; run: %smin_i64x2([1 0xffffffffffffffff], [1 0]) == [1 0xffffffffffffffff]
+; run: %smin_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0x8000000000000000 0x7ffffffffffffffe]
+; run: %smin_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0xffffffff 0xffffffff]
+
+function %umin_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = umin v0, v1
+    return v2
+}
+; run: %umin_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0 0]
+; run: %umin_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0x7fffffffffffffff 0x7fffffffffffffff]
+; run: %umin_i64x2([1 0xffffffffffffffff], [1 0]) == [1 0]
+; run: %umin_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0x8000000000000000 0x7ffffffffffffffe]
+; run: %umin_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0xffffffff 0xffffffff]
+
+function %smax_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = smax v0, v1
+    return v2
+}
+; run: %smax_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0 0]
+; run: %smax_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0x7fffffffffffffff 0x7fffffffffffffff]
+; run: %smax_i64x2([1 0xffffffffffffffff], [1 0]) == [1 0]
+; run: %smax_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0x8000000000000001 0x7fffffffffffffff]
+; run: %smax_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0x100000000 0x100000000]
+
+function %umax_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = umax v0, v1
+    return v2
+}
+; run: %umax_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0x8000000000000000 0x8000000000000000]
+; run: %umax_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0xffffffffffffffff 0xffffffffffffffff]
+; run: %umax_i64x2([1 0xffffffffffffffff], [1 0]) == [1 0xffffffffffffffff]
+; run: %umax_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0x8000000000000001 0x7fffffffffffffff]
+; run: %umax_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0x100000000 0x100000000]
+
+function %icmp_ugt_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0 0xffffffffffffffff]
+; run: %icmp_ugt_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0 0xffffffffffffffff]
+; run: %icmp_ugt_i64x2([1 0xffffffffffffffff], [1 0]) == [0 0xffffffffffffffff]
+; run: %icmp_ugt_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0 0xffffffffffffffff]
+; run: %icmp_ugt_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0xffffffffffffffff 0]
+; run: %icmp_ugt_i64x2([5 0x8000000000000005], [5 0x8000000000000005]) == [0 0]
+
+function %icmp_uge_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0 0xffffffffffffffff]
+; run: %icmp_uge_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0 0xffffffffffffffff]
+; run: %icmp_uge_i64x2([1 0xffffffffffffffff], [1 0]) == [0xffffffffffffffff 0xffffffffffffffff]
+; run: %icmp_uge_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0 0xffffffffffffffff]
+; run: %icmp_uge_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0xffffffffffffffff 0]
+; run: %icmp_uge_i64x2([5 0x8000000000000005], [5 0x8000000000000005]) == [0xffffffffffffffff 0xffffffffffffffff]
+
+function %icmp_ult_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0xffffffffffffffff 0]
+; run: %icmp_ult_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0xffffffffffffffff 0]
+; run: %icmp_ult_i64x2([1 0xffffffffffffffff], [1 0]) == [0 0]
+; run: %icmp_ult_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0xffffffffffffffff 0]
+; run: %icmp_ult_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0 0xffffffffffffffff]
+; run: %icmp_ult_i64x2([5 0x8000000000000005], [5 0x8000000000000005]) == [0 0]
+
+function %icmp_ule_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_i64x2([0 0x8000000000000000], [0x8000000000000000 0]) == [0xffffffffffffffff 0]
+; run: %icmp_ule_i64x2([0x7fffffffffffffff 0xffffffffffffffff], [0xffffffffffffffff 0x7fffffffffffffff]) == [0xffffffffffffffff 0]
+; run: %icmp_ule_i64x2([1 0xffffffffffffffff], [1 0]) == [0xffffffffffffffff 0]
+; run: %icmp_ule_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000001 0x7ffffffffffffffe]) == [0xffffffffffffffff 0]
+; run: %icmp_ule_i64x2([0x100000000 0xffffffff], [0xffffffff 0x100000000]) == [0 0xffffffffffffffff]
+; run: %icmp_ule_i64x2([5 0x8000000000000005], [5 0x8000000000000005]) == [0xffffffffffffffff 0xffffffffffffffff]
+
+function %sadd_sat_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = sadd_sat v0, v1
+    return v2
+}
+; run: %sadd_sat_i32x4([40 40 40 40], [2 2 2 2]) == [42 42 42 42]
+; run: %sadd_sat_i32x4([0xfffffffa 0x7ffffff8 0xfffffffa 0xfffffffa], [100 100 100 100]) == [94 0x7fffffff 94 94]
+; run: %sadd_sat_i32x4([0x100 0x80000288 0x7ffffd78 0x7ffffd78], [0x100 0xfffffc18 0x3e8 0x3e8]) == [0x200 0x80000000 0x7fffffff 0x7fffffff]
+; run: %sadd_sat_i32x4([0x7fffffff 0x80000000 0xffffffff 0], [1 0xffffffff 1 0xffffffff]) == [0x7fffffff 0x80000000 0 0xffffffff]
+; run: %sadd_sat_i32x4([0x80000000 0x7fffffff 0 1], [0x80000000 0x7fffffff 0x80000000 0x7fffffff]) == [0x80000000 0x7fffffff 0x80000000 0x7fffffff]
+; run: %sadd_sat_i32x4([0xffffffff 0 0x80000000 0x7fffffff], [0xffffffff 0 1 0x80000000]) == [0xfffffffe 0 0x80000001 0xffffffff]
+
+function %sadd_sat_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = sadd_sat v0, v1
+    return v2
+}
+; run: %sadd_sat_i64x2([40 40], [2 2]) == [42 42]
+; run: %sadd_sat_i64x2([0xfffffffa 0xfffffffffffffffa], [100 100]) == [0x10000005e 94]
+; run: %sadd_sat_i64x2([0x8000000000000328 0x7ffffffffffffcd8], [0xfffffffffffffc18 0x3e8]) == [0x8000000000000000 0x7fffffffffffffff]
+; run: %sadd_sat_i64x2([0x7fffffffffffffff 0x8000000000000000], [1 0xffffffffffffffff]) == [0x7fffffffffffffff 0x8000000000000000]
+; run: %sadd_sat_i64x2([0xffffffffffffffff 0], [1 0xffffffffffffffff]) == [0 0xffffffffffffffff]
+; run: %sadd_sat_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000000 0x7fffffffffffffff]) == [0x8000000000000000 0x7fffffffffffffff]
+; run: %sadd_sat_i64x2([0 0x8000000000000000], [0x8000000000000000 1]) == [0x8000000000000000 0x8000000000000001]
+; run: %sadd_sat_i64x2([0xffffffffffffffff 0x7fffffffffffffff], [0xffffffffffffffff 0x8000000000000000]) == [0xfffffffffffffffe 0xffffffffffffffff]
+
+function %ssub_sat_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = ssub_sat v0, v1
+    return v2
+}
+; run: %ssub_sat_i32x4([40 40 40 40], [2 2 2 2]) == [38 38 38 38]
+; run: %ssub_sat_i32x4([0xfffffffa 0x7ffffff8 0xfffffffa 0xfffffffa], [100 100 100 100]) == [0xffffff96 0x7fffff94 0xffffff96 0xffffff96]
+; run: %ssub_sat_i32x4([0x100 0x80000288 0x7ffffd78 0x7ffffd78], [0x100 0xfffffc18 0x3e8 0x3e8]) == [0 0x80000670 0x7ffff990 0x7ffff990]
+; run: %ssub_sat_i32x4([0x7fffffff 0x80000000 0xffffffff 0], [1 0xffffffff 1 0xffffffff]) == [0x7ffffffe 0x80000001 0xfffffffe 1]
+; run: %ssub_sat_i32x4([0x80000000 0x7fffffff 0 1], [0x80000000 0x7fffffff 0x80000000 0x7fffffff]) == [0 0 0x7fffffff 0x80000002]
+; run: %ssub_sat_i32x4([0xffffffff 0 0x80000000 0x7fffffff], [0xffffffff 0 1 0x80000000]) == [0 0 0x80000000 0x7fffffff]
+
+function %ssub_sat_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = ssub_sat v0, v1
+    return v2
+}
+; run: %ssub_sat_i64x2([40 40], [2 2]) == [38 38]
+; run: %ssub_sat_i64x2([0xfffffffa 0xfffffffffffffffa], [100 100]) == [0xffffff96 0xffffffffffffff96]
+; run: %ssub_sat_i64x2([0x8000000000000328 0x7ffffffffffffcd8], [0xfffffffffffffc18 0x3e8]) == [0x8000000000000710 0x7ffffffffffff8f0]
+; run: %ssub_sat_i64x2([0x7fffffffffffffff 0x8000000000000000], [1 0xffffffffffffffff]) == [0x7ffffffffffffffe 0x8000000000000001]
+; run: %ssub_sat_i64x2([0xffffffffffffffff 0], [1 0xffffffffffffffff]) == [0xfffffffffffffffe 1]
+; run: %ssub_sat_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000000 0x7fffffffffffffff]) == [0 0]
+; run: %ssub_sat_i64x2([0 0x8000000000000000], [0x8000000000000000 1]) == [0x7fffffffffffffff 0x8000000000000000]
+; run: %ssub_sat_i64x2([0xffffffffffffffff 0x7fffffffffffffff], [0xffffffffffffffff 0x8000000000000000]) == [0 0x7fffffffffffffff]
+
+function %uadd_sat_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = uadd_sat v0, v1
+    return v2
+}
+; run: %uadd_sat_i32x4([40 40 40 40], [2 2 2 2]) == [42 42 42 42]
+; run: %uadd_sat_i32x4([0xfffffffa 0x7ffffff8 0xfffffffa 0xfffffffa], [100 100 100 100]) == [0xffffffff 0x8000005c 0xffffffff 0xffffffff]
+; run: %uadd_sat_i32x4([0x100 0x80000288 0x7ffffd78 0x7ffffd78], [0x100 0xfffffc18 0x3e8 0x3e8]) == [0x200 0xffffffff 0x80000160 0x80000160]
+; run: %uadd_sat_i32x4([0x7fffffff 0x80000000 0xffffffff 0], [1 0xffffffff 1 0xffffffff]) == [0x80000000 0xffffffff 0xffffffff 0xffffffff]
+; run: %uadd_sat_i32x4([0x80000000 0x7fffffff 0 1], [0x80000000 0x7fffffff 0x80000000 0x7fffffff]) == [0xffffffff 0xfffffffe 0x80000000 0x80000000]
+; run: %uadd_sat_i32x4([0xffffffff 0 0x80000000 0x7fffffff], [0xffffffff 0 1 0x80000000]) == [0xffffffff 0 0x80000001 0xffffffff]
+
+function %uadd_sat_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = uadd_sat v0, v1
+    return v2
+}
+; run: %uadd_sat_i64x2([40 40], [2 2]) == [42 42]
+; run: %uadd_sat_i64x2([0xfffffffa 0xfffffffffffffffa], [100 100]) == [0x10000005e 0xffffffffffffffff]
+; run: %uadd_sat_i64x2([0x8000000000000328 0x7ffffffffffffcd8], [0xfffffffffffffc18 0x3e8]) == [0xffffffffffffffff 0x80000000000000c0]
+; run: %uadd_sat_i64x2([0x7fffffffffffffff 0x8000000000000000], [1 0xffffffffffffffff]) == [0x8000000000000000 0xffffffffffffffff]
+; run: %uadd_sat_i64x2([0xffffffffffffffff 0], [1 0xffffffffffffffff]) == [0xffffffffffffffff 0xffffffffffffffff]
+; run: %uadd_sat_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000000 0x7fffffffffffffff]) == [0xffffffffffffffff 0xfffffffffffffffe]
+; run: %uadd_sat_i64x2([0 0x8000000000000000], [0x8000000000000000 1]) == [0x8000000000000000 0x8000000000000001]
+; run: %uadd_sat_i64x2([0xffffffffffffffff 0x7fffffffffffffff], [0xffffffffffffffff 0x8000000000000000]) == [0xffffffffffffffff 0xffffffffffffffff]
+
+function %usub_sat_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = usub_sat v0, v1
+    return v2
+}
+; run: %usub_sat_i32x4([40 40 40 40], [2 2 2 2]) == [38 38 38 38]
+; run: %usub_sat_i32x4([0xfffffffa 0x7ffffff8 0xfffffffa 0xfffffffa], [100 100 100 100]) == [0xffffff96 0x7fffff94 0xffffff96 0xffffff96]
+; run: %usub_sat_i32x4([0x100 0x80000288 0x7ffffd78 0x7ffffd78], [0x100 0xfffffc18 0x3e8 0x3e8]) == [0 0 0x7ffff990 0x7ffff990]
+; run: %usub_sat_i32x4([0x7fffffff 0x80000000 0xffffffff 0], [1 0xffffffff 1 0xffffffff]) == [0x7ffffffe 0 0xfffffffe 0]
+; run: %usub_sat_i32x4([0x80000000 0x7fffffff 0 1], [0x80000000 0x7fffffff 0x80000000 0x7fffffff]) == [0 0 0 0]
+; run: %usub_sat_i32x4([0xffffffff 0 0x80000000 0x7fffffff], [0xffffffff 0 1 0x80000000]) == [0 0 0x7fffffff 0]
+
+function %usub_sat_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = usub_sat v0, v1
+    return v2
+}
+; run: %usub_sat_i64x2([40 40], [2 2]) == [38 38]
+; run: %usub_sat_i64x2([0xfffffffa 0xfffffffffffffffa], [100 100]) == [0xffffff96 0xffffffffffffff96]
+; run: %usub_sat_i64x2([0x8000000000000328 0x7ffffffffffffcd8], [0xfffffffffffffc18 0x3e8]) == [0 0x7ffffffffffff8f0]
+; run: %usub_sat_i64x2([0x7fffffffffffffff 0x8000000000000000], [1 0xffffffffffffffff]) == [0x7ffffffffffffffe 0]
+; run: %usub_sat_i64x2([0xffffffffffffffff 0], [1 0xffffffffffffffff]) == [0xfffffffffffffffe 0]
+; run: %usub_sat_i64x2([0x8000000000000000 0x7fffffffffffffff], [0x8000000000000000 0x7fffffffffffffff]) == [0 0]
+; run: %usub_sat_i64x2([0 0x8000000000000000], [0x8000000000000000 1]) == [0 0x7fffffffffffffff]
+; run: %usub_sat_i64x2([0xffffffffffffffff 0x7fffffffffffffff], [0xffffffffffffffff 0x8000000000000000]) == [0 0]
+
+function %uunarrow_i16x8(i16x8, i16x8) -> i8x16 {
+block0(v0: i16x8, v1: i16x8):
+    v2 = uunarrow v0, v1
+    return v2
+}
+; run: %uunarrow_i16x8([1 127 0x80 15 0xffff 0xffe0 48 0], [8 0xff 0xff9c 100 0xfffe 73 80 42]) == [1 127 0x80 15 0xff 0xff 48 0 8 0xff 0xff 100 0xff 73 80 42]
+; run: %uunarrow_i16x8([0 0xff 0x100 0x7fff 0x8000 0xffff 0xfe 1], [0x1ff 0x80 127 0x81 0x100 0xff 0xff00 2]) == [0 0xff 0xff 0xff 0xff 0xff 0xfe 1 0xff 0x80 127 0x81 0xff 0xff 0xff 2]
+
+function %uunarrow_i32x4(i32x4, i32x4) -> i16x8 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = uunarrow v0, v1
+    return v2
+}
+; run: %uunarrow_i32x4([0xffff 0xfffff 0xfffeee90 0xfffffffb], [0xfffffff 73 0xfffffff 42]) == [0xffff 0xffff 0xffff 0xffff 0xffff 73 0xffff 42]
+; run: %uunarrow_i32x4([0 0xffff 0x10000 0x80000000], [0x7fff 0x8000 0xffffffff 0xfffe]) == [0 0xffff 0xffff 0xffff 0x7fff 0x8000 0xffff 0xfffe]
+
+function %uunarrow_i64x2(i64x2, i64x2) -> i32x4 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = uunarrow v0, v1
+    return v2
+}
+; run: %uunarrow_i64x2([0xffff 0xfffffffffffe7960], [0x12a05f200 73]) == [0xffff 0xffffffff 0xffffffff 73]
+; run: %uunarrow_i64x2([0xffffffff 0x100000000], [0x8000000000000000 0x7fffffff]) == [0xffffffff 0xffffffff 0xffffffff 0x7fffffff]
+
+function %sqmul_round_sat_i32x4(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = sqmul_round_sat v0, v1
+    return v2
+}
+; run: %sqmul_round_sat_i32x4([0x3e8 0x7d0 0xbb8 0xfa0], [0x2710 0x186a0 0xf4240 0x989680]) == [0 0 1 19]
+; run: %sqmul_round_sat_i32x4([0x7fffffff 0x80000000 0x80000000 0], [0x7fffffff 0x80000000 0x7fffffff 0]) == [0x7ffffffe 0x7fffffff 0x80000001 0]
+; run: %sqmul_round_sat_i32x4([0x40000000 0x40000000 0xffffffff 1], [0x40000000 0x80000000 1 1]) == [0x20000000 0xc0000000 0 0]
+; run: %sqmul_round_sat_i32x4([0x40000000 0xffffffff 3 0x80000000], [1 0xffffffff 0x40000000 1]) == [1 0 2 0xffffffff]
+
+function %imul_i64x2(i64x2, i64x2) -> i64x2 {
+block0(v0: i64x2, v1: i64x2):
+    v2 = imul v0, v1
+    return v2
+}
+; run: %imul_i64x2([0x100000000 0xffffffff], [0x100000000 0xffffffff]) == [0 0xfffffffe00000001]
+; run: %imul_i64x2([0xffffffffffffffff 0x8000000000000000], [0xffffffffffffffff 3]) == [1 0x8000000000000000]
+; run: %imul_i64x2([0x123456789abcdef0 0x7fffffffffffffff], [0xfedcba987654321 0x7fffffffffffffff]) == [0x2236d88fe5618cf0 1]
+; run: %imul_i64x2([0xffffffff00000001 0x8000000080000000], [0xffffffff00000001 2]) == [0xfffffffe00000001 0x100000000]
+
+function %fma_f32x4(f32x4, f32x4, f32x4) -> f32x4 {
+block0(v0: f32x4, v1: f32x4, v2: f32x4):
+    v3 = fma v0, v1, v2
+    return v3
+}
+; run: %fma_f32x4([0x9.0 0x83.0 0x1.99999ap-2 -0x1.4cccccp0], [0x9.0 0x2.68091p6 0x1.333334p-1 -0x1.666666p1], [0x9.0 0x9.88721p1 0x1.400000p1 -0x1.b33334p0]) == [0x1.680000p6 0x1.3b88e6p14 0x1.5eb852p1 0x1.f0a3d2p0]
+; run: %fma_f32x4([0x0.0 0x0.0 0x0.0 -0x0.0], [0x0.0 0x0.0 -0x0.0 0x0.0], [0x0.0 -0x0.0 0x0.0 0x0.0]) == [0x0.0 0x0.0 0x0.0 0x0.0]
+; run: %fma_f32x4([-0x0.0 0x1.0p0 0x1.0p0 -0x0.0], [0x0.0 -0x1.0p0 0x1.0p0 -0x0.0], [-0x0.0 0x1.0p0 -0x1.0p0 -0x0.0]) == [-0x0.0 0x0.0 0x0.0 0x0.0]
+; run: %fma_f32x4([-Inf +Inf -Inf +Inf], [-Inf -Inf +Inf -Inf], [0x0.0 0x0.0 0x0.0 -Inf]) == [+Inf -Inf -Inf -Inf]
+; run: %fma_f32x4([-Inf 0x0.0 0x0.0 0x0.0], [+Inf 0x0.0 0x0.0 0x0.0], [-Inf 0x0.0 0x0.0 0x0.0]) == [-Inf 0x0.0 0x0.0 0x0.0]
+; run: %fma_f32x4([0x1.000000p-23 0x0.0 0x1.fffffep127 0x0.0], [0x1.000000p-23 0x0.0 0x1.fffffep127 0x0.0], [0x1.000000p-23 0x1.000000p-23 0x1.fffffep127 0x1.fffffep127]) == [0x1.000002p-23 0x1.000000p-23 +Inf 0x1.fffffep127]
+; run: %fma_f32x4([0x1.000000p-126 0x0.0 0x0.0 0x0.0], [0x1.000000p-126 0x0.0 0x0.0 0x0.0], [0x1.000000p-126 0x1.000000p-126 0x0.0 0x0.0]) == [0x1.000000p-126 0x1.000000p-126 0x0.0 0x0.0]
+; run: %fma_f32x4([0x0.800000p-126 0x0.800000p-126 0x0.0 0x0.000002p-126], [0x0.800000p-126 0x0.800000p-126 0x0.0 0x0.000002p-126], [0x0.800000p-126 0x0.0 0x0.000002p-126 0x0.000002p-126]) == [0x0.800000p-126 0x0.0 0x0.000002p-126 0x0.000002p-126]
+; run: %fma_f32x4([0x1.000002p0 0x1.000002p0 0x1.0p0 0x1.8p1], [0x1.000002p0 -0x1.000002p0 0x1.0p0 0x1.0p1], [-0x1.000004p0 0x1.000004p0 -0x1.0p0 0x1.0p0]) == [0x1.0p-46 -0x1.0p-46 0x0.0 0x1.cp2]
+; run: %fma_f32x4([+NaN 0x1.0p0 +Inf 0x0.0], [0x1.0p0 +NaN 0x0.0 +Inf], [0x1.0p0 0x1.0p0 0x1.0p0 0x1.0p0]) == [+NaN +NaN +NaN +NaN]
+
+function %fma_f64x2(f64x2, f64x2, f64x2) -> f64x2 {
+block0(v0: f64x2, v1: f64x2, v2: f64x2):
+    v3 = fma v0, v1, v2
+    return v3
+}
+; run: %fma_f64x2([0x9.0 0x1.3b88ea148dd4ap14], [0x9.0 0x2.680916809121p6], [0x9.0 0x9.887218721837p1]) == [0x1.680000p6 0x1.7ba6ebee17417p21]
+; run: %fma_f64x2([0x0.0 0x0.0], [0x0.0 0x0.0], [0x0.0 -0x0.0]) == [0x0.0 0x0.0]
+; run: %fma_f64x2([0x0.0 -0x0.0], [-0x0.0 0x0.0], [0x0.0 0x0.0]) == [0x0.0 0x0.0]
+; run: %fma_f64x2([-0x0.0 0x1.0p0], [0x0.0 -0x1.0p0], [-0x0.0 0x1.0p0]) == [-0x0.0 0x0.0]
+; run: %fma_f64x2([-Inf +Inf], [-Inf -Inf], [0x0.0 0x0.0]) == [+Inf -Inf]
+; run: %fma_f64x2([-Inf +Inf], [+Inf -Inf], [0x0.0 -Inf]) == [-Inf -Inf]
+; run: %fma_f64x2([-Inf +Inf], [+Inf +Inf], [-Inf +Inf]) == [-Inf +Inf]
+; run: %fma_f64x2([0x1.0p-52 0x0.0], [0x1.0p-52 0x0.0], [0x1.0p-52 0x1.0p-52]) == [0x1.0000000000001p-52 0x1.0p-52]
+; run: %fma_f64x2([0x1.fffffffffffffp1023 0x0.0], [0x1.fffffffffffffp1023 0x0.0], [0x1.fffffffffffffp1023 0x1.fffffffffffffp1023]) == [+Inf 0x1.fffffffffffffp1023]
+; run: %fma_f64x2([0x1.0p-1022 0x0.0], [0x1.0p-1022 0x0.0], [0x1.0p-1022 0x1.0p-1022]) == [0x1.0p-1022 0x1.0p-1022]
+; run: %fma_f64x2([0x0.8p-1022 0x0.8p-1022], [0x0.8p-1022 0x0.8p-1022], [0x0.8p-1022 0x0.0]) == [0x0.8p-1022 0x0.0]
+; run: %fma_f64x2([0x0.0 0x0.0000000000001p-1022], [0x0.0 0x0.0000000000001p-1022], [0x0.8p-1022 0x0.0000000000001p-1022]) == [0x0.8p-1022 0x0.0000000000001p-1022]
+; run: %fma_f64x2([0x1.0000000000001p0 0x1.0000000000001p0], [0x1.0000000000001p0 -0x1.0000000000001p0], [-0x1.0000000000002p0 0x1.0000000000002p0]) == [0x1.0p-104 -0x1.0p-104]
+; run: %fma_f64x2([+Inf -NaN], [0x0.0 0x1.0p0], [0x1.0p0 0x1.0p0]) == [+NaN +NaN]
+
+function %fma_is_nan_f32x4(f32x4, f32x4, f32x4) -> i8 {
+block0(v0: f32x4, v1: f32x4, v2: f32x4):
+    v3 = fma v0, v1, v2
+    v4 = fcmp ne v3, v3
+    v5 = vall_true v4
+    return v5
+}
+; run: %fma_is_nan_f32x4([+Inf -Inf -Inf +NaN], [-Inf +Inf -Inf 0x0.0], [+Inf +Inf -Inf 0x0.0]) == 1
+; run: %fma_is_nan_f32x4([0x0.0 0x0.0 -NaN 0x0.0], [+NaN 0x0.0 0x0.0 -NaN], [0x0.0 +NaN 0x0.0 0x0.0]) == 1
+; run: %fma_is_nan_f32x4([0x0.0 0x1.0p0 0x1.0p0 0x1.0p0], [0x0.0 0x1.0p0 0x1.0p0 0x1.0p0], [-NaN 0x1.0p0 0x1.0p0 0x1.0p0]) == 0
+
+function %fma_splat_f32x4(f32x4, f32, f32x4) -> f32x4 {
+block0(v0: f32x4, v1: f32, v2: f32x4):
+    v3 = splat.f32x4 v1
+    v4 = fma v0, v3, v2
+    return v4
+}
+; run: %fma_splat_f32x4([0x1.0p0 0x1.0p1 -0x1.0p0 0x0.0], 0x1.8p1, [0x1.0p0 -0x1.8p2 0x1.8p1 -0x0.0]) == [0x1.0p2 0x0.0 0x0.0 0x0.0]
+
+function %scalar_to_vector_i8x16(i8) -> i8x16 {
+block0(v0: i8):
+    v1 = scalar_to_vector.i8x16 v0
+    return v1
+}
+; run: %scalar_to_vector_i8x16(1) == [1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+; run: %scalar_to_vector_i8x16(0xff) == [0xff 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+; run: %scalar_to_vector_i8x16(0x80) == [0x80 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+; run: %scalar_to_vector_i8x16(0) == [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+
+function %scalar_to_vector_const_i8x16() -> i8x16 {
+block0:
+    v0 = iconst.i8 0x7f
+    v1 = scalar_to_vector.i8x16 v0
+    return v1
+}
+; run: %scalar_to_vector_const_i8x16() == [127 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]

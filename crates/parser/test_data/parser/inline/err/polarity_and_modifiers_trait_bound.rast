@@ -1,0 +1,74 @@
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    WHITESPACE " "
+    NAME
+      IDENT "f"
+    GENERIC_PARAM_LIST
+      L_ANGLE "<"
+      TYPE_PARAM
+        NAME
+          IDENT "T"
+        COLON ":"
+        WHITESPACE " "
+        TYPE_BOUND_LIST
+          TYPE_BOUND
+            CONST_KW "const"
+            WHITESPACE " "
+            QUESTION "?"
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "Sized"
+      COMMA ","
+      WHITESPACE " "
+      TYPE_PARAM
+        NAME
+          IDENT "U"
+        COLON ":"
+        WHITESPACE " "
+        TYPE_BOUND_LIST
+          TYPE_BOUND
+            L_BRACK "["
+            CONST_KW "const"
+            R_BRACK "]"
+            WHITESPACE " "
+            ASYNC_KW "async"
+            WHITESPACE " "
+            BANG "!"
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "Trait"
+      COMMA ","
+      WHITESPACE " "
+      TYPE_PARAM
+        NAME
+          IDENT "V"
+        COLON ":"
+        WHITESPACE " "
+        TYPE_BOUND_LIST
+          TYPE_BOUND
+            ASYNC_KW "async"
+            WHITESPACE " "
+            QUESTION "?"
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "Sized"
+      R_ANGLE ">"
+    PARAM_LIST
+      L_PAREN "("
+      R_PAREN ")"
+    WHITESPACE " "
+    BLOCK_EXPR
+      STMT_LIST
+        L_CURLY "{"
+        R_CURLY "}"
+  WHITESPACE "\n"
+error 15: `const` trait not allowed with `?` trait polarity modifier
+error 40: `[const] async` trait not allowed with `!` trait polarity modifier
+error 57: `async` trait not allowed with `?` trait polarity modifier

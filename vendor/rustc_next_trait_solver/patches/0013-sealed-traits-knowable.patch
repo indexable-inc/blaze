@@ -1,0 +1,17 @@
+diff --git a/src/coherence.rs b/src/coherence.rs
+index 016f270..24646e4 100644
+--- a/src/coherence.rs
++++ b/src/coherence.rs
+@@ -55,7 +55,11 @@ where
+     I: Interner,
+     E: Debug,
+ {
+-    if orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?.is_ok()
++    // blaze: no crate but a sealed trait's own may implement it, so it has no downstream or
++    // cousin implementor whatever its generic parameters are.
++    if !infcx.cx().trait_is_sealed(trait_ref.def_id)
++        && orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?
++            .is_ok()
+     {
+         // A downstream or cousin crate is allowed to implement some
+         // generic parameters of this trait-ref.

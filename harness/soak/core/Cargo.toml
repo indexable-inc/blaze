@@ -1,0 +1,11 @@
+[package]
+name = "soak-core"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+loud = []
+
+[dependencies]
+soak-gen = { path = "../gen" }

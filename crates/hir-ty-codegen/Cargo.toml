@@ -1,0 +1,110 @@
+[package]
+name = "hir-ty-codegen"
+description = "blaze's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+# The files predate the crate: its root is the module file it was compiled from in hir-ty.
+path = "mod.rs"
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-serde.workspace = true
+either.workspace = true
+hashbrown.workspace = true
+la-arena.workspace = true
+parking_lot.workspace = true
+postcard.workspace = true
+blaze-query.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
+triomphe.workspace = true
+rustc-demangle.workspace = true
+rustc-stable-hash.workspace = true
+
+rustc_abi.workspace = true
+ra-ap-rustc_ast_ir.workspace = true
+ra-ap-rustc_index.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-print.workspace = true
+hir-ty-mir.workspace = true
+hir-ty-identity.workspace = true
+hir-ty-share.workspace = true
+intern.workspace = true
+span.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+
+blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
+blaze-stencil.workspace = true
+# The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.
+target-features.workspace = true
+
+cranelift-codegen = { workspace = true, features = ["enable-serde", "x86", "arm64"] }
+cranelift-frontend.workspace = true
+cranelift-module = { workspace = true, features = ["enable-serde"] }
+cranelift-object.workspace = true
+target-lexicon.workspace = true
+object = { workspace = true, features = ["read", "std", "elf", "macho", "coff"] }
+wasm-encoder = { workspace = true, features = ["std"] }
+# The LLVM backend, against the LLVM 23 blaze pins (llvm.json, checked by vendor/llvm-sys/pin.rs).
+# inkwell's llvm-sys (vendor/llvm-sys) links it statically, with libstdc++ on Linux. Nothing of
+# LLVM's calls into libffi, so inkwell need not link it.
+inkwell = { workspace = true, features = ["llvm23-1-prefer-static", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }
+# The assembler of a build without LLVM (the seed, docs/future/bootstrap.md): Rust, no
+# dependencies, in process (`asm/rsasm.rs`).
+rsasm = { workspace = true, optional = true }
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+# The code identity, held to what rustc says each of the code generator's crates read
+# (`toolchain/tests.rs`).
+blaze-codegen-code.workspace = true
+blaze-cas.workspace = true
+blaze-v2-proof.workspace = true
+blaze-store-check.workspace = true
+hegeltest.workspace = true
+hir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[features]
+# LLVM, linked in (inkwell over llvm-sys): the producer of std and every opt-level 2/3 unit, and
+# the maker of blaze-stencil's stencils at build time, which checks them against the committed
+# ones. Every native blaze has it (blaze-cargo's `native`); the seed, which has no C, does not.
+llvm = ["dep:inkwell", "blaze-stencil/llvm-stencils"]
+# The assembler of a blaze without LLVM (the seed): `asm/rsasm.rs`.
+rsasm = ["dep:rsasm"]
+# The LLVM producer of wasm32 code (`llvm.rs` `Machine::create_for`), for an LLVM built with
+# the WebAssembly target. Off because the pinned archives (llvm.json, 2026-10-26) predate
+# llvm.py building that target (2026-11-01); once llvm.json pins ones that have it, this folds
+# into `llvm`.
+llvm-wasm = ["llvm", "inkwell/target-webassembly"]
+# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`, a workspace of its own
+# and the only one that turns it on, so it never unifies into the native build. It decides only what is
+# about that program, where it runs (`Target::host`) and that it links what it compiles into the
+# page's table (`Target::calls`), never anything of a target's code (`target.rs` tests).
+wasm = []
+
+[lints]
+workspace = true

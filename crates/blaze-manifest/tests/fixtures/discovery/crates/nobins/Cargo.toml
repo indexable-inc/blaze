@@ -1,0 +1,10 @@
+[package]
+name = "nobins"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+build = false
+
+[[bin]]
+name = "nobins"
+path = "src/main.rs"

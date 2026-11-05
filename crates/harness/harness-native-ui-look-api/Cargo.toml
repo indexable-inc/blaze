@@ -1,0 +1,17 @@
+[package]
+name = "harness-native-ui-look-api"
+description = "Appearance components shared by native views and UI modules (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"

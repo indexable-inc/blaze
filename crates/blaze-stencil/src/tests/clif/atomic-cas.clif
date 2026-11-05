@@ -1,0 +1,148 @@
+; Follows cranelift/filetests/filetests/runtests/atomic-cas.clif (and atomic-cas-little.clif,
+; atomic-cas-subword-little.clif, and atomic-128.clif's `atomic_cas`), for the stencil set:
+; `atomic_cas` of `i8` to `i128` on a stack slot a `store` initialised, matching and not
+; matching (in each half, for `i128`), returning the old value and the memory after. An `i8`
+; sits at byte 3 and an `i16` at byte 2 of an 8-byte slot whose other bytes are set, and the
+; memory after is that whole word. Every signature returns at most two integer registers, so
+; the `i128` one (on a 16-aligned slot) is split in two functions, old value and memory
+; after. Cranelift lowers it with `cmpxchg16b` on x86-64 and only with LSE on AArch64, so on
+; AArch64 Linux (no LSE) this file runs in the interpreter and as Apple AArch64 code.
+; Upstream's big-endian variants are left out: the stencil set has little-endian accesses only.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %cas_i8(i8, i8, i8) -> i8, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8, v2: i8):
+    v3 = iconst.i64 0x1122334455667788
+    v4 = stack_addr.i64 ss0
+    store v3, v4
+    v5 = stack_addr.i64 ss0+3
+    store v0, v5
+    v6 = atomic_cas v5, v1, v2
+    v7 = load.i64 v4
+    return v6, v7
+}
+; run: %cas_i8(0x12, 0x12, 0x34) == [0x12, 0x1122334434667788]
+; run: %cas_i8(0x12, 0x13, 0x34) == [0x12, 0x1122334412667788]
+; run: %cas_i8(-1, -1, 0) == [-1, 0x1122334400667788]
+; run: %cas_i8(0, 0, -1) == [0, 0x11223344ff667788]
+; run: %cas_i8(-128, 0, 127) == [-128, 0x1122334480667788]
+; run: %cas_i8(-128, 127, 1) == [-128, 0x1122334480667788]
+
+function %cas_i16(i16, i16, i16) -> i16, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16, v2: i16):
+    v3 = iconst.i64 0x1122334455667788
+    v4 = stack_addr.i64 ss0
+    store v3, v4
+    v5 = stack_addr.i64 ss0+2
+    store v0, v5
+    v6 = atomic_cas v5, v1, v2
+    v7 = load.i64 v4
+    return v6, v7
+}
+; run: %cas_i16(0x1234, 0x1234, 0xabcd) == [0x1234, 0x11223344abcd7788]
+; run: %cas_i16(0x1234, 0x1235, 0xabcd) == [0x1234, 0x1122334412347788]
+; run: %cas_i16(0x1234, 0x0034, 0xabcd) == [0x1234, 0x1122334412347788]
+; run: %cas_i16(-1, -1, 0) == [-1, 0x1122334400007788]
+; run: %cas_i16(0, 0, -1) == [0, 0x11223344ffff7788]
+; run: %cas_i16(0x8000, 0x0080, 1) == [0x8000, 0x1122334480007788]
+
+function %cas_i32(i32, i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = atomic_cas v3, v1, v2
+    v5 = load.i32 v3
+    return v4, v5
+}
+; run: %cas_i32(0x12345678, 0x12345678, 0x9abcdef0) == [0x12345678, 0x9abcdef0]
+; run: %cas_i32(0x12345678, 0x12345679, 0x9abcdef0) == [0x12345678, 0x12345678]
+; run: %cas_i32(0x12345678, 0x00005678, 0x9abcdef0) == [0x12345678, 0x12345678]
+; run: %cas_i32(-1, -1, 0) == [-1, 0]
+; run: %cas_i32(0, 0x80000000, 1) == [0, 0]
+; run: %cas_i32(0x80000000, 0x80000000, 0x7fffffff) == [0x80000000, 0x7fffffff]
+
+function %cas_i32_in_word(i64, i32, i32) -> i32, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i32, v2: i32):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = stack_addr.i64 ss0+4
+    v5 = atomic_cas v4, v1, v2
+    v6 = load.i64 v3
+    return v5, v6
+}
+; run: %cas_i32_in_word(0x0123456789abcdef, 0x01234567, -1) == [0x01234567, 0xffffffff89abcdef]
+; run: %cas_i32_in_word(0x0123456789abcdef, 0x89abcdef, -1) == [0x01234567, 0x0123456789abcdef]
+; run: %cas_i32_in_word(-1, -1, 0) == [-1, 0x00000000ffffffff]
+
+function %cas_i64(i64, i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = atomic_cas v3, v1, v2
+    v5 = load.i64 v3
+    return v4, v5
+}
+; run: %cas_i64(0x0123456789abcdef, 0x0123456789abcdef, 0xfedcba9876543210) == [0x0123456789abcdef, 0xfedcba9876543210]
+; run: %cas_i64(0x0123456789abcdef, 0x0123456789abcdee, 0xfedcba9876543210) == [0x0123456789abcdef, 0x0123456789abcdef]
+; run: %cas_i64(0x0000000100000000, 0, 7) == [0x0000000100000000, 0x0000000100000000]
+; run: %cas_i64(0x0000000100000000, 0x0000000100000000, 7) == [0x0000000100000000, 7]
+; run: %cas_i64(-1, -1, 0) == [-1, 0]
+; run: %cas_i64(0, 0, 0x8000000000000000) == [0, 0x8000000000000000]
+; run: %cas_i64(0x8000000000000000, 0, 1) == [0x8000000000000000, 0x8000000000000000]
+
+function %cas_i64_twice(i64, i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = atomic_cas v3, v0, v1
+    v5 = atomic_cas v3, v0, v2
+    return v4, v5
+}
+; run: %cas_i64_twice(1, 2, 3) == [1, 2]
+; run: %cas_i64_twice(-1, 0, 5) == [-1, 0]
+
+function %cas_i128_old(i128, i128, i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+
+block0(v0: i128, v1: i128, v2: i128):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = atomic_cas v3, v1, v2
+    return v4
+}
+; run: %cas_i128_old(0x0123456789abcdeffedcba9876543210, 0x0123456789abcdeffedcba9876543210, 0x11111111111111112222222222222222) == 0x0123456789abcdeffedcba9876543210
+; run: %cas_i128_old(0x0123456789abcdeffedcba9876543210, 0x0123456789abcdeffedcba9876543211, 0x11111111111111112222222222222222) == 0x0123456789abcdeffedcba9876543210
+; run: %cas_i128_old(0x0123456789abcdeffedcba9876543210, 0x1123456789abcdeffedcba9876543210, 0x11111111111111112222222222222222) == 0x0123456789abcdeffedcba9876543210
+; run: %cas_i128_old(-1, -1, 0) == -1
+
+function %cas_i128_mem(i128, i128, i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+
+block0(v0: i128, v1: i128, v2: i128):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v4 = atomic_cas v3, v1, v2
+    v5 = load.i128 v3
+    return v5
+}
+; run: %cas_i128_mem(0x0123456789abcdeffedcba9876543210, 0x0123456789abcdeffedcba9876543210, 0x11111111111111112222222222222222) == 0x11111111111111112222222222222222
+; run: %cas_i128_mem(0x0123456789abcdeffedcba9876543210, 0x0123456789abcdeffedcba9876543211, 0x11111111111111112222222222222222) == 0x0123456789abcdeffedcba9876543210
+; run: %cas_i128_mem(0x0123456789abcdeffedcba9876543210, 0x1123456789abcdeffedcba9876543210, 0x11111111111111112222222222222222) == 0x0123456789abcdeffedcba9876543210
+; run: %cas_i128_mem(-1, -1, 0) == 0
+; run: %cas_i128_mem(0, 0x00000000000000010000000000000000, -1) == 0
+; run: %cas_i128_mem(0x00000000000000010000000000000000, 0x00000000000000010000000000000000, 1) == 1

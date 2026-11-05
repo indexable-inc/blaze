@@ -1,0 +1,127 @@
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    WHITESPACE " "
+    NAME
+      IDENT "main"
+    PARAM_LIST
+      L_PAREN "("
+      R_PAREN ")"
+    WHITESPACE " "
+    BLOCK_EXPR
+      STMT_LIST
+        L_CURLY "{"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          TUPLE_PAT
+            L_PAREN "("
+            GUARD_PAT
+              IDENT_PAT
+                NAME
+                  IDENT "a"
+              WHITESPACE " "
+              MATCH_GUARD
+                IF_KW "if"
+                WHITESPACE " "
+                PATH_EXPR
+                  PATH
+                    PATH_SEGMENT
+                      NAME_REF
+                        IDENT "a"
+            COMMA ","
+            WHITESPACE " "
+            SLICE_PAT
+              L_BRACK "["
+              GUARD_PAT
+                OR_PAT
+                  IDENT_PAT
+                    NAME
+                      IDENT "b"
+                  WHITESPACE " "
+                  PIPE "|"
+                  WHITESPACE " "
+                  IDENT_PAT
+                    NAME
+                      IDENT "c"
+                WHITESPACE " "
+                MATCH_GUARD
+                  IF_KW "if"
+                  WHITESPACE " "
+                  LITERAL
+                    TRUE_KW "true"
+              R_BRACK "]"
+            R_PAREN ")"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          TUPLE_STRUCT_PAT
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "S"
+            L_PAREN "("
+            GUARD_PAT
+              IDENT_PAT
+                NAME
+                  IDENT "d"
+              WHITESPACE " "
+              MATCH_GUARD
+                IF_KW "if"
+                WHITESPACE " "
+                PATH_EXPR
+                  PATH
+                    PATH_SEGMENT
+                      NAME_REF
+                        IDENT "d"
+            COMMA ","
+            WHITESPACE " "
+            RECORD_PAT
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "E"
+              WHITESPACE " "
+              RECORD_PAT_FIELD_LIST
+                L_CURLY "{"
+                WHITESPACE " "
+                RECORD_PAT_FIELD
+                  NAME_REF
+                    IDENT "f"
+                  COLON ":"
+                  WHITESPACE " "
+                  GUARD_PAT
+                    IDENT_PAT
+                      NAME
+                        IDENT "g"
+                    WHITESPACE " "
+                    MATCH_GUARD
+                      IF_KW "if"
+                      WHITESPACE " "
+                      PATH_EXPR
+                        PATH
+                          PATH_SEGMENT
+                            NAME_REF
+                              IDENT "g"
+                WHITESPACE " "
+                R_CURLY "}"
+            R_PAREN ")"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n"
+        R_CURLY "}"
+  WHITESPACE "\n"

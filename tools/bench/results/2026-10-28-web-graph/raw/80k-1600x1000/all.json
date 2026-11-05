@@ -1,0 +1,943 @@
+{
+ "machine": {
+  "nproc": 16,
+  "cpu": "0xd84",
+  "lscpu_model": "Architecture:                            aarch64\nCPU op-mode(s):                          64-bit\nByte Order:                              Little Endian\nCPU(s):                                  128\nOn-line CPU(s) list:                     0-15\nOff-line CPU(s) list:                    16-127\nVendor ID:                               ARM\nModel name:                              Neoverse-V3\nModel:                                   1\nThread(s) per core:                      1\nCore(s) per cluster:                     16\nSocket(s):                               -\nCluster(s):                              1\nStepping:                                r0p1\nBogoMIPS:                                2000.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb dcpodp flagm2 frint i8mm bf16 dgh rng bti ecv afp wfxt\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-15\nNUMA node1 CPU(s):                       \nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "machine": "aarch64",
+  "chromium": "Chromium 155.0.8059.84"
+ },
+ "input": {
+  "assets": "crates/blaze-web/assets",
+  "vendor": "vb/out",
+  "fixture": "fx/anim-like.blzw",
+  "out": "raw/80k-1600x1000",
+  "chromium": "/nix/store/3hp6rjjzvjy2491xqhrad49m0hn65zxm-chromium-155.0.8059.84/bin/chromium",
+  "runs": 3,
+  "arms": [
+   "cosmos",
+   "sigma"
+  ],
+  "settle_cap_s": 240,
+  "panzoom_s": 10,
+  "live_s": 10,
+  "width": 1600,
+  "height": 1000
+ },
+ "results": [
+  {
+   "arm": "cosmos",
+   "run": 1,
+   "setup": {
+    "prep": {
+     "fetchMs": 12.199999999953434,
+     "parseMs": 64.80000000004657,
+     "layoutMs": 68.5,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "readyMs": 826,
+    "firstFrameMs": 1136.8000000000466,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "alpha < 0.001 (cosmos onSimulationEnd); and mean step per tick < 0.0005 of the layout diagonal",
+    "alphaEndMs": null,
+    "ticks": 64,
+    "progress": 0.03305217168699802,
+    "ticksToAlphaEndEstimate": 1936,
+    "stepSettledMs": 143696.69999999995,
+    "stepSettledTicks": 34,
+    "capped": true,
+    "lastStepRatio": 2.5460100344612065e-05,
+    "trace": [
+     [
+      143697,
+      34,
+      0.0002197
+     ],
+     [
+      276080,
+      64,
+      2.546e-05
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 72.69063568115234,
+    "totalJSHeapMB": 75.65539169311523
+   },
+   "rss_after_settle_mb": 1500.84765625,
+   "panzoom": {
+    "frames": 6,
+    "seconds": 12.382699999999954,
+    "fps": 0.4845469889442547,
+    "p50ms": 4113.899999999907,
+    "p95ms": 4126.5,
+    "maxMs": 4126.5,
+    "rendererRafCalls": 17,
+    "rendererRafMsPerCall": 0.27647058823255494
+   },
+   "live": {
+    "frames": 5,
+    "seconds": 12.318,
+    "fps": 0.4059100503328463,
+    "p50ms": 4070,
+    "p95ms": 4115.199999999953,
+    "maxMs": 4115.199999999953,
+    "rendererRafCalls": 2,
+    "rendererRafMsPerCall": 0.8000000000465661,
+    "updates": 18,
+    "updateMeanMs": 599.1833333333359
+   },
+   "live_moving": {
+    "frames": 3,
+    "seconds": 12.189300000000047,
+    "fps": 0.24611749649282472,
+    "p50ms": 4122.09999999986,
+    "p95ms": 4133.800000000047,
+    "maxMs": 4133.800000000047,
+    "rendererRafCalls": 8,
+    "rendererRafMsPerCall": 0.33749999999417923,
+    "updates": 10,
+    "updateMeanMs": 1145.6700000000187
+   },
+   "sim_only": {
+    "steps": 10,
+    "msPerStep": 326.36999999999534
+   },
+   "memory_end": {
+    "usedJSHeapMB": 145.54760932922363,
+    "totalJSHeapMB": 166.8533992767334
+   },
+   "rss_end_mb": 1686.234375,
+   "problems": {
+    "violations": [],
+    "errors": [
+     "ResizeObserver loop completed with undelivered notifications."
+    ]
+   },
+   "console": [
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: too many errors, no more errors will be reported to the console for this context."
+   ],
+   "wall_s": 348.89280700683594
+  },
+  {
+   "arm": "sigma",
+   "run": 1,
+   "setup": {
+    "prep": {
+     "fetchMs": 12.800000000046566,
+     "parseMs": 68.10000000009313,
+     "layoutMs": 69.80000000004657,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "graphologyMs": 704.1999999999534,
+    "firstFrameMs": 2762.2999999998137,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "ForceAtlas2 (Barnes-Hut, inferred settings) until mean step per iteration < 0.0005 of the layout diagonal",
+    "stepSettledMs": 71713.6000000001,
+    "stepSettledIterations": 137,
+    "iterations": 137,
+    "iterationMedianMs": 453.30000000004657,
+    "capped": false,
+    "lastStepRatio": 0.0004962135044989092,
+    "settings": {
+     "linLogMode": false,
+     "outboundAttractionDistribution": false,
+     "adjustSizes": false,
+     "edgeWeightInfluence": 1,
+     "barnesHutTheta": 0.5,
+     "barnesHutOptimize": true,
+     "strongGravityMode": true,
+     "gravity": 0.05,
+     "scalingRatio": 10,
+     "slowDown": 12.289781913656018
+    },
+    "trace": [
+     [
+      14196,
+      10,
+      0.008614
+     ],
+     [
+      18397,
+      20,
+      0.005226
+     ],
+     [
+      22758,
+      30,
+      0.003373
+     ],
+     [
+      27116,
+      40,
+      0.002286
+     ],
+     [
+      31507,
+      50,
+      0.001655
+     ],
+     [
+      35985,
+      60,
+      0.001287
+     ],
+     [
+      40546,
+      70,
+      0.001078
+     ],
+     [
+      45136,
+      80,
+      0.0009272
+     ],
+     [
+      49751,
+      90,
+      0.0008263
+     ],
+     [
+      54434,
+      100,
+      0.0007285
+     ],
+     [
+      59106,
+      110,
+      0.0006634
+     ],
+     [
+      63796,
+      120,
+      0.0005983
+     ],
+     [
+      68458,
+      130,
+      0.0005356
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 467.738018989563,
+    "totalJSHeapMB": 525.5194253921509
+   },
+   "rss_after_settle_mb": 1877.34375,
+   "panzoom": {
+    "frames": 4,
+    "seconds": 11.263399999999907,
+    "fps": 0.35513255322549436,
+    "p50ms": 5565.100000000093,
+    "p95ms": 5689.600000000093,
+    "maxMs": 5689.600000000093,
+    "rendererRafCalls": 4,
+    "rendererRafMsPerCall": 0.39999999990686774
+   },
+   "live": {
+    "frames": 2,
+    "seconds": 11.23119999999972,
+    "fps": 0.17807536149298825,
+    "p50ms": 5824,
+    "p95ms": 5824,
+    "maxMs": 5824,
+    "rendererRafCalls": 1,
+    "rendererRafMsPerCall": 95.60000000009313,
+    "updates": 112,
+    "updateMeanMs": 3.8178571427457166
+   },
+   "live_moving": {
+    "frames": 2,
+    "seconds": 11.0195,
+    "fps": 0.18149643813240163,
+    "p50ms": 5524.600000000093,
+    "p95ms": 5524.600000000093,
+    "maxMs": 5524.600000000093,
+    "rendererRafCalls": 2,
+    "rendererRafMsPerCall": 87.24999999976717,
+    "updates": 109,
+    "updateMeanMs": 3.5119266054003475
+   },
+   "sim_only": null,
+   "memory_end": {
+    "usedJSHeapMB": 428.78130531311035,
+    "totalJSHeapMB": 466.2323360443115
+   },
+   "rss_end_mb": 1784.09375,
+   "problems": {
+    "violations": [],
+    "errors": []
+   },
+   "console": [
+    "error: Failed to load resource: the server responded with a status of 404 (File not found)"
+   ],
+   "wall_s": 134.54375791549683
+  },
+  {
+   "arm": "cosmos",
+   "run": 2,
+   "setup": {
+    "prep": {
+     "fetchMs": 21.799999999813735,
+     "parseMs": 68.89999999990687,
+     "layoutMs": 70.90000000037253,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "readyMs": 835.2999999998137,
+    "firstFrameMs": 1152.5,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "alpha < 0.001 (cosmos onSimulationEnd); and mean step per tick < 0.0005 of the layout diagonal",
+    "alphaEndMs": null,
+    "ticks": 64,
+    "progress": 0.03305217168699802,
+    "ticksToAlphaEndEstimate": 1936,
+    "stepSettledMs": 144866.19999999972,
+    "stepSettledTicks": 34,
+    "capped": true,
+    "lastStepRatio": 2.5457678897450634e-05,
+    "trace": [
+     [
+      144866,
+      34,
+      0.0002197
+     ],
+     [
+      275984,
+      64,
+      2.546e-05
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 73.33171463012695,
+    "totalJSHeapMB": 75.40536117553711
+   },
+   "rss_after_settle_mb": 1463.92578125,
+   "panzoom": {
+    "frames": 6,
+    "seconds": 12.116399999999906,
+    "fps": 0.4951965930474437,
+    "p50ms": 4007.2999999998137,
+    "p95ms": 4068.7000000001863,
+    "maxMs": 4068.7000000001863,
+    "rendererRafCalls": 17,
+    "rendererRafMsPerCall": 0.21176470586043947
+   },
+   "live": {
+    "frames": 5,
+    "seconds": 12.078799999999815,
+    "fps": 0.41394840547074846,
+    "p50ms": 5,
+    "p95ms": 8091.799999999814,
+    "maxMs": 8091.799999999814,
+    "rendererRafCalls": 3,
+    "rendererRafMsPerCall": 0.9666666666356226,
+    "updates": 18,
+    "updateMeanMs": 580.1166666666977
+   },
+   "live_moving": {
+    "frames": 3,
+    "seconds": 12.036799999999813,
+    "fps": 0.24923567725641754,
+    "p50ms": 4026.1999999997206,
+    "p95ms": 4087.8000000002794,
+    "maxMs": 4087.8000000002794,
+    "rendererRafCalls": 8,
+    "rendererRafMsPerCall": 0.28749999997671694,
+    "updates": 12,
+    "updateMeanMs": 924.8333333332945
+   },
+   "sim_only": {
+    "steps": 10,
+    "msPerStep": 329.88000000002796
+   },
+   "memory_end": {
+    "usedJSHeapMB": 128.501859664917,
+    "totalJSHeapMB": 133.385404586792
+   },
+   "rss_end_mb": 1614.80078125,
+   "problems": {
+    "violations": [],
+    "errors": [
+     "ResizeObserver loop completed with undelivered notifications."
+    ]
+   },
+   "console": [
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: too many errors, no more errors will be reported to the console for this context."
+   ],
+   "wall_s": 347.5373704433441
+  },
+  {
+   "arm": "sigma",
+   "run": 2,
+   "setup": {
+    "prep": {
+     "fetchMs": 13.399999999906868,
+     "parseMs": 65.60000000009313,
+     "layoutMs": 69.70000000018626,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "graphologyMs": 667.5,
+    "firstFrameMs": 2542.399999999907,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "ForceAtlas2 (Barnes-Hut, inferred settings) until mean step per iteration < 0.0005 of the layout diagonal",
+    "stepSettledMs": 66257.30000000028,
+    "stepSettledIterations": 137,
+    "iterations": 137,
+    "iterationMedianMs": 444.70000000018626,
+    "capped": false,
+    "lastStepRatio": 0.0004962135044989092,
+    "settings": {
+     "linLogMode": false,
+     "outboundAttractionDistribution": false,
+     "adjustSizes": false,
+     "edgeWeightInfluence": 1,
+     "barnesHutTheta": 0.5,
+     "barnesHutOptimize": true,
+     "strongGravityMode": true,
+     "gravity": 0.05,
+     "scalingRatio": 10,
+     "slowDown": 12.289781913656018
+    },
+    "trace": [
+     [
+      9301,
+      10,
+      0.008614
+     ],
+     [
+      13425,
+      20,
+      0.005226
+     ],
+     [
+      17776,
+      30,
+      0.003373
+     ],
+     [
+      22209,
+      40,
+      0.002286
+     ],
+     [
+      26589,
+      50,
+      0.001655
+     ],
+     [
+      31065,
+      60,
+      0.001287
+     ],
+     [
+      35648,
+      70,
+      0.001078
+     ],
+     [
+      40203,
+      80,
+      0.0009272
+     ],
+     [
+      44670,
+      90,
+      0.0008263
+     ],
+     [
+      49150,
+      100,
+      0.0007285
+     ],
+     [
+      53661,
+      110,
+      0.0006634
+     ],
+     [
+      58196,
+      120,
+      0.0005983
+     ],
+     [
+      62914,
+      130,
+      0.0005356
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 400.29666233062744,
+    "totalJSHeapMB": 433.8172769546509
+   },
+   "rss_after_settle_mb": 1721.0078125,
+   "panzoom": {
+    "frames": 4,
+    "seconds": 11.208799999999814,
+    "fps": 0.3568624652059156,
+    "p50ms": 5560.5,
+    "p95ms": 5634.299999999814,
+    "maxMs": 5634.299999999814,
+    "rendererRafCalls": 4,
+    "rendererRafMsPerCall": 0.30000000004656613
+   },
+   "live": {
+    "frames": 2,
+    "seconds": 11.117399999999908,
+    "fps": 0.1798981776314621,
+    "p50ms": 5705.5,
+    "p95ms": 5705.5,
+    "maxMs": 5705.5,
+    "rendererRafCalls": 1,
+    "rendererRafMsPerCall": 90.60000000009313,
+    "updates": 111,
+    "updateMeanMs": 3.570270270428008
+   },
+   "live_moving": {
+    "frames": 2,
+    "seconds": 11.068399999999906,
+    "fps": 0.1806945900039768,
+    "p50ms": 5551.5,
+    "p95ms": 5551.5,
+    "maxMs": 5551.5,
+    "rendererRafCalls": 2,
+    "rendererRafMsPerCall": 85.4000000001397,
+    "updates": 109,
+    "updateMeanMs": 3.360550458871956
+   },
+   "sim_only": null,
+   "memory_end": {
+    "usedJSHeapMB": 428.65710639953613,
+    "totalJSHeapMB": 471.36115074157715
+   },
+   "rss_end_mb": 1685.83203125,
+   "problems": {
+    "violations": [],
+    "errors": []
+   },
+   "console": [
+    "error: Failed to load resource: the server responded with a status of 404 (File not found)"
+   ],
+   "wall_s": 124.51436686515808
+  },
+  {
+   "arm": "cosmos",
+   "run": 3,
+   "setup": {
+    "prep": {
+     "fetchMs": 12.699999999720603,
+     "parseMs": 67.5,
+     "layoutMs": 70.10000000009313,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "readyMs": 845.2000000001863,
+    "firstFrameMs": 1158.2999999998137,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "alpha < 0.001 (cosmos onSimulationEnd); and mean step per tick < 0.0005 of the layout diagonal",
+    "alphaEndMs": null,
+    "ticks": 64,
+    "progress": 0.03305217168699802,
+    "ticksToAlphaEndEstimate": 1936,
+    "stepSettledMs": 145571.59999999963,
+    "stepSettledTicks": 34,
+    "capped": true,
+    "lastStepRatio": 2.5458712294264227e-05,
+    "trace": [
+     [
+      145572,
+      34,
+      0.0002197
+     ],
+     [
+      276699,
+      64,
+      2.546e-05
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 73.29924011230469,
+    "totalJSHeapMB": 76.65536117553711
+   },
+   "rss_after_settle_mb": 1515.28125,
+   "panzoom": {
+    "frames": 6,
+    "seconds": 12.299899999999907,
+    "fps": 0.48780884397434493,
+    "p50ms": 4059.5,
+    "p95ms": 4127.200000000186,
+    "maxMs": 4127.200000000186,
+    "rendererRafCalls": 17,
+    "rendererRafMsPerCall": 0.23529411761966698
+   },
+   "live": {
+    "frames": 6,
+    "seconds": 12.177799999999813,
+    "fps": 0.4926998308397323,
+    "p50ms": 15.600000000093132,
+    "p95ms": 8118.299999999814,
+    "maxMs": 8118.299999999814,
+    "rendererRafCalls": 3,
+    "rendererRafMsPerCall": 0.6666666668218871,
+    "updates": 18,
+    "updateMeanMs": 589.0222222222429
+   },
+   "live_moving": {
+    "frames": 4,
+    "seconds": 12.024399999999908,
+    "fps": 0.33265693090715803,
+    "p50ms": 4081,
+    "p95ms": 4087.399999999907,
+    "maxMs": 4087.399999999907,
+    "rendererRafCalls": 11,
+    "rendererRafMsPerCall": 0.22727272723039443,
+    "updates": 12,
+    "updateMeanMs": 928.7250000000544
+   },
+   "sim_only": {
+    "steps": 10,
+    "msPerStep": 331.0799999999814
+   },
+   "memory_end": {
+    "usedJSHeapMB": 127.66825294494629,
+    "totalJSHeapMB": 136.52374839782715
+   },
+   "rss_end_mb": 1668.390625,
+   "problems": {
+    "violations": [],
+    "errors": [
+     "ResizeObserver loop completed with undelivered notifications."
+    ]
+   },
+   "console": [
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: INVALID_OPERATION: clientWaitSync: attempt to use a deleted object",
+    "warning: WebGL: too many errors, no more errors will be reported to the console for this context."
+   ],
+   "wall_s": 353.0623016357422
+  },
+  {
+   "arm": "sigma",
+   "run": 3,
+   "setup": {
+    "prep": {
+     "fetchMs": 15.799999999813735,
+     "parseMs": 68.10000000009313,
+     "layoutMs": 70.10000000009313,
+     "nodes": 80000,
+     "edges": 300000,
+     "modules": 7071
+    },
+    "graphologyMs": 725.3999999999069,
+    "firstFrameMs": 2769.399999999907,
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"
+   },
+   "settle": {
+    "definition": "ForceAtlas2 (Barnes-Hut, inferred settings) until mean step per iteration < 0.0005 of the layout diagonal",
+    "stepSettledMs": 69673.79999999981,
+    "stepSettledIterations": 137,
+    "iterations": 137,
+    "iterationMedianMs": 432.1999999997206,
+    "capped": false,
+    "lastStepRatio": 0.0004962135044989092,
+    "settings": {
+     "linLogMode": false,
+     "outboundAttractionDistribution": false,
+     "adjustSizes": false,
+     "edgeWeightInfluence": 1,
+     "barnesHutTheta": 0.5,
+     "barnesHutOptimize": true,
+     "strongGravityMode": true,
+     "gravity": 0.05,
+     "scalingRatio": 10,
+     "slowDown": 12.289781913656018
+    },
+    "trace": [
+     [
+      14317,
+      10,
+      0.008614
+     ],
+     [
+      18453,
+      20,
+      0.005226
+     ],
+     [
+      22812,
+      30,
+      0.003373
+     ],
+     [
+      27035,
+      40,
+      0.002286
+     ],
+     [
+      31253,
+      50,
+      0.001655
+     ],
+     [
+      35617,
+      60,
+      0.001287
+     ],
+     [
+      39885,
+      70,
+      0.001078
+     ],
+     [
+      44242,
+      80,
+      0.0009272
+     ],
+     [
+      48657,
+      90,
+      0.0008263
+     ],
+     [
+      53098,
+      100,
+      0.0007285
+     ],
+     [
+      57567,
+      110,
+      0.0006634
+     ],
+     [
+      62051,
+      120,
+      0.0005983
+     ],
+     [
+      66538,
+      130,
+      0.0005356
+     ]
+    ]
+   },
+   "memory_after_settle": {
+    "usedJSHeapMB": 457.6374750137329,
+    "totalJSHeapMB": 494.2645425796509
+   },
+   "rss_after_settle_mb": 1838.57421875,
+   "panzoom": {
+    "frames": 4,
+    "seconds": 11.205299999999813,
+    "fps": 0.3569739319786232,
+    "p50ms": 5577.699999999721,
+    "p95ms": 5611.399999999907,
+    "maxMs": 5611.399999999907,
+    "rendererRafCalls": 4,
+    "rendererRafMsPerCall": 0.30000000004656613
+   },
+   "live": {
+    "frames": 2,
+    "seconds": 11.367,
+    "fps": 0.1759479194158529,
+    "p50ms": 5796.5,
+    "p95ms": 5796.5,
+    "maxMs": 5796.5,
+    "rendererRafCalls": 1,
+    "rendererRafMsPerCall": 89.8000000002794,
+    "updates": 113,
+    "updateMeanMs": 3.0415929204380485
+   },
+   "live_moving": {
+    "frames": 2,
+    "seconds": 11.379599999999627,
+    "fps": 0.1757531020422568,
+    "p50ms": 5790.399999999907,
+    "p95ms": 5790.399999999907,
+    "maxMs": 5790.399999999907,
+    "rendererRafCalls": 2,
+    "rendererRafMsPerCall": 82.30000000004657,
+    "updates": 112,
+    "updateMeanMs": 2.9214285715799115
+   },
+   "sim_only": null,
+   "memory_end": {
+    "usedJSHeapMB": 395.311487197876,
+    "totalJSHeapMB": 469.7414302825928
+   },
+   "rss_end_mb": 1749.984375,
+   "problems": {
+    "violations": [],
+    "errors": []
+   },
+   "console": [
+    "error: Failed to load resource: the server responded with a status of 404 (File not found)"
+   ],
+   "wall_s": 124.68858122825623
+  }
+ ]
+}

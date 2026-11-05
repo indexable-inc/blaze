@@ -1,0 +1,39 @@
+--- frame 0
+     Waiting for the daemon 0.10s
+--- frame 25
+     Loading workspace 2.59s
+--- frame 50
+     Loading workspace 5.19s
+--- frame 75
+     Loading workspace 7.79s
+--- frame 100
+     Loading workspace 10.3s
+--- frame 125
+     Loading workspace 13.0s
+--- frame 150
+     Loading workspace 15.6s
+--- frame 175
+     Loading workspace 18.2s
+--- frame 200
+   Compiling rg 0.20s
+--- frame 225
+   Compiling rg 2.61s · 0/1 crates
+            └─ rg  6058 fns  2.21s
+--- frame 250
+   Compiling rg 5.03s · 0/1 crates
+            └─ rg  17240 fns  4.62s
+--- frame 275
+   Compiling rg 7.35s · 0/1 crates
+            └─ rg  28056 fns  6.94s
+--- frame 300
+    Checking 74 files 0.47s · 0/1 crates
+            └─ rg  31894 fns  9.27s
+--- left on the screen (312 frames drawn)
+   Compiling ripgrep v15.1.0 (/tmp/…/ripgrep)
+      Loaded workspace in 18.8s
+    Resolved names in 1.41s
+    Compiled rg: 31848 fns compiled, 0 kept in 9.43s
+     Checked 74 files in 0.63s
+      Linked rg in 0.63s
+    Compiled 31848 fns in 1 crate, 0 kept; 30.9s
+    Finished `dev` profile [blaze] target(s) in 30.95s

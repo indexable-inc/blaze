@@ -1,0 +1,9 @@
+// Flecs accepts all of these (it converts the values); the TS layer flags them.
+site {
+  typed : Doc {
+    P count(text: 1)
+    P cite("See [[nope_ref]] for more.")
+    (DependsOn, refs.zig_016)
+    (Cites, site.demo_good)
+  }
+}

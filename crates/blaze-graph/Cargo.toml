@@ -1,0 +1,65 @@
+[package]
+name = "blaze-graph"
+description = "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/driver.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-image.workspace = true
+blaze-mem.workspace = true
+blaze-radix.workspace = true
+blaze-protocol.workspace = true
+blaze-reclaim.workspace = true
+blaze-rng.workspace = true
+blaze-serde.workspace = true
+blaze-spin.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-deque.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+stdx.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# The fibers' stacks on native targets; on wasm the host switches them (`sched::stack`).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+corosensei.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+expect-test.workspace = true
+hegeltest.workspace = true
+
+# `Flights` under contention: N threads' keys spread over 128 shards, in one shard, and on one
+# key, in ns per operation.
+[[bench]]
+name = "flights"
+harness = false
+
+# The pool's `Victims` (topology walk, two choices) at the ends of fan-out waves: wave time
+# against a perfect split, in us.
+[[bench]]
+name = "steal"
+harness = false
+
+[lints]
+workspace = true

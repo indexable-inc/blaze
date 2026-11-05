@@ -1,0 +1,89 @@
+{
+  "toolchain": "1.99.0",
+  "commit": "948d54e375ef4f4685a932539d3a4118992a31c1",
+  "date": "2026-10-23T04:30:48Z",
+  "host": {
+    "name": null,
+    "cpu": "Apple M5 Max",
+    "cores": 18,
+    "machine_cores": 18,
+    "load": "28.6, 33.3, 30.4",
+    "memory_gib": 128,
+    "os": "Darwin",
+    "arch": "arm64",
+    "kernel": "27.0.0",
+    "rustc": "rustc 1.100.0-nightly (574ff7d98 2026-09-14)",
+    "cc": "clang version 21.1.8",
+    "ld": "ld: unknown option: --version",
+    "llvm": "23.1.3",
+    "incremental": "profile default (on for dev)",
+    "wrapper": null,
+    "linker": "the toolchain's default (cc)",
+    "library_dirs": 116
+  },
+  "runbench": {
+    "builds": [
+      "release",
+      "blaze"
+    ],
+    "variants": {},
+    "programs": {
+      "bun": {
+        "builds": {
+          "release": {
+            "build_s": 177.4,
+            "build_peak_mb": 7102,
+            "build_largest_mb": 4741,
+            "size_mb": 103.09
+          },
+          "blaze": {
+            "build_s": 983.1,
+            "cargo_s": 18.8,
+            "blaze_s": 962.9,
+            "link_s": 1.4,
+            "compiled": 62031,
+            "left": 0,
+            "reasons": {},
+            "build_peak_mb": 27342,
+            "build_largest_mb": 27342,
+            "size_mb": 129.61
+          }
+        },
+        "benches": {
+          "bun": {
+            "release": {
+              "median_s": 0.3325,
+              "ratio": 1.0,
+              "runs": [
+                0.3325,
+                0.3264,
+                0.3279,
+                0.3866,
+                0.4439
+              ],
+              "peak_mb": 43,
+              "peak_max_mb": 43
+            },
+            "blaze": {
+              "median_s": 0.4154,
+              "ratio": 1.249,
+              "runs": [
+                0.4144,
+                0.4078,
+                0.4154,
+                0.4808,
+                0.4706
+              ],
+              "peak_mb": 46,
+              "peak_max_mb": 46
+            }
+          }
+        }
+      }
+    },
+    "geomean": {
+      "release": 1.0,
+      "blaze": 1.249
+    }
+  }
+}

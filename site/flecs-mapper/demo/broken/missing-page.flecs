@@ -1,0 +1,6 @@
+// Flecs rejects a dependency on a page that does not exist.
+site {
+  dep : Rfc {
+    (DependsOn, site.no_such_page)
+  }
+}

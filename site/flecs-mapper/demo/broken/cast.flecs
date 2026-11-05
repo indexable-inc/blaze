@@ -1,0 +1,6 @@
+// Flecs itself rejects this too: a string where Img.width is a number.
+site {
+  cast : Doc {
+    Img pic(src: "/a.png", alt: "a", width: "wide", height: 2)
+  }
+}

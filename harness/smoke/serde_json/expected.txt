@@ -1,0 +1,11 @@
+{"name":"blaze","version":[0,20261028,0],"yanked":false,"totalDownloads":null,"features":{"default":["std"],"std":[]},"kind":{"type":"bin","path":"src/main.rs"}}
+round trip true
+2.5
+-3
+[
+  1,
+  2.5,
+  "x",
+  null,
+  true
+]

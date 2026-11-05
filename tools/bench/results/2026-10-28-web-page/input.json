@@ -1,0 +1,3 @@
+{"arms": {"before": "/root/web/target-fns/release/blaze", "after": "/root/web/target-page/release/blaze"},
+ "project": "/root/anim", "out": "/root/web/bench-page", "edited": "src/main.rs",
+ "opening": "fn main() -> io::Result<()> {", "colds": 2, "noops": 30, "edits": 8}

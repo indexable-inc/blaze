@@ -1,0 +1,26 @@
+# rustc's `compiler/rustc_type_ir_macros` at the rustc commit of `harness/toolchain`, as written by
+# `tools/v2/solver_sync.py`: `src` is upstream's with the series in `PATCHES.md` replayed on it, and
+# `Cargo.toml.orig` is upstream's manifest, whose dependencies this one has unchanged. It takes the
+# place of the crates.io `ra-ap-rustc_type_ir_macros`, so the derives match the `rustc_type_ir`
+# beside them.
+[package]
+name = "rustc_type_ir_macros"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/rust"
+publish = false
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[features]
+nightly = []
+
+[dependencies]
+indexmap = "2.4.0"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2.0.9", features = ["full", "visit-mut"] }
+synstructure = "0.13.0"

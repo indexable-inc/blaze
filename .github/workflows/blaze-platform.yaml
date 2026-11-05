@@ -1,0 +1,588 @@
+# One platform of blaze.yaml: its unit tests, one build of blaze with both producers, and the
+# harnesses of the tier against that build, split into parts (harness/ci.py) that each run on a
+# machine of their own. The tiers `gate` (the merge gate's, blaze.yaml) and `warm` (a push to
+# main, which writes the caches the other runs read) are the unit tests and the build alone;
+# `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
+# so nothing is cross-compiled or emulated.
+#
+# With `ix-cpu`, the build and the unit tests run on ix's GitHub Actions runners
+# (https://ix.dev/docs/runners) in place of `os`: a VM of that many vCPUs whose memory grows on
+# demand up to 256 GiB, forked from a snapshot of the last green job on main with the same labels,
+# its disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has
+# its own label set (`blaze-build`, `blaze-tests`), so each forks its own job's snapshot; main's
+# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. `ix-arch` is the
+# runner's architecture label: ix's runner plane picks the machine by it (`arm64`, or `x64`,
+# whose cap is 64 vCPUs) and refuses one it does not serve, and ix serves AArch64 alone today,
+# so `x64` goes on only with BLAZE_IX_X64_RUNNERS (blaze.yaml). Memory has no label: every ix
+# runner's grows on demand to the platform's 256 GiB.
+name: blaze platform
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: the name of the platform in artifacts and job names
+        type: string
+        required: true
+      os:
+        description: the hosted runner
+        type: string
+        required: true
+      ix-cpu:
+        description: "vCPUs of the ix runner the build and the unit tests run on (8, 16, 32, 64 or 128), or empty for `os`"
+        type: string
+        default: ""
+      ix-arch:
+        description: "the ix runner's architecture label, `arm64` or `x64`, which has to be the platform's"
+        type: string
+        default: arm64
+      tier:
+        description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
+        type: string
+        required: true
+      blaze-cli:
+        description: "`blaze` against cargo on small projects at pinned commits"
+        type: boolean
+        default: false
+      projects:
+        description: "`blaze` against cargo on the larger projects (an hour of machines)"
+        type: boolean
+        default: false
+      bench:
+        description: harness/bench.py on ripgrep against the stored baseline (not required)
+        type: boolean
+        default: false
+      smoke:
+        description: the std cases of the smoke corpus (harness/smoke.py), in every tier
+        type: boolean
+        default: false
+      harnesses:
+        description: "a JSON list of ci.py's harnesses (focused.yaml): these alone in place of the tier's parts, and no unit tests"
+        type: string
+        default: ""
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  # Every test `blaze test` runs is in a sandbox, which Windows does not have yet.
+  BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
+  # Git Bash on Windows has `python` and no `python3`.
+  PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
+  # The build and the unit tests on an ix runner (.github/actions/blaze keeps the store under
+  # $HOME there, for the snapshot, and makes no swap).
+  BLAZE_CI_IX: ${{ inputs.ix-cpu != '' }}
+  # blaze builds and tests blaze (AGENTS.md rule blaze-builds-blaze): the latest release is the
+  # compiler and its store the one cache, pulled from the shared remote main's runs push to
+  # (.github/actions/blaze). On Windows the build and the tests stop with an error: release.yaml
+  # makes no release of blaze for Windows yet, so there is no blaze there to build with, and
+  # cargo is no stand-in (rule no-fallback).
+  BLAZE: ${{ !startsWith(inputs.os, 'windows') }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: tests
+    if: inputs.harnesses == ''
+    # After the build, whose store it starts from: in the `gate` and `warm` tiers the build job
+    # compiles every library the test programs are built on, with the keys they ask for
+    # (harness/unittests.py), and hands over what it compiled, so only the crates built with
+    # `cfg(test)` are compiled here.
+    needs: build
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
+    # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
+    # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
+    # enough for that one run to finish and push, which the runs after it then pull.
+    # Room after the test step's own limit for main's push, which keeps what was compiled.
+    # Main's push runs get close to the hosted runner's 6-hour cap: a cold store's 20 release
+    # test binaries ran past 150 minutes on 2026-10-28, and only main pushes what they compiled,
+    # so a pull request's run is warm only once one of main's has finished.
+    timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 355 || startsWith(inputs.os, 'macos') && 240 || 170 }}
+    # The remote's write token and signing key, for the push of blaze.yaml's runs on main alone
+    # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
+    # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
+    environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    env:
+      # A pull request runs the tests its change reached and takes the rest as passed from
+      # main's store; main runs every test, which records each pass for the pull requests after
+      # it, and says of each that passed before whether it passed again.
+      BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
+    steps:
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
+        run: |
+          echo "::error::blaze's unit tests on Windows need a release of blaze for Windows to build them with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
+          exit 1
+      - uses: actions/checkout@v7
+      # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
+      # the C compiler and linker are the runner's.
+      # With the build job's project too, and LLVM: the tests are built with the features the
+      # build ships (harness/unittests.py, FEATURES).
+      - if: env.BLAZE == 'true'
+        id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: tests
+          llvm: true
+          also: build
+      # What this run's build job compiled, which main's remote has only once main pushes it:
+      # a pull request's build pushes nowhere.
+      - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        uses: actions/download-artifact@v8
+        with:
+          name: store-${{ inputs.platform }}
+          path: ${{ runner.temp }}/handoff
+      # Each pack is named by the hash of its bytes, which is checked here before the store
+      # has it (and again by the daemon as it opens the store).
+      - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        name: the build job's packs into the store
+        working-directory: ${{ runner.temp }}/handoff
+        run: |
+          while read -r pack; do
+            [ -f "$pack" ] || { echo "::error::the build job's pack $pack is not in its artifact"; exit 1; }
+            $PYTHON -c 'import hashlib, sys; sys.exit(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest() + ".pack" != sys.argv[1])' "$pack" \
+              || { echo "::error::the build job's pack $pack is not what it is named by"; exit 1; }
+            mv "$pack" "$BLAZE_CACHE/$pack"
+          done < packs.txt
+          echo "$(wc -l < packs.txt | tr -d ' ') packs of the build job's put in the store"
+      # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
+      # on 2026-10-28, which cancelled the push after them, so no run after it found them
+      # compiled. Run out here, the step fails and main's push still runs.
+      # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
+      # ix's image may carry no package lists, which a hosted image has.
+      - if: env.BLAZE == 'true' && runner.os == 'Linux'
+        run: |
+          if [ "$BLAZE_CI_IX" = true ]; then sudo apt-get update -qq > /dev/null; fi
+          sudo apt-get install -y -qq gdb > /dev/null
+      - if: env.BLAZE == 'true'
+        timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
+        run: |
+          $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
+      # What was compiled, and each test that passed, for the runs after this one; a run whose
+      # tests failed pushes too, since what it compiled is no less right. The daemons end
+      # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
+        run: blaze stop
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
+        uses: ./.github/actions/blaze-remote
+        with:
+          mode: push
+          project: ${{ steps.blaze.outputs.project }}
+          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
+          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
+
+  build:
+    name: build
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
+    # A store blaze's release has not compiled into builds for about 97 minutes on Linux
+    # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
+    timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
+    # The remote's write token and signing key, for main's push alone.
+    environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
+    # Every tier builds with blaze, the train's `fast` and `full` too, as release.yaml does: their
+    # harnesses and benches time and test the blaze users get, which blaze builds. That blaze's
+    # code runs slower than rustc's while it inlines too little
+    # (https://github.com/indexable-inc/blaze/issues/899) is the work, not a reason for cargo.
+    outputs:
+      parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
+    steps:
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
+        run: |
+          echo "::error::building blaze on Windows needs a release of blaze for Windows to build it with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
+          exit 1
+      - uses: actions/checkout@v7
+      # blaze's build (every tier): no rustup and no Nix. blaze brings its own Rust and the
+      # pinned LLVM (LLVM_SYS_231_PREFIX, fetched by its sha256), and the C compiler, linker and
+      # libc are the runner's.
+      - if: env.BLAZE == 'true'
+        id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: build
+          llvm: true
+      # The packs the store has before the build, so that what it adds can be handed on.
+      - if: env.BLAZE == 'true'
+        run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
+      # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
+      # with their features and profile (harness/unittests.py), so that its libraries are the
+      # ones the tests job's programs are built on. Every one of them is a dependency of
+      # blaze-engine, and each has the features it has in blaze-engine's build alone.
+      # The profile history's files the build writes are told from those the runner had (an ix
+      # runner's snapshot keeps earlier runs') by being newer than this file.
+      - if: env.BLAZE == 'true' && inputs.harnesses == ''
+        run: touch "$RUNNER_TEMP/profile-since"
+      - name: blaze build --release, of what the unit tests are built on
+        if: env.BLAZE == 'true'
+        run: |
+          $PYTHON harness/unittests.py '{"build": true}'
+      # The daemon ends first: its last pack seals when it does.
+      - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
+        run: blaze stop
+      # The self-build's profile history (blaze's root, docs/profiling.md), for the profile-gate
+      # job. After the stop, which flushes and merges the last of it. A build that wrote none
+      # hands over its list alone, and the gate says it found no build.
+      - id: profile
+        if: always() && env.BLAZE == 'true' && inputs.harnesses == '' && steps.blaze.outcome == 'success'
+        run: |
+          src="${BLAZE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/blaze}/v2/profile"
+          dir="$RUNNER_TEMP/profile"
+          mkdir -p "$dir"
+          find "$src" -maxdepth 1 -name '*.parquet' ! -name 'schema.*' -newer "$RUNNER_TEMP/profile-since" -exec cp -p {} "$dir/" \; || true
+          ls "$dir" > "$dir/copied.txt"
+          echo "$(($(wc -l < "$dir/copied.txt") - 1)) profile history files, $(du -sh "$dir" | cut -f1), for the profile gate" | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always() && steps.profile.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      # What the build added to the store, for the tests job (`needs: build`), which pulls the
+      # same keys; a hard link each, since the store and the runner's temporary directory are
+      # one disk. packs.txt lists them, so that a build that added none still hands over a list.
+      - id: handoff
+        if: env.BLAZE == 'true' && inputs.harnesses == '' && (inputs.tier == 'gate' || inputs.tier == 'warm')
+        run: |
+          dir="$RUNNER_TEMP/handoff"
+          mkdir -p "$dir"
+          find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-built.txt"
+          comm -13 "$RUNNER_TEMP/packs-pulled.txt" "$RUNNER_TEMP/packs-built.txt" > "$dir/packs.txt"
+          while read -r pack; do ln "$BLAZE_CACHE/$pack" "$dir/$pack"; done < "$dir/packs.txt"
+          echo "$(wc -l < "$dir/packs.txt" | tr -d ' ') packs, $(du -sh "$dir" | cut -f1), for the tests job" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Packs are compressed already.
+      - if: steps.handoff.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: store-${{ inputs.platform }}
+          path: ${{ runner.temp }}/handoff
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
+        uses: ./.github/actions/blaze-remote
+        with:
+          mode: push
+          project: ${{ steps.blaze.outputs.project }}
+          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
+          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
+      # The binaries run each other from next to themselves. A tar keeps them executable.
+      - name: Pack
+        working-directory: target/release
+        run: |
+          exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
+          tar -cf blaze.tar blaze-engine$exe blaze$exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release/blaze.tar
+          retention-days: 3
+      # ci.py and focused.py run in the repository's Python workspace (pyproject.toml, uv.lock),
+      # and the harnesses in the Python that runs them: they read their input with typed_input.
+      - if: inputs.tier == 'fast' || inputs.tier == 'full'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - id: parts
+        if: (inputs.tier == 'fast' || inputs.tier == 'full') && inputs.harnesses == ''
+        run: |
+          parts=$(uv run --frozen --no-dev python harness/ci.py parts '{"tier": "${{ inputs.tier }}"}')
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+      # focused.yaml's harnesses, by name (harness/focused.py).
+      - id: focused
+        if: inputs.harnesses != ''
+        env:
+          HARNESSES: ${{ inputs.harnesses }}
+        # A name that is no harness's, or runs nowhere here, fails this step.
+        run: |
+          parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+
+  # The profile's gate (crates/blaze-profile/src/gate.rs, docs/profiling.md "The gate") over the
+  # history the build job's self-build wrote, run by the blaze this tree built and held to
+  # harness/profile-gate-known.toml, and each of its fixtures failing its own check
+  # (harness/profile_gate.py). It uploads the build's per-build summary, named by platform,
+  # runner class, commit, tree and blaze, for profile-nightly.yaml. No secret and no
+  # environment: a fork's pull request runs it as it is.
+  profile-gate:
+    name: profile gate
+    needs: build
+    if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The class of machine the self-build ran on: a summary compares only with its own class's.
+      RUNNER_CLASS: ${{ inputs.ix-cpu != '' && format('ix-{0}-{1}', inputs.ix-arch, inputs.ix-cpu) || inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned DuckDB (flake.nix), which `blaze debug gate` runs: blaze never links one.
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - id: duckdb
+        run: echo "path=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: ${{ runner.temp }}/blaze
+      - uses: actions/download-artifact@v8
+        with:
+          name: profile-${{ inputs.platform }}
+          path: ${{ runner.temp }}/profile
+      - working-directory: ${{ runner.temp }}/blaze
+        run: tar -xf blaze.tar
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: blaze debug gate, over the self-build and the fixtures
+        env:
+          DUCKDB: ${{ steps.duckdb.outputs.path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg duckdb "$DUCKDB" --arg history "$RUNNER_TEMP/profile" \
+            --arg platform "$PLATFORM" --arg runner "$RUNNER_CLASS" --arg commit "$GITHUB_SHA" --arg out "$RUNNER_TEMP/profile-gate" \
+            '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
+            > "$RUNNER_TEMP/profile-gate.json"
+          uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      - id: summary
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/profile-gate"
+          if [ -f "$out/report.md" ]; then cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f "$out/artifact" ] && [ -f "$out/summary.parquet" ]; then echo "name=$(cat "$out/artifact")" >> "$GITHUB_OUTPUT"; fi
+      - if: always() && steps.summary.outputs.name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.summary.outputs.name }}
+          path: |
+            ${{ runner.temp }}/profile-gate/summary.parquet
+            ${{ runner.temp }}/profile-gate/identity.json
+            ${{ runner.temp }}/profile-gate/verdict.json
+          retention-days: 90
+          if-no-files-found: error
+
+  harness:
+    name: harness (${{ matrix.part }})
+    if: (inputs.tier == 'fast' || inputs.tier == 'full')
+    needs: build
+    runs-on: ${{ inputs.os }}
+    # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
+    timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
+    strategy:
+      fail-fast: false
+      # {"include": [{"part", "apt"}, ...]}. No backend: v2 picks it by the profile, and refuses
+      # every unit while BLAZE_BACKEND or BLAZE_OPT is set (harness/ci.py).
+      matrix: ${{ fromJSON(needs.build.outputs.parts) }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      # What ci.py says the part's harnesses use (gdb).
+      - name: Linux tools
+        if: runner.os == 'Linux' && matrix.apt != ''
+        uses: ./.github/actions/apt
+        with:
+          packages: ${{ matrix.apt }}
+      # `debuginfo.py` has perf unwind what blaze built, which it says it did not run where
+      # there is no perf or the kernel does not let this user sample.
+      - name: perf
+        if: runner.os == 'Linux' && startsWith(matrix.part, 'core-')
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
+          perf --version || sudo ln -sf "$(ls /usr/lib/linux-tools/*/perf | tail -n 1)" /usr/local/bin/perf
+          perf --version
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - name: blaze
+        working-directory: target/release
+        run: |
+          tar -xf blaze.tar
+          if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$PWD")\\blaze-engine.exe"; else bin="$PWD/blaze-engine"; fi
+          echo "BLAZE_BIN=$bin" >> "$GITHUB_ENV"
+      # The harnesses run in the Python of the repository's workspace, as ci.py and focused.py do.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - if: inputs.harnesses == ''
+        run: |
+          uv run --frozen --no-dev python harness/ci.py run '{"part": "${{ matrix.part }}"}'
+      - if: inputs.harnesses != ''
+        env:
+          HARNESSES: ${{ inputs.harnesses }}
+        run: |
+          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
+      # What the daemons said when a harness failed (each harness's daemon logs in a temporary
+      # home of its own: `serve.log` there or in its `v2/`), and the report of a process that
+      # crashed on macOS.
+      - name: Daemon logs
+        if: failure()
+        run: |
+          find "${TMPDIR:-/tmp}" /tmp -maxdepth 5 -name serve.log 2>/dev/null | sort -u | while read -r log; do
+            echo "::group::$log"; tail -n 60 "$log"; echo "::endgroup::"
+          done
+          for report in "$HOME"/Library/Logs/DiagnosticReports/blaze-engine*; do
+            [ -f "$report" ] && { echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::"; }
+          done
+          true
+
+  # The std cases of the smoke corpus (docs/release.md): small programs with no dependencies
+  # that `blaze run` must print the expected output of and `blaze test` must pass, dev and
+  # --release, as a user runs them. The merge gate's; the whole corpus, against a release's
+  # archives, is what a canary passes to become stable (promote.yaml).
+  smoke:
+    name: smoke (std)
+    # Not in the merge gate while blaze's own code runs ten to twenty times slower than rustc's
+    # (https://github.com/indexable-inc/blaze/issues/899): 74 s with a blaze rustc built, 17 to
+    # 30 min with the one blaze builds, which no warm store shortens. Main runs it after each
+    # merge, and promote.yaml runs the whole corpus on every release before it is stable.
+    if: inputs.smoke && inputs.tier != 'gate'
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
+    steps:
+      - uses: actions/checkout@v7
+      # With Nix: the build's programs ask for the dev shell's glibc, from the Nix store.
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - name: smoke corpus (std)
+        run: |
+          BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
+            "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
+
+  # `blaze` in place of cargo on projects at pinned commits, and the flags and the daemon's
+  # life. Incremental compilation is left to the profile,
+  # as on a developer's machine: with it off the tests of every project are cargo's (the
+  # harness has that case among the flags).
+  blaze-cli:
+    name: blaze (${{ matrix.group }})
+    if: inputs.blaze-cli
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ["ripgrep hyperfine", "fd", "checks"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - name: blaze against cargo
+        working-directory: harness
+        # Under the job's limit, so that a run that hangs leaves time to keep what it logged.
+        timeout-minutes: 40
+        run: |
+          if [ "${{ matrix.group }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.group }}"; fi
+          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" env -u CARGO_INCREMENTAL $PYTHON blaze_cli.py $what
+      - name: what was running, and the daemons' logs
+        if: failure()
+        run: ps -eo pid,ppid,etime,args > /tmp/blaze-cargo-processes.txt
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: blaze-cli-logs-${{ inputs.platform }}-${{ strategy.job-index }}
+          path: |
+            /tmp/blaze-cargo-processes.txt
+            /tmp/blaze-cargo-*/home-*/*.log
+            /tmp/blaze-cargo-*/home-*/*/*/log
+          if-no-files-found: ignore
+
+  # The larger projects as they are published, natively on AArch64: what the programs print and
+  # what every test says has to be what cargo gives. The ten after these take more than a hosted
+  # runner's three hours, and it was shut down loading rust-analyzer.
+  projects:
+    name: projects (${{ matrix.projects }})
+    if: inputs.projects
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 120
+    # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
+    # axum's example-testing crashes in the test binary the daemon builds. nushell's cold build
+    # needs about 16 GB, more than the hosted AArch64 runner has, until
+    # https://github.com/indexable-inc/blaze/issues/734 is fixed.
+    continue-on-error: ${{ matrix.projects == 'axum' || matrix.projects == 'nushell' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        projects: ["ripgrep fd", "bat hyperfine", "just", "axum", "nushell", "checks"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - name: blaze
+        working-directory: harness
+        run: |
+          if [ "${{ matrix.projects }}" = checks ]; then what=--only-checks; else what="--only-projects ${{ matrix.projects }}"; fi
+          status=0
+          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" $PYTHON blaze_cli.py $what || status=$?
+          cat BLAZE-CLI*.md
+          exit $status
+
+  # Not required to pass yet: the baseline was measured on another machine than the runner, so
+  # the threshold on times is wide, and what it holds exactly is who built each step, whether
+  # it was spliced and how many functions were compiled.
+  bench:
+    name: bench (ripgrep)
+    if: inputs.bench
+    needs: build
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-${{ inputs.platform }}
+          path: target/release
+      - run: tar -xf blaze.tar
+        working-directory: target/release
+      - name: Bench
+        working-directory: harness
+        run: |
+          export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" BLAZE_LLVM_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
+          $PYTHON bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
+          $PYTHON bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench
+          path: ${{ runner.temp }}/bench.json

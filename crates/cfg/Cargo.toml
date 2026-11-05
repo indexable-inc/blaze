@@ -1,0 +1,32 @@
+[package]
+name = "cfg"
+version = "0.0.0"
+repository.workspace = true
+description = "Conditional compiling options, `cfg` attribute parser and evaluator for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+tracing.workspace = true
+
+# locals deps
+tt.workspace = true
+syntax.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true
+hegeltest.workspace = true
+
+# local deps
+syntax-bridge.workspace = true
+
+[lints]
+workspace = true

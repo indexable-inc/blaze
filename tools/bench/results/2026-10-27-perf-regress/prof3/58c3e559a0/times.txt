@@ -1,0 +1,6 @@
+noop 233ms
+body 229ms
+body 172ms
+strace-daemon body 424ms
+strace-daemon body back 386ms
+strace-daemon noop 338ms

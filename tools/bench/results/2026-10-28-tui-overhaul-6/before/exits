@@ -1,0 +1,22 @@
+cold: exit 0
+cold wall: 35.599
+why-cold.txt: exit 0
+edit: exit 0
+edit wall: 0.243
+edit.piped: exit 0
+why.txt: exit 0
+status.txt: exit 0
+noop-events.jsonl: exit 0
+noop.1: exit 0
+noop.1 wall: 0.022
+noop.2: exit 0
+noop.2 wall: 0.022
+noop.3: exit 0
+noop.3 wall: 0.024
+noop.4: exit 0
+noop.4 wall: 0.021
+noop.5: exit 0
+noop.5 wall: 0.022
+warm: exit 0
+warm wall: 5.292
+DONE

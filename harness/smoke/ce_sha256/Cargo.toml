@@ -1,0 +1,16 @@
+[package]
+name = "ce_sha256"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["const"]
+const = []
+
+[dependencies]
+sha2 = { version = "0.10", features = ["force-soft"] }
+
+[workspace]
+
+[workspace.metadata.blaze]
+const-eval = { steps = 100000000000 }

@@ -1,0 +1,214 @@
+//! Post-nameres attribute resolution.
+
+use base_db::{Crate, Db};
+use hir_expand::{
+    AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
+    attrs::{Attr, AttrId, AttrInput},
+    inert_attr_macro::find_builtin_attr_idx,
+    mod_path::{ModPath, PathKind},
+};
+use span::SyntaxContext;
+use syntax::ast;
+
+use crate::{
+    AstIdWithPath, MacroId, ModuleId, UnresolvedMacro,
+    item_scope::BuiltinShadowMode,
+    nameres::{LocalDefMap, path_resolution::ResolveMode},
+};
+
+use super::{DefMap, MacroSubNs};
+
+pub enum ResolvedAttr {
+    /// Attribute resolved to an attribute macro.
+    Macro(MacroCallId),
+    /// Attribute resolved to something else that does not require expansion.
+    Other,
+}
+
+impl DefMap {
+    /// This cannot be used to resolve items that allow derives.
+    pub(crate) fn resolve_attr_macro(
+        &self,
+        local_def_map: &LocalDefMap,
+        db: &Db,
+        original_module: ModuleId,
+        ast_id: &AstIdWithPath<ast::Item>,
+        attr: &Attr,
+        attr_id: AttrId,
+        macro_depth: u32,
+    ) -> Result<ResolvedAttr, UnresolvedMacro> {
+        // NB: does not currently work for derive helpers as they aren't recorded in the `DefMap`
+
+        if self.is_builtin_or_registered_attr(&ast_id.path) {
+            return Ok(ResolvedAttr::Other);
+        }
+
+        let resolved_res = self.resolve_path_fp_with_macro(
+            local_def_map,
+            db,
+            ResolveMode::Other,
+            original_module,
+            &ast_id.path,
+            BuiltinShadowMode::Module,
+            Some(MacroSubNs::Attr),
+        );
+        let def = match resolved_res.resolved_def.take_macros() {
+            Some(def) => {
+                // `MacroSubNs` is just a hint, so the path may still resolve to a custom derive
+                // macro, or even function-like macro when the path is qualified.
+                if def.is_attribute(db) {
+                    def
+                } else {
+                    return Ok(ResolvedAttr::Other);
+                }
+            }
+            None => return Err(UnresolvedMacro { path: ast_id.path }),
+        };
+
+        Ok(ResolvedAttr::Macro(attr_macro_as_call_id(
+            db,
+            ast_id,
+            attr,
+            // There aren't any active attributes before this one, because attribute macros
+            // replace their input, and derive macros are not allowed in this function.
+            AttrMacroAttrIds::from_one(attr_id),
+            self.krate,
+            def.definition(db),
+            macro_depth,
+        )))
+    }
+
+    pub(crate) fn is_builtin_or_registered_attr(&self, path: &ModPath) -> bool {
+        if path.kind != PathKind::Plain {
+            return false;
+        }
+
+        let segments = path.segments();
+
+        if let Some(name) = segments.first() {
+            let name = name.symbol();
+            let pred = |n: &_| *n == *name;
+
+            let is_tool = self.data.registered_tools.iter().any(pred);
+            // FIXME: tool modules can be shadowed by actual modules
+            if is_tool {
+                return true;
+            }
+
+            // rustc keeps every name that starts with `rustc_` to itself, and gives the standard
+            // library new ones faster than a list of them keeps up with. One taken for a macro
+            // that never resolves holds its item back until all else is collected, which for
+            // a `macro_rules!` is after the calls it is in scope of.
+            if segments.len() == 1
+                && (find_builtin_attr_idx(name).is_some() || name.as_str().starts_with("rustc_"))
+            {
+                return true;
+            }
+
+            // `#[blaze::reassociate]`, `#![blaze::sans_io]`, `#[blaze::checkfree]`,
+            // `#[blaze::pure]` and `#[blaze::bits]`, blaze's own inert attributes
+            // (`blaze::parallelizable` reads the first from the item's syntax,
+            // `blaze::sans_io_core` the second from `AttrFlags::SANS_IO`, `blaze::checkfree`
+            // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
+            // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
+            // and `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
+            // (`hir-ty-effects`, from `AttrFlags::effect_attr`), and `#![blaze::specialization]`
+            // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
+            // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
+            // `blaze` is no tool namespace: `#[blaze::cache]` stays the `blaze` crate's
+            // attribute macro.
+            if let [_, attr] = segments
+                && name.as_str() == "blaze"
+                && matches!(
+                    attr.symbol().as_str(),
+                    "reassociate"
+                        | "sans_io"
+                        | "checkfree"
+                        | "pure"
+                        | "bits"
+                        | "nopanic"
+                        | "noalloc"
+                        | "nonblocking"
+                        | "specialization"
+                        | "specialization_trait"
+                        // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.
+                        | "linear"
+                        | "consumes"
+                        // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
+                        // (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+                        | "arbitrary_ints"
+                        // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
+                        // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
+                        | "reflect"
+                        // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
+                        | "sealed"
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub(super) fn attr_macro_as_call_id(
+    db: &Db,
+    item_attr: &AstIdWithPath<ast::Item>,
+    macro_attr: &Attr,
+    censored_attr_ids: AttrMacroAttrIds,
+    krate: Crate,
+    def: MacroDefId,
+    macro_depth: u32,
+) -> MacroCallId {
+    let arg = match macro_attr.input.as_deref() {
+        Some(AttrInput::TokenTree(tt)) => {
+            // alloc: the attribute macro call's own argument (its delimiter is changed), once per call
+            let mut tt = tt.copy();
+            tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+            Some(tt)
+        }
+
+        _ => None,
+    };
+
+    def.make_call(
+        db,
+        krate,
+        MacroCallKind::Attr {
+            ast_id: item_attr.ast_id,
+            attr_args: arg.map(Into::into),
+            censored_attr_ids,
+        },
+        macro_attr.ctxt,
+        macro_depth,
+    )
+}
+
+pub(super) fn derive_macro_as_call_id(
+    db: &Db,
+    item_attr: &AstIdWithPath<ast::Adt>,
+    derive_attr_index: AttrId,
+    derive_pos: u32,
+    call_site: SyntaxContext,
+    krate: Crate,
+    resolver: impl Fn(&ModPath) -> Option<(MacroId, MacroDefId)>,
+    derive_macro_id: MacroCallId,
+    macro_depth: u32,
+) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
+    let (macro_id, def_id) = resolver(&item_attr.path)
+        .filter(|(_, def_id)| def_id.is_derive())
+        .ok_or_else(|| UnresolvedMacro { path: item_attr.path })?;
+    let call_id = def_id.make_call(
+        db,
+        krate,
+        MacroCallKind::Derive {
+            ast_id: item_attr.ast_id,
+            derive_index: derive_pos,
+            derive_attr_index,
+            derive_macro_id,
+        },
+        call_site,
+        macro_depth,
+    );
+    Ok((macro_id, def_id, call_id))
+}

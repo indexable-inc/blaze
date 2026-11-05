@@ -1,0 +1,6 @@
+// Flecs itself rejects this: an unknown member. Flecs stops at its first error, so only one shows.
+site {
+  broken : Doc {
+    P why(nope: 1)
+  }
+}

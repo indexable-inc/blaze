@@ -1,0 +1,137 @@
+; Follows cranelift/filetests/filetests/runtests/simd-valltrue.clif (and
+; simd-valltrue-64bit.clif), for the stencil set: `vall_true` of each integer vector type, on
+; all lanes zero, one lane zero in each position class (first, middle, last), all lanes
+; nonzero with only a high or only a low byte set (which a byte-wise or 32-bit-wise compare
+; gets wrong), and of an `icmp` mask, branched on and selected on. Upstream's
+; `vall_true.f32x4`/`f64x2` are a `bitcast` to the integer vector here: the stencil set has
+; `vall_true` of integer vectors only.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %vall_true_i8x16(i8x16) -> i8 {
+block0(v0: i8x16):
+    v1 = vall_true v0
+    return v1
+}
+; run: %vall_true_i8x16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vall_true_i8x16([-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vall_true_i8x16([-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1]) == 1
+; run: %vall_true_i8x16(0xffffffffffffffffffffffffffffff00) == 0
+; run: %vall_true_i8x16(0x00ffffffffffffffffffffffffffffff) == 0
+; run: %vall_true_i8x16(0xffffffffffffff00ffffffffffffffff) == 0
+; run: %vall_true_i8x16(0x01010101010101010101010101010101) == 1
+; run: %vall_true_i8x16(0xe66021830506f2fffdfebfc8c8c8c8c8) == 1
+; run: %vall_true_i8x16([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 1
+; run: %vall_true_i8x16([1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0]) == 0
+; run: %vall_true_i8x16([1 2 3 4 5 6 7 0 9 10 11 12 13 14 15 16]) == 0
+; run: %vall_true_i8x16([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 0x7f]) == 1
+
+function %vall_true_i16x8(i16x8) -> i8 {
+block0(v0: i16x8):
+    v1 = vall_true v0
+    return v1
+}
+; run: %vall_true_i16x8([0 0 0 0 0 0 0 0]) == 0
+; run: %vall_true_i16x8([-1 0 0 0 0 0 0 0]) == 0
+; run: %vall_true_i16x8([-1 -1 -1 -1 -1 -1 -1 -1]) == 1
+; run: %vall_true_i16x8([0x100 0x100 0x100 0x100 0x100 0x100 0x100 0x100]) == 1
+; run: %vall_true_i16x8([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000]) == 1
+; run: %vall_true_i16x8([0xff00 0xff 1 2 3 4 5 6]) == 1
+; run: %vall_true_i16x8([1 1 1 1 1 1 1 0]) == 0
+; run: %vall_true_i16x8([1 1 1 0 1 1 1 1]) == 0
+
+function %vall_true_i32x4(i32x4) -> i8 {
+block0(v0: i32x4):
+    v1 = vall_true v0
+    return v1
+}
+; run: %vall_true_i32x4([0 0 0 0]) == 0
+; run: %vall_true_i32x4([-1 0 0 0]) == 0
+; run: %vall_true_i32x4([-1 -1 -1 -1]) == 1
+; run: %vall_true_i32x4([0x10000 0x1000000 0x100 1]) == 1
+; run: %vall_true_i32x4([0x80000000 0x80000000 0x80000000 0x80000000]) == 1
+; run: %vall_true_i32x4([1 1 0 1]) == 0
+; run: %vall_true_i32x4([1 1 1 0]) == 0
+
+function %vall_true_i64x2(i64x2) -> i8 {
+block0(v0: i64x2):
+    v1 = vall_true v0
+    return v1
+}
+; run: %vall_true_i64x2([0 0]) == 0
+; run: %vall_true_i64x2([-1 0]) == 0
+; run: %vall_true_i64x2([-1 -1]) == 1
+; run: %vall_true_i64x2([0xffffffff00000000 -1]) == 1
+; run: %vall_true_i64x2([0x100000000 1]) == 1
+; run: %vall_true_i64x2([0x8000000000000000 0x8000000000000000]) == 1
+; run: %vall_true_i64x2([1 0]) == 0
+; run: %vall_true_i64x2([0 0x8000000000000000]) == 0
+
+function %vall_true_f32x4(f32x4) -> i8 {
+block0(v0: f32x4):
+    v1 = bitcast.i32x4 little v0
+    v2 = vall_true v1
+    return v2
+}
+; run: %vall_true_f32x4([0x0.0 0x0.0 0x0.0 0x0.0]) == 0
+; run: %vall_true_f32x4([0x0.0 -0x0.0 0x0.0 0x0.0]) == 0
+; run: %vall_true_f32x4([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 1
+; run: %vall_true_f32x4([0x1.0p0 0x1.0p0 0x1.0p0 0x1.0p0]) == 1
+
+function %vall_true_f64x2(f64x2) -> i8 {
+block0(v0: f64x2):
+    v1 = bitcast.i64x2 little v0
+    v2 = vall_true v1
+    return v2
+}
+; run: %vall_true_f64x2([0x0.0 0x0.0]) == 0
+; run: %vall_true_f64x2([0x0.0 -0x0.0]) == 0
+; run: %vall_true_f64x2([-0x0.0 -0x0.0]) == 1
+; run: %vall_true_f64x2([0x1.0p0 0x0.0000000000001p-1022]) == 1
+
+function %vall_true_icmp_eq_i32x4(i32x4, i32x4) -> i8 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = icmp eq v0, v1
+    v3 = vall_true v2
+    return v3
+}
+; run: %vall_true_icmp_eq_i32x4([1 2 3 4], [1 2 3 4]) == 1
+; run: %vall_true_icmp_eq_i32x4([1 2 3 4], [1 2 3 5]) == 0
+; run: %vall_true_icmp_eq_i32x4([0 0 0 0], [0 0 0 0]) == 1
+
+function %vall_true_icmp_slt_i8x16(i8x16, i8x16) -> i8 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = icmp slt v0, v1
+    v3 = vall_true v2
+    return v3
+}
+; run: %vall_true_icmp_slt_i8x16([0x80 -1 0 1 2 3 4 5 6 7 8 9 10 11 12 13], [0x81 0 1 2 3 4 5 6 7 8 9 10 11 12 13 0x7f]) == 1
+; run: %vall_true_icmp_slt_i8x16([0x80 -1 0 1 2 3 4 5 6 7 8 9 10 11 12 0x7f], [0x81 0 1 2 3 4 5 6 7 8 9 10 11 12 13 0x7f]) == 0
+
+function %vall_true_brif_i16x8(i16x8) -> i32 {
+block0(v0: i16x8):
+    v1 = vall_true v0
+    brif v1, block1, block2
+
+block1:
+    v2 = iconst.i32 100
+    return v2
+
+block2:
+    v3 = iconst.i32 200
+    return v3
+}
+; run: %vall_true_brif_i16x8([1 2 3 4 5 6 7 8]) == 100
+; run: %vall_true_brif_i16x8([1 2 3 4 0 6 7 8]) == 200
+; run: %vall_true_brif_i16x8([0x100 0x200 0x400 0x800 0x1000 0x2000 0x4000 0x8000]) == 100
+
+function %vall_true_select_i64x2(i64x2, i64, i64) -> i64 {
+block0(v0: i64x2, v1: i64, v2: i64):
+    v3 = vall_true v0
+    v4 = select v3, v1, v2
+    return v4
+}
+; run: %vall_true_select_i64x2([1 0x100000000], 7, 9) == 7
+; run: %vall_true_select_i64x2([0x100000000 0], 7, 9) == 9

@@ -1,0 +1,59 @@
+--- frame 0
+     Waiting for the daemon 0.10s
+--- frame 40
+   Resolving names 0.00s
+             0 done · 0 under way · 21 waiting
+--- frame 80
+   Resolving names 0.30s · 2/56 crates · longest rg
+             rg  resolving  0.19s
+             ├─ textwrap  resolving  0.19s
+             │  └─ std  resolving  0.09s
+             ├─ lexopt waiting
+             ├─ anyhow waiting
+             ├─ log waiting
+             ├─ termcolor waiting
+             ├─ serde_json waiting
+             │  ├─ memchr waiting
+             │  ├─ ryu waiting
+             0 done · 3 under way · 32 waiting · longest chain 0.59s: rg ← textwrap ← std
+--- frame 120
+   Resolving names 0.30s · 2/56 crates · longest rg
+             rg  resolving  0.20s
+             ├─ ignore  resolving  0.08s
+             │  ├─ crossbeam_deque  resolving  0.08s
+             │  │  └─ crossbeam_epoch  resolving  0.08s
+             │  └─ globset  resolving  0.08s
+             │     └─ bstr  resolving  0.08s
+             └─ grep waiting
+                ├─ grep_regex waiting
+                ├─ grep_searcher waiting
+                ├─ grep_printer waiting
+             0 done · 6 under way · 29 waiting · longest chain 0.56s: rg ← ignore ← crossbeam_deque ← crossb…
+--- frame 160
+   Resolving names 0.30s · 2/56 crates · longest rg
+             rg  resolving  0.20s
+             ├─ grep  resolving  0.07s
+             │  ├─ grep_printer  resolving  0.07s
+             │  │  ├─ grep_searcher  resolving  0.05s
+             │  │  │  ├─ encoding_rs_io  resolving  0.05s
+             │  │  │  │  └─ encoding_rs  resolving  0.05s
+             │  │  └─ termcolor  resolving  0.04s
+             │  └─ grep_cli waiting
+             0 done · 7 under way · 28 waiting · longest chain 0.61s: rg ← grep ← grep_printer ← grep_search…
+--- frame 200
+   Compiling rg 1.56s
+             8 done (8 up to date) · 0 under way · 27 waiting · longest chain 0.54s: rg ← grep ← grep_printe…
+--- frame 240
+   Finishing 3.91s · 31219/31219 fns
+             35 done (35 up to date) · 0 under way · 0 waiting · longest chain 0.54s: rg ← grep ← grep_print…
+--- frame 280
+    Building build scripts and proc macros 0.01s · 0/14 steps · 31219/31219 fns
+             35 done (35 up to date) · 0 under way · 0 waiting · longest chain 0.54s: rg ← grep ← grep_print…
+--- left on the screen (283 frames drawn)
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.ZOTyZV7zQT/again)
+       Built build scripts and proc macros in 0.94s
+     Checked 74 files in 0.59s
+      Stored the manifest in 3.83s
+       Built from the store: 31219 fns found, 1 compiled; 7.78s
+        Took 7.78s: storing the build in the store 3.83s, compiling functions 1.68s, building build scripts and proc macros 1.03s
+    Finished `dev` profile [blaze] target(s) in 7.81s

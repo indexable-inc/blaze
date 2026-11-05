@@ -1,0 +1,95 @@
+; Follows cranelift/filetests/filetests/runtests/cls.clif, for the stencil set: `cls` of
+; `i8` to `i64`: leading bits equal to the sign bit, the sign bit not counted. The `i128`
+; form is i128-bitops.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %cls_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = cls v0
+    return v1
+}
+; run: %cls_i8(0) == 7
+; run: %cls_i8(1) == 6
+; run: %cls_i8(-1) == 7
+; run: %cls_i8(-128) == 0
+; run: %cls_i8(127) == 0
+; run: %cls_i8(-127) == 0
+; run: %cls_i8(126) == 0
+; run: %cls_i8(2) == 5
+; run: %cls_i8(100) == 0
+; run: %cls_i8(-77) == 0
+; run: %cls_i8(8) == 3
+; run: %cls_i8(16) == 2
+; run: %cls_i8(64) == 0
+; run: %cls_i8(15) == 3
+; run: %cls_i8(-16) == 3
+; run: %cls_i8(120) == 0
+
+function %cls_i16(i16) -> i16 {
+block0(v0: i16):
+    v1 = cls v0
+    return v1
+}
+; run: %cls_i16(0) == 15
+; run: %cls_i16(1) == 14
+; run: %cls_i16(-1) == 15
+; run: %cls_i16(0x8000) == 0
+; run: %cls_i16(0x7fff) == 0
+; run: %cls_i16(0x8001) == 0
+; run: %cls_i16(0x7ffe) == 0
+; run: %cls_i16(2) == 13
+; run: %cls_i16(0x3039) == 1
+; run: %cls_i16(0xa460) == 0
+; run: %cls_i16(128) == 7
+; run: %cls_i16(256) == 6
+; run: %cls_i16(0x4000) == 0
+; run: %cls_i16(255) == 7
+; run: %cls_i16(-256) == 7
+; run: %cls_i16(0x5678) == 0
+
+function %cls_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = cls v0
+    return v1
+}
+; run: %cls_i32(0) == 31
+; run: %cls_i32(1) == 30
+; run: %cls_i32(-1) == 31
+; run: %cls_i32(0x80000000) == 0
+; run: %cls_i32(0x7fffffff) == 0
+; run: %cls_i32(0x80000001) == 0
+; run: %cls_i32(0x7ffffffe) == 0
+; run: %cls_i32(2) == 29
+; run: %cls_i32(0x075bcd15) == 4
+; run: %cls_i32(0xc521974f) == 1
+; run: %cls_i32(0x00008000) == 15
+; run: %cls_i32(0x00010000) == 14
+; run: %cls_i32(0x40000000) == 0
+; run: %cls_i32(0x0000ffff) == 15
+; run: %cls_i32(0xffff0000) == 15
+; run: %cls_i32(0x12345678) == 2
+
+function %cls_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = cls v0
+    return v1
+}
+; run: %cls_i64(0) == 63
+; run: %cls_i64(1) == 62
+; run: %cls_i64(-1) == 63
+; run: %cls_i64(0x8000000000000000) == 0
+; run: %cls_i64(0x7fffffffffffffff) == 0
+; run: %cls_i64(0x8000000000000001) == 0
+; run: %cls_i64(0x7ffffffffffffffe) == 0
+; run: %cls_i64(2) == 61
+; run: %cls_i64(0x123456789abcdef0) == 2
+; run: %cls_i64(0xf0123456789abcdf) == 3
+; run: %cls_i64(0x0000000080000000) == 31
+; run: %cls_i64(0x0000000100000000) == 30
+; run: %cls_i64(0x4000000000000000) == 0
+; run: %cls_i64(0x00000000ffffffff) == 31
+; run: %cls_i64(0xffffffff00000000) == 31
+; run: %cls_i64(0x1234567812345678) == 2

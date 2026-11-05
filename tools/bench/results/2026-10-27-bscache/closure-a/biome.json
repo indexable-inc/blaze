@@ -1,0 +1,620 @@
+{
+ "project": "biome",
+ "rev": "c5c3383d590d6e08b08d625d10d1d557577284d7",
+ "status": 101,
+ "seconds": 69.49,
+ "failed": [
+  "biome_css_analyze v0.7.0",
+  "biome_graphql_analyze v0.7.0",
+  "biome_html_analyze v0.5.7",
+  "biome_js_analyze v0.5.7",
+  "biome_json_analyze v0.7.0",
+  "biome_markdown_analyze v0.1.0",
+  "biome_yaml_analyze v0.1.0"
+ ],
+ "stderr_tail": "/biome/Cargo.toml, kept on this machine alone\n   Compiling biome_grit_patterns v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_grit_patterns)\n   Compiling ignore v0.4.25\n   Compiling biome_manifest v0.0.1 (/root/bs/cl/work/src/biome/crates/biome_manifest)\n   Compiling inotify-sys v0.1.5\n   Compiling wasm-bindgen-shared v0.2.117\n   Compiling pastey v0.1.1\n   Compiling winnow v1.0.1\n   Compiling inotify v0.11.0\n   Compiling biome_markdown_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_markdown_formatter)\n   Compiling toml_parser v1.1.2+spec-1.1.0\n   Compiling biome_plugin_loader v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_plugin_loader)\n   Compiling biome_js_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_js_formatter)\n   Compiling biome_html_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_html_formatter)\n   Compiling biome_json_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_json_formatter)\n   Compiling mio v1.2.0\n   Compiling bpaf_derive v0.5.26\n   Compiling toml_datetime v1.1.1+spec-1.1.0\n   Compiling pkg-config v0.3.34\n   Compiling percent-encoding v2.3.2\n   Compiling notify-types v2.0.0\n   Compiling notify v8.2.0\n   Compiling bpaf v0.9.28\n   Compiling biome_markdown_parser v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_markdown_parser)\n   Compiling toml_edit v0.25.13+spec-1.1.0\n   Compiling biome_html_parser v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_html_parser)\n   Compiling biome_graphql_parser v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_graphql_parser)\n   Compiling biome_grit_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_grit_formatter)\n   Compiling biome_graphql_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_graphql_formatter)\n   Compiling biome_css_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_css_formatter)\n   Compiling biome_yaml_formatter v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_yaml_formatter)\n   Compiling tokio v1.53.3\n   Compiling synstructure v0.13.2\n   Compiling web-time v1.1.0\n   Compiling semver v1.0.27\n   Compiling rustc_version v0.4.1\n   Compiling proc-macro-crate v3.5.0\n   Compiling libz-sys v1.1.8\n   Compiling ring v0.17.13\n   Compiling phf_shared v0.14.0\n   Compiling autocfg v1.1.0\n   Compiling bumpalo v3.12.0\n   Compiling cfg_aliases v0.2.1\n   Compiling nix v0.31.2\n   Compiling wasm-bindgen-macro-support v0.2.117\n   Compiling num-traits v0.2.19\n   Compiling phf_generator v0.14.0\n   Compiling float16 v0.1.7\n   Compiling libgit2-sys v0.18.5+1.9.4\n   Compiling wasm-bindgen v0.2.117\n   Compiling encoding_rs v0.8.42\n   Compiling globwalk v0.9.1\n   Compiling tikv-jemalloc-sys v0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7\n   Compiling codspeed v5.0.1\n   Compiling itertools v0.14.0\n   Compiling divan-macros v0.1.17\n   Compiling synstructure v0.14.0\n   Compiling codspeed-criterion-compat v5.0.1\n   Compiling getrandom v0.3.4\n   Compiling rustls v0.23.46\n   Compiling crc32fast v1.3.2\n   Compiling self_update v1.3.1\n   Compiling target-triple v1.0.0\n   Compiling icu_properties_data v2.3.0\n   Compiling case v1.0.0\n   Compiling cow-utils v0.1.3\n   Compiling heck v0.5.0\n   Compiling getrandom v0.4.3\n   Compiling codspeed-divan-compat v5.0.1\n   Compiling num-conv v0.2.2\n   Compiling thiserror v2.0.20\n   Compiling time-core v0.1.9\n   Compiling httparse v1.10.1\n   Compiling owo-colors v4.3.0\n   Compiling icu_normalizer_data v2.3.0\n   Compiling time-macros v0.2.32\n   Compiling strum_macros v0.28.0\n   Compiling boa_macros v0.22.0\n   Compiling tests_macros v0.0.0 (/root/bs/cl/work/src/biome/crates/tests_macros)\n   Compiling codspeed-divan-compat-macros v5.0.1\nerror: failed to run custom build command for `biome_js_analyze v0.5.7 (/root/bs/cl/work/src/biome/crates/biome_js_analyze)`\n\nCaused by:\n  process didn't exit successfully: `/root/bs/cl/work/target/biome/debug/build/biome_js_analyze/e0e241e015d6b492/out/build_script_build` (exit status: 1)\n  --- stdout\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/no_duplicate_classes.rs\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/organize_imports.rs\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/use_sorted_attributes.rs\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/use_sorted_enum_members.rs\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/use_sorted_interface_members.rs\n  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs\n\n  --- stderr\n  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }\n  note: the build script of `biome_js_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_js_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone\n   Compiling wasm-bindgen-macro v0.2.117\n   Compiling phf_macros v0.14.0\n   Compiling num_enum_derive v0.7.6\n   Compiling zerofrom-derive v0.1.7\n   Compiling yoke-derive v0.8.2\n   Compiling yoke-derive v0.7.4\n   Compiling zerovec-derive v0.11.6\n   Compiling thiserror-impl v2.0.20\n   Compiling serial_test_derive v3.3.1\n   Compiling pin-project-internal v1.1.10\n   Compiling dynify-macros v0.1.2\n   Compiling quickcheck_macros v1.2.0\n   Compiling equator-macro v0.4.2\n   Compiling futures-macro v0.3.32\n   Compiling bytemuck_derive v1.10.2\n   Compiling displaydoc v0.2.5\n   Compiling tokio-macros v2.7.0\n   Compiling zerovec-derive v0.10.3\n   Compiling icu_provider_macros v1.5.0\n   Compiling multiversion_no_op v1.0.0\n   Compiling pastey v0.2.3\n",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.104",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "biome_aria_metadata",
+   "version": "0.7.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "biome_css_analyze",
+   "version": "0.7.0",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "failed to run custom build command for `biome_css_analyze v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_css_analyze)`",
+    "",
+    "Caused by:",
+    "  process didn't exit successfully: `/root/bs/cl/work/target/biome/debug/build/biome_css_analyze/369198105d6c5320/out/build_script_build` (exit status: 1)",
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_css_analyze/src/assist/source",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_css_analyze/src/assist/source/use_sorted_properties.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_css_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_css_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone"
+   ]
+  },
+  {
+   "package": "biome_diagnostics_categories",
+   "version": "0.7.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "biome_graphql_analyze",
+   "version": "0.7.0",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_graphql_sorted_arguments.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_graphql_sorted_definitions.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_graphql_sorted_variables.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_sorted_enum_members.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_sorted_selection_set.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_graphql_analyze/src/assist/source/use_sorted_type_fields.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_graphql_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_graphql_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone"
+   ]
+  },
+  {
+   "package": "biome_html_analyze",
+   "version": "0.5.7",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "failed to run custom build command for `biome_html_analyze v0.5.7 (/root/bs/cl/work/src/biome/crates/biome_html_analyze)`",
+    "",
+    "Caused by:",
+    "  process didn't exit successfully: `/root/bs/cl/work/target/biome/debug/build/biome_html_analyze/6fd2ec3c271b3b65/out/build_script_build` (exit status: 1)",
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_html_analyze/src/assist/source",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_html_analyze/src/assist/source/no_duplicate_classes.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_html_analyze/src/assist/source/use_sorted_attributes.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_html_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_html_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone"
+   ]
+  },
+  {
+   "package": "biome_js_analyze",
+   "version": "0.5.7",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "   Compiling codspeed-divan-compat v5.0.1",
+    "   Compiling num-conv v0.2.2",
+    "   Compiling thiserror v2.0.20",
+    "   Compiling time-core v0.1.9",
+    "   Compiling httparse v1.10.1",
+    "   Compiling owo-colors v4.3.0",
+    "   Compiling icu_normalizer_data v2.3.0",
+    "   Compiling time-macros v0.2.32",
+    "   Compiling strum_macros v0.28.0",
+    "   Compiling boa_macros v0.22.0",
+    "   Compiling tests_macros v0.0.0 (/root/bs/cl/work/src/biome/crates/tests_macros)",
+    "   Compiling codspeed-divan-compat-macros v5.0.1"
+   ]
+  },
+  {
+   "package": "biome_js_analyze",
+   "version": "0.5.7",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "   Compiling codspeed-divan-compat v5.0.1",
+    "   Compiling num-conv v0.2.2",
+    "   Compiling thiserror v2.0.20",
+    "   Compiling time-core v0.1.9",
+    "   Compiling httparse v1.10.1",
+    "   Compiling owo-colors v4.3.0",
+    "   Compiling icu_normalizer_data v2.3.0",
+    "   Compiling time-macros v0.2.32",
+    "   Compiling strum_macros v0.28.0",
+    "   Compiling boa_macros v0.22.0",
+    "   Compiling tests_macros v0.0.0 (/root/bs/cl/work/src/biome/crates/tests_macros)",
+    "   Compiling codspeed-divan-compat-macros v5.0.1"
+   ]
+  },
+  {
+   "package": "biome_json_analyze",
+   "version": "0.7.0",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_json_analyze/src/assist/source",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_json_analyze/src/assist/source/use_sorted_package_json.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_json_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_json_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone",
+    "   Compiling biome_grit_parser v0.7.0 (/root/bs/cl/work/src/biome/crates/biome_grit_parser)",
+    "   Compiling pulldown-cmark-escape v0.11.0",
+    "   Compiling rustversion v1.0.19",
+    "   Compiling ryu-js v1.0.3"
+   ]
+  },
+  {
+   "package": "biome_markdown_analyze",
+   "version": "0.1.0",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery/use_consistent_heading_level.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery/use_consistent_unicode_bom.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery/use_fenced_code_language.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery/use_single_top_level_heading.rs",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_markdown_analyze/src/lint/nursery/use_top_level_heading.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_markdown_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_markdown_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone",
+    "   Compiling htmlize v1.0.6"
+   ]
+  },
+  {
+   "package": "biome_yaml_analyze",
+   "version": "0.1.0",
+   "ok": false,
+   "kept": false,
+   "notes": [],
+   "tail": [
+    "failed to run custom build command for `biome_yaml_analyze v0.1.0 (/root/bs/cl/work/src/biome/crates/biome_yaml_analyze)`",
+    "",
+    "Caused by:",
+    "  process didn't exit successfully: `/root/bs/cl/work/target/biome/debug/build/biome_yaml_analyze/8fc87b6f4d3ca919/out/build_script_build` (exit status: 1)",
+    "  --- stdout",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_yaml_analyze/src/lint/nursery",
+    "  cargo:rerun-if-changed=/root/bs/cl/work/src/biome/crates/biome_yaml_analyze/src/lint/nursery/no_duplicate_map_keys.rs",
+    "",
+    "  --- stderr",
+    "  Error: Os { code: 30, kind: ReadOnlyFilesystem, message: \"Read-only file system\" }",
+    "  note: the build script of `biome_yaml_analyze` failed in its closure, which has the toolchain and the libc sysroot alone, and wrote outside OUT_DIR, which is the one place a run may write; a script that writes its package's sources runs outside with `unsandboxed-build-scripts = [\"biome_yaml_analyze\"]` under [workspace.metadata.blaze.sandbox] in /root/bs/cl/work/src/biome/Cargo.toml, kept on this machine alone"
+   ]
+  },
+  {
+   "package": "camino",
+   "version": "1.2.6",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "codspeed",
+   "version": "5.0.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "codspeed-criterion-compat",
+   "version": "5.0.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "codspeed-divan-compat",
+   "version": "5.0.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crc32fast",
+   "version": "1.3.2",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-epoch",
+   "version": "0.9.20",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "encoding_rs",
+   "version": "0.8.42",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "float16",
+   "version": "0.1.7",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.3.4",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.4.3",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "htmlize",
+   "version": "1.0.6",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "httparse",
+   "version": "1.10.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_normalizer_data",
+   "version": "2.3.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_properties_data",
+   "version": "2.3.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.190",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libgit2-sys",
+   "version": "0.18.5+1.9.4",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libz-sys",
+   "version": "1.1.8",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "nix",
+   "version": "0.31.2",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": false,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name probe0 --crate-type=lib --out-dir /root/bs/cl/work/target/biome/debug/build/num-traits/1d5f8e2759853bdd/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name probe1 --crate-type=lib --out-dir /root/bs/cl/work/target/biome/debug/build/num-traits/1d5f8e2759853bdd/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name probe2 --crate-type=lib --out-dir /root/bs/cl/work/target/biome/debug/build/num-traits/1d5f8e2759853bdd/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "object",
+   "version": "0.37.3",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "owo-colors",
+   "version": "4.3.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "parking_lot_core",
+   "version": "0.9.12",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "portable-atomic",
+   "version": "1.15.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "prettyplease",
+   "version": "0.2.37",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.107",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "pulldown-cmark",
+   "version": "0.13.3",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "quote",
+   "version": "1.0.47",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "radium",
+   "version": "0.7.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rayon-core",
+   "version": "1.13.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "ref-cast",
+   "version": "1.0.25",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "ring",
+   "version": "0.17.13",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "1.0.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustls",
+   "version": "0.23.46",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustversion",
+   "version": "1.0.19",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "self_update",
+   "version": "1.3.1",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.229",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.229",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_core",
+   "version": "1.0.229",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_core",
+   "version": "1.0.229",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.151",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "syn",
+   "version": "1.0.109",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "target-triple",
+   "version": "1.0.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "1.0.63",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "2.0.20",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "tikv-jemalloc-sys",
+   "version": "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "typeid",
+   "version": "1.0.3",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "unicase",
+   "version": "2.6.0",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "wasm-bindgen",
+   "version": "0.2.117",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "wasm-bindgen-shared",
+   "version": "0.2.117",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "zmij",
+   "version": "1.0.2",
+   "ok": true,
+   "kept": false,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

@@ -1,0 +1,5 @@
+[build]
+rustflags = ["--cfg", "more"]
+incremental = true
+[http]
+timeout = 30

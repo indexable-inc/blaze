@@ -1,0 +1,31 @@
+[package]
+name = "libzstd-rs-sys"
+version = "0.0.1-prerelease.2"
+repository = "https://github.com/trifectatechfoundation/libzstd-rs-sys"
+description = "a rust implementation of zstd compression and decompression"
+license = "BSD-3-Clause"
+edition = "2021"
+rust-version = "1.95"
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[lib]
+name = "libzstd_rs_sys"
+path = "c2rust-lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = ["rust-allocator"]
+export-symbols = [] # whether the zstd api symbols are publicly exported
+custom-prefix = ["export-symbols"] # use the LIBZSTD_RS_SYS_PREFIX to prefix all exported symbols
+semver-prefix = ["export-symbols"] # prefix all symbols in a semver-compatible way
+no-prefetch = [] # do not prefetch
+trace = []
+nightly = []
+c-allocator = []
+rust-allocator = []
+unsafe-performance-experimental = []

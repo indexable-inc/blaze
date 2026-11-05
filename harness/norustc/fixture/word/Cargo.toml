@@ -1,0 +1,10 @@
+[package]
+name = "word"
+version = "0.1.0"
+edition = "2021"
+
+# Features of a package the root depends on only through another: the doctests are
+# built with them.
+[features]
+default = ["split"]
+split = []

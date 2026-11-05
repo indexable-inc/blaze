@@ -1,0 +1,20 @@
+[package]
+name = "blaze-spin"
+description = "blaze's one bounded spin (AGENTS.md rules 9 and 13): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[lints]
+workspace = true

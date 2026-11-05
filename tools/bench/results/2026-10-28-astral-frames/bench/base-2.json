@@ -1,0 +1,665 @@
+{
+ "toolchain": "nightly-2026-10-27",
+ "machine": "aarch64",
+ "cores": 16,
+ "runs": 5,
+ "cold_runs": 1,
+ "commit": "f7f0c4d1426349538292558b227aec131a4a848c",
+ "date": "2026-10-28T18:50:06Z",
+ "host": {
+  "name": "ix-astral-arm64-16",
+  "cpu": "Neoverse-V3",
+  "cores": 16,
+  "machine_cores": 16,
+  "load": "1.4, 1.2, 0.6",
+  "memory_gib": 16,
+  "os": "Linux",
+  "arch": "aarch64",
+  "kernel": "7.2.11",
+  "rustc": "rustc 1.101.0-nightly (16d1ffac1 2026-10-26)",
+  "cc": "gcc (GCC) 16.2.0",
+  "ld": "GNU ld (GNU Binutils) 2.46",
+  "llvm": "23.1.4",
+  "incremental": "profile default (on for dev)",
+  "wrapper": null,
+  "linker": "the toolchain's default (cc)",
+  "library_dirs": 4
+ },
+ "backends": {
+  "cranelift": {
+   "BLAZE_BACKEND": "cranelift"
+  }
+ },
+ "setups": {},
+ "results": {
+  "ripgrep/cranelift": {
+   "phases": {
+    "cold": {
+     "wall_s": 14.171,
+     "cargo_s": 4.169,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "build_s": 14.162,
+     "warm_s": 0.01,
+     "samples_s": [
+      14.171
+     ],
+     "cargo_samples_s": [
+      4.169
+     ],
+     "build_samples_s": [
+      14.162
+     ],
+     "setups": {},
+     "compiled": 31253,
+     "steps_s": {
+      "load": 5.6,
+      "resolve": 0.522,
+      "compile": 2.3,
+      "emit": 0.0,
+      "link": 0.119
+     },
+     "threads_s": {
+      "infer": 1.8,
+      "mir": 2.5,
+      "monomorphize": 0.582,
+      "translate": 8.5,
+      "describe": 0.16,
+      "store read": 0.084,
+      "store write": 0.662,
+      "cranelift": 3.0
+     },
+     "started_over": [],
+     "memory": {
+      "blaze": {
+       "peak_mb": 3207,
+       "peak_max_mb": 3207,
+       "largest_mb": 2843,
+       "resident_mb": 2346
+      },
+      "cargo": {
+       "peak_mb": 1688,
+       "peak_max_mb": 1688,
+       "largest_mb": 493
+      }
+     },
+     "disk_mb": {
+      "target": 573,
+      "store": 273,
+      "home": 13,
+      "cargo target": 328
+     },
+     "std_made_s": 18.821,
+     "warm_store_build_s": 7.277,
+     "warm_store_s": 7.284,
+     "warm_store_samples_s": [
+      7.284
+     ],
+     "warm_store_memory": {
+      "peak_mb": 1958,
+      "resident_mb": 1449
+     }
+    },
+    "no-op": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 2197,
+       "peak_max_mb": 2352,
+       "largest_mb": 2174,
+       "resident_mb": 2197
+      },
+      "cargo": {
+       "peak_mb": 35,
+       "peak_max_mb": 35,
+       "largest_mb": 35
+      }
+     },
+     "wall_s": 0.006,
+     "cargo_s": 0.025,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "compiled": 0,
+     "samples_s": [
+      0.017,
+      0.006,
+      0.006,
+      0.006,
+      0.006
+     ],
+     "cargo_samples_s": [
+      0.026,
+      0.025,
+      0.81,
+      0.025,
+      0.025
+     ],
+     "setups": {}
+    },
+    "body": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 2226,
+       "peak_max_mb": 4351,
+       "largest_mb": 1857,
+       "resident_mb": 1875
+      },
+      "cargo": {
+       "peak_mb": 617,
+       "peak_max_mb": 647,
+       "largest_mb": 353
+      }
+     },
+     "wall_s": 0.117,
+     "cargo_s": 0.861,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 141,
+     "places": 1,
+     "steps_ms": {
+      "settle": 0.15,
+      "read": 2.06,
+      "apply": 3.34,
+      "roots": 43.72,
+      "check": 39.62,
+      "reach": 0.74,
+      "resolve": 1.01,
+      "define": 0.08,
+      "object": 1.47,
+      "discarded": 0.0,
+      "statics": 0.43,
+      "setup": 0.68,
+      "compile-rest": 3.49,
+      "write": 0.0,
+      "build-rest": 0.96,
+      "report": 0.3,
+      "refuse": 0.44,
+      "link": 1.67
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.001,
+      "monomorphize": 0.007,
+      "translate": 0.038,
+      "describe": 0.004,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.483
+     },
+     "started_over": [],
+     "slowest_s": 0.188,
+     "back_s": 0.108,
+     "back_cargo_s": 1.087,
+     "back_link": "spliced",
+     "samples_s": [
+      0.188,
+      0.116,
+      0.118,
+      0.115,
+      0.117
+     ],
+     "cargo_samples_s": [
+      0.945,
+      0.861,
+      0.331,
+      0.709,
+      1.393
+     ],
+     "setups": {}
+    },
+    "signature": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 1910,
+       "peak_max_mb": 1913,
+       "largest_mb": 1858,
+       "resident_mb": 1874
+      },
+      "cargo": {
+       "peak_mb": 648,
+       "peak_max_mb": 649,
+       "largest_mb": 371
+      }
+     },
+     "wall_s": 0.065,
+     "cargo_s": 0.672,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 20,
+     "places": 11,
+     "steps_ms": {
+      "settle": 0.06,
+      "read": 8.27,
+      "apply": 13.24,
+      "roots": 15.62,
+      "check": 24.23,
+      "reach": 1.78,
+      "resolve": 0.6,
+      "define": 0.06,
+      "object": 0.85,
+      "discarded": 0.0,
+      "statics": 0.44,
+      "setup": 0.74,
+      "compile-rest": 0.96,
+      "write": 0.0,
+      "build-rest": 0.63,
+      "report": 0.18,
+      "refuse": 2.62,
+      "link": 0.98
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.001,
+      "monomorphize": 0.001,
+      "translate": 0.015,
+      "describe": 0.001,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.017
+     },
+     "started_over": [],
+     "slowest_s": 0.078,
+     "back_s": 0.059,
+     "back_cargo_s": 0.687,
+     "back_link": "spliced",
+     "samples_s": [
+      0.078,
+      0.064,
+      0.065,
+      0.065,
+      0.073
+     ],
+     "cargo_samples_s": [
+      0.433,
+      0.576,
+      0.778,
+      1.594,
+      0.672
+     ],
+     "setups": {}
+    },
+    "leaf": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 1903,
+       "peak_max_mb": 1904,
+       "largest_mb": 1852,
+       "resident_mb": 1873
+      },
+      "cargo": {
+       "peak_mb": 658,
+       "peak_max_mb": 664,
+       "largest_mb": 372
+      }
+     },
+     "wall_s": 0.028,
+     "cargo_s": 0.819,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 1,
+     "places": 1,
+     "steps_ms": {
+      "settle": 0.13,
+      "read": 3.9,
+      "apply": 5.62,
+      "roots": 1.49,
+      "check": 2.81,
+      "reach": 2.26,
+      "resolve": 0.46,
+      "define": 0.16,
+      "object": 1.07,
+      "discarded": 0.0,
+      "statics": 0.44,
+      "setup": 0.68,
+      "compile-rest": 2.33,
+      "write": 0.0,
+      "build-rest": 0.69,
+      "report": 0.2,
+      "refuse": 0.82,
+      "link": 1.18
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.001,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.0
+     },
+     "started_over": [],
+     "slowest_s": 0.031,
+     "back_s": 0.021,
+     "back_cargo_s": 1.015,
+     "back_link": "spliced",
+     "samples_s": [
+      0.031,
+      0.027,
+      0.027,
+      0.029,
+      0.028
+     ],
+     "cargo_samples_s": [
+      0.58,
+      0.901,
+      0.819,
+      0.78,
+      1.154
+     ],
+     "setups": {}
+    },
+    "generic": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 1906,
+       "peak_max_mb": 1908,
+       "largest_mb": 1854,
+       "resident_mb": 1874
+      },
+      "cargo": {
+       "peak_mb": 649,
+       "peak_max_mb": 658,
+       "largest_mb": 363
+      }
+     },
+     "wall_s": 0.032,
+     "cargo_s": 0.822,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 7,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.13,
+      "read": 0.09,
+      "apply": 5.75,
+      "roots": 1.5,
+      "check": 9.67,
+      "reach": 2.04,
+      "resolve": 0.26,
+      "define": 0.1,
+      "object": 0.84,
+      "discarded": 0.0,
+      "statics": 0.44,
+      "setup": 0.68,
+      "compile-rest": 1.27,
+      "write": 0.0,
+      "build-rest": 0.65,
+      "report": 0.16,
+      "refuse": 0.81,
+      "link": 0.98
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.001,
+      "translate": 0.004,
+      "describe": 0.001,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.004
+     },
+     "started_over": [],
+     "slowest_s": 0.033,
+     "back_s": 0.027,
+     "back_cargo_s": 1.138,
+     "back_link": "spliced",
+     "samples_s": [
+      0.032,
+      0.032,
+      0.032,
+      0.033,
+      0.032
+     ],
+     "cargo_samples_s": [
+      1.104,
+      1.56,
+      0.672,
+      0.822,
+      0.555
+     ],
+     "setups": {}
+    },
+    "struct": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 1911,
+       "peak_max_mb": 1914,
+       "largest_mb": 1859,
+       "resident_mb": 1878
+      },
+      "cargo": {
+       "peak_mb": 658,
+       "peak_max_mb": 675,
+       "largest_mb": 383
+      }
+     },
+     "wall_s": 0.046,
+     "cargo_s": 1.046,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 65,
+     "places": 3,
+     "steps_ms": {
+      "settle": 0.07,
+      "read": 1.64,
+      "apply": 6.51,
+      "roots": 5.99,
+      "check": 19.77,
+      "reach": 0.87,
+      "resolve": 0.37,
+      "define": 0.04,
+      "object": 0.55,
+      "discarded": 0.0,
+      "statics": 0.45,
+      "setup": 0.68,
+      "compile-rest": 1.2,
+      "write": 0.0,
+      "build-rest": 0.71,
+      "report": 0.18,
+      "refuse": 0.98,
+      "link": 0.87
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.006,
+      "translate": 0.016,
+      "describe": 0.001,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.005
+     },
+     "started_over": [],
+     "slowest_s": 0.048,
+     "back_s": 0.042,
+     "back_cargo_s": 0.666,
+     "back_link": "spliced",
+     "samples_s": [
+      0.046,
+      0.048,
+      0.047,
+      0.046,
+      0.045
+     ],
+     "cargo_samples_s": [
+      2.032,
+      0.658,
+      1.046,
+      0.712,
+      1.541
+     ],
+     "setups": {}
+    },
+    "newfn": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 2216,
+       "peak_max_mb": 2258,
+       "largest_mb": 1860,
+       "resident_mb": 1877
+      },
+      "cargo": {
+       "peak_mb": 604,
+       "peak_max_mb": 638,
+       "largest_mb": 322
+      }
+     },
+     "wall_s": 0.124,
+     "cargo_s": 0.4,
+     "rss_mb": 2862,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 142,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.15,
+      "read": 0.93,
+      "apply": 7.01,
+      "roots": 3.65,
+      "check": 18.07,
+      "reach": 0.68,
+      "resolve": 1.01,
+      "define": 0.06,
+      "object": 1.7,
+      "discarded": 0.0,
+      "statics": 0.46,
+      "setup": 0.69,
+      "compile-rest": 3.44,
+      "write": 0.0,
+      "build-rest": 0.69,
+      "report": 0.22,
+      "refuse": 0.52,
+      "link": 1.05
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.002,
+      "monomorphize": 0.007,
+      "translate": 0.031,
+      "describe": 0.004,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.013
+     },
+     "started_over": [],
+     "slowest_s": 0.125,
+     "back_s": 0.116,
+     "back_cargo_s": 0.571,
+     "back_link": "spliced",
+     "samples_s": [
+      0.125,
+      0.124,
+      0.122,
+      0.124,
+      0.125
+     ],
+     "cargo_samples_s": [
+      0.326,
+      0.691,
+      0.4,
+      0.304,
+      1.263
+     ],
+     "setups": {}
+    }
+   },
+   "wrong": [],
+   "tag": "15.1.0",
+   "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+   "store_mb": 342,
+   "store_added_mb": 342,
+   "cold_runs": 1,
+   "resident": {
+    "ready_mb": 2346,
+    "after": [
+     {
+      "phase": "no-op",
+      "builds": 5,
+      "mb": 2197
+     },
+     {
+      "phase": "body",
+      "builds": 15,
+      "mb": 1875
+     },
+     {
+      "phase": "signature",
+      "builds": 25,
+      "mb": 1874
+     },
+     {
+      "phase": "leaf",
+      "builds": 35,
+      "mb": 1873
+     },
+     {
+      "phase": "generic",
+      "builds": 45,
+      "mb": 1874
+     },
+     {
+      "phase": "struct",
+      "builds": 55,
+      "mb": 1878
+     },
+     {
+      "phase": "newfn",
+      "builds": 65,
+      "mb": 1877
+     }
+    ],
+    "end_mb": 1877,
+    "builds": 65
+   },
+   "disk_mb": {
+    "target": 576,
+    "store": 273,
+    "home": 14,
+    "cargo target": 327
+   },
+   "runtime": {
+    "command": [
+     "rg",
+     "-uuu",
+     "--sort",
+     "path",
+     "-c",
+     "\\w+_unchecked\\(|unsafe \\{",
+     "{library}"
+    ],
+    "blaze": {
+     "median_s": 2.2492,
+     "min_s": 2.2484,
+     "max_s": 2.2502,
+     "runs": 10,
+     "peak_mb": 173,
+     "peak_max_mb": 173,
+     "size_mb": 159.5
+    },
+    "cargo debug": {
+     "median_s": 0.3956,
+     "min_s": 0.3951,
+     "max_s": 0.3964,
+     "runs": 10,
+     "peak_mb": 173,
+     "peak_max_mb": 173,
+     "size_mb": 52.1
+    },
+    "cargo release": {
+     "median_s": 0.0424,
+     "min_s": 0.0417,
+     "max_s": 0.0432,
+     "runs": 10,
+     "peak_mb": 173,
+     "peak_max_mb": 173,
+     "size_mb": 32.2
+    }
+   }
+  }
+ }
+}

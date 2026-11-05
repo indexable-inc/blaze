@@ -1,0 +1,78 @@
+[
+	{
+		"name": "static",
+		"comments": false,
+		"discussion": {
+			"viewer": null,
+			"signIn": true
+		}
+	},
+	{
+		"name": "anon",
+		"comments": true,
+		"discussion": {
+			"viewer": null,
+			"signIn": true
+		}
+	},
+	{
+		"name": "user",
+		"comments": true,
+		"discussion": {
+			"viewer": {
+				"id": 1,
+				"login": "octo",
+				"admin": false
+			},
+			"signIn": true
+		}
+	},
+	{
+		"name": "admin",
+		"comments": true,
+		"discussion": {
+			"viewer": {
+				"id": 3,
+				"login": "admin",
+				"admin": true
+			},
+			"signIn": true
+		}
+	},
+	{
+		"name": "no-signin",
+		"comments": true,
+		"discussion": {
+			"viewer": null,
+			"signIn": false
+		}
+	},
+	{
+		"name": "error",
+		"comments": true,
+		"discussion": {
+			"viewer": {
+				"id": 1,
+				"login": "octo",
+				"admin": false
+			},
+			"signIn": true,
+			"error": {
+				"block": "lede",
+				"message": "A comment is 1 to 4000 characters."
+			}
+		}
+	},
+	{
+		"name": "error-page",
+		"comments": true,
+		"discussion": {
+			"viewer": null,
+			"signIn": true,
+			"error": {
+				"block": "_page",
+				"message": "Sign in to comment."
+			}
+		}
+	}
+]

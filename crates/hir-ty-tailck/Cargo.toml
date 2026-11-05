@@ -1,0 +1,28 @@
+[package]
+name = "hir-ty-tailck"
+version = "0.0.0"
+repository.workspace = true
+description = "rustc's checks of explicit tail calls (`become`) over a body's expression store and inference."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+either.workspace = true
+blaze-query.workspace = true
+
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,864 @@
+{
+ "host": "aarch64-apple-darwin",
+ "runs": [
+  {
+   "args": [
+    "build"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--release"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "test",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "doctest",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "test"
+       ],
+       "name": "it"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "args": [
+    "bench",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 1,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "check"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--target",
+    "x86_64-unknown-linux-gnu"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "one"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "one",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "two"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "test",
+    "--profile",
+    "two",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "doctest",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "test"
+       ],
+       "name": "it"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     }
+    ],
+    "roots": [
+     0,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "three"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "three",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": true,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "four"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "four",
+       "opt_level": "s",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "check",
+    "--profile",
+    "test"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "debug"
+   ],
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "debug",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 2,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--profile",
+    "two"
+   ],
+   "env": {
+    "CARGO_PROFILE_TWO_LTO": "thin"
+   },
+   "code": 0,
+   "warnings": [],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT#inh@0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "inh"
+      },
+      "profile": {
+       "name": "two",
+       "opt_level": "s",
+       "lto": "thin",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "abort",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  }
+ ]
+}

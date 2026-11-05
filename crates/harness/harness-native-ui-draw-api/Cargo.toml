@@ -1,0 +1,18 @@
+[package]
+name = "harness-native-ui-draw-api"
+description = "What the draw pass resolves per node (order, opacity, clip), as components the host's renderer reads (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"

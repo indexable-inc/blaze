@@ -1,0 +1,1264 @@
+{
+ "ripgrep": {
+  "polonius": {
+   "bodies": 2980,
+   "infer_ms": 2144.946,
+   "infer_warm_ms": 584.929,
+   "first_check_ms": 841.069,
+   "borrowck_ms": 311.522,
+   "borrowck_excl_mir_ms": 311.462,
+   "ratio_to_infer": 0.5324783007852235,
+   "per_body_us": {
+    "p50": 32,
+    "p99": 1074,
+    "max": 7272
+   },
+   "phases_ms": {
+    "constraints": 123.815,
+    "entry_sets": 6.897,
+    "errors": 1.475,
+    "infer": 9.062,
+    "liveness": 61.447,
+    "loans": 5.625,
+    "mir": 0.06,
+    "moves": 43.483,
+    "scopes": 10.911,
+    "setup": 0.486,
+    "walk": 21.766
+   },
+   "slowest": [
+    {
+     "name": "ignore::default_types::DEFAULT_TYPES",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/default_types.rs",
+     "us": 7272,
+     "infer_us": 5870,
+     "phases_us": {
+      "constraints": 2528,
+      "entry_sets": 0,
+      "errors": 67,
+      "infer": 862,
+      "liveness": 1237,
+      "loans": 266,
+      "mir": 0,
+      "moves": 895,
+      "scopes": 370,
+      "setup": 2,
+      "walk": 728
+     },
+     "counts": {
+      "blocks": 1,
+      "bodies": 1,
+      "constraints": 10305,
+      "loans": 0,
+      "localized": 10305,
+      "locals": 3611,
+      "points": 10832,
+      "regions": 10683,
+      "universals": 2
+     }
+    },
+    {
+     "name": "rg::flags::lowargs::<LowArgs>::fmt",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/lowargs.rs",
+     "us": 2794,
+     "infer_us": 4279,
+     "phases_us": {
+      "constraints": 924,
+      "entry_sets": 67,
+      "errors": 9,
+      "infer": 229,
+      "liveness": 641,
+      "loans": 50,
+      "mir": 0,
+      "moves": 281,
+      "scopes": 269,
+      "setup": 2,
+      "walk": 232
+     },
+     "counts": {
+      "blocks": 398,
+      "bodies": 1,
+      "constraints": 3813,
+      "loans": 234,
+      "localized": 3813,
+      "locals": 702,
+      "points": 2498,
+      "regions": 2573,
+      "universals": 5
+     }
+    },
+    {
+     "name": "rg::flags::hiargs::<HiArgs>::fmt",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/hiargs.rs",
+     "us": 2514,
+     "infer_us": 3896,
+     "phases_us": {
+      "constraints": 855,
+      "entry_sets": 67,
+      "errors": 9,
+      "infer": 208,
+      "liveness": 540,
+      "loans": 46,
+      "mir": 0,
+      "moves": 266,
+      "scopes": 246,
+      "setup": 2,
+      "walk": 195
+     },
+     "counts": {
+      "blocks": 363,
+      "bodies": 1,
+      "constraints": 3470,
+      "loans": 213,
+      "localized": 3470,
+      "locals": 639,
+      "points": 2274,
+      "regions": 2342,
+      "universals": 5
+     }
+    },
+    {
+     "name": "ignore::dir::<Ignore>::matched_ignore",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/dir.rs",
+     "us": 2406,
+     "infer_us": 4511,
+     "phases_us": {
+      "constraints": 1276,
+      "entry_sets": 58,
+      "errors": 14,
+      "infer": 51,
+      "liveness": 476,
+      "loans": 30,
+      "mir": 1,
+      "moves": 257,
+      "scopes": 42,
+      "setup": 5,
+      "walk": 142
+     },
+     "counts": {
+      "blocks": 311,
+      "bodies": 6,
+      "constraints": 662,
+      "loans": 24,
+      "localized": 662,
+      "locals": 274,
+      "points": 1130,
+      "regions": 548,
+      "universals": 72
+     }
+    },
+    {
+     "name": "rg::flags::hiargs::<HiArgs>::from_low_args",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/hiargs.rs",
+     "us": 2284,
+     "infer_us": 3379,
+     "phases_us": {
+      "constraints": 752,
+      "entry_sets": 65,
+      "errors": 13,
+      "infer": 31,
+      "liveness": 637,
+      "loans": 57,
+      "mir": 1,
+      "moves": 370,
+      "scopes": 55,
+      "setup": 7,
+      "walk": 221
+     },
+     "counts": {
+      "blocks": 514,
+      "bodies": 5,
+      "constraints": 322,
+      "loans": 52,
+      "localized": 322,
+      "locals": 375,
+      "points": 1715,
+      "regions": 365,
+      "universals": 20
+     }
+    },
+    {
+     "name": "rg::flags::doc::help::generate_long_flag",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/help.rs",
+     "us": 2130,
+     "infer_us": 4075,
+     "phases_us": {
+      "constraints": 1081,
+      "entry_sets": 59,
+      "errors": 12,
+      "infer": 69,
+      "liveness": 352,
+      "loans": 39,
+      "mir": 1,
+      "moves": 223,
+      "scopes": 90,
+      "setup": 5,
+      "walk": 140
+     },
+     "counts": {
+      "blocks": 230,
+      "bodies": 4,
+      "constraints": 812,
+      "loans": 57,
+      "localized": 812,
+      "locals": 389,
+      "points": 1286,
+      "regions": 815,
+      "universals": 18
+     }
+    },
+    {
+     "name": "ignore::dir::<Ignore>::add_child_path_with_found_ignore_files",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/dir.rs",
+     "us": 2029,
+     "infer_us": 4872,
+     "phases_us": {
+      "constraints": 1198,
+      "entry_sets": 41,
+      "errors": 10,
+      "infer": 44,
+      "liveness": 317,
+      "loans": 31,
+      "mir": 1,
+      "moves": 180,
+      "scopes": 40,
+      "setup": 5,
+      "walk": 105
+     },
+     "counts": {
+      "blocks": 248,
+      "bodies": 9,
+      "constraints": 463,
+      "loans": 19,
+      "localized": 461,
+      "locals": 255,
+      "points": 911,
+      "regions": 465,
+      "universals": 46
+     }
+    },
+    {
+     "name": "rg::search_parallel",
+     "path": "/root/bp/apps/ripgrep/crates/core/main.rs",
+     "us": 1989,
+     "infer_us": 4852,
+     "phases_us": {
+      "constraints": 725,
+      "entry_sets": 59,
+      "errors": 18,
+      "infer": 41,
+      "liveness": 505,
+      "loans": 50,
+      "mir": 1,
+      "moves": 296,
+      "scopes": 71,
+      "setup": 6,
+      "walk": 158
+     },
+     "counts": {
+      "blocks": 421,
+      "bodies": 3,
+      "constraints": 464,
+      "loans": 58,
+      "localized": 464,
+      "locals": 325,
+      "points": 1342,
+      "regions": 488,
+      "universals": 24
+     }
+    },
+    {
+     "name": "globset::<GlobSet>::new",
+     "path": "/root/bp/apps/ripgrep/crates/globset/src/lib.rs",
+     "us": 1689,
+     "infer_us": 3240,
+     "phases_us": {
+      "constraints": 514,
+      "entry_sets": 56,
+      "errors": 12,
+      "infer": 29,
+      "liveness": 531,
+      "loans": 38,
+      "mir": 0,
+      "moves": 268,
+      "scopes": 63,
+      "setup": 2,
+      "walk": 129
+     },
+     "counts": {
+      "blocks": 334,
+      "bodies": 1,
+      "constraints": 309,
+      "loans": 54,
+      "localized": 309,
+      "locals": 270,
+      "points": 1164,
+      "regions": 365,
+      "universals": 2
+     }
+    },
+    {
+     "name": "ignore::walk::<WalkParallel>::visit",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/walk.rs",
+     "us": 1659,
+     "infer_us": 4857,
+     "phases_us": {
+      "constraints": 718,
+      "entry_sets": 42,
+      "errors": 16,
+      "infer": 32,
+      "liveness": 379,
+      "loans": 26,
+      "mir": 1,
+      "moves": 221,
+      "scopes": 41,
+      "setup": 6,
+      "walk": 114
+     },
+     "counts": {
+      "blocks": 290,
+      "bodies": 5,
+      "constraints": 401,
+      "loans": 30,
+      "localized": 397,
+      "locals": 184,
+      "points": 817,
+      "regions": 340,
+      "universals": 39
+     }
+    },
+    {
+     "name": "grep_printer::standard::<StandardImpl<'a, M, W>>::write_exceeded_line",
+     "path": "/root/bp/apps/ripgrep/crates/printer/src/standard.rs",
+     "us": 1613,
+     "infer_us": 3767,
+     "phases_us": {
+      "constraints": 812,
+      "entry_sets": 36,
+      "errors": 12,
+      "infer": 34,
+      "liveness": 307,
+      "loans": 25,
+      "mir": 1,
+      "moves": 202,
+      "scopes": 35,
+      "setup": 3,
+      "walk": 103
+     },
+     "counts": {
+      "blocks": 281,
+      "bodies": 3,
+      "constraints": 381,
+      "loans": 14,
+      "localized": 381,
+      "locals": 227,
+      "points": 1022,
+      "regions": 367,
+      "universals": 28
+     }
+    },
+    {
+     "name": "rg::search",
+     "path": "/root/bp/apps/ripgrep/crates/core/main.rs",
+     "us": 1476,
+     "infer_us": 1903,
+     "phases_us": {
+      "constraints": 423,
+      "entry_sets": 46,
+      "errors": 8,
+      "infer": 19,
+      "liveness": 460,
+      "loans": 34,
+      "mir": 1,
+      "moves": 250,
+      "scopes": 62,
+      "setup": 4,
+      "walk": 131
+     },
+     "counts": {
+      "blocks": 306,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 27,
+      "localized": 190,
+      "locals": 189,
+      "points": 887,
+      "regions": 212,
+      "universals": 7
+     }
+    },
+    {
+     "name": "grep_regex::ban::check",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/ban.rs",
+     "us": 1467,
+     "infer_us": 3072,
+     "phases_us": {
+      "constraints": 791,
+      "entry_sets": 30,
+      "errors": 8,
+      "infer": 28,
+      "liveness": 246,
+      "loans": 22,
+      "mir": 1,
+      "moves": 158,
+      "scopes": 37,
+      "setup": 5,
+      "walk": 95
+     },
+     "counts": {
+      "blocks": 237,
+      "bodies": 7,
+      "constraints": 289,
+      "loans": 18,
+      "localized": 281,
+      "locals": 189,
+      "points": 818,
+      "regions": 290,
+      "universals": 41
+     }
+    },
+    {
+     "name": "rg::flags::defs::FLAGS",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/defs.rs",
+     "us": 1455,
+     "infer_us": 2402,
+     "phases_us": {
+      "constraints": 343,
+      "entry_sets": 0,
+      "errors": 5,
+      "infer": 74,
+      "liveness": 501,
+      "loans": 182,
+      "mir": 0,
+      "moves": 168,
+      "scopes": 40,
+      "setup": 1,
+      "walk": 81
+     },
+     "counts": {
+      "blocks": 217,
+      "bodies": 1,
+      "constraints": 879,
+      "loans": 0,
+      "localized": 879,
+      "locals": 436,
+      "points": 1523,
+      "regions": 879,
+      "universals": 2
+     }
+    },
+    {
+     "name": "grep_regex::config::<ConfiguredHIR>::new",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/config.rs",
+     "us": 1404,
+     "infer_us": 2317,
+     "phases_us": {
+      "constraints": 449,
+      "entry_sets": 46,
+      "errors": 9,
+      "infer": 27,
+      "liveness": 425,
+      "loans": 31,
+      "mir": 0,
+      "moves": 225,
+      "scopes": 47,
+      "setup": 2,
+      "walk": 102
+     },
+     "counts": {
+      "blocks": 317,
+      "bodies": 1,
+      "constraints": 282,
+      "loans": 40,
+      "localized": 282,
+      "locals": 216,
+      "points": 988,
+      "regions": 310,
+      "universals": 3
+     }
+    },
+    {
+     "name": "rg::flags::doc::man::generate_flag",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/man.rs",
+     "us": 1382,
+     "infer_us": 3420,
+     "phases_us": {
+      "constraints": 641,
+      "entry_sets": 40,
+      "errors": 8,
+      "infer": 56,
+      "liveness": 226,
+      "loans": 28,
+      "mir": 1,
+      "moves": 171,
+      "scopes": 57,
+      "setup": 5,
+      "walk": 104
+     },
+     "counts": {
+      "blocks": 159,
+      "bodies": 3,
+      "constraints": 683,
+      "loans": 49,
+      "localized": 683,
+      "locals": 335,
+      "points": 1052,
+      "regions": 706,
+      "universals": 13
+     }
+    },
+    {
+     "name": "grep_regex::strip::strip_from_match_ascii",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/strip.rs",
+     "us": 1349,
+     "infer_us": 2224,
+     "phases_us": {
+      "constraints": 639,
+      "entry_sets": 33,
+      "errors": 7,
+      "infer": 13,
+      "liveness": 263,
+      "loans": 22,
+      "mir": 1,
+      "moves": 188,
+      "scopes": 34,
+      "setup": 4,
+      "walk": 103
+     },
+     "counts": {
+      "blocks": 295,
+      "bodies": 5,
+      "constraints": 132,
+      "loans": 19,
+      "localized": 132,
+      "locals": 182,
+      "points": 827,
+      "regions": 143,
+      "universals": 24
+     }
+    },
+    {
+     "name": "rg::flags::parse::<Parser>::parse",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/parse.rs",
+     "us": 1311,
+     "infer_us": 2911,
+     "phases_us": {
+      "constraints": 465,
+      "entry_sets": 37,
+      "errors": 8,
+      "infer": 27,
+      "liveness": 336,
+      "loans": 27,
+      "mir": 1,
+      "moves": 207,
+      "scopes": 42,
+      "setup": 6,
+      "walk": 112
+     },
+     "counts": {
+      "blocks": 250,
+      "bodies": 3,
+      "constraints": 287,
+      "loans": 22,
+      "localized": 287,
+      "locals": 214,
+      "points": 912,
+      "regions": 311,
+      "universals": 12
+     }
+    },
+    {
+     "name": "rg::flags::doc::help::remove_roff",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/help.rs",
+     "us": 1274,
+     "infer_us": 1792,
+     "phases_us": {
+      "constraints": 640,
+      "entry_sets": 31,
+      "errors": 7,
+      "infer": 49,
+      "liveness": 223,
+      "loans": 21,
+      "mir": 1,
+      "moves": 141,
+      "scopes": 50,
+      "setup": 2,
+      "walk": 75
+     },
+     "counts": {
+      "blocks": 170,
+      "bodies": 2,
+      "constraints": 339,
+      "loans": 27,
+      "localized": 339,
+      "locals": 187,
+      "points": 672,
+      "regions": 415,
+      "universals": 8
+     }
+    },
+    {
+     "name": "ignore::gitignore::<GitignoreBuilder>::add_line",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/gitignore.rs",
+     "us": 1265,
+     "infer_us": 2022,
+     "phases_us": {
+      "constraints": 568,
+      "entry_sets": 37,
+      "errors": 8,
+      "infer": 29,
+      "liveness": 238,
+      "loans": 45,
+      "mir": 1,
+      "moves": 155,
+      "scopes": 42,
+      "setup": 3,
+      "walk": 98
+     },
+     "counts": {
+      "blocks": 209,
+      "bodies": 3,
+      "constraints": 326,
+      "loans": 24,
+      "localized": 326,
+      "locals": 227,
+      "points": 897,
+      "regions": 327,
+      "universals": 10
+     }
+    }
+   ],
+   "secs": 8
+  },
+  "nll": {
+   "bodies": 2980,
+   "infer_ms": 2144.946,
+   "infer_warm_ms": 584.929,
+   "first_check_ms": 841.069,
+   "borrowck_ms": 267.655,
+   "borrowck_excl_mir_ms": 267.624,
+   "ratio_to_infer": 0.4575324526566472,
+   "per_body_us": {
+    "p50": 28,
+    "p99": 922,
+    "max": 7026
+   },
+   "phases_ms": {
+    "constraints": 107.782,
+    "entry_sets": 6.342,
+    "errors": 1.294,
+    "infer": 8.624,
+    "liveness": 56.557,
+    "loans": 4.803,
+    "mir": 0.031,
+    "moves": 38.698,
+    "scopes": 0.927,
+    "setup": 0.334,
+    "walk": 19.955
+   },
+   "slowest": [
+    {
+     "name": "ignore::default_types::DEFAULT_TYPES",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/default_types.rs",
+     "us": 7026,
+     "infer_us": 5870,
+     "phases_us": {
+      "constraints": 2451,
+      "entry_sets": 0,
+      "errors": 67,
+      "infer": 1131,
+      "liveness": 1256,
+      "loans": 258,
+      "mir": 0,
+      "moves": 875,
+      "scopes": 0,
+      "setup": 2,
+      "walk": 732
+     },
+     "counts": {
+      "blocks": 1,
+      "bodies": 1,
+      "constraints": 10305,
+      "loans": 0,
+      "localized": 10305,
+      "locals": 3611,
+      "points": 10832,
+      "regions": 10683,
+      "universals": 2
+     }
+    },
+    {
+     "name": "rg::flags::lowargs::<LowArgs>::fmt",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/lowargs.rs",
+     "us": 2492,
+     "infer_us": 4279,
+     "phases_us": {
+      "constraints": 893,
+      "entry_sets": 64,
+      "errors": 9,
+      "infer": 274,
+      "liveness": 623,
+      "loans": 49,
+      "mir": 0,
+      "moves": 287,
+      "scopes": 21,
+      "setup": 2,
+      "walk": 201
+     },
+     "counts": {
+      "blocks": 398,
+      "bodies": 1,
+      "constraints": 3813,
+      "loans": 234,
+      "localized": 3813,
+      "locals": 702,
+      "points": 2498,
+      "regions": 2573,
+      "universals": 5
+     }
+    },
+    {
+     "name": "ignore::dir::<Ignore>::matched_ignore",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/dir.rs",
+     "us": 2290,
+     "infer_us": 4511,
+     "phases_us": {
+      "constraints": 1246,
+      "entry_sets": 55,
+      "errors": 14,
+      "infer": 51,
+      "liveness": 443,
+      "loans": 29,
+      "mir": 1,
+      "moves": 249,
+      "scopes": 2,
+      "setup": 5,
+      "walk": 148
+     },
+     "counts": {
+      "blocks": 311,
+      "bodies": 6,
+      "constraints": 662,
+      "loans": 24,
+      "localized": 662,
+      "locals": 274,
+      "points": 1130,
+      "regions": 548,
+      "universals": 72
+     }
+    },
+    {
+     "name": "rg::flags::hiargs::<HiArgs>::fmt",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/hiargs.rs",
+     "us": 2185,
+     "infer_us": 3896,
+     "phases_us": {
+      "constraints": 789,
+      "entry_sets": 66,
+      "errors": 8,
+      "infer": 194,
+      "liveness": 552,
+      "loans": 45,
+      "mir": 0,
+      "moves": 257,
+      "scopes": 18,
+      "setup": 2,
+      "walk": 191
+     },
+     "counts": {
+      "blocks": 363,
+      "bodies": 1,
+      "constraints": 3470,
+      "loans": 213,
+      "localized": 3470,
+      "locals": 639,
+      "points": 2274,
+      "regions": 2342,
+      "universals": 5
+     }
+    },
+    {
+     "name": "rg::flags::hiargs::<HiArgs>::from_low_args",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/hiargs.rs",
+     "us": 2089,
+     "infer_us": 3379,
+     "phases_us": {
+      "constraints": 691,
+      "entry_sets": 62,
+      "errors": 13,
+      "infer": 30,
+      "liveness": 607,
+      "loans": 48,
+      "mir": 1,
+      "moves": 344,
+      "scopes": 5,
+      "setup": 7,
+      "walk": 212
+     },
+     "counts": {
+      "blocks": 514,
+      "bodies": 5,
+      "constraints": 322,
+      "loans": 52,
+      "localized": 322,
+      "locals": 375,
+      "points": 1715,
+      "regions": 365,
+      "universals": 20
+     }
+    },
+    {
+     "name": "ignore::dir::<Ignore>::add_child_path_with_found_ignore_files",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/dir.rs",
+     "us": 1929,
+     "infer_us": 4872,
+     "phases_us": {
+      "constraints": 1173,
+      "entry_sets": 39,
+      "errors": 10,
+      "infer": 40,
+      "liveness": 301,
+      "loans": 28,
+      "mir": 1,
+      "moves": 175,
+      "scopes": 2,
+      "setup": 6,
+      "walk": 102
+     },
+     "counts": {
+      "blocks": 248,
+      "bodies": 9,
+      "constraints": 463,
+      "loans": 19,
+      "localized": 461,
+      "locals": 255,
+      "points": 911,
+      "regions": 465,
+      "universals": 46
+     }
+    },
+    {
+     "name": "rg::flags::doc::help::generate_long_flag",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/help.rs",
+     "us": 1914,
+     "infer_us": 4075,
+     "phases_us": {
+      "constraints": 997,
+      "entry_sets": 56,
+      "errors": 11,
+      "infer": 68,
+      "liveness": 330,
+      "loans": 37,
+      "mir": 1,
+      "moves": 215,
+      "scopes": 9,
+      "setup": 5,
+      "walk": 135
+     },
+     "counts": {
+      "blocks": 230,
+      "bodies": 4,
+      "constraints": 812,
+      "loans": 57,
+      "localized": 812,
+      "locals": 389,
+      "points": 1286,
+      "regions": 815,
+      "universals": 18
+     }
+    },
+    {
+     "name": "rg::search_parallel",
+     "path": "/root/bp/apps/ripgrep/crates/core/main.rs",
+     "us": 1786,
+     "infer_us": 4852,
+     "phases_us": {
+      "constraints": 646,
+      "entry_sets": 58,
+      "errors": 18,
+      "infer": 39,
+      "liveness": 483,
+      "loans": 48,
+      "mir": 1,
+      "moves": 280,
+      "scopes": 8,
+      "setup": 5,
+      "walk": 149
+     },
+     "counts": {
+      "blocks": 421,
+      "bodies": 3,
+      "constraints": 464,
+      "loans": 58,
+      "localized": 464,
+      "locals": 325,
+      "points": 1342,
+      "regions": 488,
+      "universals": 24
+     }
+    },
+    {
+     "name": "ignore::walk::<WalkParallel>::visit",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/walk.rs",
+     "us": 1507,
+     "infer_us": 4857,
+     "phases_us": {
+      "constraints": 640,
+      "entry_sets": 42,
+      "errors": 15,
+      "infer": 42,
+      "liveness": 373,
+      "loans": 24,
+      "mir": 1,
+      "moves": 209,
+      "scopes": 3,
+      "setup": 5,
+      "walk": 109
+     },
+     "counts": {
+      "blocks": 290,
+      "bodies": 5,
+      "constraints": 401,
+      "loans": 30,
+      "localized": 397,
+      "locals": 184,
+      "points": 817,
+      "regions": 340,
+      "universals": 39
+     }
+    },
+    {
+     "name": "globset::<GlobSet>::new",
+     "path": "/root/bp/apps/ripgrep/crates/globset/src/lib.rs",
+     "us": 1498,
+     "infer_us": 3240,
+     "phases_us": {
+      "constraints": 478,
+      "entry_sets": 61,
+      "errors": 11,
+      "infer": 28,
+      "liveness": 471,
+      "loans": 34,
+      "mir": 0,
+      "moves": 244,
+      "scopes": 8,
+      "setup": 2,
+      "walk": 119
+     },
+     "counts": {
+      "blocks": 334,
+      "bodies": 1,
+      "constraints": 309,
+      "loans": 54,
+      "localized": 309,
+      "locals": 270,
+      "points": 1164,
+      "regions": 365,
+      "universals": 2
+     }
+    },
+    {
+     "name": "grep_printer::standard::<StandardImpl<'a, M, W>>::write_exceeded_line",
+     "path": "/root/bp/apps/ripgrep/crates/printer/src/standard.rs",
+     "us": 1474,
+     "infer_us": 3767,
+     "phases_us": {
+      "constraints": 769,
+      "entry_sets": 34,
+      "errors": 12,
+      "infer": 34,
+      "liveness": 272,
+      "loans": 23,
+      "mir": 1,
+      "moves": 183,
+      "scopes": 2,
+      "setup": 4,
+      "walk": 101
+     },
+     "counts": {
+      "blocks": 281,
+      "bodies": 3,
+      "constraints": 381,
+      "loans": 14,
+      "localized": 381,
+      "locals": 227,
+      "points": 1022,
+      "regions": 367,
+      "universals": 28
+     }
+    },
+    {
+     "name": "grep_regex::ban::check",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/ban.rs",
+     "us": 1356,
+     "infer_us": 3072,
+     "phases_us": {
+      "constraints": 729,
+      "entry_sets": 30,
+      "errors": 8,
+      "infer": 27,
+      "liveness": 227,
+      "loans": 21,
+      "mir": 1,
+      "moves": 164,
+      "scopes": 3,
+      "setup": 5,
+      "walk": 90
+     },
+     "counts": {
+      "blocks": 237,
+      "bodies": 7,
+      "constraints": 289,
+      "loans": 18,
+      "localized": 281,
+      "locals": 189,
+      "points": 818,
+      "regions": 290,
+      "universals": 41
+     }
+    },
+    {
+     "name": "rg::flags::defs::FLAGS",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/defs.rs",
+     "us": 1310,
+     "infer_us": 2402,
+     "phases_us": {
+      "constraints": 299,
+      "entry_sets": 0,
+      "errors": 5,
+      "infer": 58,
+      "liveness": 479,
+      "loans": 182,
+      "mir": 0,
+      "moves": 156,
+      "scopes": 0,
+      "setup": 1,
+      "walk": 80
+     },
+     "counts": {
+      "blocks": 217,
+      "bodies": 1,
+      "constraints": 879,
+      "loans": 0,
+      "localized": 879,
+      "locals": 436,
+      "points": 1523,
+      "regions": 879,
+      "universals": 2
+     }
+    },
+    {
+     "name": "rg::flags::doc::man::generate_flag",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/man.rs",
+     "us": 1279,
+     "infer_us": 3420,
+     "phases_us": {
+      "constraints": 615,
+      "entry_sets": 50,
+      "errors": 8,
+      "infer": 55,
+      "liveness": 211,
+      "loans": 26,
+      "mir": 0,
+      "moves": 164,
+      "scopes": 6,
+      "setup": 4,
+      "walk": 101
+     },
+     "counts": {
+      "blocks": 159,
+      "bodies": 3,
+      "constraints": 683,
+      "loans": 49,
+      "localized": 683,
+      "locals": 335,
+      "points": 1052,
+      "regions": 706,
+      "universals": 13
+     }
+    },
+    {
+     "name": "grep_regex::strip::strip_from_match_ascii",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/strip.rs",
+     "us": 1269,
+     "infer_us": 2224,
+     "phases_us": {
+      "constraints": 592,
+      "entry_sets": 32,
+      "errors": 7,
+      "infer": 12,
+      "liveness": 238,
+      "loans": 19,
+      "mir": 1,
+      "moves": 192,
+      "scopes": 4,
+      "setup": 4,
+      "walk": 107
+     },
+     "counts": {
+      "blocks": 295,
+      "bodies": 5,
+      "constraints": 132,
+      "loans": 19,
+      "localized": 132,
+      "locals": 182,
+      "points": 827,
+      "regions": 143,
+      "universals": 24
+     }
+    },
+    {
+     "name": "rg::search",
+     "path": "/root/bp/apps/ripgrep/crates/core/main.rs",
+     "us": 1267,
+     "infer_us": 1903,
+     "phases_us": {
+      "constraints": 376,
+      "entry_sets": 45,
+      "errors": 7,
+      "infer": 19,
+      "liveness": 413,
+      "loans": 32,
+      "mir": 0,
+      "moves": 212,
+      "scopes": 8,
+      "setup": 4,
+      "walk": 116
+     },
+     "counts": {
+      "blocks": 306,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 27,
+      "localized": 190,
+      "locals": 189,
+      "points": 887,
+      "regions": 212,
+      "universals": 7
+     }
+    },
+    {
+     "name": "grep_regex::config::<ConfiguredHIR>::new",
+     "path": "/root/bp/apps/ripgrep/crates/regex/src/config.rs",
+     "us": 1252,
+     "infer_us": 2317,
+     "phases_us": {
+      "constraints": 374,
+      "entry_sets": 46,
+      "errors": 9,
+      "infer": 34,
+      "liveness": 395,
+      "loans": 30,
+      "mir": 0,
+      "moves": 213,
+      "scopes": 6,
+      "setup": 9,
+      "walk": 99
+     },
+     "counts": {
+      "blocks": 317,
+      "bodies": 1,
+      "constraints": 282,
+      "loans": 40,
+      "localized": 282,
+      "locals": 216,
+      "points": 988,
+      "regions": 310,
+      "universals": 3
+     }
+    },
+    {
+     "name": "ignore::gitignore::<GitignoreBuilder>::add_line",
+     "path": "/root/bp/apps/ripgrep/crates/ignore/src/gitignore.rs",
+     "us": 1162,
+     "infer_us": 2022,
+     "phases_us": {
+      "constraints": 518,
+      "entry_sets": 37,
+      "errors": 7,
+      "infer": 29,
+      "liveness": 248,
+      "loans": 30,
+      "mir": 1,
+      "moves": 152,
+      "scopes": 4,
+      "setup": 3,
+      "walk": 96
+     },
+     "counts": {
+      "blocks": 209,
+      "bodies": 3,
+      "constraints": 326,
+      "loans": 24,
+      "localized": 326,
+      "locals": 227,
+      "points": 897,
+      "regions": 327,
+      "universals": 10
+     }
+    },
+    {
+     "name": "rg::flags::parse::<Parser>::parse",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/parse.rs",
+     "us": 1156,
+     "infer_us": 2911,
+     "phases_us": {
+      "constraints": 409,
+      "entry_sets": 35,
+      "errors": 8,
+      "infer": 28,
+      "liveness": 306,
+      "loans": 25,
+      "mir": 0,
+      "moves": 192,
+      "scopes": 4,
+      "setup": 6,
+      "walk": 104
+     },
+     "counts": {
+      "blocks": 250,
+      "bodies": 3,
+      "constraints": 287,
+      "loans": 22,
+      "localized": 287,
+      "locals": 214,
+      "points": 912,
+      "regions": 311,
+      "universals": 12
+     }
+    },
+    {
+     "name": "rg::flags::doc::help::remove_roff",
+     "path": "/root/bp/apps/ripgrep/crates/core/flags/doc/help.rs",
+     "us": 1143,
+     "infer_us": 1792,
+     "phases_us": {
+      "constraints": 585,
+      "entry_sets": 29,
+      "errors": 6,
+      "infer": 32,
+      "liveness": 233,
+      "loans": 19,
+      "mir": 0,
+      "moves": 130,
+      "scopes": 4,
+      "setup": 2,
+      "walk": 70
+     },
+     "counts": {
+      "blocks": 170,
+      "bodies": 2,
+      "constraints": 339,
+      "loans": 27,
+      "localized": 339,
+      "locals": 187,
+      "points": 672,
+      "regions": 415,
+      "universals": 8
+     }
+    }
+   ],
+   "secs": 8
+  }
+ }
+}

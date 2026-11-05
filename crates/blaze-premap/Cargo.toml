@@ -1,0 +1,34 @@
+[package]
+name = "blaze-premap"
+description = "blaze v2's dependency image: everything below the workspace members prelinked once at a fixed base, keyed by the dependency graph, kept in the store and mapped by every dev run, so a dev link covers only the workspace's own code"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-cas.workspace = true
+blaze-codegen.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-inproc.workspace = true
+blaze-items.workspace = true
+blaze-link.workspace = true
+blaze-mem.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-core.workspace = true
+
+[lints]
+workspace = true

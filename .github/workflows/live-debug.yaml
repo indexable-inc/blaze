@@ -1,0 +1,66 @@
+# Live edits on macOS arm64 alone, with the daemon's log kept: for chasing a
+# live-edit failure without the rest of nix-live.yaml. Runs on a push to a live-debug* branch.
+name: live edits (debug)
+on:
+  push:
+    branches: ["live-debug*"]
+  workflow_dispatch:
+    inputs:
+      edits:
+        description: how many edits the running program takes
+        default: "5"
+
+# A newer push to the branch cancels the run before it; a run by hand is never cancelled.
+concurrency:
+  group: live-debug-${{ github.event_name }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
+jobs:
+  live-edits:
+    name: live edits (macOS arm64, debug)
+    runs-on: macos-15
+    # A store main's build job has not compiled into builds for longer than an hour on macOS.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names and the pinned LLVM, as blaze-platform.yaml's build job has them, from the store
+      # main's build job pushed. This debugs the blaze users get, which blaze builds.
+      - uses: ./.github/actions/blaze
+        with:
+          job: build
+          llvm: true
+      - run: blaze build --release -p blaze-engine --locked
+      # The stage 0's daemon ends before the blaze just built starts one of its own.
+      - run: blaze stop
+      - name: edit a running program, edit after edit
+        env:
+          LIVE_EDITS: ${{ inputs.edits || '8' }}
+          RUST_BACKTRACE: "1"
+          BLAZE_IDLE_SECS: "0"
+        # Its daemon's home is kept, `/tmp/rj-live-*` (live_e2e.py's `keep`), for the logs below.
+        run: |
+          python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\", \"edits\": $LIVE_EDITS, \"keep\": true}"
+      # v2 has one daemon and one log, `<home>/v2/serve.log`: the harness's home and the stage 0's.
+      - name: what the daemon said
+        if: always()
+        run: |
+          for log in /tmp/rj-live-*/v2/serve.log "$HOME/.cache/blaze/v2/serve.log"; do
+            [ -f "$log" ] || continue
+            echo "::group::$log"; tail -n 2000 "$log" | cut -c1-300; echo "::endgroup::"
+          done
+      - name: keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: blaze-logs
+          path: |
+            /tmp/rj-live-*/v2/serve.log
+            ~/.cache/blaze/v2/serve.log
+          if-no-files-found: warn

@@ -1,0 +1,149 @@
+# bun (oven-sh/bun 1.4.3, its Rust port: 1.25M lines in 103 crates) built through blaze on each
+# platform's dedicated benchmark machine, nightly: the edits of harness/bench.py, stored as
+# docs/benchmarks/bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
+# in the tables and charts of docs/benchmarks.md, which benchreport.py writes again from every stored result
+# (docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
+# (harness/benchplatforms.py, BENCH_RUNNERS); one whose runner is not registered is skipped and
+# keeps its last numbers. Too slow for every push: bun's own build of its C and C++ (once per
+# revision, kept in BENCH_HOME), cargo's cold build and blaze's whole-program LLVM build each
+# take minutes. It shares bench-readme's concurrency group, so the two never run at once on the
+# machines.
+name: bench-bun
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Write the README even when every number is within noise"
+        type: boolean
+        default: false
+
+concurrency:
+  group: bench-readme
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
+jobs:
+  platforms:
+    name: platforms with a registered runner
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      any: ${{ steps.matrix.outputs.any }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: matrix
+        env:
+          BENCH_RUNNERS: ${{ vars.BENCH_RUNNERS }}
+          BENCH_RUNNER: ${{ vars.BENCH_RUNNER }}
+        run: python3 harness/benchplatforms.py matrix
+
+  bench:
+    name: bench (bun, ${{ matrix.name }})
+    needs: platforms
+    if: needs.platforms.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 360
+    env:
+      # Kept between runs, outside the checkout, as bench-readme's: blaze builds
+      # incrementally, bun is cloned once and its C and C++ built once per revision.
+      BENCH_HOME: ${{ github.workspace }}/../bench-state
+      BENCH_WORK: ${{ matrix.work }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+      # bench.py runs the projects' tests with `blaze test`, which sandboxes them in
+      # namespaces a user makes; Ubuntu's AppArmor keeps users from that unless told otherwise.
+      - name: user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo -n sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names, installed into $BENCH_HOME (kept between runs, as its store under ~/.cache/blaze
+      # is, so blaze itself builds incrementally), run in the bench shell for the pinned LLVM and
+      # the C toolchain. Its daemon ends before the measured blaze starts.
+      - name: Build blaze
+        run: |
+          mkdir -p "$BENCH_HOME"
+          CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+          stage0="$BENCH_HOME/stage0/bin/blaze"
+          CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
+          "$stage0" stop
+      # Edits: bun's own build of its C and C++ goes to BLAZE_PROJECTS/bun-native once per
+      # revision (bunprep.py); the measured trees are copies of it.
+      - name: Bench
+        id: bench
+        run: |
+          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine" BLAZE_PROJECTS="$BENCH_HOME/projects"
+          work=${BENCH_WORK:+$BENCH_WORK-bun}
+          work=${work:-$BENCH_HOME/work-bun}
+          rm -rf "$work" "$BENCH_HOME/reference-bun"
+          mkdir -p "$RUNNER_TEMP/results"
+          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py bun \
+            --runs 3 --work "$work" --reference "$BENCH_HOME/reference-bun" --out "$RUNNER_TEMP/results/bench-bun.json" \
+            || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-bun-${{ matrix.slug }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: ignore
+      - name: Fail on a wrong result
+        if: steps.bench.outputs.wrong == 'true'
+        run: |
+          echo "::error::under blaze bun said something else than under cargo: see the Bench step"
+          exit 1
+
+  publish:
+    name: README
+    needs: [platforms, bench]
+    if: always() && needs.platforms.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # The ruleset on main refuses a push from the workflow's own token: this one is allowed
+          # past it (docs/harness.md, "CI").
+          token: ${{ secrets.BLAZE_BOT_TOKEN || github.token }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-bun-*
+          path: ${{ runner.temp }}/results
+      - name: README
+        run: |
+          for result in "$RUNNER_TEMP"/results/bench-bun-*/bench-bun.json; do
+            [ -f "$result" ] || continue
+            python3 harness/benchreport.py "$result" --name bun ${{ inputs.force && '--force' || '' }} \
+              || echo "::warning::$result was not published"
+          done
+      - name: Commit to main
+        run: |
+          git add README.md docs/benchmarks.md docs/benchmarks/
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "bench: bun's numbers for ${GITHUB_SHA::10} [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main
+            git rebase -q origin/main || { git rebase --abort; echo "::error::the bench commit does not apply to main"; exit 1; }
+            git push -q origin HEAD:main && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1

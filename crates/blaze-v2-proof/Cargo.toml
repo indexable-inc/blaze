@@ -1,0 +1,39 @@
+[package]
+name = "blaze-v2-proof"
+description = "blaze v2's invalidation oracle on the query database's own record: which query went stale and which read it missed, which reran for nothing"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-v2-proof"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-kernel.workspace = true
+blaze-protocol.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-store-check.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

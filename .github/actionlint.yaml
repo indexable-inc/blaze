@@ -1,0 +1,6 @@
+# actionlint's configuration (blaze.yaml's `workflows` job runs it). Each ignore says why.
+paths:
+  .github/workflows/release.yaml:
+    ignore:
+      # The crates.io job is off on purpose until the rename (#270); `if: false` is how.
+      - 'constant expression "false" in condition'

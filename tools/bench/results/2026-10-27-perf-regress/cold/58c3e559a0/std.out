@@ -1,0 +1,4 @@
+standard library: 17 crates, compiled 30168 of 30168 fns (+16290 instances) in 4.8s (+2.0µs emit); built in 8.0s
+standard library: 17 crates, compiled 30168 of 30168 fns (+16290 instances) in 5.6s (+1.9µs emit), for a `dev` program; built in 6.9s
+standard library: from the store, 17 crates, for a `release` program; built in 697.1ms
+std-aarch64-unknown-linux-gnu-8255f80a0cfa85f3: 8 packs added to `std-aarch64-unknown-linux-gnu-8255f80a0cfa85f3`, 39188769 bytes sent in 315.9ms

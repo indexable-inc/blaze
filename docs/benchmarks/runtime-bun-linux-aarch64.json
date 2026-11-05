@@ -1,0 +1,110 @@
+{
+ "toolchain": "1.99.0",
+ "commit": "68c3558698d1a050d728c592737766712fefae86",
+ "date": "2026-10-23T21:50:51Z",
+ "host": {
+  "name": null,
+  "cpu": "Neoverse-V2",
+  "cores": 16,
+  "machine_cores": 96,
+  "load": "12.2, 7.1, 3.7",
+  "memory_gib": 185,
+  "os": "Linux",
+  "arch": "aarch64",
+  "kernel": "6.18.53",
+  "rustc": "rustc 1.100.0-nightly (574ff7d98 2026-09-14)",
+  "cc": "gcc (GCC) 16.2.0",
+  "ld": "GNU ld (GNU Binutils) 2.46",
+  "llvm": "23.1.3",
+  "incremental": "profile default (on for dev)",
+  "wrapper": null,
+  "linker": "the toolchain's default (cc)",
+  "library_dirs": 88
+ },
+ "runbench": {
+  "builds": [
+   "release",
+   "checked",
+   "blaze"
+  ],
+  "variants": {},
+  "programs": {
+   "bun": {
+    "builds": {
+     "release": {
+      "build_s": 167.4,
+      "build_peak_mb": 6502,
+      "build_largest_mb": 3676,
+      "size_mb": 318.66
+     },
+     "checked": {
+      "build_s": 175.8,
+      "build_peak_mb": 6618,
+      "build_largest_mb": 3756,
+      "size_mb": 325.57
+     },
+     "blaze": {
+      "build_s": 160.2,
+      "cargo_s": 6.4,
+      "blaze_s": 152.0,
+      "link_s": 1.8,
+      "compiled": 68160,
+      "left": 0,
+      "reasons": {},
+      "build_peak_mb": 16030,
+      "build_largest_mb": 15965,
+      "size_mb": 301.54
+     }
+    },
+    "benches": {
+     "bun": {
+      "release": {
+       "median_s": 0.535,
+       "ratio": 1.0,
+       "runs": [
+        0.535,
+        0.535,
+        0.5349,
+        0.5359,
+        0.5345
+       ],
+       "peak_mb": 54,
+       "peak_max_mb": 54
+      },
+      "checked": {
+       "median_s": 0.5862,
+       "ratio": 1.096,
+       "runs": [
+        0.5861,
+        0.586,
+        0.5862,
+        0.5863,
+        0.5865
+       ],
+       "peak_mb": 57,
+       "peak_max_mb": 57
+      },
+      "blaze": {
+       "median_s": 0.6237,
+       "ratio": 1.166,
+       "runs": [
+        0.6234,
+        0.6237,
+        0.6233,
+        0.6242,
+        0.6242
+       ],
+       "peak_mb": 58,
+       "peak_max_mb": 58
+      }
+     }
+    }
+   }
+  },
+  "geomean": {
+   "release": 1.0,
+   "checked": 1.096,
+   "blaze": 1.166
+  }
+ }
+}

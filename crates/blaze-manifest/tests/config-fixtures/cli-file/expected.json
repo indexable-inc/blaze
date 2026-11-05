@@ -1,0 +1,118 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "build.incremental = true\nbuild.jobs = 1\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.incremental = true # $ROOT/.cargo/config.toml\nbuild.jobs = 1 # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nbuild.incremental = true\nbuild.jobs = 1\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nbuild.incremental = true # $ROOT/.cargo/config.toml\nbuild.jobs = 1 # $ROOT/.cargo/config.toml\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"incremental\":true,\"jobs\":1}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"incremental\":true,\"jobs\":1}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "--config",
+   "conf/cli.toml",
+   "build",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to load config from `$ROOT/conf/cli.toml`\n\nCaused by:\n  expected a list of strings or a list of tables, but found string at `include` in `$ROOT/conf/cli.toml\n"
+ },
+ {
+  "args": [
+   "--config",
+   "conf/cli.toml",
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to load config from `$ROOT/conf/cli.toml`\n\nCaused by:\n  expected a list of strings or a list of tables, but found string at `include` in `$ROOT/conf/cli.toml\n"
+ },
+ {
+  "args": [
+   "--config",
+   "conf/missing.toml"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to parse value from --config argument `conf/missing.toml` as a dotted key expression\n\nCaused by:\n  TOML parse error at line 1, column 18\n    |\n  1 | conf/missing.toml\n    |                  ^\n  key with no value, expected `=`\n"
+ },
+ {
+  "args": [
+   "--config",
+   "conf/cli.toml",
+   "--config",
+   "build.jobs=9",
+   "build",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to load config from `$ROOT/conf/cli.toml`\n\nCaused by:\n  expected a list of strings or a list of tables, but found string at `include` in `$ROOT/conf/cli.toml\n"
+ },
+ {
+  "args": [
+   "--config",
+   "include=\"conf/inc.toml\"",
+   "build",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to load --config include\n\nCaused by:\n  expected a list of strings or a list of tables, but found string at `include` in `--config cli option\n"
+ }
+]

@@ -1,0 +1,40 @@
+name: Bug
+description: blaze built something wrong, crashed, or fell back to cargo when it should not have.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got. A miscompile (the program behaves differently from rustc's build) is the most useful kind of report.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest project or function that shows it, and the commands. A public repository and commit work too.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: blaze version
+      description: Output of `blaze-engine --version` (or the commit you built).
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and architecture, and how you installed blaze (nix, release binary, source).
+      placeholder: macOS 15, aarch64, nix
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Output
+      description: What blaze printed. `blaze status` helps when it fell back to cargo.
+      render: text

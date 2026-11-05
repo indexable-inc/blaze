@@ -1,0 +1,3 @@
+the last `blaze build` that compiled anything took 0.11s
+  search (rg): crates/core/main.rs edited
+  rg: 31220 fns, 2 compiled, 31218 kept

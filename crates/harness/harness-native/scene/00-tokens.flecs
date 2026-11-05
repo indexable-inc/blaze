@@ -1,0 +1,245 @@
+// harness-native's tokens: the names den's primitives (harness-native-ui-prims, prims.flecs) read, and the app's own.
+// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws, in a native macOS look:
+// the window and sidebar are clear over an NSVisualEffectView (material .sidebar), so the sidebar's inks are vibrant
+// labels (white at an alpha in the dark appearance, black at an alpha in the light one, as AppKit's label colours are)
+// rather than fixed greys; the main card is an opaque plate in the terminal's ground. Colours are sRGB 0..1, `{r, g, b,
+// a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
+
+// Type: macOS sidebar sizes in Inter. Rows 13, runs 12, section labels 11, a run's command in the code face 11.5.
+export const size_caption = 11
+export const size_body = 13
+export const size_row = 13
+export const size_run = 12
+export const size_label = 11
+export const size_code = 11.5
+// Weights (CSS numbers): a session's name medium, a section label semibold.
+export const weight_row = 500
+export const weight_label = 600
+
+// Rows: a session 24 tall, a run 20, the fold 20 (packed: the tree has no gap between rows); children indented 16 a level; icons 14 in a 16 box.
+export const row_h = 24
+export const run_h = 20
+export const more_h = 20
+export const indent_step = 16
+export const icon_box = 16
+export const chevron_box = 12
+// A tree row's disclosure slot: the chevron's hit target, left of the row's icon. In the sidebar it hangs in the gutter
+// left of the icon (never pushing the row's content right).
+export const disclose_w = 18
+// The sidebar's side margin: the tree pads itself by it (so a depth-0 chevron hangs in it, inside the tree's clip), and
+// the section label and the Archive row sit in from it. label_inset is side_inset + row_pad: the section label's left
+// edge, where depth-0 icons start.
+export const side_inset = 10
+export const label_inset = 18
+// The seam between the sidebar and the main card: a soft shadow off the card's left edge.
+export const seam_blur = 14
+export const seam_alpha = 0
+export const row_gap = 8
+export const row_pad = 8
+
+// A status dot, and a failure's badge (its exit code).
+export const dot_size = 6
+export const dot_radius = 3
+export const badge_h = 15
+export const badge_radius = 4
+export const badge_pad = 5
+export const size_badge = 10
+export const line_badge = 12
+
+// Springs (omega rad/s, zeta): a running dot's breath (slow, critically damped, dimming to breath_floor), a disclosure
+// chevron's quarter turn, the selection pill sliding between rows, the sidebar folding (cmd+S) and the hover wash.
+export const breath_omega = 3.2
+export const breath_zeta = 1
+export const breath_floor = 0.3
+export const turn_omega = 30
+export const turn_zeta = 0.78
+export const pill_omega = 32
+export const pill_zeta = 0.86
+// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
+export const pill_jump_rows = 3
+export const sidebar_omega = 24
+// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
+export const tree_glide_omega = 22
+export const tree_fold_omega = 26
+export const tree_fold_zeta = 1
+export const tree_glide_zeta = 1
+export const tree_reveal_margin = 8
+export const tree_fade_len = 22
+export const knob_width = 6
+export const sidebar_zeta = 1
+// The traffic lights fading in while the pointer rests in their corner (sidebar folded, Dia's).
+export const lights_omega = 26
+export const lights_zeta = 1
+// The archive row: on hover its box rises archive_lift and grows to archive_scale; an archive bounces it (kicked up
+// archive_kick_lift, archive_kick_scale bigger, ringing at archive_omega / archive_zeta) and pulses its count.
+export const archive_lift = 1.5
+export const archive_scale = 1.08
+export const archive_kick_lift = 3
+export const archive_kick_scale = 0.12
+export const archive_omega = 22
+export const archive_zeta = 0.3
+export const count_kick_scale = 0.35
+export const count_omega = 26
+export const count_zeta = 0.35
+// The generic motion springs (prims.flecs's ui.spring tokens): a node's insert and removal Transition, a MatchedGeometry
+// slide (the selection pill between rows), and an Animate node's Size, Padding and Fill easing.
+export const spring_transition_omega = 20
+export const spring_transition_zeta = 0.9
+export const spring_matched_omega = 26
+export const spring_matched_zeta = 0.84
+export const spring_layout_omega = 18
+export const spring_layout_zeta = 1
+
+// The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
+export const size_title = 15
+export const field_h = 30
+export const chip_h = 24
+export const chip_radius = 12
+export const section_h = 30
+export const arch_took_w = 56
+export const arch_time_w = 84
+// A finished run with no session leaves the live tree this long after it ended (seconds).
+export const archive_after_s = 600
+
+// Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
+// (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs). They come in on a spring (the scrim fades in, the card
+// grows from overlay_scale) and go out the same way, never in a step.
+export const overlay_omega = 30
+export const overlay_zeta = 0.92
+export const overlay_scale = 0.96
+export const overlay_radius = 12
+export const overlay_pad = 6
+export const overlay_lift_blur = 24
+export const overlay_lift_alpha = 0.5
+export const overlay_lift_dy = 8
+// The palette: a wide card near the window's top, its query line, its entries.
+export const palette_w = 560
+export const palette_top = 96
+export const palette_query_h = 38
+export const palette_row_h = 32
+// The picker: a narrow card a little above the window's middle (picker_rise lifts it), a quiet label over one row a
+// kind (its mark in a picker_mark box, its name, its shortcut, the key that picks it in a keycap).
+export const picker_w = 300
+export const picker_rise = 80
+export const picker_head_h = 24
+export const picker_row_h = 34
+export const picker_mark = 18
+export const keycap_min = 18
+export const keycap_h = 18
+export const keycap_pad = 5
+export const keycap_radius = 4
+export const size_keycap = 11
+export const line_keycap = 13
+
+export const radius_control = 6
+export const radius_card = 12
+
+// Vibrant labels: primary, secondary, tertiary, quaternary.
+export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+export const tone_ink_2: Fill = {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
+export const tone_ink_3: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
+export const tone_ink_4: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+
+export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
+export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
+export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// The selected row: a soft accent-tinted pill over the vibrancy.
+export const tone_knob: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+// The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
+export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
+// The one hairline between the sidebar and the main card.
+export const tone_seam: Fill = {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
+// Nothing: a node that paints no fill.
+export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+// The palette's scrim over the window and its card.
+export const tone_scrim: Fill = {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
+export mut tone_card: Fill = {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+// Offscreen shots only (src/shot.rs): a flat stand-in for the sidebar's vibrancy, which a texture cannot sample.
+export const tone_shot_ground: Fill = {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
+export mut tone_plate: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
+export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
+export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+// With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
+// ground are set at runtime from each appearance's theme background and foreground: tone_term_ground (hn.Main),
+// tone_term_ink and tone_term_muted (hn.TitleBar), tone_plate (Plate), tone_card (hn.Palette.card) and tone_side_tint
+// (hn.SideClip). The values here are the built-in theme's, kept for an appearance the config does not theme.
+// The terminal's ground (the built-in theme's bg, #121214): the main card and the title bar over it, in both appearances.
+export mut tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
+// Ink over the terminal's ground (always dark): the title bar's words.
+export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
+export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
+
+export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
+export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
+export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
+export const tone_lost: Fill = {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
+
+// The cute touch: a small warm colour per kind on its icon.
+export const tone_kind_claude: Fill = {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
+export const tone_kind_codex: Fill = {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
+export const tone_kind_cursor: Fill = {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
+export const tone_kind_shell: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
+
+// The brand marks' fills (hn.Kind): Claude's orange (#D97757, its brand hex) in both appearances; OpenAI's and Cursor's
+// marks are monochrome, in the strong ink, so they turn with the appearance.
+export const tone_mark_claude: Fill = {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
+export const tone_mark_ink: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+
+prefab Strong {
+  Fill: $tone_ink_1
+}
+prefab Ink {
+  Fill: $tone_ink_2
+}
+prefab Muted {
+  Fill: $tone_ink_3
+}
+prefab Faint {
+  Fill: $tone_ink_4
+}
+prefab Accent {
+  Fill: $tone_accent
+}
+prefab Wash {
+  Fill: $tone_wash
+}
+prefab Plate {
+  Fill: $tone_plate
+  Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+  Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
+}
+
+// F3's debug overlay (hn.Stats, src/app/stats.rs), over the terminal's ground in both appearances: a translucent plate, its
+// monospace caption, and its frame-time bars (a frame over the 60 Hz budget in the hot tone).
+export const size_stats = 11
+export const line_stats = 14
+export const radius_stats = 6
+export const tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0.62}}
+export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
+export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
+export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
+
+// Text being edited (ui.TextArea): the selection's wash and the caret. Inline code's chip (MarkdownText).
+export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.369, 0.384, 0.902, 0.24}}
+export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
+export const textarea_max_h = 132
+
+// The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
+// well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
+export const chat_w = 720
+export const chat_pad = 24
+export const size_chat = 14
+export const line_chat = 21
+export const size_chat_h1 = 19
+export const size_chat_h2 = 16.5
+export const size_chat_h3 = 14.5
+export const line_chat_code = 17
+export const chat_bubble_radius = 12
+export const chat_input_radius = 12
+export const chat_row_estimate = 44
+export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
+export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
+export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}

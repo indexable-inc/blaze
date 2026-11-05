@@ -1,0 +1,161 @@
+{
+ "project": "ty",
+ "repo": "astral-sh/ruff",
+ "rev": "07872adbafa7c00f42f1174d8aa3c3e324033009",
+ "arms": {
+  "cargo": {
+   "kind": "cargo",
+   "phases": {
+    "cold": {
+     "build_s": 237.673,
+     "ready_s": 0.0,
+     "wall_s": 237.673,
+     "built": "cargo",
+     "states": [
+      "cargo"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.216,
+     "samples_s": [
+      0.222,
+      0.215,
+      0.216,
+      0.216,
+      0.216
+     ],
+     "built": [
+      "cargo"
+     ]
+    },
+    "body": {
+     "wall_s": 5.072,
+     "samples_s": [
+      5.072,
+      5.782,
+      3.534,
+      5.077,
+      3.545
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 3.612
+    }
+   },
+   "wrong": [],
+   "failed": "build failed: 'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n   --> crates/ty_module_resolver/src/module.rs:127:26\n    |\n127 |             .is_some_and(SearchPath::is_standard_library)\n    |              ----------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `FnOnce(&path::SearchPath)` signature, found `for<'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n    |              |\n    |              required by a bound introduced by this call\n    |\n    = help: the trait `FnOnce(&path::SearchPath)` is not implemented for fn item `for<'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n    = note: expected a closure taking 2 arguments, but one taking 1 argument was given\nnote: required by a bound in `Option::<T>::is_some_and`\n   --> /home/runner/.rustup/toolchains/nightly-2026-10-27-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:659:44\n    |\n613 | impl<T> Option<T> {\n...\n659 |     pub const fn is_some_and(self, f: impl [const] FnOnce(T) -> bool + [const] Destruct) -> bool {\n    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Option::<T>::is_some_and`\nhelp: call `Option::as_deref()` first\n    |\n126 |         self.search_path(db).as_deref()\n    |                             +++++++++++\n\nFor more information about this error, try `rustc --explain E0277`.\nerror: could not compile `ty_module_resolver` (lib) due to 2 previous errors\n"
+  },
+  "ours": {
+   "kind": "blaze",
+   "phases": {
+    "cold": {
+     "build_s": 536.551,
+     "ready_s": 0.453,
+     "wall_s": 537.004,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.066,
+     "samples_s": [
+      0.066,
+      0.065,
+      0.066,
+      0.066,
+      0.067
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 146.683,
+     "samples_s": [
+      101.308,
+      148.445,
+      146.683,
+      149.168,
+      145.348
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 146.261
+    },
+    "signature": {
+     "wall_s": 27.306,
+     "samples_s": [
+      43.43,
+      25.838,
+      26.388,
+      27.306,
+      27.775
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 26.231
+    },
+    "tests_first": {
+     "wall_s": 219.963
+    },
+    "tests": {
+     "wall_s": 17.59,
+     "status": 0,
+     "passed": 183,
+     "failed": 0,
+     "ignored": 2,
+     "built": "daemon"
+    }
+   },
+   "wrong": [],
+   "failed": null
+  },
+  "astral": {
+   "kind": "astral",
+   "phases": {
+    "cold": {
+     "build_s": 421.976,
+     "ready_s": 0.014,
+     "wall_s": 421.99,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.049,
+     "samples_s": [
+      0.053,
+      0.048,
+      0.05,
+      0.047,
+      0.049
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 0.347,
+     "samples_s": [
+      0.489,
+      0.341,
+      0.343,
+      0.347,
+      0.353
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.346
+    }
+   },
+   "wrong": [],
+   "failed": "build failed: 'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n   --> crates/ty_module_resolver/src/module.rs:127:26\n    |\n127 |             .is_some_and(SearchPath::is_standard_library)\n    |              ----------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `FnOnce(&path::SearchPath)` signature, found `for<'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n    |              |\n    |              required by a bound introduced by this call\n    |\n    = help: the trait `FnOnce(&path::SearchPath)` is not implemented for fn item `for<'a> fn(&'a path::SearchPath, ()) -> bool {path::SearchPath::is_standard_library}`\n    = note: expected a closure taking 2 arguments, but one taking 1 argument was given\nnote: required by a bound in `Option::<T>::is_some_and`\n   --> /home/runner/.rustup/toolchains/nightly-2026-10-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:659:44\n    |\n613 | impl<T> Option<T> {\n...\n659 |     pub const fn is_some_and(self, f: impl [const] FnOnce(T) -> bool + [const] Destruct) -> bool {\n    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Option::<T>::is_some_and`\nhelp: call `Option::as_deref()` first\n    |\n126 |         self.search_path(db).as_deref()\n    |                             +++++++++++\n\nFor more information about this error, try `rustc --explain E0277`.\nerror: could not compile `ty_module_resolver` (lib) due to 2 previous errors\n"
+  }
+ }
+}

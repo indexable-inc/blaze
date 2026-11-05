@@ -1,0 +1,48 @@
+    fn execute_maybe_iterate<'db>(
+        &'db self,
+        db: &'db C::DbView,
+        opt_old_memo: Option<&'db Memo<C>>,
+        claim_guard: &mut ClaimGuard<'db>,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> (C::Output<'db>, CompletedQuery) {
+        claim_guard.set_release_mode(ReleaseMode::Default);
+
+        let database_key_index = claim_guard.database_key_index();
+        let zalsa = claim_guard.zalsa();
+
+        let id = database_key_index.key_index();
+
+        // Our provisional value from the previous iteration, when doing fixpoint iteration.
+        // This is different from `opt_old_memo` which might be from a different revision.
+        let mut last_provisional_memo_opt: Option<&Memo<C>> = None;
+
+        let mut last_stale_tracked_ids: Vec<(Identity, Id)> = Vec::new();
+        let current_revision = zalsa.current_revision();
+        let cancellation_count = zalsa.runtime().cancellation_count();
+        let mut opt_old_memo = opt_old_memo;
+        let mut iteration = IterationStamp::initial(cancellation_count);
+
+        // An ordinary query doesn't memoize a cancelled execution. Match that behavior for
+        // fixpoint queries: a memo from an abandoned cancellation epoch in this revision doesn't
+        // seed the retry, while a memo from an older revision remains useful for backdating and
+        // output bookkeeping. Cancellation counts are only comparable within a revision.
+        if let Some(old_memo) = opt_old_memo
+            && old_memo.header.verified_at.load() == current_revision
+        {
+            match old_memo.header.previous_iteration(
+                database_key_index,
+                cancellation_count,
+                old_memo.value.is_some(),
+            ) {
+                Some(previous_iteration) => {
+                    if previous_iteration.reuse_as_provisional {
+                        last_provisional_memo_opt = Some(old_memo);
+                    }
+
+                    iteration = previous_iteration.iteration;
+                }
+                None => opt_old_memo = None,
+            }
+        }
+
+        let _poison_guard =

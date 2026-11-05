@@ -1,0 +1,5 @@
+echo client 0
+echo client 1
+echo client 2
+echo client 3
+blocking thread named true

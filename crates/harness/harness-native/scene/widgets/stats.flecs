@@ -1,0 +1,78 @@
+// F3's debug overlay (src/app/stats.rs), Minecraft's, as a template: the host sets the measurements as props about 4 times
+// a second and the caption is formatted here, one fact a line, columns padded so it holds still in the monospace face.
+// Only the caption re-runs on a tick (and the padding when the title-bar strip moves).
+
+@tree ChildOf
+hn {
+  // A layer over the main card (out of its flow), its plate in the top-right corner under the title-bar strip (`top`, the
+  // strip's height: an Overlay child takes its parent's whole frame, not its safe area). Under the caption, a 120-frame
+  // frame-time sparkline the host draws as panels into `spark`'s rect (its Fill the bars, `hot`'s a frame over budget).
+  // Nothing in it is Hoverable or Pressable, so it never takes the pointer.
+  @tree ChildOf
+  template Stats {
+    prop top: f64 = 0
+    prop fps: f64 = 0
+    prop frames: f64 = 0
+    prop cpu: f64 = 0
+    prop cpu50: f64 = 0
+    prop cpu99: f64 = 0
+    prop gpu: f64 = 0
+    prop gpu50: f64 = 0
+    prop gpu99: f64 = 0
+    prop state: string = ""
+    prop asked: f64 = 0
+    prop why: string = ""
+    prop ents: f64 = 0
+    prop nodes: f64 = 0
+    prop laid: f64 = 0
+    prop panels: f64 = 0
+    prop glyphs: f64 = 0
+    prop sprites: f64 = 0
+    prop atlas: f64 = 0
+    prop glyph_hit: string = ""
+    prop shape_hit: string = ""
+    // The shown terminal (`cols` 0: none): its object, grid, cell in device pixels, scrollback and stream rate.
+    prop term: string = ""
+    prop cols: f64 = 0
+    prop rows: f64 = 0
+    prop cw: f64 = 0
+    prop ch: f64 = 0
+    prop sb: f64 = 0
+    prop pty_rate: string = ""
+    prop pty_total: string = ""
+    prop link: string = ""
+    prop rtt: string = ""
+    prop pid: string = ""
+    prop rss: string = ""
+    // The system pointer's shape and why (src/app/pointer.rs).
+    prop pointer: string = ""
+    (IsA, ui.Column)
+    Overlay
+    Flex: {axis: Column, gap: 0, align: End, justify: Start, wrap: false}
+    Padding: {l: 0, r: 10, t: 8 + $top, b: 0}
+    plate : ui.Column {
+      Fill: $tone_stats_plate
+      Shape: {radius: $radius_stats, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Column, gap: 6, align: Start, justify: Start, wrap: false}
+      Padding: {l: 9, r: 9, t: 7, b: 8}
+      text : ui.Words {
+        Fill: $tone_stats_ink
+        TextStyle: {size: $size_stats, line: $line_stats, role: 9, bold: 0}
+        const head = "fps   {fps:>5.0} now  {frames:>5.0} in 1s\ncpu   {cpu:>5.2} ms  p50 {cpu50:>5.2}  p99 {cpu99:>5.2}\ngpu   {gpu:>5.2} ms  p50 {gpu50:>5.2}  p99 {gpu99:>5.2}\nstate {state}  ({asked:.0} of {frames:.0} frames asked for in 1s)\nwhy   {why}\necs  {ents:.0} entities  {nodes:.0} nodes  {laid:.0} laid\ndraw  {panels:.0} panels  {glyphs:.0} glyphs  {sprites:.0} sprites\natlas {atlas:.1}% full  glyph hit {glyph_hit}  shape hit {shape_hit}"
+        const tail = "link  {link}  rtt {rtt}  harnessd {pid}\nmem   rss {rss}\nptr   {pointer}"
+        if $cols > 0 {
+          Text: {s: "{head}\nterm  {term} {cols:.0}x{rows:.0}  cell {cw:.0}x{ch:.0}px  sb {sb:.0}\npty   {pty_rate}/s  ({pty_total} total)\n{tail}"}
+        } else {
+          Text: {s: "{head}\nterm  -\n{tail}"}
+        }
+      }
+      spark : ui.Node {
+        StatsSpark: {budget_ms: 16.67}
+        Fill: $tone_stats_bar
+        Size: {w: {kind: Fixed, value: 240, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+        hot { Fill: $tone_stats_hot }
+      }
+    }
+  }
+}

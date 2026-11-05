@@ -1,0 +1,36 @@
+[package]
+name = "hir-ty-suspend"
+description = "Rejects a value that must not cross threads held across a call that may park a fiber: may-suspend inferred from the monomorphized call graph, liveness as across a yield"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+
+either.workspace = true
+smallvec.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

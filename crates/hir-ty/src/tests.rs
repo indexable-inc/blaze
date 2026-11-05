@@ -1,0 +1,34 @@
+//! Tests of hir-ty as a whole: what its queries allocate.
+
+mod adjusted_ty;
+mod budget;
+mod closure_binder;
+mod coercion_lub;
+mod comptime_infer;
+mod comptime_solver;
+mod const_args;
+mod const_bounds;
+mod const_param_ty;
+mod consteval_inference;
+mod elided_lifetime_args;
+mod fn_cache;
+mod fn_item_predicates;
+mod impl_header_elided_lifetimes;
+mod impl_rpitit_tys;
+mod impossible_items;
+mod index_places;
+mod infer_vars;
+mod inhabitedness;
+mod lowering_errors;
+mod member_hygiene;
+mod method_resolutions;
+mod probe_errors;
+mod qualifier_resolutions;
+mod query_span_names;
+mod raw_pointer_impls;
+mod ref_mut_bindings;
+mod rpitit_nested;
+mod sizedness;
+mod struct_paths;
+mod trait_item_imports;
+mod variant_hygiene;

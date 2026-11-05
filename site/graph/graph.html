@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Code graph · blaze</title>
+	<meta name="description" content="blaze's symbols and how they relate, as a live force-directed graph.">
+	<link rel="icon" href="brand/favicon.ico">
+	<link rel="stylesheet" href="graph/graph.css">
+	<script type="module" src="graph/graph.js"></script>
+</head>
+<body>
+	<div id="stage"><canvas id="gpu"></canvas><canvas id="labels"></canvas></div>
+	<header id="bar">
+		<a class="home" href="./">blaze</a><span class="title">code graph</span>
+		<div class="search">
+			<input id="q" type="search" placeholder="Search symbols" aria-label="Search symbols" autocomplete="off" spellcheck="false"><kbd>/</kbd>
+			<ul id="results" hidden></ul>
+		</div>
+		<span id="stats"></span>
+	</header>
+	<aside id="controls">
+		<label class="line">Colour by
+			<select id="colour-by"><option value="kind">kind</option><option value="crate">crate</option></select>
+		</label>
+		<ul id="legend"></ul>
+		<label class="line"><input id="labels-on" type="checkbox" checked> Labels</label>
+		<details>
+			<summary>Forces</summary>
+			<label>Centre <input id="f-centre" type="range" min="0" max="50"></label>
+			<label>Repel <input id="f-repel" type="range" min="0" max="60"></label>
+			<label>Link force <input id="f-link" type="range" min="0" max="40"></label>
+			<label>Link distance <input id="f-distance" type="range" min="10" max="200"></label>
+		</details>
+		<button id="fit" type="button">Fit <kbd>F</kbd></button>
+		<p class="hint">Drag a node, scroll to zoom, drag the background to pan, click for details. Drop a graph file on the page to view it.</p>
+	</aside>
+	<aside id="details" hidden></aside>
+	<div id="message" hidden></div>
+</body>
+</html>

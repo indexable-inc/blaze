@@ -1,0 +1,12 @@
+[package]
+name = "livetypes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A program whose types change while it runs, as a game's components do; harness/live_types.py edits it"
+
+[dependencies]
+blaze-live = { path = "../../crates/blaze-live" }
+
+# Its own workspace and lock, like demo/life.
+[workspace]

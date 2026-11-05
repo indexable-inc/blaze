@@ -1,0 +1,15 @@
+{
+ "runs": [
+  {"args": ["build", "--profile", "nope"]},
+  {"args": ["build", "--profile", "doc"]},
+  {"args": ["build", "--profile", "a b"]},
+  {"args": ["build", "--profile", "loop1", "--config", "profile.loop1.inherits=\"loop2\"", "--config", "profile.loop2.inherits=\"loop1\""]},
+  {"args": ["build", "--profile", "noinherits"], "env": {"CARGO_PROFILE_NOINHERITS_OPT_LEVEL": "1"}},
+  {"args": ["build", "--profile", "missing", "--config", "profile.missing.inherits=\"zz\""]},
+  {"args": ["build"], "env": {"CARGO_PROFILE_DEV_PANIC": "bogus"}},
+  {"args": ["build"], "env": {"CARGO_PROFILE_DEV_INHERITS": "release"}},
+  {"args": ["build", "--config", "profile.dev.package.e.panic=\"abort\""]},
+  {"args": ["build", "--config", "profile.release.lto=\"true\"", "--release"]},
+  {"args": ["build", "--config", "profile.dev.dir-name=\"x\""]}
+ ]
+}

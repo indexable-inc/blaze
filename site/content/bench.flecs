@@ -1,0 +1,32 @@
+// /bench: the benchmark history. `history` names the history (docs/benchmarks/history, one line per run, appended by
+// CI); the build turns it into Sections of charts under it (gen/bench/), and the renderer draws them.
+
+// What the charts compare. A subject keeps its colour (--series-<slot>, styles/tokens.css) in every chart.
+subjects {
+  blaze { Subject: {label: "blaze", slot: 1, dashed: false} }
+  cargo { Subject: {label: "cargo", slot: 2, dashed: false} }
+  warm { Subject: {label: "blaze, a second checkout", slot: 3, dashed: false} }
+  setup { Subject: {label: "cargo, fastest other setup", slot: 4, dashed: false} }
+  median { Subject: {label: "median edit", slot: 1, dashed: false} }
+  p90 { Subject: {label: "90th percentile", slot: 1, dashed: true} }
+}
+
+site {
+  bench : Page {
+    Wide
+    Title: {"Benchmark history"}
+    Nav: {"Benchmarks", 5}
+    Icon: {"chart"}
+    (InGroup, nav.reference)
+    Description: {"blaze's build and live-edit benchmarks over every run, next to plain cargo on the same machine."}
+
+    Lede lede("How long blaze takes to build after an edit, next to plain cargo on the same machine, on real projects at pinned commits ([how it is measured](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md)), and how soon a live edit runs. Each platform, macOS arm64, Linux aarch64 and Linux x86-64, is measured on a machine of its own, so compare its numbers with each other, not with another platform's. It updates after every push to main and every night.")
+
+    BenchHistory history(dir: "docs/benchmarks/history")
+
+    Section regressions(title: "Regressions") {
+      P compared("Each run is compared with the runs before it on the same machine. A number that goes above its noise band opens an issue labelled [bench-regression](https://github.com/indexable-inc/blaze/issues?q=label%3Abench-regression).")
+      Dim data("The data: [docs/benchmarks/history](https://github.com/indexable-inc/blaze/tree/main/docs/benchmarks/history), one line per run.")
+    }
+  }
+}

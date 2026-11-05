@@ -1,0 +1,25 @@
+repository = "https://github.com/salsa-rs/salsa"
+
+[features]
+accumulator = ["salsa-macro-rules/accumulator"]
+default = [
+    "salsa_unstable",
+    "rayon",
+    "macros",
+    "inventory",
+    "accumulator",
+]
+detailed-trace = []
+inventory = ["dep:inventory"]
+macros = ["dep:salsa-macros"]
+persistence = [
+    "dep:serde",
+    "dep:erased-serde",
+    "salsa-macros/persistence",
+    "thin-vec/serde",
+]
+salsa_unstable = []
+shuttle = ["dep:shuttle"]
+
+[lib]
+name = "salsa"

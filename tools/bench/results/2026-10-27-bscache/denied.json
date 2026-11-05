@@ -1,0 +1,627 @@
+{
+ "cargo 0.92.0": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "cargo"
+  ]
+ },
+ "cli 0.1.0": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 5,
+    "first": [
+     "$HOME/bs/work/src/zed/.git",
+     "$HOME/bs/work/src/zed/.git/HEAD",
+     "$HOME/bs/work/src/zed/.git/config",
+     "$HOME/bs/work/src/zed/.git/objects",
+     "$HOME/bs/work/src/zed/.git/refs"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ },
+ "cranelift-codegen 0.135.1": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ },
+ "curl-sys 0.4.78+curl-8.11.0": {
+  "denied": {
+   "executables": {
+    "count": 7,
+    "first": [
+     "/nix/store/*-gettext-1.0/bin/envsubst",
+     "/nix/store/*-gettext-1.0/bin/gettext",
+     "/nix/store/*-gettext-1.0/bin/gettext.sh",
+     "/nix/store/*-git-2.56.0/bin/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-submodule",
+     "/nix/store/*-gnused-4.10/bin/sed"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 4,
+    "first": [
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-i18n",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-setup",
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "nushell"
+  ]
+ },
+ "curl-sys 0.4.83+curl-8.15.0": {
+  "denied": {
+   "executables": {
+    "count": 7,
+    "first": [
+     "/nix/store/*-gettext-1.0/bin/envsubst",
+     "/nix/store/*-gettext-1.0/bin/gettext",
+     "/nix/store/*-gettext-1.0/bin/gettext.sh",
+     "/nix/store/*-git-2.56.0/bin/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-submodule",
+     "/nix/store/*-gnused-4.10/bin/sed"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 4,
+    "first": [
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-i18n",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-setup",
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "cargo"
+  ]
+ },
+ "helix-loader 25.7.1": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 5,
+    "first": [
+     "$HOME/bs/work/src/helix/.git",
+     "$HOME/bs/work/src/helix/.git/HEAD",
+     "$HOME/bs/work/src/helix/.git/config",
+     "$HOME/bs/work/src/helix/.git/objects",
+     "$HOME/bs/work/src/helix/.git/refs"
+    ]
+   }
+  },
+  "projects": [
+   "helix"
+  ]
+ },
+ "helix-term 25.7.1": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 1,
+    "first": [
+     "$HOME/bs/work/src/helix/.git"
+    ]
+   },
+   "writes": {
+    "count": 1,
+    "first": [
+     "$HOME/bs/work/src/helix/runtime/grammars/sources"
+    ]
+   }
+  },
+  "projects": [
+   "helix"
+  ]
+ },
+ "libssh2-sys 0.3.0": {
+  "denied": {
+   "executables": {
+    "count": 7,
+    "first": [
+     "/nix/store/*-gettext-1.0/bin/envsubst",
+     "/nix/store/*-gettext-1.0/bin/gettext",
+     "/nix/store/*-gettext-1.0/bin/gettext.sh",
+     "/nix/store/*-git-2.56.0/bin/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-submodule",
+     "/nix/store/*-gnused-4.10/bin/sed"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 4,
+    "first": [
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-i18n",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-setup",
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "nushell"
+  ]
+ },
+ "libssh2-sys 0.3.1": {
+  "denied": {
+   "executables": {
+    "count": 7,
+    "first": [
+     "/nix/store/*-gettext-1.0/bin/envsubst",
+     "/nix/store/*-gettext-1.0/bin/gettext",
+     "/nix/store/*-gettext-1.0/bin/gettext.sh",
+     "/nix/store/*-git-2.56.0/bin/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-submodule",
+     "/nix/store/*-gnused-4.10/bin/sed"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 4,
+    "first": [
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-i18n",
+     "/nix/store/*-git-2.56.0/libexec/git-core/git-sh-setup",
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "cargo"
+  ]
+ },
+ "nu-cmd-lang 0.108.0": {
+  "denied": {
+   "executables": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-gawk-5.4.1/bin/awk",
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 4,
+    "first": [
+     "/etc/gitconfig",
+     "/etc/pki/tls",
+     "/etc/pki/tls/certs",
+     "/etc/pki/tls/certs/ca-bundle.crt"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   },
+   "reads: cargo home (other packages)": {
+    "count": 1421,
+    "first": [
+     "$CARGO_HOME/.global-cache",
+     "$CARGO_HOME/.package-cache",
+     "$CARGO_HOME/registry",
+     "$CARGO_HOME/registry/CACHEDIR.TAG",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/adler2-2.0.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/aho-corasick-1.1.3.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/allocator-api2-0.2.21.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/arrayvec-0.7.6.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/autocfg-1.4.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/bit-set-0.8.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/bit-vec-0.8.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/bitflags-2.6.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/buf-trait-0.4.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/byteorder-1.5.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/bytes-1.10.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/bytesize-2.1.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/byteyarn-0.5.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/castaway-0.2.3.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/cfg_aliases-0.2.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/chrono-0.4.42.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/chrono-humanize-0.2.3.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/const_format-0.2.34.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/const_format_proc_macros-0.2.34.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/crc32fast-1.4.2.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/crossterm-0.28.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/deranged-0.3.11.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/dirs-6.0.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/dirs-sys-0.5.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/either-1.15.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/env_logger-0.8.4.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/erased-serde-0.4.5.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/errno-0.3.10.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.16.1.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/flate2-1.1.2.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/foldhash-0.1.5.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.15.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/hashbrown-0.15.5.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/heck-0.5.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/hex-0.4.3.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/iana-time-zone-0.1.61.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/indexmap-2.11.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/inventory-0.3.15.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/is_ci-1.2.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/is_debug-1.1.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/itertools-0.14.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/itoa-1.0.14.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/lean_string-0.5.0.crate",
+     "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/libc-0.2.174.crate"
+    ]
+   },
+   "reads: target directory": {
+    "count": 1,
+    "first": [
+     "$HOME/bs/work/target/nushell/.rustc_info.json"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 2459,
+    "first": [
+     "$HOME/bs/work/src/nushell/.git",
+     "$HOME/bs/work/src/nushell/.git/FETCH_HEAD",
+     "$HOME/bs/work/src/nushell/.git/HEAD",
+     "$HOME/bs/work/src/nushell/.git/config",
+     "$HOME/bs/work/src/nushell/.git/index",
+     "$HOME/bs/work/src/nushell/.git/info/exclude",
+     "$HOME/bs/work/src/nushell/.git/logs/HEAD",
+     "$HOME/bs/work/src/nushell/.git/objects",
+     "$HOME/bs/work/src/nushell/.git/objects/pack",
+     "$HOME/bs/work/src/nushell/.git/objects/pack/pack-0046651caccca405d41e43692d9ab0565cceec21.idx",
+     "$HOME/bs/work/src/nushell/.git/objects/pack/pack-0046651caccca405d41e43692d9ab0565cceec21.pack",
+     "$HOME/bs/work/src/nushell/.git/refs",
+     "$HOME/bs/work/src/nushell/.git/refs/tags",
+     "$HOME/bs/work/src/nushell/.git/shallow",
+     "$HOME/bs/work/src/nushell/.gitattributes",
+     "$HOME/bs/work/src/nushell/.githooks",
+     "$HOME/bs/work/src/nushell/.githooks/pre-commit",
+     "$HOME/bs/work/src/nushell/.githooks/pre-push",
+     "$HOME/bs/work/src/nushell/.github",
+     "$HOME/bs/work/src/nushell/.github/AUTO_ISSUE_TEMPLATE",
+     "$HOME/bs/work/src/nushell/.github/AUTO_ISSUE_TEMPLATE/README.md",
+     "$HOME/bs/work/src/nushell/.github/AUTO_ISSUE_TEMPLATE/nightly-build-fail.md",
+     "$HOME/bs/work/src/nushell/.github/ISSUE_TEMPLATE",
+     "$HOME/bs/work/src/nushell/.github/ISSUE_TEMPLATE/bug_report.yml",
+     "$HOME/bs/work/src/nushell/.github/ISSUE_TEMPLATE/config.yml",
+     "$HOME/bs/work/src/nushell/.github/ISSUE_TEMPLATE/experimental_option.yml",
+     "$HOME/bs/work/src/nushell/.github/ISSUE_TEMPLATE/feature_request.yml",
+     "$HOME/bs/work/src/nushell/.github/dependabot.yml",
+     "$HOME/bs/work/src/nushell/.github/labeler.yml",
+     "$HOME/bs/work/src/nushell/.github/pull_request_template.md",
+     "$HOME/bs/work/src/nushell/.github/workflows",
+     "$HOME/bs/work/src/nushell/.github/workflows/audit.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/beta-test.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/check-msrv.nu",
+     "$HOME/bs/work/src/nushell/.github/workflows/ci.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/friendly-config-reminder.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/labels.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/milestone.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/nightly-build.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/pre-release-checkup.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/release-msi.nu",
+     "$HOME/bs/work/src/nushell/.github/workflows/release-msi.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/release-pkg.nu",
+     "$HOME/bs/work/src/nushell/.github/workflows/release.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/typos.yml",
+     "$HOME/bs/work/src/nushell/.github/workflows/winget-submission.yml",
+     "$HOME/bs/work/src/nushell/.gitignore",
+     "$HOME/bs/work/src/nushell/CITATION.cff",
+     "$HOME/bs/work/src/nushell/CODE_OF_CONDUCT.md",
+     "$HOME/bs/work/src/nushell/CONTRIBUTING.md"
+    ]
+   },
+   "writes": {
+    "count": 4,
+    "first": [
+     "$CARGO_HOME/.global-cache",
+     "$CARGO_HOME/.package-cache",
+     "$CARGO_HOME/registry",
+     "$HOME/bs/work/target/nushell/.rustc_info.json"
+    ]
+   }
+  },
+  "projects": [
+   "nushell"
+  ]
+ },
+ "octocrab 0.49.7": {
+  "denied": {
+   "reads: /etc": {
+    "count": 3,
+    "first": [
+     "/etc/pki/tls",
+     "/etc/pki/tls/certs",
+     "/etc/pki/tls/certs/ca-bundle.crt"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ },
+ "remote_server 0.1.0": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 5,
+    "first": [
+     "$HOME/bs/work/src/zed/.git",
+     "$HOME/bs/work/src/zed/.git/HEAD",
+     "$HOME/bs/work/src/zed/.git/config",
+     "$HOME/bs/work/src/zed/.git/objects",
+     "$HOME/bs/work/src/zed/.git/refs"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ },
+ "ripgrep 15.1.0": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   }
+  },
+  "projects": [
+   "ripgrep"
+  ]
+ },
+ "tikv-jemalloc-sys 0.6.0+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7": {
+  "denied": {
+   "executables": {
+    "count": 11,
+    "first": [
+     "/bin/arch",
+     "/bin/sh",
+     "/bin/uname",
+     "/nix/store/*-diffutils-3.12/bin/cmp",
+     "/nix/store/*-diffutils-3.12/bin/diff",
+     "/nix/store/*-gawk-5.4.1/bin/awk",
+     "/nix/store/*-gawk-5.4.1/bin/gawk",
+     "/nix/store/*-gnumake-4.4.1/bin/make",
+     "/nix/store/*-gnused-4.10/bin/sed",
+     "/usr/bin/arch",
+     "/usr/bin/uname"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-gnumake-4.4.1/include"
+    ]
+   }
+  },
+  "projects": [
+   "fd"
+  ]
+ },
+ "uucore 0.2.2": {
+  "denied": {
+   "reads: cargo home (other packages)": {
+    "count": 7,
+    "first": [
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_cp-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_mkdir-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_mktemp-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_mv-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_touch-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_uname-0.2.2/locales/en-US.ftl",
+     "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/uu_whoami-0.2.2/locales/en-US.ftl"
+    ]
+   }
+  },
+  "projects": [
+   "nushell"
+  ]
+ },
+ "wasmtime-c-api-impl 48.0.1": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-cmake-4.4.4/bin/cmake"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 6,
+    "first": [
+     "/nix/store/*-cmake-4.4.4/share/cmake-4.4/Modules/CMake.cmake",
+     "/nix/store/*-curl-8.22.0/lib",
+     "/nix/store/*-libarchive-3.8.9-lib/lib",
+     "/nix/store/*-libuv-1.53.0/lib",
+     "/nix/store/*-rhash-1.4.6/lib",
+     "/nix/store/*-xz-5.8.4/lib"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ },
+ "zed 1.24.4": {
+  "denied": {
+   "executables": {
+    "count": 1,
+    "first": [
+     "/nix/store/*-git-2.56.0/bin/git"
+    ]
+   },
+   "reads: /etc": {
+    "count": 1,
+    "first": [
+     "/etc/gitconfig"
+    ]
+   },
+   "reads: Nix store outside the C compiler": {
+    "count": 2,
+    "first": [
+     "/nix/store/*-git-2.56.0/share/locale",
+     "/nix/store/*-zlib-ng-2.3.3/lib"
+    ]
+   },
+   "reads: workspace outside the package": {
+    "count": 5,
+    "first": [
+     "$HOME/bs/work/src/zed/.git",
+     "$HOME/bs/work/src/zed/.git/HEAD",
+     "$HOME/bs/work/src/zed/.git/config",
+     "$HOME/bs/work/src/zed/.git/objects",
+     "$HOME/bs/work/src/zed/.git/refs"
+    ]
+   }
+  },
+  "projects": [
+   "zed"
+  ]
+ }
+}

@@ -1,0 +1,23 @@
+// blaze-gateway: the only holder of the R2 binding to blaze-cache (docs/remote-cache.md, "The gateway").
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "blaze-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // node:zlib's zstd decompresses /put's frames.
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "blaze-cache" }],
+  "kv_namespaces": [{ "binding": "TOKENS", "id": "c6406c32066b468790732cc063aedc7e" }],
+  // Per Cloudflare location and approximate. Keyed by the token's tenant, or by the client IP when anonymous.
+  "ratelimits": [
+    { "name": "RL_TENANT", "namespace_id": "4100", "simple": { "limit": 2000, "period": 10 } },
+    { "name": "RL_ANON", "namespace_id": "4101", "simple": { "limit": 600, "period": 10 } }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "blaze-gateway", "database_id": "fede545c-a86d-4cde-80b7-f2b46df8f9b2", "migrations_dir": "migrations" }
+  ],
+  // Secrets, set with `wrangler secret put`: GATEWAY_SECRET_1, the HKDF input of every private tenant's key.
+  "analytics_engine_datasets": [{ "binding": "METER", "dataset": "blaze_gateway" }],
+  "observability": { "enabled": true }
+}

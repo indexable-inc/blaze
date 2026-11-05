@@ -1,0 +1,11 @@
+    fn reset_for_new_revision(&mut self, table: &mut Table) {
+        self.eviction.for_each_evicted(|evict| {
+            let ingredient_index = table.ingredient_index(evict);
+            Self::evict_value_from_memo_for(
+                table.memos_mut(evict),
+                self.memo_ingredient_indices.get(ingredient_index),
+            )
+        });
+
+        self.deleted_entries.clear();
+    }

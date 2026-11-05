@@ -1,0 +1,39 @@
+[package]
+name = "blaze-doc"
+description = "HTML documentation of a workspace and its dependencies, written by blaze from rust-analyzer's HIR, with no rustdoc"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+base-db.workspace = true
+blaze-query.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
+either.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+intern.workspace = true
+parking_lot.workspace = true
+parser.workspace = true
+# `html`: `push_html`; `simd`: its escaping with SSE where the target has it.
+pulldown-cmark = { workspace = true, features = ["html", "simd"] }
+serde_json.workspace = true
+span.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

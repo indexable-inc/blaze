@@ -1,0 +1,116 @@
+# cranelift-object 0.137.1 from crates.io, patched for blaze: see SOURCE.md.
+
+[package]
+edition = "2024"
+rust-version = "1.97.0"
+name = "cranelift-object"
+version = "0.137.1"
+authors = ["The Cranelift Project Developers"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Emit Cranelift output to native object files with `object`"
+documentation = "https://docs.rs/cranelift-object"
+readme = "README.md"
+license = "Apache-2.0 WITH LLVM-exception"
+repository = "https://github.com/bytecodealliance/wasmtime"
+resolver = "2"
+
+[features]
+default = ["unwind"]
+unwind = [
+    "dep:gimli",
+    "cranelift-codegen/unwind",
+]
+
+[lib]
+name = "cranelift_object"
+path = "src/lib.rs"
+
+[dependencies.anyhow]
+version = "1.0.103"
+default-features = false
+
+[dependencies.cranelift-codegen]
+version = "0.137.1"
+features = [
+    "unwind",
+    "std",
+]
+default-features = false
+
+[dependencies.cranelift-control]
+version = "0.137.1"
+default-features = false
+
+[dependencies.cranelift-module]
+version = "0.137.1"
+
+[dependencies.gimli]
+version = "0.33.0"
+features = [
+    "read",
+    "write",
+]
+optional = true
+default-features = false
+
+[dependencies.log]
+version = "0.4.28"
+default-features = false
+
+[dependencies.object]
+version = "0.40.0"
+features = [
+    "read_core",
+    "elf",
+    "write",
+    "std",
+]
+default-features = false
+
+[dependencies.target-lexicon]
+version = "0.13.5"
+
+[lints.clippy]
+allow_attributes_without_reason = "warn"
+clone_on_copy = "warn"
+extra_unused_type_parameters = "warn"
+from_over_into = "warn"
+manual_strip = "warn"
+map_clone = "warn"
+multiple_bound_locations = "warn"
+redundant_field_names = "warn"
+uninlined_format_args = "warn"
+unnecessary_cast = "warn"
+unnecessary_fallible_conversions = "warn"
+unnecessary_mut_passed = "warn"
+unnecessary_to_owned = "warn"
+useless_conversion = "warn"
+
+[lints.clippy.all]
+level = "allow"
+priority = -1
+
+[lints.rust]
+trivial_numeric_casts = "warn"
+unstable_features = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(pulley_tail_calls)",
+    "cfg(pulley_assume_llvm_makes_tail_calls)",
+    "cfg(pulley_disable_interp_simd)",
+    "cfg(arc_try_new)",
+    "cfg(fuzzing)",
+    "cfg(gc_zeal)",
+]

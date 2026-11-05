@@ -1,0 +1,17 @@
+// The worker only (worker/*.ts). gen/ and client/ have their own runtimes (Bun, the browser).
+{
+	"compilerOptions": {
+		"target": "es2023",
+		"lib": ["es2023"],
+		"module": "es2022",
+		"moduleResolution": "bundler",
+		"types": ["@cloudflare/workers-types"],
+		"resolveJsonModule": true,
+		"strict": true,
+		"noEmit": true,
+		"isolatedModules": true,
+		"skipLibCheck": true,
+		"noUncheckedIndexedAccess": false
+	},
+	"include": ["worker/**/*.ts"]
+}

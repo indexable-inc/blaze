@@ -1,0 +1,14 @@
+{
+ "cwd": "ws/sub",
+ "home": "home",
+ "env": {"CARGO_BUILD_JOBS": "8", "CARGO_BUILD_RUSTFLAGS": "-a -b", "CARGO_ENV_FOO": "zz", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER": "env A=1", "CARGO_NET_OFFLINE": "true"},
+ "runs": [
+  ["build"], ["build.rustflags", "--show-origin"], ["--format", "json", "build"], ["--format", "json-value", "build.jobs"],
+  ["target.x86_64-unknown-linux-gnu.runner", "--show-origin"], ["env"], ["net.offline"], ["nope"], ["build.rustflags.x"],
+  ["--merged", "no", "build"], ["--format", "json", "--show-origin"], ["--format", "json", "--merged", "no"], ["--format", "yaml"],
+  ["--config", "build.jobs=2", "build.jobs", "--show-origin"], ["--config", "build.rustflags=[\"-x\"]", "build.rustflags", "--show-origin"],
+  ["--config", "build.jobs", "--show-origin"], ["--config", "[build]", "build"], ["--config", "registry.token=\"x\"", "registry"],
+  ["--config", "a.b=1", "--config", "a.b=\"s\"", "a"], ["--config", "../.cargo/more.toml", "build", "--show-origin"],
+  ["--config", "include=\"../.cargo/more.toml\"", "--merged", "no"]
+ ]
+}

@@ -1,0 +1,73 @@
+--- frame 0
+blaze build                                                                                             0.10s
+     Waiting for the daemon 0.10s
+--- frame 40
+blaze build                                                                                             1.00s
+✓ workspace 0.15s  ✓ build scripts 14/14 steps 0.82s  ● names 0.02s
+cores                   ▄▂ 1.1/8 busy
+   Resolving names 0.02s
+             0 done · 0 under way · 21 waiting
+--- frame 80
+blaze build                                                                                             1.20s
+✓ workspace 0.15s  ✓ build scripts 14/14 steps 0.82s  ● names 2/56 crates 0.22s
+cores                   ▃▄ 3.4/8 busy
+   Resolving names 0.22s · 2/56 crates · longest rg
+             rg  resolving  0.11s
+             ├─ textwrap  resolving  0.11s
+             │  └─ std  resolving  0.00s
+             ├─ lexopt waiting
+             ├─ anyhow waiting
+             ├─ log waiting
+             ├─ termcolor waiting
+             ├─ serde_json waiting
+             │  ├─ memchr waiting
+             │  ├─ ryu waiting
+             0 done · 3 under way · 32 waiting
+--- frame 120
+blaze build                                                                                             1.30s
+✓ workspace 0.15s  ✓ build scripts 14/14 steps 0.82s  ● names 2/56 crates 0.32s
+cores                  ▄▃▄ 3.4/8 busy
+   Resolving names 0.32s · 2/56 crates · longest rg
+             rg  resolving  0.21s
+             ├─ ignore  resolving  0.10s
+             │  ├─ crossbeam_deque  resolving  0.09s
+             │  │  └─ crossbeam_epoch  resolving  0.09s
+             │  └─ globset  resolving  0.09s
+             │     └─ bstr  resolving  0.09s
+             └─ grep waiting
+                ├─ grep_regex waiting
+                ├─ grep_searcher waiting
+                ├─ grep_printer waiting
+             0 done · 6 under way · 29 waiting
+--- frame 160
+blaze build                                                                                             1.30s
+✓ workspace 0.15s  ✓ build scripts 14/14 steps 0.82s  ● names 2/56 crates 0.32s
+cores                  ▄▃▄ 3.4/8 busy
+   Resolving names 0.32s · 2/56 crates · longest rg
+             rg  resolving  0.21s
+             └─ grep  resolving  0.09s
+                ├─ grep_printer  resolving  0.08s
+                │  └─ grep_searcher  resolving  0.07s
+                │     ├─ encoding_rs_io  resolving  0.06s
+                │     │  └─ encoding_rs  resolving  0.06s
+             0 done · 6 under way · 29 waiting
+--- frame 200
+blaze build                                                                                             3.00s
+✓ workspace 0.15s  ✓ build scripts 14/14 steps 0.82s  ✓ names 56/56 crates 0.35s  ● codegen 1.67s
+cores               ▄▂▃▆▃▃ 1.7/8 busy
+   Compiling rg 1.47s
+             8 done (8 up to date) · 0 under way · 27 waiting
+--- frame 240
+blaze build                                                                                             3.60s
+✓ 2 more  ✓ names 56/56 crates 0.35s  ✓ codegen 1.66s  ✓ check 74/74 files 0.44s  ✓ link 0.10s
+cores              ▃▂▃▃▃▃▇ 6.8/8 busy
+     Linking rg 0.15s · 31219/31219 fns
+             35 done (35 up to date) · 0 under way · 0 waiting
+--- left on the screen (273 frames drawn)
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.E12XGoSQqE/again)
+       Built build scripts and proc macros in 0.82s
+      Stored the manifest in 2.57s
+       Built from the store: 31219 fns found, 1 compiled; 6.25s
+        Took 6.25s: store the manifest 2.57s (0.5/8 cores), codegen 1.66s (3.3/8), build scripts 0.90s (3.1/8)
+             `blaze why` says more
+    Finished `dev` profile [blaze] target(s) in 6.27s

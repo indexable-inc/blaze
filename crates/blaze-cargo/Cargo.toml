@@ -1,0 +1,172 @@
+[package]
+name = "blaze-cargo"
+description = "blaze's cargo: the commands, the daemon and its client, plans, the sandbox and the remote store"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+doctest = false
+
+# These make a sandbox with a view, whose seccomp listener the kernel refuses inside the test
+# sandbox's own (one listener to a process): `blaze test` runs them outside.
+[package.metadata.blaze.sandbox]
+unsandboxed-tests = [
+    "sandbox::linux::tests::a_view_shows_its_binds_and_nothing_of_the_machine",
+    "sandbox::linux::tests::a_view_binds_a_store_path_from_anywhere",
+]
+
+[dependencies]
+anyhow.workspace = true
+blaze-diagnostics.workspace = true
+blaze-hash.workspace = true
+blaze-item-hash.workspace = true
+blaze-items.workspace = true
+blaze-serde.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-ub.workspace = true
+hir-ty-pure.workspace = true
+# `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
+blaze-doc.workspace = true
+# `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
+blaze-fmt.workspace = true
+# `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
+# blaze-wasm's `wasm` feature never reaches this build.
+blaze-wasm-pack.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+cfg.workspace = true
+intern.workspace = true
+blaze-sha256.workspace = true
+toml.workspace = true
+
+hir-ty-codegen.workspace = true
+blaze-macro-eval.workspace = true
+blaze-manifest.workspace = true
+blaze-global.workspace = true
+blaze-graph.workspace = true
+blaze-history.workspace = true
+# The flight recorder in both; the daemon writes the history, the client sends its rows and
+# exports `BLAZE_PROFILE`'s trace from it.
+blaze-profile.workspace = true
+# `blaze pprof`: the reader, views, reports and exports of .ixprof and pprof files.
+ix-prof.workspace = true
+regex.workspace = true
+# `blaze explore`: the explorer's server, started in the daemon on the first request for it.
+blaze-explore = { workspace = true, optional = true }
+# The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
+arrow-array.workspace = true
+blaze-inproc.workspace = true
+blaze-intent.workspace = true
+# `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
+# baselines the client checks a run's counts against.
+blaze-lints.workspace = true
+blaze-image.workspace = true
+blaze-mem.workspace = true
+blaze-protocol.workspace = true
+proc-macro-api.workspace = true
+blaze-ui.workspace = true
+blaze-units.workspace = true
+blaze-registry.workspace = true
+blaze-report.workspace = true
+# `.crate` files and `blaze fetch-url`: bytes by their digest, kept in the store.
+blaze-fetch.workspace = true
+# The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
+blaze-source.workspace = true
+blaze-build-script.workspace = true
+paths.workspace = true
+syntax.workspace = true
+span.workspace = true
+stdx.workspace = true
+# The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
+# each a feature tokio has on wasm too, so the seed builds the same.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+futures-util = { workspace = true, features = ["std"] }
+url.workspace = true
+semver.workspace = true
+tar = { workspace = true, features = ["default"] }
+# The zips build scripts download, unpacked where a crate's variable names a directory
+# (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
+zip = { workspace = true, features = ["deflate-flate2"] }
+# The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
+flate2 = { workspace = true, features = ["default"] }
+# The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
+# of liblzma's time on rustc's 84 MB.
+lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
+blaze-live.workspace = true
+# blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
+# query database, the store, the workspace load's queries, user code, codegen and the linker.
+blaze-api.workspace = true
+blaze-core.workspace = true
+blaze-vfs.workspace = true
+blaze-query.workspace = true
+blaze-cas.workspace = true
+blaze-gc.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-kernel.workspace = true
+blaze-usercode.workspace = true
+blaze-codegen.workspace = true
+blaze-store-check.workspace = true
+blaze-testsel.workspace = true
+blaze-lazy = { workspace = true, features = ["daemon"] }
+blaze-link.workspace = true
+blaze-lower.workspace = true
+base-db.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
+# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm with `native`.
+ratatui.workspace = true
+# `extended`: the `mi_collect` binding.
+libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
+blaze-alloc-count.workspace = true
+# The front end's code identity held to what building it read (`tests/front_end_identity.rs`).
+blaze-codegen-code.workspace = true
+# `Writer::hold_put`, for the gate's tests of a put counted and not yet published.
+blaze-cas = { workspace = true, features = ["test-hooks"] }
+tokio = { workspace = true, features = ["net"] }
+lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }
+
+[features]
+default = ["native"]
+# Everything the native blaze has and the wasm seed (docs/future/bootstrap.md, "The seed has no C")
+# leaves out, as one switch: LLVM as a code producer and the stencils it makes at build time
+# (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
+# (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
+# blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
+# test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze serve`
+# with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
+# (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one
+# request and exits (`serve/once.rs`), and what needs any of the above is refused, naming it.
+native = [
+    "hir-ty-codegen/llvm",
+    "blaze-registry/net",
+    "blaze-global/net",
+    "dep:blaze-explore",
+    "dep:libmimalloc-sys",
+    "ratatui/crossterm",
+]
+
+[lints]
+workspace = true

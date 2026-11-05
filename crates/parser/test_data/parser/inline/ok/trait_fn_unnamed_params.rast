@@ -1,0 +1,105 @@
+SOURCE_FILE
+  TRAIT
+    COMMENT "// 2015"
+    WHITESPACE "\n"
+    TRAIT_KW "trait"
+    WHITESPACE " "
+    NAME
+      IDENT "T"
+    WHITESPACE " "
+    ASSOC_ITEM_LIST
+      L_CURLY "{"
+      WHITESPACE " "
+      FN
+        FN_KW "fn"
+        WHITESPACE " "
+        NAME
+          IDENT "f"
+        PARAM_LIST
+          L_PAREN "("
+          SELF_PARAM
+            AMP "&"
+            NAME
+              SELF_KW "self"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            PTR_TYPE
+              STAR "*"
+              CONST_KW "const"
+              WHITESPACE " "
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "Option"
+                  GENERIC_ARG_LIST
+                    L_ANGLE "<"
+                    TYPE_ARG
+                      REF_TYPE
+                        AMP "&"
+                        PATH_TYPE
+                          PATH
+                            PATH_SEGMENT
+                              NAME_REF
+                                IDENT "u8"
+                    R_ANGLE ">"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            IDENT_PAT
+              NAME
+                IDENT "x"
+            COLON ":"
+            WHITESPACE " "
+            PATH_TYPE
+              PATH
+                PATH_SEGMENT
+                  NAME_REF
+                    IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            WILDCARD_PAT
+              UNDERSCORE "_"
+            COLON ":"
+            WHITESPACE " "
+            REF_TYPE
+              AMP "&"
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+          COMMA ","
+          WHITESPACE " "
+          PARAM
+            REF_TYPE
+              AMP "&"
+              PATH_TYPE
+                PATH
+                  PATH_SEGMENT
+                    NAME_REF
+                      IDENT "u8"
+          R_PAREN ")"
+        WHITESPACE " "
+        RET_TYPE
+          THIN_ARROW "->"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        SEMICOLON ";"
+      WHITESPACE " "
+      R_CURLY "}"
+  WHITESPACE "\n"

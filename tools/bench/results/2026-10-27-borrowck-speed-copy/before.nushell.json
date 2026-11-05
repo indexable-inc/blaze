@@ -1,0 +1,1264 @@
+{
+ "nushell": {
+  "polonius": {
+   "bodies": 35727,
+   "infer_ms": 35000.307,
+   "infer_warm_ms": 14714.161,
+   "first_check_ms": 26858.665,
+   "borrowck_ms": 11584.47,
+   "borrowck_excl_mir_ms": 11581.309,
+   "ratio_to_infer": 0.7870859235535074,
+   "per_body_us": {
+    "p50": 99,
+    "p99": 2944,
+    "max": 222300
+   },
+   "phases_ms": {
+    "constraints": 4187.436,
+    "entry_sets": 110.752,
+    "errors": 27.778,
+    "infer": 132.268,
+    "liveness": 2579.169,
+    "loans": 99.2,
+    "mir": 3.161,
+    "moves": 1668.377,
+    "scopes": 167.419,
+    "setup": 17.509,
+    "walk": 2188.617
+   },
+   "slowest": [
+    {
+     "name": "nu_cmd_extra::extra::formats::to::html::theme_list::<HtmlTheme>::list",
+     "path": "/root/bp/apps/nushell/crates/nu-cmd-extra/src/extra/formats/to/html/mod.rs",
+     "us": 222300,
+     "infer_us": 65619,
+     "phases_us": {
+      "constraints": 25635,
+      "entry_sets": 4,
+      "errors": 230,
+      "infer": 3537,
+      "liveness": 133516,
+      "loans": 1070,
+      "mir": 1,
+      "moves": 41179,
+      "scopes": 1802,
+      "setup": 17,
+      "walk": 12913
+     },
+     "counts": {
+      "blocks": 9123,
+      "bodies": 1,
+      "constraints": 25997,
+      "loans": 0,
+      "localized": 25997,
+      "locals": 13228,
+      "points": 48805,
+      "regions": 30331,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_command::filters::par_each::stream_parallel_values",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/filters/par_each.rs",
+     "us": 190737,
+     "infer_us": 26092,
+     "phases_us": {
+      "constraints": 188876,
+      "entry_sets": 14,
+      "errors": 9,
+      "infer": 11,
+      "liveness": 1191,
+      "loans": 13,
+      "mir": 4,
+      "moves": 282,
+      "scopes": 39,
+      "setup": 13,
+      "walk": 239
+     },
+     "counts": {
+      "blocks": 118,
+      "bodies": 6,
+      "constraints": 32,
+      "loans": 6,
+      "localized": 32,
+      "locals": 92,
+      "points": 317,
+      "regions": 53,
+      "universals": 16
+     }
+    },
+    {
+     "name": "nu_mcp::run_http_server",
+     "path": "/root/bp/apps/nushell/crates/nu-mcp/src/lib.rs",
+     "us": 127227,
+     "infer_us": 82119,
+     "phases_us": {
+      "constraints": 5569,
+      "entry_sets": 336,
+      "errors": 58,
+      "infer": 209,
+      "liveness": 4214,
+      "loans": 195,
+      "mir": 5,
+      "moves": 114529,
+      "scopes": 310,
+      "setup": 32,
+      "walk": 1496
+     },
+     "counts": {
+      "blocks": 2409,
+      "bodies": 10,
+      "constraints": 2017,
+      "loans": 136,
+      "localized": 2009,
+      "locals": 1138,
+      "points": 7041,
+      "regions": 1947,
+      "universals": 49
+     }
+    },
+    {
+     "name": "nu_mcp::server::<NushellMcpServer>::tool_router",
+     "path": "/root/bp/apps/nushell/crates/nu-mcp/src/server.rs",
+     "us": 107168,
+     "infer_us": 17982,
+     "phases_us": {
+      "constraints": 106924,
+      "entry_sets": 0,
+      "errors": 1,
+      "infer": 2,
+      "liveness": 97,
+      "loans": 2,
+      "mir": 1,
+      "moves": 47,
+      "scopes": 4,
+      "setup": 2,
+      "walk": 64
+     },
+     "counts": {
+      "blocks": 27,
+      "bodies": 1,
+      "constraints": 0,
+      "loans": 0,
+      "localized": 0,
+      "locals": 13,
+      "points": 57,
+      "regions": 2,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_protocol::errors::parse_error::<ParseError>::labels",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/parse_error.rs",
+     "us": 57939,
+     "infer_us": 266296,
+     "phases_us": {
+      "constraints": 40527,
+      "entry_sets": 505,
+      "errors": 121,
+      "infer": 455,
+      "liveness": 5745,
+      "loans": 207,
+      "mir": 14,
+      "moves": 5814,
+      "scopes": 528,
+      "setup": 323,
+      "walk": 2718
+     },
+     "counts": {
+      "blocks": 4408,
+      "bodies": 106,
+      "constraints": 5265,
+      "loans": 222,
+      "localized": 5265,
+      "locals": 3756,
+      "points": 13457,
+      "regions": 5575,
+      "universals": 449
+     }
+    },
+    {
+     "name": "nu_protocol::errors::shell_error::<ShellError>::labels",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/shell_error/mod.rs",
+     "us": 57424,
+     "infer_us": 304506,
+     "phases_us": {
+      "constraints": 40359,
+      "entry_sets": 487,
+      "errors": 118,
+      "infer": 431,
+      "liveness": 5544,
+      "loans": 210,
+      "mir": 16,
+      "moves": 5662,
+      "scopes": 523,
+      "setup": 317,
+      "walk": 2765
+     },
+     "counts": {
+      "blocks": 4332,
+      "bodies": 107,
+      "constraints": 4981,
+      "loans": 218,
+      "localized": 4981,
+      "locals": 3653,
+      "points": 13112,
+      "regions": 5285,
+      "universals": 431
+     }
+    },
+    {
+     "name": "nu_command::strings::ansi::ansi_::CODE_LIST",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/strings/ansi/ansi_.rs",
+     "us": 46817,
+     "infer_us": 29466,
+     "phases_us": {
+      "constraints": 5837,
+      "entry_sets": 817,
+      "errors": 100,
+      "infer": 596,
+      "liveness": 30545,
+      "loans": 345,
+      "mir": 2,
+      "moves": 4970,
+      "scopes": 475,
+      "setup": 17,
+      "walk": 2286
+     },
+     "counts": {
+      "blocks": 4516,
+      "bodies": 2,
+      "constraints": 4014,
+      "loans": 425,
+      "localized": 4014,
+      "locals": 3612,
+      "points": 14354,
+      "regions": 4947,
+      "universals": 5
+     }
+    },
+    {
+     "name": "nu::main",
+     "path": "/root/bp/apps/nushell/src/main.rs",
+     "us": 33866,
+     "infer_us": 66206,
+     "phases_us": {
+      "constraints": 16911,
+      "entry_sets": 467,
+      "errors": 113,
+      "infer": 436,
+      "liveness": 6485,
+      "loans": 433,
+      "mir": 8,
+      "moves": 3860,
+      "scopes": 750,
+      "setup": 73,
+      "walk": 3785
+     },
+     "counts": {
+      "blocks": 2013,
+      "bodies": 27,
+      "constraints": 4318,
+      "loans": 381,
+      "localized": 4316,
+      "locals": 2532,
+      "points": 9351,
+      "regions": 4848,
+      "universals": 94
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::typed_column_to_series",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 29655,
+     "infer_us": 121062,
+     "phases_us": {
+      "constraints": 18884,
+      "entry_sets": 219,
+      "errors": 57,
+      "infer": 180,
+      "liveness": 2942,
+      "loans": 158,
+      "mir": 14,
+      "moves": 2804,
+      "scopes": 310,
+      "setup": 88,
+      "walk": 3604
+     },
+     "counts": {
+      "blocks": 1530,
+      "bodies": 54,
+      "constraints": 1469,
+      "loans": 85,
+      "localized": 1467,
+      "locals": 1140,
+      "points": 4603,
+      "regions": 1729,
+      "universals": 177
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::series_to_values",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 28954,
+     "infer_us": 239815,
+     "phases_us": {
+      "constraints": 16249,
+      "entry_sets": 262,
+      "errors": 54,
+      "infer": 176,
+      "liveness": 4253,
+      "loans": 163,
+      "mir": 9,
+      "moves": 3238,
+      "scopes": 419,
+      "setup": 78,
+      "walk": 3671
+     },
+     "counts": {
+      "blocks": 1729,
+      "bodies": 43,
+      "constraints": 1944,
+      "loans": 63,
+      "localized": 1944,
+      "locals": 1247,
+      "points": 5483,
+      "regions": 1612,
+      "universals": 138
+     }
+    },
+    {
+     "name": "nu_engine::eval_ir::eval_instruction",
+     "path": "/root/bp/apps/nushell/crates/nu-engine/src/eval_ir.rs",
+     "us": 21793,
+     "infer_us": 23380,
+     "phases_us": {
+      "constraints": 5792,
+      "entry_sets": 460,
+      "errors": 62,
+      "infer": 176,
+      "liveness": 4962,
+      "loans": 259,
+      "mir": 2,
+      "moves": 2889,
+      "scopes": 267,
+      "setup": 37,
+      "walk": 6526
+     },
+     "counts": {
+      "blocks": 2615,
+      "bodies": 10,
+      "constraints": 1640,
+      "loans": 192,
+      "localized": 1640,
+      "locals": 1591,
+      "points": 7958,
+      "regions": 1486,
+      "universals": 32
+     }
+    },
+    {
+     "name": "nu_command::strings::format::date::expand_locale_specifiers",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/strings/format/date.rs",
+     "us": 20744,
+     "infer_us": 8121,
+     "phases_us": {
+      "constraints": 2290,
+      "entry_sets": 617,
+      "errors": 61,
+      "infer": 3741,
+      "liveness": 6156,
+      "loans": 265,
+      "mir": 1,
+      "moves": 4741,
+      "scopes": 214,
+      "setup": 7,
+      "walk": 1633
+     },
+     "counts": {
+      "blocks": 5108,
+      "bodies": 1,
+      "constraints": 5130,
+      "loans": 11,
+      "localized": 5130,
+      "locals": 1743,
+      "points": 13714,
+      "regions": 5129,
+      "universals": 3
+     }
+    },
+    {
+     "name": "nu_command::default_context::add_shell_command_context",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/default_context.rs",
+     "us": 20411,
+     "infer_us": 28510,
+     "phases_us": {
+      "constraints": 6934,
+      "entry_sets": 467,
+      "errors": 54,
+      "infer": 234,
+      "liveness": 4761,
+      "loans": 183,
+      "mir": 0,
+      "moves": 5231,
+      "scopes": 825,
+      "setup": 3,
+      "walk": 1419
+     },
+     "counts": {
+      "blocks": 3217,
+      "bodies": 1,
+      "constraints": 3636,
+      "loans": 404,
+      "localized": 3636,
+      "locals": 2031,
+      "points": 8913,
+      "regions": 2850,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_expression::expr_to_value",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_expression/mod.rs",
+     "us": 19054,
+     "infer_us": 26913,
+     "phases_us": {
+      "constraints": 6613,
+      "entry_sets": 323,
+      "errors": 46,
+      "infer": 121,
+      "liveness": 3397,
+      "loans": 85,
+      "mir": 4,
+      "moves": 2236,
+      "scopes": 152,
+      "setup": 23,
+      "walk": 5756
+     },
+     "counts": {
+      "blocks": 2774,
+      "bodies": 9,
+      "constraints": 1169,
+      "loans": 39,
+      "localized": 1169,
+      "locals": 1136,
+      "points": 6329,
+      "regions": 1318,
+      "universals": 43
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::input_type_list_to_series",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 17971,
+     "infer_us": 57585,
+     "phases_us": {
+      "constraints": 9207,
+      "entry_sets": 278,
+      "errors": 45,
+      "infer": 146,
+      "liveness": 2484,
+      "loans": 102,
+      "mir": 5,
+      "moves": 1807,
+      "scopes": 424,
+      "setup": 34,
+      "walk": 3198
+     },
+     "counts": {
+      "blocks": 1694,
+      "bodies": 26,
+      "constraints": 1362,
+      "loans": 76,
+      "localized": 1362,
+      "locals": 882,
+      "points": 4461,
+      "regions": 1245,
+      "universals": 90
+     }
+    },
+    {
+     "name": "nu_command::platform::input::list::<SelectWidget<'a>>::render",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/platform/input/list.rs",
+     "us": 17619,
+     "infer_us": 130020,
+     "phases_us": {
+      "constraints": 10013,
+      "entry_sets": 264,
+      "errors": 86,
+      "infer": 202,
+      "liveness": 2360,
+      "loans": 180,
+      "mir": 13,
+      "moves": 2380,
+      "scopes": 290,
+      "setup": 104,
+      "walk": 1184
+     },
+     "counts": {
+      "blocks": 1795,
+      "bodies": 80,
+      "constraints": 2356,
+      "loans": 220,
+      "localized": 2356,
+      "locals": 1375,
+      "points": 5769,
+      "regions": 2115,
+      "universals": 371
+     }
+    },
+    {
+     "name": "nu_protocol::errors::shell_error::<ShellError>::fmt",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/shell_error/mod.rs",
+     "us": 15753,
+     "infer_us": 21354,
+     "phases_us": {
+      "constraints": 4816,
+      "entry_sets": 503,
+      "errors": 66,
+      "infer": 993,
+      "liveness": 4183,
+      "loans": 327,
+      "mir": 0,
+      "moves": 2029,
+      "scopes": 1104,
+      "setup": 11,
+      "walk": 1353
+     },
+     "counts": {
+      "blocks": 2300,
+      "bodies": 1,
+      "constraints": 15310,
+      "loans": 996,
+      "localized": 15310,
+      "locals": 2660,
+      "points": 10379,
+      "regions": 9986,
+      "universals": 5
+     }
+    },
+    {
+     "name": "nu_cli::reedline_config::edit_from_record",
+     "path": "/root/bp/apps/nushell/crates/nu-cli/src/reedline_config.rs",
+     "us": 15229,
+     "infer_us": 27068,
+     "phases_us": {
+      "constraints": 5870,
+      "entry_sets": 217,
+      "errors": 36,
+      "infer": 124,
+      "liveness": 1841,
+      "loans": 53,
+      "mir": 7,
+      "moves": 1455,
+      "scopes": 80,
+      "setup": 40,
+      "walk": 5210
+     },
+     "counts": {
+      "blocks": 1795,
+      "bodies": 26,
+      "constraints": 774,
+      "loans": 2,
+      "localized": 774,
+      "locals": 865,
+      "points": 4934,
+      "regions": 836,
+      "universals": 79
+     }
+    },
+    {
+     "name": "nu_cli::repl::loop_iteration",
+     "path": "/root/bp/apps/nushell/crates/nu-cli/src/repl.rs",
+     "us": 14805,
+     "infer_us": 35387,
+     "phases_us": {
+      "constraints": 5706,
+      "entry_sets": 358,
+      "errors": 67,
+      "infer": 377,
+      "liveness": 3615,
+      "loans": 270,
+      "mir": 2,
+      "moves": 2175,
+      "scopes": 460,
+      "setup": 17,
+      "walk": 1466
+     },
+     "counts": {
+      "blocks": 1392,
+      "bodies": 6,
+      "constraints": 4008,
+      "loans": 350,
+      "localized": 4008,
+      "locals": 2174,
+      "points": 7760,
+      "regions": 4463,
+      "universals": 18
+     }
+    },
+    {
+     "name": "nu_command::filesystem::ls::ls_for_one_pattern",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/filesystem/ls.rs",
+     "us": 14643,
+     "infer_us": 23630,
+     "phases_us": {
+      "constraints": 9533,
+      "entry_sets": 177,
+      "errors": 30,
+      "infer": 89,
+      "liveness": 1588,
+      "loans": 84,
+      "mir": 3,
+      "moves": 1323,
+      "scopes": 181,
+      "setup": 29,
+      "walk": 1462
+     },
+     "counts": {
+      "blocks": 799,
+      "bodies": 12,
+      "constraints": 713,
+      "loans": 82,
+      "localized": 710,
+      "locals": 676,
+      "points": 2642,
+      "regions": 806,
+      "universals": 48
+     }
+    }
+   ],
+   "secs": 135
+  },
+  "nll": {
+   "bodies": 35727,
+   "infer_ms": 35000.307,
+   "infer_warm_ms": 14714.161,
+   "first_check_ms": 26858.665,
+   "borrowck_ms": 10729.047,
+   "borrowck_excl_mir_ms": 10727.463,
+   "ratio_to_infer": 0.7290570627846196,
+   "per_body_us": {
+    "p50": 86,
+    "p99": 2806,
+    "max": 226457
+   },
+   "phases_ms": {
+    "constraints": 3878.474,
+    "entry_sets": 107.727,
+    "errors": 25.341,
+    "infer": 126.976,
+    "liveness": 2443.586,
+    "loans": 92.038,
+    "mir": 1.584,
+    "moves": 1572.112,
+    "scopes": 12.808,
+    "setup": 14.028,
+    "walk": 2110.925
+   },
+   "slowest": [
+    {
+     "name": "nu_cmd_extra::extra::formats::to::html::theme_list::<HtmlTheme>::list",
+     "path": "/root/bp/apps/nushell/crates/nu-cmd-extra/src/extra/formats/to/html/mod.rs",
+     "us": 226457,
+     "infer_us": 65619,
+     "phases_us": {
+      "constraints": 24859,
+      "entry_sets": 3,
+      "errors": 234,
+      "infer": 3626,
+      "liveness": 132885,
+      "loans": 1069,
+      "mir": 2,
+      "moves": 48968,
+      "scopes": 0,
+      "setup": 22,
+      "walk": 12233
+     },
+     "counts": {
+      "blocks": 9123,
+      "bodies": 1,
+      "constraints": 25997,
+      "loans": 0,
+      "localized": 25997,
+      "locals": 13228,
+      "points": 48805,
+      "regions": 30331,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_command::filters::par_each::stream_parallel_values",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/filters/par_each.rs",
+     "us": 190447,
+     "infer_us": 26092,
+     "phases_us": {
+      "constraints": 188616,
+      "entry_sets": 14,
+      "errors": 8,
+      "infer": 11,
+      "liveness": 1219,
+      "loans": 13,
+      "mir": 3,
+      "moves": 271,
+      "scopes": 2,
+      "setup": 12,
+      "walk": 239
+     },
+     "counts": {
+      "blocks": 118,
+      "bodies": 6,
+      "constraints": 32,
+      "loans": 6,
+      "localized": 32,
+      "locals": 92,
+      "points": 317,
+      "regions": 53,
+      "universals": 16
+     }
+    },
+    {
+     "name": "nu_mcp::run_http_server",
+     "path": "/root/bp/apps/nushell/crates/nu-mcp/src/lib.rs",
+     "us": 128894,
+     "infer_us": 82119,
+     "phases_us": {
+      "constraints": 6026,
+      "entry_sets": 382,
+      "errors": 56,
+      "infer": 233,
+      "liveness": 4390,
+      "loans": 219,
+      "mir": 4,
+      "moves": 115808,
+      "scopes": 27,
+      "setup": 32,
+      "walk": 1475
+     },
+     "counts": {
+      "blocks": 2409,
+      "bodies": 10,
+      "constraints": 2017,
+      "loans": 136,
+      "localized": 2009,
+      "locals": 1138,
+      "points": 7041,
+      "regions": 1947,
+      "universals": 49
+     }
+    },
+    {
+     "name": "nu_mcp::server::<NushellMcpServer>::tool_router",
+     "path": "/root/bp/apps/nushell/crates/nu-mcp/src/server.rs",
+     "us": 107136,
+     "infer_us": 17982,
+     "phases_us": {
+      "constraints": 106911,
+      "entry_sets": 0,
+      "errors": 1,
+      "infer": 2,
+      "liveness": 94,
+      "loans": 2,
+      "mir": 1,
+      "moves": 38,
+      "scopes": 0,
+      "setup": 3,
+      "walk": 65
+     },
+     "counts": {
+      "blocks": 27,
+      "bodies": 1,
+      "constraints": 0,
+      "loans": 0,
+      "localized": 0,
+      "locals": 13,
+      "points": 57,
+      "regions": 2,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_protocol::errors::parse_error::<ParseError>::labels",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/parse_error.rs",
+     "us": 57222,
+     "infer_us": 266296,
+     "phases_us": {
+      "constraints": 40330,
+      "entry_sets": 495,
+      "errors": 120,
+      "infer": 445,
+      "liveness": 5665,
+      "loans": 211,
+      "mir": 16,
+      "moves": 5864,
+      "scopes": 33,
+      "setup": 331,
+      "walk": 2780
+     },
+     "counts": {
+      "blocks": 4408,
+      "bodies": 106,
+      "constraints": 5265,
+      "loans": 222,
+      "localized": 5265,
+      "locals": 3756,
+      "points": 13457,
+      "regions": 5575,
+      "universals": 449
+     }
+    },
+    {
+     "name": "nu_protocol::errors::shell_error::<ShellError>::labels",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/shell_error/mod.rs",
+     "us": 56509,
+     "infer_us": 304506,
+     "phases_us": {
+      "constraints": 40261,
+      "entry_sets": 469,
+      "errors": 119,
+      "infer": 421,
+      "liveness": 5345,
+      "loans": 206,
+      "mir": 18,
+      "moves": 5638,
+      "scopes": 33,
+      "setup": 314,
+      "walk": 2734
+     },
+     "counts": {
+      "blocks": 4332,
+      "bodies": 107,
+      "constraints": 4981,
+      "loans": 218,
+      "localized": 4981,
+      "locals": 3653,
+      "points": 13112,
+      "regions": 5285,
+      "universals": 431
+     }
+    },
+    {
+     "name": "nu_command::strings::ansi::ansi_::CODE_LIST",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/strings/ansi/ansi_.rs",
+     "us": 44023,
+     "infer_us": 29466,
+     "phases_us": {
+      "constraints": 5390,
+      "entry_sets": 1092,
+      "errors": 95,
+      "infer": 428,
+      "liveness": 28570,
+      "loans": 283,
+      "mir": 2,
+      "moves": 5155,
+      "scopes": 49,
+      "setup": 16,
+      "walk": 2214
+     },
+     "counts": {
+      "blocks": 4516,
+      "bodies": 2,
+      "constraints": 4014,
+      "loans": 425,
+      "localized": 4014,
+      "locals": 3612,
+      "points": 14354,
+      "regions": 4947,
+      "universals": 5
+     }
+    },
+    {
+     "name": "nu::main",
+     "path": "/root/bp/apps/nushell/src/main.rs",
+     "us": 33527,
+     "infer_us": 66206,
+     "phases_us": {
+      "constraints": 17262,
+      "entry_sets": 477,
+      "errors": 103,
+      "infer": 437,
+      "liveness": 6422,
+      "loans": 373,
+      "mir": 9,
+      "moves": 4147,
+      "scopes": 79,
+      "setup": 80,
+      "walk": 3618
+     },
+     "counts": {
+      "blocks": 2013,
+      "bodies": 27,
+      "constraints": 4318,
+      "loans": 381,
+      "localized": 4316,
+      "locals": 2532,
+      "points": 9351,
+      "regions": 4848,
+      "universals": 94
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::series_to_values",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 28836,
+     "infer_us": 239815,
+     "phases_us": {
+      "constraints": 16561,
+      "entry_sets": 320,
+      "errors": 53,
+      "infer": 178,
+      "liveness": 4206,
+      "loans": 195,
+      "mir": 9,
+      "moves": 3264,
+      "scopes": 16,
+      "setup": 78,
+      "walk": 3593
+     },
+     "counts": {
+      "blocks": 1729,
+      "bodies": 43,
+      "constraints": 1944,
+      "loans": 63,
+      "localized": 1944,
+      "locals": 1247,
+      "points": 5483,
+      "regions": 1612,
+      "universals": 138
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::typed_column_to_series",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 28818,
+     "infer_us": 121062,
+     "phases_us": {
+      "constraints": 18308,
+      "entry_sets": 278,
+      "errors": 56,
+      "infer": 188,
+      "liveness": 2956,
+      "loans": 155,
+      "mir": 15,
+      "moves": 2729,
+      "scopes": 29,
+      "setup": 89,
+      "walk": 3643
+     },
+     "counts": {
+      "blocks": 1530,
+      "bodies": 54,
+      "constraints": 1469,
+      "loans": 85,
+      "localized": 1467,
+      "locals": 1140,
+      "points": 4603,
+      "regions": 1729,
+      "universals": 177
+     }
+    },
+    {
+     "name": "nu_engine::eval_ir::eval_instruction",
+     "path": "/root/bp/apps/nushell/crates/nu-engine/src/eval_ir.rs",
+     "us": 21311,
+     "infer_us": 23380,
+     "phases_us": {
+      "constraints": 5795,
+      "entry_sets": 444,
+      "errors": 61,
+      "infer": 176,
+      "liveness": 4809,
+      "loans": 233,
+      "mir": 2,
+      "moves": 2820,
+      "scopes": 32,
+      "setup": 39,
+      "walk": 6554
+     },
+     "counts": {
+      "blocks": 2615,
+      "bodies": 10,
+      "constraints": 1640,
+      "loans": 192,
+      "localized": 1640,
+      "locals": 1591,
+      "points": 7958,
+      "regions": 1486,
+      "universals": 32
+     }
+    },
+    {
+     "name": "nu_command::strings::format::date::expand_locale_specifiers",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/strings/format/date.rs",
+     "us": 20333,
+     "infer_us": 8121,
+     "phases_us": {
+      "constraints": 2697,
+      "entry_sets": 636,
+      "errors": 74,
+      "infer": 3495,
+      "liveness": 6085,
+      "loans": 322,
+      "mir": 1,
+      "moves": 4016,
+      "scopes": 5,
+      "setup": 16,
+      "walk": 1828
+     },
+     "counts": {
+      "blocks": 5108,
+      "bodies": 1,
+      "constraints": 5130,
+      "loans": 11,
+      "localized": 5130,
+      "locals": 1743,
+      "points": 13714,
+      "regions": 5129,
+      "universals": 3
+     }
+    },
+    {
+     "name": "nu_command::default_context::add_shell_command_context",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/default_context.rs",
+     "us": 19552,
+     "infer_us": 28510,
+     "phases_us": {
+      "constraints": 7114,
+      "entry_sets": 532,
+      "errors": 57,
+      "infer": 232,
+      "liveness": 4380,
+      "loans": 190,
+      "mir": 1,
+      "moves": 5281,
+      "scopes": 92,
+      "setup": 6,
+      "walk": 1382
+     },
+     "counts": {
+      "blocks": 3217,
+      "bodies": 1,
+      "constraints": 3636,
+      "loans": 404,
+      "localized": 3636,
+      "locals": 2031,
+      "points": 8913,
+      "regions": 2850,
+      "universals": 2
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_expression::expr_to_value",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_expression/mod.rs",
+     "us": 17908,
+     "infer_us": 26913,
+     "phases_us": {
+      "constraints": 6182,
+      "entry_sets": 349,
+      "errors": 45,
+      "infer": 132,
+      "liveness": 3127,
+      "loans": 87,
+      "mir": 3,
+      "moves": 2010,
+      "scopes": 7,
+      "setup": 22,
+      "walk": 5703
+     },
+     "counts": {
+      "blocks": 2774,
+      "bodies": 9,
+      "constraints": 1169,
+      "loans": 39,
+      "localized": 1169,
+      "locals": 1136,
+      "points": 6329,
+      "regions": 1318,
+      "universals": 43
+     }
+    },
+    {
+     "name": "nu_command::platform::input::list::<SelectWidget<'a>>::render",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/platform/input/list.rs",
+     "us": 17377,
+     "infer_us": 130020,
+     "phases_us": {
+      "constraints": 10094,
+      "entry_sets": 269,
+      "errors": 86,
+      "infer": 200,
+      "liveness": 2425,
+      "loans": 177,
+      "mir": 13,
+      "moves": 2309,
+      "scopes": 31,
+      "setup": 103,
+      "walk": 1149
+     },
+     "counts": {
+      "blocks": 1795,
+      "bodies": 80,
+      "constraints": 2356,
+      "loans": 220,
+      "localized": 2356,
+      "locals": 1375,
+      "points": 5769,
+      "regions": 2115,
+      "universals": 371
+     }
+    },
+    {
+     "name": "nu_plugin_polars::dataframe::values::nu_dataframe::conversion::input_type_list_to_series",
+     "path": "/root/bp/apps/nushell/crates/nu_plugin_polars/src/dataframe/values/nu_dataframe/conversion.rs",
+     "us": 17071,
+     "infer_us": 57585,
+     "phases_us": {
+      "constraints": 8784,
+      "entry_sets": 216,
+      "errors": 39,
+      "infer": 147,
+      "liveness": 2507,
+      "loans": 102,
+      "mir": 5,
+      "moves": 1768,
+      "scopes": 52,
+      "setup": 34,
+      "walk": 3183
+     },
+     "counts": {
+      "blocks": 1694,
+      "bodies": 26,
+      "constraints": 1362,
+      "loans": 76,
+      "localized": 1362,
+      "locals": 882,
+      "points": 4461,
+      "regions": 1245,
+      "universals": 90
+     }
+    },
+    {
+     "name": "nu_protocol::errors::shell_error::<ShellError>::fmt",
+     "path": "/root/bp/apps/nushell/crates/nu-protocol/src/errors/shell_error/mod.rs",
+     "us": 15016,
+     "infer_us": 21354,
+     "phases_us": {
+      "constraints": 4887,
+      "entry_sets": 532,
+      "errors": 66,
+      "infer": 968,
+      "liveness": 4459,
+      "loans": 332,
+      "mir": 0,
+      "moves": 2003,
+      "scopes": 100,
+      "setup": 11,
+      "walk": 1334
+     },
+     "counts": {
+      "blocks": 2300,
+      "bodies": 1,
+      "constraints": 15310,
+      "loans": 996,
+      "localized": 15310,
+      "locals": 2660,
+      "points": 10379,
+      "regions": 9986,
+      "universals": 5
+     }
+    },
+    {
+     "name": "nu_cli::reedline_config::edit_from_record",
+     "path": "/root/bp/apps/nushell/crates/nu-cli/src/reedline_config.rs",
+     "us": 14619,
+     "infer_us": 27068,
+     "phases_us": {
+      "constraints": 5367,
+      "entry_sets": 300,
+      "errors": 35,
+      "infer": 92,
+      "liveness": 1800,
+      "loans": 59,
+      "mir": 5,
+      "moves": 1412,
+      "scopes": 2,
+      "setup": 36,
+      "walk": 5199
+     },
+     "counts": {
+      "blocks": 1795,
+      "bodies": 26,
+      "constraints": 774,
+      "loans": 2,
+      "localized": 774,
+      "locals": 865,
+      "points": 4934,
+      "regions": 836,
+      "universals": 79
+     }
+    },
+    {
+     "name": "nu_command::filesystem::ls::ls_for_one_pattern",
+     "path": "/root/bp/apps/nushell/crates/nu-command/src/filesystem/ls.rs",
+     "us": 14189,
+     "infer_us": 23630,
+     "phases_us": {
+      "constraints": 9314,
+      "entry_sets": 189,
+      "errors": 39,
+      "infer": 92,
+      "liveness": 1545,
+      "loans": 84,
+      "mir": 3,
+      "moves": 1296,
+      "scopes": 30,
+      "setup": 28,
+      "walk": 1441
+     },
+     "counts": {
+      "blocks": 799,
+      "bodies": 12,
+      "constraints": 713,
+      "loans": 82,
+      "localized": 710,
+      "locals": 676,
+      "points": 2642,
+      "regions": 806,
+      "universals": 48
+     }
+    },
+    {
+     "name": "nu_cli::repl::loop_iteration",
+     "path": "/root/bp/apps/nushell/crates/nu-cli/src/repl.rs",
+     "us": 14152,
+     "infer_us": 35387,
+     "phases_us": {
+      "constraints": 5557,
+      "entry_sets": 378,
+      "errors": 67,
+      "infer": 380,
+      "liveness": 3641,
+      "loans": 251,
+      "mir": 2,
+      "moves": 2157,
+      "scopes": 43,
+      "setup": 20,
+      "walk": 1410
+     },
+     "counts": {
+      "blocks": 1392,
+      "bodies": 6,
+      "constraints": 4008,
+      "loans": 350,
+      "localized": 4008,
+      "locals": 2174,
+      "points": 7760,
+      "regions": 4463,
+      "universals": 18
+     }
+    }
+   ],
+   "secs": 135
+  }
+ }
+}

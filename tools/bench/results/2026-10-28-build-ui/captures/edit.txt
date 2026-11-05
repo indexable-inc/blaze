@@ -1,0 +1,4 @@
+--- left on the screen (0 frames drawn)
+     Rebuilt 1 fn: search (crates/core/main.rs edited); 0.17s
+   Compiling ripgrep v15.1.0 (/tmp/…/ripgrep)
+    Finished `dev` profile [blaze] target(s) in 0.20s

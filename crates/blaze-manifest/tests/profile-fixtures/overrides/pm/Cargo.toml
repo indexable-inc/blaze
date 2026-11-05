@@ -1,0 +1,8 @@
+[package]
+name = "pm"
+version = "0.3.0"
+edition = "2021"
+[lib]
+proc-macro = true
+[dependencies]
+bonly = { path = "../bonly" }

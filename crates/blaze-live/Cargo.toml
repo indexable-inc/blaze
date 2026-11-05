@@ -1,0 +1,100 @@
+[package]
+name = "blaze-live"
+version = "0.1.0"
+description = "Applies blaze's edits to a program while it runs"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Indexable, Inc."]
+repository = "https://github.com/indexable-inc/blaze"
+homepage = "https://ix.dev/blaze"
+readme = "README.md"
+keywords = ["hot-reload", "live-reload", "jit", "compiler"]
+categories = ["development-tools"]
+
+# blaze-inproc's run side (no `host` feature): the start hook a dev run needs, the channel
+# patches come through and the fences. blaze-inproc-rt is that run side itself (the dev runtime,
+# which blaze also links into every dev executable as a crate of the standard library): the
+# descriptor, the jump table's execution log and the tier counters are its, and blaze-live's
+# switch is built on them. blaze-live is a path dependency of programs outside this
+# workspace too (demo/life, user programs, `tools/nix/life_launch.py`); cargo inherits its
+# `workspace = true` lines from this workspace's root `Cargo.toml`, which a copy of it must
+# carry with every crate below (flake.nix's `lifeSource` lists them). Its lints are written out, equal to
+# the root's `[workspace.lints]`, so a program's own lints don't apply to it.
+[dependencies]
+blaze-inproc.workspace = true
+blaze-inproc-rt.workspace = true
+blaze-sha256.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+
+[target.'cfg(blaze_check)'.dev-dependencies]
+blaze-check.workspace = true
+
+[lints.cargo]
+unused_dependencies = "allow"
+
+[lints.rust]
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(bootstrap)',
+    "cfg(blaze_check)",
+] }
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+too_long_first_doc_paragraph = "allow"
+single_match = "allow"
+result_unit_err = "allow"
+len_without_is_empty = "allow"
+enum_variant_names = "allow"
+new_ret_no_self = "allow"
+useless_asref = "allow"
+assigning_clones = "allow"
+vec_init_then_push = "allow"
+literal_string_with_formatting_args = "allow"
+unnecessary_map_or = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+wrong_self_convention = "allow"
+
+redundant_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+clone_on_ref_ptr = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+implicit_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+unnecessary_to_owned = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+inefficient_to_string = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+format_collect = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+needless_pass_by_value = "deny"
+large_types_passed_by_value = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+box_collection = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+vec_box = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+rc_buffer = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+large_enum_variant = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+# in `perf` (deny above): warn until their baselines are empty
+useless_vec = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+useless_borrows_in_formatting = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+str_to_string = "warn"
+
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+let_underscore_must_use = "warn"

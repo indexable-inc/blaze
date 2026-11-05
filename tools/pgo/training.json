@@ -1,0 +1,53 @@
+{
+  "projects": [
+    {
+      "name": "blaze",
+      "source": "self",
+      "edit": "crates/blaze-engine/src/main.rs",
+      "turns": [
+        {"args": ["build", "-p", "blaze-engine"]},
+        {"args": ["build", "-p", "blaze-engine"]},
+        {"args": ["build", "-p", "blaze-engine"], "edit": true},
+        {"args": ["build", "-p", "blaze-engine"], "edit": true},
+        {"args": ["test", "-p", "blaze-graph"]}
+      ]
+    },
+    {
+      "name": "ripgrep",
+      "source": "git",
+      "repo": "https://github.com/BurntSushi/ripgrep",
+      "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+      "edit": "crates/core/main.rs",
+      "turns": [
+        {"args": ["build"]},
+        {"args": ["build"]},
+        {"args": ["build"], "edit": true},
+        {"args": ["build"], "edit": true},
+        {"args": ["test"]},
+        {"args": ["build", "--release"]}
+      ]
+    },
+    {
+      "name": "nushell",
+      "source": "git",
+      "repo": "https://github.com/nushell/nushell",
+      "rev": "da141be11b3acaa55b39321e5f9651d02aa2ed6f",
+      "edit": "src/main.rs",
+      "turns": [
+        {"args": ["build"]},
+        {"args": ["build"], "edit": true},
+        {"args": ["build"], "edit": true}
+      ]
+    }
+  ],
+  "measure": ["ripgrep"],
+  "corpus": {
+    "path": "harness/v2/corpus.json",
+    "edit": "src/lib.rs",
+    "turns": [
+      {"args": ["build"]},
+      {"args": ["build"], "edit": true},
+      {"args": ["test"]}
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+# The site's renderer in Rust (README.md). Its own workspace, not a member of blaze's: it builds for wasm32 and
+# depends on flecs-opinionated by path, neither of which the compiler's workspace should see.
+[workspace]
+resolver = "3"
+members = ["core", "wasm", "snapshot", "serve"]
+# `serve` is a wasi:http component and builds only for wasm32-wasip2 (`cargo build -p site-serve --target wasm32-wasip2`).
+default-members = ["core", "wasm", "snapshot"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+site-render = { path = "core" }
+# Pinned to a commit of indexable-inc/flecs-opinionated (public; cargo fetches its vendor/flecs submodule), so CI and
+# dev hosts build the same thing. For local work on both, override with a `[patch]` in .cargo/config.toml.
+flecs-snapshot = { git = "https://github.com/indexable-inc/flecs-opinionated", rev = "959ccd42741ec72d075563b0161945fae80cdb88" }
+ipld-core = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_ipld_dagcbor = "0.7"
+ciborium = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+regex-lite = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The wasm modules (build.py): smallest code, then wasm-opt -Oz.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"

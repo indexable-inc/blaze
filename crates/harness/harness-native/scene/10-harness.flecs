@@ -1,0 +1,17 @@
+// harness-native's views, composites of den's primitives (prims.flecs). The world's objects become rows of these by key
+// (src/view.rs, harness_native_ui_view::for_each); layout, drawing and hit testing are the generic passes'.
+//
+// One file a group (scene/widgets/), each loaded as a managed script of its own (scene/widgets/<name>.flecs). A
+// template resolves the names it uses when it is defined, so a file comes after the ones it builds on. A file holds
+// either prefabs or templates and fns, never a template after a prefab (flecs 4.2.0 aborts on that; see row.flecs).
+include widgets/frame
+include widgets/parts
+include widgets/row
+include widgets/rows
+include widgets/panes
+include widgets/archive
+include widgets/chat
+include widgets/palette
+include widgets/picker
+include widgets/theme
+include widgets/stats

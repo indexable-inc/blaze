@@ -1,0 +1,27 @@
+[package]
+name = "harness-native-ecs"
+description = "Typed, owning entity-component store over the vendored flecs (hyperion world layer); builds for wasm32 (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+hyperion-ecs = { path = "../vendor/hyperion-ecs" }
+hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "cached_queries", "query_plans"] }
+
+# `Home` (not on wasm32): the oneshot that `Home::run` awaits.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-channel = "0.3"
+
+[dev-dependencies]
+# home.rs's tests (they did not compile without these).
+futures-executor = "0.3"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[lints.rust]
+# The one crate that talks to flecs: every unsafe block carries a SAFETY note.
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "warn"

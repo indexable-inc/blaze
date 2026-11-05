@@ -1,0 +1,4 @@
+main 3
+others [2, 4, 6]
+log ["main"]
+fresh log 0

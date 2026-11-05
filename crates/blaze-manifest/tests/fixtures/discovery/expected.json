@@ -1,0 +1,387 @@
+{
+ "packages": [
+  {
+   "name": "app",
+   "version": "0.3.0",
+   "id": "path+file://$ROOT/crates/app#0.3.0",
+   "license": null,
+   "license_file": "LICENSE.txt",
+   "description": null,
+   "source": null,
+   "dependencies": [
+    {
+     "name": "helper",
+     "source": null,
+     "req": "*",
+     "kind": null,
+     "rename": null,
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null,
+     "path": "$ROOT/tools/helper"
+    },
+    {
+     "name": "macro",
+     "source": null,
+     "req": "*",
+     "kind": null,
+     "rename": "mac",
+     "optional": false,
+     "uses_default_features": true,
+     "features": [],
+     "target": null,
+     "registry": null,
+     "path": "$ROOT/crates/macro"
+    }
+   ],
+   "targets": [
+    {
+     "kind": [
+      "rlib",
+      "cdylib"
+     ],
+     "crate_types": [
+      "rlib",
+      "cdylib"
+     ],
+     "name": "app_lib",
+     "src_path": "$ROOT/crates/app/src/lib.rs",
+     "edition": "2024",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "app",
+     "src_path": "$ROOT/crates/app/src/main.rs",
+     "edition": "2024",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "multi",
+     "src_path": "$ROOT/crates/app/src/bin/multi/main.rs",
+     "edition": "2024",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "one",
+     "src_path": "$ROOT/crates/app/src/bin/one.rs",
+     "edition": "2024",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "tool",
+     "src_path": "$ROOT/crates/app/src/tool.rs",
+     "edition": "2024",
+     "required-features": [
+      "extra"
+     ],
+     "doc": true,
+     "doctest": false,
+     "test": false
+    },
+    {
+     "kind": [
+      "example"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "big",
+     "src_path": "$ROOT/crates/app/examples/big/main.rs",
+     "edition": "2024",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    },
+    {
+     "kind": [
+      "example"
+     ],
+     "crate_types": [
+      "staticlib"
+     ],
+     "name": "small",
+     "src_path": "$ROOT/crates/app/examples/small.rs",
+     "edition": "2024",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    },
+    {
+     "kind": [
+      "test"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "it",
+     "src_path": "$ROOT/crates/app/tests/it.rs",
+     "edition": "2024",
+     "doc": false,
+     "doctest": false,
+     "test": true
+    },
+    {
+     "kind": [
+      "bench"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "speed",
+     "src_path": "$ROOT/crates/app/benches/speed.rs",
+     "edition": "2024",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    },
+    {
+     "kind": [
+      "custom-build"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "build-script-build",
+     "src_path": "$ROOT/crates/app/build.rs",
+     "edition": "2024",
+     "doc": false,
+     "doctest": false,
+     "test": false
+    }
+   ],
+   "features": {
+    "extra": []
+   },
+   "manifest_path": "$ROOT/crates/app/Cargo.toml",
+   "metadata": null,
+   "publish": null,
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": "README.md",
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2024",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  },
+  {
+   "name": "helper",
+   "version": "0.0.1",
+   "id": "path+file://$ROOT/tools/helper#0.0.1",
+   "license": null,
+   "license_file": null,
+   "description": null,
+   "source": null,
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "crate_types": [
+      "lib"
+     ],
+     "name": "helper",
+     "src_path": "$ROOT/tools/helper/src/lib.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": true,
+     "test": true
+    }
+   ],
+   "features": {},
+   "manifest_path": "$ROOT/tools/helper/Cargo.toml",
+   "metadata": null,
+   "publish": null,
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": null,
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2021",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  },
+  {
+   "name": "macro",
+   "version": "0.1.0",
+   "id": "path+file://$ROOT/crates/macro#0.1.0",
+   "license": null,
+   "license_file": null,
+   "description": null,
+   "source": null,
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "proc-macro"
+     ],
+     "crate_types": [
+      "proc-macro"
+     ],
+     "name": "macro",
+     "src_path": "$ROOT/crates/macro/src/lib.rs",
+     "edition": "2018",
+     "doc": true,
+     "doctest": true,
+     "test": true
+    }
+   ],
+   "features": {},
+   "manifest_path": "$ROOT/crates/macro/Cargo.toml",
+   "metadata": null,
+   "publish": null,
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": null,
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2018",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  },
+  {
+   "name": "lib",
+   "version": "0.1.0-alpha.1+build",
+   "id": "path+file://$ROOT/crates/lib#0.1.0-alpha.1+build",
+   "license": null,
+   "license_file": null,
+   "description": null,
+   "source": null,
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "lib"
+     ],
+     "crate_types": [
+      "lib"
+     ],
+     "name": "lib",
+     "src_path": "$ROOT/crates/lib/src/lib.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": true,
+     "test": true
+    }
+   ],
+   "features": {},
+   "manifest_path": "$ROOT/crates/lib/Cargo.toml",
+   "metadata": null,
+   "publish": [
+    "my-registry"
+   ],
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": null,
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2021",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  },
+  {
+   "name": "nobins",
+   "version": "0.1.0",
+   "id": "path+file://$ROOT/crates/nobins#0.1.0",
+   "license": null,
+   "license_file": null,
+   "description": null,
+   "source": null,
+   "dependencies": [],
+   "targets": [
+    {
+     "kind": [
+      "bin"
+     ],
+     "crate_types": [
+      "bin"
+     ],
+     "name": "nobins",
+     "src_path": "$ROOT/crates/nobins/src/main.rs",
+     "edition": "2021",
+     "doc": true,
+     "doctest": false,
+     "test": true
+    }
+   ],
+   "features": {},
+   "manifest_path": "$ROOT/crates/nobins/Cargo.toml",
+   "metadata": null,
+   "publish": null,
+   "authors": [],
+   "categories": [],
+   "keywords": [],
+   "readme": null,
+   "repository": null,
+   "homepage": null,
+   "documentation": null,
+   "edition": "2021",
+   "links": null,
+   "default_run": null,
+   "rust_version": null
+  }
+ ],
+ "workspace_members": [
+  "path+file://$ROOT/crates/app#0.3.0",
+  "path+file://$ROOT/tools/helper#0.0.1",
+  "path+file://$ROOT/crates/macro#0.1.0",
+  "path+file://$ROOT/crates/lib#0.1.0-alpha.1+build",
+  "path+file://$ROOT/crates/nobins#0.1.0"
+ ],
+ "workspace_default_members": [
+  "path+file://$ROOT/crates/app#0.3.0"
+ ],
+ "resolve": null,
+ "target_directory": "$BLAZE_HOME/build/discovery-ID",
+ "build_directory": "$BLAZE_HOME/build/discovery-ID",
+ "version": 1,
+ "workspace_root": "$ROOT",
+ "metadata": null
+}

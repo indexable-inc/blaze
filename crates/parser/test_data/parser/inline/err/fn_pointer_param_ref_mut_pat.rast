@@ -1,0 +1,32 @@
+SOURCE_FILE
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "A"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    FN_PTR_TYPE
+      FN_KW "fn"
+      PARAM_LIST
+        L_PAREN "("
+        PARAM
+          REF_PAT
+            AMP "&"
+            MUT_KW "mut"
+            WHITESPACE " "
+            IDENT_PAT
+              NAME
+                IDENT "a"
+          COLON ":"
+          WHITESPACE " "
+          PATH_TYPE
+            PATH
+              PATH_SEGMENT
+                NAME_REF
+                  IDENT "u8"
+        R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"
+error 18: patterns aren't allowed in function pointer types

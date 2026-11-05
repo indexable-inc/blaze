@@ -1,0 +1,21 @@
+[package]
+name = "hir-ty-comptime"
+version = "0.0.0"
+repository.workspace = true
+description = "The domain of `#![feature(blaze_comptime)]` reflection: which fields and variants `for<F: Field<T>>`, `fields_of` and the solver's builtin `Struct`/`Enum`/`Field`/`Variant` candidates range over."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# local deps
+base-db.workspace = true
+hir-def.workspace = true
+
+[lints]
+workspace = true

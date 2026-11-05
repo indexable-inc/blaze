@@ -1,0 +1,552 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::bit_iterator::{BitIndexIterator, BitIterator, BitSliceIterator};
+use crate::buffer::BooleanBuffer;
+use crate::{Buffer, MutableBuffer, OverflowError};
+
+/// A [`BooleanBuffer`] used to encode validity (null values) for Arrow arrays
+///
+/// In the [Arrow specification], array validity is encoded in a packed bitmask with a
+/// `true` value indicating the corresponding slot is not null, and `false` indicating
+/// that it is null.
+///
+/// # See also
+/// * [`NullBufferBuilder`] for creating `NullBuffer`s
+///
+/// [Arrow specification]: https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
+/// [`NullBufferBuilder`]: crate::NullBufferBuilder
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NullBuffer {
+    buffer: BooleanBuffer,
+    null_count: usize,
+}
+
+impl NullBuffer {
+    /// Create a new [`NullBuffer`] computing the null count
+    pub fn new(buffer: BooleanBuffer) -> Self {
+        let null_count = buffer.len() - buffer.count_set_bits();
+        Self { buffer, null_count }
+    }
+
+    /// Create a new [`NullBuffer`] of length `len` where all values are null
+    pub fn new_null(len: usize) -> Self {
+        Self {
+            buffer: BooleanBuffer::new_unset(len),
+            null_count: len,
+        }
+    }
+
+    /// Create a new [`NullBuffer`] of length `len` where all values are valid
+    ///
+    /// Note: it is more efficient to not set the null buffer if it is known to
+    /// be all valid (aka all values are not null)
+    pub fn new_valid(len: usize) -> Self {
+        Self {
+            buffer: BooleanBuffer::new_set(len),
+            null_count: 0,
+        }
+    }
+
+    /// Create a new [`NullBuffer`] with the provided `buffer` and `null_count`
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must contain `null_count` `0` bits
+    pub unsafe fn new_unchecked(buffer: BooleanBuffer, null_count: usize) -> Self {
+        Self { buffer, null_count }
+    }
+
+    /// Computes the union of the nulls in two optional [`NullBuffer`]
+    ///
+    /// This is commonly used by binary operations where the result is NULL if either
+    /// of the input values is NULL. Handling the null mask separately in this way
+    /// can yield significant performance improvements over an iterator approach
+    pub fn union(lhs: Option<&NullBuffer>, rhs: Option<&NullBuffer>) -> Option<NullBuffer> {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) if lhs.null_count() > 0 || rhs.null_count() > 0 => {
+                Some(Self::new(lhs.inner() & rhs.inner()))
+            }
+            (Some(n), None) | (None, Some(n)) if n.null_count() > 0 => Some(n.clone()),
+            (_, _) => None,
+        }
+    }
+
+    /// Computes the union of the nulls in multiple optional [`NullBuffer`]s
+    ///
+    /// See [`union`](Self::union)
+    pub fn union_many<'a>(
+        nulls: impl IntoIterator<Item = Option<&'a NullBuffer>>,
+    ) -> Option<NullBuffer> {
+        // Unwrap to BooleanBuffer because BitAndAssign is not implemented for NullBuffer
+        let mut buffers = nulls.into_iter().filter_map(|nb| match nb {
+            Some(nb) if nb.null_count > 0 => Some(nb.inner()),
+            _ => None,
+        });
+        let first = buffers.next()?;
+        let mut result = first.clone();
+        for buf in buffers {
+            result &= buf;
+        }
+        Some(Self::new(result))
+    }
+
+    /// Returns true if all nulls in `other` also exist in self
+    pub fn contains(&self, other: &NullBuffer) -> bool {
+        if other.null_count == 0 {
+            return true;
+        }
+        let lhs = self.inner().bit_chunks().iter_padded();
+        let rhs = other.inner().bit_chunks().iter_padded();
+        lhs.zip(rhs).all(|(l, r)| (l & !r) == 0)
+    }
+
+    /// Returns a new [`NullBuffer`] where each bit in the current null buffer
+    /// is repeated `count` times. This is useful for masking the nulls of
+    /// the child of a FixedSizeListArray based on its parent
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len() * count` overflows `usize`.
+    /// Use [`Self::try_expand`] for a fallible version.
+    pub fn expand(&self, count: usize) -> Self {
+        self.try_expand(count).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Returns a new [`NullBuffer`] where each bit in the current null buffer
+    /// is repeated `count` times. This is useful for masking the nulls of
+    /// the child of a FixedSizeListArray based on its parent
+    ///
+    /// # Errors
+    ///
+    /// Errors if `self.len() * count` overflows `usize`
+    pub fn try_expand(&self, count: usize) -> Result<Self, OverflowError> {
+        let capacity = self
+            .buffer
+            .len()
+            .checked_mul(count)
+            .ok_or_else(|| OverflowError::new::<usize>("buffer length"))?;
+        let mut buffer = MutableBuffer::new_null(capacity);
+
+        if count.is_multiple_of(8) {
+            // When count is a multiple of 8 every expanded run starts on a byte
+            // boundary (bit i starts at bit i*count, which is divisible by 8),
+            // so we can fill count/8 bytes of 0xFF at a time instead of setting
+            // bits individually.
+            let bytes_per_bit = count / 8;
+            let buf = buffer.as_mut();
+            for (start, end) in BitSliceIterator::new(
+                self.buffer.values(),
+                self.buffer.offset(),
+                self.buffer.len(),
+            ) {
+                let byte_start = start * bytes_per_bit;
+                let byte_end = end * bytes_per_bit;
+                buf[byte_start..byte_end].fill(0xFF);
+            }
+        } else if count.is_multiple_of(4) {
+            // count is a multiple of 4 but not 8: each bit's range starts and ends
+            // on a nibble boundary. Fill any full bytes, then OR in the partial nibble
+            // (0x0F if the range ends mid-byte, 0xF0 if it starts mid-byte).
+            let buf = buffer.as_mut();
+            for i in 0..self.buffer.len() {
+                if self.is_null(i) {
+                    continue;
+                }
+                let start_bit = i * count;
+                let end_bit = start_bit + count;
+                if start_bit.is_multiple_of(8) {
+                    buf[start_bit / 8..end_bit / 8].fill(0xFF);
+                    buf[end_bit / 8] |= 0x0F;
+                } else {
+                    buf[start_bit / 8] |= 0xF0;
+                    buf[start_bit / 8 + 1..end_bit / 8].fill(0xFF);
+                }
+            }
+        } else {
+            // For each contiguous run of valid bits [start, end), the corresponding
+            // output bits [start*count, end*count) are set. Boundary bytes that are
+            // only partially covered are ORed with a mask; fully covered interior
+            // bytes are filled with 0xFF.
+            let buf = buffer.as_mut();
+            for (start, end) in BitSliceIterator::new(
+                self.buffer.values(),
+                self.buffer.offset(),
+                self.buffer.len(),
+            ) {
+                let start_bit = start * count;
+                let end_bit = end * count;
+                let start_byte = start_bit / 8;
+                let start_offset = (start_bit % 8) as u32; // first bit to set within start_byte
+                let end_byte = end_bit / 8;
+                let end_offset = (end_bit % 8) as u32; // one-past-last bit within end_byte
+
+                if start_byte == end_byte {
+                    // All bits land in one byte: mask from start_offset up to end_offset.
+                    // 0xFF << start_offset  → bits [start_offset, 7] set
+                    // (1 << end_offset) - 1 → bits [0, end_offset) set
+                    // AND of both           → bits [start_offset, end_offset) set
+                    buf[start_byte] |= (0xFFu8 << start_offset) & ((1u8 << end_offset) - 1);
+                } else {
+                    if start_offset != 0 {
+                        // Partial leading byte: set bits from start_offset to bit 7.
+                        buf[start_byte] |= 0xFFu8 << start_offset;
+                    }
+                    // Full interior bytes (skip start_byte if it was only partially covered).
+                    let full_start = start_byte + (start_offset != 0) as usize;
+                    buf[full_start..end_byte].fill(0xFF);
+                    if end_offset != 0 {
+                        // Partial trailing byte: set bits 0 up to end_offset.
+                        // (1 << end_offset) - 1 → bits [0, end_offset) set
+                        buf[end_byte] |= (1u8 << end_offset) - 1;
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            buffer: BooleanBuffer::new(buffer.into(), 0, capacity),
+            null_count: self.null_count * count,
+        })
+    }
+
+    /// Returns the length of this [`NullBuffer`] in bits
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns the offset of this [`NullBuffer`] in bits
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.buffer.offset()
+    }
+
+    /// Returns true if this [`NullBuffer`] is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Free up unused memory.
+    pub fn shrink_to_fit(&mut self) {
+        self.buffer.shrink_to_fit();
+    }
+
+    /// Returns the null count for this [`NullBuffer`]
+    #[inline]
+    pub fn null_count(&self) -> usize {
+        self.null_count
+    }
+
+    /// Returns `true` if the value at `idx` is not null
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= self.len()`
+    #[inline]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.buffer.value(idx)
+    }
+
+    /// Returns `true` if the value at `idx` is null
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= self.len()`
+    #[inline]
+    pub fn is_null(&self, idx: usize) -> bool {
+        !self.is_valid(idx)
+    }
+
+    /// Returns the packed validity of this [`NullBuffer`] not including any offset
+    #[inline]
+    pub fn validity(&self) -> &[u8] {
+        self.buffer.values()
+    }
+
+    /// Slices this [`NullBuffer`] by the provided `offset` and `length`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len > self.len()`
+    pub fn slice(&self, offset: usize, len: usize) -> Self {
+        Self::new(self.buffer.slice(offset, len))
+    }
+
+    /// Returns an iterator over the bits in this [`NullBuffer`]
+    ///
+    /// * `true` indicates that the corresponding value is not NULL
+    /// * `false` indicates that the corresponding value is NULL
+    ///
+    /// Note: [`Self::valid_indices`] will be significantly faster for most use-cases
+    pub fn iter(&self) -> BitIterator<'_> {
+        self.buffer.iter()
+    }
+
+    /// Returns a [`BitIndexIterator`] over the valid indices in this [`NullBuffer`]
+    ///
+    /// Valid indices indicate the corresponding value is not NULL
+    pub fn valid_indices(&self) -> BitIndexIterator<'_> {
+        self.buffer.set_indices()
+    }
+
+    /// Returns a [`BitSliceIterator`] yielding contiguous ranges of valid indices
+    ///
+    /// Valid indices indicate the corresponding value is not NULL
+    pub fn valid_slices(&self) -> BitSliceIterator<'_> {
+        self.buffer.set_slices()
+    }
+
+    /// Calls the provided closure for each index in this null mask that is set
+    #[inline]
+    pub fn try_for_each_valid_idx<E, F: FnMut(usize) -> Result<(), E>>(
+        &self,
+        f: F,
+    ) -> Result<(), E> {
+        if self.null_count == self.len() {
+            return Ok(());
+        }
+        self.valid_indices().try_for_each(f)
+    }
+
+    /// Returns the inner [`BooleanBuffer`]
+    #[inline]
+    pub fn inner(&self) -> &BooleanBuffer {
+        &self.buffer
+    }
+
+    /// Returns the inner [`BooleanBuffer`]
+    #[inline]
+    pub fn into_inner(self) -> BooleanBuffer {
+        self.buffer
+    }
+
+    /// Returns the underlying [`Buffer`]
+    #[inline]
+    pub fn buffer(&self) -> &Buffer {
+        self.buffer.inner()
+    }
+
+    /// Create a [`NullBuffer`] from an *unsliced* validity bitmap (`offset = 0` **bits**) of length `len`.
+    ///
+    /// Returns `None` if there are no nulls (all values valid).
+    pub fn from_unsliced_buffer(buffer: impl Into<Buffer>, len: usize) -> Option<Self> {
+        let bb = BooleanBuffer::new(buffer.into(), 0, len);
+        let nb = NullBuffer::new(bb);
+        (nb.null_count() > 0).then_some(nb)
+    }
+
+    /// Claim memory used by this null buffer in the provided memory pool.
+    #[cfg(feature = "pool")]
+    pub fn claim(&self, pool: &dyn crate::MemoryPool) {
+        // NullBuffer wraps a BooleanBuffer which wraps a Buffer
+        self.buffer.inner().claim(pool);
+    }
+}
+
+impl<'a> IntoIterator for &'a NullBuffer {
+    type Item = bool;
+    type IntoIter = BitIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.buffer.iter()
+    }
+}
+
+impl From<BooleanBuffer> for NullBuffer {
+    fn from(value: BooleanBuffer) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&[bool]> for NullBuffer {
+    fn from(value: &[bool]) -> Self {
+        BooleanBuffer::from(value).into()
+    }
+}
+
+impl<const N: usize> From<&[bool; N]> for NullBuffer {
+    fn from(value: &[bool; N]) -> Self {
+        value[..].into()
+    }
+}
+
+impl From<Vec<bool>> for NullBuffer {
+    fn from(value: Vec<bool>) -> Self {
+        BooleanBuffer::from(value).into()
+    }
+}
+
+impl FromIterator<bool> for NullBuffer {
+    fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
+        BooleanBuffer::from_iter(iter).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size() {
+        // This tests that the niche optimisation eliminates the overhead of an option
+        assert_eq!(
+            std::mem::size_of::<NullBuffer>(),
+            std::mem::size_of::<Option<NullBuffer>>()
+        );
+    }
+
+    #[test]
+    fn test_from_unsliced_buffer_with_nulls() {
+        // 0b10110010 → null(0), valid(1), null(2), null(3), valid(4), valid(5), null(6), valid(7)
+        let buf = Buffer::from([0b10110010u8]);
+        let result = NullBuffer::from_unsliced_buffer(buf, 8);
+        assert!(result.is_some());
+        let nb = result.unwrap();
+        assert_eq!(nb.len(), 8);
+        assert_eq!(nb.null_count(), 4);
+        assert!(nb.is_null(0));
+        assert!(nb.is_valid(1));
+        assert!(nb.is_null(2));
+        assert!(nb.is_null(3));
+        assert!(nb.is_valid(4));
+        assert!(nb.is_valid(5));
+        assert!(nb.is_null(6));
+        assert!(nb.is_valid(7));
+    }
+
+    #[test]
+    fn test_from_unsliced_buffer_all_valid() {
+        // All bits set = all valid, no nulls
+        let buf = Buffer::from([0b11111111u8]);
+        let result = NullBuffer::from_unsliced_buffer(buf, 8);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_unsliced_buffer_all_null() {
+        // No bits set = all null
+        let buf = Buffer::from([0b00000000u8]);
+        let result = NullBuffer::from_unsliced_buffer(buf, 8);
+        assert!(result.is_some());
+        let nb = result.unwrap();
+        assert_eq!(nb.len(), 8);
+        assert_eq!(nb.null_count(), 8);
+    }
+
+    #[test]
+    fn test_from_unsliced_buffer_empty() {
+        let buf = Buffer::from([]);
+        let result = NullBuffer::from_unsliced_buffer(buf, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_union_many_all_none() {
+        let result = NullBuffer::union_many([None, None, None]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_union_many_single_some() {
+        let a = NullBuffer::from(&[true, false, true, true]);
+        let result = NullBuffer::union_many([Some(&a)]);
+        assert_eq!(result, Some(a));
+    }
+
+    #[test]
+    fn test_union_many_two_inputs() {
+        let a = NullBuffer::from(&[true, false, true, true]);
+        let b = NullBuffer::from(&[true, true, false, true]);
+        let result = NullBuffer::union_many([Some(&a), Some(&b)]);
+        let expected = NullBuffer::union(Some(&a), Some(&b));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_union_many_three_inputs() {
+        let a = NullBuffer::from(&[true, false, true, true]);
+        let b = NullBuffer::from(&[true, true, false, true]);
+        let c = NullBuffer::from(&[false, true, true, true]);
+        let result = NullBuffer::union_many([Some(&a), Some(&b), Some(&c)]);
+        let expected = NullBuffer::from(&[false, false, false, true]);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_union_many_mixed_none() {
+        let a = NullBuffer::from(&[true, false, true, true]);
+        let b = NullBuffer::from(&[false, true, true, true]);
+        let result = NullBuffer::union_many([Some(&a), None, Some(&b)]);
+        let expected = NullBuffer::union(Some(&a), Some(&b));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_union_many_empty_slice() {
+        let result = NullBuffer::union_many([] as [Option<&NullBuffer>; 0]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_union_many_no_nulls() {
+        let a = NullBuffer::from(&[true, true, true, true]);
+
+        let result = NullBuffer::union_many([Some(&a), Some(&a), Some(&a)]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_union_no_nulls() {
+        let a = NullBuffer::from(&[true, true, true, true]);
+
+        let result = NullBuffer::union(Some(&a), Some(&a));
+        assert_eq!(result, None);
+
+        let result = NullBuffer::union(Some(&a), None);
+        assert_eq!(result, None);
+
+        let result = NullBuffer::union(None, Some(&a));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_union_nulls_one_side() {
+        let all_valid = NullBuffer::from(&[true, true, true, true]);
+        let all_null = NullBuffer::from(&[false, false, false, false]);
+
+        let result = NullBuffer::union(Some(&all_valid), Some(&all_null));
+        assert_eq!(result, Some(all_null.clone()));
+
+        let result = NullBuffer::union(Some(&all_null), Some(&all_valid));
+        assert_eq!(result, Some(all_null.clone()));
+    }
+
+    #[test]
+    fn test_expand_code_paths() {
+        let source = NullBuffer::from(&[true, false, true] as &[bool]);
+
+        for count in [8, 4, 3] {
+            let expanded = source.expand(count);
+            assert_eq!(expanded.len(), 3 * count);
+            assert_eq!(expanded.null_count(), count);
+            assert!((0..count).all(|i| expanded.is_valid(i)));
+            assert!((count..2 * count).all(|i| expanded.is_null(i)));
+            assert!((2 * count..3 * count).all(|i| expanded.is_valid(i)));
+        }
+    }
+}

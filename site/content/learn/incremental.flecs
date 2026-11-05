@@ -1,0 +1,72 @@
+// Lesson 2: rebuilding only what changed. blaze's unit is the function; a body edit is private to the function, a
+// signature edit is seen by its callers (today blaze rechecks more than the callers; narrowing to them is #273,
+// planned). Changed functions are spliced into the built program, and with blaze-live into a running one.
+site {
+  learn {
+    incremental : Page {
+      Narrow
+      Lesson: {2, "Why editing a function's body is cheap, and its signature less so.", "functions"}
+      (InTheme, themes.basics)
+      (Requires, site.learn.builds)
+      Title: {"Only what changed"}
+      Description: {"Lesson 2: how blaze rebuilds one function at a time, and patches it into your program."}
+
+      Step functions("Down to functions") {
+        P unit("Cargo reruns `rustc` for whole crates, and `rustc` reuses its work in groups of functions. blaze's smallest piece of work is a single **function**.")
+        P kept("Inside the running blaze, compiling a function is one small piece of work whose result is remembered, and kept until that function, or something it uses, changes.")
+      }
+
+      Step calls("Who calls whom") {
+        P graph("Inside a crate, functions call each other. Here `main` calls `parse` and `print`, and `parse` calls `lex`. Tap a function to edit it, and switch between editing its body and changing its signature.")
+        Figure fns(piece: "fns", label: "Four functions: main calls parse and print, parse calls lex. A body edit lights only that function; a signature change also lights the functions that call it.")
+      }
+
+      Step body("The body is private") {
+        P inside("A function's **body** is the code between its braces. Code that calls it relies only on its **signature**: its name, what it takes and what it gives back.")
+        P so("So when only the body changes, nothing that calls it has to change.")
+      }
+
+      Step bugfix("Which functions?") {
+        Tap q(prompt: "You fix a bug inside the body of `lex`. Which functions does blaze compile again? Tap each one.", piece: "fns", right: "lex", hint: "Did anything change that the callers of `lex` can see?", why: "Only `lex`. Its signature is the same, so `parse` calls it exactly as before, and nothing else needs redoing.")
+      }
+
+      Step signature("Signatures are seen") {
+        P seen("Change what a function takes or returns, and every caller has to be checked again: code that called it the old way may not fit any more.")
+        Dim today("Today blaze rechecks more than just the real callers; narrowing it to exactly the callers is planned.")
+      }
+
+      Step param("A new parameter") {
+        Quiz q(prompt: "You add a parameter to `lex`. Which other function now needs a look?") {
+          Choice print("`print`, because it comes after `lex` on the screen.", "Where a function sits doesn't matter, only who calls whom. `print` never calls `lex`.")
+          Choice none("None: only `lex` changed.", "That holds for a body edit. A parameter is part of the signature, and callers depend on it.")
+          Choice parse("`parse`, because it calls `lex`.", "`parse` calls `lex` the old way, so it has to be checked against the new signature, and you'll likely edit it too.") {
+            Right
+          }
+        }
+      }
+
+      Step visible("A few bodies show through") {
+        P exception("A few exceptions: sometimes callers can see into the body, as with a `const fn`, an `async fn` or a function returning `impl Trait`, a body handed to a macro, or one that declares items. Then a body edit counts as a signature edit.")
+      }
+
+      Step splice("Patching, not linking") {
+        P append("Once the changed functions are compiled, blaze usually doesn't link the program again. It adds the new code at the end of the program file and writes a jump at the start of the old version, so every caller lands in the new code.")
+        Figure patch(piece: "splice", label: "The program file as a column of functions. On save, a new lex is written at the end, and the old lex starts with a jump to it.")
+      }
+
+      Step live("Even while it runs") {
+        P running("A program that links blaze's `blaze-live` crate takes changed functions while it runs, state intact: about 20 ms from your save, and under a millisecond to swap them in.")
+        Dim where("Released on macOS on Apple silicon; Linux x86-64 and Windows x86-64 support is on main, for the next release.")
+      }
+
+      Step game("What can it take live?") {
+        Quiz q(prompt: "Your game links `blaze-live` and is running. Which edit can it take without restarting?") {
+          Choice jump("A change to how one function works out the height of a jump.", "That's a body edit: the new function is swapped in while the game keeps running.") {
+            Right
+          }
+          Choice field("A new field on the `Player` struct.", "That changes a type. Every `Player` already in memory has the old shape, so the program has to restart.")
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,464 @@
+{
+ "project": "axum",
+ "rev": "c1bb9c3e90625fb8de4f9c9750f669cb4edac3df",
+ "status": 0,
+ "seconds": 26.77,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "ahash",
+   "version": "0.8.12",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "anyhow",
+   "version": "1.0.100",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "aws-lc-rs",
+   "version": "1.14.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "aws-lc-sys",
+   "version": "0.32.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "blake3",
+   "version": "0.3.8",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "cookie",
+   "version": "0.18.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crc32fast",
+   "version": "1.5.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crunchy",
+   "version": "0.2.4",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "fs-err",
+   "version": "3.1.2",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_8b8fa09bcfe8a5c7_0 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/fs-err/0099f05e27d27dcd/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_8b8fa09bcfe8a5c7_1 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/fs-err/0099f05e27d27dcd/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "generic-array",
+   "version": "0.14.7",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.3.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "httparse",
+   "version": "1.10.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_normalizer_data",
+   "version": "2.0.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_properties_data",
+   "version": "2.0.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.176",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libm",
+   "version": "0.2.15",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "lock_api",
+   "version": "0.4.13",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_af225689e84379b7_0 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/lock_api/8cb9a788574df9f6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_af225689e84379b7_1 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/lock_api/8cb9a788574df9f6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "mime_guess",
+   "version": "2.0.5",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "mime_guess",
+   "version": "2.0.5",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "mongocrypt-sys",
+   "version": "0.1.4+1.12.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "multer",
+   "version": "3.1.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "native-tls",
+   "version": "0.2.14",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_5bf7d4811f384989_0 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/cc91b14aea97e136/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_5bf7d4811f384989_1 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/cc91b14aea97e136/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_5bf7d4811f384989_2 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/cc91b14aea97e136/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_24841cf362b71977_0 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/150b78e497f5c669/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_24841cf362b71977_1 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/150b78e497f5c669/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_24841cf362b71977_2 --crate-type=lib --out-dir /root/bs/cl/work/target/axum/debug/build/num-traits/150b78e497f5c669/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "openssl",
+   "version": "0.10.73",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "openssl-sys",
+   "version": "0.9.109",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "parking_lot_core",
+   "version": "0.9.11",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "pq-sys",
+   "version": "0.7.2",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro-error",
+   "version": "1.0.4",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro-error-attr",
+   "version": "1.0.4",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.101",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "radium",
+   "version": "0.7.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "ring",
+   "version": "0.17.14",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "ring",
+   "version": "0.17.14",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustc_version_runtime",
+   "version": "0.3.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustls",
+   "version": "0.21.12",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustls",
+   "version": "0.23.32",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustls",
+   "version": "0.23.32",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustversion",
+   "version": "1.0.22",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.228",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_core",
+   "version": "1.0.228",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.145",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.145",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "syn",
+   "version": "1.0.109",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "target-triple",
+   "version": "0.1.4",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "1.0.69",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "2.0.16",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "tiny-keccak",
+   "version": "2.0.2",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "tokio-openssl",
+   "version": "0.6.5",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "typenum",
+   "version": "1.18.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "zerocopy",
+   "version": "0.8.27",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "zstd-safe",
+   "version": "7.2.4",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "zstd-sys",
+   "version": "2.0.16+zstd.1.5.7",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

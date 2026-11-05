@@ -1,0 +1,51 @@
+[package]
+name = "blaze-profile"
+description = "Where the time of a blaze build goes: the flight recorder, the profile history the daemon writes (spans, child processes, test runs, the client's rows), BLAZE_PROFILE's trace export, the stall watchdog and the CPU sampler"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+base64.workspace = true
+blaze-core.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-serde.workspace = true
+bytes.workspace = true
+blaze-v2-proof.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
+ix-prof.workspace = true
+parking_lot.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+stdx.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "harness-native-ui-motion"
+description = "Hot-swappable visibility springs over Flecs components and relationships (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-api = { path = "../harness-native-api" }
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "warn"

@@ -1,0 +1,19 @@
+# blaze-gateway signed index, from ix VM rcache-index (aarch64, us-west-2) to blaze-gateway.indexable.workers.dev, private tenant rcache-test (HMAC names), Worker 6a3b1f3c, 2026-10-27T13:37Z
+# head_put_refresh_*: one head write after the packs' objects.uploaded was set 46 days back in D1 (wrangler d1 execute), so the refresh rewrites every pack; *_fresh: the same head, nothing old. p4x8_seq: before rewrites ran four at a time (Worker 5658531b)
+metric	p50	p90	min	max	unit	n	detail
+seg_put_small	292.1	751.3	241.9	930.6	ms	20	one entry, one blob; includes the D1 readability check
+seg_get_small	89.8	186.9	73.3	248.7	ms	20	R2 read, no edge cache
+seg_put_2000_blobs	359.3	415.7	293.4	415.7	ms	5	100015 bytes, 2000 blobs checked in D1 (HMAC keys)
+seg_get_2000_blobs	102.8	126.6	75.8	126.6	ms	5	100015 bytes
+head_put_no_refresh_1seg	483.3	607.5	381.0	803.4	ms	20	If-Match, 1 segment of 1 blob, nothing old
+head_put_no_refresh_2001_blobs	766.1	1121.6	523.4	1121.6	ms	5	2 segments naming 2001 blobs, nothing old
+heads_read_50	569.0	930.5	457.6	1136.5	ms	20	50 present heads, private names (HMAC)
+heads_read_50_absent	456.3	593.7	421.3	734.9	ms	20	50 absent names
+head_put_refresh_p1x8_fresh	697.9	697.9	621.6	697.9	ms	2	1 packs of 8 MiB; refresh phase 102-108 ms; rewrote 0 packs, 0 segments
+head_put_refresh_p1x8_aged	1720.0	1728.3	1596.2	1728.3	ms	3	1 packs of 8 MiB; refresh phase 1044-1261 ms; rewrote 1 packs, 0 segments
+head_put_refresh_p4x8_seq_fresh	8228.1	8228.1	588.0	8228.1	ms	2	4 packs of 8 MiB; refresh phase 163-167 ms; rewrote 0 packs, 0 segments
+head_put_refresh_p4x8_seq_aged	5061.7	8291.4	4901.2	8291.4	ms	3	4 packs of 8 MiB; refresh phase 4407-7786 ms; rewrote 4 packs, 0 segments
+head_put_refresh_p4x8_fresh	648.2	648.2	631.7	648.2	ms	2	4 packs of 8 MiB; refresh phase 71-110 ms; rewrote 0 packs, 0 segments
+head_put_refresh_p4x8_aged	1816.7	2339.7	1790.4	2339.7	ms	3	4 packs of 8 MiB; refresh phase 1319-1895 ms; rewrote 4 packs, 0 segments
+head_put_refresh_p8x8_fresh	583.1	583.1	526.8	583.1	ms	2	8 packs of 8 MiB; refresh phase 75-107 ms; rewrote 0 packs, 0 segments
+head_put_refresh_p8x8_aged	3701.8	3701.8	2847.9	3701.8	ms	2	8 packs of 8 MiB; refresh phase 2386-3231 ms; rewrote 8 packs, 0 segments

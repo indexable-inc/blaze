@@ -1,0 +1,215 @@
+; Follows cranelift/filetests/filetests/runtests/simd-vhighbits.clif, for the stencil set:
+; `vhigh_bits` of each integer vector type into each integer result wide enough for its
+; lanes (`i8x16` into `i16`, `i32`, `i64`; the others into `i8` too), on lanes with only the
+; sign bit, only lower bits, all bits, and the sign bit in alternating, sparse and single
+; positions, and of an `icmp` mask (wasm's `bitmask` after `eq`). Left out: `vhigh_bits.i8` of
+; `i8x16` (the stencil set's result must hold a bit per lane) and `vhigh_bits` of
+; `f32x4`/`f64x2`, which Cranelift 0.136 does not lower on AArch64, so they would stop this
+; file's code there.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %vhigh_bits_i8x16_i16(i8x16) -> i16 {
+block0(v0: i8x16):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_i8x16_i16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i8x16_i16([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0xffff
+; run: %vhigh_bits_i8x16_i16([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0xffff
+; run: %vhigh_bits_i8x16_i16([127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127]) == 0
+; run: %vhigh_bits_i8x16_i16([0x80 0 0xff 1 127 0x81 0 0 0 0 0 0 0 0 0 0xc0]) == 0x8025
+; run: %vhigh_bits_i8x16_i16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0x80]) == 0x8000
+; run: %vhigh_bits_i8x16_i16([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 8]) == 0x7fff
+; run: %vhigh_bits_i8x16_i16([127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80]) == 0xaaaa
+; run: %vhigh_bits_i8x16_i16([0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80]) == 0x9249
+
+function %vhigh_bits_i8x16_i32(i8x16) -> i32 {
+block0(v0: i8x16):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_i8x16_i32([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i8x16_i32([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0xffff
+; run: %vhigh_bits_i8x16_i32([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0xffff
+; run: %vhigh_bits_i8x16_i32([127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127]) == 0
+; run: %vhigh_bits_i8x16_i32([0x80 0 0xff 1 127 0x81 0 0 0 0 0 0 0 0 0 0xc0]) == 0x8025
+; run: %vhigh_bits_i8x16_i32([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0x80]) == 0x8000
+; run: %vhigh_bits_i8x16_i32([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 8]) == 0x7fff
+; run: %vhigh_bits_i8x16_i32([127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80]) == 0xaaaa
+; run: %vhigh_bits_i8x16_i32([0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80]) == 0x9249
+
+function %vhigh_bits_i8x16_i64(i8x16) -> i64 {
+block0(v0: i8x16):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_i8x16_i64([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i8x16_i64([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0xffff
+; run: %vhigh_bits_i8x16_i64([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0xffff
+; run: %vhigh_bits_i8x16_i64([127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127]) == 0
+; run: %vhigh_bits_i8x16_i64([0x80 0 0xff 1 127 0x81 0 0 0 0 0 0 0 0 0 0xc0]) == 0x8025
+; run: %vhigh_bits_i8x16_i64([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0x80]) == 0x8000
+; run: %vhigh_bits_i8x16_i64([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 8]) == 0x7fff
+; run: %vhigh_bits_i8x16_i64([127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80 127 0x80]) == 0xaaaa
+; run: %vhigh_bits_i8x16_i64([0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80 64 64 0x80]) == 0x9249
+
+function %vhigh_bits_i16x8_i8(i16x8) -> i8 {
+block0(v0: i16x8):
+    v1 = vhigh_bits.i8 v0
+    return v1
+}
+; run: %vhigh_bits_i16x8_i8([0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i16x8_i8([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000]) == 0xff
+; run: %vhigh_bits_i16x8_i8([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i16x8_i8([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0
+; run: %vhigh_bits_i16x8_i8([0x7fff 0x8000 0xffff 1 0x80ff 0xff 0x7f80 0xc000]) == 0x96
+; run: %vhigh_bits_i16x8_i8([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0]) == 127
+; run: %vhigh_bits_i16x8_i8([0 0 0 0 0 0 0 0x8000]) == 0x80
+
+function %vhigh_bits_i16x8_i16(i16x8) -> i16 {
+block0(v0: i16x8):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_i16x8_i16([0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i16x8_i16([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000]) == 0xff
+; run: %vhigh_bits_i16x8_i16([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i16x8_i16([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0
+; run: %vhigh_bits_i16x8_i16([0x7fff 0x8000 0xffff 1 0x80ff 0xff 0x7f80 0xc000]) == 0x96
+; run: %vhigh_bits_i16x8_i16([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0]) == 127
+; run: %vhigh_bits_i16x8_i16([0 0 0 0 0 0 0 0x8000]) == 0x80
+
+function %vhigh_bits_i16x8_i32(i16x8) -> i32 {
+block0(v0: i16x8):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_i16x8_i32([0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i16x8_i32([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000]) == 0xff
+; run: %vhigh_bits_i16x8_i32([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i16x8_i32([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0
+; run: %vhigh_bits_i16x8_i32([0x7fff 0x8000 0xffff 1 0x80ff 0xff 0x7f80 0xc000]) == 0x96
+; run: %vhigh_bits_i16x8_i32([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0]) == 127
+; run: %vhigh_bits_i16x8_i32([0 0 0 0 0 0 0 0x8000]) == 0x80
+
+function %vhigh_bits_i16x8_i64(i16x8) -> i64 {
+block0(v0: i16x8):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_i16x8_i64([0 0 0 0 0 0 0 0]) == 0
+; run: %vhigh_bits_i16x8_i64([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000]) == 0xff
+; run: %vhigh_bits_i16x8_i64([0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i16x8_i64([0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff]) == 0
+; run: %vhigh_bits_i16x8_i64([0x7fff 0x8000 0xffff 1 0x80ff 0xff 0x7f80 0xc000]) == 0x96
+; run: %vhigh_bits_i16x8_i64([0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0x8000 0]) == 127
+; run: %vhigh_bits_i16x8_i64([0 0 0 0 0 0 0 0x8000]) == 0x80
+
+function %vhigh_bits_i32x4_i8(i32x4) -> i8 {
+block0(v0: i32x4):
+    v1 = vhigh_bits.i8 v0
+    return v1
+}
+; run: %vhigh_bits_i32x4_i8([0 0 0 0]) == 0
+; run: %vhigh_bits_i32x4_i8([0x80000000 0x80000000 0x80000000 0x80000000]) == 15
+; run: %vhigh_bits_i32x4_i8([0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i32x4_i8([0x80000000 0 0x80000000 0]) == 5
+; run: %vhigh_bits_i32x4_i8([0x7fffffff 0xffffffff 0x800000 0xc0000000]) == 10
+; run: %vhigh_bits_i32x4_i8([0 0 0 0x80000000]) == 8
+
+function %vhigh_bits_i32x4_i16(i32x4) -> i16 {
+block0(v0: i32x4):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_i32x4_i16([0 0 0 0]) == 0
+; run: %vhigh_bits_i32x4_i16([0x80000000 0x80000000 0x80000000 0x80000000]) == 15
+; run: %vhigh_bits_i32x4_i16([0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i32x4_i16([0x80000000 0 0x80000000 0]) == 5
+; run: %vhigh_bits_i32x4_i16([0x7fffffff 0xffffffff 0x800000 0xc0000000]) == 10
+; run: %vhigh_bits_i32x4_i16([0 0 0 0x80000000]) == 8
+
+function %vhigh_bits_i32x4_i32(i32x4) -> i32 {
+block0(v0: i32x4):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_i32x4_i32([0 0 0 0]) == 0
+; run: %vhigh_bits_i32x4_i32([0x80000000 0x80000000 0x80000000 0x80000000]) == 15
+; run: %vhigh_bits_i32x4_i32([0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i32x4_i32([0x80000000 0 0x80000000 0]) == 5
+; run: %vhigh_bits_i32x4_i32([0x7fffffff 0xffffffff 0x800000 0xc0000000]) == 10
+; run: %vhigh_bits_i32x4_i32([0 0 0 0x80000000]) == 8
+
+function %vhigh_bits_i32x4_i64(i32x4) -> i64 {
+block0(v0: i32x4):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_i32x4_i64([0 0 0 0]) == 0
+; run: %vhigh_bits_i32x4_i64([0x80000000 0x80000000 0x80000000 0x80000000]) == 15
+; run: %vhigh_bits_i32x4_i64([0x80 0x80 0x80 0x80]) == 0
+; run: %vhigh_bits_i32x4_i64([0x80000000 0 0x80000000 0]) == 5
+; run: %vhigh_bits_i32x4_i64([0x7fffffff 0xffffffff 0x800000 0xc0000000]) == 10
+; run: %vhigh_bits_i32x4_i64([0 0 0 0x80000000]) == 8
+
+function %vhigh_bits_i64x2_i8(i64x2) -> i8 {
+block0(v0: i64x2):
+    v1 = vhigh_bits.i8 v0
+    return v1
+}
+; run: %vhigh_bits_i64x2_i8([0 0]) == 0
+; run: %vhigh_bits_i64x2_i8([0xffffffffffffffff 0xffffffffffffffff]) == 3
+; run: %vhigh_bits_i64x2_i8([0xffffffffffffffff 0]) == 1
+; run: %vhigh_bits_i64x2_i8([0 0x8000000000000000]) == 2
+; run: %vhigh_bits_i64x2_i8([0x80000000 0x7fffffffffffffff]) == 0
+; run: %vhigh_bits_i64x2_i8([0x80000000 0x8000000000000001]) == 2
+
+function %vhigh_bits_i64x2_i16(i64x2) -> i16 {
+block0(v0: i64x2):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_i64x2_i16([0 0]) == 0
+; run: %vhigh_bits_i64x2_i16([0xffffffffffffffff 0xffffffffffffffff]) == 3
+; run: %vhigh_bits_i64x2_i16([0xffffffffffffffff 0]) == 1
+; run: %vhigh_bits_i64x2_i16([0 0x8000000000000000]) == 2
+; run: %vhigh_bits_i64x2_i16([0x80000000 0x7fffffffffffffff]) == 0
+; run: %vhigh_bits_i64x2_i16([0x80000000 0x8000000000000001]) == 2
+
+function %vhigh_bits_i64x2_i32(i64x2) -> i32 {
+block0(v0: i64x2):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_i64x2_i32([0 0]) == 0
+; run: %vhigh_bits_i64x2_i32([0xffffffffffffffff 0xffffffffffffffff]) == 3
+; run: %vhigh_bits_i64x2_i32([0xffffffffffffffff 0]) == 1
+; run: %vhigh_bits_i64x2_i32([0 0x8000000000000000]) == 2
+; run: %vhigh_bits_i64x2_i32([0x80000000 0x7fffffffffffffff]) == 0
+; run: %vhigh_bits_i64x2_i32([0x80000000 0x8000000000000001]) == 2
+
+function %vhigh_bits_i64x2_i64(i64x2) -> i64 {
+block0(v0: i64x2):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_i64x2_i64([0 0]) == 0
+; run: %vhigh_bits_i64x2_i64([0xffffffffffffffff 0xffffffffffffffff]) == 3
+; run: %vhigh_bits_i64x2_i64([0xffffffffffffffff 0]) == 1
+; run: %vhigh_bits_i64x2_i64([0 0x8000000000000000]) == 2
+; run: %vhigh_bits_i64x2_i64([0x80000000 0x7fffffffffffffff]) == 0
+; run: %vhigh_bits_i64x2_i64([0x80000000 0x8000000000000001]) == 2
+
+function %vhigh_bits_icmp_eq_i8x16(i8x16, i8x16) -> i32 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = icmp eq v0, v1
+    v3 = vhigh_bits.i32 v2
+    return v3
+}
+; run: %vhigh_bits_icmp_eq_i8x16([0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15], [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]) == 0xffff
+; run: %vhigh_bits_icmp_eq_i8x16([0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15], [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 1
+; run: %vhigh_bits_icmp_eq_i8x16([0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15], [0xff 1 0xff 3 0xff 5 0xff 7 0xff 9 0xff 11 0xff 13 0xff 15]) == 0xaaaa

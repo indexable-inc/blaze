@@ -1,0 +1,14 @@
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[workspace]
+
+[workspace.metadata.blaze.lints]
+hot_alloc = "warn"
+
+[workspace.lints.rust]

@@ -1,0 +1,1264 @@
+{
+ "helix": {
+  "polonius": {
+   "bodies": 7614,
+   "infer_ms": 8037.488,
+   "infer_warm_ms": 3124.147,
+   "first_check_ms": 3808.251,
+   "borrowck_ms": 1509.836,
+   "borrowck_excl_mir_ms": 1509.082,
+   "ratio_to_infer": 0.48303809007706744,
+   "per_body_us": {
+    "p50": 49,
+    "p99": 2181,
+    "max": 110520
+   },
+   "phases_ms": {
+    "constraints": 617.691,
+    "entry_sets": 29.637,
+    "errors": 7.276,
+    "infer": 35.399,
+    "liveness": 321.058,
+    "loans": 26.6,
+    "mir": 0.754,
+    "moves": 181.264,
+    "scopes": 52.976,
+    "setup": 3.664,
+    "walk": 151.021
+   },
+   "slowest": [
+    {
+     "name": "helix_term::keymap::default::default",
+     "path": "/root/bp/apps/helix/helix-term/src/keymap/default.rs",
+     "us": 110520,
+     "infer_us": 96681,
+     "phases_us": {
+      "constraints": 21273,
+      "entry_sets": 2384,
+      "errors": 239,
+      "infer": 1739,
+      "liveness": 56626,
+      "loans": 952,
+      "mir": 1,
+      "moves": 13335,
+      "scopes": 2420,
+      "setup": 36,
+      "walk": 9747
+     },
+     "counts": {
+      "blocks": 7299,
+      "bodies": 1,
+      "constraints": 12493,
+      "loans": 1593,
+      "localized": 12493,
+      "locals": 12533,
+      "points": 36964,
+      "regions": 15331,
+      "universals": 2
+     }
+    },
+    {
+     "name": "helix_lsp::client::<Client>::initialize",
+     "path": "/root/bp/apps/helix/helix-lsp/src/client.rs",
+     "us": 17902,
+     "infer_us": 12288,
+     "phases_us": {
+      "constraints": 1135,
+      "entry_sets": 1084,
+      "errors": 45,
+      "infer": 31,
+      "liveness": 8256,
+      "loans": 298,
+      "mir": 2,
+      "moves": 3543,
+      "scopes": 78,
+      "setup": 7,
+      "walk": 3094
+     },
+     "counts": {
+      "blocks": 8973,
+      "bodies": 4,
+      "constraints": 182,
+      "loans": 10,
+      "localized": 181,
+      "locals": 314,
+      "points": 15414,
+      "regions": 209,
+      "universals": 16
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::handle_language_server_message",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 17167,
+     "infer_us": 47401,
+     "phases_us": {
+      "constraints": 5248,
+      "entry_sets": 508,
+      "errors": 72,
+      "infer": 276,
+      "liveness": 5458,
+      "loans": 278,
+      "mir": 3,
+      "moves": 2967,
+      "scopes": 477,
+      "setup": 34,
+      "walk": 1499
+     },
+     "counts": {
+      "blocks": 3728,
+      "bodies": 10,
+      "constraints": 2480,
+      "loans": 260,
+      "localized": 2477,
+      "locals": 1492,
+      "points": 10535,
+      "regions": 2700,
+      "universals": 45
+     }
+    },
+    {
+     "name": "helix_view::handlers::dap::<Editor>::handle_debugger_message",
+     "path": "/root/bp/apps/helix/helix-view/src/handlers/dap.rs",
+     "us": 16847,
+     "infer_us": 29954,
+     "phases_us": {
+      "constraints": 3622,
+      "entry_sets": 520,
+      "errors": 68,
+      "infer": 243,
+      "liveness": 6233,
+      "loans": 262,
+      "mir": 2,
+      "moves": 3039,
+      "scopes": 491,
+      "setup": 18,
+      "walk": 2039
+     },
+     "counts": {
+      "blocks": 3891,
+      "bodies": 7,
+      "constraints": 2041,
+      "loans": 250,
+      "localized": 2040,
+      "locals": 1267,
+      "points": 9952,
+      "regions": 2142,
+      "universals": 28
+     }
+    },
+    {
+     "name": "helix_view::document::<Document>::save_impl",
+     "path": "/root/bp/apps/helix/helix-view/src/document.rs",
+     "us": 9144,
+     "infer_us": 49169,
+     "phases_us": {
+      "constraints": 3290,
+      "entry_sets": 202,
+      "errors": 60,
+      "infer": 121,
+      "liveness": 2204,
+      "loans": 160,
+      "mir": 4,
+      "moves": 1199,
+      "scopes": 275,
+      "setup": 45,
+      "walk": 1379
+     },
+     "counts": {
+      "blocks": 1690,
+      "bodies": 18,
+      "constraints": 1269,
+      "loans": 129,
+      "localized": 1268,
+      "locals": 775,
+      "points": 4517,
+      "regions": 1218,
+      "universals": 62
+     }
+    },
+    {
+     "name": "helix_term::health::languages",
+     "path": "/root/bp/apps/helix/helix-term/src/health.rs",
+     "us": 8575,
+     "infer_us": 12507,
+     "phases_us": {
+      "constraints": 4359,
+      "entry_sets": 128,
+      "errors": 51,
+      "infer": 187,
+      "liveness": 1439,
+      "loans": 86,
+      "mir": 3,
+      "moves": 760,
+      "scopes": 780,
+      "setup": 21,
+      "walk": 589
+     },
+     "counts": {
+      "blocks": 724,
+      "bodies": 17,
+      "constraints": 2108,
+      "loans": 90,
+      "localized": 2094,
+      "locals": 638,
+      "points": 2672,
+      "regions": 1852,
+      "universals": 235
+     }
+    },
+    {
+     "name": "helix_lsp::transport::<Transport>::send",
+     "path": "/root/bp/apps/helix/helix-lsp/src/transport.rs",
+     "us": 8324,
+     "infer_us": 14533,
+     "phases_us": {
+      "constraints": 2401,
+      "entry_sets": 207,
+      "errors": 42,
+      "infer": 132,
+      "liveness": 2478,
+      "loans": 110,
+      "mir": 2,
+      "moves": 1130,
+      "scopes": 767,
+      "setup": 11,
+      "walk": 900
+     },
+     "counts": {
+      "blocks": 1609,
+      "bodies": 3,
+      "constraints": 1386,
+      "loans": 101,
+      "localized": 1386,
+      "locals": 614,
+      "points": 4386,
+      "regions": 1146,
+      "universals": 19
+     }
+    },
+    {
+     "name": "helix_term::commands::syntax::syntax_workspace_symbol_picker",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/syntax.rs",
+     "us": 7613,
+     "infer_us": 21639,
+     "phases_us": {
+      "constraints": 3568,
+      "entry_sets": 113,
+      "errors": 37,
+      "infer": 119,
+      "liveness": 1631,
+      "loans": 119,
+      "mir": 4,
+      "moves": 767,
+      "scopes": 249,
+      "setup": 32,
+      "walk": 806
+     },
+     "counts": {
+      "blocks": 847,
+      "bodies": 19,
+      "constraints": 1082,
+      "loans": 103,
+      "localized": 1068,
+      "locals": 760,
+      "points": 2936,
+      "regions": 1166,
+      "universals": 121
+     }
+    },
+    {
+     "name": "xtask::tasks::highlightcheck",
+     "path": "/root/bp/apps/helix/xtask/src/main.rs",
+     "us": 7323,
+     "infer_us": 11973,
+     "phases_us": {
+      "constraints": 3437,
+      "entry_sets": 117,
+      "errors": 32,
+      "infer": 118,
+      "liveness": 1607,
+      "loans": 89,
+      "mir": 2,
+      "moves": 843,
+      "scopes": 372,
+      "setup": 16,
+      "walk": 558
+     },
+     "counts": {
+      "blocks": 701,
+      "bodies": 10,
+      "constraints": 1038,
+      "loans": 95,
+      "localized": 1034,
+      "locals": 656,
+      "points": 2682,
+      "regions": 1089,
+      "universals": 50
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::event_loop_until_idle",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 7181,
+     "infer_us": 27372,
+     "phases_us": {
+      "constraints": 2637,
+      "entry_sets": 141,
+      "errors": 35,
+      "infer": 77,
+      "liveness": 1731,
+      "loans": 72,
+      "mir": 1,
+      "moves": 791,
+      "scopes": 291,
+      "setup": 11,
+      "walk": 1286
+     },
+     "counts": {
+      "blocks": 1051,
+      "bodies": 3,
+      "constraints": 1012,
+      "loans": 70,
+      "localized": 1010,
+      "locals": 463,
+      "points": 2969,
+      "regions": 684,
+      "universals": 25
+     }
+    },
+    {
+     "name": "helix_view::document::<Document>::format",
+     "path": "/root/bp/apps/helix/helix-view/src/document.rs",
+     "us": 7094,
+     "infer_us": 16056,
+     "phases_us": {
+      "constraints": 3007,
+      "entry_sets": 142,
+      "errors": 34,
+      "infer": 98,
+      "liveness": 1571,
+      "loans": 102,
+      "mir": 3,
+      "moves": 861,
+      "scopes": 197,
+      "setup": 23,
+      "walk": 897
+     },
+     "counts": {
+      "blocks": 1171,
+      "bodies": 14,
+      "constraints": 924,
+      "loans": 81,
+      "localized": 924,
+      "locals": 587,
+      "points": 3243,
+      "regions": 945,
+      "universals": 55
+     }
+    },
+    {
+     "name": "helix_term::commands::global_search",
+     "path": "/root/bp/apps/helix/helix-term/src/commands.rs",
+     "us": 6390,
+     "infer_us": 18517,
+     "phases_us": {
+      "constraints": 3198,
+      "entry_sets": 120,
+      "errors": 36,
+      "infer": 111,
+      "liveness": 1235,
+      "loans": 88,
+      "mir": 4,
+      "moves": 665,
+      "scopes": 189,
+      "setup": 25,
+      "walk": 581
+     },
+     "counts": {
+      "blocks": 1005,
+      "bodies": 17,
+      "constraints": 1109,
+      "loans": 93,
+      "localized": 1097,
+      "locals": 575,
+      "points": 2864,
+      "regions": 1070,
+      "universals": 135
+     }
+    },
+    {
+     "name": "xtask::tasks::indentcheck",
+     "path": "/root/bp/apps/helix/xtask/src/main.rs",
+     "us": 6088,
+     "infer_us": 16500,
+     "phases_us": {
+      "constraints": 3249,
+      "entry_sets": 104,
+      "errors": 27,
+      "infer": 130,
+      "liveness": 1180,
+      "loans": 73,
+      "mir": 3,
+      "moves": 558,
+      "scopes": 250,
+      "setup": 15,
+      "walk": 376
+     },
+     "counts": {
+      "blocks": 523,
+      "bodies": 14,
+      "constraints": 1117,
+      "loans": 101,
+      "localized": 1117,
+      "locals": 631,
+      "points": 2290,
+      "regions": 1190,
+      "universals": 69
+     }
+    },
+    {
+     "name": "helix_term::handlers::completion::request::request_completions",
+     "path": "/root/bp/apps/helix/helix-term/src/handlers/completion/request.rs",
+     "us": 5451,
+     "infer_us": 7286,
+     "phases_us": {
+      "constraints": 2947,
+      "entry_sets": 81,
+      "errors": 25,
+      "infer": 54,
+      "liveness": 921,
+      "loans": 58,
+      "mir": 2,
+      "moves": 451,
+      "scopes": 200,
+      "setup": 10,
+      "walk": 620
+     },
+     "counts": {
+      "blocks": 585,
+      "bodies": 6,
+      "constraints": 503,
+      "loans": 60,
+      "localized": 501,
+      "locals": 312,
+      "points": 1616,
+      "regions": 483,
+      "universals": 44
+     }
+    },
+    {
+     "name": "helix_term::commands::typed::TYPABLE_COMMAND_LIST",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/typed.rs",
+     "us": 5446,
+     "infer_us": 6658,
+     "phases_us": {
+      "constraints": 1616,
+      "entry_sets": 0,
+      "errors": 89,
+      "infer": 195,
+      "liveness": 2060,
+      "loans": 170,
+      "mir": 0,
+      "moves": 590,
+      "scopes": 143,
+      "setup": 3,
+      "walk": 422
+     },
+     "counts": {
+      "blocks": 498,
+      "bodies": 1,
+      "constraints": 2437,
+      "loans": 0,
+      "localized": 2437,
+      "locals": 1414,
+      "points": 4643,
+      "regions": 2589,
+      "universals": 422
+     }
+    },
+    {
+     "name": "helix_term::commands::goto_file_impl",
+     "path": "/root/bp/apps/helix/helix-term/src/commands.rs",
+     "us": 5304,
+     "infer_us": 11043,
+     "phases_us": {
+      "constraints": 2480,
+      "entry_sets": 93,
+      "errors": 25,
+      "infer": 79,
+      "liveness": 1105,
+      "loans": 93,
+      "mir": 3,
+      "moves": 605,
+      "scopes": 201,
+      "setup": 14,
+      "walk": 490
+     },
+     "counts": {
+      "blocks": 693,
+      "bodies": 10,
+      "constraints": 750,
+      "loans": 81,
+      "localized": 750,
+      "locals": 486,
+      "points": 2189,
+      "regions": 782,
+      "universals": 51
+     }
+    },
+    {
+     "name": "helix_view::editor::<Editor>::wait_event",
+     "path": "/root/bp/apps/helix/helix-view/src/editor.rs",
+     "us": 5104,
+     "infer_us": 27285,
+     "phases_us": {
+      "constraints": 2117,
+      "entry_sets": 113,
+      "errors": 28,
+      "infer": 68,
+      "liveness": 1127,
+      "loans": 63,
+      "mir": 1,
+      "moves": 614,
+      "scopes": 198,
+      "setup": 9,
+      "walk": 655
+     },
+     "counts": {
+      "blocks": 822,
+      "bodies": 3,
+      "constraints": 849,
+      "loans": 54,
+      "localized": 848,
+      "locals": 448,
+      "points": 2600,
+      "regions": 625,
+      "universals": 23
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::new",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 4847,
+     "infer_us": 11197,
+     "phases_us": {
+      "constraints": 1921,
+      "entry_sets": 95,
+      "errors": 19,
+      "infer": 41,
+      "liveness": 1414,
+      "loans": 62,
+      "mir": 2,
+      "moves": 469,
+      "scopes": 99,
+      "setup": 10,
+      "walk": 630
+     },
+     "counts": {
+      "blocks": 536,
+      "bodies": 6,
+      "constraints": 355,
+      "loans": 65,
+      "localized": 351,
+      "locals": 373,
+      "points": 1653,
+      "regions": 428,
+      "universals": 20
+     }
+    },
+    {
+     "name": "helix_term::commands::lsp::workspace_symbol_picker",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/lsp.rs",
+     "us": 4771,
+     "infer_us": 12034,
+     "phases_us": {
+      "constraints": 2577,
+      "entry_sets": 67,
+      "errors": 21,
+      "infer": 62,
+      "liveness": 792,
+      "loans": 54,
+      "mir": 3,
+      "moves": 469,
+      "scopes": 110,
+      "setup": 16,
+      "walk": 502
+     },
+     "counts": {
+      "blocks": 594,
+      "bodies": 14,
+      "constraints": 576,
+      "loans": 35,
+      "localized": 560,
+      "locals": 336,
+      "points": 1639,
+      "regions": 624,
+      "universals": 101
+     }
+    },
+    {
+     "name": "helix_term::commands::jumplist_picker",
+     "path": "/root/bp/apps/helix/helix-term/src/commands.rs",
+     "us": 4733,
+     "infer_us": 9126,
+     "phases_us": {
+      "constraints": 3235,
+      "entry_sets": 35,
+      "errors": 34,
+      "infer": 85,
+      "liveness": 424,
+      "loans": 36,
+      "mir": 2,
+      "moves": 290,
+      "scopes": 121,
+      "setup": 11,
+      "walk": 383
+     },
+     "counts": {
+      "blocks": 251,
+      "bodies": 11,
+      "constraints": 1020,
+      "loans": 42,
+      "localized": 1000,
+      "locals": 276,
+      "points": 937,
+      "regions": 796,
+      "universals": 152
+     }
+    }
+   ],
+   "secs": 29
+  },
+  "nll": {
+   "bodies": 7614,
+   "infer_ms": 8037.488,
+   "infer_warm_ms": 3124.147,
+   "first_check_ms": 3808.251,
+   "borrowck_ms": 1334.441,
+   "borrowck_excl_mir_ms": 1334.072,
+   "ratio_to_infer": 0.4270195992698167,
+   "per_body_us": {
+    "p50": 41,
+    "p99": 2041,
+    "max": 104855
+   },
+   "phases_ms": {
+    "constraints": 553.678,
+    "entry_sets": 28.202,
+    "errors": 6.503,
+    "infer": 33.428,
+    "liveness": 301.419,
+    "loans": 24.456,
+    "mir": 0.369,
+    "moves": 165.74,
+    "scopes": 4.926,
+    "setup": 2.578,
+    "walk": 143.107
+   },
+   "slowest": [
+    {
+     "name": "helix_term::keymap::default::default",
+     "path": "/root/bp/apps/helix/helix-term/src/keymap/default.rs",
+     "us": 104855,
+     "infer_us": 96681,
+     "phases_us": {
+      "constraints": 21698,
+      "entry_sets": 2427,
+      "errors": 236,
+      "infer": 1800,
+      "liveness": 54034,
+      "loans": 956,
+      "mir": 1,
+      "moves": 12254,
+      "scopes": 273,
+      "setup": 37,
+      "walk": 9715
+     },
+     "counts": {
+      "blocks": 7299,
+      "bodies": 1,
+      "constraints": 12493,
+      "loans": 1593,
+      "localized": 12493,
+      "locals": 12533,
+      "points": 36964,
+      "regions": 15331,
+      "universals": 2
+     }
+    },
+    {
+     "name": "helix_lsp::client::<Client>::initialize",
+     "path": "/root/bp/apps/helix/helix-lsp/src/client.rs",
+     "us": 17921,
+     "infer_us": 12288,
+     "phases_us": {
+      "constraints": 1120,
+      "entry_sets": 921,
+      "errors": 44,
+      "infer": 29,
+      "liveness": 8177,
+      "loans": 239,
+      "mir": 2,
+      "moves": 3955,
+      "scopes": 3,
+      "setup": 7,
+      "walk": 3108
+     },
+     "counts": {
+      "blocks": 8973,
+      "bodies": 4,
+      "constraints": 182,
+      "loans": 10,
+      "localized": 181,
+      "locals": 314,
+      "points": 15414,
+      "regions": 209,
+      "universals": 16
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::handle_language_server_message",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 16538,
+     "infer_us": 47401,
+     "phases_us": {
+      "constraints": 5183,
+      "entry_sets": 511,
+      "errors": 72,
+      "infer": 288,
+      "liveness": 5394,
+      "loans": 268,
+      "mir": 3,
+      "moves": 2921,
+      "scopes": 62,
+      "setup": 33,
+      "walk": 1478
+     },
+     "counts": {
+      "blocks": 3728,
+      "bodies": 10,
+      "constraints": 2480,
+      "loans": 260,
+      "localized": 2477,
+      "locals": 1492,
+      "points": 10535,
+      "regions": 2700,
+      "universals": 45
+     }
+    },
+    {
+     "name": "helix_view::handlers::dap::<Editor>::handle_debugger_message",
+     "path": "/root/bp/apps/helix/helix-view/src/handlers/dap.rs",
+     "us": 16209,
+     "infer_us": 29954,
+     "phases_us": {
+      "constraints": 3560,
+      "entry_sets": 521,
+      "errors": 66,
+      "infer": 235,
+      "liveness": 6088,
+      "loans": 268,
+      "mir": 2,
+      "moves": 3020,
+      "scopes": 64,
+      "setup": 19,
+      "walk": 2052
+     },
+     "counts": {
+      "blocks": 3891,
+      "bodies": 7,
+      "constraints": 2041,
+      "loans": 250,
+      "localized": 2040,
+      "locals": 1267,
+      "points": 9952,
+      "regions": 2142,
+      "universals": 28
+     }
+    },
+    {
+     "name": "helix_view::document::<Document>::save_impl",
+     "path": "/root/bp/apps/helix/helix-view/src/document.rs",
+     "us": 8708,
+     "infer_us": 49169,
+     "phases_us": {
+      "constraints": 3160,
+      "entry_sets": 197,
+      "errors": 60,
+      "infer": 152,
+      "liveness": 2224,
+      "loans": 146,
+      "mir": 4,
+      "moves": 1159,
+      "scopes": 27,
+      "setup": 44,
+      "walk": 1345
+     },
+     "counts": {
+      "blocks": 1690,
+      "bodies": 18,
+      "constraints": 1269,
+      "loans": 129,
+      "localized": 1268,
+      "locals": 775,
+      "points": 4517,
+      "regions": 1218,
+      "universals": 62
+     }
+    },
+    {
+     "name": "helix_term::health::languages",
+     "path": "/root/bp/apps/helix/helix-term/src/health.rs",
+     "us": 7684,
+     "infer_us": 12507,
+     "phases_us": {
+      "constraints": 4291,
+      "entry_sets": 126,
+      "errors": 59,
+      "infer": 184,
+      "liveness": 1390,
+      "loans": 76,
+      "mir": 3,
+      "moves": 769,
+      "scopes": 40,
+      "setup": 22,
+      "walk": 565
+     },
+     "counts": {
+      "blocks": 724,
+      "bodies": 17,
+      "constraints": 2108,
+      "loans": 90,
+      "localized": 2094,
+      "locals": 638,
+      "points": 2672,
+      "regions": 1852,
+      "universals": 235
+     }
+    },
+    {
+     "name": "helix_lsp::transport::<Transport>::send",
+     "path": "/root/bp/apps/helix/helix-lsp/src/transport.rs",
+     "us": 7536,
+     "infer_us": 14533,
+     "phases_us": {
+      "constraints": 2371,
+      "entry_sets": 224,
+      "errors": 45,
+      "infer": 133,
+      "liveness": 2405,
+      "loans": 112,
+      "mir": 1,
+      "moves": 1147,
+      "scopes": 54,
+      "setup": 11,
+      "walk": 897
+     },
+     "counts": {
+      "blocks": 1609,
+      "bodies": 3,
+      "constraints": 1386,
+      "loans": 101,
+      "localized": 1386,
+      "locals": 614,
+      "points": 4386,
+      "regions": 1146,
+      "universals": 19
+     }
+    },
+    {
+     "name": "helix_term::commands::syntax::syntax_workspace_symbol_picker",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/syntax.rs",
+     "us": 7149,
+     "infer_us": 21639,
+     "phases_us": {
+      "constraints": 3432,
+      "entry_sets": 111,
+      "errors": 36,
+      "infer": 117,
+      "liveness": 1612,
+      "loans": 102,
+      "mir": 4,
+      "moves": 733,
+      "scopes": 24,
+      "setup": 29,
+      "walk": 797
+     },
+     "counts": {
+      "blocks": 847,
+      "bodies": 19,
+      "constraints": 1082,
+      "loans": 103,
+      "localized": 1068,
+      "locals": 760,
+      "points": 2936,
+      "regions": 1166,
+      "universals": 121
+     }
+    },
+    {
+     "name": "xtask::tasks::highlightcheck",
+     "path": "/root/bp/apps/helix/xtask/src/main.rs",
+     "us": 6871,
+     "infer_us": 11973,
+     "phases_us": {
+      "constraints": 3402,
+      "entry_sets": 149,
+      "errors": 32,
+      "infer": 135,
+      "liveness": 1533,
+      "loans": 89,
+      "mir": 3,
+      "moves": 804,
+      "scopes": 27,
+      "setup": 17,
+      "walk": 560
+     },
+     "counts": {
+      "blocks": 701,
+      "bodies": 10,
+      "constraints": 1038,
+      "loans": 95,
+      "localized": 1034,
+      "locals": 656,
+      "points": 2682,
+      "regions": 1089,
+      "universals": 50
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::event_loop_until_idle",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 6796,
+     "infer_us": 27372,
+     "phases_us": {
+      "constraints": 2593,
+      "entry_sets": 142,
+      "errors": 34,
+      "infer": 83,
+      "liveness": 1688,
+      "loans": 73,
+      "mir": 1,
+      "moves": 779,
+      "scopes": 22,
+      "setup": 11,
+      "walk": 1268
+     },
+     "counts": {
+      "blocks": 1051,
+      "bodies": 3,
+      "constraints": 1012,
+      "loans": 70,
+      "localized": 1010,
+      "locals": 463,
+      "points": 2969,
+      "regions": 684,
+      "universals": 25
+     }
+    },
+    {
+     "name": "helix_view::document::<Document>::format",
+     "path": "/root/bp/apps/helix/helix-view/src/document.rs",
+     "us": 6684,
+     "infer_us": 16056,
+     "phases_us": {
+      "constraints": 3002,
+      "entry_sets": 138,
+      "errors": 33,
+      "infer": 97,
+      "liveness": 1425,
+      "loans": 99,
+      "mir": 3,
+      "moves": 855,
+      "scopes": 18,
+      "setup": 22,
+      "walk": 855
+     },
+     "counts": {
+      "blocks": 1171,
+      "bodies": 14,
+      "constraints": 924,
+      "loans": 81,
+      "localized": 924,
+      "locals": 587,
+      "points": 3243,
+      "regions": 945,
+      "universals": 55
+     }
+    },
+    {
+     "name": "helix_term::commands::global_search",
+     "path": "/root/bp/apps/helix/helix-term/src/commands.rs",
+     "us": 6166,
+     "infer_us": 18517,
+     "phases_us": {
+      "constraints": 3211,
+      "entry_sets": 133,
+      "errors": 36,
+      "infer": 111,
+      "liveness": 1186,
+      "loans": 86,
+      "mir": 4,
+      "moves": 644,
+      "scopes": 24,
+      "setup": 24,
+      "walk": 576
+     },
+     "counts": {
+      "blocks": 1005,
+      "bodies": 17,
+      "constraints": 1109,
+      "loans": 93,
+      "localized": 1097,
+      "locals": 575,
+      "points": 2864,
+      "regions": 1070,
+      "universals": 135
+     }
+    },
+    {
+     "name": "xtask::tasks::indentcheck",
+     "path": "/root/bp/apps/helix/xtask/src/main.rs",
+     "us": 5696,
+     "infer_us": 16500,
+     "phases_us": {
+      "constraints": 3167,
+      "entry_sets": 103,
+      "errors": 26,
+      "infer": 122,
+      "liveness": 1144,
+      "loans": 79,
+      "mir": 3,
+      "moves": 530,
+      "scopes": 27,
+      "setup": 16,
+      "walk": 367
+     },
+     "counts": {
+      "blocks": 523,
+      "bodies": 14,
+      "constraints": 1117,
+      "loans": 101,
+      "localized": 1117,
+      "locals": 631,
+      "points": 2290,
+      "regions": 1190,
+      "universals": 69
+     }
+    },
+    {
+     "name": "helix_term::commands::typed::TYPABLE_COMMAND_LIST",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/typed.rs",
+     "us": 5283,
+     "infer_us": 6658,
+     "phases_us": {
+      "constraints": 1552,
+      "entry_sets": 0,
+      "errors": 46,
+      "infer": 206,
+      "liveness": 2180,
+      "loans": 171,
+      "mir": 0,
+      "moves": 569,
+      "scopes": 0,
+      "setup": 2,
+      "walk": 414
+     },
+     "counts": {
+      "blocks": 498,
+      "bodies": 1,
+      "constraints": 2437,
+      "loans": 0,
+      "localized": 2437,
+      "locals": 1414,
+      "points": 4643,
+      "regions": 2589,
+      "universals": 422
+     }
+    },
+    {
+     "name": "helix_term::handlers::completion::request::request_completions",
+     "path": "/root/bp/apps/helix/helix-term/src/handlers/completion/request.rs",
+     "us": 5198,
+     "infer_us": 7286,
+     "phases_us": {
+      "constraints": 2946,
+      "entry_sets": 80,
+      "errors": 23,
+      "infer": 54,
+      "liveness": 904,
+      "loans": 58,
+      "mir": 2,
+      "moves": 468,
+      "scopes": 18,
+      "setup": 10,
+      "walk": 564
+     },
+     "counts": {
+      "blocks": 585,
+      "bodies": 6,
+      "constraints": 503,
+      "loans": 60,
+      "localized": 501,
+      "locals": 312,
+      "points": 1616,
+      "regions": 483,
+      "universals": 44
+     }
+    },
+    {
+     "name": "helix_term::commands::goto_file_impl",
+     "path": "/root/bp/apps/helix/helix-term/src/commands.rs",
+     "us": 5052,
+     "infer_us": 11043,
+     "phases_us": {
+      "constraints": 2467,
+      "entry_sets": 91,
+      "errors": 25,
+      "infer": 79,
+      "liveness": 1085,
+      "loans": 79,
+      "mir": 3,
+      "moves": 607,
+      "scopes": 21,
+      "setup": 13,
+      "walk": 482
+     },
+     "counts": {
+      "blocks": 693,
+      "bodies": 10,
+      "constraints": 750,
+      "loans": 81,
+      "localized": 750,
+      "locals": 486,
+      "points": 2189,
+      "regions": 782,
+      "universals": 51
+     }
+    },
+    {
+     "name": "helix_view::editor::<Editor>::wait_event",
+     "path": "/root/bp/apps/helix/helix-view/src/editor.rs",
+     "us": 4827,
+     "infer_us": 27285,
+     "phases_us": {
+      "constraints": 2061,
+      "entry_sets": 113,
+      "errors": 28,
+      "infer": 68,
+      "liveness": 1091,
+      "loans": 62,
+      "mir": 1,
+      "moves": 631,
+      "scopes": 16,
+      "setup": 8,
+      "walk": 660
+     },
+     "counts": {
+      "blocks": 822,
+      "bodies": 3,
+      "constraints": 849,
+      "loans": 54,
+      "localized": 848,
+      "locals": 448,
+      "points": 2600,
+      "regions": 625,
+      "universals": 23
+     }
+    },
+    {
+     "name": "helix_term::application::<Application>::new",
+     "path": "/root/bp/apps/helix/helix-term/src/application.rs",
+     "us": 4635,
+     "infer_us": 11197,
+     "phases_us": {
+      "constraints": 1871,
+      "entry_sets": 94,
+      "errors": 18,
+      "infer": 41,
+      "liveness": 1377,
+      "loans": 61,
+      "mir": 2,
+      "moves": 451,
+      "scopes": 13,
+      "setup": 11,
+      "walk": 607
+     },
+     "counts": {
+      "blocks": 536,
+      "bodies": 6,
+      "constraints": 355,
+      "loans": 65,
+      "localized": 351,
+      "locals": 373,
+      "points": 1653,
+      "regions": 428,
+      "universals": 20
+     }
+    },
+    {
+     "name": "helix_term::commands::lsp::workspace_symbol_picker",
+     "path": "/root/bp/apps/helix/helix-term/src/commands/lsp.rs",
+     "us": 4621,
+     "infer_us": 12034,
+     "phases_us": {
+      "constraints": 2558,
+      "entry_sets": 65,
+      "errors": 20,
+      "infer": 63,
+      "liveness": 730,
+      "loans": 53,
+      "mir": 3,
+      "moves": 475,
+      "scopes": 8,
+      "setup": 16,
+      "walk": 501
+     },
+     "counts": {
+      "blocks": 594,
+      "bodies": 14,
+      "constraints": 576,
+      "loans": 35,
+      "localized": 560,
+      "locals": 336,
+      "points": 1639,
+      "regions": 624,
+      "universals": 101
+     }
+    },
+    {
+     "name": "helix_tui::backend::termina::<TerminaBackend>::new",
+     "path": "/root/bp/apps/helix/helix-tui/src/backend/termina.rs",
+     "us": 4496,
+     "infer_us": 5559,
+     "phases_us": {
+      "constraints": 1287,
+      "entry_sets": 84,
+      "errors": 17,
+      "infer": 65,
+      "liveness": 853,
+      "loans": 1078,
+      "mir": 1,
+      "moves": 433,
+      "scopes": 10,
+      "setup": 8,
+      "walk": 575
+     },
+     "counts": {
+      "blocks": 517,
+      "bodies": 3,
+      "constraints": 658,
+      "loans": 62,
+      "localized": 656,
+      "locals": 522,
+      "points": 2212,
+      "regions": 766,
+      "universals": 11
+     }
+    }
+   ],
+   "secs": 29
+  }
+ }
+}

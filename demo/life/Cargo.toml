@@ -1,0 +1,15 @@
+[package]
+name = "life"
+version = "0.1.0"
+description = "Conway's Game of Life in an egui window, taking edits to its own rules while it runs"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+blaze-api = { path = "../../crates/blaze-api" }
+blaze-live = { path = "../../crates/blaze-live" }
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+
+# Not part of the blaze workspace: it has its own lock and its own unit graph.
+[workspace]

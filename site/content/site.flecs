@@ -1,0 +1,74 @@
+// The site's pages. Each page is an entity under `site`; its path is its URL (site.index is /).
+// RFCs live in rfcs/, the charter in charter.flecs, /bench in bench.flecs, /install and /usage in their own files,
+// the course's lessons in learn/, its updates and What's new in updates.flecs and updates/.
+// The sidebar's sections are in nav.flecs; a page joins one with Nav, Icon and (InGroup, nav.<section>).
+site {
+  OrderedChildren
+  // https://ix.dev/blaze/ (the worker answers there; blaze.ix.dev and blaze.ix.dev redirect to it).
+  Served: {"https://ix.dev", "/blaze"}
+  // The pixel-fire wordmark (docs/brand/fire/gen.py), copied to static/brand/.
+  Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368, "/brand/blaze-dark-still.webp", "/brand/blaze-light-still.webp"}
+
+  // Opened here so the course map below can name it; updates.flecs, which runs later, fills it in.
+  updates {}
+
+  // The home page is the course: the logo, one line on what blaze is, the install line, then the map of lessons
+  // (learn.flecs and learn/), with the speed numbers and the credits below. What blaze is for is taught by the
+  // lessons rather than listed here.
+  index : Page {
+    Hero
+    Title: {"blaze"}
+    Nav: {"Course", 0}
+    Icon: {"path"}
+    (InGroup, nav.learn)
+    Tab: {"blaze: learn how Rust builds in milliseconds"}
+    Description: {"A Rust build with cargo's commands that rebuilds an edit in milliseconds, and a short course on how it works: five lessons, one idea per screen, with questions as you go."}
+
+    Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.")
+    Command install("curl -fsSL https://ix.dev/blaze | sh")
+    Dim then("Then `blaze run` in any Rust project. [Install](/install) has the other ways in and what you need; [Usage](/usage) has the day to day.")
+
+    Section course(title: "How blaze works") {
+      P line("Five short lessons, a few minutes each: one idea per screen, and a question now and then to check it landed. No compiler knowledge needed; a little Rust is enough.")
+      P branches("Some lessons build on others, so the path branches. As blaze changes, updates branch off the lesson they extend; [What's new](/updates) lists them all.")
+      Course map {
+        (Lessons, site.learn)
+        (Lessons, site.updates)
+      }
+      Dim kept("Your progress, and when you last came by, stay in this browser. Nothing is sent anywhere.")
+    }
+
+    Section speed(title: "How fast") {
+      Dim setup("Edit one function, then build. A generated 200-crate workspace on Linux x86-64 with 8 CPUs, median of three, measured once by hand.")
+      Table numbers {
+        Tr head { Th a("Edit"); Th b("cargo"); Th c("blaze") }
+        Tr main_crate { Td a("Function in the main crate"); Td b("1.76 s"); Td c("0.42 s") }
+        Tr deep_crate { Td a("Function in a crate everything depends on"); Td b("6.33 s"); Td c("0.60 s") }
+      }
+      Dim history("[Benchmark history](/bench): every run on real projects, next to plain cargo on the same machine.")
+    }
+
+    Section credits(title: "Credits") {
+      Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
+      Dim open("Designed in the open: the [charter](/charter) says what blaze holds to, and [the RFCs](/rfcs) are designs still being argued about. Sign in with GitHub to comment on any paragraph.")
+    }
+  }
+
+  rfcs : Page {
+    Title: {"RFCs"}
+    Nav: {"RFCs", 4}
+    Icon: {"files"}
+    (InGroup, nav.reference)
+    Description: {"Designs for what blaze adds to Rust, open for comment."}
+    Lede lede("Designs for what blaze adds to Rust. Each one is a draft until it is not: sign in with GitHub and comment on any paragraph, or on the RFC as a whole.")
+    P charter("Read the [charter](/charter) first: it says what every RFC has to keep.")
+    RfcIndex list
+    Dim source("Each RFC is a Flecs script in [site/content/rfcs](https://github.com/indexable-inc/blaze/tree/main/site/content/rfcs). To propose one, open a pull request with a new file.")
+  }
+
+  "404" : Page {
+    Quiet
+    Title: {"Not found"}
+    P gone("Nothing here. Try the [home page](/) or [the RFCs](/rfcs).")
+  }
+}

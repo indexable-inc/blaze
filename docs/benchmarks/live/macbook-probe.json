@@ -1,0 +1,7333 @@
+{
+ "program": "probe",
+ "date": "2026-10-20T23:27:53Z",
+ "commit": "ad07271066882dea5f539e65531884ed68f1294a",
+ "run_url": null,
+ "host": {
+  "name": "MacBook Pro (Mac17,6)",
+  "cpu": "Apple M5 Max",
+  "cores": 18,
+  "memory_gib": 128,
+  "os": "macOS 27.0.1",
+  "battery": "AC"
+ },
+ "modes": {
+  "socket": [
+   {
+    "to-worker": 0.346,
+    "worker": 6.158,
+    "delivery": 0.10299999999999998,
+    "wait": 0.0302,
+    "apply": 0.3018,
+    "total": 6.939,
+    "reply": 7.082,
+    "worker.apply.change": 0.116,
+    "worker.apply.outlines": 0.506,
+    "worker.apply.rest": 0.017,
+    "worker.publish": 0.484,
+    "worker.notice": 0.0,
+    "worker.settle": 0.251,
+    "worker.read": 0.01,
+    "worker.apply": 0.64,
+    "worker.roots": 0.008,
+    "worker.check": 1.766,
+    "worker.reach": 0.009,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.067,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.153,
+    "worker.compile-rest": 0.461,
+    "worker.write": 1.407,
+    "worker.build-rest": 0.319,
+    "worker.report": 0.187,
+    "worker.refuse": 0.309,
+    "worker.link": 2.3,
+    "worker.edit-to-binary": 6.0,
+    "worker.splice.place": 0.921,
+    "worker.splice.copy": 0.187,
+    "worker.splice.overwrite": 0.283,
+    "worker.splice.sign": 0.406,
+    "worker.splice.append": 0.115,
+    "worker.splice.rename": 0.281
+   },
+   {
+    "to-worker": 0.499,
+    "worker": 14.625,
+    "delivery": 0.20030000000000003,
+    "wait": 0.0442,
+    "apply": 0.5535,
+    "total": 15.922,
+    "reply": 15.889,
+    "worker.apply.change": 0.102,
+    "worker.apply.outlines": 1.036,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.364,
+    "worker.notice": 0.0,
+    "worker.settle": 0.278,
+    "worker.read": 0.011,
+    "worker.apply": 1.155,
+    "worker.roots": 0.012,
+    "worker.check": 10.432,
+    "worker.reach": 0.008,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.149,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.021,
+    "worker.setup": 0.183,
+    "worker.compile-rest": 0.715,
+    "worker.write": 0.322,
+    "worker.build-rest": 0.573,
+    "worker.report": 0.126,
+    "worker.refuse": 0.205,
+    "worker.link": 1.9,
+    "worker.edit-to-binary": 14.4,
+    "worker.splice.place": 0.104,
+    "worker.splice.copy": 0.197,
+    "worker.splice.overwrite": 0.649,
+    "worker.splice.sign": 0.425,
+    "worker.splice.append": 0.087,
+    "worker.splice.rename": 0.225
+   },
+   {
+    "to-worker": 0.486,
+    "worker": 4.41,
+    "delivery": 0.12639999999999996,
+    "wait": 0.027,
+    "apply": 0.2866,
+    "total": 5.336,
+    "reply": 5.622,
+    "worker.apply.change": 0.071,
+    "worker.apply.outlines": 0.489,
+    "worker.apply.rest": 0.019,
+    "worker.publish": 0.309,
+    "worker.notice": 0.0,
+    "worker.settle": 0.316,
+    "worker.read": 0.013,
+    "worker.apply": 0.58,
+    "worker.roots": 0.007,
+    "worker.check": 1.263,
+    "worker.reach": 0.017,
+    "worker.resolve": 0.005,
+    "worker.define": 0.016,
+    "worker.object": 0.081,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.173,
+    "worker.compile-rest": 0.576,
+    "worker.write": 0.349,
+    "worker.build-rest": 0.321,
+    "worker.report": 0.133,
+    "worker.refuse": 0.182,
+    "worker.link": 2.5,
+    "worker.edit-to-binary": 4.2,
+    "worker.splice.place": 0.173,
+    "worker.splice.copy": 0.419,
+    "worker.splice.overwrite": 0.734,
+    "worker.splice.sign": 0.519,
+    "worker.splice.append": 0.117,
+    "worker.splice.rename": 0.314
+   },
+   {
+    "to-worker": 0.711,
+    "worker": 7.536,
+    "delivery": 0.0951999999999999,
+    "wait": 0.0218,
+    "apply": 0.45,
+    "total": 8.814,
+    "reply": 9.037,
+    "worker.apply.change": 0.07,
+    "worker.apply.outlines": 0.521,
+    "worker.apply.rest": 0.024,
+    "worker.publish": 0.481,
+    "worker.notice": 0.0,
+    "worker.settle": 0.308,
+    "worker.read": 0.01,
+    "worker.apply": 0.616,
+    "worker.roots": 0.014,
+    "worker.check": 2.386,
+    "worker.reach": 0.008,
+    "worker.resolve": 0.005,
+    "worker.define": 0.006,
+    "worker.object": 0.743,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.021,
+    "worker.setup": 0.169,
+    "worker.compile-rest": 0.726,
+    "worker.write": 0.435,
+    "worker.build-rest": 0.981,
+    "worker.report": 0.167,
+    "worker.refuse": 0.342,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 7.3,
+    "worker.splice.place": 0.154,
+    "worker.splice.copy": 0.21,
+    "worker.splice.overwrite": 0.549,
+    "worker.splice.sign": 0.394,
+    "worker.splice.append": 0.104,
+    "worker.splice.rename": 0.264
+   },
+   {
+    "to-worker": 0.439,
+    "worker": 4.896,
+    "delivery": 0.0973,
+    "wait": 0.0172,
+    "apply": 0.3155,
+    "total": 5.765,
+    "reply": 6.067,
+    "worker.apply.change": 0.123,
+    "worker.apply.outlines": 0.566,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.482,
+    "worker.notice": 0.0,
+    "worker.settle": 0.198,
+    "worker.read": 0.013,
+    "worker.apply": 0.71,
+    "worker.roots": 0.009,
+    "worker.check": 1.38,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.107,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.161,
+    "worker.compile-rest": 0.587,
+    "worker.write": 0.328,
+    "worker.build-rest": 0.357,
+    "worker.report": 0.127,
+    "worker.refuse": 0.336,
+    "worker.link": 5.9,
+    "worker.edit-to-binary": 4.8,
+    "worker.splice.place": 0.203,
+    "worker.splice.copy": 0.245,
+    "worker.splice.overwrite": 0.295,
+    "worker.splice.sign": 4.517,
+    "worker.splice.append": 0.153,
+    "worker.splice.rename": 0.266
+   },
+   {
+    "to-worker": 7.266,
+    "worker": 30.53,
+    "delivery": 0.5821999999999998,
+    "wait": 0.2938,
+    "apply": 0.393,
+    "total": 39.065,
+    "reply": 38.459,
+    "worker.apply.change": 0.07,
+    "worker.apply.outlines": 0.94,
+    "worker.apply.rest": 0.019,
+    "worker.publish": 0.446,
+    "worker.notice": 0.0,
+    "worker.settle": 2.564,
+    "worker.read": 0.011,
+    "worker.apply": 1.029,
+    "worker.roots": 0.009,
+    "worker.check": 22.537,
+    "worker.reach": 0.01,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.262,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.019,
+    "worker.setup": 0.207,
+    "worker.compile-rest": 0.666,
+    "worker.write": 0.272,
+    "worker.build-rest": 0.891,
+    "worker.report": 0.147,
+    "worker.refuse": 1.384,
+    "worker.link": 2.4,
+    "worker.edit-to-binary": 28.0,
+    "worker.splice.place": 0.152,
+    "worker.splice.copy": 0.542,
+    "worker.splice.overwrite": 0.754,
+    "worker.splice.sign": 0.38,
+    "worker.splice.append": 0.114,
+    "worker.splice.rename": 0.25
+   },
+   {
+    "to-worker": 6.958,
+    "worker": 7.677,
+    "delivery": 0.10010000000000008,
+    "wait": 0.1149,
+    "apply": 1.7,
+    "total": 16.55,
+    "reply": 16.378,
+    "worker.apply.change": 0.087,
+    "worker.apply.outlines": 0.6,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.388,
+    "worker.notice": 0.0,
+    "worker.settle": 1.105,
+    "worker.read": 0.031,
+    "worker.apply": 0.704,
+    "worker.roots": 0.011,
+    "worker.check": 2.478,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.151,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.157,
+    "worker.compile-rest": 0.798,
+    "worker.write": 0.348,
+    "worker.build-rest": 0.686,
+    "worker.report": 0.13,
+    "worker.refuse": 0.283,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 6.3,
+    "worker.splice.place": 0.112,
+    "worker.splice.copy": 0.268,
+    "worker.splice.overwrite": 0.314,
+    "worker.splice.sign": 0.566,
+    "worker.splice.append": 0.099,
+    "worker.splice.rename": 0.261
+   },
+   {
+    "to-worker": 0.31,
+    "worker": 4.944,
+    "delivery": 0.06590000000000001,
+    "wait": 0.0152,
+    "apply": 0.2789,
+    "total": 5.614,
+    "reply": 5.863,
+    "worker.apply.change": 0.09,
+    "worker.apply.outlines": 0.445,
+    "worker.apply.rest": 0.023,
+    "worker.publish": 0.352,
+    "worker.notice": 0.0,
+    "worker.settle": 0.277,
+    "worker.read": 0.008,
+    "worker.apply": 0.559,
+    "worker.roots": 0.007,
+    "worker.check": 1.797,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.066,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.135,
+    "worker.compile-rest": 0.626,
+    "worker.write": 0.352,
+    "worker.build-rest": 0.297,
+    "worker.report": 0.119,
+    "worker.refuse": 0.256,
+    "worker.link": 2.1,
+    "worker.edit-to-binary": 4.7,
+    "worker.splice.place": 0.109,
+    "worker.splice.copy": 0.205,
+    "worker.splice.overwrite": 0.99,
+    "worker.splice.sign": 0.373,
+    "worker.splice.append": 0.08,
+    "worker.splice.rename": 0.198
+   },
+   {
+    "to-worker": 0.478,
+    "worker": 7.187,
+    "delivery": 0.13180000000000003,
+    "wait": 0.0218,
+    "apply": 0.32139999999999996,
+    "total": 8.14,
+    "reply": 8.928,
+    "worker.apply.change": 0.072,
+    "worker.apply.outlines": 0.583,
+    "worker.apply.rest": 0.018,
+    "worker.publish": 0.555,
+    "worker.notice": 0.0,
+    "worker.settle": 0.225,
+    "worker.read": 0.01,
+    "worker.apply": 0.673,
+    "worker.roots": 0.008,
+    "worker.check": 3.295,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.087,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.009,
+    "worker.setup": 0.118,
+    "worker.compile-rest": 0.934,
+    "worker.write": 0.421,
+    "worker.build-rest": 0.296,
+    "worker.report": 0.146,
+    "worker.refuse": 0.311,
+    "worker.link": 3.5,
+    "worker.edit-to-binary": 7.0,
+    "worker.splice.place": 0.245,
+    "worker.splice.copy": 0.192,
+    "worker.splice.overwrite": 0.524,
+    "worker.splice.sign": 1.169,
+    "worker.splice.append": 0.82,
+    "worker.splice.rename": 0.306
+   },
+   {
+    "to-worker": 0.456,
+    "worker": 8.105,
+    "delivery": 0.10339999999999999,
+    "wait": 0.0194,
+    "apply": 0.3232,
+    "total": 9.007,
+    "reply": 9.479,
+    "worker.apply.change": 0.078,
+    "worker.apply.outlines": 0.469,
+    "worker.apply.rest": 0.017,
+    "worker.publish": 0.561,
+    "worker.notice": 0.0,
+    "worker.settle": 0.291,
+    "worker.read": 0.011,
+    "worker.apply": 0.565,
+    "worker.roots": 0.008,
+    "worker.check": 4.202,
+    "worker.reach": 0.006,
+    "worker.resolve": 0.005,
+    "worker.define": 0.01,
+    "worker.object": 0.095,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.131,
+    "worker.compile-rest": 0.744,
+    "worker.write": 0.494,
+    "worker.build-rest": 0.346,
+    "worker.report": 0.185,
+    "worker.refuse": 0.366,
+    "worker.link": 1.9,
+    "worker.edit-to-binary": 7.9,
+    "worker.splice.place": 0.157,
+    "worker.splice.copy": 0.321,
+    "worker.splice.overwrite": 0.315,
+    "worker.splice.sign": 0.468,
+    "worker.splice.append": 0.126,
+    "worker.splice.rename": 0.28
+   },
+   {
+    "to-worker": 0.428,
+    "worker": 8.003,
+    "delivery": 0.07519999999999999,
+    "wait": 0.0159,
+    "apply": 0.3009,
+    "total": 8.823,
+    "reply": 8.998,
+    "worker.apply.change": 0.125,
+    "worker.apply.outlines": 0.718,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.409,
+    "worker.notice": 0.0,
+    "worker.settle": 0.238,
+    "worker.read": 0.016,
+    "worker.apply": 0.864,
+    "worker.roots": 0.011,
+    "worker.check": 4.034,
+    "worker.reach": 0.011,
+    "worker.resolve": 0.007,
+    "worker.define": 0.005,
+    "worker.object": 0.113,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.014,
+    "worker.setup": 0.188,
+    "worker.compile-rest": 0.614,
+    "worker.write": 0.402,
+    "worker.build-rest": 0.422,
+    "worker.report": 0.125,
+    "worker.refuse": 0.363,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 7.7,
+    "worker.splice.place": 0.113,
+    "worker.splice.copy": 0.241,
+    "worker.splice.overwrite": 0.404,
+    "worker.splice.sign": 0.402,
+    "worker.splice.append": 0.169,
+    "worker.splice.rename": 0.274
+   },
+   {
+    "to-worker": 0.388,
+    "worker": 4.643,
+    "delivery": 0.07079999999999997,
+    "wait": 0.0202,
+    "apply": 0.401,
+    "total": 5.523,
+    "reply": 5.599,
+    "worker.apply.change": 0.079,
+    "worker.apply.outlines": 0.394,
+    "worker.apply.rest": 0.013,
+    "worker.publish": 0.293,
+    "worker.notice": 0.0,
+    "worker.settle": 0.166,
+    "worker.read": 0.009,
+    "worker.apply": 0.487,
+    "worker.roots": 0.008,
+    "worker.check": 2.157,
+    "worker.reach": 0.005,
+    "worker.resolve": 0.003,
+    "worker.define": 0.003,
+    "worker.object": 0.056,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.008,
+    "worker.setup": 0.108,
+    "worker.compile-rest": 0.448,
+    "worker.write": 0.253,
+    "worker.build-rest": 0.286,
+    "worker.report": 0.104,
+    "worker.refuse": 0.195,
+    "worker.link": 8.1,
+    "worker.edit-to-binary": 4.5,
+    "worker.splice.place": 0.089,
+    "worker.splice.copy": 0.182,
+    "worker.splice.overwrite": 0.255,
+    "worker.splice.sign": 2.347,
+    "worker.splice.append": 0.098,
+    "worker.splice.rename": 0.221
+   },
+   {
+    "to-worker": 0.436,
+    "worker": 4.673,
+    "delivery": 0.42119999999999996,
+    "wait": 0.056,
+    "apply": 0.4098,
+    "total": 5.996,
+    "reply": 5.956,
+    "worker.apply.change": 0.079,
+    "worker.apply.outlines": 0.496,
+    "worker.apply.rest": 0.015,
+    "worker.publish": 0.398,
+    "worker.notice": 0.0,
+    "worker.settle": 0.205,
+    "worker.read": 0.011,
+    "worker.apply": 0.592,
+    "worker.roots": 0.012,
+    "worker.check": 1.403,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.086,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.154,
+    "worker.compile-rest": 0.569,
+    "worker.write": 0.318,
+    "worker.build-rest": 0.391,
+    "worker.report": 0.136,
+    "worker.refuse": 0.31,
+    "worker.link": 1.6,
+    "worker.edit-to-binary": 4.5,
+    "worker.splice.place": 0.218,
+    "worker.splice.copy": 0.24,
+    "worker.splice.overwrite": 0.305,
+    "worker.splice.sign": 0.377,
+    "worker.splice.append": 0.087,
+    "worker.splice.rename": 0.26
+   },
+   {
+    "to-worker": 0.564,
+    "worker": 4.882,
+    "delivery": 0.07229999999999998,
+    "wait": 0.0185,
+    "apply": 0.2902,
+    "total": 5.827,
+    "reply": 6.046,
+    "worker.apply.change": 0.104,
+    "worker.apply.outlines": 0.552,
+    "worker.apply.rest": 0.019,
+    "worker.publish": 0.427,
+    "worker.notice": 0.0,
+    "worker.settle": 0.193,
+    "worker.read": 0.011,
+    "worker.apply": 0.676,
+    "worker.roots": 0.012,
+    "worker.check": 1.355,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.077,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.008,
+    "worker.setup": 0.172,
+    "worker.compile-rest": 0.541,
+    "worker.write": 0.319,
+    "worker.build-rest": 0.583,
+    "worker.report": 0.105,
+    "worker.refuse": 0.319,
+    "worker.link": 1.6,
+    "worker.edit-to-binary": 4.8,
+    "worker.splice.place": 0.1,
+    "worker.splice.copy": 0.177,
+    "worker.splice.overwrite": 0.397,
+    "worker.splice.sign": 0.376,
+    "worker.splice.append": 0.114,
+    "worker.splice.rename": 0.28
+   },
+   {
+    "to-worker": 0.404,
+    "worker": 4.621,
+    "delivery": 0.14519999999999994,
+    "wait": 0.06620000000000001,
+    "apply": 0.4186,
+    "total": 5.655,
+    "reply": 5.688,
+    "worker.apply.change": 0.102,
+    "worker.apply.outlines": 0.529,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.424,
+    "worker.notice": 0.0,
+    "worker.settle": 0.2,
+    "worker.read": 0.01,
+    "worker.apply": 0.651,
+    "worker.roots": 0.009,
+    "worker.check": 1.349,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.083,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.011,
+    "worker.setup": 0.151,
+    "worker.compile-rest": 0.568,
+    "worker.write": 0.325,
+    "worker.build-rest": 0.313,
+    "worker.report": 0.165,
+    "worker.refuse": 0.274,
+    "worker.link": 1.9,
+    "worker.edit-to-binary": 4.5,
+    "worker.splice.place": 0.144,
+    "worker.splice.copy": 0.36,
+    "worker.splice.overwrite": 0.466,
+    "worker.splice.sign": 0.409,
+    "worker.splice.append": 0.091,
+    "worker.splice.rename": 0.23
+   },
+   {
+    "to-worker": 0.342,
+    "worker": 3.574,
+    "delivery": 0.06919999999999998,
+    "wait": 0.0143,
+    "apply": 0.2795,
+    "total": 4.279,
+    "reply": 4.373,
+    "worker.apply.change": 0.085,
+    "worker.apply.outlines": 0.398,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.307,
+    "worker.notice": 0.0,
+    "worker.settle": 0.179,
+    "worker.read": 0.01,
+    "worker.apply": 0.5,
+    "worker.roots": 0.007,
+    "worker.check": 1.012,
+    "worker.reach": 0.005,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.07,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.008,
+    "worker.setup": 0.107,
+    "worker.compile-rest": 0.492,
+    "worker.write": 0.293,
+    "worker.build-rest": 0.264,
+    "worker.report": 0.099,
+    "worker.refuse": 0.156,
+    "worker.link": 1.3,
+    "worker.edit-to-binary": 3.4,
+    "worker.splice.place": 0.101,
+    "worker.splice.copy": 0.195,
+    "worker.splice.overwrite": 0.249,
+    "worker.splice.sign": 0.37,
+    "worker.splice.append": 0.071,
+    "worker.splice.rename": 0.188
+   },
+   {
+    "to-worker": 3.157,
+    "worker": 24.689,
+    "delivery": 0.07769999999999988,
+    "wait": 1.5,
+    "apply": 0.46730000000000005,
+    "total": 29.891,
+    "reply": 29.923,
+    "worker.apply.change": 0.079,
+    "worker.apply.outlines": 0.656,
+    "worker.apply.rest": 0.017,
+    "worker.publish": 0.503,
+    "worker.notice": 0.0,
+    "worker.settle": 0.414,
+    "worker.read": 0.013,
+    "worker.apply": 0.753,
+    "worker.roots": 0.008,
+    "worker.check": 20.012,
+    "worker.reach": 0.009,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.488,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.013,
+    "worker.setup": 0.246,
+    "worker.compile-rest": 0.535,
+    "worker.write": 0.475,
+    "worker.build-rest": 0.501,
+    "worker.report": 0.16,
+    "worker.refuse": 0.47,
+    "worker.link": 2.4,
+    "worker.edit-to-binary": 24.3,
+    "worker.splice.place": 0.198,
+    "worker.splice.copy": 0.192,
+    "worker.splice.overwrite": 1.085,
+    "worker.splice.sign": 0.41,
+    "worker.splice.append": 0.105,
+    "worker.splice.rename": 0.237
+   },
+   {
+    "to-worker": 0.398,
+    "worker": 4.175,
+    "delivery": 0.0695,
+    "wait": 0.0198,
+    "apply": 0.4027,
+    "total": 5.065,
+    "reply": 5.046,
+    "worker.apply.change": 0.1,
+    "worker.apply.outlines": 0.51,
+    "worker.apply.rest": 0.014,
+    "worker.publish": 0.294,
+    "worker.notice": 0.0,
+    "worker.settle": 0.201,
+    "worker.read": 0.013,
+    "worker.apply": 0.624,
+    "worker.roots": 0.027,
+    "worker.check": 1.297,
+    "worker.reach": 0.008,
+    "worker.resolve": 0.006,
+    "worker.define": 0.004,
+    "worker.object": 0.08,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.149,
+    "worker.compile-rest": 0.472,
+    "worker.write": 0.303,
+    "worker.build-rest": 0.333,
+    "worker.report": 0.092,
+    "worker.refuse": 0.197,
+    "worker.link": 1.5,
+    "worker.edit-to-binary": 4.0,
+    "worker.splice.place": 0.101,
+    "worker.splice.copy": 0.196,
+    "worker.splice.overwrite": 0.291,
+    "worker.splice.sign": 0.384,
+    "worker.splice.append": 0.125,
+    "worker.splice.rename": 0.254
+   },
+   {
+    "to-worker": 0.589,
+    "worker": 5.719,
+    "delivery": 0.08400000000000013,
+    "wait": 0.019600000000000003,
+    "apply": 0.44339999999999996,
+    "total": 6.855,
+    "reply": 6.998,
+    "worker.apply.change": 0.093,
+    "worker.apply.outlines": 0.581,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.62,
+    "worker.notice": 0.0,
+    "worker.settle": 0.22,
+    "worker.read": 0.013,
+    "worker.apply": 0.695,
+    "worker.roots": 0.039,
+    "worker.check": 2.07,
+    "worker.reach": 0.006,
+    "worker.resolve": 0.004,
+    "worker.define": 0.004,
+    "worker.object": 0.097,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.011,
+    "worker.setup": 0.138,
+    "worker.compile-rest": 0.568,
+    "worker.write": 0.334,
+    "worker.build-rest": 0.409,
+    "worker.report": 0.135,
+    "worker.refuse": 0.268,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 5.6,
+    "worker.splice.place": 0.144,
+    "worker.splice.copy": 0.222,
+    "worker.splice.overwrite": 0.581,
+    "worker.splice.sign": 0.389,
+    "worker.splice.append": 0.09,
+    "worker.splice.rename": 0.232
+   },
+   {
+    "to-worker": 1.056,
+    "worker": 9.282,
+    "delivery": 0.1126,
+    "wait": 0.10020000000000001,
+    "apply": 0.2462,
+    "total": 10.797,
+    "reply": 11.758,
+    "worker.apply.change": 0.072,
+    "worker.apply.outlines": 2.088,
+    "worker.apply.rest": 0.015,
+    "worker.publish": 0.496,
+    "worker.notice": 0.0,
+    "worker.settle": 0.26,
+    "worker.read": 0.011,
+    "worker.apply": 2.176,
+    "worker.roots": 0.02,
+    "worker.check": 3.952,
+    "worker.reach": 0.01,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.183,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.016,
+    "worker.setup": 0.185,
+    "worker.compile-rest": 0.544,
+    "worker.write": 0.279,
+    "worker.build-rest": 0.525,
+    "worker.report": 0.142,
+    "worker.refuse": 0.398,
+    "worker.link": 1.6,
+    "worker.edit-to-binary": 9.1,
+    "worker.splice.place": 0.09,
+    "worker.splice.copy": 0.191,
+    "worker.splice.overwrite": 0.272,
+    "worker.splice.sign": 0.415,
+    "worker.splice.append": 0.117,
+    "worker.splice.rename": 0.248
+   },
+   {
+    "to-worker": 0.467,
+    "worker": 4.75,
+    "delivery": 0.15560000000000007,
+    "wait": 0.019600000000000003,
+    "apply": 0.3568,
+    "total": 5.749,
+    "reply": 5.844,
+    "worker.apply.change": 0.084,
+    "worker.apply.outlines": 0.567,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.477,
+    "worker.notice": 0.0,
+    "worker.settle": 0.235,
+    "worker.read": 0.011,
+    "worker.apply": 0.668,
+    "worker.roots": 0.01,
+    "worker.check": 1.13,
+    "worker.reach": 0.025,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.069,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.009,
+    "worker.setup": 0.129,
+    "worker.compile-rest": 0.763,
+    "worker.write": 0.368,
+    "worker.build-rest": 0.355,
+    "worker.report": 0.186,
+    "worker.refuse": 0.222,
+    "worker.link": 3.6,
+    "worker.edit-to-binary": 4.5,
+    "worker.splice.place": 1.121,
+    "worker.splice.copy": 0.191,
+    "worker.splice.overwrite": 0.635,
+    "worker.splice.sign": 1.1,
+    "worker.splice.append": 0.087,
+    "worker.splice.rename": 0.224
+   },
+   {
+    "to-worker": 14.795,
+    "worker": 15.43,
+    "delivery": 0.9884000000000001,
+    "wait": 0.19,
+    "apply": 0.5536,
+    "total": 31.957,
+    "reply": 31.848,
+    "worker.apply.change": 0.138,
+    "worker.apply.outlines": 0.71,
+    "worker.apply.rest": 0.024,
+    "worker.publish": 0.32,
+    "worker.notice": 0.0,
+    "worker.settle": 1.936,
+    "worker.read": 0.016,
+    "worker.apply": 0.872,
+    "worker.roots": 0.013,
+    "worker.check": 7.329,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.115,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.013,
+    "worker.setup": 0.14,
+    "worker.compile-rest": 0.671,
+    "worker.write": 0.373,
+    "worker.build-rest": 3.135,
+    "worker.report": 0.191,
+    "worker.refuse": 0.197,
+    "worker.link": 3.5,
+    "worker.edit-to-binary": 13.5,
+    "worker.splice.place": 0.118,
+    "worker.splice.copy": 0.198,
+    "worker.splice.overwrite": 0.876,
+    "worker.splice.sign": 0.372,
+    "worker.splice.append": 0.167,
+    "worker.splice.rename": 1.332
+   },
+   {
+    "to-worker": 0.42,
+    "worker": 4.269,
+    "delivery": 0.13390000000000002,
+    "wait": 0.0152,
+    "apply": 0.3319,
+    "total": 5.17,
+    "reply": 5.195,
+    "worker.apply.change": 0.102,
+    "worker.apply.outlines": 0.476,
+    "worker.apply.rest": 0.018,
+    "worker.publish": 0.323,
+    "worker.notice": 0.0,
+    "worker.settle": 0.202,
+    "worker.read": 0.01,
+    "worker.apply": 0.596,
+    "worker.roots": 0.012,
+    "worker.check": 1.284,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.003,
+    "worker.object": 0.066,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.011,
+    "worker.setup": 0.152,
+    "worker.compile-rest": 0.54,
+    "worker.write": 0.348,
+    "worker.build-rest": 0.35,
+    "worker.report": 0.087,
+    "worker.refuse": 0.198,
+    "worker.link": 1.9,
+    "worker.edit-to-binary": 4.1,
+    "worker.splice.place": 0.237,
+    "worker.splice.copy": 0.193,
+    "worker.splice.overwrite": 0.334,
+    "worker.splice.sign": 0.403,
+    "worker.splice.append": 0.131,
+    "worker.splice.rename": 0.346
+   },
+   {
+    "to-worker": 0.341,
+    "worker": 4.681,
+    "delivery": 0.08579999999999993,
+    "wait": 0.019,
+    "apply": 0.3642,
+    "total": 5.491,
+    "reply": 6.376,
+    "worker.apply.change": 0.106,
+    "worker.apply.outlines": 0.501,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.514,
+    "worker.notice": 0.0,
+    "worker.settle": 0.188,
+    "worker.read": 0.011,
+    "worker.apply": 0.628,
+    "worker.roots": 0.013,
+    "worker.check": 1.198,
+    "worker.reach": 0.005,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.08,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.008,
+    "worker.setup": 0.127,
+    "worker.compile-rest": 0.67,
+    "worker.write": 0.354,
+    "worker.build-rest": 0.373,
+    "worker.report": 0.143,
+    "worker.refuse": 0.289,
+    "worker.link": 1.5,
+    "worker.edit-to-binary": 4.5,
+    "worker.splice.place": 0.104,
+    "worker.splice.copy": 0.186,
+    "worker.splice.overwrite": 0.284,
+    "worker.splice.sign": 0.373,
+    "worker.splice.append": 0.103,
+    "worker.splice.rename": 0.238
+   },
+   {
+    "to-worker": 0.342,
+    "worker": 5.324,
+    "delivery": 0.0928,
+    "wait": 0.017,
+    "apply": 0.4132,
+    "total": 6.189,
+    "reply": 6.325,
+    "worker.apply.change": 0.087,
+    "worker.apply.outlines": 0.394,
+    "worker.apply.rest": 0.014,
+    "worker.publish": 0.462,
+    "worker.notice": 0.0,
+    "worker.settle": 0.263,
+    "worker.read": 0.011,
+    "worker.apply": 0.495,
+    "worker.roots": 0.016,
+    "worker.check": 1.927,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.083,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.151,
+    "worker.compile-rest": 0.586,
+    "worker.write": 0.391,
+    "worker.build-rest": 0.397,
+    "worker.report": 0.158,
+    "worker.refuse": 0.282,
+    "worker.link": 3.4,
+    "worker.edit-to-binary": 5.1,
+    "worker.splice.place": 0.262,
+    "worker.splice.copy": 0.647,
+    "worker.splice.overwrite": 0.774,
+    "worker.splice.sign": 1.025,
+    "worker.splice.append": 0.137,
+    "worker.splice.rename": 0.243
+   },
+   {
+    "to-worker": 10.04,
+    "worker": 7.194,
+    "delivery": 0.3192999999999998,
+    "wait": 0.187,
+    "apply": 0.5287000000000001,
+    "total": 18.269,
+    "reply": 18.759,
+    "worker.apply.change": 0.08,
+    "worker.apply.outlines": 0.475,
+    "worker.apply.rest": 0.017,
+    "worker.publish": 0.298,
+    "worker.notice": 0.0,
+    "worker.settle": 0.705,
+    "worker.read": 0.011,
+    "worker.apply": 0.572,
+    "worker.roots": 0.014,
+    "worker.check": 3.083,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.159,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.155,
+    "worker.compile-rest": 0.534,
+    "worker.write": 0.771,
+    "worker.build-rest": 0.445,
+    "worker.report": 0.133,
+    "worker.refuse": 0.209,
+    "worker.link": 3.8,
+    "worker.edit-to-binary": 6.5,
+    "worker.splice.place": 0.123,
+    "worker.splice.copy": 0.267,
+    "worker.splice.overwrite": 0.372,
+    "worker.splice.sign": 2.235,
+    "worker.splice.append": 0.183,
+    "worker.splice.rename": 0.459
+   },
+   {
+    "to-worker": 0.389,
+    "worker": 5.891,
+    "delivery": 0.14539999999999997,
+    "wait": 0.1338,
+    "apply": 0.39080000000000004,
+    "total": 6.95,
+    "reply": 6.998,
+    "worker.apply.change": 0.11,
+    "worker.apply.outlines": 0.67,
+    "worker.apply.rest": 0.028,
+    "worker.publish": 0.509,
+    "worker.notice": 0.0,
+    "worker.settle": 0.198,
+    "worker.read": 0.01,
+    "worker.apply": 0.809,
+    "worker.roots": 0.026,
+    "worker.check": 2.037,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.004,
+    "worker.define": 0.004,
+    "worker.object": 0.079,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.142,
+    "worker.compile-rest": 0.51,
+    "worker.write": 0.398,
+    "worker.build-rest": 0.674,
+    "worker.report": 0.135,
+    "worker.refuse": 0.265,
+    "worker.link": 6.1,
+    "worker.edit-to-binary": 5.9,
+    "worker.splice.place": 0.164,
+    "worker.splice.copy": 0.257,
+    "worker.splice.overwrite": 2.133,
+    "worker.splice.sign": 2.947,
+    "worker.splice.append": 0.141,
+    "worker.splice.rename": 0.306
+   },
+   {
+    "to-worker": 0.372,
+    "worker": 8.363,
+    "delivery": 0.10769999999999996,
+    "wait": 0.034,
+    "apply": 0.26730000000000004,
+    "total": 9.144,
+    "reply": 9.694,
+    "worker.apply.change": 0.081,
+    "worker.apply.outlines": 0.502,
+    "worker.apply.rest": 0.018,
+    "worker.publish": 0.452,
+    "worker.notice": 0.0,
+    "worker.settle": 0.196,
+    "worker.read": 0.011,
+    "worker.apply": 0.602,
+    "worker.roots": 0.011,
+    "worker.check": 4.72,
+    "worker.reach": 0.009,
+    "worker.resolve": 0.006,
+    "worker.define": 0.005,
+    "worker.object": 0.086,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.015,
+    "worker.setup": 0.222,
+    "worker.compile-rest": 0.662,
+    "worker.write": 0.503,
+    "worker.build-rest": 0.372,
+    "worker.report": 0.182,
+    "worker.refuse": 0.228,
+    "worker.link": 2.9,
+    "worker.edit-to-binary": 8.2,
+    "worker.splice.place": 0.229,
+    "worker.splice.copy": 0.217,
+    "worker.splice.overwrite": 0.821,
+    "worker.splice.sign": 1.034,
+    "worker.splice.append": 0.119,
+    "worker.splice.rename": 0.251
+   },
+   {
+    "to-worker": 0.534,
+    "worker": 30.049,
+    "delivery": 0.1352,
+    "wait": 0.02,
+    "apply": 0.3458,
+    "total": 31.084,
+    "reply": 31.392,
+    "worker.apply.change": 0.102,
+    "worker.apply.outlines": 0.561,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.387,
+    "worker.notice": 0.0,
+    "worker.settle": 0.19,
+    "worker.read": 0.009,
+    "worker.apply": 0.683,
+    "worker.roots": 0.013,
+    "worker.check": 26.599,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.072,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.178,
+    "worker.compile-rest": 0.554,
+    "worker.write": 0.379,
+    "worker.build-rest": 0.403,
+    "worker.report": 0.134,
+    "worker.refuse": 0.268,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 29.8,
+    "worker.splice.place": 0.229,
+    "worker.splice.copy": 0.222,
+    "worker.splice.overwrite": 0.393,
+    "worker.splice.sign": 0.387,
+    "worker.splice.append": 0.109,
+    "worker.splice.rename": 0.258
+   },
+   {
+    "to-worker": 4.629,
+    "worker": 15.544,
+    "delivery": 1.2357000000000002,
+    "wait": 0.7992,
+    "apply": 0.4031,
+    "total": 22.611,
+    "reply": 22.932,
+    "worker.apply.change": 0.066,
+    "worker.apply.outlines": 0.741,
+    "worker.apply.rest": 0.02,
+    "worker.publish": 0.492,
+    "worker.notice": 0.0,
+    "worker.settle": 0.297,
+    "worker.read": 0.009,
+    "worker.apply": 0.827,
+    "worker.roots": 0.009,
+    "worker.check": 7.301,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 2.292,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.015,
+    "worker.setup": 0.199,
+    "worker.compile-rest": 0.568,
+    "worker.write": 0.366,
+    "worker.build-rest": 2.615,
+    "worker.report": 0.155,
+    "worker.refuse": 0.3,
+    "worker.link": 1.6,
+    "worker.edit-to-binary": 15.3,
+    "worker.splice.place": 0.135,
+    "worker.splice.copy": 0.207,
+    "worker.splice.overwrite": 0.361,
+    "worker.splice.sign": 0.396,
+    "worker.splice.append": 0.125,
+    "worker.splice.rename": 0.227
+   },
+   {
+    "to-worker": 5.285,
+    "worker": 48.03,
+    "delivery": 0.8080000000000002,
+    "wait": 4.1,
+    "apply": 0.674,
+    "total": 58.897,
+    "reply": 59.274,
+    "worker.apply.change": 0.084,
+    "worker.apply.outlines": 0.557,
+    "worker.apply.rest": 0.015,
+    "worker.publish": 0.396,
+    "worker.notice": 0.0,
+    "worker.settle": 2.217,
+    "worker.read": 0.018,
+    "worker.apply": 0.658,
+    "worker.roots": 0.01,
+    "worker.check": 36.497,
+    "worker.reach": 0.01,
+    "worker.resolve": 0.007,
+    "worker.define": 0.007,
+    "worker.object": 2.348,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.014,
+    "worker.setup": 2.839,
+    "worker.compile-rest": 0.61,
+    "worker.write": 0.377,
+    "worker.build-rest": 1.522,
+    "worker.report": 0.128,
+    "worker.refuse": 0.273,
+    "worker.link": 2.6,
+    "worker.edit-to-binary": 45.8,
+    "worker.splice.place": 0.144,
+    "worker.splice.copy": 0.26,
+    "worker.splice.overwrite": 0.656,
+    "worker.splice.sign": 0.915,
+    "worker.splice.append": 0.166,
+    "worker.splice.rename": 0.285
+   },
+   {
+    "to-worker": 11.606,
+    "worker": 24.598,
+    "delivery": 1.5955000000000004,
+    "wait": 4.1,
+    "apply": 0.3365,
+    "total": 42.236,
+    "reply": 44.877,
+    "worker.apply.change": 0.085,
+    "worker.apply.outlines": 1.085,
+    "worker.apply.rest": 0.014,
+    "worker.publish": 0.286,
+    "worker.notice": 0.0,
+    "worker.settle": 4.558,
+    "worker.read": 0.011,
+    "worker.apply": 1.186,
+    "worker.roots": 0.015,
+    "worker.check": 12.369,
+    "worker.reach": 0.009,
+    "worker.resolve": 0.006,
+    "worker.define": 0.004,
+    "worker.object": 2.563,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.191,
+    "worker.compile-rest": 0.733,
+    "worker.write": 0.283,
+    "worker.build-rest": 1.922,
+    "worker.report": 0.106,
+    "worker.refuse": 0.219,
+    "worker.link": 1.9,
+    "worker.edit-to-binary": 20.0,
+    "worker.splice.place": 0.235,
+    "worker.splice.copy": 0.249,
+    "worker.splice.overwrite": 0.382,
+    "worker.splice.sign": 0.402,
+    "worker.splice.append": 0.122,
+    "worker.splice.rename": 0.274
+   },
+   {
+    "to-worker": 2.67,
+    "worker": 10.795,
+    "delivery": 1.4029,
+    "wait": 2.2,
+    "apply": 0.43510000000000004,
+    "total": 17.503,
+    "reply": 18.321,
+    "worker.apply.change": 0.17,
+    "worker.apply.outlines": 0.524,
+    "worker.apply.rest": 0.015,
+    "worker.publish": 0.43,
+    "worker.notice": 0.0,
+    "worker.settle": 0.348,
+    "worker.read": 0.012,
+    "worker.apply": 0.709,
+    "worker.roots": 0.011,
+    "worker.check": 6.566,
+    "worker.reach": 0.008,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.229,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.013,
+    "worker.setup": 0.158,
+    "worker.compile-rest": 0.682,
+    "worker.write": 0.494,
+    "worker.build-rest": 0.655,
+    "worker.report": 0.117,
+    "worker.refuse": 0.24,
+    "worker.link": 2.1,
+    "worker.edit-to-binary": 10.4,
+    "worker.splice.place": 0.112,
+    "worker.splice.copy": 0.198,
+    "worker.splice.overwrite": 0.396,
+    "worker.splice.sign": 0.757,
+    "worker.splice.append": 0.161,
+    "worker.splice.rename": 0.269
+   },
+   {
+    "to-worker": 2.212,
+    "worker": 55.42,
+    "delivery": 0.07440000000000002,
+    "wait": 0.016800000000000002,
+    "apply": 0.2778,
+    "total": 58.001,
+    "reply": 58.1,
+    "worker.apply.change": 0.07,
+    "worker.apply.outlines": 0.493,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.404,
+    "worker.notice": 0.0,
+    "worker.settle": 2.7,
+    "worker.read": 0.01,
+    "worker.apply": 0.58,
+    "worker.roots": 0.011,
+    "worker.check": 49.488,
+    "worker.reach": 0.008,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.1,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.013,
+    "worker.setup": 0.169,
+    "worker.compile-rest": 0.628,
+    "worker.write": 0.34,
+    "worker.build-rest": 0.334,
+    "worker.report": 0.324,
+    "worker.refuse": 0.231,
+    "worker.link": 3.9,
+    "worker.edit-to-binary": 52.7,
+    "worker.splice.place": 0.127,
+    "worker.splice.copy": 0.951,
+    "worker.splice.overwrite": 0.508,
+    "worker.splice.sign": 0.878,
+    "worker.splice.append": 0.13,
+    "worker.splice.rename": 0.239
+   },
+   {
+    "to-worker": 6.436,
+    "worker": 17.601,
+    "delivery": 1.9131000000000005,
+    "wait": 3.3,
+    "apply": 0.9019,
+    "total": 30.152,
+    "reply": 34.475,
+    "worker.apply.change": 0.069,
+    "worker.apply.outlines": 1.692,
+    "worker.apply.rest": 0.015,
+    "worker.publish": 3.525,
+    "worker.notice": 0.0,
+    "worker.settle": 3.225,
+    "worker.read": 0.01,
+    "worker.apply": 1.777,
+    "worker.roots": 0.016,
+    "worker.check": 2.745,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.004,
+    "worker.define": 0.004,
+    "worker.object": 3.219,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.011,
+    "worker.setup": 0.131,
+    "worker.compile-rest": 0.701,
+    "worker.write": 0.395,
+    "worker.build-rest": 1.179,
+    "worker.report": 0.136,
+    "worker.refuse": 0.316,
+    "worker.link": 7.6,
+    "worker.edit-to-binary": 14.3,
+    "worker.splice.place": 0.196,
+    "worker.splice.copy": 0.206,
+    "worker.splice.overwrite": 6.269,
+    "worker.splice.sign": 0.385,
+    "worker.splice.append": 0.127,
+    "worker.splice.rename": 0.261
+   },
+   {
+    "to-worker": 0.327,
+    "worker": 4.017,
+    "delivery": 0.11019999999999996,
+    "wait": 0.027,
+    "apply": 0.2978,
+    "total": 4.779,
+    "reply": 4.824,
+    "worker.apply.change": 0.077,
+    "worker.apply.outlines": 0.49,
+    "worker.apply.rest": 0.013,
+    "worker.publish": 0.411,
+    "worker.notice": 0.0,
+    "worker.settle": 0.195,
+    "worker.read": 0.008,
+    "worker.apply": 0.581,
+    "worker.roots": 0.016,
+    "worker.check": 1.156,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.082,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.01,
+    "worker.setup": 0.169,
+    "worker.compile-rest": 0.47,
+    "worker.write": 0.277,
+    "worker.build-rest": 0.296,
+    "worker.report": 0.099,
+    "worker.refuse": 0.163,
+    "worker.link": 2.4,
+    "worker.edit-to-binary": 3.8,
+    "worker.splice.place": 0.13,
+    "worker.splice.copy": 0.23,
+    "worker.splice.overwrite": 0.314,
+    "worker.splice.sign": 1.13,
+    "worker.splice.append": 0.149,
+    "worker.splice.rename": 0.266
+   },
+   {
+    "to-worker": 0.346,
+    "worker": 5.086,
+    "delivery": 0.08890000000000003,
+    "wait": 0.0181,
+    "apply": 0.297,
+    "total": 5.836,
+    "reply": 5.958,
+    "worker.apply.change": 0.102,
+    "worker.apply.outlines": 0.512,
+    "worker.apply.rest": 0.018,
+    "worker.publish": 0.368,
+    "worker.notice": 0.0,
+    "worker.settle": 0.194,
+    "worker.read": 0.011,
+    "worker.apply": 0.633,
+    "worker.roots": 0.012,
+    "worker.check": 1.593,
+    "worker.reach": 0.006,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.416,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.008,
+    "worker.setup": 0.134,
+    "worker.compile-rest": 0.536,
+    "worker.write": 0.333,
+    "worker.build-rest": 0.394,
+    "worker.report": 0.12,
+    "worker.refuse": 0.231,
+    "worker.link": 15.7,
+    "worker.edit-to-binary": 4.9,
+    "worker.splice.place": 0.28,
+    "worker.splice.copy": 0.257,
+    "worker.splice.overwrite": 8.475,
+    "worker.splice.sign": 6.135,
+    "worker.splice.append": 0.126,
+    "worker.splice.rename": 0.272
+   },
+   {
+    "to-worker": 0.662,
+    "worker": 14.997,
+    "delivery": 0.08579999999999999,
+    "wait": 0.0275,
+    "apply": 0.3717,
+    "total": 16.144,
+    "reply": 16.242,
+    "worker.apply.change": 0.08,
+    "worker.apply.outlines": 0.846,
+    "worker.apply.rest": 0.022,
+    "worker.publish": 0.417,
+    "worker.notice": 0.0,
+    "worker.settle": 0.199,
+    "worker.read": 0.01,
+    "worker.apply": 0.949,
+    "worker.roots": 0.021,
+    "worker.check": 11.313,
+    "worker.reach": 0.006,
+    "worker.resolve": 0.004,
+    "worker.define": 0.003,
+    "worker.object": 0.065,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.012,
+    "worker.setup": 0.162,
+    "worker.compile-rest": 0.507,
+    "worker.write": 0.343,
+    "worker.build-rest": 0.46,
+    "worker.report": 0.141,
+    "worker.refuse": 0.313,
+    "worker.link": 2.1,
+    "worker.edit-to-binary": 14.8,
+    "worker.splice.place": 0.141,
+    "worker.splice.copy": 0.214,
+    "worker.splice.overwrite": 0.629,
+    "worker.splice.sign": 0.43,
+    "worker.splice.append": 0.131,
+    "worker.splice.rename": 0.273
+   },
+   {
+    "to-worker": 0.357,
+    "worker": 17.506,
+    "delivery": 0.03889999999999999,
+    "wait": 0.0151,
+    "apply": 0.357,
+    "total": 18.274,
+    "reply": 18.531,
+    "worker.apply.change": 0.104,
+    "worker.apply.outlines": 0.611,
+    "worker.apply.rest": 0.017,
+    "worker.publish": 0.483,
+    "worker.notice": 0.0,
+    "worker.settle": 0.264,
+    "worker.read": 0.01,
+    "worker.apply": 0.733,
+    "worker.roots": 0.011,
+    "worker.check": 13.947,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.087,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.014,
+    "worker.setup": 0.171,
+    "worker.compile-rest": 0.529,
+    "worker.write": 0.425,
+    "worker.build-rest": 0.338,
+    "worker.report": 0.125,
+    "worker.refuse": 0.291,
+    "worker.link": 1.8,
+    "worker.edit-to-binary": 17.3,
+    "worker.splice.place": 0.213,
+    "worker.splice.copy": 0.23,
+    "worker.splice.overwrite": 0.37,
+    "worker.splice.sign": 0.39,
+    "worker.splice.append": 0.14,
+    "worker.splice.rename": 0.263
+   },
+   {
+    "to-worker": 0.314,
+    "worker": 4.336,
+    "delivery": 0.09999999999999992,
+    "wait": 0.0169,
+    "apply": 0.38710000000000006,
+    "total": 5.154,
+    "reply": 5.31,
+    "worker.apply.change": 0.106,
+    "worker.apply.outlines": 0.459,
+    "worker.apply.rest": 0.016,
+    "worker.publish": 0.41,
+    "worker.notice": 0.0,
+    "worker.settle": 0.175,
+    "worker.read": 0.01,
+    "worker.apply": 0.583,
+    "worker.roots": 0.013,
+    "worker.check": 1.155,
+    "worker.reach": 0.007,
+    "worker.resolve": 0.005,
+    "worker.define": 0.004,
+    "worker.object": 0.069,
+    "worker.discarded": 0.0,
+    "worker.statics": 0.011,
+    "worker.setup": 0.163,
+    "worker.compile-rest": 0.51,
+    "worker.write": 0.403,
+    "worker.build-rest": 0.35,
+    "worker.report": 0.136,
+    "worker.refuse": 0.269,
+    "worker.link": 1.6,
+    "worker.edit-to-binary": 4.2,
+    "worker.splice.place": 0.123,
+    "worker.splice.copy": 0.22,
+    "worker.splice.overwrite": 0.35,
+    "worker.splice.sign": 0.387,
+    "worker.splice.append": 0.128,
+    "worker.splice.rename": 0.241
+   }
+  ],
+  "burst": [
+   {
+    "total": 6.11,
+    "queued": 0.094
+   },
+   {
+    "total": 5.684,
+    "queued": 0.052
+   },
+   {
+    "total": 5.566,
+    "queued": 0.063
+   },
+   {
+    "total": 5.129,
+    "queued": 0.048
+   },
+   {
+    "total": 5.97,
+    "queued": 0.061
+   },
+   {
+    "total": 4.8,
+    "queued": 0.051
+   },
+   {
+    "total": 9.536,
+    "queued": 0.074
+   },
+   {
+    "total": 46.921,
+    "queued": 0.138
+   },
+   {
+    "total": 44.611,
+    "queued": 6.163
+   },
+   {
+    "total": 16.519,
+    "queued": 11.179
+   },
+   {
+    "total": 5.541,
+    "queued": 0.044
+   },
+   {
+    "total": 5.012,
+    "queued": 0.04
+   },
+   {
+    "total": 4.951,
+    "queued": 0.065
+   },
+   {
+    "total": 5.342,
+    "queued": 0.041
+   },
+   {
+    "total": 6.137,
+    "queued": 0.069
+   },
+   {
+    "total": 5.875,
+    "queued": 0.037
+   },
+   {
+    "total": 5.131,
+    "queued": 0.097
+   },
+   {
+    "total": 28.195,
+    "queued": 1.396
+   },
+   {
+    "total": 25.205,
+    "queued": 0.042
+   },
+   {
+    "total": 23.107,
+    "queued": 0.061
+   },
+   {
+    "total": 5.952,
+    "queued": 0.052
+   },
+   {
+    "total": 6.248,
+    "queued": 0.153
+   },
+   {
+    "total": 6.5,
+    "queued": 0.051
+   },
+   {
+    "total": 20.194,
+    "queued": 0.065
+   },
+   {
+    "total": 14.572,
+    "queued": 0.062
+   },
+   {
+    "total": 15.823,
+    "queued": 0.037
+   },
+   {
+    "total": 5.154,
+    "queued": 0.042
+   },
+   {
+    "total": 4.938,
+    "queued": 0.042
+   },
+   {
+    "total": 28.739,
+    "queued": 0.06
+   },
+   {
+    "total": 5.792,
+    "queued": 0.047
+   },
+   {
+    "total": 6.387,
+    "queued": 0.057
+   },
+   {
+    "total": 5.745,
+    "queued": 0.04
+   },
+   {
+    "total": 6.948,
+    "queued": 0.041
+   },
+   {
+    "total": 7.737,
+    "queued": 0.058
+   },
+   {
+    "total": 9.62,
+    "queued": 0.058
+   },
+   {
+    "total": 5.983,
+    "queued": 0.041
+   },
+   {
+    "total": 11.626,
+    "queued": 0.091
+   },
+   {
+    "total": 6.134,
+    "queued": 0.046
+   },
+   {
+    "total": 8.313,
+    "queued": 0.042
+   },
+   {
+    "total": 6.236,
+    "queued": 0.042
+   },
+   {
+    "total": 8.45,
+    "queued": 0.081
+   },
+   {
+    "total": 9.921,
+    "queued": 0.069
+   },
+   {
+    "total": 11.981,
+    "queued": 0.12
+   },
+   {
+    "total": 10.872,
+    "queued": 0.101
+   },
+   {
+    "total": 13.08,
+    "queued": 0.138
+   },
+   {
+    "total": 10.662,
+    "queued": 0.075
+   },
+   {
+    "total": 8.122,
+    "queued": 0.064
+   },
+   {
+    "total": 24.187,
+    "queued": 1.467
+   },
+   {
+    "total": 9.629,
+    "queued": 0.052
+   },
+   {
+    "total": 6.697,
+    "queued": 0.051
+   },
+   {
+    "total": 4.916,
+    "queued": 0.056
+   },
+   {
+    "total": 5.98,
+    "queued": 0.053
+   },
+   {
+    "total": 11.104,
+    "queued": 0.064
+   },
+   {
+    "total": 6.165,
+    "queued": 0.051
+   },
+   {
+    "total": 8.248,
+    "queued": 0.035
+   },
+   {
+    "total": 5.262,
+    "queued": 0.043
+   },
+   {
+    "total": 7.496,
+    "queued": 0.037
+   },
+   {
+    "total": 5.596,
+    "queued": 0.04
+   },
+   {
+    "total": 6.055,
+    "queued": 0.038
+   },
+   {
+    "total": 5.743,
+    "queued": 0.037
+   },
+   {
+    "total": 6.903,
+    "queued": 0.043
+   },
+   {
+    "total": 5.307,
+    "queued": 0.051
+   },
+   {
+    "total": 5.747,
+    "queued": 0.097
+   },
+   {
+    "total": 8.253,
+    "queued": 0.057
+   },
+   {
+    "total": 6.511,
+    "queued": 0.043
+   },
+   {
+    "total": 13.988,
+    "queued": 0.041
+   },
+   {
+    "total": 6.882,
+    "queued": 0.052
+   },
+   {
+    "total": 5.784,
+    "queued": 0.072
+   },
+   {
+    "total": 6.267,
+    "queued": 0.048
+   },
+   {
+    "total": 6.149,
+    "queued": 0.048
+   },
+   {
+    "total": 7.695,
+    "queued": 0.094
+   },
+   {
+    "total": 11.139,
+    "queued": 0.076
+   },
+   {
+    "total": 6.499,
+    "queued": 0.064
+   },
+   {
+    "total": 6.235,
+    "queued": 0.059
+   },
+   {
+    "total": 6.469,
+    "queued": 0.115
+   },
+   {
+    "total": 6.983,
+    "queued": 0.06
+   },
+   {
+    "total": 7.207,
+    "queued": 0.082
+   },
+   {
+    "total": 7.657,
+    "queued": 0.053
+   },
+   {
+    "total": 6.89,
+    "queued": 0.067
+   },
+   {
+    "total": 8.825,
+    "queued": 0.273
+   },
+   {
+    "total": 5.15,
+    "queued": 0.056
+   },
+   {
+    "total": 6.388,
+    "queued": 0.099
+   },
+   {
+    "total": 13.443,
+    "queued": 0.046
+   },
+   {
+    "total": 8.181,
+    "queued": 0.045
+   },
+   {
+    "total": 6.298,
+    "queued": 0.043
+   },
+   {
+    "total": 6.196,
+    "queued": 0.04
+   },
+   {
+    "total": 7.193,
+    "queued": 0.039
+   },
+   {
+    "total": 28.415,
+    "queued": 0.075
+   },
+   {
+    "total": 7.547,
+    "queued": 0.064
+   },
+   {
+    "total": 6.443,
+    "queued": 0.039
+   },
+   {
+    "total": 22.797,
+    "queued": 0.048
+   },
+   {
+    "total": 8.62,
+    "queued": 0.044
+   },
+   {
+    "total": 9.065,
+    "queued": 0.057
+   },
+   {
+    "total": 6.049,
+    "queued": 0.049
+   },
+   {
+    "total": 5.796,
+    "queued": 0.039
+   },
+   {
+    "total": 7.172,
+    "queued": 0.115
+   },
+   {
+    "total": 6.243,
+    "queued": 0.041
+   },
+   {
+    "total": 10.634,
+    "queued": 0.049
+   },
+   {
+    "total": 6.505,
+    "queued": 0.056
+   },
+   {
+    "total": 5.472,
+    "queued": 0.037
+   },
+   {
+    "total": 7.316,
+    "queued": 0.268
+   },
+   {
+    "total": 5.598,
+    "queued": 0.072
+   },
+   {
+    "total": 79.079,
+    "queued": 3.661
+   },
+   {
+    "total": 41.08,
+    "queued": 26.521
+   },
+   {
+    "total": 7.084,
+    "queued": 0.143
+   },
+   {
+    "total": 8.103,
+    "queued": 0.075
+   },
+   {
+    "total": 6.689,
+    "queued": 0.063
+   },
+   {
+    "total": 5.729,
+    "queued": 0.045
+   },
+   {
+    "total": 6.531,
+    "queued": 0.042
+   },
+   {
+    "total": 6.283,
+    "queued": 0.043
+   },
+   {
+    "total": 7.001,
+    "queued": 0.06
+   },
+   {
+    "total": 10.697,
+    "queued": 2.334
+   },
+   {
+    "total": 6.129,
+    "queued": 0.044
+   },
+   {
+    "total": 6.38,
+    "queued": 0.04
+   },
+   {
+    "total": 9.798,
+    "queued": 0.042
+   },
+   {
+    "total": 7.406,
+    "queued": 0.064
+   },
+   {
+    "total": 5.73,
+    "queued": 0.041
+   },
+   {
+    "total": 6.633,
+    "queued": 0.043
+   },
+   {
+    "total": 9.598,
+    "queued": 0.056
+   },
+   {
+    "total": 5.595,
+    "queued": 0.05
+   },
+   {
+    "total": 14.711,
+    "queued": 0.045
+   },
+   {
+    "total": 6.79,
+    "queued": 0.08
+   },
+   {
+    "total": 8.986,
+    "queued": 0.042
+   },
+   {
+    "total": 8.145,
+    "queued": 0.052
+   },
+   {
+    "total": 7.677,
+    "queued": 0.043
+   },
+   {
+    "total": 8.497,
+    "queued": 0.063
+   },
+   {
+    "total": 9.364,
+    "queued": 0.062
+   },
+   {
+    "total": 6.947,
+    "queued": 0.044
+   },
+   {
+    "total": 62.932,
+    "queued": 0.053
+   },
+   {
+    "total": 15.985,
+    "queued": 0.038
+   },
+   {
+    "total": 17.768,
+    "queued": 0.06
+   },
+   {
+    "total": 56.347,
+    "queued": 0.054
+   },
+   {
+    "total": 54.321,
+    "queued": 8.32
+   },
+   {
+    "total": 25.555,
+    "queued": 0.375
+   },
+   {
+    "total": 43.915,
+    "queued": 0.051
+   },
+   {
+    "total": 48.277,
+    "queued": 9.807
+   },
+   {
+    "total": 14.628,
+    "queued": 0.05
+   },
+   {
+    "total": 17.423,
+    "queued": 0.066
+   },
+   {
+    "total": 5.935,
+    "queued": 0.044
+   },
+   {
+    "total": 7.394,
+    "queued": 0.051
+   },
+   {
+    "total": 6.478,
+    "queued": 0.059
+   },
+   {
+    "total": 8.577,
+    "queued": 0.046
+   },
+   {
+    "total": 6.623,
+    "queued": 0.046
+   },
+   {
+    "total": 6.717,
+    "queued": 0.051
+   },
+   {
+    "total": 13.367,
+    "queued": 0.051
+   },
+   {
+    "total": 39.992,
+    "queued": 0.055
+   },
+   {
+    "total": 27.971,
+    "queued": 0.06
+   },
+   {
+    "total": 7.409,
+    "queued": 0.069
+   },
+   {
+    "total": 6.885,
+    "queued": 0.049
+   },
+   {
+    "total": 7.953,
+    "queued": 0.121
+   },
+   {
+    "total": 11.44,
+    "queued": 0.052
+   },
+   {
+    "total": 7.203,
+    "queued": 0.047
+   },
+   {
+    "total": 5.445,
+    "queued": 0.042
+   },
+   {
+    "total": 6.574,
+    "queued": 0.099
+   },
+   {
+    "total": 5.581,
+    "queued": 0.056
+   },
+   {
+    "total": 7.429,
+    "queued": 0.06
+   },
+   {
+    "total": 16.708,
+    "queued": 0.041
+   },
+   {
+    "total": 30.231,
+    "queued": 0.157
+   },
+   {
+    "total": 9.011,
+    "queued": 0.048
+   },
+   {
+    "total": 7.581,
+    "queued": 0.203
+   },
+   {
+    "total": 7.366,
+    "queued": 0.056
+   },
+   {
+    "total": 8.15,
+    "queued": 0.063
+   },
+   {
+    "total": 5.849,
+    "queued": 0.041
+   },
+   {
+    "total": 16.073,
+    "queued": 0.043
+   },
+   {
+    "total": 6.773,
+    "queued": 0.067
+   },
+   {
+    "total": 9.074,
+    "queued": 0.059
+   },
+   {
+    "total": 26.061,
+    "queued": 0.116
+   },
+   {
+    "total": 12.715,
+    "queued": 0.044
+   },
+   {
+    "total": 7.501,
+    "queued": 0.065
+   },
+   {
+    "total": 7.133,
+    "queued": 0.042
+   },
+   {
+    "total": 6.926,
+    "queued": 0.042
+   },
+   {
+    "total": 17.238,
+    "queued": 0.039
+   },
+   {
+    "total": 7.312,
+    "queued": 0.042
+   },
+   {
+    "total": 8.817,
+    "queued": 0.044
+   },
+   {
+    "total": 7.447,
+    "queued": 0.041
+   },
+   {
+    "total": 8.977,
+    "queued": 0.053
+   },
+   {
+    "total": 8.42,
+    "queued": 0.039
+   },
+   {
+    "total": 6.308,
+    "queued": 0.043
+   },
+   {
+    "total": 7.914,
+    "queued": 0.051
+   },
+   {
+    "total": 5.952,
+    "queued": 0.042
+   },
+   {
+    "total": 6.523,
+    "queued": 0.114
+   },
+   {
+    "total": 7.542,
+    "queued": 0.05
+   },
+   {
+    "total": 6.392,
+    "queued": 0.045
+   },
+   {
+    "total": 13.205,
+    "queued": 0.05
+   },
+   {
+    "total": 6.152,
+    "queued": 0.047
+   },
+   {
+    "total": 7.005,
+    "queued": 0.06
+   },
+   {
+    "total": 6.912,
+    "queued": 0.053
+   },
+   {
+    "total": 6.396,
+    "queued": 0.064
+   },
+   {
+    "total": 7.913,
+    "queued": 0.05
+   },
+   {
+    "total": 4.563,
+    "queued": 0.055
+   },
+   {
+    "total": 18.898,
+    "queued": 0.053
+   },
+   {
+    "total": 18.544,
+    "queued": 0.04
+   },
+   {
+    "total": 22.315,
+    "queued": 0.041
+   },
+   {
+    "total": 19.206,
+    "queued": 0.105
+   },
+   {
+    "total": 7.289,
+    "queued": 0.325
+   },
+   {
+    "total": 7.383,
+    "queued": 0.038
+   },
+   {
+    "total": 11.943,
+    "queued": 0.071
+   },
+   {
+    "total": 36.26,
+    "queued": 0.056
+   },
+   {
+    "total": 7.779,
+    "queued": 0.038
+   },
+   {
+    "total": 4.497,
+    "queued": 0.055
+   }
+  ],
+  "replay": [
+   {
+    "total": 1728.836,
+    "queued": 1605.672,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1683.173,
+    "queued": 1560.009,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1560.339,
+    "queued": 1437.175,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1504.98,
+    "queued": 1381.816,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1046.645,
+    "queued": 923.481,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1003.128,
+    "queued": 879.964,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 227.69,
+    "queued": 104.526,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 168.485,
+    "queued": 148.67,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 232.757,
+    "queued": 106.784,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 211.45,
+    "queued": 186.85,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 274.698,
+    "queued": 124.489,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 233.412,
+    "queued": 212.033,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 261.779,
+    "queued": 83.357,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1601.645,
+    "queued": 1408.06,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1242.023,
+    "queued": 1048.438,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1006.601,
+    "queued": 813.016,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 941.656,
+    "queued": 748.071,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 720.166,
+    "queued": 526.581,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 687.716,
+    "queued": 494.131,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 502.501,
+    "queued": 308.916,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 461.163,
+    "queued": 267.578,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 301.028,
+    "queued": 107.443,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 1060.759,
+    "queued": 886.208,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 679.278,
+    "queued": 504.727,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 299.695,
+    "queued": 125.144,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 288.687,
+    "queued": 261.084,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 9.762,
+    "queued": 0.096,
+    "by": "patch",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 240.174,
+    "queued": 103.922,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 212.117,
+    "queued": 191.497,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 272.157,
+    "queued": 85.795,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 364.292,
+    "queued": 235.34,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 213.54,
+    "queued": 84.588,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 481.89,
+    "queued": 284.891,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 281.219,
+    "queued": 84.22,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 257.477,
+    "queued": 240.675,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 245.766,
+    "queued": 115.319,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 169.53,
+    "queued": 148.225,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 223.825,
+    "queued": 86.282,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 188.637,
+    "queued": 172.289,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 255.39,
+    "queued": 82.621,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 2812.562,
+    "queued": 2541.651,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 352.873,
+    "queued": 81.962,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1550.026,
+    "queued": 1421.468,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1224.181,
+    "queued": 1095.623,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1031.679,
+    "queued": 903.121,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 981.791,
+    "queued": 853.233,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 776.02,
+    "queued": 647.462,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 744.361,
+    "queued": 615.803,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 540.252,
+    "queued": 411.694,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 448.994,
+    "queued": 320.436,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 356.926,
+    "queued": 228.368,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 1102.106,
+    "queued": 916.93,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 675.424,
+    "queued": 490.248,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 279.243,
+    "queued": 94.067,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 214.474,
+    "queued": 197.803,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 16.669,
+    "queued": 0.071,
+    "by": "patch",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 291.589,
+    "queued": 127.72,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 218.411,
+    "queued": 195.57,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 905.987,
+    "queued": 763.926,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 837.209,
+    "queued": 695.148,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 754.202,
+    "queued": 612.141,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 669.004,
+    "queued": 526.943,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 482.015,
+    "queued": 339.954,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 413.249,
+    "queued": 271.188,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 252.915,
+    "queued": 110.854,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1197.667,
+    "queued": 977.922,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 427.291,
+    "queued": 207.546,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 631.516,
+    "queued": 481.098,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 263.879,
+    "queued": 113.461,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 2262.297,
+    "queued": 2097.472,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 242.736,
+    "queued": 77.911,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1155.806,
+    "queued": 1026.237,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 440.646,
+    "queued": 311.077,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 226.709,
+    "queued": 97.14,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 483.181,
+    "queued": 351.131,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 248.51,
+    "queued": 116.46,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 618.096,
+    "queued": 319.353,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 403.911,
+    "queued": 105.168,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 1087.287,
+    "queued": 955.417,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 961.992,
+    "queued": 830.122,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 893.486,
+    "queued": 761.616,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 691.984,
+    "queued": 560.114,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 272.956,
+    "queued": 141.086,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 242.641,
+    "queued": 223.753,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 8.82,
+    "queued": 0.157,
+    "by": "patch",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 248.104,
+    "queued": 114.011,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 180.846,
+    "queued": 159.613,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 313.218,
+    "queued": 185.473,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 267.177,
+    "queued": 139.432,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 737.211,
+    "queued": 608.027,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 681.092,
+    "queued": 551.908,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 222.329,
+    "queued": 93.145,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1084.861,
+    "queued": 911.465,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 308.908,
+    "queued": 135.512,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 998.042,
+    "queued": 863.357,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 239.731,
+    "queued": 105.046,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 201.237,
+    "queued": 181.893,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 281.468,
+    "queued": 88.164,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 238.374,
+    "queued": 218.901,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 246.667,
+    "queued": 57.31,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 807.288,
+    "queued": 678.807,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 448.953,
+    "queued": 320.472,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 208.317,
+    "queued": 79.836,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 474.979,
+    "queued": 310.933,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 252.219,
+    "queued": 88.173,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 416.112,
+    "queued": 290.265,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 229.798,
+    "queued": 103.951,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 437.177,
+    "queued": 267.887,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 275.596,
+    "queued": 106.306,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 257.818,
+    "queued": 235.941,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 666.324,
+    "queued": 515.467,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 283.264,
+    "queued": 132.407,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 264.691,
+    "queued": 242.08,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 11.395,
+    "queued": 0.086,
+    "by": "patch",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 286.029,
+    "queued": 159.02,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 262.782,
+    "queued": 236.176,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 238.955,
+    "queued": 115.285,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 452.823,
+    "queued": 140.516,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 520.05,
+    "queued": 394.237,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 447.784,
+    "queued": 321.971,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 244.871,
+    "queued": 119.058,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 225.129,
+    "queued": 202.571,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 312.855,
+    "queued": 127.804,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 238.075,
+    "queued": 214.966,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 261.011,
+    "queued": 133.534,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 231.313,
+    "queued": 208.674,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 245.388,
+    "queued": 115.016,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 2673.981,
+    "queued": 2546.854,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 210.633,
+    "queued": 83.506,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1255.193,
+    "queued": 1130.659,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 926.028,
+    "queued": 801.494,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 731.352,
+    "queued": 606.818,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 680.477,
+    "queued": 555.943,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 473.621,
+    "queued": 349.087,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 440.797,
+    "queued": 316.263,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 236.61,
+    "queued": 112.076,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 350.203,
+    "queued": 224.659,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 259.344,
+    "queued": 133.8,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 216.876,
+    "queued": 193.487,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 740.051,
+    "queued": 531.85,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 342.185,
+    "queued": 133.984,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 283.57,
+    "queued": 259.885,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 8.206,
+    "queued": 0.093,
+    "by": "patch",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 304.304,
+    "queued": 152.541,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 232.299,
+    "queued": 206.537,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 1785.812,
+    "queued": 1657.776,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1716.063,
+    "queued": 1588.027,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1628.771,
+    "queued": 1500.735,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1544.08,
+    "queued": 1416.044,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1352.604,
+    "queued": 1224.568,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1282.798,
+    "queued": 1154.762,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1118.204,
+    "queued": 990.168,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 1017.666,
+    "queued": 889.63,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 248.619,
+    "queued": 120.583,
+    "by": "restart",
+    "script": "scale: retype the body",
+    "refused": false
+   },
+   {
+    "total": 220.807,
+    "queued": 198.475,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 263.677,
+    "queued": 134.247,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 2256.633,
+    "queued": 2110.225,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 224.441,
+    "queued": 78.033,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 1216.429,
+    "queued": 1049.351,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 497.416,
+    "queued": 330.338,
+    "by": "restart",
+    "script": "weigh<T>: a factor, a local and its use",
+    "refused": false
+   },
+   {
+    "total": 282.212,
+    "queued": 115.134,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 785.865,
+    "queued": 655.61,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 550.213,
+    "queued": 419.958,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 454.982,
+    "queued": 324.727,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 238.893,
+    "queued": 108.638,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 434.236,
+    "queued": 234.999,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 308.079,
+    "queued": 108.842,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 975.322,
+    "queued": 790.364,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 770.007,
+    "queued": 585.049,
+    "by": "restart",
+    "script": "scale: back as it was",
+    "refused": false
+   },
+   {
+    "total": 346.185,
+    "queued": 161.227,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 429.132,
+    "queued": 296.48,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 140.827,
+    "queued": 8.175,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   },
+   {
+    "total": 323.903,
+    "queued": 149.715,
+    "by": "restart",
+    "script": "weigh<T>: back as it was",
+    "refused": false
+   }
+  ],
+  "cargo-run": [
+   {
+    "edit": "Tally: a field added",
+    "total": 369.895,
+    "build": 190.747,
+    "start": 179.148
+   },
+   {
+    "edit": "Tally: the field's type changed",
+    "total": 400.833,
+    "build": 257.799,
+    "start": 143.034
+   },
+   {
+    "edit": "Tally: a field added",
+    "total": 307.507,
+    "build": 186.881,
+    "start": 120.626
+   },
+   {
+    "edit": "Tally: the field's type changed",
+    "total": 264.974,
+    "build": 152.004,
+    "start": 112.97
+   }
+  ],
+  "restart": [
+   {
+    "edit": "Tally: a field added",
+    "total": 137.464,
+    "edit-reply": 8.665,
+    "build": 16.368,
+    "start": 112.262
+   },
+   {
+    "edit": "Tally: the field's type changed",
+    "total": 156.835,
+    "edit-reply": 9.882,
+    "build": 19.065,
+    "start": 127.688
+   },
+   {
+    "edit": "Tally: a field added",
+    "total": 185.744,
+    "edit-reply": 8.792,
+    "build": 15.245,
+    "start": 161.531
+   },
+   {
+    "edit": "Tally: the field's type changed",
+    "total": 201.827,
+    "edit-reply": 8.627,
+    "build": 16.8,
+    "start": 176.214
+   }
+  ]
+ },
+ "passes": [
+  {
+   "date": "2026-10-20T23:27:53Z",
+   "commit": "ad07271066882dea5f539e65531884ed68f1294a",
+   "battery": "AC",
+   "load at start": 51.85,
+   "load at end": 36.98,
+   "rows": {
+    "socket": 20,
+    "burst": 100,
+    "replay": 87,
+    "cargo-run": 2,
+    "restart": 2
+   },
+   "counts": {
+    "replay": {
+     "answer error": 156,
+     "answer no program built": 13,
+     "answer object": 41,
+     "answer patch": 36,
+     "asked after": 14,
+     "keys": 244,
+     "keys run by a patch": 3,
+     "keys run by a restart": 84,
+     "keys that compile": 87,
+     "keys that do not compile": 157,
+     "patch for no program (the executable was linked again)": 33,
+     "restarts": [
+      {
+       "key": -1,
+       "started": 1792538897687770,
+       "running": 1792538897959010,
+       "total": 271.24
+      },
+      {
+       "key": 13,
+       "started": 1792538899252052,
+       "running": 1792538899375216,
+       "total": 123.164
+      },
+      {
+       "key": 14,
+       "started": 1792538899375566,
+       "running": 1792538899395381,
+       "total": 19.815
+      },
+      {
+       "key": 17,
+       "started": 1792538900090327,
+       "running": 1792538900216300,
+       "total": 125.973
+      },
+      {
+       "key": 18,
+       "started": 1792538900224705,
+       "running": 1792538900249305,
+       "total": 24.6
+      },
+      {
+       "key": 21,
+       "started": 1792538900679018,
+       "running": 1792538900829227,
+       "total": 150.209
+      },
+      {
+       "key": 22,
+       "started": 1792538900829541,
+       "running": 1792538900850920,
+       "total": 21.379
+      },
+      {
+       "key": 44,
+       "started": 1792538902946378,
+       "running": 1792538903124800,
+       "total": 178.422
+      },
+      {
+       "key": 65,
+       "started": 1792538904312146,
+       "running": 1792538904505731,
+       "total": 193.585
+      },
+      {
+       "key": 75,
+       "started": 1792538905131275,
+       "running": 1792538905305826,
+       "total": 174.551
+      },
+      {
+       "key": 76,
+       "started": 1792538905307638,
+       "running": 1792538905335241,
+       "total": 27.603
+      },
+      {
+       "key": 80,
+       "started": 1792538905724178,
+       "running": 1792538905860430,
+       "total": 136.252
+      },
+      {
+       "key": 81,
+       "started": 1792538905860733,
+       "running": 1792538905881353,
+       "total": 20.62
+      },
+      {
+       "key": 2,
+       "started": 1792538908708825,
+       "running": 1792538908895187,
+       "total": 186.362
+      },
+      {
+       "key": 5,
+       "started": 1792538908954672,
+       "running": 1792538909083624,
+       "total": 128.952
+      },
+      {
+       "key": 9,
+       "started": 1792538909226661,
+       "running": 1792538909423660,
+       "total": 196.999
+      },
+      {
+       "key": 10,
+       "started": 1792538909423895,
+       "running": 1792538909440697,
+       "total": 16.802
+      },
+      {
+       "key": 13,
+       "started": 1792538909918495,
+       "running": 1792538910048942,
+       "total": 130.447
+      },
+      {
+       "key": 14,
+       "started": 1792538910049211,
+       "running": 1792538910070516,
+       "total": 21.305
+      },
+      {
+       "key": 17,
+       "started": 1792538910737548,
+       "running": 1792538910875091,
+       "total": 137.543
+      },
+      {
+       "key": 18,
+       "started": 1792538910875385,
+       "running": 1792538910891733,
+       "total": 16.348
+      },
+      {
+       "key": 21,
+       "started": 1792538911874528,
+       "running": 1792538912047297,
+       "total": 172.769
+      },
+      {
+       "key": 44,
+       "started": 1792538914405875,
+       "running": 1792538914676786,
+       "total": 270.911
+      },
+      {
+       "key": 65,
+       "started": 1792538915816454,
+       "running": 1792538915945012,
+       "total": 128.558
+      },
+      {
+       "key": 75,
+       "started": 1792538916575259,
+       "running": 1792538916760435,
+       "total": 185.176
+      },
+      {
+       "key": 76,
+       "started": 1792538916760722,
+       "running": 1792538916777393,
+       "total": 16.671
+      },
+      {
+       "key": 80,
+       "started": 1792538917444435,
+       "running": 1792538917608304,
+       "total": 163.869
+      },
+      {
+       "key": 81,
+       "started": 1792538917608662,
+       "running": 1792538917631503,
+       "total": 22.841
+      },
+      {
+       "key": 13,
+       "started": 1792538920888996,
+       "running": 1792538921031057,
+       "total": 142.061
+      },
+      {
+       "key": 17,
+       "started": 1792538921855448,
+       "running": 1792538922075193,
+       "total": 219.745
+      },
+      {
+       "key": 21,
+       "started": 1792538922178640,
+       "running": 1792538922329058,
+       "total": 150.418
+      },
+      {
+       "key": 42,
+       "started": 1792538924259189,
+       "running": 1792538924424014,
+       "total": 164.825
+      },
+      {
+       "key": 52,
+       "started": 1792538925266397,
+       "running": 1792538925395966,
+       "total": 129.569
+      },
+      {
+       "key": 56,
+       "started": 1792538925610654,
+       "running": 1792538925742704,
+       "total": 132.05
+      },
+      {
+       "key": 60,
+       "started": 1792538925907349,
+       "running": 1792538926206092,
+       "total": 298.743
+      },
+      {
+       "key": 73,
+       "started": 1792538926832285,
+       "running": 1792538926964155,
+       "total": 131.87
+      },
+      {
+       "key": 74,
+       "started": 1792538926964425,
+       "running": 1792538926983313,
+       "total": 18.888
+      },
+      {
+       "key": 78,
+       "started": 1792538927324252,
+       "running": 1792538927458345,
+       "total": 134.093
+      },
+      {
+       "key": 79,
+       "started": 1792538927458626,
+       "running": 1792538927479859,
+       "total": 21.233
+      }
+     ],
+     "restarts asked by the answer": 41,
+     "restarts asked by the program": 16,
+     "restarts the program was told": 16,
+     "sent": 233,
+     "answers": [
+      {
+       "round": 0,
+       "key": 4,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 0,
+       "key": 10,
+       "asked after": true,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=116"
+      },
+      {
+       "round": 0,
+       "key": 52,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 54,
+       "asked after": true,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=94"
+      },
+      {
+       "round": 0,
+       "key": 57,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 59,
+       "asked after": true,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=88"
+      },
+      {
+       "round": 0,
+       "key": 71,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 0,
+       "ms": 207.611,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 2,
+       "ms": 150.912,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=149"
+      },
+      {
+       "round": 0,
+       "key": 5,
+       "ms": 8.564,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=7"
+      },
+      {
+       "round": 0,
+       "key": 6,
+       "ms": 13.269,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=12"
+      },
+      {
+       "round": 0,
+       "key": 7,
+       "ms": 65.827,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 8,
+       "ms": 4.942,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 9,
+       "ms": 123.25,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
+      },
+      {
+       "round": 0,
+       "key": 11,
+       "ms": 76.333,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 12,
+       "ms": 14.405,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 13,
+       "ms": 104.047,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=103"
+      },
+      {
+       "round": 0,
+       "key": 14,
+       "ms": 12.919,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=6"
+      },
+      {
+       "round": 0,
+       "key": 15,
+       "ms": 59.613,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 16,
+       "ms": 6.755,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 17,
+       "ms": 106.251,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=105"
+      },
+      {
+       "round": 0,
+       "key": 18,
+       "ms": 8.017,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 19,
+       "ms": 51.029,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 20,
+       "ms": 10.025,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 21,
+       "ms": 123.794,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
+      },
+      {
+       "round": 0,
+       "key": 22,
+       "ms": 10.842,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
+      },
+      {
+       "round": 0,
+       "key": 23,
+       "ms": 41.532,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 24,
+       "ms": 4.408,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 25,
+       "ms": 5.006,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 0,
+       "key": 26,
+       "ms": 5.054,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 0,
+       "key": 27,
+       "ms": 17.123,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 28,
+       "ms": 11.278,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 29,
+       "ms": 24.129,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 30,
+       "ms": 5.185,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 31,
+       "ms": 12.014,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 32,
+       "ms": 5.771,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 33,
+       "ms": 13.979,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 34,
+       "ms": 81.877,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 35,
+       "ms": 4.073,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 36,
+       "ms": 6.378,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 37,
+       "ms": 4.343,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 38,
+       "ms": 38.725,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 39,
+       "ms": 4.431,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 0,
+       "key": 40,
+       "ms": 4.539,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 0,
+       "key": 41,
+       "ms": 63.053,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 42,
+       "ms": 5.243,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 43,
+       "ms": 7.667,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 44,
+       "ms": 82.556,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=81"
+      },
+      {
+       "round": 0,
+       "key": 45,
+       "ms": 19.851,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=13"
+      },
+      {
+       "round": 0,
+       "key": 46,
+       "ms": 46.631,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 47,
+       "ms": 14.115,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 48,
+       "ms": 4.938,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 49,
+       "ms": 18.91,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 50,
+       "ms": 39.144,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 51,
+       "ms": 174.533,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=173"
+      },
+      {
+       "round": 0,
+       "key": 53,
+       "ms": 57.961,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 54,
+       "ms": 0.745,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 0,
+       "key": 55,
+       "ms": 111.562,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=110"
+      },
+      {
+       "round": 0,
+       "key": 56,
+       "ms": 76.239,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 57,
+       "ms": 0.673,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 0,
+       "key": 58,
+       "ms": 123.643,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=122"
+      },
+      {
+       "round": 0,
+       "key": 60,
+       "ms": 63.005,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 61,
+       "ms": 0.844,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 0,
+       "key": 62,
+       "ms": 126.776,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=125"
+      },
+      {
+       "round": 0,
+       "key": 63,
+       "ms": 7.313,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 64,
+       "ms": 56.352,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 0,
+       "key": 65,
+       "ms": 106.931,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=105"
+      },
+      {
+       "round": 0,
+       "key": 66,
+       "ms": 9.16,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 0,
+       "key": 67,
+       "ms": 58.361,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 68,
+       "ms": 0.694,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 0,
+       "key": 69,
+       "ms": 111.185,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=110"
+      },
+      {
+       "round": 0,
+       "key": 70,
+       "ms": 81.503,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 71,
+       "ms": 0.63,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 0,
+       "key": 72,
+       "ms": 5.368,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 73,
+       "ms": 9.196,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 74,
+       "ms": 6.072,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 75,
+       "ms": 124.609,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=123"
+      },
+      {
+       "round": 0,
+       "key": 76,
+       "ms": 35.9,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=30"
+      },
+      {
+       "round": 0,
+       "key": 77,
+       "ms": 9.479,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
+      },
+      {
+       "round": 0,
+       "key": 78,
+       "ms": 38.325,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 79,
+       "ms": 4.095,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 80,
+       "ms": 103.383,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=102"
+      },
+      {
+       "round": 0,
+       "key": 81,
+       "ms": 9.224,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 1,
+       "key": 53,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 55,
+       "asked after": true,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=114"
+      },
+      {
+       "round": 1,
+       "key": 59,
+       "asked after": true,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=23"
+      },
+      {
+       "round": 1,
+       "key": 0,
+       "ms": 52.527,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 1,
+       "ms": 3.744,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 2,
+       "ms": 85.399,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=84"
+      },
+      {
+       "round": 1,
+       "key": 3,
+       "ms": 4.847,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 1,
+       "key": 4,
+       "ms": 41.998,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 1,
+       "key": 5,
+       "ms": 84.05,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=82"
+      },
+      {
+       "round": 1,
+       "key": 6,
+       "ms": 5.427,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 1,
+       "key": 7,
+       "ms": 41.493,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 8,
+       "ms": 3.233,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 9,
+       "ms": 83.886,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=82"
+      },
+      {
+       "round": 1,
+       "key": 10,
+       "ms": 5.605,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 1,
+       "key": 11,
+       "ms": 50.384,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 12,
+       "ms": 5.538,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 13,
+       "ms": 114.723,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=113"
+      },
+      {
+       "round": 1,
+       "key": 14,
+       "ms": 7.673,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 15,
+       "ms": 58.762,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 16,
+       "ms": 4.975,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 17,
+       "ms": 85.844,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=84"
+      },
+      {
+       "round": 1,
+       "key": 18,
+       "ms": 6.27,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 1,
+       "key": 19,
+       "ms": 54.763,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 20,
+       "ms": 5.141,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 21,
+       "ms": 82.241,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=81"
+      },
+      {
+       "round": 1,
+       "key": 22,
+       "ms": 6.626,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 23,
+       "ms": 25.348,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 24,
+       "ms": 6.466,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 25,
+       "ms": 3.092,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 1,
+       "key": 26,
+       "ms": 4.541,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 1,
+       "key": 27,
+       "ms": 4.333,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 28,
+       "ms": 3.304,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 29,
+       "ms": 3.736,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 30,
+       "ms": 4.107,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 31,
+       "ms": 4.974,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 32,
+       "ms": 4.46,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 33,
+       "ms": 4.139,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 34,
+       "ms": 42.261,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 35,
+       "ms": 4.594,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 36,
+       "ms": 5.216,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 37,
+       "ms": 9.601,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 38,
+       "ms": 74.93,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 39,
+       "ms": 14.41,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 1,
+       "key": 40,
+       "ms": 6.714,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 1,
+       "key": 41,
+       "ms": 55.115,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 42,
+       "ms": 5.477,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 43,
+       "ms": 12.997,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 44,
+       "ms": 81.366,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=80"
+      },
+      {
+       "round": 1,
+       "key": 45,
+       "ms": 8.252,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 46,
+       "ms": 41.675,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 47,
+       "ms": 4.395,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 48,
+       "ms": 6.72,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 49,
+       "ms": 5.48,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 50,
+       "ms": 8.79,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 51,
+       "ms": 119.875,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=118"
+      },
+      {
+       "round": 1,
+       "key": 52,
+       "ms": 70.583,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 53,
+       "ms": 0.718,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 54,
+       "ms": 145.371,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=144"
+      },
+      {
+       "round": 1,
+       "key": 56,
+       "ms": 58.542,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 57,
+       "ms": 4.872,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 58,
+       "ms": 122.541,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=120"
+      },
+      {
+       "round": 1,
+       "key": 60,
+       "ms": 75.509,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 61,
+       "ms": 0.694,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 62,
+       "ms": 135.277,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=133"
+      },
+      {
+       "round": 1,
+       "key": 64,
+       "ms": 94.963,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 1,
+       "key": 65,
+       "ms": 179.326,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=166"
+      },
+      {
+       "round": 1,
+       "key": 66,
+       "ms": 12.532,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=5"
+      },
+      {
+       "round": 1,
+       "key": 67,
+       "ms": 50.281,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 68,
+       "ms": 0.722,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 69,
+       "ms": 88.774,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=87"
+      },
+      {
+       "round": 1,
+       "key": 70,
+       "ms": 34.208,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 71,
+       "ms": 4.836,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 72,
+       "ms": 4.44,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 73,
+       "ms": 4.887,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 74,
+       "ms": 3.903,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 75,
+       "ms": 93.659,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=92"
+      },
+      {
+       "round": 1,
+       "key": 76,
+       "ms": 7.115,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 77,
+       "ms": 16.457,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=11"
+      },
+      {
+       "round": 1,
+       "key": 78,
+       "ms": 33.593,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 79,
+       "ms": 6.256,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 80,
+       "ms": 127.239,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=126"
+      },
+      {
+       "round": 1,
+       "key": 81,
+       "ms": 9.187,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 3,
+       "asked after": true,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=4"
+      },
+      {
+       "round": 2,
+       "key": 10,
+       "asked after": true,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=1 files=1 ms=5"
+      },
+      {
+       "round": 2,
+       "key": 12,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 69,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 0,
+       "ms": 72.175,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 1,
+       "ms": 10.355,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 2,
+       "ms": 128.945,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=127"
+      },
+      {
+       "round": 2,
+       "key": 4,
+       "ms": 89.494,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 2,
+       "key": 5,
+       "ms": 0.933,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 6,
+       "ms": 113.254,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=112"
+      },
+      {
+       "round": 2,
+       "key": 7,
+       "ms": 66.563,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 8,
+       "ms": 0.859,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 9,
+       "ms": 124.103,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=123"
+      },
+      {
+       "round": 2,
+       "key": 11,
+       "ms": 60.844,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 12,
+       "ms": 0.691,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 13,
+       "ms": 110.349,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=109"
+      },
+      {
+       "round": 2,
+       "key": 14,
+       "ms": 9.072,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 2,
+       "key": 15,
+       "ms": 60.691,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 16,
+       "ms": 3.95,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 17,
+       "ms": 206.044,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=191"
+      },
+      {
+       "round": 2,
+       "key": 18,
+       "ms": 65.986,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=40"
+      },
+      {
+       "round": 2,
+       "key": 19,
+       "ms": 37.066,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 20,
+       "ms": 4.06,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 21,
+       "ms": 112.969,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=111"
+      },
+      {
+       "round": 2,
+       "key": 22,
+       "ms": 11.397,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=5"
+      },
+      {
+       "round": 2,
+       "key": 23,
+       "ms": 34.132,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 24,
+       "ms": 5.562,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 25,
+       "ms": 4.77,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 2,
+       "key": 26,
+       "ms": 4.169,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 2,
+       "key": 27,
+       "ms": 5.177,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 28,
+       "ms": 5.299,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 29,
+       "ms": 4.943,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 30,
+       "ms": 5.486,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 31,
+       "ms": 4.314,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 32,
+       "ms": 35.949,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 33,
+       "ms": 4.985,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 34,
+       "ms": 6.143,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 35,
+       "ms": 4.548,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 36,
+       "ms": 47.559,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 37,
+       "ms": 6.22,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 2,
+       "key": 38,
+       "ms": 4.607,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 2,
+       "key": 39,
+       "ms": 41.509,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 40,
+       "ms": 5.435,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 41,
+       "ms": 6.502,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 42,
+       "ms": 76.639,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=75"
+      },
+      {
+       "round": 2,
+       "key": 43,
+       "ms": 11.029,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=2 files=1 ms=6"
+      },
+      {
+       "round": 2,
+       "key": 44,
+       "ms": 39.794,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 45,
+       "ms": 4.047,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 46,
+       "ms": 4.474,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 47,
+       "ms": 4.552,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 48,
+       "ms": 9.997,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 49,
+       "ms": 117.116,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=115"
+      },
+      {
+       "round": 2,
+       "key": 50,
+       "ms": 56.965,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 51,
+       "ms": 4.085,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 52,
+       "ms": 96.592,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=95"
+      },
+      {
+       "round": 2,
+       "key": 53,
+       "ms": 7.854,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 54,
+       "ms": 58.16,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 55,
+       "ms": 4.068,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 56,
+       "ms": 115.986,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=114"
+      },
+      {
+       "round": 2,
+       "key": 57,
+       "ms": 9.524,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 2,
+       "key": 58,
+       "ms": 63.983,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 59,
+       "ms": 5.447,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 60,
+       "ms": 104.692,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=103"
+      },
+      {
+       "round": 2,
+       "key": 61,
+       "ms": 7.449,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 62,
+       "ms": 54.701,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 2,
+       "key": 63,
+       "ms": 99.978,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=98"
+      },
+      {
+       "round": 2,
+       "key": 64,
+       "ms": 4.811,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 65,
+       "ms": 65.371,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 66,
+       "ms": 1.177,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 67,
+       "ms": 120.168,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=118"
+      },
+      {
+       "round": 2,
+       "key": 68,
+       "ms": 63.963,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 69,
+       "ms": 1.317,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 70,
+       "ms": 18.664,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 71,
+       "ms": 16.569,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 72,
+       "ms": 15.395,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 73,
+       "ms": 140.645,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=137"
+      },
+      {
+       "round": 2,
+       "key": 74,
+       "ms": 13.95,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 2,
+       "key": 75,
+       "ms": 8.491,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=5 files=1 ms=7"
+      },
+      {
+       "round": 2,
+       "key": 76,
+       "ms": 37.86,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 77,
+       "ms": 5.003,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 78,
+       "ms": 113.549,
+       "answer": "ok object=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/blaze.o functions=2 files=1 ms=112"
+      },
+      {
+       "round": 2,
+       "key": 79,
+       "ms": 8.768,
+       "answer": "ok patch=blaze/9537560eac40bfb2/programs/liveprobe-55082a5dd5b7a1b5/patch.o functions=0 files=1 ms=4"
+      }
+     ]
+    },
+    "restart": {
+     "body applied": 6,
+     "type restart": 2,
+     "edits": 8,
+     "session": [
+      {
+       "edit": "scale: another factor",
+       "kind": "body",
+       "reply": 7.256,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 7.418
+      },
+      {
+       "edit": "weigh<T>: start at one",
+       "kind": "body",
+       "reply": 5.826,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 5.952
+      },
+      {
+       "edit": "Tally: a field added",
+       "kind": "type",
+       "reply": 8.665,
+       "answer": "ok patch=<tmp>",
+       "outcome": "restart",
+       "why": "the edit changes `struct Tally`, which the running program may have values of",
+       "restart": 137.464,
+       "cargo run": 369.895
+      },
+      {
+       "edit": "scale: back",
+       "kind": "body",
+       "reply": 8.104,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 8.116
+      },
+      {
+       "edit": "weigh<T>: back",
+       "kind": "body",
+       "reply": 8.905,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 9.159
+      },
+      {
+       "edit": "scale: a sum",
+       "kind": "body",
+       "reply": 6.503,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 6.727
+      },
+      {
+       "edit": "Tally: the field's type changed",
+       "kind": "type",
+       "reply": 9.882,
+       "answer": "ok patch=<tmp>",
+       "outcome": "restart",
+       "why": "the edit changes `struct Tally`, which the running program may have values of",
+       "restart": 156.835,
+       "cargo run": 400.833
+      },
+      {
+       "edit": "scale: back again",
+       "kind": "body",
+       "reply": 8.89,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 9.208
+      }
+     ]
+    }
+   }
+  },
+  {
+   "date": "2026-10-20T23:57:39Z",
+   "commit": "140f90a58285b350b11b313cdc46b4bacca7f604",
+   "battery": "AC",
+   "load at start": 25.33,
+   "load at end": 32.42,
+   "rows": {
+    "socket": 20,
+    "burst": 100,
+    "replay": 86,
+    "cargo-run": 2,
+    "restart": 2
+   },
+   "counts": {
+    "replay": {
+     "answer error": 156,
+     "answer no program built": 9,
+     "answer object": 41,
+     "answer patch": 38,
+     "answer unchanged": 1,
+     "asked after": 10,
+     "keys": 244,
+     "keys never run": 1,
+     "keys run by a patch": 2,
+     "keys run by a restart": 84,
+     "keys that compile": 87,
+     "keys that do not compile": 157,
+     "patch for no program (the executable was linked again)": 36,
+     "restarts": [
+      {
+       "key": 3,
+       "started": 1792540684099033,
+       "running": 1792540684226778,
+       "total": 127.745
+      },
+      {
+       "key": 9,
+       "started": 1792540684691918,
+       "running": 1792540684821102,
+       "total": 129.184
+      },
+      {
+       "key": 13,
+       "started": 1792540685553223,
+       "running": 1792540685726619,
+       "total": 173.396
+      },
+      {
+       "key": 17,
+       "started": 1792540686360079,
+       "running": 1792540686494764,
+       "total": 134.685
+      },
+      {
+       "key": 18,
+       "started": 1792540686495064,
+       "running": 1792540686514408,
+       "total": 19.344
+      },
+      {
+       "key": 21,
+       "started": 1792540686918432,
+       "running": 1792540687111736,
+       "total": 193.304
+      },
+      {
+       "key": 22,
+       "started": 1792540687112072,
+       "running": 1792540687131545,
+       "total": 19.473
+      },
+      {
+       "key": 44,
+       "started": 1792540689213682,
+       "running": 1792540689403039,
+       "total": 189.357
+      },
+      {
+       "key": 54,
+       "started": 1792540689874984,
+       "running": 1792540690003465,
+       "total": 128.481
+      },
+      {
+       "key": 58,
+       "started": 1792540690170903,
+       "running": 1792540690334949,
+       "total": 164.046
+      },
+      {
+       "key": 62,
+       "started": 1792540690405503,
+       "running": 1792540690531350,
+       "total": 125.847
+      },
+      {
+       "key": 65,
+       "started": 1792540690612405,
+       "running": 1792540690781695,
+       "total": 169.29
+      },
+      {
+       "key": 66,
+       "started": 1792540690782101,
+       "running": 1792540690803978,
+       "total": 21.877
+      },
+      {
+       "key": 75,
+       "started": 1792540691442749,
+       "running": 1792540691593606,
+       "total": 150.857
+      },
+      {
+       "key": 76,
+       "started": 1792540691593899,
+       "running": 1792540691616510,
+       "total": 22.611
+      },
+      {
+       "key": 80,
+       "started": 1792540692090086,
+       "running": 1792540692217095,
+       "total": 127.009
+      },
+      {
+       "key": 81,
+       "started": 1792540692217472,
+       "running": 1792540692244078,
+       "total": 26.606
+      },
+      {
+       "key": 2,
+       "started": 1792540694731749,
+       "running": 1792540694855419,
+       "total": 123.67
+      },
+      {
+       "key": 3,
+       "started": 1792540694855759,
+       "running": 1792540695168066,
+       "total": 312.307
+      },
+      {
+       "key": 9,
+       "started": 1792540695260037,
+       "running": 1792540695385850,
+       "total": 125.813
+      },
+      {
+       "key": 10,
+       "started": 1792540695386138,
+       "running": 1792540695408696,
+       "total": 22.558
+      },
+      {
+       "key": 13,
+       "started": 1792540695930507,
+       "running": 1792540696115558,
+       "total": 185.051
+      },
+      {
+       "key": 14,
+       "started": 1792540696115857,
+       "running": 1792540696138966,
+       "total": 23.109
+      },
+      {
+       "key": 17,
+       "started": 1792540696785308,
+       "running": 1792540696912785,
+       "total": 127.477
+      },
+      {
+       "key": 18,
+       "started": 1792540696913088,
+       "running": 1792540696935727,
+       "total": 22.639
+      },
+      {
+       "key": 21,
+       "started": 1792540697906512,
+       "running": 1792540698036884,
+       "total": 130.372
+      },
+      {
+       "key": 44,
+       "started": 1792540700411589,
+       "running": 1792540700538716,
+       "total": 127.127
+      },
+      {
+       "key": 62,
+       "started": 1792540701530376,
+       "running": 1792540701654910,
+       "total": 124.534
+      },
+      {
+       "key": 65,
+       "started": 1792540701733554,
+       "running": 1792540701859098,
+       "total": 125.544
+      },
+      {
+       "key": 66,
+       "started": 1792540701859419,
+       "running": 1792540701882808,
+       "total": 23.389
+      },
+      {
+       "key": 75,
+       "started": 1792540702625269,
+       "running": 1792540702833470,
+       "total": 208.201
+      },
+      {
+       "key": 76,
+       "started": 1792540702833869,
+       "running": 1792540702857554,
+       "total": 23.685
+      },
+      {
+       "key": 80,
+       "started": 1792540703486843,
+       "running": 1792540703638606,
+       "total": 151.763
+      },
+      {
+       "key": 81,
+       "started": 1792540703639020,
+       "running": 1792540703664782,
+       "total": 25.762
+      },
+      {
+       "key": 17,
+       "started": 1792540707794589,
+       "running": 1792540707922625,
+       "total": 128.036
+      },
+      {
+       "key": 18,
+       "started": 1792540707922941,
+       "running": 1792540707945273,
+       "total": 22.332
+      },
+      {
+       "key": 21,
+       "started": 1792540708228263,
+       "running": 1792540708357693,
+       "total": 129.43
+      },
+      {
+       "key": 42,
+       "started": 1792540710298695,
+       "running": 1792540710445103,
+       "total": 146.408
+      },
+      {
+       "key": 52,
+       "started": 1792540711327918,
+       "running": 1792540711494996,
+       "total": 167.078
+      },
+      {
+       "key": 60,
+       "started": 1792540711960134,
+       "running": 1792540712090389,
+       "total": 130.255
+      },
+      {
+       "key": 63,
+       "started": 1792540712160614,
+       "running": 1792540712359851,
+       "total": 199.237
+      },
+      {
+       "key": 73,
+       "started": 1792540712911742,
+       "running": 1792540713096700,
+       "total": 184.958
+      },
+      {
+       "key": 75,
+       "started": 1792540713097349,
+       "running": 1792540713230001,
+       "total": 132.652
+      },
+      {
+       "key": 78,
+       "started": 1792540713422690,
+       "running": 1792540713596878,
+       "total": 174.188
+      }
+     ],
+     "restarts asked by the answer": 41,
+     "restarts asked by the program": 20,
+     "restarts the program was told": 20,
+     "sent": 236,
+     "answers": [
+      {
+       "round": 0,
+       "key": 4,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 0,
+       "key": 0,
+       "ms": 223.384,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 3,
+       "ms": 121.56,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=120"
+      },
+      {
+       "round": 0,
+       "key": 5,
+       "ms": 4.466,
+       "answer": "ok unchanged"
+      },
+      {
+       "round": 0,
+       "key": 6,
+       "ms": 5.179,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 0,
+       "key": 7,
+       "ms": 70.148,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 8,
+       "ms": 4.371,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 9,
+       "ms": 92.654,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=91"
+      },
+      {
+       "round": 0,
+       "key": 10,
+       "ms": 7.594,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 11,
+       "ms": 55.105,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 12,
+       "ms": 3.596,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 13,
+       "ms": 134.965,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=133"
+      },
+      {
+       "round": 0,
+       "key": 14,
+       "ms": 7.555,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 15,
+       "ms": 58.882,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 16,
+       "ms": 3.574,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 17,
+       "ms": 104.557,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=103"
+      },
+      {
+       "round": 0,
+       "key": 18,
+       "ms": 7.154,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 0,
+       "key": 19,
+       "ms": 32.26,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 20,
+       "ms": 3.592,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 21,
+       "ms": 87.601,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=86"
+      },
+      {
+       "round": 0,
+       "key": 22,
+       "ms": 6.478,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 23,
+       "ms": 40.996,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 24,
+       "ms": 5.22,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 25,
+       "ms": 3.328,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 0,
+       "key": 26,
+       "ms": 5.03,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 0,
+       "key": 27,
+       "ms": 5.405,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 28,
+       "ms": 4.936,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 29,
+       "ms": 4.755,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 30,
+       "ms": 5.096,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 31,
+       "ms": 4.448,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 32,
+       "ms": 4.488,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 33,
+       "ms": 10.498,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 34,
+       "ms": 58.852,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 35,
+       "ms": 4.779,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 36,
+       "ms": 6.541,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 37,
+       "ms": 4.896,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 38,
+       "ms": 32.872,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 39,
+       "ms": 4.025,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 0,
+       "key": 40,
+       "ms": 3.772,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 0,
+       "key": 41,
+       "ms": 32.689,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 42,
+       "ms": 4.477,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 43,
+       "ms": 5.185,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 0,
+       "key": 44,
+       "ms": 56.861,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=55"
+      },
+      {
+       "round": 0,
+       "key": 45,
+       "ms": 6.164,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=2"
+      },
+      {
+       "round": 0,
+       "key": 46,
+       "ms": 27.299,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 47,
+       "ms": 3.273,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 48,
+       "ms": 3.959,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 49,
+       "ms": 4.515,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 50,
+       "ms": 4.637,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 51,
+       "ms": 85.21,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=84"
+      },
+      {
+       "round": 0,
+       "key": 52,
+       "ms": 45.817,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 53,
+       "ms": 3.019,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 54,
+       "ms": 79.345,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=78"
+      },
+      {
+       "round": 0,
+       "key": 55,
+       "ms": 5.733,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=2"
+      },
+      {
+       "round": 0,
+       "key": 56,
+       "ms": 50.059,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 57,
+       "ms": 4.043,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 58,
+       "ms": 87.771,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=86"
+      },
+      {
+       "round": 0,
+       "key": 59,
+       "ms": 7.458,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 60,
+       "ms": 49.813,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 61,
+       "ms": 4.363,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 62,
+       "ms": 103.529,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=102"
+      },
+      {
+       "round": 0,
+       "key": 63,
+       "ms": 7.752,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 64,
+       "ms": 54.925,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 0,
+       "key": 65,
+       "ms": 105.837,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=104"
+      },
+      {
+       "round": 0,
+       "key": 66,
+       "ms": 8.551,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+      },
+      {
+       "round": 0,
+       "key": 67,
+       "ms": 60.693,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 68,
+       "ms": 4.244,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 69,
+       "ms": 113.173,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=112"
+      },
+      {
+       "round": 0,
+       "key": 70,
+       "ms": 40.18,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 71,
+       "ms": 5.185,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 72,
+       "ms": 22.945,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 0,
+       "key": 73,
+       "ms": 7.757,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 74,
+       "ms": 4.911,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 75,
+       "ms": 131.75,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=130"
+      },
+      {
+       "round": 0,
+       "key": 76,
+       "ms": 7.765,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 0,
+       "key": 77,
+       "ms": 11.197,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=10"
+      },
+      {
+       "round": 0,
+       "key": 78,
+       "ms": 55.453,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 79,
+       "ms": 14.473,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 0,
+       "key": 80,
+       "ms": 158.399,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=157"
+      },
+      {
+       "round": 0,
+       "key": 81,
+       "ms": 10.771,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 1,
+       "key": 52,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 54,
+       "asked after": true,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=135"
+      },
+      {
+       "round": 1,
+       "key": 0,
+       "ms": 59.539,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 1,
+       "ms": 4.625,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 2,
+       "ms": 114.603,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
+      },
+      {
+       "round": 1,
+       "key": 3,
+       "ms": 7.769,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 4,
+       "ms": 59.197,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 1,
+       "key": 5,
+       "ms": 130.348,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=129"
+      },
+      {
+       "round": 1,
+       "key": 6,
+       "ms": 0.694,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 7,
+       "ms": 85.21,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 8,
+       "ms": 3.843,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 9,
+       "ms": 118.503,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=117"
+      },
+      {
+       "round": 1,
+       "key": 10,
+       "ms": 10.804,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+      },
+      {
+       "round": 1,
+       "key": 11,
+       "ms": 70.969,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 12,
+       "ms": 17.983,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 13,
+       "ms": 127.33,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=126"
+      },
+      {
+       "round": 1,
+       "key": 14,
+       "ms": 12.3,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=6"
+      },
+      {
+       "round": 1,
+       "key": 15,
+       "ms": 65.754,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 16,
+       "ms": 4.529,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 17,
+       "ms": 132.917,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=131"
+      },
+      {
+       "round": 1,
+       "key": 18,
+       "ms": 9.633,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 1,
+       "key": 19,
+       "ms": 53.626,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 20,
+       "ms": 17.174,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 21,
+       "ms": 114.421,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
+      },
+      {
+       "round": 1,
+       "key": 22,
+       "ms": 8.971,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 23,
+       "ms": 42.437,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 24,
+       "ms": 4.692,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 25,
+       "ms": 4.129,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 1,
+       "key": 26,
+       "ms": 4.221,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 1,
+       "key": 27,
+       "ms": 4.861,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 28,
+       "ms": 4.678,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 29,
+       "ms": 4.565,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 30,
+       "ms": 4.611,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 31,
+       "ms": 15.204,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 32,
+       "ms": 5.608,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 33,
+       "ms": 5.03,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 34,
+       "ms": 41.664,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 35,
+       "ms": 5.441,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 36,
+       "ms": 11.12,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 37,
+       "ms": 5.381,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 38,
+       "ms": 42.931,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 39,
+       "ms": 4.216,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 1,
+       "key": 40,
+       "ms": 4.254,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 1,
+       "key": 41,
+       "ms": 42.858,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 42,
+       "ms": 4.595,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 43,
+       "ms": 6.268,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 1,
+       "key": 44,
+       "ms": 82.884,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=81"
+      },
+      {
+       "round": 1,
+       "key": 45,
+       "ms": 10.183,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=5"
+      },
+      {
+       "round": 1,
+       "key": 46,
+       "ms": 38.191,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 47,
+       "ms": 4.537,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 48,
+       "ms": 13.25,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 49,
+       "ms": 5.542,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 50,
+       "ms": 6.179,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 51,
+       "ms": 140.467,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=139"
+      },
+      {
+       "round": 1,
+       "key": 53,
+       "ms": 68.201,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 54,
+       "ms": 0.525,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 55,
+       "ms": 103.426,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=102"
+      },
+      {
+       "round": 1,
+       "key": 56,
+       "ms": 67.433,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 57,
+       "ms": 4.394,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 58,
+       "ms": 108.51,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
+      },
+      {
+       "round": 1,
+       "key": 59,
+       "ms": 9.879,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 1,
+       "key": 60,
+       "ms": 62.137,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 61,
+       "ms": 0.636,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 1,
+       "key": 62,
+       "ms": 111.459,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=110"
+      },
+      {
+       "round": 1,
+       "key": 63,
+       "ms": 9.127,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 1,
+       "key": 64,
+       "ms": 59.378,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 1,
+       "key": 65,
+       "ms": 127.191,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=125"
+      },
+      {
+       "round": 1,
+       "key": 66,
+       "ms": 12.656,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=8"
+      },
+      {
+       "round": 1,
+       "key": 67,
+       "ms": 69.256,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 68,
+       "ms": 4.091,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 69,
+       "ms": 109.291,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=108"
+      },
+      {
+       "round": 1,
+       "key": 70,
+       "ms": 56.907,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 71,
+       "ms": 5.607,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 72,
+       "ms": 7.903,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 1,
+       "key": 73,
+       "ms": 8.25,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 74,
+       "ms": 5.398,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 75,
+       "ms": 133.302,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=132"
+      },
+      {
+       "round": 1,
+       "key": 76,
+       "ms": 12.223,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=4"
+      },
+      {
+       "round": 1,
+       "key": 77,
+       "ms": 7.911,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
+      },
+      {
+       "round": 1,
+       "key": 78,
+       "ms": 50.362,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 79,
+       "ms": 5.227,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 1,
+       "key": 80,
+       "ms": 150.755,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=148"
+      },
+      {
+       "round": 1,
+       "key": 81,
+       "ms": 8.078,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 3,
+       "asked after": true,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 9,
+       "asked after": true,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=1 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 11,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 13,
+       "asked after": true,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=80"
+      },
+      {
+       "round": 2,
+       "key": 15,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 51,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 69,
+       "asked after": true,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 0,
+       "ms": 79.217,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 1,
+       "ms": 4.727,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 2,
+       "ms": 139.351,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=138"
+      },
+      {
+       "round": 2,
+       "key": 4,
+       "ms": 77.4,
+       "answer": "error: harness/live/src/main.rs:25:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 2,
+       "key": 5,
+       "ms": 0.985,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 6,
+       "ms": 128.994,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=127"
+      },
+      {
+       "round": 2,
+       "key": 7,
+       "ms": 78.94,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 9,
+       "ms": 0.929,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 10,
+       "ms": 127.669,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=126"
+      },
+      {
+       "round": 2,
+       "key": 12,
+       "ms": 72.607,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 13,
+       "ms": 0.738,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 14,
+       "ms": 113.33,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=112"
+      },
+      {
+       "round": 2,
+       "key": 16,
+       "ms": 70.812,
+       "answer": "error: harness/live/src/main.rs:24: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 17,
+       "ms": 119.959,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=119"
+      },
+      {
+       "round": 2,
+       "key": 18,
+       "ms": 9.234,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 19,
+       "ms": 43.27,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 20,
+       "ms": 5.387,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 21,
+       "ms": 133.652,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=132"
+      },
+      {
+       "round": 2,
+       "key": 22,
+       "ms": 8.164,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 23,
+       "ms": 45.857,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 24,
+       "ms": 5.007,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 25,
+       "ms": 8.15,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 2,
+       "key": 26,
+       "ms": 5.49,
+       "answer": "error: harness/live/src/main.rs:17: expected pattern"
+      },
+      {
+       "round": 2,
+       "key": 27,
+       "ms": 5.956,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 28,
+       "ms": 6.099,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 29,
+       "ms": 16.502,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 30,
+       "ms": 5.809,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 31,
+       "ms": 3.831,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 32,
+       "ms": 38.681,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 33,
+       "ms": 3.859,
+       "answer": "error: harness/live/src/main.rs:19: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 34,
+       "ms": 7.121,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 35,
+       "ms": 4.522,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 36,
+       "ms": 44.413,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 37,
+       "ms": 4.494,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 2,
+       "key": 38,
+       "ms": 4.497,
+       "answer": "error: harness/live/src/main.rs:17: expected `<`"
+      },
+      {
+       "round": 2,
+       "key": 39,
+       "ms": 62.26,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 40,
+       "ms": 26.324,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 41,
+       "ms": 6.64,
+       "answer": "error: harness/live/src/main.rs:16: expected SEMICOLON"
+      },
+      {
+       "round": 2,
+       "key": 42,
+       "ms": 77.449,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=76"
+      },
+      {
+       "round": 2,
+       "key": 43,
+       "ms": 9.517,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=2 files=1 ms=4"
+      },
+      {
+       "round": 2,
+       "key": 44,
+       "ms": 54.591,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 45,
+       "ms": 5.008,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 46,
+       "ms": 5.455,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 47,
+       "ms": 5.019,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 48,
+       "ms": 5.546,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 49,
+       "ms": 112.569,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=111"
+      },
+      {
+       "round": 2,
+       "key": 50,
+       "ms": 68.085,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 51,
+       "ms": 0.692,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 52,
+       "ms": 114.46,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=113"
+      },
+      {
+       "round": 2,
+       "key": 53,
+       "ms": 12.037,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=5"
+      },
+      {
+       "round": 2,
+       "key": 54,
+       "ms": 64.151,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 55,
+       "ms": 4.61,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 56,
+       "ms": 141.757,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=139"
+      },
+      {
+       "round": 2,
+       "key": 57,
+       "ms": 7.919,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 58,
+       "ms": 98.257,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 59,
+       "ms": 0.677,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 60,
+       "ms": 108.111,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
+      },
+      {
+       "round": 2,
+       "key": 61,
+       "ms": 15.003,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=7"
+      },
+      {
+       "round": 2,
+       "key": 62,
+       "ms": 54.469,
+       "answer": "error: harness/live/src/main.rs:26:1: expected u64, found () [E0308]"
+      },
+      {
+       "round": 2,
+       "key": 63,
+       "ms": 108.301,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=107"
+      },
+      {
+       "round": 2,
+       "key": 64,
+       "ms": 8.309,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 65,
+       "ms": 67.086,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 66,
+       "ms": 5.019,
+       "answer": "error: harness/live/src/main.rs:25: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 67,
+       "ms": 152.905,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=151"
+      },
+      {
+       "round": 2,
+       "key": 68,
+       "ms": 73.179,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 69,
+       "ms": 1.029,
+       "answer": "error: no program built has harness/live/src/main.rs"
+      },
+      {
+       "round": 2,
+       "key": 70,
+       "ms": 27.48,
+       "answer": "error: harness/live/src/main.rs:20:13: no such value in this scope [E0425]"
+      },
+      {
+       "round": 2,
+       "key": 71,
+       "ms": 24.915,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 72,
+       "ms": 21.083,
+       "answer": "error: harness/live/src/main.rs:20: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 73,
+       "ms": 160.604,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=159"
+      },
+      {
+       "round": 2,
+       "key": 74,
+       "ms": 8.434,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      },
+      {
+       "round": 2,
+       "key": 75,
+       "ms": 7.611,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=5 files=1 ms=6"
+      },
+      {
+       "round": 2,
+       "key": 76,
+       "ms": 47.793,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 77,
+       "ms": 5.336,
+       "answer": "error: harness/live/src/main.rs:17: expected expression"
+      },
+      {
+       "round": 2,
+       "key": 78,
+       "ms": 149.175,
+       "answer": "ok object=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/blaze.o functions=2 files=1 ms=148"
+      },
+      {
+       "round": 2,
+       "key": 79,
+       "ms": 7.92,
+       "answer": "ok patch=blaze/7571fe3ada6aa0be/programs/liveprobe-12a8c531d2244f2c/patch.o functions=0 files=1 ms=3"
+      }
+     ]
+    },
+    "restart": {
+     "body applied": 6,
+     "type restart": 2,
+     "edits": 8,
+     "session": [
+      {
+       "edit": "scale: another factor",
+       "kind": "body",
+       "reply": 4.402,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 4.536
+      },
+      {
+       "edit": "weigh<T>: start at one",
+       "kind": "body",
+       "reply": 5.706,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 5.96
+      },
+      {
+       "edit": "Tally: a field added",
+       "kind": "type",
+       "reply": 8.792,
+       "answer": "ok patch=<tmp>",
+       "outcome": "restart",
+       "why": "the edit changes `struct Tally`, which the running program may have values of",
+       "restart": 185.744,
+       "cargo run": 307.507
+      },
+      {
+       "edit": "scale: back",
+       "kind": "body",
+       "reply": 5.343,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 5.599
+      },
+      {
+       "edit": "weigh<T>: back",
+       "kind": "body",
+       "reply": 5.913,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 6.193
+      },
+      {
+       "edit": "scale: a sum",
+       "kind": "body",
+       "reply": 5.666,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 5.992
+      },
+      {
+       "edit": "Tally: the field's type changed",
+       "kind": "type",
+       "reply": 8.627,
+       "answer": "ok patch=<tmp>",
+       "outcome": "restart",
+       "why": "the edit changes `struct Tally`, which the running program may have values of",
+       "restart": 201.827,
+       "cargo run": 264.974
+      },
+      {
+       "edit": "scale: back again",
+       "kind": "body",
+       "reply": 4.411,
+       "answer": "ok patch=<tmp>",
+       "outcome": "applied",
+       "total": 4.504
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

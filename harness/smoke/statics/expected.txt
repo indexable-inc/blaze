@@ -1,0 +1,5 @@
+hits 8
+total 36
+events [1, 2, 3, 4, 5, 6, 7, 8]
+config config-3 [8, 8, 8, 8, 8, 8, 8, 8]
+table {1: "one", 2: "two", 3: "three"}

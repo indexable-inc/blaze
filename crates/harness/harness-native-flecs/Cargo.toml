@@ -1,0 +1,30 @@
+[package]
+name = "harness-native-flecs"
+description = "den-native's world API over hyperion-ecs: components found by world name and layout hash, entity views, queries, systems, scripts; no flecs C linked here, so host and module images share the host's one flecs (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[features]
+# `WorldRef::schema_json` and `query_json` (src/reflect.rs): needs the flecs a binary links to have its json addon
+# (hyperion-flecs-c's `json`), so it is off until that binary turns both on.
+json = []
+
+[dependencies]
+harness-native-flecs-derive = { path = "../harness-native-flecs-derive" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
+hyperion-ecs-core = { path = "../vendor/hyperion-ecs-core" }
+hyperion-layout = { path = "../vendor/hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-panic = { path = "../vendor/hyperion-panic" }
+inventory = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+# Talks to flecs: every unsafe block carries a SAFETY note.
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "warn"

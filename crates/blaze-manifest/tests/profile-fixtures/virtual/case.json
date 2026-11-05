@@ -1,0 +1,8 @@
+{
+ "cwd": "a",
+ "runs": [
+  {"args": ["test", "--release", "--no-run"]},
+  {"args": ["build", "--release", "--manifest-path", "../b/Cargo.toml"]},
+  {"args": ["build", "-p", "b"], "env": {"CARGO_INCREMENTAL": "1"}}
+ ]
+}

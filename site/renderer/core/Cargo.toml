@@ -1,0 +1,20 @@
+[package]
+name = "site-render"
+description = "The blaze site's renderer: a Flecs world of pages, comments and a viewer in, one page's HTML out. Sans-IO: no files, clock or globals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Run the content scripts in a Flecs world (flecs-opinionated, Flecs's C) and snapshot it. Native build time only:
+# hosts load the snapshot instead, so the wasm module carries no C.
+scripts = ["dep:flecs-snapshot"]
+
+[dependencies]
+ipld-core.workspace = true
+serde.workspace = true
+serde_ipld_dagcbor.workspace = true
+ciborium.workspace = true
+regex-lite.workspace = true
+flecs-snapshot = { workspace = true, optional = true }

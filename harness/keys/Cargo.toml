@@ -1,0 +1,6 @@
+[workspace]
+members = ["kapp", "klib", "kdep"]
+resolver = "2"
+
+[workspace.lints.rust]
+unexpected_cfgs = "allow"

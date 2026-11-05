@@ -1,0 +1,263 @@
+//! Transform method calls on `&dyn Trait` to vtable function pointer calls.
+//!
+//! This pass converts direct method calls on trait objects into calls through vtable
+//! function pointers. For example:
+//!
+//! ```rust,ignore
+//! let x: &dyn Trait = &obj;
+//! x.method(args);
+//! ```
+//!
+//! is transformed from:
+//! ```text
+//! @0 := call <dyn Trait as Trait>::method(x, args)
+//! ```
+//! to:
+//! ```text
+//! @0 := (move (*@receiver.ptr_metadata).method_check)(move (@receiver), move (@args)) // Call through function pointer
+//! ```
+use super::super::ctx::UllbcPass;
+use crate::{
+    errors::Error,
+    formatter::IntoFormatter,
+    pretty::FmtWithCtx,
+    raise_error, register_error,
+    transform::{
+        TransformCtx,
+        ctx::{BodyTransformCtx, UllbcStatementTransformCtx},
+    },
+    ullbc_ast::*,
+};
+
+/// Transform a call to a trait method on a dyn trait object
+fn transform_dyn_trait_call(
+    ctx: &mut UllbcStatementTransformCtx<'_>,
+    call: &mut Call,
+    dest: &Place,
+) -> Result<(), Error> {
+    let fmt_ctx = &ctx.ctx.into_fmt();
+
+    // Detect if this call should be transformed
+    let FnOperand::Regular(fn_ptr) = &call.func else {
+        return Ok(()); // Not a regular function call
+    };
+    let FnPtrKind::Trait(trait_ref, method_id) = fn_ptr.kind.as_ref() else {
+        return Ok(()); // Not a trait method call
+    };
+    let mut dyn_proof = trait_ref;
+    let mut supertrait_path = vec![];
+    while let TraitRefKind::ParentClause(parent, clause_id, _) = &dyn_proof.kind {
+        supertrait_path.push(*clause_id);
+        dyn_proof = parent;
+    }
+    let TraitRefKind::Dyn = &dyn_proof.kind else {
+        return Ok(()); // Not a dyn trait trait call
+    };
+    supertrait_path.reverse();
+
+    // The drop glue of the `Destruct` implied clause is the drop function, which
+    // we must manually desugar, because `Destruct` is not dyn-compatible.
+    let is_drop_glue = ctx
+        .ctx
+        .translated
+        .trait_decls
+        .get(trait_ref.trait_id())
+        .and_then(|decl| decl.item_meta.lang_item.as_ref())
+        == Some(&from_rustc::LangItem::Destruct);
+
+    let vtable_tref = if is_drop_glue {
+        supertrait_path.clear(); // we actually don't need to go up; the drop is here!
+        dyn_proof
+    } else {
+        trait_ref
+    };
+
+    // Get the type of the vtable struct.
+    let vtable_decl_ref: TypeDeclRef = {
+        // Get the trait declaration by its ID
+        let Some(trait_decl) = ctx.ctx.translated.trait_decls.get(vtable_tref.trait_id()) else {
+            return Ok(()); // Unknown trait
+        };
+        // Get vtable ref from definition for correct ID.
+        let Some(vtable_ty) = &trait_decl.vtable else {
+            raise_error!(
+                ctx.ctx,
+                ctx.span,
+                "Found a `dyn Trait` method call for non-dyn-compatible trait `{}`!",
+                vtable_tref.trait_id().with_ctx(fmt_ctx)
+            );
+        };
+        vtable_ty.clone().substitute_with_tref(vtable_tref)
+    };
+
+    let Some(vtable_decl) = ctx.ctx.translated.type_decls.get(vtable_decl_ref.id) else {
+        return Ok(()); // Missing data
+    };
+
+    let TypeDeclKind::Struct(fields) = &vtable_decl.kind else {
+        return Ok(()); // Missing data
+    };
+    let TypeSource::VTable { field_map, .. } = &vtable_decl.src else {
+        return Ok(()); // Weird
+    };
+    // Retrieve the target field from the vtable struct definition.
+    let Some((method_field_id, target_field)) =
+        field_map.iter_enumerated().find(|(_, field)| match field {
+            VTableField::Drop => is_drop_glue,
+            VTableField::Method(id, _) => !is_drop_glue && id == method_id,
+            _ => false,
+        })
+    else {
+        let vtable_name = vtable_decl_ref.id.with_ctx(fmt_ctx).to_string();
+        raise_error!(
+            ctx.ctx,
+            ctx.span,
+            "Could not determine method index for method {} in vtable {}",
+            method_id,
+            vtable_name
+        );
+    };
+
+    let receiver_path = match target_field {
+        VTableField::Method(_, path) => path.clone(),
+        _ => vec![],
+    };
+
+    let method_field = &fields[method_field_id];
+    let method_ty = method_field.ty.clone().substitute(&vtable_decl_ref.generics);
+
+    // Get the receiver (first argument).
+    if call.args.is_empty() {
+        raise_error!(ctx.ctx, ctx.span, "Dyn trait call has no arguments!");
+    }
+    let mut dyn_trait_place = match &call.args[0] {
+        Operand::Copy(place) | Operand::Move(place) => place.clone(),
+        Operand::Const(_) => {
+            panic!("Unexpected constant as receiver for dyn trait method call")
+        }
+    };
+
+    // Rustc may move the unsized first argument of by-value dyn call into a temporary local,
+    // e.g. for `StructWithTail<dyn T>>` and `b.field.by_value()`, we get `_15 = move (*b).field; by_value(move _15)`.
+    // That's an unsized local, which we is not supposed to happen. To avoid that we inline the
+    // place back into the call, giving us: `by_value(move (*b).field)`.
+    if let TyKind::DynTrait(..) = dyn_trait_place.ty().kind()
+        && let PlaceKind::Local(local) = dyn_trait_place.kind
+        && let Some(last) = ctx.statements.last()
+        && let StatementKind::Assign(dest, Rvalue::Use(src, _)) = &last.kind
+        && let Operand::Copy(place) | Operand::Move(place) = src
+        && dest.local_id() == Some(local)
+    {
+        call.args[0] = src.clone();
+        dyn_trait_place = place.clone();
+        ctx.statements.pop();
+    }
+
+    // `dyn Trait` has a carveout for unsized `self` types. It works by calling the method on a place
+    // of type `dyn Trait` directly. The actual shim we generate expects `*mut dyn Trait`, so we must
+    // borrow that unsized place. See `dyn/mono-dyn-call-by-value.out`.
+    if let TyKind::DynTrait(..) = dyn_trait_place.ty().kind() {
+        let ptr_ty = TyKind::RawPtr(dyn_trait_place.ty().clone(), RefKind::Mut).into_ty();
+        let rvalue = ctx.raw_borrow(dyn_trait_place, RefKind::Mut);
+        dyn_trait_place = ctx.fresh_var(None, ptr_ty);
+        ctx.insert_assn_stmt(dyn_trait_place.clone(), rvalue);
+        call.args[0] = Operand::Move(dyn_trait_place.clone());
+    }
+
+    let dyn_pred = dyn_proof.trait_decl_ref.clone();
+    let dyn_ty = &dyn_pred.generics.types[0];
+    let PtrMetadata::VTable(receiver_vtable_ref) = dyn_ty.get_ptr_metadata(&ctx.ctx.translated)
+    else {
+        raise_error!(ctx.ctx, ctx.span, "Dyn trait receiver does not have vtable metadata");
+    };
+
+    let receiver_vtable_ty = TyKind::Adt(receiver_vtable_ref).into_ty();
+    let ptr_to_vtable_ty = Ty::new(TyKind::RawPtr(receiver_vtable_ty.clone(), RefKind::Shared));
+    let Some(receiver_ptr) = receiver_path.iter().try_fold(dyn_trait_place, |p, field| {
+        p.project_auto_ty(&ctx.ctx.translated, ProjectionElem::Field(None, *field))
+    }) else {
+        raise_error!(ctx.ctx, ctx.span, "Could not project into dyn receiver");
+    };
+    let mut method_vtable_place = receiver_ptr
+        .project(ProjectionElem::PtrMetadata, ptr_to_vtable_ty)
+        .project(ProjectionElem::Deref, receiver_vtable_ty);
+
+    for clause_id in supertrait_path {
+        let current_vtable_ref =
+            method_vtable_place.ty().as_adt().expect("vtable place should have an ADT type");
+        let current_vtable = ctx
+            .ctx
+            .translated
+            .type_decls
+            .get(current_vtable_ref.id)
+            .expect("vtable declaration should have been translated");
+        let TypeDeclKind::Struct(fields) = &current_vtable.kind else {
+            panic!("vtable declaration should be a struct")
+        };
+        let TypeSource::VTable { supertrait_map, .. } = &current_vtable.src else {
+            panic!("vtable declaration should have a vtable source")
+        };
+        let Some(supertrait_field_id) = supertrait_map[clause_id] else {
+            raise_error!(
+                ctx.ctx,
+                ctx.span,
+                "Dyn trait proof uses a parent clause without a vtable"
+            );
+        };
+        let field_ty =
+            fields[supertrait_field_id].ty.clone().substitute(&current_vtable_ref.generics);
+        method_vtable_place = method_vtable_place
+            .project(ProjectionElem::Field(None, supertrait_field_id), field_ty)
+            .deref();
+    }
+    let method_field_place =
+        method_vtable_place.project(ProjectionElem::Field(None, method_field_id), method_ty);
+
+    let fn_ptr_place = if ctx.ctx.options.monomorphize_with_hax {
+        // In mono mode, the vtable contains erased function pointers, cast to `*const ()`.
+        // This casts back to the expected signature.
+        let is_unsafe = is_drop_glue || call.safety.is_unsafe();
+        call.safety = if is_drop_glue { CallSafety::Safe } else { CallSafety::Inherit };
+        let real_sig_ty = TyKind::FnPtr(RegionBinder::empty(FunSig {
+            is_unsafe,
+            abi: Abi::rust(),
+            is_variadic: false,
+            inputs: call.args.iter().map(|op| op.ty().clone()).collect(),
+            output: dest.ty.clone(),
+        }))
+        .into_ty();
+        let fn_ptr_place = ctx.fresh_var(None, real_sig_ty);
+        let rval_cast = Rvalue::UnaryOp(
+            UnOp::Cast(CastKind::RawPtr(fn_ptr_place.ty().clone())),
+            Operand::Copy(method_field_place),
+        );
+        ctx.insert_assn_stmt(fn_ptr_place.clone(), rval_cast);
+        fn_ptr_place
+    } else {
+        method_field_place
+    };
+
+    // The function pointer in the vtable binds the method late-bound regions.
+    let TyKind::FnPtr(sig) = fn_ptr_place.ty().kind() else {
+        unreachable!("vtable method is not a function pointer")
+    };
+    let method_region_count = sig.regions.len();
+    let regions: RegionArgs =
+        fn_ptr.generics.regions.iter().rev().take(method_region_count).rev().cloned().collect();
+
+    // Transform the original call to use the function pointer.
+    call.func = FnOperand::Dynamic(Operand::Copy(fn_ptr_place), regions);
+
+    Ok(())
+}
+
+pub struct Transform;
+impl UllbcPass for Transform {
+    fn transform_function(&self, ctx: &mut TransformCtx, decl: &mut FunDecl) {
+        decl.transform_ullbc_terminators(ctx, |ctx, term| {
+            if let TerminatorKind::Call { call, dest, .. } = &mut term.kind {
+                let _ = transform_dyn_trait_call(ctx, call, dest);
+            }
+        });
+    }
+}

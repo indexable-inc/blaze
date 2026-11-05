@@ -1,0 +1,6 @@
+// Flecs rejects a reference to a Ref that does not exist.
+site {
+  missing : Doc {
+    (Cites, refs.no_such_ref)
+  }
+}

@@ -1,0 +1,45 @@
+[package]
+name = "blaze-item-hash"
+description = "blaze v2's item identities: the a-priori hash a body's inference, MIR and borrow check are filed under, what each read of them stands for, and the values of the facts their records are keyed by"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+
+la-arena.workspace = true
+smallvec.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-borrowck.workspace = true
+hir-ty-matchck.workspace = true
+span.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+parking_lot.workspace = true
+
+[lints]
+workspace = true

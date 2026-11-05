@@ -1,0 +1,83 @@
+/* The ix docs palette, dark and light, following the reader's system. Copied from ix packages/web/src/styles/site.css
+   (.site grayscale ladder and aliases, the light .site values), styles/theme.css (font stacks) and
+   lib/docs/Blocks.svelte (the red inline-code ink). */
+:root {
+	color-scheme: dark light;
+
+	--g-0: #0c0c0d;
+	--g-1: #101011;
+	--g-2: #141415;
+	--g-3: #19191a;
+	--g-4: #1f1f20;
+	--g-5: #28282a;
+	--g-6: #333335;
+	--g-7: #414143;
+	--g-8: #57575a;
+	--g-9: #727274;
+	--g-10: #929190;
+	--g-11: #b3b2af;
+	--g-12: #d4d3cf;
+	--g-13: #ebeae6;
+
+	--bg: var(--g-1);
+	--bg-2: var(--g-2);
+	--bg-3: var(--g-3);
+	--bg-4: var(--g-4);
+	--line: var(--g-5);
+	--line-2: var(--g-6);
+	--ink-1: var(--g-13);
+	--ink-2: var(--g-11);
+	--ink-3: #878684;
+	--ink-4: var(--g-8);
+
+	--code-bg: color-mix(in srgb, var(--g-2) 70%, var(--g-1));
+	--s-tint: color-mix(in srgb, var(--ink-1) 6%, transparent);
+
+	/* Colour carries meaning only: an error or a live status (site.css). */
+	--danger: #ff7168;
+	--ok: #4cc27a;
+
+	/* Chart series (renderer core chart.rs): a Subject's slot N is --series-N in every chart. 1 to 3 are orange, blue
+	   and aqua, checked with the dataviz palette validator against --bg in each scheme, all pairs (lightness band,
+	   chroma, colour-blind and normal-vision separation, 3:1 contrast). 4 is a neutral grey for an "everything else"
+	   reference; it is never drawn beside 3 (it fails against aqua) and passes against 1 and 2. */
+	--series-1: #d95926;
+	--series-2: #3987e5;
+	--series-3: #199e70;
+	--series-4: #7f7e82;
+
+	/* Inline code in the docs (Blocks.svelte, dark). Also the diagrams' "changed / rebuilt" ink. */
+	--doc-code-ink: #ff7369;
+	/* Code blocks' plain text. */
+	--code-ink: var(--g-12);
+
+	--font-sans:
+		'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', 'Segoe UI', system-ui, sans-serif;
+	--font-mono: 'Berkeley Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ix site.css's light .site: warm paper. */
+@media (prefers-color-scheme: light) {
+	:root {
+		--g-12: #2a2a2c;
+		--bg: #f2f1ee;
+		--bg-2: #eae9e4;
+		--bg-3: #f6f5f2;
+		--bg-4: #e2e1dc;
+		--line: #dcdbd5;
+		--line-2: #cdccc6;
+		--ink-1: #161617;
+		--ink-2: #46464a;
+		--ink-3: #6b6a6e;
+		--ink-4: #a2a19d;
+		--code-bg: #ebeae5;
+		--code-ink: #4d4d51;
+		--danger: #c4332a;
+		--ok: #2b8a4f;
+		--doc-code-ink: #eb5757;
+		--series-1: #d4561f;
+		--series-2: #2a78d6;
+		--series-3: #138f63;
+		--series-4: #82817d;
+	}
+}

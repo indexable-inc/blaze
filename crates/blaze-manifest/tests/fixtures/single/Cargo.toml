@@ -1,0 +1,9 @@
+[package]
+name = "single"
+version = "2.0.0"
+authors = []
+
+[lib]
+path = "lib/mod.rs"
+
+[workspace]

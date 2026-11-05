@@ -1,0 +1,3 @@
+{"at_ns":0,"event":{"Began":{"build":4,"command":"build","root":"/tmp/…/ripgrep"}}}
+{"at_ns":92884376,"event":{"Finished":{"ok":true,"summary":{"took_ns":92884376,"crates":0,"fns":{"total":0,"done":0,"kept":0},"rebuilt":[],"more":0,"error":null}}}}
+    Finished `dev` profile [blaze] target(s) in 0.10s

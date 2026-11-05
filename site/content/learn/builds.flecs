@@ -1,0 +1,76 @@
+// Lesson 1: what a build does. Compile, then link. Cargo runs rustc once per crate, a fresh process each time; rustc's
+// incremental compilation (on in the dev profile) reloads its saved state from disk and recompiles only the codegen
+// units that changed, but cargo still reruns it for every crate downstream of an edit, and the program is linked again
+// every build (docs/architecture.md, "The idea"). blaze stays running, keeps the program in memory, redoes functions
+// and patches the built program. `blaze build/run/test` run no rustc; plain cargo after `blaze enable` still does
+// (docs/no-rustc.md, "Today").
+site {
+  learn {
+    builds : Page {
+      Narrow
+      Lesson: {1, "Compile, then link, and why a one-line edit can still take a while.", "pipeline"}
+      (InTheme, themes.basics)
+      Title: {"What a build does"}
+      Description: {"Lesson 1: what happens when you build Rust, and why a small edit can take seconds."}
+
+      Step source("From source to a program") {
+        P what("When you run `cargo build`, your Rust source becomes one program you can run. Two jobs make that happen: **compiling** turns code into machine code, and **linking** joins the pieces into one file.")
+        Figure trip(piece: "pipeline", label: "Source goes to the compiler, the compiler's output goes to the linker, and the linker writes the program.")
+      }
+
+      Step crates("Crates") {
+        P unit("Cargo hands your code to the Rust compiler, `rustc`, one **crate** per run. A crate is one library or one program: your app is a crate, and so is each of its dependencies.")
+        P fresh("For each crate, `rustc` starts up fresh, does its work, and exits.")
+      }
+
+      Step notes("rustc keeps notes") {
+        P saves("It doesn't start from nothing, though. In a dev build `rustc` saves notes on disk for each crate: what it worked out about your code, and the machine code it made, in groups of functions called **codegen units**.")
+        P reuse("Next time it checks the crate against those notes and recompiles only the groups that changed. This is **incremental compilation**, on by default in the dev profile.")
+      }
+
+      Step uses("Crates use crates") {
+        P graph("Crates use other crates. Here `app` uses `net` and `json`, and both of them use `core`. Tap a crate to edit it, and watch which crates cargo runs `rustc` on again.")
+        Figure deps(piece: "crates", label: "Four crates: app uses net and json, and net and json both use core. Editing a crate lights it and every crate that uses it, which cargo runs rustc on again, then the program, which is linked again.")
+      }
+
+      Step typo("Which crates?") {
+        Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json, then follow the arrows back to every crate that uses it.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
+      }
+
+      Step link("Then it all links again") {
+        P join("After compiling, the **linker** joins every crate into the one program file. It does that on every build: even a one-line change ends with linking the whole program again, which is slow for a big one.")
+      }
+
+      Step core_edit("Why is it slow?") {
+        Quiz q(prompt: "You change one line in `core`, which every other crate uses. Why can the build still take a while?") {
+          Choice careful("`rustc` recompiles just that line, but very carefully.", "`rustc` reuses work in groups of functions, not lines, and cargo runs it again for `core` and for each crate that uses it.")
+          Choice ripple("Cargo runs `rustc` again for `core` and every crate that uses it, and then the whole program is linked.", "Each of those runs starts up, reloads its notes and checks its crate again, and the link redoes the whole program. Incremental compilation makes each run cheaper, not free.") {
+            Right
+          }
+          Choice fetch("Cargo downloads `core` again.", "Nothing is downloaded: `core` is your own code here. The time goes into compiling and linking.")
+        }
+      }
+
+      Step instead("blaze stays running") {
+        P stays("blaze is a compiler that stays running. Rather than a fresh `rustc` per crate reloading its notes from disk, one blaze keeps your whole program in memory, already read and type-checked, and when you save it compiles **only the functions you changed**, one by one rather than in groups.")
+        Art art(piece: "incremental", label: "A lattice of dots. One dot changes, and only it and the few dots that depend on it light up and settle; the rest never move.")
+        P patch("Then, usually, it patches them into the program it already built, instead of linking it all again.")
+      }
+
+      Step same("Same commands") {
+        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. These don't run `rustc`: blaze compiles the code itself. (Plain `cargo build` after `blaze enable` still runs `rustc` for some crates, for now.)")
+        Dim number("On a 200-crate workspace, an edit in the crate everything uses took 6.33 s with cargo and 0.60 s with blaze (measured once, by hand; [more runs](/bench)).")
+      }
+
+      Step save("What happens on save?") {
+        Quiz q(prompt: "You save an edit to one function. What does blaze do?") {
+          Choice faster("Runs `rustc` on that crate, only faster.", "`blaze build` doesn't run `rustc`: blaze compiles the code itself, and only what changed.")
+          Choice all("Rebuilds every crate from scratch, in parallel.", "The point is to do less work, not the same work faster: functions you didn't touch are kept.")
+          Choice one("Compiles that function and patches it into the program it already built.", "It redoes the one function and patches it in, with no full link in the usual case.") {
+            Right
+          }
+        }
+      }
+    }
+  }
+}

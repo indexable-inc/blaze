@@ -1,0 +1,17 @@
+[package]
+name = "hyperion-ecs"
+description = "The raw flecs world layer from hyperion: entities, component identity by name and layout hash, checked access, systems, observers, queries (no REST, scripts loader, threads or reload notices)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[features]
+system = []
+pipeline = ["system"]
+meta = []
+
+[dependencies]
+hyperion-ecs-sys = { path = "../hyperion-ecs-sys" }
+hyperion-layout = { path = "../hyperion-layout", package = "hyperion-abi-layout" }
+hyperion-panic = { path = "../hyperion-panic" }

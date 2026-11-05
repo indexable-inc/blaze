@@ -1,0 +1,32 @@
+[package]
+name = "app"
+version = "0.3.0"
+edition = "2024"
+license-file = "LICENSE.txt"
+autoexamples = true
+
+[lib]
+name = "app_lib"
+crate-type = ["rlib", "cdylib"]
+doctest = false
+
+[[bin]]
+name = "tool"
+path = "src/tool.rs"
+required-features = ["extra"]
+test = false
+
+[[example]]
+name = "small"
+crate-type = ["staticlib"]
+
+[[bench]]
+name = "speed"
+harness = false
+
+[dependencies]
+helper = { path = "../../tools/helper" }
+mac = { path = "../macro", package = "macro" }
+
+[features]
+extra = []

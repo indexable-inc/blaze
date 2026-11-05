@@ -1,0 +1,400 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 296K of event 'cpu-clock:ppp'
+# Event count (approx.): 59290455720
+#
+# Children      Self  Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ........  .................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    45.23%     0.00%  [.] start_thread
+            |          
+             --45.23%--thread_start
+
+    45.23%     0.00%  [.] thread_start
+    45.00%     0.00%  [.] <std::sys::thread::unix::Thread>::new::thread_start
+            |          
+             --44.92%--<std::sys::thread::unix::Thread>::new::thread_start
+                       |          
+                        --44.91%--start_thread
+                                  |          
+                                   --44.90%--thread_start
+
+    36.27%     0.00%  [.] <std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+            |          
+             --36.27%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                       |          
+                        --36.26%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                  |          
+                                   --36.25%--<std::sys::thread::unix::Thread>::new::thread_start
+                                             |          
+                                              --36.24%--start_thread
+                                                        |          
+                                                         --36.24%--thread_start
+
+    36.27%     0.00%  [.] std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+            |          
+             --36.26%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                       |          
+                        --36.25%--<std::sys::thread::unix::Thread>::new::thread_start
+                                  |          
+                                   --36.25%--start_thread
+                                             |          
+                                              --36.24%--thread_start
+
+    36.26%     0.00%  [.] <std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          
+             --36.25%--<std::sys::thread::unix::Thread>::new::thread_start
+                       |          
+                        --36.25%--start_thread
+                                  |          
+                                   --36.24%--thread_start
+
+    31.13%     0.04%  [.] <hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+            |          
+             --31.12%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                       |          
+                        --31.12%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                  |          
+                                   --31.11%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                             |          
+                                              --31.10%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                        |          
+                                                         --31.10%--start_thread
+                                                                   |          
+                                                                    --31.09%--thread_start
+
+    17.49%     0.03%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+            |          
+             --17.39%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                       |          
+                        --17.39%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                  |          
+                                   --17.39%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                             |          
+                                              --17.39%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                        |          
+                                                         --17.39%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                   |          
+                                                                    --17.38%--start_thread
+                                                                              |          
+                                                                               --17.38%--thread_start
+
+    17.37%     0.00%  [.] <salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+            |          
+             --17.37%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                       |          
+                        --17.37%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                  |          
+                                   --17.37%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                             |          
+                                              --17.36%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                        |          
+                                                         --17.36%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                   |          
+                                                                    --17.36%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                              |          
+                                                                               --17.36%--start_thread
+                                                                                         |          
+                                                                                          --17.36%--thread_start
+
+    17.37%     0.00%  [.] <salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+            |          
+             --17.36%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+                       |          
+                        --17.36%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                  |          
+                                   --17.36%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                             |          
+                                              --17.36%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                        |          
+                                                         --17.35%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                   |          
+                                                                    --17.35%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                              |          
+                                                                               --17.35%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                         |          
+                                                                                          --17.35%--start_thread
+                                                                                                    |          
+                                                                                                     --17.35%--thread_start
+
+    17.33%     0.00%  [.] <hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute
+            |          
+             --17.33%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+                       |          
+                        --17.33%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+                                  |          
+                                   --17.32%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                             |          
+                                              --17.32%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                        |          
+                                                         --17.32%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                   |          
+                                                                    --17.32%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                              |          
+                                                                               --17.32%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                         |          
+                                                                                          --17.31%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                    |          
+                                                                                                     --17.31%--start_thread
+                                                                                                               |          
+                                                                                                                --17.31%--thread_start
+
+    17.32%     0.00%  [.] hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+            |          
+             --17.32%--<hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute
+                       |          
+                        --17.32%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+                                  |          
+                                   --17.31%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+                                             |          
+                                              --17.31%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                                        |          
+                                                         --17.31%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                                   |          
+                                                                    --17.31%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                              |          
+                                                                               --17.31%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                                         |          
+                                                                                          --17.30%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                                    |          
+                                                                                                     --17.30%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                               |          
+                                                                                                                --17.30%--start_thread
+                                                                                                                          |          
+                                                                                                                           --17.30%--thread_start
+
+    17.32%     0.01%  [.] hir_ty_codegen::instance_code
+            |          
+             --17.31%--hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+                       |          
+                        --17.31%--<hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute
+                                  |          
+                                   --17.31%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+                                             |          
+                                              --17.31%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+                                                        |          
+                                                         --17.30%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                                                   |          
+                                                                    --17.30%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                                              |          
+                                                                               --17.30%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                                         |          
+                                                                                          --17.30%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                                                    |          
+                                                                                                     --17.30%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                                               |          
+                                                                                                                --17.29%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                                          |          
+                                                                                                                           --17.29%--start_thread
+                                                                                                                                     |          
+                                                                                                                                      --17.29%--thread_start
+
+    11.89%     0.00%  [.] hir_ty_codegen::build::<hir_ty_codegen::instance_code::{closure#6}>
+            |          
+            |--8.59%--<hir_ty_codegen::backend::Tally>::step::<core::result::Result<cranelift_codegen::context::Context, hir_ty_codegen::CodegenError>, hir_ty_codegen::compile_as<hir_ty_codegen::instance_code::{closure#6}>::{closure#0}>
+            |          |          
+            |           --8.59%--hir_ty_codegen::instance_code
+            |                     |          
+            |                      --8.59%--hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+            |                                |          
+            |                                 --8.59%--<hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute
+            |                                           |          
+            |                                            --8.59%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+            |                                                      |          
+            |                                                       --8.58%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+            |                                                                 |          
+            |                                                                  --8.58%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+            |                                                                            |          
+            |                                                                             --8.58%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+            |                                                                                       |          
+            |                                                                                        --8.58%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+            |                                                                                                  |          
+            |                                                                                                   --8.58%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+            |                                                                                                             |          
+            |                                                                                                              --8.58%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |                                                                                                                        |          
+            |                                                                                                                         --8.57%--<std::sys::thread::unix::Thread>::new::thread_start
+            |                                                                                                                                   |          
+            |                                                                                                                                    --8.57%--start_thread
+            |                                                                                                                                              |          
+            |                                                                                                                                               --8.57%--thread_start
+            |          
+             --3.30%--<hir_ty_codegen::backend::Tally>::step::<core::result::Result<cranelift_codegen::context::Context, hir_ty_codegen::CodegenError>, hir_ty_codegen::compile_as<hir_ty_codegen::root_code::{closure#1}>::{closure#0}>
+                       |          
+                        --3.29%--hir_ty_codegen::root_code
+                                  |          
+                                   --3.29%--hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_root_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+                                             |          
+                                              --3.29%--<hir_ty_codegen::_::compiled_root_Configuration_ as salsa::function::Configuration>::execute
+                                                        |          
+                                                         --3.29%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_root_Configuration_>>::execute
+                                                                   <salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_root_Configuration_>>::fetch_cold
+                                                                   |          
+                                                                    --3.29%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_root::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                                                              |          
+                                                                               --3.29%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::execute
+                                                                                         |          
+                                                                                          --3.29%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::fetch_cold
+                                                                                                    |          
+                                                                                                     --3.28%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+                                                                                                               |          
+                                                                                                                --3.28%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                                                                                          |          
+                                                                                                                           --3.28%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                                                                                     |          
+                                                                                                                                      --3.28%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                                                                                                |          
+                                                                                                                                                 --3.28%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                                                                                           |          
+                                                                                                                                                            --3.28%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                                                                                      |          
+                                                                                                                                                                       --3.27%--start_thread
+                                                                                                                                                                                 |          
+                                                                                                                                                                                  --3.27%--thread_start
+
+    11.75%     0.10%  [.] <hir_ty_codegen::FunctionCx>::codegen
+            |          
+             --11.04%--hir_ty_codegen::build::<hir_ty_codegen::instance_code::{closure#6}>
+                       |          
+                       |--7.97%--<hir_ty_codegen::backend::Tally>::step::<core::result::Result<cranelift_codegen::context::Context, hir_ty_codegen::CodegenError>, hir_ty_codegen::compile_as<hir_ty_codegen::instance_code::{closure#6}>::{closure#0}>
+                       |          |          
+                       |           --7.97%--hir_ty_codegen::instance_code
+                       |                     |          
+                       |                      --7.96%--hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+                       |                                |          
+                       |                                 --7.96%--<hir_ty_codegen::_::compiled_instance_Configuration_ as salsa::function::Configuration>::execute
+                       |                                           |          
+                       |                                            --7.96%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::execute
+                       |                                                      |          
+                       |                                                       --7.96%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_instance_Configuration_>>::fetch_cold
+                       |                                                                 |          
+                       |                                                                  --7.95%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_instance::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                       |                                                                            |          
+                       |                                                                             --7.95%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                       |                                                                                       |          
+                       |                                                                                        --7.95%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                       |                                                                                                  |          
+                       |                                                                                                   --7.95%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                       |                                                                                                             |          
+                       |                                                                                                              --7.95%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                       |                                                                                                                        |          
+                       |                                                                                                                         --7.95%--<std::sys::thread::unix::Thread>::new::thread_start
+                       |                                                                                                                                   |          
+                       |                                                                                                                                    --7.94%--start_thread
+                       |                                                                                                                                              |          
+                       |                                                                                                                                               --7.94%--thread_start
+                       |          
+                        --3.07%--<hir_ty_codegen::backend::Tally>::step::<core::result::Result<cranelift_codegen::context::Context, hir_ty_codegen::CodegenError>, hir_ty_codegen::compile_as<hir_ty_codegen::root_code::{closure#1}>::{closure#0}>
+                                  |          
+                                   --3.07%--hir_ty_codegen::root_code
+                                             |          
+                                              --3.07%--hir_ty_codegen::tier::for_build::<core::result::Result<hir_ty_codegen::Produced, hir_ty_codegen::CodegenError>, <hir_ty_codegen::_::compiled_root_Configuration_ as salsa::function::Configuration>::execute::inner_::{closure#0}>
+                                                        |          
+                                                         --3.07%--<hir_ty_codegen::_::compiled_root_Configuration_ as salsa::function::Configuration>::execute
+                                                                   |          
+                                                                    --3.07%--<salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_root_Configuration_>>::execute
+                                                                              <salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_root_Configuration_>>::fetch_cold
+                                                                              |          
+                                                                               --3.07%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_root::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+                                                                                         |          
+                                                                                          --3.07%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::execute
+                                                                                                    |          
+                                                                                                     --3.06%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::fetch_cold
+                                                                                                               |          
+                                                                                                                --3.06%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+                                                                                                                          |          
+                                                                                                                           --3.06%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                                                                                                     |          
+                                                                                                                                      --3.06%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                                                                                                |          
+                                                                                                                                                 --3.06%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                                                                                                           |          
+                                                                                                                                                            --3.06%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                                                                                                      |          
+                                                                                                                                                                       --3.06%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                                                                                                 |          
+                                                                                                                                                                                  --3.06%--start_thread
+                                                                                                                                                                                            |          
+                                                                                                                                                                                             --3.06%--thread_start
+
+     9.88%     0.00%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+            |          
+             --9.87%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                       |          
+                        --9.87%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                  |          
+                                   --9.87%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                             |          
+                                              --9.87%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                        |          
+                                                         --9.86%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                   |          
+                                                                    --9.86%--start_thread
+                                                                              |          
+                                                                               --9.86%--thread_start
+
+     9.87%     0.00%  [.] <salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::execute
+            |          
+             --9.87%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::fetch_cold
+                       |          
+                        --9.87%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+                                  |          
+                                   --9.87%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                             |          
+                                              --9.86%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                        |          
+                                                         --9.86%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                   |          
+                                                                    --9.86%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                              |          
+                                                                               --9.86%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                         |          
+                                                                                          --9.85%--start_thread
+                                                                                                    |          
+                                                                                                     --9.85%--thread_start
+
+     9.87%     0.00%  [.] <salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::fetch_cold
+            |          
+             --9.87%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+                       |          
+                        --9.87%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                  |          
+                                   --9.87%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                             |          
+                                              --9.86%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                        |          
+                                                         --9.86%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                   |          
+                                                                    --9.86%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                              |          
+                                                                               --9.85%--start_thread
+                                                                                         |          
+                                                                                          --9.85%--thread_start
+
+     9.49%     0.01%  [.] <std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::compiled_root::{closure#0}>::{closure#0}, &core::result::Result<hir_ty_codegen::fragment::CompiledFunction, hir_ty_codegen::CodegenError>>
+            |          
+             --9.49%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::execute
+                       |          
+                        --9.48%--<salsa::function::IngredientImpl<hir_ty_codegen::_::root_rows_Configuration_>>::fetch_cold
+                                  |          
+                                   --9.48%--<std::thread::local::LocalKey<salsa::attach::Attached>>::with::<salsa::attach::attach<&alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>, dyn hir_ty::db::HirDatabase, hir_ty_codegen::root_rows::{closure#0}>::{closure#0}, &alloc::vec::Vec<(u32, vfs::FileId, u32, u32)>>
+                                             |          
+                                              --9.48%--<hir_ty_codegen::ObjectCodegen>::compile_ahead::{closure#5}
+                                                        |          
+                                                         --9.48%--<std::thread::local::LocalKey<hir_ty::next_solver::interner::tls_db::Attached>>::with::<hir_ty::next_solver::interner::tls_db::attach_db<(), <blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}::{closure#0}>::{closure#0}, ()>
+                                                                   |          
+                                                                    --9.47%--std::sys::backtrace::__rust_begin_short_backtrace::<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>
+                                                                              |          
+                                                                               --9.47%--<std::thread::lifecycle::spawn_unchecked<<blaze::Resolver as hir_ty_codegen::SymbolResolver>::in_parallel_beside::{closure#1}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                                                                                         |          
+                                                                                          --9.47%--<std::sys::thread::unix::Thread>::new::thread_start
+                                                                                                    |          
+                                                                                                     --9.46%--start_thread
+                                                                                                               |          
+                                                                                                                --9.46%--thread_start
+
+     9.49%     0.00%  [.] <salsa::function::IngredientImpl<hir_ty_codegen::_::compiled_root_Configuration_>>::fetch_cold
+            |          

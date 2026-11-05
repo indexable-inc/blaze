@@ -1,0 +1,345 @@
+{
+ "project": "cargo",
+ "rev": "ea2d97820c16195b0ca3fadb4319fe512c199a43",
+ "status": 0,
+ "seconds": 15.91,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.99",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "blake3",
+   "version": "1.8.2",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "build-rs-test-lib",
+   "version": "0.0.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "camino",
+   "version": "1.1.12",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "cargo",
+   "version": "0.92.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "cargo-test-support",
+   "version": "0.8.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crc32fast",
+   "version": "1.5.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "curl",
+   "version": "0.4.49",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "curl-sys",
+   "version": "0.4.83+curl-8.15.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "escargot",
+   "version": "0.5.15",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "generic-array",
+   "version": "0.14.7",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.3.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "heapless",
+   "version": "0.8.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_normalizer_data",
+   "version": "2.0.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "icu_properties_data",
+   "version": "2.0.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "im-rc",
+   "version": "15.1.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.174",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libgit2-sys",
+   "version": "0.18.2+1.9.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libnghttp2-sys",
+   "version": "0.1.11+1.64.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libsqlite3-sys",
+   "version": "0.35.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libssh2-sys",
+   "version": "0.3.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libz-sys",
+   "version": "1.1.22",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "lock_api",
+   "version": "0.4.13",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_6c88fdf840ba6a35_0 --crate-type=lib --out-dir /root/bs/cl/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_6c88fdf840ba6a35_1 --crate-type=lib --out-dir /root/bs/cl/work/target/cargo/debug/build/lock_api/8cb9a788574df9f6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_3dc6f9e0282584a3_0 --crate-type=lib --out-dir /root/bs/cl/work/target/cargo/debug/build/num-traits/5444906ada933885/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_3dc6f9e0282584a3_1 --crate-type=lib --out-dir /root/bs/cl/work/target/cargo/debug/build/num-traits/5444906ada933885/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_3dc6f9e0282584a3_2 --crate-type=lib --out-dir /root/bs/cl/work/target/cargo/debug/build/num-traits/5444906ada933885/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "openssl-sys",
+   "version": "0.9.109",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "parking_lot_core",
+   "version": "0.9.11",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.101",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "pulldown-cmark",
+   "version": "0.13.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rayon-core",
+   "version": "1.13.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "1.0.8",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "semver",
+   "version": "1.0.26",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.219",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.143",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "syn",
+   "version": "1.0.109",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "1.0.69",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "2.0.16",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "typeid",
+   "version": "1.0.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "typenum",
+   "version": "1.18.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "varisat",
+   "version": "0.2.2",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "zerocopy",
+   "version": "0.8.26",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

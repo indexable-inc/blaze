@@ -1,0 +1,47 @@
+[package]
+name = "blaze-items"
+description = "blaze v2's items by content, as Unison has its definitions: each item's interface, layout, code and deep hashes, and the facts queries depend on instead of items"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+smallvec.workspace = true
+tracing.workspace = true
+either.workspace = true
+rustc_type_ir.workspace = true
+rustc_abi.workspace = true
+
+base-db.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+intern.workspace = true
+span.workspace = true
+syntax.workspace = true
+stdx.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

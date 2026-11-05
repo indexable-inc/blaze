@@ -1,0 +1,12 @@
+{"io":2,"work":2,"keep_going":false}
+{"Add":{"at_ns":0,"nodes":[{"id":1,"kind":"Manifest","name":"Cargo.toml","deps":[],"pool":"Io","cost":1},{"id":2,"kind":"Std","name":"std","deps":[],"pool":"Io","cost":1},{"id":3,"kind":"Names","name":"memchr","deps":[1],"pool":"Work","cost":2},{"id":4,"kind":"Names","name":"regex","deps":[3],"pool":"Work","cost":3},{"id":5,"kind":"Names","name":"rg","deps":[4],"pool":"Work","cost":1},{"id":6,"kind":"Codegen","name":"rg","deps":[5,2],"pool":"Work","cost":3},{"id":7,"kind":"Link","name":"rg","deps":[6],"pool":"Io","cost":1}]}}
+{"Close":{"at_ns":0}}
+{"Done":{"at_ns":1000,"id":1,"outcome":"Built","added":[{"id":8,"kind":"Names","name":"aho-corasick","deps":[1],"pool":"Work","cost":2},{"id":9,"kind":"Names","name":"grep","deps":[8,3],"pool":"Work","cost":1}]}}
+{"Done":{"at_ns":1500,"id":2,"outcome":{"Cached":{"remote":true}},"added":[]}}
+{"Done":{"at_ns":2000,"id":3,"outcome":"Built","added":[]}}
+{"Done":{"at_ns":2600,"id":8,"outcome":{"Cached":{"remote":false}},"added":[]}}
+{"Done":{"at_ns":3000,"id":9,"outcome":"Built","added":[]}}
+{"Done":{"at_ns":5000,"id":4,"outcome":"Built","added":[]}}
+{"Done":{"at_ns":6000,"id":5,"outcome":"Built","added":[]}}
+{"Done":{"at_ns":9000,"id":6,"outcome":"Built","added":[]}}
+{"Done":{"at_ns":9500,"id":7,"outcome":"Built","added":[]}}

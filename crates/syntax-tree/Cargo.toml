@@ -1,0 +1,27 @@
+# blaze's syntax trees: flat trees (`flat.rs`), packed arrays (a token 4 bytes, a node 8) over a
+# shared source, with lazy nodes whose parts are parsed when a cursor enters them, and the cursors
+# over them. Every parse makes one; an edit makes a new one. (It began as rowan 0.17.0.)
+[package]
+name = "syntax-tree"
+version = "0.0.0"
+authors = ["Aleksey Kladov <aleksey.kladov@gmail.com>"]
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Library for generic lossless syntax trees"
+edition = "2021"
+publish = false
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+text-size.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-spin.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

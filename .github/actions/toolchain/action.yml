@@ -1,0 +1,78 @@
+# Rust (the nightly in harness/toolchain) and the LLVM 23 blaze pins
+# (crates/hir-ty-codegen/llvm.json), on any of the hosted runners CI uses. `llvm: build` is Nix
+# with the flake's dev shell fetched: a build of blaze, which links LLVM, runs in it
+# (`nix develop --command cargo build ...`), linked statically against that LLVM with the dev
+# shell's C toolchain and libc. `llvm: run` puts the pinned LLVM's tools the harnesses read with
+# (llvm-dwarfdump) on PATH; `llvm: none` is neither. Windows has no Nix: it fetches the same
+# pinned build with .github/scripts/llvm.py, which has llvm-pdbutil besides.
+name: toolchain
+description: Rust (the nightly in harness/toolchain) and LLVM 23
+inputs:
+  components:
+    description: rustup components besides rust-src (see below), space separated
+    default: ""
+  targets:
+    description: rustup targets besides the host, space separated
+    default: ""
+  llvm:
+    description: build, run or none
+    default: none
+runs:
+  using: composite
+  steps:
+    - name: Rust (the nightly in harness/toolchain)
+      shell: bash
+      run: |
+        tc=$(cat harness/toolchain)
+        # No rust-src: blaze compiles the standard library only from its own library/
+        # (docs/toolchain.md) and reads no toolchain's rust-src.
+        components=""
+        for c in ${{ inputs.components }}; do components="$components -c $c"; done
+        rustup toolchain install "$tc" --profile minimal $components
+        rustup default "$tc"
+        for t in ${{ inputs.targets }}; do rustup target add "$t"; done
+
+    # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
+    # Ubuntu's AppArmor keeps users from making unless told otherwise.
+    - name: user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+
+    - if: runner.os != 'Windows' && inputs.llvm != 'none'
+      uses: DeterminateSystems/nix-installer-action@v23
+    - name: LLVM 23 (Nix)
+      if: runner.os != 'Windows' && inputs.llvm != 'none'
+      shell: bash
+      run: |
+        if [ "${{ inputs.llvm }}" = build ]; then nix develop --command true; fi
+        echo "$(nix build --no-link --print-out-paths .#llvm)/bin" >> "$GITHUB_PATH"
+
+    # The harnesses run the linker themselves, with the environment the compiler has. In Git
+    # Bash the `link` of coreutils comes before the linker, so it goes.
+    - if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: rm -f /usr/bin/link.exe
+    # The build of the pinned LLVM the flake fetches, for Windows: the libraries, the headers and
+    # `llvm-config`, which is all the build reads. blaze links it statically: running it needs
+    # none of this.
+    - if: runner.os == 'Windows' && inputs.llvm != 'none'
+      id: llvm-windows
+      uses: actions/cache@v6
+      with:
+        path: C:\llvm
+        key: llvm-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}-x86_64-pc-windows-msvc
+    - name: LLVM 23 (Windows)
+      if: runner.os == 'Windows' && inputs.llvm != 'none' && steps.llvm-windows.outputs.cache-hit != 'true'
+      shell: bash
+      run: python .github/scripts/llvm.py fetch --target x86_64-pc-windows-msvc --dir 'C:\llvm'
+    - if: runner.os == 'Windows' && inputs.llvm != 'none'
+      shell: bash
+      run: |
+        echo 'LLVM_SYS_231_PREFIX=C:\llvm' >> "$GITHUB_ENV"
+        echo 'C:\llvm\bin' >> "$GITHUB_PATH"

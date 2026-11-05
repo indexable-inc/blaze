@@ -1,0 +1,20 @@
+# Merge gate (blaze.yaml -> blaze-platform.yaml) job wall times with cargo + compiler cache, green runs, read 2026-10-27 10:45Z via gh run view.
+run	event	job	seconds
+40488819304	pull_request	linux x64 / build	329
+40488819304	pull_request	linux x64 / tests	322
+40488491270	pull_request	linux x64 / build	247
+40488491270	pull_request	linux x64 / tests	312
+40487974048	merge_group	linux x64 / build	388
+40487974048	merge_group	linux x64 / tests	391
+40487838603	merge_group	linux x64 / build	381
+40487838603	merge_group	linux x64 / tests	494
+40487762782	merge_group	linux x64 / build	282
+40487762782	merge_group	linux x64 / tests	377
+40487721018	push	linux x64 / build	173
+40487721018	push	linux x64 / tests	349
+40487721018	push	linux arm64 / build	172
+40487721018	push	linux arm64 / tests	260
+40487473278	merge_group	linux x64 / build	280
+40487473278	merge_group	linux x64 / tests	500
+40487429016	push	linux x64 / build	208
+40487429016	push	linux x64 / tests	307

@@ -1,0 +1,24 @@
+[package]
+name = "blaze-radix"
+description = "blaze v2's one stable LSD radix sort over integer keys, parallel on the plane's workers from 100k elements"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

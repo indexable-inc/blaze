@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "alias.b = [\"build\", \"--release\"]\nalias.config = \"build\"\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "alias.b = [\n    \"build\", # $ROOT/.cargo/config.toml\n    \"--release\", # $ROOT/.cargo/config.toml\n]\nalias.config = \"build\" # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nalias.b = [\"build\", \"--release\"]\nalias.config = \"build\"\n\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nalias.b = [\n    \"build\", # $ROOT/.cargo/config.toml\n    \"--release\", # $ROOT/.cargo/config.toml\n]\nalias.config = \"build\" # $ROOT/.cargo/config.toml\n\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"alias\":{\"b\":[\"build\",\"--release\"],\"config\":\"build\"}}\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"alias\":{\"b\":[\"build\",\"--release\"],\"config\":\"build\"}}\n",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "warning: user-defined alias `config` is ignored, because it is shadowed by a built-in command\nerror: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ }
+]

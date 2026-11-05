@@ -1,0 +1,9 @@
+[package]
+name = "stress-deep-vector"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: not a member of the edit-stress workspace here nor of blaze's
+# (harness/stress-corpus/README.md).
+[workspace]

@@ -1,0 +1,9 @@
+[package]
+name = "clocks"
+version = "0.1.0"
+edition = "2021"
+description = "The one place the servil fork and bench-hashes read clocks: wall time and the thread's counts per core kind"
+license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+publish = false
+
+[dependencies]

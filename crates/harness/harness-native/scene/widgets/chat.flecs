@@ -1,0 +1,247 @@
+// The chat pane (src/app/chat.rs): a chat session's transcript over its agent's structured events, drawn as a chat, not
+// a terminal. The transcript is a ui.LazyList (only the rows in view exist, each as tall as its words); the input a
+// ui.TextArea on a soft plate at the foot, a quiet status line under it.
+
+@tree ChildOf
+hn {
+  // The pane: the transcript scrolling over the card's ground, a column as wide as reads well; the input under it.
+  prefab ChatPane : hn.Pane {
+    list : ui.Scroll {
+      Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+      rows : ui.LazyList {
+        LazyStack: {estimate: $chat_row_estimate, overscan: 600}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
+      }
+    }
+    foot : ui.Column {
+      Flex: {axis: Column, gap: 6, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $chat_pad, r: $chat_pad, t: 4, b: 12}
+      input : ui.Row {
+        Fill: $tone_chat_input
+        Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+        Shape: {radius: $chat_input_radius, n: 4, border: 1, feather: 0}
+        Cursor: {shape: Text}
+        Pressable
+        Action: {name: "chat:focus"}
+        Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 14, r: 14, t: 10, b: 10}
+        area : ui.TextArea {}
+      }
+      status : ui.Row {
+        Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 6, r: 6, t: 0, b: 0}
+        model : ui.Line, Faint {
+          TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        }
+        spacer : ui.Spacer {}
+        state : ui.Line, Faint {
+          TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        }
+      }
+    }
+  }
+
+  // What the person sent: their words on a soft plate at the trailing edge.
+  prefab ChatUser : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 48, r: 0, t: 14, b: 10}
+    bubble : ui.Column {
+      Fill: $tone_chat_bubble
+      Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 14, r: 14, t: 8, b: 8}
+      text : ui.Words {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // A paragraph of the agent's words (inline markdown).
+  prefab ChatProse : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 4, b: 6}
+    text : ui.Words {
+      Fill: $tone_term_ink
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+
+  // Headings, by level.
+  prefab ChatH1 : hn.ChatProse {
+    Padding: {l: 0, r: 0, t: 12, b: 4}
+    text : ui.Words { TextStyle: {size: $size_chat_h1, line: 26, role: 0, bold: 1} }
+  }
+  prefab ChatH2 : hn.ChatProse {
+    Padding: {l: 0, r: 0, t: 10, b: 2}
+    text : ui.Words { TextStyle: {size: $size_chat_h2, line: 23, role: 0, bold: 1} }
+  }
+  prefab ChatH3 : hn.ChatProse {
+    Padding: {l: 0, r: 0, t: 8, b: 2}
+    text : ui.Words { TextStyle: {size: $size_chat_h3, line: $line_chat, role: 0, bold: 1} }
+  }
+
+  // A list item: its bullet or number in a fixed gutter, then its words; `indent` is its depth.
+  prefab ChatItem : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 2, r: 0, t: 1, b: 3}
+    indent : ui.Node {
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    mark : ui.Words, Muted {
+      Size: {w: {kind: Fixed, value: 22, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+    text : ui.Words {
+      Fill: $tone_term_ink
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+
+  // A quote: a hairline at its leading edge, its words muted.
+  prefab ChatQuote : ui.Row {
+    Flex: {axis: Row, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 2, r: 0, t: 4, b: 6}
+    bar : hn.Seam {}
+    text : ui.Words {
+      Fill: $tone_term_muted
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+
+  // A fenced code block on a card, in the code face (coloured by its language when blaze has its grammar).
+  prefab ChatCode : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 4, b: 8}
+    card : ui.Column {
+      Fill: $tone_chat_card
+      Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+      Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 12, r: 12, t: 9, b: 10}
+      text : ui.Words {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+      }
+    }
+  }
+
+  // A tool call's line: an icon, the tool's name, its main argument in the code face, and how it went. Pressed, it opens.
+  prefab ChatToolHead : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Hand}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+    Padding: {l: 6, r: 8, t: 0, b: 0}
+    disclose : ui.Symbol, Faint {
+      Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+    }
+    name : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0, weight: $weight_row}
+    }
+    arg : ui.Lead {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_code, line: 16, role: 9, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    state : ui.Line, Faint {
+      LayoutPriority: {value: 1}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A tool call, folded to its line.
+  prefab ChatTool : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 1, b: 1}
+    head : hn.ChatToolHead {}
+  }
+
+  // A tool call opened: its line, then its input and its result on a card.
+  prefab ChatToolOpen : hn.ChatTool {
+    Padding: {l: 0, r: 0, t: 1, b: 8}
+    body : ui.Column {
+      Fill: $tone_chat_card
+      Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+      Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 12, r: 12, t: 9, b: 10}
+      input : ui.Words {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+      }
+      result : ui.Words {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+      }
+    }
+  }
+
+  // The agent's reasoning, folded to one dim line; pressed, it opens to its words, dim.
+  prefab ChatThinking : ui.Column {
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 1, b: 1}
+    head : hn.ChatToolHead {}
+  }
+  prefab ChatThinkingOpen : hn.ChatThinking {
+    Padding: {l: 0, r: 0, t: 1, b: 8}
+    text : ui.Words {
+      Fill: $tone_term_muted
+      Padding: {l: 25, r: 0, t: 0, b: 0}
+      TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+    }
+  }
+
+  // Something said about the conversation (it was interrupted), quiet and centred; an error in the failed tone.
+  prefab ChatNote : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 6, b: 6}
+    text : ui.Words, Faint {
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    }
+  }
+  prefab ChatError : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 4, b: 6}
+    text : ui.Words {
+      Fill: $tone_failed
+      TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+    }
+  }
+
+  // A turn's quiet foot: how long it took and what it cost.
+  prefab ChatFoot : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 2, b: 12}
+    text : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+}

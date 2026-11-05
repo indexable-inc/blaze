@@ -1,0 +1,1861 @@
+{
+ "ripgrep": {
+  "repo": "https://github.com/BurntSushi/ripgrep",
+  "rev": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+  "package": "ripgrep",
+  "bin": "rg",
+  "scrub": [
+   "\"nanos\":\\d+",
+   "[0-9.]+s\\b",
+   "[0-9.]+ seconds"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-n",
+    "fn main",
+    "crates/core"
+   ],
+   [
+    "-c",
+    "-i",
+    "regex",
+    "crates",
+    "--sort",
+    "path"
+   ],
+   [
+    "--json",
+    "Searcher",
+    "crates/searcher/src/lib.rs"
+   ],
+   [
+    "-o",
+    "-w",
+    "[A-Z][a-z]+Builder",
+    "crates/printer/src",
+    "--sort",
+    "path"
+   ],
+   [
+    "--files",
+    "crates/globset",
+    "--sort",
+    "path"
+   ],
+   [
+    "-U",
+    "-C",
+    "1",
+    "impl Default[^{]*\\{\\n",
+    "crates/matcher/src/lib.rs"
+   ],
+   [
+    "--stats",
+    "-q",
+    "unsafe",
+    "crates",
+    "-j",
+    "1"
+   ],
+   [
+    "-t",
+    "toml",
+    "-F",
+    "version",
+    "--sort",
+    "path"
+   ],
+   [
+    "-c",
+    "\\w+ing\\b",
+    "../ripgrep-vendor",
+    "--sort",
+    "path"
+   ],
+   [
+    "-i",
+    "-o",
+    "fn \\w+<",
+    "../ripgrep-vendor",
+    "--sort",
+    "path"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "-e",
+    "(unclosed",
+    "crates"
+   ]
+  ],
+  "bench": [
+   "-c",
+   "\\w+ing\\b",
+   "../ripgrep-vendor",
+   "-j",
+   "1"
+  ],
+  "edit_check": [
+   "--stats",
+   "-n",
+   "-C",
+   "1",
+   "--trim",
+   "fn main",
+   "crates/core",
+   "--sort",
+   "path"
+  ],
+  "edits": [
+   {
+    "file": "crates/core/main.rs",
+    "old": "{matches} matches\n",
+    "new": "{matches} matches found\n",
+    "what": "a word in the statistics"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "self.matches += n;",
+    "new": "self.matches += n * 2;",
+    "what": "matches counted twice"
+   },
+   {
+    "file": "crates/printer/src/standard.rs",
+    "old": "separator_context: Arc::new(Some(b\"--\".to_vec())),",
+    "new": "separator_context: Arc::new(Some(b\"~~\".to_vec())),",
+    "what": "the default context separator"
+   },
+   {
+    "file": "crates/printer/src/util.rs",
+    "old": "b'\\t' | b'\\n' | b'\\x0B' | b'\\x0C' | b'\\r' | b' ' => true,",
+    "new": "b'\\n' | b'\\x0B' | b'\\x0C' | b'\\r' | b' ' => true,",
+    "what": "a tab is not trimmed"
+   },
+   {
+    "file": "crates/core/main.rs",
+    "old": "{searches} files searched\n",
+    "new": "{searches} files looked at\n",
+    "what": "another word in the statistics"
+   },
+   {
+    "file": "crates/printer/src/standard.rs",
+    "old": "        let n = DecimalFormatter::new(line_number);\n        self.std.write_spec(self.config().colors.line(), n.as_bytes())?;",
+    "new": "        let n = DecimalFormatter::new(line_number + 1000);\n        self.std.write_spec(self.config().colors.line(), n.as_bytes())?;",
+    "what": "line numbers offset"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "    /// Add to the total number of matches.\n",
+    "new": "    /// Half of what was counted, rounded up.\n    fn halved(n: u64) -> u64 {\n        n.div_ceil(2)\n    }\n\n    /// Add to the total number of matches.\n",
+    "what": "a new function"
+   },
+   {
+    "file": "crates/printer/src/stats.rs",
+    "old": "self.matches += n * 2;",
+    "new": "self.matches += Self::halved(n * 2);",
+    "what": "a call of the new function"
+   },
+   {
+    "file": "crates/printer/src/summary.rs",
+    "old": "count.max(1)",
+    "new": "count.max(2)",
+    "what": "a floor of a count"
+   },
+   {
+    "file": "crates/core/main.rs",
+    "old": "{bytes_printed} bytes printed\n",
+    "new": "{bytes_printed} bytes printed ({matches} matches)\n",
+    "what": "a format argument used twice"
+   }
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "integration"
+   ]
+  }
+ },
+ "fd": {
+  "repo": "https://github.com/sharkdp/fd",
+  "rev": "b6ca4e02167833c2c492de6ae9d06b56488d4696",
+  "package": "fd-find",
+  "bin": "fd",
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-e",
+    "rs",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-t",
+    "d",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-g",
+    "*.toml",
+    "-j",
+    "1"
+   ],
+   [
+    "walk",
+    "src",
+    "-x",
+    "echo",
+    "found",
+    "-j",
+    "1"
+   ],
+   [
+    "-S",
+    "+10k",
+    ".",
+    "src",
+    "-j",
+    "1"
+   ],
+   [
+    "-d",
+    "1",
+    "-a",
+    "-0",
+    "main",
+    "src"
+   ],
+   [
+    "-e",
+    "rs",
+    "-j",
+    "1",
+    "--base-directory",
+    "../fd-vendor",
+    "-c",
+    "never"
+   ],
+   [
+    "-t",
+    "f",
+    "-g",
+    "*.md",
+    "../fd-vendor",
+    "-j",
+    "1",
+    "-X",
+    "wc",
+    "-c"
+   ],
+   [
+    "--bad-flag"
+   ],
+   [
+    "[invalid",
+    "src"
+   ]
+  ],
+  "bench": [
+   "-e",
+   "rs",
+   "-j",
+   "1",
+   "--base-directory",
+   "../fd-vendor"
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "tests"
+   ]
+  }
+ },
+ "bat": {
+  "repo": "https://github.com/sharkdp/bat",
+  "rev": "62b439dae330a8c4d053ff7d8526a6e3697000b9",
+  "package": "bat",
+  "cargo_args": [
+   "--bin",
+   "bat"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-p",
+    "--color=never",
+    "Cargo.toml"
+   ],
+   [
+    "--color=always",
+    "-n",
+    "src/lib.rs"
+   ],
+   [
+    "-A",
+    "--color=never",
+    "-r",
+    "1:20",
+    "src/main.rs"
+   ],
+   [
+    "--list-languages"
+   ],
+   [
+    "--list-themes",
+    "--color=never"
+   ],
+   [
+    "--style=full",
+    "--color=always",
+    "--decorations=always",
+    "--terminal-width=80",
+    "-l",
+    "rust",
+    "src/pager.rs"
+   ],
+   [
+    "--color=always",
+    "--theme=TwoDark",
+    "--style=numbers,grid",
+    "--terminal-width=100",
+    "src/printer.rs",
+    "README.md",
+    "Cargo.lock"
+   ],
+   [
+    "--diff",
+    "--color=never",
+    "src/config.rs"
+   ],
+   [
+    "no-such-file"
+   ]
+  ],
+  "bench": [
+   "--color=always",
+   "--style=full",
+   "--terminal-width=100",
+   "src/printer.rs",
+   "src/controller.rs",
+   "Cargo.lock"
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "integration_tests"
+   ]
+  }
+ },
+ "eza": {
+  "repo": "https://github.com/eza-community/eza",
+  "rev": "471bfbc7b03cbac8c738e8d9050edb06ee79132a",
+  "package": "eza",
+  "scrub": [],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-1",
+    "src"
+   ],
+   [
+    "--tree",
+    "--level=3",
+    "src",
+    "--color=always"
+   ],
+   [
+    "-1",
+    "-R",
+    "-a",
+    "src",
+    "--color=never"
+   ],
+   [
+    "-l",
+    "--no-user",
+    "--no-time",
+    "--no-permissions",
+    "--no-filesize",
+    "--git",
+    "src"
+   ],
+   [
+    "--oneline",
+    "--sort=size",
+    "--reverse",
+    "src/output"
+   ],
+   [
+    "-G",
+    "--width=80",
+    "--icons=always",
+    "src/fs"
+   ],
+   [
+    "--tree",
+    "-I",
+    "*.rs",
+    "../eza-vendor",
+    "--color=never",
+    "--level=2"
+   ],
+   [
+    "no-such-file"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "--tree",
+   "--color=always",
+   "../eza-vendor"
+  ],
+  "cargo_args": [
+   "--bin",
+   "eza"
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "cli_tests"
+   ]
+  }
+ },
+ "tokei": {
+  "repo": "https://github.com/XAMPPRocky/tokei",
+  "rev": "c14f744716272fadeb27a74443cdffa0af35f82f",
+  "package": "tokei",
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "src",
+    "--sort",
+    "code"
+   ],
+   [
+    "--files",
+    "src",
+    "--sort",
+    "lines"
+   ],
+   [
+    "-t",
+    "Rust,TOML",
+    "."
+   ],
+   [
+    "../tokei-vendor",
+    "--sort",
+    "code"
+   ],
+   [
+    "-e",
+    "*.rs",
+    "../tokei-vendor",
+    "--sort",
+    "files",
+    "-C"
+   ],
+   [
+    "--languages"
+   ],
+   [
+    "no-such-dir"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "cargo_args": [
+   "--bin",
+   "tokei"
+  ],
+  "bench": [
+   "../tokei-vendor"
+  ],
+  "tests": {
+   "program": [
+    "--test",
+    "accuracy"
+   ]
+  }
+ },
+ "delta": {
+  "repo": "https://github.com/dandavison/delta",
+  "rev": "3c2269c6b845913965575f11b0196d70ef5352f3",
+  "package": "git-delta",
+  "bin": "delta",
+  "setup": [
+   "diff -u src/delta.rs src/paint.rs > .apps-a.diff; diff -ru src/handlers src/features > .apps-b.diff; true"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--no-gitconfig",
+    "--width=120",
+    "src/delta.rs",
+    "src/paint.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--side-by-side",
+    "--width=160",
+    "--line-numbers",
+    "src/handlers/hunk.rs",
+    "src/handlers/hunk_header.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--color-only",
+    "src/cli.rs",
+    "src/config.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "--show-syntax-themes"
+   ],
+   [
+    "--no-gitconfig",
+    "--list-languages"
+   ],
+   [
+    "--no-gitconfig",
+    "--show-config"
+   ],
+   [
+    "--no-gitconfig",
+    "--paging=never",
+    "--diff-so-fancy",
+    "src/align.rs",
+    "src/edits.rs"
+   ],
+   [
+    "--no-gitconfig",
+    "no-such-a",
+    "no-such-b"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "--no-gitconfig",
+   "--side-by-side",
+   "--width=160",
+   "--line-numbers",
+   "src/delta.rs",
+   "src/paint.rs"
+  ]
+ },
+ "starship": {
+  "repo": "https://github.com/starship/starship",
+  "rev": "2d8741e4830273ff2bec1fe45e1e7fe6aa979cf4",
+  "package": "starship",
+  "cargo_args": [
+   "--bin",
+   "starship"
+  ],
+  "env": {
+   "STARSHIP_CONFIG": "/dev/null",
+   "STARSHIP_CACHE": "/tmp/starship-apps-cache",
+   "STARSHIP_SHELL": "bash"
+  },
+  "scrub": [
+   "took [0-9a-z.]+",
+   "\\d+(ms|s)\\b",
+   "build_time:[^\\n]*",
+   " +-  "
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "print-config",
+    "--default"
+   ],
+   [
+    "preset",
+    "--list"
+   ],
+   [
+    "preset",
+    "nerd-font-symbols"
+   ],
+   [
+    "init",
+    "bash",
+    "--print-full-init"
+   ],
+   [
+    "init",
+    "zsh",
+    "--print-full-init"
+   ],
+   [
+    "module",
+    "directory"
+   ],
+   [
+    "module",
+    "rust"
+   ],
+   [
+    "module",
+    "package"
+   ],
+   [
+    "prompt",
+    "--status=1",
+    "--cmd-duration=5000",
+    "--jobs=2",
+    "--terminal-width=100"
+   ],
+   [
+    "explain"
+   ],
+   [
+    "completions",
+    "fish"
+   ],
+   [
+    "module",
+    "no-such-module"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "prompt",
+   "--terminal-width=100"
+  ],
+  "edits": [
+   {
+    "file": "src/bug_report.rs",
+    "old": "        let link = make_github_issue_link(&issue_body);\n",
+    "new": "        let link = make_github_issue_link(&issue_body);\n        let _edited = 41;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/config.rs",
+    "old": "        let config = config.into();\n",
+    "new": "        let config = config.into();\n        let _edited = 50;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/configs/directory.rs",
+    "old": "            Either::First(vec) => vec.is_empty(),\n",
+    "new": "            Either::First(vec) => vec.len() == 0,\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/configs/mod.rs",
+    "old": "        let full_cfg = Value::try_from(FullConfig::default()).unwrap();\n",
+    "new": "        let full_cfg = Value::try_from(FullConfig::default()).unwrap();\n        let _edited = 362;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/configure.rs",
+    "old": "        if key.is_empty() {\n",
+    "new": "        if key.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/formatter/string_formatter.rs",
+    "old": "            if textgroup.format.is_empty() {\n",
+    "new": "            if textgroup.format.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/logger.rs",
+    "old": "                Err(err) => return eprintln!(\"Log file writer mutex was poisoned: {err:?}\"),\n",
+    "new": "                Err(err) => return eprintln!(\"Log file writer mutex was poisoned indeed: {err:?}\"),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/main.rs",
+    "old": "                println!(\"Supported modules list\");\n",
+    "new": "                println!(\"Supported modules list indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/modules/time.rs",
+    "old": "            .map_err(|err| format!(\"Invalid timezone offset: {err:?}\"))?;\n",
+    "new": "            .map_err(|err| format!(\"Invalid timezone offset indeed: {err:?}\"))?;\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/print.rs",
+    "old": "        eprintln!(\"Error writing preset to stdout: {err}\");\n",
+    "new": "        eprintln!(\"Error writing preset to stdout indeed: {err}\");\n",
+    "what": "a word in a message"
+   }
+  ]
+ },
+ "numeric": {
+  "source": "numeric",
+  "package": "numeric",
+  "runs": [
+   [],
+   [
+    "2"
+   ],
+   [
+    "1",
+    "1"
+   ],
+   [
+    "3",
+    "3"
+   ]
+  ],
+  "bench": [
+   "3"
+  ],
+  "scrub": [
+   "\\(\\d+\\) panicked"
+  ]
+ },
+ "nativecalls": {
+  "source": "nativecalls",
+  "package": "nativecalls",
+  "runs": [
+   [],
+   [
+    "10"
+   ],
+   [
+    "100000"
+   ]
+  ],
+  "bench": [
+   "200000000"
+  ]
+ },
+ "jsonrt": {
+  "source": "jsonrt",
+  "package": "jsonrt",
+  "runs": [
+   [
+    "2000"
+   ],
+   [
+    "20000",
+    "../jsonrt-vendor"
+   ],
+   [
+    "0"
+   ]
+  ],
+  "bench": [
+   "60000",
+   "../jsonrt-vendor"
+  ]
+ },
+ "tlsfetch": {
+  "source": "tlsfetch",
+  "package": "tlsfetch",
+  "runs": [
+   [],
+   [
+    "3"
+   ]
+  ],
+  "bench": [
+   "5"
+  ]
+ },
+ "wasmrun": {
+  "source": "wasmrun",
+  "package": "wasmrun",
+  "runs": [
+   [],
+   [
+    "4"
+   ]
+  ],
+  "bench": [
+   "8"
+  ]
+ },
+ "ecs": {
+  "source": "ecs",
+  "package": "ecs",
+  "runs": [
+   [],
+   [
+    "1"
+   ],
+   [
+    "2000"
+   ]
+  ],
+  "bench": [
+   "5000"
+  ]
+ },
+ "fieldorder": {
+  "source": "fieldorder",
+  "package": "fieldorder",
+  "runs": [
+   [],
+   [
+    "4",
+    "100"
+   ],
+   [
+    "16",
+    "100000"
+   ]
+  ],
+  "bench": [
+   "20",
+   "50000000"
+  ]
+ },
+ "websvc": {
+  "source": "websvc",
+  "package": "websvc",
+  "serve": [
+   "{port}"
+  ],
+  "scrub": [
+   "date: [^\\r]*"
+  ],
+  "runs": [
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/health"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes?after=490&limit=100"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes?limit=0"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes/17"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes/9999"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/notes/x"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "http://127.0.0.1:{port}/notes/17/star"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "http://127.0.0.1:{port}/notes/17/star"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "-H",
+     "content-type: application/json",
+     "-d",
+     "{\"author\":\"me\",\"body\":\"a new note \\u00e9\"}",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "-H",
+     "content-type: application/json",
+     "-d",
+     "{\"author\":\"me\",\"body\":\"\"}",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "-H",
+     "content-type: application/json",
+     "-d",
+     "{not json",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "POST",
+     "-d",
+     "x",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/stats"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "http://127.0.0.1:{port}/nothing"
+    ]
+   },
+   {
+    "tool": [
+     "curl",
+     "-s",
+     "-i",
+     "--max-time",
+     "20",
+     "-X",
+     "DELETE",
+     "http://127.0.0.1:{port}/notes"
+    ]
+   }
+  ],
+  "load": [
+   "wrk",
+   "-t4",
+   "-c64",
+   "-d5s",
+   "http://127.0.0.1:{port}/notes?after=100&limit=20"
+  ]
+ },
+ "grpc": {
+  "source": "grpc",
+  "package": "grpc",
+  "serve": [
+   "serve",
+   "{port}"
+  ],
+  "runs": [
+   [
+    "client",
+    "{port}",
+    "50"
+   ],
+   [
+    "client",
+    "{port}",
+    "200"
+   ],
+   [
+    "client",
+    "{port}",
+    "1"
+   ]
+  ],
+  "bench": [
+   "client",
+   "{port}",
+   "400"
+  ]
+ },
+ "cargo": {
+  "repo": "https://github.com/rust-lang/cargo",
+  "rev": "5f94df4789f005f9a352888e8355ffc645b7ed0e",
+  "package": "cargo",
+  "cargo_args": [
+   "--bin",
+   "cargo"
+  ],
+  "scrub": [
+   "in [0-9.]+s",
+   "[0-9.]+(MiB|KiB|GiB|B) total"
+  ],
+  "env": {
+   "CARGO_TERM_COLOR": "never",
+   "CARGO_NET_OFFLINE": "true"
+  },
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--list"
+   ],
+   [
+    "help",
+    "build"
+   ],
+   [
+    "metadata",
+    "--format-version",
+    "1",
+    "--no-deps"
+   ],
+   [
+    "tree",
+    "-p",
+    "cargo-platform",
+    "--edges",
+    "normal"
+   ],
+   [
+    "tree",
+    "-p",
+    "cargo",
+    "--depth",
+    "1",
+    "--edges",
+    "normal",
+    "--prefix",
+    "none"
+   ],
+   [
+    "pkgid",
+    "-p",
+    "cargo-util"
+   ],
+   [
+    "locate-project",
+    "--workspace"
+   ],
+   [
+    "clean",
+    "--target-dir",
+    ".apps-target"
+   ],
+   [
+    "build",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1"
+   ],
+   [
+    "build",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1",
+    "--message-format",
+    "json"
+   ],
+   [
+    "test",
+    "-p",
+    "cargo-platform",
+    "--target-dir",
+    ".apps-target",
+    "-j",
+    "1",
+    "--lib"
+   ],
+   [
+    "build",
+    "-p",
+    "no-such-package"
+   ],
+   [
+    "frobnicate"
+   ],
+   [
+    "metadata",
+    "--format-version",
+    "1",
+    "--manifest-path",
+    "no/such/Cargo.toml"
+   ]
+  ],
+  "bench": [
+   "metadata",
+   "--format-version",
+   "1"
+  ],
+  "edits": [
+   {
+    "file": "src/bin/cargo/cli.rs",
+    "old": "        let nightly_features_allowed = matches!(&*features::channel(), \"nightly\" | \"dev\");\n",
+    "new": "        let nightly_features_allowed = matches!(&*features::channel(), \"nightly\" | \"dev\");\n        let _edited = 35;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/add.rs",
+    "old": "                    let candidates = get_registry_candidates();\n",
+    "new": "                    let candidates = get_registry_candidates();\n                    let _edited = 150;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/build.rs",
+    "old": "        let artifact_dir = artifact_dir.resolve_path(gctx);\n",
+    "new": "        let artifact_dir = artifact_dir.resolve_path(gctx);\n        let _edited = 58;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "src/bin/cargo/commands/install.rs",
+    "old": "        if k.is_empty() {\n",
+    "new": "        if k.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/commands/locate_project.rs",
+    "old": "            s => bail!(\"invalid message format specifier: `{}`\", s),\n",
+    "new": "            s => bail!(\"invalid message format specifier indeed: `{}`\", s),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/bin/cargo/commands/remove.rs",
+    "old": "        assert!(!target.is_empty(), \"Target specification may not be empty\");\n",
+    "new": "        assert!(!target.len() == 0, \"Target specification may not be empty\");\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/commands/rustc.rs",
+    "old": "            .filter(|s| !s.is_empty())\n",
+    "new": "            .filter(|s| !s.len() == 0)\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "src/bin/cargo/main.rs",
+    "old": "        anyhow::bail!(\"subcommand is required, but `{alias_name}` is empty\");\n",
+    "new": "        anyhow::bail!(\"subcommand is required indeed, but `{alias_name}` is empty\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/compiler/build_runner/compilation_files.rs",
+    "old": "            panic!(\"doc tests do not have an out dir\");\n",
+    "new": "            panic!(\"doc tests do not have an out dir indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "src/compiler/compile_kind.rs",
+    "old": "            bail!(\"target was empty\");\n",
+    "new": "            bail!(\"target was empty indeed\");\n",
+    "what": "a word in a message"
+   }
+  ]
+ },
+ "rust-analyzer": {
+  "repo": "https://github.com/rust-lang/rust-analyzer",
+  "rev": "70e0c46be740a471bcc95f2be290f4bbfdcffd87",
+  "package": "rust-analyzer",
+  "cargo_args": [
+   "--bin",
+   "rust-analyzer"
+  ],
+  "scrub": [
+   "[0-9.]+(ms|s)\\b",
+   "\\d+(mb|kb|b)\\b",
+   "[0-9]+ ?(MB|GB|KB)"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   {
+    "args": [
+     "parse"
+    ],
+    "stdin": "crates/stdx/src/lib.rs"
+   },
+   {
+    "args": [
+     "symbols"
+    ],
+    "stdin": "crates/stdx/src/lib.rs"
+   },
+   {
+    "args": [
+     "highlight"
+    ],
+    "stdin": "crates/stdx/src/process.rs"
+   },
+   [
+    "lsif",
+    "lib/la-arena"
+   ],
+   [
+    "diagnostics",
+    "lib/la-arena"
+   ],
+   [
+    "analysis-stats",
+    "--randomize",
+    "lib/line-index"
+   ],
+   [
+    "analysis-stats",
+    "lib/la-arena"
+   ],
+   [
+    "unresolved-references",
+    "lib/la-arena"
+   ],
+   [
+    "ssr",
+    "$a.len() == 0 ==>> $a.is_empty()"
+   ],
+   [
+    "no-such-command"
+   ],
+   [
+    "lsif",
+    "no/such/dir"
+   ]
+  ],
+  "bench": [
+   "analysis-stats",
+   "lib/la-arena"
+  ]
+ },
+ "nushell": {
+  "repo": "https://github.com/nushell/nushell",
+  "rev": "85aae22da8e8c010e782d011b07c46bc7d703fb8",
+  "package": "nu",
+  "cargo_args": [
+   "--bin",
+   "nu"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "1..2000 | each {|x| $x * $x mod 7} | math sum"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "open Cargo.toml | get package | select name edition | to json"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "open Cargo.lock | get package | where name =~ \"^nu\" | get name | str join \",\""
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "ls crates | get name | sort | first 20 | to nuon"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "glob crates/nu-parser/src/*.rs | sort | each {|f| open --raw $f | lines | length} | math sum"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "\"the quick brown fox\" | split words | each {|w| $w | str capitalize | str reverse} | to json -r"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "[[a b]; [1 2] [3 4] [5 6]] | update a {|r| $r.a * 10} | table"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "def fib [n: int] { if $n < 2 { $n } else { (fib ($n - 1)) + (fib ($n - 2)) } }; fib 18"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "{a: 1, b: [1 2 3], c: {d: \"x\"}} | to yaml"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "help commands | length"
+   ],
+   [
+    "-n",
+    "-c",
+    "use std/assert; assert equal (1 + 1) 2; \"std ok\""
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "1 / 0"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "no-such-command 1"
+   ],
+   [
+    "-n",
+    "--no-std-lib",
+    "-c",
+    "let x = [1 2 3; $x.9"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "-n",
+   "--no-std-lib",
+   "-c",
+   "def fib [n: int] { if $n < 2 { $n } else { (fib ($n - 1)) + (fib ($n - 2)) } }; fib 22"
+  ]
+ },
+ "helix": {
+  "repo": "https://github.com/helix-editor/helix",
+  "rev": "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc",
+  "package": "helix-term",
+  "bin": "hx",
+  "cargo_args": [
+   "--bin",
+   "hx"
+  ],
+  "build_env": {
+   "HELIX_DISABLE_AUTO_GRAMMAR_BUILD": "1"
+  },
+  "env": {
+   "HELIX_RUNTIME": "runtime",
+   "HOME": "/tmp/apps-helix-home",
+   "XDG_CONFIG_HOME": "/tmp/apps-helix-home/config",
+   "XDG_CACHE_HOME": "/tmp/apps-helix-home/cache"
+  },
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "--health"
+   ],
+   [
+    "--health",
+    "rust"
+   ],
+   [
+    "--health",
+    "languages"
+   ],
+   [
+    "--health",
+    "no-such-language"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "-c",
+    "no/such/config.toml",
+    "--health",
+    "toml"
+   ]
+  ],
+  "bench": [
+   "--health"
+  ],
+  "edits": [
+   {
+    "file": "helix-term/src/application.rs",
+    "old": "        let mut theme_parent_dirs = vec![helix_loader::config_dir()];\n",
+    "new": "        let mut theme_parent_dirs = vec![helix_loader::config_dir()];\n        let _edited = 104;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/args.rs",
+    "old": "        let mut args = Args::default();\n",
+    "new": "        let mut args = Args::default();\n        let _edited = 27;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/commands.rs",
+    "old": "        let response = call.await?;\n",
+    "new": "        let response = call.await?;\n        let _edited = 190;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "helix-term/src/commands/dap.rs",
+    "old": "        bail!(\"Workspace is not trusted. Run `:workspace-trust` to enable the debug adapter.\");\n",
+    "new": "        bail!(\"Workspace is not trusted indeed. Run `:workspace-trust` to enable the debug adapter.\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/lsp.rs",
+    "old": "            let err = format!(\"failed to open path: {:?}: {:?}\", path, err);\n",
+    "new": "            let err = format!(\"failed to open path indeed: {:?}: {:?}\", path, err);\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/syntax.rs",
+    "old": "            return async { Err(anyhow::anyhow!(\"Current working directory does not exist\")) }\n",
+    "new": "            return async { Err(anyhow::anyhow!(\"Current working directory does not exist indeed\")) }\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/commands/typed.rs",
+    "old": "        _ => bail!(\"invalid line ending\"),\n",
+    "new": "        _ => bail!(\"invalid line ending indeed\"),\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "helix-term/src/compositor.rs",
+    "old": "            if cx.editor.macro_replaying.is_empty() {\n",
+    "new": "            if cx.editor.macro_replaying.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "helix-term/src/handlers/completion/item.rs",
+    "old": "            CompletionItems::Lsp(items) => items.is_empty(),\n",
+    "new": "            CompletionItems::Lsp(items) => items.len() == 0,\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "helix-term/src/handlers/completion/request.rs",
+    "old": "        if !requests.is_empty() {\n",
+    "new": "        if !requests.len() == 0 {\n",
+    "what": "a condition rewritten"
+   }
+  ]
+ },
+ "alacritty": {
+  "repo": "https://github.com/alacritty/alacritty",
+  "rev": "542147067dd016fc5f49120ef0ba605a98a4e3a7",
+  "package": "alacritty",
+  "env": {
+   "HOME": "/tmp/apps-alacritty-home",
+   "XDG_RUNTIME_DIR": "/tmp/apps-alacritty-home",
+   "WAYLAND_DISPLAY": "",
+   "DISPLAY": ""
+  },
+  "setup": [
+   "printf 'font:\\n  size: 11.5\\nwindow:\\n  padding:\\n    x: 4\\n    y: 6\\ncolors:\\n  primary:\\n    background: \"0x101010\"\\nkey_bindings:\\n  - { key: V, mods: Control|Shift, action: Paste }\\n' > .apps-old.yml"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    ".apps-old.yml"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    "alacritty/alacritty.toml"
+   ],
+   [
+    "migrate",
+    "--dry-run",
+    "-c",
+    "no-such.yml"
+   ],
+   [
+    "msg",
+    "create-window"
+   ],
+   [
+    "msg",
+    "--help"
+   ],
+   [
+    "--no-such-flag"
+   ],
+   [
+    "--config-file",
+    "no-such.toml",
+    "--print-events",
+    "--hold",
+    "--bad"
+   ]
+  ],
+  "bench": [
+   "migrate",
+   "--dry-run",
+   "-c",
+   ".apps-old.yml"
+  ]
+ },
+ "ruff": {
+  "repo": "https://github.com/astral-sh/ruff",
+  "rev": "8d122c1fd2b8f16d494ff8a8f8ee6f264bba7ceb",
+  "package": "ruff",
+  "cargo_args": [
+   "--bin",
+   "ruff"
+  ],
+  "scrub": [
+   "in [0-9.]+(ms|s)"
+  ],
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--help"
+   ],
+   [
+    "linter"
+   ],
+   [
+    "rule",
+    "E501"
+   ],
+   [
+    "rule",
+    "--all",
+    "--output-format",
+    "json"
+   ],
+   [
+    "config"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "ALL",
+    "--output-format",
+    "concise",
+    "crates/ruff_linter/resources/test/fixtures/pycodestyle"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "E,F,B,UP",
+    "--output-format",
+    "json",
+    "crates/ruff_linter/resources/test/fixtures/pyflakes"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "ALL",
+    "--statistics",
+    "crates/ruff_linter/resources/test/fixtures"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--select",
+    "UP,SIM",
+    "--diff",
+    "crates/ruff_linter/resources/test/fixtures/pyupgrade"
+   ],
+   [
+    "format",
+    "--isolated",
+    "--no-cache",
+    "--diff",
+    "crates/ruff_python_formatter/resources/test/fixtures/black"
+   ],
+   [
+    "format",
+    "--isolated",
+    "--no-cache",
+    "--check",
+    "crates/ruff_python_formatter/resources/test/fixtures/ruff"
+   ],
+   [
+    "check",
+    "--isolated",
+    "--no-cache",
+    "--show-settings",
+    "scripts"
+   ],
+   [
+    "check",
+    "no/such/file.py"
+   ],
+   [
+    "--no-such-flag"
+   ]
+  ],
+  "bench": [
+   "check",
+   "--isolated",
+   "--no-cache",
+   "--select",
+   "ALL",
+   "--statistics",
+   "crates/ruff_linter/resources/test/fixtures"
+  ],
+  "edits": [
+   {
+    "file": "crates/ruff/src/args.rs",
+    "old": "        let mut overrides = Configuration::default();\n",
+    "new": "        let mut overrides = Configuration::default();\n        let _edited = 741;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/cache.rs",
+    "old": "        let metadata = path.metadata()?;\n",
+    "new": "        let metadata = path.metadata()?;\n        let _edited = 41;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/commands/add_noqa.rs",
+    "old": "            let source_type = SourceType::from(resolved_file.path());\n",
+    "new": "            let source_type = SourceType::from(resolved_file.path());\n            let _edited = 64;\n",
+    "what": "a statement added"
+   },
+   {
+    "file": "crates/ruff/src/commands/format.rs",
+    "old": "                            let edit = if formatted.is_empty() {\n",
+    "new": "                            let edit = if formatted.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/commands/show_settings.rs",
+    "old": "        bail!(\"No files found under the given path\");\n",
+    "new": "        bail!(\"No files found under the given path indeed\");\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/lib.rs",
+    "old": "                if !diagnostics.inner.is_empty() {\n",
+    "new": "                if !diagnostics.inner.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/printer.rs",
+    "old": "        if statistics.is_empty() {\n",
+    "new": "        if statistics.len() == 0 {\n",
+    "what": "a condition rewritten"
+   },
+   {
+    "file": "crates/ruff/src/resolve.rs",
+    "old": "        bail!(\"Working directory does not exist\")\n",
+    "new": "        bail!(\"Working directory does not exist indeed\")\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/commands/format.rs",
+    "old": "                    write!(f, \"{header} {err}\", header = \"Failed to read:\".bold())\n",
+    "new": "                    write!(f, \"{header} {err}\", header = \"Failed to read indeed:\".bold())\n",
+    "what": "a word in a message"
+   },
+   {
+    "file": "crates/ruff/src/commands/show_settings.rs",
+    "old": "    writeln!(writer, \"Resolved settings for: \\\"{}\\\"\", path.display())?;\n",
+    "new": "    writeln!(writer, \"Resolved settings for indeed: \\\"{}\\\"\", path.display())?;\n",
+    "what": "a word in a message"
+   }
+  ]
+ },
+ "bun": {
+  "repo": "https://github.com/oven-sh/bun",
+  "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+  "prepare": "bunprep",
+  "package": "bun-exe",
+  "bin": "bun",
+  "rustflags": "-Cforce-frame-pointers=yes",
+  "runs": [
+   [
+    "--version"
+   ],
+   [
+    "--revision"
+   ],
+   [
+    "-e",
+    "console.log(1 + 2)"
+   ],
+   [
+    "-e",
+    "console.log(Bun.hash('blaze'), Bun.semver.order('1.2.3', '1.10.0'), new URL('https://a.b/c?d=1').searchParams.get('d'), JSON.stringify(Bun.deepEquals({a: [1]}, {a: [1]})))"
+   ],
+   [
+    "build",
+    "--no-bundle",
+    "--minify",
+    "src/js/node/http2.ts"
+   ],
+   [
+    "build",
+    "--no-bundle",
+    "src/js/node/net.ts"
+   ],
+   [
+    "-e",
+    "const t = new Bun.Transpiler({ loader: \"ts\", minifyWhitespace: true }); const fs = require(\"fs\"); const sources = [\"http2\", \"net\", \"_http_server\", \"fs\", \"child_process\"].map(n => fs.readFileSync(\"src/js/node/\" + n + \".ts\", \"utf8\")); let n = 0; for (let i = 0; i < 2; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"
+   ],
+   [
+    "-e",
+    "throw new Error('expected')"
+   ]
+  ],
+  "bench": [
+   "-e",
+   "const t = new Bun.Transpiler({ loader: \"ts\", minifyWhitespace: true }); const fs = require(\"fs\"); const sources = [\"http2\", \"net\", \"_http_server\", \"fs\", \"child_process\"].map(n => fs.readFileSync(\"src/js/node/\" + n + \".ts\", \"utf8\")); let n = 0; for (let i = 0; i < 60; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"
+  ]
+ }
+}

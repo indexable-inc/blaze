@@ -1,0 +1,19 @@
+/* Copied from ix packages/web/src/styles/fonts.css (the two faces the docs use).
+   Inter 4.1 (SIL OFL 1.1, static/fonts/Inter-LICENSE.txt), InterVariable.ttf subset to Latin-1 plus general
+   punctuation, arrows and geometric shapes, both variable axes (wght 100-900, opsz 14-32). */
+@font-face {
+	font-family: 'Inter';
+	src: url('fonts/InterVariable-latin.woff2') format('woff2');
+	font-weight: 100 900;
+	font-style: normal;
+	font-display: swap;
+}
+
+/* Monospace is for code, commands and identifiers only. */
+@font-face {
+	font-family: 'Berkeley Mono';
+	src: url('fonts/BerkeleyMono-Variable.woff2') format('woff2');
+	font-weight: 100 700;
+	font-style: normal;
+	font-display: swap;
+}

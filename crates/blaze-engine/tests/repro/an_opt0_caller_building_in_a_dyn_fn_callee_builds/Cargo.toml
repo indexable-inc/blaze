@@ -1,0 +1,19 @@
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dep = { path = "dep" }
+hot = { path = "hot" }
+
+# The caller is at level 0, where `resize` is built in by the code generator
+# (`built_in_body`), not by the MIR inliner; `hot` at level 3 makes some unit inline, as
+# blaze's own workspace has, so every generic is walked for inlining.
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package.hot]
+opt-level = 3
+
+[workspace]

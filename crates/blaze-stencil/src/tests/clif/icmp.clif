@@ -1,0 +1,4612 @@
+; Follows cranelift/filetests/filetests/runtests/icmp.clif (and icmp-eq.clif, icmp-ne.clif,
+; icmp-slt.clif, icmp-sge.clif, icmp-sgt.clif, icmp-sle.clif, icmp-ult.clif, icmp-uge.clif,
+; icmp-ugt.clif, icmp-ule.clif), for the stencil set: the ten conditions of `i8` to `i64`
+; on the edges, each as a value (`icmp_*`), by a `brif` right after (`br_icmp_*`, which the
+; stencil backend fuses into one compare-and-branch), as both at once (`icmp_br_*`, not
+; fused: the result has two uses), and each of these but the last with an `iconst` second
+; operand (folded into an immediate; for `i64` also one of more than 32 bits). `i128` is
+; i128-icmp.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %icmp_eq_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_i8(0, 0) == 1
+; run: %icmp_eq_i8(0, 1) == 0
+; run: %icmp_eq_i8(1, 0) == 0
+; run: %icmp_eq_i8(-1, 0) == 0
+; run: %icmp_eq_i8(0, -1) == 0
+; run: %icmp_eq_i8(-128, 127) == 0
+; run: %icmp_eq_i8(127, -128) == 0
+; run: %icmp_eq_i8(-128, -128) == 1
+; run: %icmp_eq_i8(127, 127) == 1
+; run: %icmp_eq_i8(-1, -1) == 1
+; run: %icmp_eq_i8(-128, -127) == 0
+; run: %icmp_eq_i8(126, 127) == 0
+; run: %icmp_eq_i8(-1, 1) == 0
+; run: %icmp_eq_i8(100, -77) == 0
+
+function %br_icmp_eq_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_i8(0, 0) == 1
+; run: %br_icmp_eq_i8(0, 1) == 2
+; run: %br_icmp_eq_i8(1, 0) == 2
+; run: %br_icmp_eq_i8(-1, 0) == 2
+; run: %br_icmp_eq_i8(0, -1) == 2
+; run: %br_icmp_eq_i8(-128, 127) == 2
+; run: %br_icmp_eq_i8(127, -128) == 2
+; run: %br_icmp_eq_i8(-128, -128) == 1
+; run: %br_icmp_eq_i8(127, 127) == 1
+; run: %br_icmp_eq_i8(-1, -1) == 1
+; run: %br_icmp_eq_i8(-128, -127) == 2
+; run: %br_icmp_eq_i8(126, 127) == 2
+; run: %br_icmp_eq_i8(-1, 1) == 2
+; run: %br_icmp_eq_i8(100, -77) == 2
+
+function %icmp_br_eq_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_eq_i8(0, 0) == [1, 1]
+; run: %icmp_br_eq_i8(0, 1) == [0, 2]
+; run: %icmp_br_eq_i8(1, 0) == [0, 2]
+; run: %icmp_br_eq_i8(-1, 0) == [0, 2]
+; run: %icmp_br_eq_i8(0, -1) == [0, 2]
+; run: %icmp_br_eq_i8(-128, 127) == [0, 2]
+; run: %icmp_br_eq_i8(127, -128) == [0, 2]
+; run: %icmp_br_eq_i8(-128, -128) == [1, 1]
+
+function %icmp_eq_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_imm_i8(-3) == 0
+; run: %icmp_eq_imm_i8(-2) == 1
+; run: %icmp_eq_imm_i8(-1) == 0
+; run: %icmp_eq_imm_i8(0) == 0
+; run: %icmp_eq_imm_i8(-128) == 0
+; run: %icmp_eq_imm_i8(127) == 0
+; run: %icmp_eq_imm_i8(1) == 0
+
+function %br_icmp_eq_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_imm_i8(-3) == 2
+; run: %br_icmp_eq_imm_i8(-2) == 1
+; run: %br_icmp_eq_imm_i8(-1) == 2
+; run: %br_icmp_eq_imm_i8(0) == 2
+; run: %br_icmp_eq_imm_i8(-128) == 2
+; run: %br_icmp_eq_imm_i8(127) == 2
+; run: %br_icmp_eq_imm_i8(1) == 2
+
+function %icmp_ne_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_i8(0, 0) == 0
+; run: %icmp_ne_i8(0, 1) == 1
+; run: %icmp_ne_i8(1, 0) == 1
+; run: %icmp_ne_i8(-1, 0) == 1
+; run: %icmp_ne_i8(0, -1) == 1
+; run: %icmp_ne_i8(-128, 127) == 1
+; run: %icmp_ne_i8(127, -128) == 1
+; run: %icmp_ne_i8(-128, -128) == 0
+; run: %icmp_ne_i8(127, 127) == 0
+; run: %icmp_ne_i8(-1, -1) == 0
+; run: %icmp_ne_i8(-128, -127) == 1
+; run: %icmp_ne_i8(126, 127) == 1
+; run: %icmp_ne_i8(-1, 1) == 1
+; run: %icmp_ne_i8(100, -77) == 1
+
+function %br_icmp_ne_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_i8(0, 0) == 2
+; run: %br_icmp_ne_i8(0, 1) == 1
+; run: %br_icmp_ne_i8(1, 0) == 1
+; run: %br_icmp_ne_i8(-1, 0) == 1
+; run: %br_icmp_ne_i8(0, -1) == 1
+; run: %br_icmp_ne_i8(-128, 127) == 1
+; run: %br_icmp_ne_i8(127, -128) == 1
+; run: %br_icmp_ne_i8(-128, -128) == 2
+; run: %br_icmp_ne_i8(127, 127) == 2
+; run: %br_icmp_ne_i8(-1, -1) == 2
+; run: %br_icmp_ne_i8(-128, -127) == 1
+; run: %br_icmp_ne_i8(126, 127) == 1
+; run: %br_icmp_ne_i8(-1, 1) == 1
+; run: %br_icmp_ne_i8(100, -77) == 1
+
+function %icmp_br_ne_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ne_i8(0, 0) == [0, 2]
+; run: %icmp_br_ne_i8(0, 1) == [1, 1]
+; run: %icmp_br_ne_i8(1, 0) == [1, 1]
+; run: %icmp_br_ne_i8(-1, 0) == [1, 1]
+; run: %icmp_br_ne_i8(0, -1) == [1, 1]
+; run: %icmp_br_ne_i8(-128, 127) == [1, 1]
+; run: %icmp_br_ne_i8(127, -128) == [1, 1]
+; run: %icmp_br_ne_i8(-128, -128) == [0, 2]
+
+function %icmp_ne_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_imm_i8(-3) == 1
+; run: %icmp_ne_imm_i8(-2) == 0
+; run: %icmp_ne_imm_i8(-1) == 1
+; run: %icmp_ne_imm_i8(0) == 1
+; run: %icmp_ne_imm_i8(-128) == 1
+; run: %icmp_ne_imm_i8(127) == 1
+; run: %icmp_ne_imm_i8(1) == 1
+
+function %br_icmp_ne_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_imm_i8(-3) == 1
+; run: %br_icmp_ne_imm_i8(-2) == 2
+; run: %br_icmp_ne_imm_i8(-1) == 1
+; run: %br_icmp_ne_imm_i8(0) == 1
+; run: %br_icmp_ne_imm_i8(-128) == 1
+; run: %br_icmp_ne_imm_i8(127) == 1
+; run: %br_icmp_ne_imm_i8(1) == 1
+
+function %icmp_slt_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_i8(0, 0) == 0
+; run: %icmp_slt_i8(0, 1) == 1
+; run: %icmp_slt_i8(1, 0) == 0
+; run: %icmp_slt_i8(-1, 0) == 1
+; run: %icmp_slt_i8(0, -1) == 0
+; run: %icmp_slt_i8(-128, 127) == 1
+; run: %icmp_slt_i8(127, -128) == 0
+; run: %icmp_slt_i8(-128, -128) == 0
+; run: %icmp_slt_i8(127, 127) == 0
+; run: %icmp_slt_i8(-1, -1) == 0
+; run: %icmp_slt_i8(-128, -127) == 1
+; run: %icmp_slt_i8(126, 127) == 1
+; run: %icmp_slt_i8(-1, 1) == 1
+; run: %icmp_slt_i8(100, -77) == 0
+
+function %br_icmp_slt_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_i8(0, 0) == 2
+; run: %br_icmp_slt_i8(0, 1) == 1
+; run: %br_icmp_slt_i8(1, 0) == 2
+; run: %br_icmp_slt_i8(-1, 0) == 1
+; run: %br_icmp_slt_i8(0, -1) == 2
+; run: %br_icmp_slt_i8(-128, 127) == 1
+; run: %br_icmp_slt_i8(127, -128) == 2
+; run: %br_icmp_slt_i8(-128, -128) == 2
+; run: %br_icmp_slt_i8(127, 127) == 2
+; run: %br_icmp_slt_i8(-1, -1) == 2
+; run: %br_icmp_slt_i8(-128, -127) == 1
+; run: %br_icmp_slt_i8(126, 127) == 1
+; run: %br_icmp_slt_i8(-1, 1) == 1
+; run: %br_icmp_slt_i8(100, -77) == 2
+
+function %icmp_br_slt_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_slt_i8(0, 0) == [0, 2]
+; run: %icmp_br_slt_i8(0, 1) == [1, 1]
+; run: %icmp_br_slt_i8(1, 0) == [0, 2]
+; run: %icmp_br_slt_i8(-1, 0) == [1, 1]
+; run: %icmp_br_slt_i8(0, -1) == [0, 2]
+; run: %icmp_br_slt_i8(-128, 127) == [1, 1]
+; run: %icmp_br_slt_i8(127, -128) == [0, 2]
+; run: %icmp_br_slt_i8(-128, -128) == [0, 2]
+
+function %icmp_slt_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_imm_i8(-3) == 1
+; run: %icmp_slt_imm_i8(-2) == 0
+; run: %icmp_slt_imm_i8(-1) == 0
+; run: %icmp_slt_imm_i8(0) == 0
+; run: %icmp_slt_imm_i8(-128) == 1
+; run: %icmp_slt_imm_i8(127) == 0
+; run: %icmp_slt_imm_i8(1) == 0
+
+function %br_icmp_slt_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_imm_i8(-3) == 1
+; run: %br_icmp_slt_imm_i8(-2) == 2
+; run: %br_icmp_slt_imm_i8(-1) == 2
+; run: %br_icmp_slt_imm_i8(0) == 2
+; run: %br_icmp_slt_imm_i8(-128) == 1
+; run: %br_icmp_slt_imm_i8(127) == 2
+; run: %br_icmp_slt_imm_i8(1) == 2
+
+function %icmp_sge_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_i8(0, 0) == 1
+; run: %icmp_sge_i8(0, 1) == 0
+; run: %icmp_sge_i8(1, 0) == 1
+; run: %icmp_sge_i8(-1, 0) == 0
+; run: %icmp_sge_i8(0, -1) == 1
+; run: %icmp_sge_i8(-128, 127) == 0
+; run: %icmp_sge_i8(127, -128) == 1
+; run: %icmp_sge_i8(-128, -128) == 1
+; run: %icmp_sge_i8(127, 127) == 1
+; run: %icmp_sge_i8(-1, -1) == 1
+; run: %icmp_sge_i8(-128, -127) == 0
+; run: %icmp_sge_i8(126, 127) == 0
+; run: %icmp_sge_i8(-1, 1) == 0
+; run: %icmp_sge_i8(100, -77) == 1
+
+function %br_icmp_sge_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_i8(0, 0) == 1
+; run: %br_icmp_sge_i8(0, 1) == 2
+; run: %br_icmp_sge_i8(1, 0) == 1
+; run: %br_icmp_sge_i8(-1, 0) == 2
+; run: %br_icmp_sge_i8(0, -1) == 1
+; run: %br_icmp_sge_i8(-128, 127) == 2
+; run: %br_icmp_sge_i8(127, -128) == 1
+; run: %br_icmp_sge_i8(-128, -128) == 1
+; run: %br_icmp_sge_i8(127, 127) == 1
+; run: %br_icmp_sge_i8(-1, -1) == 1
+; run: %br_icmp_sge_i8(-128, -127) == 2
+; run: %br_icmp_sge_i8(126, 127) == 2
+; run: %br_icmp_sge_i8(-1, 1) == 2
+; run: %br_icmp_sge_i8(100, -77) == 1
+
+function %icmp_br_sge_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sge_i8(0, 0) == [1, 1]
+; run: %icmp_br_sge_i8(0, 1) == [0, 2]
+; run: %icmp_br_sge_i8(1, 0) == [1, 1]
+; run: %icmp_br_sge_i8(-1, 0) == [0, 2]
+; run: %icmp_br_sge_i8(0, -1) == [1, 1]
+; run: %icmp_br_sge_i8(-128, 127) == [0, 2]
+; run: %icmp_br_sge_i8(127, -128) == [1, 1]
+; run: %icmp_br_sge_i8(-128, -128) == [1, 1]
+
+function %icmp_sge_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_imm_i8(-3) == 0
+; run: %icmp_sge_imm_i8(-2) == 1
+; run: %icmp_sge_imm_i8(-1) == 1
+; run: %icmp_sge_imm_i8(0) == 1
+; run: %icmp_sge_imm_i8(-128) == 0
+; run: %icmp_sge_imm_i8(127) == 1
+; run: %icmp_sge_imm_i8(1) == 1
+
+function %br_icmp_sge_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_imm_i8(-3) == 2
+; run: %br_icmp_sge_imm_i8(-2) == 1
+; run: %br_icmp_sge_imm_i8(-1) == 1
+; run: %br_icmp_sge_imm_i8(0) == 1
+; run: %br_icmp_sge_imm_i8(-128) == 2
+; run: %br_icmp_sge_imm_i8(127) == 1
+; run: %br_icmp_sge_imm_i8(1) == 1
+
+function %icmp_sgt_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_i8(0, 0) == 0
+; run: %icmp_sgt_i8(0, 1) == 0
+; run: %icmp_sgt_i8(1, 0) == 1
+; run: %icmp_sgt_i8(-1, 0) == 0
+; run: %icmp_sgt_i8(0, -1) == 1
+; run: %icmp_sgt_i8(-128, 127) == 0
+; run: %icmp_sgt_i8(127, -128) == 1
+; run: %icmp_sgt_i8(-128, -128) == 0
+; run: %icmp_sgt_i8(127, 127) == 0
+; run: %icmp_sgt_i8(-1, -1) == 0
+; run: %icmp_sgt_i8(-128, -127) == 0
+; run: %icmp_sgt_i8(126, 127) == 0
+; run: %icmp_sgt_i8(-1, 1) == 0
+; run: %icmp_sgt_i8(100, -77) == 1
+
+function %br_icmp_sgt_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_i8(0, 0) == 2
+; run: %br_icmp_sgt_i8(0, 1) == 2
+; run: %br_icmp_sgt_i8(1, 0) == 1
+; run: %br_icmp_sgt_i8(-1, 0) == 2
+; run: %br_icmp_sgt_i8(0, -1) == 1
+; run: %br_icmp_sgt_i8(-128, 127) == 2
+; run: %br_icmp_sgt_i8(127, -128) == 1
+; run: %br_icmp_sgt_i8(-128, -128) == 2
+; run: %br_icmp_sgt_i8(127, 127) == 2
+; run: %br_icmp_sgt_i8(-1, -1) == 2
+; run: %br_icmp_sgt_i8(-128, -127) == 2
+; run: %br_icmp_sgt_i8(126, 127) == 2
+; run: %br_icmp_sgt_i8(-1, 1) == 2
+; run: %br_icmp_sgt_i8(100, -77) == 1
+
+function %icmp_br_sgt_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sgt_i8(0, 0) == [0, 2]
+; run: %icmp_br_sgt_i8(0, 1) == [0, 2]
+; run: %icmp_br_sgt_i8(1, 0) == [1, 1]
+; run: %icmp_br_sgt_i8(-1, 0) == [0, 2]
+; run: %icmp_br_sgt_i8(0, -1) == [1, 1]
+; run: %icmp_br_sgt_i8(-128, 127) == [0, 2]
+; run: %icmp_br_sgt_i8(127, -128) == [1, 1]
+; run: %icmp_br_sgt_i8(-128, -128) == [0, 2]
+
+function %icmp_sgt_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_imm_i8(-3) == 0
+; run: %icmp_sgt_imm_i8(-2) == 0
+; run: %icmp_sgt_imm_i8(-1) == 1
+; run: %icmp_sgt_imm_i8(0) == 1
+; run: %icmp_sgt_imm_i8(-128) == 0
+; run: %icmp_sgt_imm_i8(127) == 1
+; run: %icmp_sgt_imm_i8(1) == 1
+
+function %br_icmp_sgt_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_imm_i8(-3) == 2
+; run: %br_icmp_sgt_imm_i8(-2) == 2
+; run: %br_icmp_sgt_imm_i8(-1) == 1
+; run: %br_icmp_sgt_imm_i8(0) == 1
+; run: %br_icmp_sgt_imm_i8(-128) == 2
+; run: %br_icmp_sgt_imm_i8(127) == 1
+; run: %br_icmp_sgt_imm_i8(1) == 1
+
+function %icmp_sle_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_i8(0, 0) == 1
+; run: %icmp_sle_i8(0, 1) == 1
+; run: %icmp_sle_i8(1, 0) == 0
+; run: %icmp_sle_i8(-1, 0) == 1
+; run: %icmp_sle_i8(0, -1) == 0
+; run: %icmp_sle_i8(-128, 127) == 1
+; run: %icmp_sle_i8(127, -128) == 0
+; run: %icmp_sle_i8(-128, -128) == 1
+; run: %icmp_sle_i8(127, 127) == 1
+; run: %icmp_sle_i8(-1, -1) == 1
+; run: %icmp_sle_i8(-128, -127) == 1
+; run: %icmp_sle_i8(126, 127) == 1
+; run: %icmp_sle_i8(-1, 1) == 1
+; run: %icmp_sle_i8(100, -77) == 0
+
+function %br_icmp_sle_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_i8(0, 0) == 1
+; run: %br_icmp_sle_i8(0, 1) == 1
+; run: %br_icmp_sle_i8(1, 0) == 2
+; run: %br_icmp_sle_i8(-1, 0) == 1
+; run: %br_icmp_sle_i8(0, -1) == 2
+; run: %br_icmp_sle_i8(-128, 127) == 1
+; run: %br_icmp_sle_i8(127, -128) == 2
+; run: %br_icmp_sle_i8(-128, -128) == 1
+; run: %br_icmp_sle_i8(127, 127) == 1
+; run: %br_icmp_sle_i8(-1, -1) == 1
+; run: %br_icmp_sle_i8(-128, -127) == 1
+; run: %br_icmp_sle_i8(126, 127) == 1
+; run: %br_icmp_sle_i8(-1, 1) == 1
+; run: %br_icmp_sle_i8(100, -77) == 2
+
+function %icmp_br_sle_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sle_i8(0, 0) == [1, 1]
+; run: %icmp_br_sle_i8(0, 1) == [1, 1]
+; run: %icmp_br_sle_i8(1, 0) == [0, 2]
+; run: %icmp_br_sle_i8(-1, 0) == [1, 1]
+; run: %icmp_br_sle_i8(0, -1) == [0, 2]
+; run: %icmp_br_sle_i8(-128, 127) == [1, 1]
+; run: %icmp_br_sle_i8(127, -128) == [0, 2]
+; run: %icmp_br_sle_i8(-128, -128) == [1, 1]
+
+function %icmp_sle_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_imm_i8(-3) == 1
+; run: %icmp_sle_imm_i8(-2) == 1
+; run: %icmp_sle_imm_i8(-1) == 0
+; run: %icmp_sle_imm_i8(0) == 0
+; run: %icmp_sle_imm_i8(-128) == 1
+; run: %icmp_sle_imm_i8(127) == 0
+; run: %icmp_sle_imm_i8(1) == 0
+
+function %br_icmp_sle_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_imm_i8(-3) == 1
+; run: %br_icmp_sle_imm_i8(-2) == 1
+; run: %br_icmp_sle_imm_i8(-1) == 2
+; run: %br_icmp_sle_imm_i8(0) == 2
+; run: %br_icmp_sle_imm_i8(-128) == 1
+; run: %br_icmp_sle_imm_i8(127) == 2
+; run: %br_icmp_sle_imm_i8(1) == 2
+
+function %icmp_ult_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_i8(0, 0) == 0
+; run: %icmp_ult_i8(0, 1) == 1
+; run: %icmp_ult_i8(1, 0) == 0
+; run: %icmp_ult_i8(-1, 0) == 0
+; run: %icmp_ult_i8(0, -1) == 1
+; run: %icmp_ult_i8(-128, 127) == 0
+; run: %icmp_ult_i8(127, -128) == 1
+; run: %icmp_ult_i8(-128, -128) == 0
+; run: %icmp_ult_i8(127, 127) == 0
+; run: %icmp_ult_i8(-1, -1) == 0
+; run: %icmp_ult_i8(-128, -127) == 1
+; run: %icmp_ult_i8(126, 127) == 1
+; run: %icmp_ult_i8(-1, 1) == 0
+; run: %icmp_ult_i8(100, -77) == 1
+
+function %br_icmp_ult_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_i8(0, 0) == 2
+; run: %br_icmp_ult_i8(0, 1) == 1
+; run: %br_icmp_ult_i8(1, 0) == 2
+; run: %br_icmp_ult_i8(-1, 0) == 2
+; run: %br_icmp_ult_i8(0, -1) == 1
+; run: %br_icmp_ult_i8(-128, 127) == 2
+; run: %br_icmp_ult_i8(127, -128) == 1
+; run: %br_icmp_ult_i8(-128, -128) == 2
+; run: %br_icmp_ult_i8(127, 127) == 2
+; run: %br_icmp_ult_i8(-1, -1) == 2
+; run: %br_icmp_ult_i8(-128, -127) == 1
+; run: %br_icmp_ult_i8(126, 127) == 1
+; run: %br_icmp_ult_i8(-1, 1) == 2
+; run: %br_icmp_ult_i8(100, -77) == 1
+
+function %icmp_br_ult_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ult_i8(0, 0) == [0, 2]
+; run: %icmp_br_ult_i8(0, 1) == [1, 1]
+; run: %icmp_br_ult_i8(1, 0) == [0, 2]
+; run: %icmp_br_ult_i8(-1, 0) == [0, 2]
+; run: %icmp_br_ult_i8(0, -1) == [1, 1]
+; run: %icmp_br_ult_i8(-128, 127) == [0, 2]
+; run: %icmp_br_ult_i8(127, -128) == [1, 1]
+; run: %icmp_br_ult_i8(-128, -128) == [0, 2]
+
+function %icmp_ult_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_imm_i8(-3) == 1
+; run: %icmp_ult_imm_i8(-2) == 0
+; run: %icmp_ult_imm_i8(-1) == 0
+; run: %icmp_ult_imm_i8(0) == 1
+; run: %icmp_ult_imm_i8(-128) == 1
+; run: %icmp_ult_imm_i8(127) == 1
+; run: %icmp_ult_imm_i8(1) == 1
+
+function %br_icmp_ult_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_imm_i8(-3) == 1
+; run: %br_icmp_ult_imm_i8(-2) == 2
+; run: %br_icmp_ult_imm_i8(-1) == 2
+; run: %br_icmp_ult_imm_i8(0) == 1
+; run: %br_icmp_ult_imm_i8(-128) == 1
+; run: %br_icmp_ult_imm_i8(127) == 1
+; run: %br_icmp_ult_imm_i8(1) == 1
+
+function %icmp_uge_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_i8(0, 0) == 1
+; run: %icmp_uge_i8(0, 1) == 0
+; run: %icmp_uge_i8(1, 0) == 1
+; run: %icmp_uge_i8(-1, 0) == 1
+; run: %icmp_uge_i8(0, -1) == 0
+; run: %icmp_uge_i8(-128, 127) == 1
+; run: %icmp_uge_i8(127, -128) == 0
+; run: %icmp_uge_i8(-128, -128) == 1
+; run: %icmp_uge_i8(127, 127) == 1
+; run: %icmp_uge_i8(-1, -1) == 1
+; run: %icmp_uge_i8(-128, -127) == 0
+; run: %icmp_uge_i8(126, 127) == 0
+; run: %icmp_uge_i8(-1, 1) == 1
+; run: %icmp_uge_i8(100, -77) == 0
+
+function %br_icmp_uge_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_i8(0, 0) == 1
+; run: %br_icmp_uge_i8(0, 1) == 2
+; run: %br_icmp_uge_i8(1, 0) == 1
+; run: %br_icmp_uge_i8(-1, 0) == 1
+; run: %br_icmp_uge_i8(0, -1) == 2
+; run: %br_icmp_uge_i8(-128, 127) == 1
+; run: %br_icmp_uge_i8(127, -128) == 2
+; run: %br_icmp_uge_i8(-128, -128) == 1
+; run: %br_icmp_uge_i8(127, 127) == 1
+; run: %br_icmp_uge_i8(-1, -1) == 1
+; run: %br_icmp_uge_i8(-128, -127) == 2
+; run: %br_icmp_uge_i8(126, 127) == 2
+; run: %br_icmp_uge_i8(-1, 1) == 1
+; run: %br_icmp_uge_i8(100, -77) == 2
+
+function %icmp_br_uge_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_uge_i8(0, 0) == [1, 1]
+; run: %icmp_br_uge_i8(0, 1) == [0, 2]
+; run: %icmp_br_uge_i8(1, 0) == [1, 1]
+; run: %icmp_br_uge_i8(-1, 0) == [1, 1]
+; run: %icmp_br_uge_i8(0, -1) == [0, 2]
+; run: %icmp_br_uge_i8(-128, 127) == [1, 1]
+; run: %icmp_br_uge_i8(127, -128) == [0, 2]
+; run: %icmp_br_uge_i8(-128, -128) == [1, 1]
+
+function %icmp_uge_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_imm_i8(-3) == 0
+; run: %icmp_uge_imm_i8(-2) == 1
+; run: %icmp_uge_imm_i8(-1) == 1
+; run: %icmp_uge_imm_i8(0) == 0
+; run: %icmp_uge_imm_i8(-128) == 0
+; run: %icmp_uge_imm_i8(127) == 0
+; run: %icmp_uge_imm_i8(1) == 0
+
+function %br_icmp_uge_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_imm_i8(-3) == 2
+; run: %br_icmp_uge_imm_i8(-2) == 1
+; run: %br_icmp_uge_imm_i8(-1) == 1
+; run: %br_icmp_uge_imm_i8(0) == 2
+; run: %br_icmp_uge_imm_i8(-128) == 2
+; run: %br_icmp_uge_imm_i8(127) == 2
+; run: %br_icmp_uge_imm_i8(1) == 2
+
+function %icmp_ugt_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_i8(0, 0) == 0
+; run: %icmp_ugt_i8(0, 1) == 0
+; run: %icmp_ugt_i8(1, 0) == 1
+; run: %icmp_ugt_i8(-1, 0) == 1
+; run: %icmp_ugt_i8(0, -1) == 0
+; run: %icmp_ugt_i8(-128, 127) == 1
+; run: %icmp_ugt_i8(127, -128) == 0
+; run: %icmp_ugt_i8(-128, -128) == 0
+; run: %icmp_ugt_i8(127, 127) == 0
+; run: %icmp_ugt_i8(-1, -1) == 0
+; run: %icmp_ugt_i8(-128, -127) == 0
+; run: %icmp_ugt_i8(126, 127) == 0
+; run: %icmp_ugt_i8(-1, 1) == 1
+; run: %icmp_ugt_i8(100, -77) == 0
+
+function %br_icmp_ugt_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_i8(0, 0) == 2
+; run: %br_icmp_ugt_i8(0, 1) == 2
+; run: %br_icmp_ugt_i8(1, 0) == 1
+; run: %br_icmp_ugt_i8(-1, 0) == 1
+; run: %br_icmp_ugt_i8(0, -1) == 2
+; run: %br_icmp_ugt_i8(-128, 127) == 1
+; run: %br_icmp_ugt_i8(127, -128) == 2
+; run: %br_icmp_ugt_i8(-128, -128) == 2
+; run: %br_icmp_ugt_i8(127, 127) == 2
+; run: %br_icmp_ugt_i8(-1, -1) == 2
+; run: %br_icmp_ugt_i8(-128, -127) == 2
+; run: %br_icmp_ugt_i8(126, 127) == 2
+; run: %br_icmp_ugt_i8(-1, 1) == 1
+; run: %br_icmp_ugt_i8(100, -77) == 2
+
+function %icmp_br_ugt_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ugt_i8(0, 0) == [0, 2]
+; run: %icmp_br_ugt_i8(0, 1) == [0, 2]
+; run: %icmp_br_ugt_i8(1, 0) == [1, 1]
+; run: %icmp_br_ugt_i8(-1, 0) == [1, 1]
+; run: %icmp_br_ugt_i8(0, -1) == [0, 2]
+; run: %icmp_br_ugt_i8(-128, 127) == [1, 1]
+; run: %icmp_br_ugt_i8(127, -128) == [0, 2]
+; run: %icmp_br_ugt_i8(-128, -128) == [0, 2]
+
+function %icmp_ugt_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_imm_i8(-3) == 0
+; run: %icmp_ugt_imm_i8(-2) == 0
+; run: %icmp_ugt_imm_i8(-1) == 1
+; run: %icmp_ugt_imm_i8(0) == 0
+; run: %icmp_ugt_imm_i8(-128) == 0
+; run: %icmp_ugt_imm_i8(127) == 0
+; run: %icmp_ugt_imm_i8(1) == 0
+
+function %br_icmp_ugt_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_imm_i8(-3) == 2
+; run: %br_icmp_ugt_imm_i8(-2) == 2
+; run: %br_icmp_ugt_imm_i8(-1) == 1
+; run: %br_icmp_ugt_imm_i8(0) == 2
+; run: %br_icmp_ugt_imm_i8(-128) == 2
+; run: %br_icmp_ugt_imm_i8(127) == 2
+; run: %br_icmp_ugt_imm_i8(1) == 2
+
+function %icmp_ule_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_i8(0, 0) == 1
+; run: %icmp_ule_i8(0, 1) == 1
+; run: %icmp_ule_i8(1, 0) == 0
+; run: %icmp_ule_i8(-1, 0) == 0
+; run: %icmp_ule_i8(0, -1) == 1
+; run: %icmp_ule_i8(-128, 127) == 0
+; run: %icmp_ule_i8(127, -128) == 1
+; run: %icmp_ule_i8(-128, -128) == 1
+; run: %icmp_ule_i8(127, 127) == 1
+; run: %icmp_ule_i8(-1, -1) == 1
+; run: %icmp_ule_i8(-128, -127) == 1
+; run: %icmp_ule_i8(126, 127) == 1
+; run: %icmp_ule_i8(-1, 1) == 0
+; run: %icmp_ule_i8(100, -77) == 1
+
+function %br_icmp_ule_i8(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_i8(0, 0) == 1
+; run: %br_icmp_ule_i8(0, 1) == 1
+; run: %br_icmp_ule_i8(1, 0) == 2
+; run: %br_icmp_ule_i8(-1, 0) == 2
+; run: %br_icmp_ule_i8(0, -1) == 1
+; run: %br_icmp_ule_i8(-128, 127) == 2
+; run: %br_icmp_ule_i8(127, -128) == 1
+; run: %br_icmp_ule_i8(-128, -128) == 1
+; run: %br_icmp_ule_i8(127, 127) == 1
+; run: %br_icmp_ule_i8(-1, -1) == 1
+; run: %br_icmp_ule_i8(-128, -127) == 1
+; run: %br_icmp_ule_i8(126, 127) == 1
+; run: %br_icmp_ule_i8(-1, 1) == 2
+; run: %br_icmp_ule_i8(100, -77) == 1
+
+function %icmp_br_ule_i8(i8, i8) -> i8, i32 {
+block0(v0: i8, v1: i8):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ule_i8(0, 0) == [1, 1]
+; run: %icmp_br_ule_i8(0, 1) == [1, 1]
+; run: %icmp_br_ule_i8(1, 0) == [0, 2]
+; run: %icmp_br_ule_i8(-1, 0) == [0, 2]
+; run: %icmp_br_ule_i8(0, -1) == [1, 1]
+; run: %icmp_br_ule_i8(-128, 127) == [0, 2]
+; run: %icmp_br_ule_i8(127, -128) == [1, 1]
+; run: %icmp_br_ule_i8(-128, -128) == [1, 1]
+
+function %icmp_ule_imm_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_imm_i8(-3) == 1
+; run: %icmp_ule_imm_i8(-2) == 1
+; run: %icmp_ule_imm_i8(-1) == 0
+; run: %icmp_ule_imm_i8(0) == 1
+; run: %icmp_ule_imm_i8(-128) == 1
+; run: %icmp_ule_imm_i8(127) == 1
+; run: %icmp_ule_imm_i8(1) == 1
+
+function %br_icmp_ule_imm_i8(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i8 254
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_imm_i8(-3) == 1
+; run: %br_icmp_ule_imm_i8(-2) == 1
+; run: %br_icmp_ule_imm_i8(-1) == 2
+; run: %br_icmp_ule_imm_i8(0) == 1
+; run: %br_icmp_ule_imm_i8(-128) == 1
+; run: %br_icmp_ule_imm_i8(127) == 1
+; run: %br_icmp_ule_imm_i8(1) == 1
+
+function %icmp_eq_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_i16(0, 0) == 1
+; run: %icmp_eq_i16(0, 1) == 0
+; run: %icmp_eq_i16(1, 0) == 0
+; run: %icmp_eq_i16(-1, 0) == 0
+; run: %icmp_eq_i16(0, -1) == 0
+; run: %icmp_eq_i16(0x8000, 0x7fff) == 0
+; run: %icmp_eq_i16(0x7fff, 0x8000) == 0
+; run: %icmp_eq_i16(0x8000, 0x8000) == 1
+; run: %icmp_eq_i16(0x7fff, 0x7fff) == 1
+; run: %icmp_eq_i16(-1, -1) == 1
+; run: %icmp_eq_i16(0x8000, 0x8001) == 0
+; run: %icmp_eq_i16(0x7ffe, 0x7fff) == 0
+; run: %icmp_eq_i16(-1, 1) == 0
+; run: %icmp_eq_i16(0x3039, 0xa460) == 0
+
+function %br_icmp_eq_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_i16(0, 0) == 1
+; run: %br_icmp_eq_i16(0, 1) == 2
+; run: %br_icmp_eq_i16(1, 0) == 2
+; run: %br_icmp_eq_i16(-1, 0) == 2
+; run: %br_icmp_eq_i16(0, -1) == 2
+; run: %br_icmp_eq_i16(0x8000, 0x7fff) == 2
+; run: %br_icmp_eq_i16(0x7fff, 0x8000) == 2
+; run: %br_icmp_eq_i16(0x8000, 0x8000) == 1
+; run: %br_icmp_eq_i16(0x7fff, 0x7fff) == 1
+; run: %br_icmp_eq_i16(-1, -1) == 1
+; run: %br_icmp_eq_i16(0x8000, 0x8001) == 2
+; run: %br_icmp_eq_i16(0x7ffe, 0x7fff) == 2
+; run: %br_icmp_eq_i16(-1, 1) == 2
+; run: %br_icmp_eq_i16(0x3039, 0xa460) == 2
+
+function %icmp_br_eq_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_eq_i16(0, 0) == [1, 1]
+; run: %icmp_br_eq_i16(0, 1) == [0, 2]
+; run: %icmp_br_eq_i16(1, 0) == [0, 2]
+; run: %icmp_br_eq_i16(-1, 0) == [0, 2]
+; run: %icmp_br_eq_i16(0, -1) == [0, 2]
+; run: %icmp_br_eq_i16(0x8000, 0x7fff) == [0, 2]
+; run: %icmp_br_eq_i16(0x7fff, 0x8000) == [0, 2]
+; run: %icmp_br_eq_i16(0x8000, 0x8000) == [1, 1]
+
+function %icmp_eq_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_imm_i16(-3) == 0
+; run: %icmp_eq_imm_i16(-2) == 1
+; run: %icmp_eq_imm_i16(-1) == 0
+; run: %icmp_eq_imm_i16(0) == 0
+; run: %icmp_eq_imm_i16(0x8000) == 0
+; run: %icmp_eq_imm_i16(0x7fff) == 0
+; run: %icmp_eq_imm_i16(1) == 0
+
+function %br_icmp_eq_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_imm_i16(-3) == 2
+; run: %br_icmp_eq_imm_i16(-2) == 1
+; run: %br_icmp_eq_imm_i16(-1) == 2
+; run: %br_icmp_eq_imm_i16(0) == 2
+; run: %br_icmp_eq_imm_i16(0x8000) == 2
+; run: %br_icmp_eq_imm_i16(0x7fff) == 2
+; run: %br_icmp_eq_imm_i16(1) == 2
+
+function %icmp_ne_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_i16(0, 0) == 0
+; run: %icmp_ne_i16(0, 1) == 1
+; run: %icmp_ne_i16(1, 0) == 1
+; run: %icmp_ne_i16(-1, 0) == 1
+; run: %icmp_ne_i16(0, -1) == 1
+; run: %icmp_ne_i16(0x8000, 0x7fff) == 1
+; run: %icmp_ne_i16(0x7fff, 0x8000) == 1
+; run: %icmp_ne_i16(0x8000, 0x8000) == 0
+; run: %icmp_ne_i16(0x7fff, 0x7fff) == 0
+; run: %icmp_ne_i16(-1, -1) == 0
+; run: %icmp_ne_i16(0x8000, 0x8001) == 1
+; run: %icmp_ne_i16(0x7ffe, 0x7fff) == 1
+; run: %icmp_ne_i16(-1, 1) == 1
+; run: %icmp_ne_i16(0x3039, 0xa460) == 1
+
+function %br_icmp_ne_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_i16(0, 0) == 2
+; run: %br_icmp_ne_i16(0, 1) == 1
+; run: %br_icmp_ne_i16(1, 0) == 1
+; run: %br_icmp_ne_i16(-1, 0) == 1
+; run: %br_icmp_ne_i16(0, -1) == 1
+; run: %br_icmp_ne_i16(0x8000, 0x7fff) == 1
+; run: %br_icmp_ne_i16(0x7fff, 0x8000) == 1
+; run: %br_icmp_ne_i16(0x8000, 0x8000) == 2
+; run: %br_icmp_ne_i16(0x7fff, 0x7fff) == 2
+; run: %br_icmp_ne_i16(-1, -1) == 2
+; run: %br_icmp_ne_i16(0x8000, 0x8001) == 1
+; run: %br_icmp_ne_i16(0x7ffe, 0x7fff) == 1
+; run: %br_icmp_ne_i16(-1, 1) == 1
+; run: %br_icmp_ne_i16(0x3039, 0xa460) == 1
+
+function %icmp_br_ne_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ne_i16(0, 0) == [0, 2]
+; run: %icmp_br_ne_i16(0, 1) == [1, 1]
+; run: %icmp_br_ne_i16(1, 0) == [1, 1]
+; run: %icmp_br_ne_i16(-1, 0) == [1, 1]
+; run: %icmp_br_ne_i16(0, -1) == [1, 1]
+; run: %icmp_br_ne_i16(0x8000, 0x7fff) == [1, 1]
+; run: %icmp_br_ne_i16(0x7fff, 0x8000) == [1, 1]
+; run: %icmp_br_ne_i16(0x8000, 0x8000) == [0, 2]
+
+function %icmp_ne_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_imm_i16(-3) == 1
+; run: %icmp_ne_imm_i16(-2) == 0
+; run: %icmp_ne_imm_i16(-1) == 1
+; run: %icmp_ne_imm_i16(0) == 1
+; run: %icmp_ne_imm_i16(0x8000) == 1
+; run: %icmp_ne_imm_i16(0x7fff) == 1
+; run: %icmp_ne_imm_i16(1) == 1
+
+function %br_icmp_ne_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_imm_i16(-3) == 1
+; run: %br_icmp_ne_imm_i16(-2) == 2
+; run: %br_icmp_ne_imm_i16(-1) == 1
+; run: %br_icmp_ne_imm_i16(0) == 1
+; run: %br_icmp_ne_imm_i16(0x8000) == 1
+; run: %br_icmp_ne_imm_i16(0x7fff) == 1
+; run: %br_icmp_ne_imm_i16(1) == 1
+
+function %icmp_slt_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_i16(0, 0) == 0
+; run: %icmp_slt_i16(0, 1) == 1
+; run: %icmp_slt_i16(1, 0) == 0
+; run: %icmp_slt_i16(-1, 0) == 1
+; run: %icmp_slt_i16(0, -1) == 0
+; run: %icmp_slt_i16(0x8000, 0x7fff) == 1
+; run: %icmp_slt_i16(0x7fff, 0x8000) == 0
+; run: %icmp_slt_i16(0x8000, 0x8000) == 0
+; run: %icmp_slt_i16(0x7fff, 0x7fff) == 0
+; run: %icmp_slt_i16(-1, -1) == 0
+; run: %icmp_slt_i16(0x8000, 0x8001) == 1
+; run: %icmp_slt_i16(0x7ffe, 0x7fff) == 1
+; run: %icmp_slt_i16(-1, 1) == 1
+; run: %icmp_slt_i16(0x3039, 0xa460) == 0
+
+function %br_icmp_slt_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_i16(0, 0) == 2
+; run: %br_icmp_slt_i16(0, 1) == 1
+; run: %br_icmp_slt_i16(1, 0) == 2
+; run: %br_icmp_slt_i16(-1, 0) == 1
+; run: %br_icmp_slt_i16(0, -1) == 2
+; run: %br_icmp_slt_i16(0x8000, 0x7fff) == 1
+; run: %br_icmp_slt_i16(0x7fff, 0x8000) == 2
+; run: %br_icmp_slt_i16(0x8000, 0x8000) == 2
+; run: %br_icmp_slt_i16(0x7fff, 0x7fff) == 2
+; run: %br_icmp_slt_i16(-1, -1) == 2
+; run: %br_icmp_slt_i16(0x8000, 0x8001) == 1
+; run: %br_icmp_slt_i16(0x7ffe, 0x7fff) == 1
+; run: %br_icmp_slt_i16(-1, 1) == 1
+; run: %br_icmp_slt_i16(0x3039, 0xa460) == 2
+
+function %icmp_br_slt_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_slt_i16(0, 0) == [0, 2]
+; run: %icmp_br_slt_i16(0, 1) == [1, 1]
+; run: %icmp_br_slt_i16(1, 0) == [0, 2]
+; run: %icmp_br_slt_i16(-1, 0) == [1, 1]
+; run: %icmp_br_slt_i16(0, -1) == [0, 2]
+; run: %icmp_br_slt_i16(0x8000, 0x7fff) == [1, 1]
+; run: %icmp_br_slt_i16(0x7fff, 0x8000) == [0, 2]
+; run: %icmp_br_slt_i16(0x8000, 0x8000) == [0, 2]
+
+function %icmp_slt_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_imm_i16(-3) == 1
+; run: %icmp_slt_imm_i16(-2) == 0
+; run: %icmp_slt_imm_i16(-1) == 0
+; run: %icmp_slt_imm_i16(0) == 0
+; run: %icmp_slt_imm_i16(0x8000) == 1
+; run: %icmp_slt_imm_i16(0x7fff) == 0
+; run: %icmp_slt_imm_i16(1) == 0
+
+function %br_icmp_slt_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_imm_i16(-3) == 1
+; run: %br_icmp_slt_imm_i16(-2) == 2
+; run: %br_icmp_slt_imm_i16(-1) == 2
+; run: %br_icmp_slt_imm_i16(0) == 2
+; run: %br_icmp_slt_imm_i16(0x8000) == 1
+; run: %br_icmp_slt_imm_i16(0x7fff) == 2
+; run: %br_icmp_slt_imm_i16(1) == 2
+
+function %icmp_sge_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_i16(0, 0) == 1
+; run: %icmp_sge_i16(0, 1) == 0
+; run: %icmp_sge_i16(1, 0) == 1
+; run: %icmp_sge_i16(-1, 0) == 0
+; run: %icmp_sge_i16(0, -1) == 1
+; run: %icmp_sge_i16(0x8000, 0x7fff) == 0
+; run: %icmp_sge_i16(0x7fff, 0x8000) == 1
+; run: %icmp_sge_i16(0x8000, 0x8000) == 1
+; run: %icmp_sge_i16(0x7fff, 0x7fff) == 1
+; run: %icmp_sge_i16(-1, -1) == 1
+; run: %icmp_sge_i16(0x8000, 0x8001) == 0
+; run: %icmp_sge_i16(0x7ffe, 0x7fff) == 0
+; run: %icmp_sge_i16(-1, 1) == 0
+; run: %icmp_sge_i16(0x3039, 0xa460) == 1
+
+function %br_icmp_sge_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_i16(0, 0) == 1
+; run: %br_icmp_sge_i16(0, 1) == 2
+; run: %br_icmp_sge_i16(1, 0) == 1
+; run: %br_icmp_sge_i16(-1, 0) == 2
+; run: %br_icmp_sge_i16(0, -1) == 1
+; run: %br_icmp_sge_i16(0x8000, 0x7fff) == 2
+; run: %br_icmp_sge_i16(0x7fff, 0x8000) == 1
+; run: %br_icmp_sge_i16(0x8000, 0x8000) == 1
+; run: %br_icmp_sge_i16(0x7fff, 0x7fff) == 1
+; run: %br_icmp_sge_i16(-1, -1) == 1
+; run: %br_icmp_sge_i16(0x8000, 0x8001) == 2
+; run: %br_icmp_sge_i16(0x7ffe, 0x7fff) == 2
+; run: %br_icmp_sge_i16(-1, 1) == 2
+; run: %br_icmp_sge_i16(0x3039, 0xa460) == 1
+
+function %icmp_br_sge_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sge_i16(0, 0) == [1, 1]
+; run: %icmp_br_sge_i16(0, 1) == [0, 2]
+; run: %icmp_br_sge_i16(1, 0) == [1, 1]
+; run: %icmp_br_sge_i16(-1, 0) == [0, 2]
+; run: %icmp_br_sge_i16(0, -1) == [1, 1]
+; run: %icmp_br_sge_i16(0x8000, 0x7fff) == [0, 2]
+; run: %icmp_br_sge_i16(0x7fff, 0x8000) == [1, 1]
+; run: %icmp_br_sge_i16(0x8000, 0x8000) == [1, 1]
+
+function %icmp_sge_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_imm_i16(-3) == 0
+; run: %icmp_sge_imm_i16(-2) == 1
+; run: %icmp_sge_imm_i16(-1) == 1
+; run: %icmp_sge_imm_i16(0) == 1
+; run: %icmp_sge_imm_i16(0x8000) == 0
+; run: %icmp_sge_imm_i16(0x7fff) == 1
+; run: %icmp_sge_imm_i16(1) == 1
+
+function %br_icmp_sge_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_imm_i16(-3) == 2
+; run: %br_icmp_sge_imm_i16(-2) == 1
+; run: %br_icmp_sge_imm_i16(-1) == 1
+; run: %br_icmp_sge_imm_i16(0) == 1
+; run: %br_icmp_sge_imm_i16(0x8000) == 2
+; run: %br_icmp_sge_imm_i16(0x7fff) == 1
+; run: %br_icmp_sge_imm_i16(1) == 1
+
+function %icmp_sgt_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_i16(0, 0) == 0
+; run: %icmp_sgt_i16(0, 1) == 0
+; run: %icmp_sgt_i16(1, 0) == 1
+; run: %icmp_sgt_i16(-1, 0) == 0
+; run: %icmp_sgt_i16(0, -1) == 1
+; run: %icmp_sgt_i16(0x8000, 0x7fff) == 0
+; run: %icmp_sgt_i16(0x7fff, 0x8000) == 1
+; run: %icmp_sgt_i16(0x8000, 0x8000) == 0
+; run: %icmp_sgt_i16(0x7fff, 0x7fff) == 0
+; run: %icmp_sgt_i16(-1, -1) == 0
+; run: %icmp_sgt_i16(0x8000, 0x8001) == 0
+; run: %icmp_sgt_i16(0x7ffe, 0x7fff) == 0
+; run: %icmp_sgt_i16(-1, 1) == 0
+; run: %icmp_sgt_i16(0x3039, 0xa460) == 1
+
+function %br_icmp_sgt_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_i16(0, 0) == 2
+; run: %br_icmp_sgt_i16(0, 1) == 2
+; run: %br_icmp_sgt_i16(1, 0) == 1
+; run: %br_icmp_sgt_i16(-1, 0) == 2
+; run: %br_icmp_sgt_i16(0, -1) == 1
+; run: %br_icmp_sgt_i16(0x8000, 0x7fff) == 2
+; run: %br_icmp_sgt_i16(0x7fff, 0x8000) == 1
+; run: %br_icmp_sgt_i16(0x8000, 0x8000) == 2
+; run: %br_icmp_sgt_i16(0x7fff, 0x7fff) == 2
+; run: %br_icmp_sgt_i16(-1, -1) == 2
+; run: %br_icmp_sgt_i16(0x8000, 0x8001) == 2
+; run: %br_icmp_sgt_i16(0x7ffe, 0x7fff) == 2
+; run: %br_icmp_sgt_i16(-1, 1) == 2
+; run: %br_icmp_sgt_i16(0x3039, 0xa460) == 1
+
+function %icmp_br_sgt_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sgt_i16(0, 0) == [0, 2]
+; run: %icmp_br_sgt_i16(0, 1) == [0, 2]
+; run: %icmp_br_sgt_i16(1, 0) == [1, 1]
+; run: %icmp_br_sgt_i16(-1, 0) == [0, 2]
+; run: %icmp_br_sgt_i16(0, -1) == [1, 1]
+; run: %icmp_br_sgt_i16(0x8000, 0x7fff) == [0, 2]
+; run: %icmp_br_sgt_i16(0x7fff, 0x8000) == [1, 1]
+; run: %icmp_br_sgt_i16(0x8000, 0x8000) == [0, 2]
+
+function %icmp_sgt_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_imm_i16(-3) == 0
+; run: %icmp_sgt_imm_i16(-2) == 0
+; run: %icmp_sgt_imm_i16(-1) == 1
+; run: %icmp_sgt_imm_i16(0) == 1
+; run: %icmp_sgt_imm_i16(0x8000) == 0
+; run: %icmp_sgt_imm_i16(0x7fff) == 1
+; run: %icmp_sgt_imm_i16(1) == 1
+
+function %br_icmp_sgt_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_imm_i16(-3) == 2
+; run: %br_icmp_sgt_imm_i16(-2) == 2
+; run: %br_icmp_sgt_imm_i16(-1) == 1
+; run: %br_icmp_sgt_imm_i16(0) == 1
+; run: %br_icmp_sgt_imm_i16(0x8000) == 2
+; run: %br_icmp_sgt_imm_i16(0x7fff) == 1
+; run: %br_icmp_sgt_imm_i16(1) == 1
+
+function %icmp_sle_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_i16(0, 0) == 1
+; run: %icmp_sle_i16(0, 1) == 1
+; run: %icmp_sle_i16(1, 0) == 0
+; run: %icmp_sle_i16(-1, 0) == 1
+; run: %icmp_sle_i16(0, -1) == 0
+; run: %icmp_sle_i16(0x8000, 0x7fff) == 1
+; run: %icmp_sle_i16(0x7fff, 0x8000) == 0
+; run: %icmp_sle_i16(0x8000, 0x8000) == 1
+; run: %icmp_sle_i16(0x7fff, 0x7fff) == 1
+; run: %icmp_sle_i16(-1, -1) == 1
+; run: %icmp_sle_i16(0x8000, 0x8001) == 1
+; run: %icmp_sle_i16(0x7ffe, 0x7fff) == 1
+; run: %icmp_sle_i16(-1, 1) == 1
+; run: %icmp_sle_i16(0x3039, 0xa460) == 0
+
+function %br_icmp_sle_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_i16(0, 0) == 1
+; run: %br_icmp_sle_i16(0, 1) == 1
+; run: %br_icmp_sle_i16(1, 0) == 2
+; run: %br_icmp_sle_i16(-1, 0) == 1
+; run: %br_icmp_sle_i16(0, -1) == 2
+; run: %br_icmp_sle_i16(0x8000, 0x7fff) == 1
+; run: %br_icmp_sle_i16(0x7fff, 0x8000) == 2
+; run: %br_icmp_sle_i16(0x8000, 0x8000) == 1
+; run: %br_icmp_sle_i16(0x7fff, 0x7fff) == 1
+; run: %br_icmp_sle_i16(-1, -1) == 1
+; run: %br_icmp_sle_i16(0x8000, 0x8001) == 1
+; run: %br_icmp_sle_i16(0x7ffe, 0x7fff) == 1
+; run: %br_icmp_sle_i16(-1, 1) == 1
+; run: %br_icmp_sle_i16(0x3039, 0xa460) == 2
+
+function %icmp_br_sle_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sle_i16(0, 0) == [1, 1]
+; run: %icmp_br_sle_i16(0, 1) == [1, 1]
+; run: %icmp_br_sle_i16(1, 0) == [0, 2]
+; run: %icmp_br_sle_i16(-1, 0) == [1, 1]
+; run: %icmp_br_sle_i16(0, -1) == [0, 2]
+; run: %icmp_br_sle_i16(0x8000, 0x7fff) == [1, 1]
+; run: %icmp_br_sle_i16(0x7fff, 0x8000) == [0, 2]
+; run: %icmp_br_sle_i16(0x8000, 0x8000) == [1, 1]
+
+function %icmp_sle_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_imm_i16(-3) == 1
+; run: %icmp_sle_imm_i16(-2) == 1
+; run: %icmp_sle_imm_i16(-1) == 0
+; run: %icmp_sle_imm_i16(0) == 0
+; run: %icmp_sle_imm_i16(0x8000) == 1
+; run: %icmp_sle_imm_i16(0x7fff) == 0
+; run: %icmp_sle_imm_i16(1) == 0
+
+function %br_icmp_sle_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_imm_i16(-3) == 1
+; run: %br_icmp_sle_imm_i16(-2) == 1
+; run: %br_icmp_sle_imm_i16(-1) == 2
+; run: %br_icmp_sle_imm_i16(0) == 2
+; run: %br_icmp_sle_imm_i16(0x8000) == 1
+; run: %br_icmp_sle_imm_i16(0x7fff) == 2
+; run: %br_icmp_sle_imm_i16(1) == 2
+
+function %icmp_ult_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_i16(0, 0) == 0
+; run: %icmp_ult_i16(0, 1) == 1
+; run: %icmp_ult_i16(1, 0) == 0
+; run: %icmp_ult_i16(-1, 0) == 0
+; run: %icmp_ult_i16(0, -1) == 1
+; run: %icmp_ult_i16(0x8000, 0x7fff) == 0
+; run: %icmp_ult_i16(0x7fff, 0x8000) == 1
+; run: %icmp_ult_i16(0x8000, 0x8000) == 0
+; run: %icmp_ult_i16(0x7fff, 0x7fff) == 0
+; run: %icmp_ult_i16(-1, -1) == 0
+; run: %icmp_ult_i16(0x8000, 0x8001) == 1
+; run: %icmp_ult_i16(0x7ffe, 0x7fff) == 1
+; run: %icmp_ult_i16(-1, 1) == 0
+; run: %icmp_ult_i16(0x3039, 0xa460) == 1
+
+function %br_icmp_ult_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_i16(0, 0) == 2
+; run: %br_icmp_ult_i16(0, 1) == 1
+; run: %br_icmp_ult_i16(1, 0) == 2
+; run: %br_icmp_ult_i16(-1, 0) == 2
+; run: %br_icmp_ult_i16(0, -1) == 1
+; run: %br_icmp_ult_i16(0x8000, 0x7fff) == 2
+; run: %br_icmp_ult_i16(0x7fff, 0x8000) == 1
+; run: %br_icmp_ult_i16(0x8000, 0x8000) == 2
+; run: %br_icmp_ult_i16(0x7fff, 0x7fff) == 2
+; run: %br_icmp_ult_i16(-1, -1) == 2
+; run: %br_icmp_ult_i16(0x8000, 0x8001) == 1
+; run: %br_icmp_ult_i16(0x7ffe, 0x7fff) == 1
+; run: %br_icmp_ult_i16(-1, 1) == 2
+; run: %br_icmp_ult_i16(0x3039, 0xa460) == 1
+
+function %icmp_br_ult_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ult_i16(0, 0) == [0, 2]
+; run: %icmp_br_ult_i16(0, 1) == [1, 1]
+; run: %icmp_br_ult_i16(1, 0) == [0, 2]
+; run: %icmp_br_ult_i16(-1, 0) == [0, 2]
+; run: %icmp_br_ult_i16(0, -1) == [1, 1]
+; run: %icmp_br_ult_i16(0x8000, 0x7fff) == [0, 2]
+; run: %icmp_br_ult_i16(0x7fff, 0x8000) == [1, 1]
+; run: %icmp_br_ult_i16(0x8000, 0x8000) == [0, 2]
+
+function %icmp_ult_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_imm_i16(-3) == 1
+; run: %icmp_ult_imm_i16(-2) == 0
+; run: %icmp_ult_imm_i16(-1) == 0
+; run: %icmp_ult_imm_i16(0) == 1
+; run: %icmp_ult_imm_i16(0x8000) == 1
+; run: %icmp_ult_imm_i16(0x7fff) == 1
+; run: %icmp_ult_imm_i16(1) == 1
+
+function %br_icmp_ult_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_imm_i16(-3) == 1
+; run: %br_icmp_ult_imm_i16(-2) == 2
+; run: %br_icmp_ult_imm_i16(-1) == 2
+; run: %br_icmp_ult_imm_i16(0) == 1
+; run: %br_icmp_ult_imm_i16(0x8000) == 1
+; run: %br_icmp_ult_imm_i16(0x7fff) == 1
+; run: %br_icmp_ult_imm_i16(1) == 1
+
+function %icmp_uge_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_i16(0, 0) == 1
+; run: %icmp_uge_i16(0, 1) == 0
+; run: %icmp_uge_i16(1, 0) == 1
+; run: %icmp_uge_i16(-1, 0) == 1
+; run: %icmp_uge_i16(0, -1) == 0
+; run: %icmp_uge_i16(0x8000, 0x7fff) == 1
+; run: %icmp_uge_i16(0x7fff, 0x8000) == 0
+; run: %icmp_uge_i16(0x8000, 0x8000) == 1
+; run: %icmp_uge_i16(0x7fff, 0x7fff) == 1
+; run: %icmp_uge_i16(-1, -1) == 1
+; run: %icmp_uge_i16(0x8000, 0x8001) == 0
+; run: %icmp_uge_i16(0x7ffe, 0x7fff) == 0
+; run: %icmp_uge_i16(-1, 1) == 1
+; run: %icmp_uge_i16(0x3039, 0xa460) == 0
+
+function %br_icmp_uge_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_i16(0, 0) == 1
+; run: %br_icmp_uge_i16(0, 1) == 2
+; run: %br_icmp_uge_i16(1, 0) == 1
+; run: %br_icmp_uge_i16(-1, 0) == 1
+; run: %br_icmp_uge_i16(0, -1) == 2
+; run: %br_icmp_uge_i16(0x8000, 0x7fff) == 1
+; run: %br_icmp_uge_i16(0x7fff, 0x8000) == 2
+; run: %br_icmp_uge_i16(0x8000, 0x8000) == 1
+; run: %br_icmp_uge_i16(0x7fff, 0x7fff) == 1
+; run: %br_icmp_uge_i16(-1, -1) == 1
+; run: %br_icmp_uge_i16(0x8000, 0x8001) == 2
+; run: %br_icmp_uge_i16(0x7ffe, 0x7fff) == 2
+; run: %br_icmp_uge_i16(-1, 1) == 1
+; run: %br_icmp_uge_i16(0x3039, 0xa460) == 2
+
+function %icmp_br_uge_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_uge_i16(0, 0) == [1, 1]
+; run: %icmp_br_uge_i16(0, 1) == [0, 2]
+; run: %icmp_br_uge_i16(1, 0) == [1, 1]
+; run: %icmp_br_uge_i16(-1, 0) == [1, 1]
+; run: %icmp_br_uge_i16(0, -1) == [0, 2]
+; run: %icmp_br_uge_i16(0x8000, 0x7fff) == [1, 1]
+; run: %icmp_br_uge_i16(0x7fff, 0x8000) == [0, 2]
+; run: %icmp_br_uge_i16(0x8000, 0x8000) == [1, 1]
+
+function %icmp_uge_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_imm_i16(-3) == 0
+; run: %icmp_uge_imm_i16(-2) == 1
+; run: %icmp_uge_imm_i16(-1) == 1
+; run: %icmp_uge_imm_i16(0) == 0
+; run: %icmp_uge_imm_i16(0x8000) == 0
+; run: %icmp_uge_imm_i16(0x7fff) == 0
+; run: %icmp_uge_imm_i16(1) == 0
+
+function %br_icmp_uge_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_imm_i16(-3) == 2
+; run: %br_icmp_uge_imm_i16(-2) == 1
+; run: %br_icmp_uge_imm_i16(-1) == 1
+; run: %br_icmp_uge_imm_i16(0) == 2
+; run: %br_icmp_uge_imm_i16(0x8000) == 2
+; run: %br_icmp_uge_imm_i16(0x7fff) == 2
+; run: %br_icmp_uge_imm_i16(1) == 2
+
+function %icmp_ugt_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_i16(0, 0) == 0
+; run: %icmp_ugt_i16(0, 1) == 0
+; run: %icmp_ugt_i16(1, 0) == 1
+; run: %icmp_ugt_i16(-1, 0) == 1
+; run: %icmp_ugt_i16(0, -1) == 0
+; run: %icmp_ugt_i16(0x8000, 0x7fff) == 1
+; run: %icmp_ugt_i16(0x7fff, 0x8000) == 0
+; run: %icmp_ugt_i16(0x8000, 0x8000) == 0
+; run: %icmp_ugt_i16(0x7fff, 0x7fff) == 0
+; run: %icmp_ugt_i16(-1, -1) == 0
+; run: %icmp_ugt_i16(0x8000, 0x8001) == 0
+; run: %icmp_ugt_i16(0x7ffe, 0x7fff) == 0
+; run: %icmp_ugt_i16(-1, 1) == 1
+; run: %icmp_ugt_i16(0x3039, 0xa460) == 0
+
+function %br_icmp_ugt_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_i16(0, 0) == 2
+; run: %br_icmp_ugt_i16(0, 1) == 2
+; run: %br_icmp_ugt_i16(1, 0) == 1
+; run: %br_icmp_ugt_i16(-1, 0) == 1
+; run: %br_icmp_ugt_i16(0, -1) == 2
+; run: %br_icmp_ugt_i16(0x8000, 0x7fff) == 1
+; run: %br_icmp_ugt_i16(0x7fff, 0x8000) == 2
+; run: %br_icmp_ugt_i16(0x8000, 0x8000) == 2
+; run: %br_icmp_ugt_i16(0x7fff, 0x7fff) == 2
+; run: %br_icmp_ugt_i16(-1, -1) == 2
+; run: %br_icmp_ugt_i16(0x8000, 0x8001) == 2
+; run: %br_icmp_ugt_i16(0x7ffe, 0x7fff) == 2
+; run: %br_icmp_ugt_i16(-1, 1) == 1
+; run: %br_icmp_ugt_i16(0x3039, 0xa460) == 2
+
+function %icmp_br_ugt_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ugt_i16(0, 0) == [0, 2]
+; run: %icmp_br_ugt_i16(0, 1) == [0, 2]
+; run: %icmp_br_ugt_i16(1, 0) == [1, 1]
+; run: %icmp_br_ugt_i16(-1, 0) == [1, 1]
+; run: %icmp_br_ugt_i16(0, -1) == [0, 2]
+; run: %icmp_br_ugt_i16(0x8000, 0x7fff) == [1, 1]
+; run: %icmp_br_ugt_i16(0x7fff, 0x8000) == [0, 2]
+; run: %icmp_br_ugt_i16(0x8000, 0x8000) == [0, 2]
+
+function %icmp_ugt_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_imm_i16(-3) == 0
+; run: %icmp_ugt_imm_i16(-2) == 0
+; run: %icmp_ugt_imm_i16(-1) == 1
+; run: %icmp_ugt_imm_i16(0) == 0
+; run: %icmp_ugt_imm_i16(0x8000) == 0
+; run: %icmp_ugt_imm_i16(0x7fff) == 0
+; run: %icmp_ugt_imm_i16(1) == 0
+
+function %br_icmp_ugt_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_imm_i16(-3) == 2
+; run: %br_icmp_ugt_imm_i16(-2) == 2
+; run: %br_icmp_ugt_imm_i16(-1) == 1
+; run: %br_icmp_ugt_imm_i16(0) == 2
+; run: %br_icmp_ugt_imm_i16(0x8000) == 2
+; run: %br_icmp_ugt_imm_i16(0x7fff) == 2
+; run: %br_icmp_ugt_imm_i16(1) == 2
+
+function %icmp_ule_i16(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_i16(0, 0) == 1
+; run: %icmp_ule_i16(0, 1) == 1
+; run: %icmp_ule_i16(1, 0) == 0
+; run: %icmp_ule_i16(-1, 0) == 0
+; run: %icmp_ule_i16(0, -1) == 1
+; run: %icmp_ule_i16(0x8000, 0x7fff) == 0
+; run: %icmp_ule_i16(0x7fff, 0x8000) == 1
+; run: %icmp_ule_i16(0x8000, 0x8000) == 1
+; run: %icmp_ule_i16(0x7fff, 0x7fff) == 1
+; run: %icmp_ule_i16(-1, -1) == 1
+; run: %icmp_ule_i16(0x8000, 0x8001) == 1
+; run: %icmp_ule_i16(0x7ffe, 0x7fff) == 1
+; run: %icmp_ule_i16(-1, 1) == 0
+; run: %icmp_ule_i16(0x3039, 0xa460) == 1
+
+function %br_icmp_ule_i16(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_i16(0, 0) == 1
+; run: %br_icmp_ule_i16(0, 1) == 1
+; run: %br_icmp_ule_i16(1, 0) == 2
+; run: %br_icmp_ule_i16(-1, 0) == 2
+; run: %br_icmp_ule_i16(0, -1) == 1
+; run: %br_icmp_ule_i16(0x8000, 0x7fff) == 2
+; run: %br_icmp_ule_i16(0x7fff, 0x8000) == 1
+; run: %br_icmp_ule_i16(0x8000, 0x8000) == 1
+; run: %br_icmp_ule_i16(0x7fff, 0x7fff) == 1
+; run: %br_icmp_ule_i16(-1, -1) == 1
+; run: %br_icmp_ule_i16(0x8000, 0x8001) == 1
+; run: %br_icmp_ule_i16(0x7ffe, 0x7fff) == 1
+; run: %br_icmp_ule_i16(-1, 1) == 2
+; run: %br_icmp_ule_i16(0x3039, 0xa460) == 1
+
+function %icmp_br_ule_i16(i16, i16) -> i8, i32 {
+block0(v0: i16, v1: i16):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ule_i16(0, 0) == [1, 1]
+; run: %icmp_br_ule_i16(0, 1) == [1, 1]
+; run: %icmp_br_ule_i16(1, 0) == [0, 2]
+; run: %icmp_br_ule_i16(-1, 0) == [0, 2]
+; run: %icmp_br_ule_i16(0, -1) == [1, 1]
+; run: %icmp_br_ule_i16(0x8000, 0x7fff) == [0, 2]
+; run: %icmp_br_ule_i16(0x7fff, 0x8000) == [1, 1]
+; run: %icmp_br_ule_i16(0x8000, 0x8000) == [1, 1]
+
+function %icmp_ule_imm_i16(i16) -> i8 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_imm_i16(-3) == 1
+; run: %icmp_ule_imm_i16(-2) == 1
+; run: %icmp_ule_imm_i16(-1) == 0
+; run: %icmp_ule_imm_i16(0) == 1
+; run: %icmp_ule_imm_i16(0x8000) == 1
+; run: %icmp_ule_imm_i16(0x7fff) == 1
+; run: %icmp_ule_imm_i16(1) == 1
+
+function %br_icmp_ule_imm_i16(i16) -> i32 {
+block0(v0: i16):
+    v1 = iconst.i16 0xfffe
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_imm_i16(-3) == 1
+; run: %br_icmp_ule_imm_i16(-2) == 1
+; run: %br_icmp_ule_imm_i16(-1) == 2
+; run: %br_icmp_ule_imm_i16(0) == 1
+; run: %br_icmp_ule_imm_i16(0x8000) == 1
+; run: %br_icmp_ule_imm_i16(0x7fff) == 1
+; run: %br_icmp_ule_imm_i16(1) == 1
+
+function %icmp_eq_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_i32(0, 0) == 1
+; run: %icmp_eq_i32(0, 1) == 0
+; run: %icmp_eq_i32(1, 0) == 0
+; run: %icmp_eq_i32(-1, 0) == 0
+; run: %icmp_eq_i32(0, -1) == 0
+; run: %icmp_eq_i32(0x80000000, 0x7fffffff) == 0
+; run: %icmp_eq_i32(0x7fffffff, 0x80000000) == 0
+; run: %icmp_eq_i32(0x80000000, 0x80000000) == 1
+; run: %icmp_eq_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %icmp_eq_i32(-1, -1) == 1
+; run: %icmp_eq_i32(0x80000000, 0x80000001) == 0
+; run: %icmp_eq_i32(0x7ffffffe, 0x7fffffff) == 0
+; run: %icmp_eq_i32(-1, 1) == 0
+; run: %icmp_eq_i32(0x075bcd15, 0xc521974f) == 0
+
+function %br_icmp_eq_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_i32(0, 0) == 1
+; run: %br_icmp_eq_i32(0, 1) == 2
+; run: %br_icmp_eq_i32(1, 0) == 2
+; run: %br_icmp_eq_i32(-1, 0) == 2
+; run: %br_icmp_eq_i32(0, -1) == 2
+; run: %br_icmp_eq_i32(0x80000000, 0x7fffffff) == 2
+; run: %br_icmp_eq_i32(0x7fffffff, 0x80000000) == 2
+; run: %br_icmp_eq_i32(0x80000000, 0x80000000) == 1
+; run: %br_icmp_eq_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %br_icmp_eq_i32(-1, -1) == 1
+; run: %br_icmp_eq_i32(0x80000000, 0x80000001) == 2
+; run: %br_icmp_eq_i32(0x7ffffffe, 0x7fffffff) == 2
+; run: %br_icmp_eq_i32(-1, 1) == 2
+; run: %br_icmp_eq_i32(0x075bcd15, 0xc521974f) == 2
+
+function %icmp_br_eq_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_eq_i32(0, 0) == [1, 1]
+; run: %icmp_br_eq_i32(0, 1) == [0, 2]
+; run: %icmp_br_eq_i32(1, 0) == [0, 2]
+; run: %icmp_br_eq_i32(-1, 0) == [0, 2]
+; run: %icmp_br_eq_i32(0, -1) == [0, 2]
+; run: %icmp_br_eq_i32(0x80000000, 0x7fffffff) == [0, 2]
+; run: %icmp_br_eq_i32(0x7fffffff, 0x80000000) == [0, 2]
+; run: %icmp_br_eq_i32(0x80000000, 0x80000000) == [1, 1]
+
+function %icmp_eq_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_imm_i32(-3) == 0
+; run: %icmp_eq_imm_i32(-2) == 1
+; run: %icmp_eq_imm_i32(-1) == 0
+; run: %icmp_eq_imm_i32(0) == 0
+; run: %icmp_eq_imm_i32(0x80000000) == 0
+; run: %icmp_eq_imm_i32(0x7fffffff) == 0
+; run: %icmp_eq_imm_i32(1) == 0
+
+function %br_icmp_eq_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_imm_i32(-3) == 2
+; run: %br_icmp_eq_imm_i32(-2) == 1
+; run: %br_icmp_eq_imm_i32(-1) == 2
+; run: %br_icmp_eq_imm_i32(0) == 2
+; run: %br_icmp_eq_imm_i32(0x80000000) == 2
+; run: %br_icmp_eq_imm_i32(0x7fffffff) == 2
+; run: %br_icmp_eq_imm_i32(1) == 2
+
+function %icmp_ne_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_i32(0, 0) == 0
+; run: %icmp_ne_i32(0, 1) == 1
+; run: %icmp_ne_i32(1, 0) == 1
+; run: %icmp_ne_i32(-1, 0) == 1
+; run: %icmp_ne_i32(0, -1) == 1
+; run: %icmp_ne_i32(0x80000000, 0x7fffffff) == 1
+; run: %icmp_ne_i32(0x7fffffff, 0x80000000) == 1
+; run: %icmp_ne_i32(0x80000000, 0x80000000) == 0
+; run: %icmp_ne_i32(0x7fffffff, 0x7fffffff) == 0
+; run: %icmp_ne_i32(-1, -1) == 0
+; run: %icmp_ne_i32(0x80000000, 0x80000001) == 1
+; run: %icmp_ne_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %icmp_ne_i32(-1, 1) == 1
+; run: %icmp_ne_i32(0x075bcd15, 0xc521974f) == 1
+
+function %br_icmp_ne_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_i32(0, 0) == 2
+; run: %br_icmp_ne_i32(0, 1) == 1
+; run: %br_icmp_ne_i32(1, 0) == 1
+; run: %br_icmp_ne_i32(-1, 0) == 1
+; run: %br_icmp_ne_i32(0, -1) == 1
+; run: %br_icmp_ne_i32(0x80000000, 0x7fffffff) == 1
+; run: %br_icmp_ne_i32(0x7fffffff, 0x80000000) == 1
+; run: %br_icmp_ne_i32(0x80000000, 0x80000000) == 2
+; run: %br_icmp_ne_i32(0x7fffffff, 0x7fffffff) == 2
+; run: %br_icmp_ne_i32(-1, -1) == 2
+; run: %br_icmp_ne_i32(0x80000000, 0x80000001) == 1
+; run: %br_icmp_ne_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %br_icmp_ne_i32(-1, 1) == 1
+; run: %br_icmp_ne_i32(0x075bcd15, 0xc521974f) == 1
+
+function %icmp_br_ne_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ne_i32(0, 0) == [0, 2]
+; run: %icmp_br_ne_i32(0, 1) == [1, 1]
+; run: %icmp_br_ne_i32(1, 0) == [1, 1]
+; run: %icmp_br_ne_i32(-1, 0) == [1, 1]
+; run: %icmp_br_ne_i32(0, -1) == [1, 1]
+; run: %icmp_br_ne_i32(0x80000000, 0x7fffffff) == [1, 1]
+; run: %icmp_br_ne_i32(0x7fffffff, 0x80000000) == [1, 1]
+; run: %icmp_br_ne_i32(0x80000000, 0x80000000) == [0, 2]
+
+function %icmp_ne_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_imm_i32(-3) == 1
+; run: %icmp_ne_imm_i32(-2) == 0
+; run: %icmp_ne_imm_i32(-1) == 1
+; run: %icmp_ne_imm_i32(0) == 1
+; run: %icmp_ne_imm_i32(0x80000000) == 1
+; run: %icmp_ne_imm_i32(0x7fffffff) == 1
+; run: %icmp_ne_imm_i32(1) == 1
+
+function %br_icmp_ne_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_imm_i32(-3) == 1
+; run: %br_icmp_ne_imm_i32(-2) == 2
+; run: %br_icmp_ne_imm_i32(-1) == 1
+; run: %br_icmp_ne_imm_i32(0) == 1
+; run: %br_icmp_ne_imm_i32(0x80000000) == 1
+; run: %br_icmp_ne_imm_i32(0x7fffffff) == 1
+; run: %br_icmp_ne_imm_i32(1) == 1
+
+function %icmp_slt_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_i32(0, 0) == 0
+; run: %icmp_slt_i32(0, 1) == 1
+; run: %icmp_slt_i32(1, 0) == 0
+; run: %icmp_slt_i32(-1, 0) == 1
+; run: %icmp_slt_i32(0, -1) == 0
+; run: %icmp_slt_i32(0x80000000, 0x7fffffff) == 1
+; run: %icmp_slt_i32(0x7fffffff, 0x80000000) == 0
+; run: %icmp_slt_i32(0x80000000, 0x80000000) == 0
+; run: %icmp_slt_i32(0x7fffffff, 0x7fffffff) == 0
+; run: %icmp_slt_i32(-1, -1) == 0
+; run: %icmp_slt_i32(0x80000000, 0x80000001) == 1
+; run: %icmp_slt_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %icmp_slt_i32(-1, 1) == 1
+; run: %icmp_slt_i32(0x075bcd15, 0xc521974f) == 0
+
+function %br_icmp_slt_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_i32(0, 0) == 2
+; run: %br_icmp_slt_i32(0, 1) == 1
+; run: %br_icmp_slt_i32(1, 0) == 2
+; run: %br_icmp_slt_i32(-1, 0) == 1
+; run: %br_icmp_slt_i32(0, -1) == 2
+; run: %br_icmp_slt_i32(0x80000000, 0x7fffffff) == 1
+; run: %br_icmp_slt_i32(0x7fffffff, 0x80000000) == 2
+; run: %br_icmp_slt_i32(0x80000000, 0x80000000) == 2
+; run: %br_icmp_slt_i32(0x7fffffff, 0x7fffffff) == 2
+; run: %br_icmp_slt_i32(-1, -1) == 2
+; run: %br_icmp_slt_i32(0x80000000, 0x80000001) == 1
+; run: %br_icmp_slt_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %br_icmp_slt_i32(-1, 1) == 1
+; run: %br_icmp_slt_i32(0x075bcd15, 0xc521974f) == 2
+
+function %icmp_br_slt_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_slt_i32(0, 0) == [0, 2]
+; run: %icmp_br_slt_i32(0, 1) == [1, 1]
+; run: %icmp_br_slt_i32(1, 0) == [0, 2]
+; run: %icmp_br_slt_i32(-1, 0) == [1, 1]
+; run: %icmp_br_slt_i32(0, -1) == [0, 2]
+; run: %icmp_br_slt_i32(0x80000000, 0x7fffffff) == [1, 1]
+; run: %icmp_br_slt_i32(0x7fffffff, 0x80000000) == [0, 2]
+; run: %icmp_br_slt_i32(0x80000000, 0x80000000) == [0, 2]
+
+function %icmp_slt_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_imm_i32(-3) == 1
+; run: %icmp_slt_imm_i32(-2) == 0
+; run: %icmp_slt_imm_i32(-1) == 0
+; run: %icmp_slt_imm_i32(0) == 0
+; run: %icmp_slt_imm_i32(0x80000000) == 1
+; run: %icmp_slt_imm_i32(0x7fffffff) == 0
+; run: %icmp_slt_imm_i32(1) == 0
+
+function %br_icmp_slt_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_imm_i32(-3) == 1
+; run: %br_icmp_slt_imm_i32(-2) == 2
+; run: %br_icmp_slt_imm_i32(-1) == 2
+; run: %br_icmp_slt_imm_i32(0) == 2
+; run: %br_icmp_slt_imm_i32(0x80000000) == 1
+; run: %br_icmp_slt_imm_i32(0x7fffffff) == 2
+; run: %br_icmp_slt_imm_i32(1) == 2
+
+function %icmp_sge_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_i32(0, 0) == 1
+; run: %icmp_sge_i32(0, 1) == 0
+; run: %icmp_sge_i32(1, 0) == 1
+; run: %icmp_sge_i32(-1, 0) == 0
+; run: %icmp_sge_i32(0, -1) == 1
+; run: %icmp_sge_i32(0x80000000, 0x7fffffff) == 0
+; run: %icmp_sge_i32(0x7fffffff, 0x80000000) == 1
+; run: %icmp_sge_i32(0x80000000, 0x80000000) == 1
+; run: %icmp_sge_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %icmp_sge_i32(-1, -1) == 1
+; run: %icmp_sge_i32(0x80000000, 0x80000001) == 0
+; run: %icmp_sge_i32(0x7ffffffe, 0x7fffffff) == 0
+; run: %icmp_sge_i32(-1, 1) == 0
+; run: %icmp_sge_i32(0x075bcd15, 0xc521974f) == 1
+
+function %br_icmp_sge_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_i32(0, 0) == 1
+; run: %br_icmp_sge_i32(0, 1) == 2
+; run: %br_icmp_sge_i32(1, 0) == 1
+; run: %br_icmp_sge_i32(-1, 0) == 2
+; run: %br_icmp_sge_i32(0, -1) == 1
+; run: %br_icmp_sge_i32(0x80000000, 0x7fffffff) == 2
+; run: %br_icmp_sge_i32(0x7fffffff, 0x80000000) == 1
+; run: %br_icmp_sge_i32(0x80000000, 0x80000000) == 1
+; run: %br_icmp_sge_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %br_icmp_sge_i32(-1, -1) == 1
+; run: %br_icmp_sge_i32(0x80000000, 0x80000001) == 2
+; run: %br_icmp_sge_i32(0x7ffffffe, 0x7fffffff) == 2
+; run: %br_icmp_sge_i32(-1, 1) == 2
+; run: %br_icmp_sge_i32(0x075bcd15, 0xc521974f) == 1
+
+function %icmp_br_sge_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sge_i32(0, 0) == [1, 1]
+; run: %icmp_br_sge_i32(0, 1) == [0, 2]
+; run: %icmp_br_sge_i32(1, 0) == [1, 1]
+; run: %icmp_br_sge_i32(-1, 0) == [0, 2]
+; run: %icmp_br_sge_i32(0, -1) == [1, 1]
+; run: %icmp_br_sge_i32(0x80000000, 0x7fffffff) == [0, 2]
+; run: %icmp_br_sge_i32(0x7fffffff, 0x80000000) == [1, 1]
+; run: %icmp_br_sge_i32(0x80000000, 0x80000000) == [1, 1]
+
+function %icmp_sge_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_imm_i32(-3) == 0
+; run: %icmp_sge_imm_i32(-2) == 1
+; run: %icmp_sge_imm_i32(-1) == 1
+; run: %icmp_sge_imm_i32(0) == 1
+; run: %icmp_sge_imm_i32(0x80000000) == 0
+; run: %icmp_sge_imm_i32(0x7fffffff) == 1
+; run: %icmp_sge_imm_i32(1) == 1
+
+function %br_icmp_sge_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_imm_i32(-3) == 2
+; run: %br_icmp_sge_imm_i32(-2) == 1
+; run: %br_icmp_sge_imm_i32(-1) == 1
+; run: %br_icmp_sge_imm_i32(0) == 1
+; run: %br_icmp_sge_imm_i32(0x80000000) == 2
+; run: %br_icmp_sge_imm_i32(0x7fffffff) == 1
+; run: %br_icmp_sge_imm_i32(1) == 1
+
+function %icmp_sgt_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_i32(0, 0) == 0
+; run: %icmp_sgt_i32(0, 1) == 0
+; run: %icmp_sgt_i32(1, 0) == 1
+; run: %icmp_sgt_i32(-1, 0) == 0
+; run: %icmp_sgt_i32(0, -1) == 1
+; run: %icmp_sgt_i32(0x80000000, 0x7fffffff) == 0
+; run: %icmp_sgt_i32(0x7fffffff, 0x80000000) == 1
+; run: %icmp_sgt_i32(0x80000000, 0x80000000) == 0
+; run: %icmp_sgt_i32(0x7fffffff, 0x7fffffff) == 0
+; run: %icmp_sgt_i32(-1, -1) == 0
+; run: %icmp_sgt_i32(0x80000000, 0x80000001) == 0
+; run: %icmp_sgt_i32(0x7ffffffe, 0x7fffffff) == 0
+; run: %icmp_sgt_i32(-1, 1) == 0
+; run: %icmp_sgt_i32(0x075bcd15, 0xc521974f) == 1
+
+function %br_icmp_sgt_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_i32(0, 0) == 2
+; run: %br_icmp_sgt_i32(0, 1) == 2
+; run: %br_icmp_sgt_i32(1, 0) == 1
+; run: %br_icmp_sgt_i32(-1, 0) == 2
+; run: %br_icmp_sgt_i32(0, -1) == 1
+; run: %br_icmp_sgt_i32(0x80000000, 0x7fffffff) == 2
+; run: %br_icmp_sgt_i32(0x7fffffff, 0x80000000) == 1
+; run: %br_icmp_sgt_i32(0x80000000, 0x80000000) == 2
+; run: %br_icmp_sgt_i32(0x7fffffff, 0x7fffffff) == 2
+; run: %br_icmp_sgt_i32(-1, -1) == 2
+; run: %br_icmp_sgt_i32(0x80000000, 0x80000001) == 2
+; run: %br_icmp_sgt_i32(0x7ffffffe, 0x7fffffff) == 2
+; run: %br_icmp_sgt_i32(-1, 1) == 2
+; run: %br_icmp_sgt_i32(0x075bcd15, 0xc521974f) == 1
+
+function %icmp_br_sgt_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sgt_i32(0, 0) == [0, 2]
+; run: %icmp_br_sgt_i32(0, 1) == [0, 2]
+; run: %icmp_br_sgt_i32(1, 0) == [1, 1]
+; run: %icmp_br_sgt_i32(-1, 0) == [0, 2]
+; run: %icmp_br_sgt_i32(0, -1) == [1, 1]
+; run: %icmp_br_sgt_i32(0x80000000, 0x7fffffff) == [0, 2]
+; run: %icmp_br_sgt_i32(0x7fffffff, 0x80000000) == [1, 1]
+; run: %icmp_br_sgt_i32(0x80000000, 0x80000000) == [0, 2]
+
+function %icmp_sgt_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_imm_i32(-3) == 0
+; run: %icmp_sgt_imm_i32(-2) == 0
+; run: %icmp_sgt_imm_i32(-1) == 1
+; run: %icmp_sgt_imm_i32(0) == 1
+; run: %icmp_sgt_imm_i32(0x80000000) == 0
+; run: %icmp_sgt_imm_i32(0x7fffffff) == 1
+; run: %icmp_sgt_imm_i32(1) == 1
+
+function %br_icmp_sgt_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_imm_i32(-3) == 2
+; run: %br_icmp_sgt_imm_i32(-2) == 2
+; run: %br_icmp_sgt_imm_i32(-1) == 1
+; run: %br_icmp_sgt_imm_i32(0) == 1
+; run: %br_icmp_sgt_imm_i32(0x80000000) == 2
+; run: %br_icmp_sgt_imm_i32(0x7fffffff) == 1
+; run: %br_icmp_sgt_imm_i32(1) == 1
+
+function %icmp_sle_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_i32(0, 0) == 1
+; run: %icmp_sle_i32(0, 1) == 1
+; run: %icmp_sle_i32(1, 0) == 0
+; run: %icmp_sle_i32(-1, 0) == 1
+; run: %icmp_sle_i32(0, -1) == 0
+; run: %icmp_sle_i32(0x80000000, 0x7fffffff) == 1
+; run: %icmp_sle_i32(0x7fffffff, 0x80000000) == 0
+; run: %icmp_sle_i32(0x80000000, 0x80000000) == 1
+; run: %icmp_sle_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %icmp_sle_i32(-1, -1) == 1
+; run: %icmp_sle_i32(0x80000000, 0x80000001) == 1
+; run: %icmp_sle_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %icmp_sle_i32(-1, 1) == 1
+; run: %icmp_sle_i32(0x075bcd15, 0xc521974f) == 0
+
+function %br_icmp_sle_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_i32(0, 0) == 1
+; run: %br_icmp_sle_i32(0, 1) == 1
+; run: %br_icmp_sle_i32(1, 0) == 2
+; run: %br_icmp_sle_i32(-1, 0) == 1
+; run: %br_icmp_sle_i32(0, -1) == 2
+; run: %br_icmp_sle_i32(0x80000000, 0x7fffffff) == 1
+; run: %br_icmp_sle_i32(0x7fffffff, 0x80000000) == 2
+; run: %br_icmp_sle_i32(0x80000000, 0x80000000) == 1
+; run: %br_icmp_sle_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %br_icmp_sle_i32(-1, -1) == 1
+; run: %br_icmp_sle_i32(0x80000000, 0x80000001) == 1
+; run: %br_icmp_sle_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %br_icmp_sle_i32(-1, 1) == 1
+; run: %br_icmp_sle_i32(0x075bcd15, 0xc521974f) == 2
+
+function %icmp_br_sle_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sle_i32(0, 0) == [1, 1]
+; run: %icmp_br_sle_i32(0, 1) == [1, 1]
+; run: %icmp_br_sle_i32(1, 0) == [0, 2]
+; run: %icmp_br_sle_i32(-1, 0) == [1, 1]
+; run: %icmp_br_sle_i32(0, -1) == [0, 2]
+; run: %icmp_br_sle_i32(0x80000000, 0x7fffffff) == [1, 1]
+; run: %icmp_br_sle_i32(0x7fffffff, 0x80000000) == [0, 2]
+; run: %icmp_br_sle_i32(0x80000000, 0x80000000) == [1, 1]
+
+function %icmp_sle_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_imm_i32(-3) == 1
+; run: %icmp_sle_imm_i32(-2) == 1
+; run: %icmp_sle_imm_i32(-1) == 0
+; run: %icmp_sle_imm_i32(0) == 0
+; run: %icmp_sle_imm_i32(0x80000000) == 1
+; run: %icmp_sle_imm_i32(0x7fffffff) == 0
+; run: %icmp_sle_imm_i32(1) == 0
+
+function %br_icmp_sle_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_imm_i32(-3) == 1
+; run: %br_icmp_sle_imm_i32(-2) == 1
+; run: %br_icmp_sle_imm_i32(-1) == 2
+; run: %br_icmp_sle_imm_i32(0) == 2
+; run: %br_icmp_sle_imm_i32(0x80000000) == 1
+; run: %br_icmp_sle_imm_i32(0x7fffffff) == 2
+; run: %br_icmp_sle_imm_i32(1) == 2
+
+function %icmp_ult_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_i32(0, 0) == 0
+; run: %icmp_ult_i32(0, 1) == 1
+; run: %icmp_ult_i32(1, 0) == 0
+; run: %icmp_ult_i32(-1, 0) == 0
+; run: %icmp_ult_i32(0, -1) == 1
+; run: %icmp_ult_i32(0x80000000, 0x7fffffff) == 0
+; run: %icmp_ult_i32(0x7fffffff, 0x80000000) == 1
+; run: %icmp_ult_i32(0x80000000, 0x80000000) == 0
+; run: %icmp_ult_i32(0x7fffffff, 0x7fffffff) == 0
+; run: %icmp_ult_i32(-1, -1) == 0
+; run: %icmp_ult_i32(0x80000000, 0x80000001) == 1
+; run: %icmp_ult_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %icmp_ult_i32(-1, 1) == 0
+; run: %icmp_ult_i32(0x075bcd15, 0xc521974f) == 1
+
+function %br_icmp_ult_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_i32(0, 0) == 2
+; run: %br_icmp_ult_i32(0, 1) == 1
+; run: %br_icmp_ult_i32(1, 0) == 2
+; run: %br_icmp_ult_i32(-1, 0) == 2
+; run: %br_icmp_ult_i32(0, -1) == 1
+; run: %br_icmp_ult_i32(0x80000000, 0x7fffffff) == 2
+; run: %br_icmp_ult_i32(0x7fffffff, 0x80000000) == 1
+; run: %br_icmp_ult_i32(0x80000000, 0x80000000) == 2
+; run: %br_icmp_ult_i32(0x7fffffff, 0x7fffffff) == 2
+; run: %br_icmp_ult_i32(-1, -1) == 2
+; run: %br_icmp_ult_i32(0x80000000, 0x80000001) == 1
+; run: %br_icmp_ult_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %br_icmp_ult_i32(-1, 1) == 2
+; run: %br_icmp_ult_i32(0x075bcd15, 0xc521974f) == 1
+
+function %icmp_br_ult_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ult_i32(0, 0) == [0, 2]
+; run: %icmp_br_ult_i32(0, 1) == [1, 1]
+; run: %icmp_br_ult_i32(1, 0) == [0, 2]
+; run: %icmp_br_ult_i32(-1, 0) == [0, 2]
+; run: %icmp_br_ult_i32(0, -1) == [1, 1]
+; run: %icmp_br_ult_i32(0x80000000, 0x7fffffff) == [0, 2]
+; run: %icmp_br_ult_i32(0x7fffffff, 0x80000000) == [1, 1]
+; run: %icmp_br_ult_i32(0x80000000, 0x80000000) == [0, 2]
+
+function %icmp_ult_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_imm_i32(-3) == 1
+; run: %icmp_ult_imm_i32(-2) == 0
+; run: %icmp_ult_imm_i32(-1) == 0
+; run: %icmp_ult_imm_i32(0) == 1
+; run: %icmp_ult_imm_i32(0x80000000) == 1
+; run: %icmp_ult_imm_i32(0x7fffffff) == 1
+; run: %icmp_ult_imm_i32(1) == 1
+
+function %br_icmp_ult_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_imm_i32(-3) == 1
+; run: %br_icmp_ult_imm_i32(-2) == 2
+; run: %br_icmp_ult_imm_i32(-1) == 2
+; run: %br_icmp_ult_imm_i32(0) == 1
+; run: %br_icmp_ult_imm_i32(0x80000000) == 1
+; run: %br_icmp_ult_imm_i32(0x7fffffff) == 1
+; run: %br_icmp_ult_imm_i32(1) == 1
+
+function %icmp_uge_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_i32(0, 0) == 1
+; run: %icmp_uge_i32(0, 1) == 0
+; run: %icmp_uge_i32(1, 0) == 1
+; run: %icmp_uge_i32(-1, 0) == 1
+; run: %icmp_uge_i32(0, -1) == 0
+; run: %icmp_uge_i32(0x80000000, 0x7fffffff) == 1
+; run: %icmp_uge_i32(0x7fffffff, 0x80000000) == 0
+; run: %icmp_uge_i32(0x80000000, 0x80000000) == 1
+; run: %icmp_uge_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %icmp_uge_i32(-1, -1) == 1
+; run: %icmp_uge_i32(0x80000000, 0x80000001) == 0
+; run: %icmp_uge_i32(0x7ffffffe, 0x7fffffff) == 0
+; run: %icmp_uge_i32(-1, 1) == 1
+; run: %icmp_uge_i32(0x075bcd15, 0xc521974f) == 0
+
+function %br_icmp_uge_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_i32(0, 0) == 1
+; run: %br_icmp_uge_i32(0, 1) == 2
+; run: %br_icmp_uge_i32(1, 0) == 1
+; run: %br_icmp_uge_i32(-1, 0) == 1
+; run: %br_icmp_uge_i32(0, -1) == 2
+; run: %br_icmp_uge_i32(0x80000000, 0x7fffffff) == 1
+; run: %br_icmp_uge_i32(0x7fffffff, 0x80000000) == 2
+; run: %br_icmp_uge_i32(0x80000000, 0x80000000) == 1
+; run: %br_icmp_uge_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %br_icmp_uge_i32(-1, -1) == 1
+; run: %br_icmp_uge_i32(0x80000000, 0x80000001) == 2
+; run: %br_icmp_uge_i32(0x7ffffffe, 0x7fffffff) == 2
+; run: %br_icmp_uge_i32(-1, 1) == 1
+; run: %br_icmp_uge_i32(0x075bcd15, 0xc521974f) == 2
+
+function %icmp_br_uge_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_uge_i32(0, 0) == [1, 1]
+; run: %icmp_br_uge_i32(0, 1) == [0, 2]
+; run: %icmp_br_uge_i32(1, 0) == [1, 1]
+; run: %icmp_br_uge_i32(-1, 0) == [1, 1]
+; run: %icmp_br_uge_i32(0, -1) == [0, 2]
+; run: %icmp_br_uge_i32(0x80000000, 0x7fffffff) == [1, 1]
+; run: %icmp_br_uge_i32(0x7fffffff, 0x80000000) == [0, 2]
+; run: %icmp_br_uge_i32(0x80000000, 0x80000000) == [1, 1]
+
+function %icmp_uge_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_imm_i32(-3) == 0
+; run: %icmp_uge_imm_i32(-2) == 1
+; run: %icmp_uge_imm_i32(-1) == 1
+; run: %icmp_uge_imm_i32(0) == 0
+; run: %icmp_uge_imm_i32(0x80000000) == 0
+; run: %icmp_uge_imm_i32(0x7fffffff) == 0
+; run: %icmp_uge_imm_i32(1) == 0
+
+function %br_icmp_uge_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_imm_i32(-3) == 2
+; run: %br_icmp_uge_imm_i32(-2) == 1
+; run: %br_icmp_uge_imm_i32(-1) == 1
+; run: %br_icmp_uge_imm_i32(0) == 2
+; run: %br_icmp_uge_imm_i32(0x80000000) == 2
+; run: %br_icmp_uge_imm_i32(0x7fffffff) == 2
+; run: %br_icmp_uge_imm_i32(1) == 2
+
+function %icmp_ugt_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_i32(0, 0) == 0
+; run: %icmp_ugt_i32(0, 1) == 0
+; run: %icmp_ugt_i32(1, 0) == 1
+; run: %icmp_ugt_i32(-1, 0) == 1
+; run: %icmp_ugt_i32(0, -1) == 0
+; run: %icmp_ugt_i32(0x80000000, 0x7fffffff) == 1
+; run: %icmp_ugt_i32(0x7fffffff, 0x80000000) == 0
+; run: %icmp_ugt_i32(0x80000000, 0x80000000) == 0
+; run: %icmp_ugt_i32(0x7fffffff, 0x7fffffff) == 0
+; run: %icmp_ugt_i32(-1, -1) == 0
+; run: %icmp_ugt_i32(0x80000000, 0x80000001) == 0
+; run: %icmp_ugt_i32(0x7ffffffe, 0x7fffffff) == 0
+; run: %icmp_ugt_i32(-1, 1) == 1
+; run: %icmp_ugt_i32(0x075bcd15, 0xc521974f) == 0
+
+function %br_icmp_ugt_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_i32(0, 0) == 2
+; run: %br_icmp_ugt_i32(0, 1) == 2
+; run: %br_icmp_ugt_i32(1, 0) == 1
+; run: %br_icmp_ugt_i32(-1, 0) == 1
+; run: %br_icmp_ugt_i32(0, -1) == 2
+; run: %br_icmp_ugt_i32(0x80000000, 0x7fffffff) == 1
+; run: %br_icmp_ugt_i32(0x7fffffff, 0x80000000) == 2
+; run: %br_icmp_ugt_i32(0x80000000, 0x80000000) == 2
+; run: %br_icmp_ugt_i32(0x7fffffff, 0x7fffffff) == 2
+; run: %br_icmp_ugt_i32(-1, -1) == 2
+; run: %br_icmp_ugt_i32(0x80000000, 0x80000001) == 2
+; run: %br_icmp_ugt_i32(0x7ffffffe, 0x7fffffff) == 2
+; run: %br_icmp_ugt_i32(-1, 1) == 1
+; run: %br_icmp_ugt_i32(0x075bcd15, 0xc521974f) == 2
+
+function %icmp_br_ugt_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ugt_i32(0, 0) == [0, 2]
+; run: %icmp_br_ugt_i32(0, 1) == [0, 2]
+; run: %icmp_br_ugt_i32(1, 0) == [1, 1]
+; run: %icmp_br_ugt_i32(-1, 0) == [1, 1]
+; run: %icmp_br_ugt_i32(0, -1) == [0, 2]
+; run: %icmp_br_ugt_i32(0x80000000, 0x7fffffff) == [1, 1]
+; run: %icmp_br_ugt_i32(0x7fffffff, 0x80000000) == [0, 2]
+; run: %icmp_br_ugt_i32(0x80000000, 0x80000000) == [0, 2]
+
+function %icmp_ugt_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_imm_i32(-3) == 0
+; run: %icmp_ugt_imm_i32(-2) == 0
+; run: %icmp_ugt_imm_i32(-1) == 1
+; run: %icmp_ugt_imm_i32(0) == 0
+; run: %icmp_ugt_imm_i32(0x80000000) == 0
+; run: %icmp_ugt_imm_i32(0x7fffffff) == 0
+; run: %icmp_ugt_imm_i32(1) == 0
+
+function %br_icmp_ugt_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_imm_i32(-3) == 2
+; run: %br_icmp_ugt_imm_i32(-2) == 2
+; run: %br_icmp_ugt_imm_i32(-1) == 1
+; run: %br_icmp_ugt_imm_i32(0) == 2
+; run: %br_icmp_ugt_imm_i32(0x80000000) == 2
+; run: %br_icmp_ugt_imm_i32(0x7fffffff) == 2
+; run: %br_icmp_ugt_imm_i32(1) == 2
+
+function %icmp_ule_i32(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_i32(0, 0) == 1
+; run: %icmp_ule_i32(0, 1) == 1
+; run: %icmp_ule_i32(1, 0) == 0
+; run: %icmp_ule_i32(-1, 0) == 0
+; run: %icmp_ule_i32(0, -1) == 1
+; run: %icmp_ule_i32(0x80000000, 0x7fffffff) == 0
+; run: %icmp_ule_i32(0x7fffffff, 0x80000000) == 1
+; run: %icmp_ule_i32(0x80000000, 0x80000000) == 1
+; run: %icmp_ule_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %icmp_ule_i32(-1, -1) == 1
+; run: %icmp_ule_i32(0x80000000, 0x80000001) == 1
+; run: %icmp_ule_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %icmp_ule_i32(-1, 1) == 0
+; run: %icmp_ule_i32(0x075bcd15, 0xc521974f) == 1
+
+function %br_icmp_ule_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_i32(0, 0) == 1
+; run: %br_icmp_ule_i32(0, 1) == 1
+; run: %br_icmp_ule_i32(1, 0) == 2
+; run: %br_icmp_ule_i32(-1, 0) == 2
+; run: %br_icmp_ule_i32(0, -1) == 1
+; run: %br_icmp_ule_i32(0x80000000, 0x7fffffff) == 2
+; run: %br_icmp_ule_i32(0x7fffffff, 0x80000000) == 1
+; run: %br_icmp_ule_i32(0x80000000, 0x80000000) == 1
+; run: %br_icmp_ule_i32(0x7fffffff, 0x7fffffff) == 1
+; run: %br_icmp_ule_i32(-1, -1) == 1
+; run: %br_icmp_ule_i32(0x80000000, 0x80000001) == 1
+; run: %br_icmp_ule_i32(0x7ffffffe, 0x7fffffff) == 1
+; run: %br_icmp_ule_i32(-1, 1) == 2
+; run: %br_icmp_ule_i32(0x075bcd15, 0xc521974f) == 1
+
+function %icmp_br_ule_i32(i32, i32) -> i8, i32 {
+block0(v0: i32, v1: i32):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ule_i32(0, 0) == [1, 1]
+; run: %icmp_br_ule_i32(0, 1) == [1, 1]
+; run: %icmp_br_ule_i32(1, 0) == [0, 2]
+; run: %icmp_br_ule_i32(-1, 0) == [0, 2]
+; run: %icmp_br_ule_i32(0, -1) == [1, 1]
+; run: %icmp_br_ule_i32(0x80000000, 0x7fffffff) == [0, 2]
+; run: %icmp_br_ule_i32(0x7fffffff, 0x80000000) == [1, 1]
+; run: %icmp_br_ule_i32(0x80000000, 0x80000000) == [1, 1]
+
+function %icmp_ule_imm_i32(i32) -> i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_imm_i32(-3) == 1
+; run: %icmp_ule_imm_i32(-2) == 1
+; run: %icmp_ule_imm_i32(-1) == 0
+; run: %icmp_ule_imm_i32(0) == 1
+; run: %icmp_ule_imm_i32(0x80000000) == 1
+; run: %icmp_ule_imm_i32(0x7fffffff) == 1
+; run: %icmp_ule_imm_i32(1) == 1
+
+function %br_icmp_ule_imm_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffffe
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_imm_i32(-3) == 1
+; run: %br_icmp_ule_imm_i32(-2) == 1
+; run: %br_icmp_ule_imm_i32(-1) == 2
+; run: %br_icmp_ule_imm_i32(0) == 1
+; run: %br_icmp_ule_imm_i32(0x80000000) == 1
+; run: %br_icmp_ule_imm_i32(0x7fffffff) == 1
+; run: %br_icmp_ule_imm_i32(1) == 1
+
+function %icmp_eq_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_i64(0, 0) == 1
+; run: %icmp_eq_i64(0, 1) == 0
+; run: %icmp_eq_i64(1, 0) == 0
+; run: %icmp_eq_i64(-1, 0) == 0
+; run: %icmp_eq_i64(0, -1) == 0
+; run: %icmp_eq_i64(0x8000000000000000, 0x7fffffffffffffff) == 0
+; run: %icmp_eq_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %icmp_eq_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %icmp_eq_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %icmp_eq_i64(-1, -1) == 1
+; run: %icmp_eq_i64(0x8000000000000000, 0x8000000000000001) == 0
+; run: %icmp_eq_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 0
+; run: %icmp_eq_i64(-1, 1) == 0
+; run: %icmp_eq_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 0
+
+function %br_icmp_eq_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_i64(0, 0) == 1
+; run: %br_icmp_eq_i64(0, 1) == 2
+; run: %br_icmp_eq_i64(1, 0) == 2
+; run: %br_icmp_eq_i64(-1, 0) == 2
+; run: %br_icmp_eq_i64(0, -1) == 2
+; run: %br_icmp_eq_i64(0x8000000000000000, 0x7fffffffffffffff) == 2
+; run: %br_icmp_eq_i64(0x7fffffffffffffff, 0x8000000000000000) == 2
+; run: %br_icmp_eq_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %br_icmp_eq_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %br_icmp_eq_i64(-1, -1) == 1
+; run: %br_icmp_eq_i64(0x8000000000000000, 0x8000000000000001) == 2
+; run: %br_icmp_eq_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 2
+; run: %br_icmp_eq_i64(-1, 1) == 2
+; run: %br_icmp_eq_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 2
+
+function %icmp_br_eq_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_eq_i64(0, 0) == [1, 1]
+; run: %icmp_br_eq_i64(0, 1) == [0, 2]
+; run: %icmp_br_eq_i64(1, 0) == [0, 2]
+; run: %icmp_br_eq_i64(-1, 0) == [0, 2]
+; run: %icmp_br_eq_i64(0, -1) == [0, 2]
+; run: %icmp_br_eq_i64(0x8000000000000000, 0x7fffffffffffffff) == [0, 2]
+; run: %icmp_br_eq_i64(0x7fffffffffffffff, 0x8000000000000000) == [0, 2]
+; run: %icmp_br_eq_i64(0x8000000000000000, 0x8000000000000000) == [1, 1]
+
+function %icmp_eq_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_imm_i64(-3) == 0
+; run: %icmp_eq_imm_i64(-2) == 1
+; run: %icmp_eq_imm_i64(-1) == 0
+; run: %icmp_eq_imm_i64(0) == 0
+; run: %icmp_eq_imm_i64(0x8000000000000000) == 0
+; run: %icmp_eq_imm_i64(0x7fffffffffffffff) == 0
+; run: %icmp_eq_imm_i64(1) == 0
+
+function %br_icmp_eq_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_imm_i64(-3) == 2
+; run: %br_icmp_eq_imm_i64(-2) == 1
+; run: %br_icmp_eq_imm_i64(-1) == 2
+; run: %br_icmp_eq_imm_i64(0) == 2
+; run: %br_icmp_eq_imm_i64(0x8000000000000000) == 2
+; run: %br_icmp_eq_imm_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_eq_imm_i64(1) == 2
+
+function %icmp_eq_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp eq v0, v1
+    return v2
+}
+; run: %icmp_eq_imm64_i64(0x0000000123456788) == 0
+; run: %icmp_eq_imm64_i64(0x0000000123456789) == 1
+; run: %icmp_eq_imm64_i64(0x000000012345678a) == 0
+; run: %icmp_eq_imm64_i64(0) == 0
+; run: %icmp_eq_imm64_i64(0x8000000000000000) == 0
+; run: %icmp_eq_imm64_i64(0x7fffffffffffffff) == 0
+; run: %icmp_eq_imm64_i64(1) == 0
+
+function %br_icmp_eq_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_eq_imm64_i64(0x0000000123456788) == 2
+; run: %br_icmp_eq_imm64_i64(0x0000000123456789) == 1
+; run: %br_icmp_eq_imm64_i64(0x000000012345678a) == 2
+; run: %br_icmp_eq_imm64_i64(0) == 2
+; run: %br_icmp_eq_imm64_i64(0x8000000000000000) == 2
+; run: %br_icmp_eq_imm64_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_eq_imm64_i64(1) == 2
+
+function %icmp_ne_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_i64(0, 0) == 0
+; run: %icmp_ne_i64(0, 1) == 1
+; run: %icmp_ne_i64(1, 0) == 1
+; run: %icmp_ne_i64(-1, 0) == 1
+; run: %icmp_ne_i64(0, -1) == 1
+; run: %icmp_ne_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %icmp_ne_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %icmp_ne_i64(0x8000000000000000, 0x8000000000000000) == 0
+; run: %icmp_ne_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 0
+; run: %icmp_ne_i64(-1, -1) == 0
+; run: %icmp_ne_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %icmp_ne_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %icmp_ne_i64(-1, 1) == 1
+; run: %icmp_ne_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %br_icmp_ne_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_i64(0, 0) == 2
+; run: %br_icmp_ne_i64(0, 1) == 1
+; run: %br_icmp_ne_i64(1, 0) == 1
+; run: %br_icmp_ne_i64(-1, 0) == 1
+; run: %br_icmp_ne_i64(0, -1) == 1
+; run: %br_icmp_ne_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ne_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %br_icmp_ne_i64(0x8000000000000000, 0x8000000000000000) == 2
+; run: %br_icmp_ne_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ne_i64(-1, -1) == 2
+; run: %br_icmp_ne_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %br_icmp_ne_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ne_i64(-1, 1) == 1
+; run: %br_icmp_ne_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %icmp_br_ne_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ne_i64(0, 0) == [0, 2]
+; run: %icmp_br_ne_i64(0, 1) == [1, 1]
+; run: %icmp_br_ne_i64(1, 0) == [1, 1]
+; run: %icmp_br_ne_i64(-1, 0) == [1, 1]
+; run: %icmp_br_ne_i64(0, -1) == [1, 1]
+; run: %icmp_br_ne_i64(0x8000000000000000, 0x7fffffffffffffff) == [1, 1]
+; run: %icmp_br_ne_i64(0x7fffffffffffffff, 0x8000000000000000) == [1, 1]
+; run: %icmp_br_ne_i64(0x8000000000000000, 0x8000000000000000) == [0, 2]
+
+function %icmp_ne_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_imm_i64(-3) == 1
+; run: %icmp_ne_imm_i64(-2) == 0
+; run: %icmp_ne_imm_i64(-1) == 1
+; run: %icmp_ne_imm_i64(0) == 1
+; run: %icmp_ne_imm_i64(0x8000000000000000) == 1
+; run: %icmp_ne_imm_i64(0x7fffffffffffffff) == 1
+; run: %icmp_ne_imm_i64(1) == 1
+
+function %br_icmp_ne_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_imm_i64(-3) == 1
+; run: %br_icmp_ne_imm_i64(-2) == 2
+; run: %br_icmp_ne_imm_i64(-1) == 1
+; run: %br_icmp_ne_imm_i64(0) == 1
+; run: %br_icmp_ne_imm_i64(0x8000000000000000) == 1
+; run: %br_icmp_ne_imm_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_ne_imm_i64(1) == 1
+
+function %icmp_ne_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ne v0, v1
+    return v2
+}
+; run: %icmp_ne_imm64_i64(0x0000000123456788) == 1
+; run: %icmp_ne_imm64_i64(0x0000000123456789) == 0
+; run: %icmp_ne_imm64_i64(0x000000012345678a) == 1
+; run: %icmp_ne_imm64_i64(0) == 1
+; run: %icmp_ne_imm64_i64(0x8000000000000000) == 1
+; run: %icmp_ne_imm64_i64(0x7fffffffffffffff) == 1
+; run: %icmp_ne_imm64_i64(1) == 1
+
+function %br_icmp_ne_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ne_imm64_i64(0x0000000123456788) == 1
+; run: %br_icmp_ne_imm64_i64(0x0000000123456789) == 2
+; run: %br_icmp_ne_imm64_i64(0x000000012345678a) == 1
+; run: %br_icmp_ne_imm64_i64(0) == 1
+; run: %br_icmp_ne_imm64_i64(0x8000000000000000) == 1
+; run: %br_icmp_ne_imm64_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_ne_imm64_i64(1) == 1
+
+function %icmp_slt_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_i64(0, 0) == 0
+; run: %icmp_slt_i64(0, 1) == 1
+; run: %icmp_slt_i64(1, 0) == 0
+; run: %icmp_slt_i64(-1, 0) == 1
+; run: %icmp_slt_i64(0, -1) == 0
+; run: %icmp_slt_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %icmp_slt_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %icmp_slt_i64(0x8000000000000000, 0x8000000000000000) == 0
+; run: %icmp_slt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 0
+; run: %icmp_slt_i64(-1, -1) == 0
+; run: %icmp_slt_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %icmp_slt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %icmp_slt_i64(-1, 1) == 1
+; run: %icmp_slt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 0
+
+function %br_icmp_slt_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_i64(0, 0) == 2
+; run: %br_icmp_slt_i64(0, 1) == 1
+; run: %br_icmp_slt_i64(1, 0) == 2
+; run: %br_icmp_slt_i64(-1, 0) == 1
+; run: %br_icmp_slt_i64(0, -1) == 2
+; run: %br_icmp_slt_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %br_icmp_slt_i64(0x7fffffffffffffff, 0x8000000000000000) == 2
+; run: %br_icmp_slt_i64(0x8000000000000000, 0x8000000000000000) == 2
+; run: %br_icmp_slt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 2
+; run: %br_icmp_slt_i64(-1, -1) == 2
+; run: %br_icmp_slt_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %br_icmp_slt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %br_icmp_slt_i64(-1, 1) == 1
+; run: %br_icmp_slt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 2
+
+function %icmp_br_slt_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_slt_i64(0, 0) == [0, 2]
+; run: %icmp_br_slt_i64(0, 1) == [1, 1]
+; run: %icmp_br_slt_i64(1, 0) == [0, 2]
+; run: %icmp_br_slt_i64(-1, 0) == [1, 1]
+; run: %icmp_br_slt_i64(0, -1) == [0, 2]
+; run: %icmp_br_slt_i64(0x8000000000000000, 0x7fffffffffffffff) == [1, 1]
+; run: %icmp_br_slt_i64(0x7fffffffffffffff, 0x8000000000000000) == [0, 2]
+; run: %icmp_br_slt_i64(0x8000000000000000, 0x8000000000000000) == [0, 2]
+
+function %icmp_slt_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_imm_i64(-3) == 1
+; run: %icmp_slt_imm_i64(-2) == 0
+; run: %icmp_slt_imm_i64(-1) == 0
+; run: %icmp_slt_imm_i64(0) == 0
+; run: %icmp_slt_imm_i64(0x8000000000000000) == 1
+; run: %icmp_slt_imm_i64(0x7fffffffffffffff) == 0
+; run: %icmp_slt_imm_i64(1) == 0
+
+function %br_icmp_slt_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_imm_i64(-3) == 1
+; run: %br_icmp_slt_imm_i64(-2) == 2
+; run: %br_icmp_slt_imm_i64(-1) == 2
+; run: %br_icmp_slt_imm_i64(0) == 2
+; run: %br_icmp_slt_imm_i64(0x8000000000000000) == 1
+; run: %br_icmp_slt_imm_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_slt_imm_i64(1) == 2
+
+function %icmp_slt_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp slt v0, v1
+    return v2
+}
+; run: %icmp_slt_imm64_i64(0x0000000123456788) == 1
+; run: %icmp_slt_imm64_i64(0x0000000123456789) == 0
+; run: %icmp_slt_imm64_i64(0x000000012345678a) == 0
+; run: %icmp_slt_imm64_i64(0) == 1
+; run: %icmp_slt_imm64_i64(0x8000000000000000) == 1
+; run: %icmp_slt_imm64_i64(0x7fffffffffffffff) == 0
+; run: %icmp_slt_imm64_i64(1) == 1
+
+function %br_icmp_slt_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp slt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_slt_imm64_i64(0x0000000123456788) == 1
+; run: %br_icmp_slt_imm64_i64(0x0000000123456789) == 2
+; run: %br_icmp_slt_imm64_i64(0x000000012345678a) == 2
+; run: %br_icmp_slt_imm64_i64(0) == 1
+; run: %br_icmp_slt_imm64_i64(0x8000000000000000) == 1
+; run: %br_icmp_slt_imm64_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_slt_imm64_i64(1) == 1
+
+function %icmp_sge_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_i64(0, 0) == 1
+; run: %icmp_sge_i64(0, 1) == 0
+; run: %icmp_sge_i64(1, 0) == 1
+; run: %icmp_sge_i64(-1, 0) == 0
+; run: %icmp_sge_i64(0, -1) == 1
+; run: %icmp_sge_i64(0x8000000000000000, 0x7fffffffffffffff) == 0
+; run: %icmp_sge_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %icmp_sge_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %icmp_sge_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %icmp_sge_i64(-1, -1) == 1
+; run: %icmp_sge_i64(0x8000000000000000, 0x8000000000000001) == 0
+; run: %icmp_sge_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 0
+; run: %icmp_sge_i64(-1, 1) == 0
+; run: %icmp_sge_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %br_icmp_sge_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_i64(0, 0) == 1
+; run: %br_icmp_sge_i64(0, 1) == 2
+; run: %br_icmp_sge_i64(1, 0) == 1
+; run: %br_icmp_sge_i64(-1, 0) == 2
+; run: %br_icmp_sge_i64(0, -1) == 1
+; run: %br_icmp_sge_i64(0x8000000000000000, 0x7fffffffffffffff) == 2
+; run: %br_icmp_sge_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %br_icmp_sge_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %br_icmp_sge_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %br_icmp_sge_i64(-1, -1) == 1
+; run: %br_icmp_sge_i64(0x8000000000000000, 0x8000000000000001) == 2
+; run: %br_icmp_sge_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 2
+; run: %br_icmp_sge_i64(-1, 1) == 2
+; run: %br_icmp_sge_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %icmp_br_sge_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sge_i64(0, 0) == [1, 1]
+; run: %icmp_br_sge_i64(0, 1) == [0, 2]
+; run: %icmp_br_sge_i64(1, 0) == [1, 1]
+; run: %icmp_br_sge_i64(-1, 0) == [0, 2]
+; run: %icmp_br_sge_i64(0, -1) == [1, 1]
+; run: %icmp_br_sge_i64(0x8000000000000000, 0x7fffffffffffffff) == [0, 2]
+; run: %icmp_br_sge_i64(0x7fffffffffffffff, 0x8000000000000000) == [1, 1]
+; run: %icmp_br_sge_i64(0x8000000000000000, 0x8000000000000000) == [1, 1]
+
+function %icmp_sge_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_imm_i64(-3) == 0
+; run: %icmp_sge_imm_i64(-2) == 1
+; run: %icmp_sge_imm_i64(-1) == 1
+; run: %icmp_sge_imm_i64(0) == 1
+; run: %icmp_sge_imm_i64(0x8000000000000000) == 0
+; run: %icmp_sge_imm_i64(0x7fffffffffffffff) == 1
+; run: %icmp_sge_imm_i64(1) == 1
+
+function %br_icmp_sge_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_imm_i64(-3) == 2
+; run: %br_icmp_sge_imm_i64(-2) == 1
+; run: %br_icmp_sge_imm_i64(-1) == 1
+; run: %br_icmp_sge_imm_i64(0) == 1
+; run: %br_icmp_sge_imm_i64(0x8000000000000000) == 2
+; run: %br_icmp_sge_imm_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_sge_imm_i64(1) == 1
+
+function %icmp_sge_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sge v0, v1
+    return v2
+}
+; run: %icmp_sge_imm64_i64(0x0000000123456788) == 0
+; run: %icmp_sge_imm64_i64(0x0000000123456789) == 1
+; run: %icmp_sge_imm64_i64(0x000000012345678a) == 1
+; run: %icmp_sge_imm64_i64(0) == 0
+; run: %icmp_sge_imm64_i64(0x8000000000000000) == 0
+; run: %icmp_sge_imm64_i64(0x7fffffffffffffff) == 1
+; run: %icmp_sge_imm64_i64(1) == 0
+
+function %br_icmp_sge_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sge_imm64_i64(0x0000000123456788) == 2
+; run: %br_icmp_sge_imm64_i64(0x0000000123456789) == 1
+; run: %br_icmp_sge_imm64_i64(0x000000012345678a) == 1
+; run: %br_icmp_sge_imm64_i64(0) == 2
+; run: %br_icmp_sge_imm64_i64(0x8000000000000000) == 2
+; run: %br_icmp_sge_imm64_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_sge_imm64_i64(1) == 2
+
+function %icmp_sgt_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_i64(0, 0) == 0
+; run: %icmp_sgt_i64(0, 1) == 0
+; run: %icmp_sgt_i64(1, 0) == 1
+; run: %icmp_sgt_i64(-1, 0) == 0
+; run: %icmp_sgt_i64(0, -1) == 1
+; run: %icmp_sgt_i64(0x8000000000000000, 0x7fffffffffffffff) == 0
+; run: %icmp_sgt_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %icmp_sgt_i64(0x8000000000000000, 0x8000000000000000) == 0
+; run: %icmp_sgt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 0
+; run: %icmp_sgt_i64(-1, -1) == 0
+; run: %icmp_sgt_i64(0x8000000000000000, 0x8000000000000001) == 0
+; run: %icmp_sgt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 0
+; run: %icmp_sgt_i64(-1, 1) == 0
+; run: %icmp_sgt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %br_icmp_sgt_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_i64(0, 0) == 2
+; run: %br_icmp_sgt_i64(0, 1) == 2
+; run: %br_icmp_sgt_i64(1, 0) == 1
+; run: %br_icmp_sgt_i64(-1, 0) == 2
+; run: %br_icmp_sgt_i64(0, -1) == 1
+; run: %br_icmp_sgt_i64(0x8000000000000000, 0x7fffffffffffffff) == 2
+; run: %br_icmp_sgt_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %br_icmp_sgt_i64(0x8000000000000000, 0x8000000000000000) == 2
+; run: %br_icmp_sgt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 2
+; run: %br_icmp_sgt_i64(-1, -1) == 2
+; run: %br_icmp_sgt_i64(0x8000000000000000, 0x8000000000000001) == 2
+; run: %br_icmp_sgt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 2
+; run: %br_icmp_sgt_i64(-1, 1) == 2
+; run: %br_icmp_sgt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %icmp_br_sgt_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sgt_i64(0, 0) == [0, 2]
+; run: %icmp_br_sgt_i64(0, 1) == [0, 2]
+; run: %icmp_br_sgt_i64(1, 0) == [1, 1]
+; run: %icmp_br_sgt_i64(-1, 0) == [0, 2]
+; run: %icmp_br_sgt_i64(0, -1) == [1, 1]
+; run: %icmp_br_sgt_i64(0x8000000000000000, 0x7fffffffffffffff) == [0, 2]
+; run: %icmp_br_sgt_i64(0x7fffffffffffffff, 0x8000000000000000) == [1, 1]
+; run: %icmp_br_sgt_i64(0x8000000000000000, 0x8000000000000000) == [0, 2]
+
+function %icmp_sgt_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_imm_i64(-3) == 0
+; run: %icmp_sgt_imm_i64(-2) == 0
+; run: %icmp_sgt_imm_i64(-1) == 1
+; run: %icmp_sgt_imm_i64(0) == 1
+; run: %icmp_sgt_imm_i64(0x8000000000000000) == 0
+; run: %icmp_sgt_imm_i64(0x7fffffffffffffff) == 1
+; run: %icmp_sgt_imm_i64(1) == 1
+
+function %br_icmp_sgt_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_imm_i64(-3) == 2
+; run: %br_icmp_sgt_imm_i64(-2) == 2
+; run: %br_icmp_sgt_imm_i64(-1) == 1
+; run: %br_icmp_sgt_imm_i64(0) == 1
+; run: %br_icmp_sgt_imm_i64(0x8000000000000000) == 2
+; run: %br_icmp_sgt_imm_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_sgt_imm_i64(1) == 1
+
+function %icmp_sgt_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sgt v0, v1
+    return v2
+}
+; run: %icmp_sgt_imm64_i64(0x0000000123456788) == 0
+; run: %icmp_sgt_imm64_i64(0x0000000123456789) == 0
+; run: %icmp_sgt_imm64_i64(0x000000012345678a) == 1
+; run: %icmp_sgt_imm64_i64(0) == 0
+; run: %icmp_sgt_imm64_i64(0x8000000000000000) == 0
+; run: %icmp_sgt_imm64_i64(0x7fffffffffffffff) == 1
+; run: %icmp_sgt_imm64_i64(1) == 0
+
+function %br_icmp_sgt_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sgt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sgt_imm64_i64(0x0000000123456788) == 2
+; run: %br_icmp_sgt_imm64_i64(0x0000000123456789) == 2
+; run: %br_icmp_sgt_imm64_i64(0x000000012345678a) == 1
+; run: %br_icmp_sgt_imm64_i64(0) == 2
+; run: %br_icmp_sgt_imm64_i64(0x8000000000000000) == 2
+; run: %br_icmp_sgt_imm64_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_sgt_imm64_i64(1) == 2
+
+function %icmp_sle_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_i64(0, 0) == 1
+; run: %icmp_sle_i64(0, 1) == 1
+; run: %icmp_sle_i64(1, 0) == 0
+; run: %icmp_sle_i64(-1, 0) == 1
+; run: %icmp_sle_i64(0, -1) == 0
+; run: %icmp_sle_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %icmp_sle_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %icmp_sle_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %icmp_sle_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %icmp_sle_i64(-1, -1) == 1
+; run: %icmp_sle_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %icmp_sle_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %icmp_sle_i64(-1, 1) == 1
+; run: %icmp_sle_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 0
+
+function %br_icmp_sle_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_i64(0, 0) == 1
+; run: %br_icmp_sle_i64(0, 1) == 1
+; run: %br_icmp_sle_i64(1, 0) == 2
+; run: %br_icmp_sle_i64(-1, 0) == 1
+; run: %br_icmp_sle_i64(0, -1) == 2
+; run: %br_icmp_sle_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %br_icmp_sle_i64(0x7fffffffffffffff, 0x8000000000000000) == 2
+; run: %br_icmp_sle_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %br_icmp_sle_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %br_icmp_sle_i64(-1, -1) == 1
+; run: %br_icmp_sle_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %br_icmp_sle_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %br_icmp_sle_i64(-1, 1) == 1
+; run: %br_icmp_sle_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 2
+
+function %icmp_br_sle_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_sle_i64(0, 0) == [1, 1]
+; run: %icmp_br_sle_i64(0, 1) == [1, 1]
+; run: %icmp_br_sle_i64(1, 0) == [0, 2]
+; run: %icmp_br_sle_i64(-1, 0) == [1, 1]
+; run: %icmp_br_sle_i64(0, -1) == [0, 2]
+; run: %icmp_br_sle_i64(0x8000000000000000, 0x7fffffffffffffff) == [1, 1]
+; run: %icmp_br_sle_i64(0x7fffffffffffffff, 0x8000000000000000) == [0, 2]
+; run: %icmp_br_sle_i64(0x8000000000000000, 0x8000000000000000) == [1, 1]
+
+function %icmp_sle_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_imm_i64(-3) == 1
+; run: %icmp_sle_imm_i64(-2) == 1
+; run: %icmp_sle_imm_i64(-1) == 0
+; run: %icmp_sle_imm_i64(0) == 0
+; run: %icmp_sle_imm_i64(0x8000000000000000) == 1
+; run: %icmp_sle_imm_i64(0x7fffffffffffffff) == 0
+; run: %icmp_sle_imm_i64(1) == 0
+
+function %br_icmp_sle_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_imm_i64(-3) == 1
+; run: %br_icmp_sle_imm_i64(-2) == 1
+; run: %br_icmp_sle_imm_i64(-1) == 2
+; run: %br_icmp_sle_imm_i64(0) == 2
+; run: %br_icmp_sle_imm_i64(0x8000000000000000) == 1
+; run: %br_icmp_sle_imm_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_sle_imm_i64(1) == 2
+
+function %icmp_sle_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sle v0, v1
+    return v2
+}
+; run: %icmp_sle_imm64_i64(0x0000000123456788) == 1
+; run: %icmp_sle_imm64_i64(0x0000000123456789) == 1
+; run: %icmp_sle_imm64_i64(0x000000012345678a) == 0
+; run: %icmp_sle_imm64_i64(0) == 1
+; run: %icmp_sle_imm64_i64(0x8000000000000000) == 1
+; run: %icmp_sle_imm64_i64(0x7fffffffffffffff) == 0
+; run: %icmp_sle_imm64_i64(1) == 1
+
+function %br_icmp_sle_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp sle v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_sle_imm64_i64(0x0000000123456788) == 1
+; run: %br_icmp_sle_imm64_i64(0x0000000123456789) == 1
+; run: %br_icmp_sle_imm64_i64(0x000000012345678a) == 2
+; run: %br_icmp_sle_imm64_i64(0) == 1
+; run: %br_icmp_sle_imm64_i64(0x8000000000000000) == 1
+; run: %br_icmp_sle_imm64_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_sle_imm64_i64(1) == 1
+
+function %icmp_ult_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_i64(0, 0) == 0
+; run: %icmp_ult_i64(0, 1) == 1
+; run: %icmp_ult_i64(1, 0) == 0
+; run: %icmp_ult_i64(-1, 0) == 0
+; run: %icmp_ult_i64(0, -1) == 1
+; run: %icmp_ult_i64(0x8000000000000000, 0x7fffffffffffffff) == 0
+; run: %icmp_ult_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %icmp_ult_i64(0x8000000000000000, 0x8000000000000000) == 0
+; run: %icmp_ult_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 0
+; run: %icmp_ult_i64(-1, -1) == 0
+; run: %icmp_ult_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %icmp_ult_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %icmp_ult_i64(-1, 1) == 0
+; run: %icmp_ult_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %br_icmp_ult_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_i64(0, 0) == 2
+; run: %br_icmp_ult_i64(0, 1) == 1
+; run: %br_icmp_ult_i64(1, 0) == 2
+; run: %br_icmp_ult_i64(-1, 0) == 2
+; run: %br_icmp_ult_i64(0, -1) == 1
+; run: %br_icmp_ult_i64(0x8000000000000000, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ult_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %br_icmp_ult_i64(0x8000000000000000, 0x8000000000000000) == 2
+; run: %br_icmp_ult_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ult_i64(-1, -1) == 2
+; run: %br_icmp_ult_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %br_icmp_ult_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ult_i64(-1, 1) == 2
+; run: %br_icmp_ult_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %icmp_br_ult_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ult_i64(0, 0) == [0, 2]
+; run: %icmp_br_ult_i64(0, 1) == [1, 1]
+; run: %icmp_br_ult_i64(1, 0) == [0, 2]
+; run: %icmp_br_ult_i64(-1, 0) == [0, 2]
+; run: %icmp_br_ult_i64(0, -1) == [1, 1]
+; run: %icmp_br_ult_i64(0x8000000000000000, 0x7fffffffffffffff) == [0, 2]
+; run: %icmp_br_ult_i64(0x7fffffffffffffff, 0x8000000000000000) == [1, 1]
+; run: %icmp_br_ult_i64(0x8000000000000000, 0x8000000000000000) == [0, 2]
+
+function %icmp_ult_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_imm_i64(-3) == 1
+; run: %icmp_ult_imm_i64(-2) == 0
+; run: %icmp_ult_imm_i64(-1) == 0
+; run: %icmp_ult_imm_i64(0) == 1
+; run: %icmp_ult_imm_i64(0x8000000000000000) == 1
+; run: %icmp_ult_imm_i64(0x7fffffffffffffff) == 1
+; run: %icmp_ult_imm_i64(1) == 1
+
+function %br_icmp_ult_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_imm_i64(-3) == 1
+; run: %br_icmp_ult_imm_i64(-2) == 2
+; run: %br_icmp_ult_imm_i64(-1) == 2
+; run: %br_icmp_ult_imm_i64(0) == 1
+; run: %br_icmp_ult_imm_i64(0x8000000000000000) == 1
+; run: %br_icmp_ult_imm_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_ult_imm_i64(1) == 1
+
+function %icmp_ult_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ult v0, v1
+    return v2
+}
+; run: %icmp_ult_imm64_i64(0x0000000123456788) == 1
+; run: %icmp_ult_imm64_i64(0x0000000123456789) == 0
+; run: %icmp_ult_imm64_i64(0x000000012345678a) == 0
+; run: %icmp_ult_imm64_i64(0) == 1
+; run: %icmp_ult_imm64_i64(0x8000000000000000) == 0
+; run: %icmp_ult_imm64_i64(0x7fffffffffffffff) == 0
+; run: %icmp_ult_imm64_i64(1) == 1
+
+function %br_icmp_ult_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ult_imm64_i64(0x0000000123456788) == 1
+; run: %br_icmp_ult_imm64_i64(0x0000000123456789) == 2
+; run: %br_icmp_ult_imm64_i64(0x000000012345678a) == 2
+; run: %br_icmp_ult_imm64_i64(0) == 1
+; run: %br_icmp_ult_imm64_i64(0x8000000000000000) == 2
+; run: %br_icmp_ult_imm64_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_ult_imm64_i64(1) == 1
+
+function %icmp_uge_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_i64(0, 0) == 1
+; run: %icmp_uge_i64(0, 1) == 0
+; run: %icmp_uge_i64(1, 0) == 1
+; run: %icmp_uge_i64(-1, 0) == 1
+; run: %icmp_uge_i64(0, -1) == 0
+; run: %icmp_uge_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %icmp_uge_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %icmp_uge_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %icmp_uge_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %icmp_uge_i64(-1, -1) == 1
+; run: %icmp_uge_i64(0x8000000000000000, 0x8000000000000001) == 0
+; run: %icmp_uge_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 0
+; run: %icmp_uge_i64(-1, 1) == 1
+; run: %icmp_uge_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 0
+
+function %br_icmp_uge_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_i64(0, 0) == 1
+; run: %br_icmp_uge_i64(0, 1) == 2
+; run: %br_icmp_uge_i64(1, 0) == 1
+; run: %br_icmp_uge_i64(-1, 0) == 1
+; run: %br_icmp_uge_i64(0, -1) == 2
+; run: %br_icmp_uge_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %br_icmp_uge_i64(0x7fffffffffffffff, 0x8000000000000000) == 2
+; run: %br_icmp_uge_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %br_icmp_uge_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %br_icmp_uge_i64(-1, -1) == 1
+; run: %br_icmp_uge_i64(0x8000000000000000, 0x8000000000000001) == 2
+; run: %br_icmp_uge_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 2
+; run: %br_icmp_uge_i64(-1, 1) == 1
+; run: %br_icmp_uge_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 2
+
+function %icmp_br_uge_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_uge_i64(0, 0) == [1, 1]
+; run: %icmp_br_uge_i64(0, 1) == [0, 2]
+; run: %icmp_br_uge_i64(1, 0) == [1, 1]
+; run: %icmp_br_uge_i64(-1, 0) == [1, 1]
+; run: %icmp_br_uge_i64(0, -1) == [0, 2]
+; run: %icmp_br_uge_i64(0x8000000000000000, 0x7fffffffffffffff) == [1, 1]
+; run: %icmp_br_uge_i64(0x7fffffffffffffff, 0x8000000000000000) == [0, 2]
+; run: %icmp_br_uge_i64(0x8000000000000000, 0x8000000000000000) == [1, 1]
+
+function %icmp_uge_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_imm_i64(-3) == 0
+; run: %icmp_uge_imm_i64(-2) == 1
+; run: %icmp_uge_imm_i64(-1) == 1
+; run: %icmp_uge_imm_i64(0) == 0
+; run: %icmp_uge_imm_i64(0x8000000000000000) == 0
+; run: %icmp_uge_imm_i64(0x7fffffffffffffff) == 0
+; run: %icmp_uge_imm_i64(1) == 0
+
+function %br_icmp_uge_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_imm_i64(-3) == 2
+; run: %br_icmp_uge_imm_i64(-2) == 1
+; run: %br_icmp_uge_imm_i64(-1) == 1
+; run: %br_icmp_uge_imm_i64(0) == 2
+; run: %br_icmp_uge_imm_i64(0x8000000000000000) == 2
+; run: %br_icmp_uge_imm_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_uge_imm_i64(1) == 2
+
+function %icmp_uge_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp uge v0, v1
+    return v2
+}
+; run: %icmp_uge_imm64_i64(0x0000000123456788) == 0
+; run: %icmp_uge_imm64_i64(0x0000000123456789) == 1
+; run: %icmp_uge_imm64_i64(0x000000012345678a) == 1
+; run: %icmp_uge_imm64_i64(0) == 0
+; run: %icmp_uge_imm64_i64(0x8000000000000000) == 1
+; run: %icmp_uge_imm64_i64(0x7fffffffffffffff) == 1
+; run: %icmp_uge_imm64_i64(1) == 0
+
+function %br_icmp_uge_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_uge_imm64_i64(0x0000000123456788) == 2
+; run: %br_icmp_uge_imm64_i64(0x0000000123456789) == 1
+; run: %br_icmp_uge_imm64_i64(0x000000012345678a) == 1
+; run: %br_icmp_uge_imm64_i64(0) == 2
+; run: %br_icmp_uge_imm64_i64(0x8000000000000000) == 1
+; run: %br_icmp_uge_imm64_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_uge_imm64_i64(1) == 2
+
+function %icmp_ugt_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_i64(0, 0) == 0
+; run: %icmp_ugt_i64(0, 1) == 0
+; run: %icmp_ugt_i64(1, 0) == 1
+; run: %icmp_ugt_i64(-1, 0) == 1
+; run: %icmp_ugt_i64(0, -1) == 0
+; run: %icmp_ugt_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %icmp_ugt_i64(0x7fffffffffffffff, 0x8000000000000000) == 0
+; run: %icmp_ugt_i64(0x8000000000000000, 0x8000000000000000) == 0
+; run: %icmp_ugt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 0
+; run: %icmp_ugt_i64(-1, -1) == 0
+; run: %icmp_ugt_i64(0x8000000000000000, 0x8000000000000001) == 0
+; run: %icmp_ugt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 0
+; run: %icmp_ugt_i64(-1, 1) == 1
+; run: %icmp_ugt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 0
+
+function %br_icmp_ugt_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_i64(0, 0) == 2
+; run: %br_icmp_ugt_i64(0, 1) == 2
+; run: %br_icmp_ugt_i64(1, 0) == 1
+; run: %br_icmp_ugt_i64(-1, 0) == 1
+; run: %br_icmp_ugt_i64(0, -1) == 2
+; run: %br_icmp_ugt_i64(0x8000000000000000, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ugt_i64(0x7fffffffffffffff, 0x8000000000000000) == 2
+; run: %br_icmp_ugt_i64(0x8000000000000000, 0x8000000000000000) == 2
+; run: %br_icmp_ugt_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ugt_i64(-1, -1) == 2
+; run: %br_icmp_ugt_i64(0x8000000000000000, 0x8000000000000001) == 2
+; run: %br_icmp_ugt_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ugt_i64(-1, 1) == 1
+; run: %br_icmp_ugt_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 2
+
+function %icmp_br_ugt_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ugt_i64(0, 0) == [0, 2]
+; run: %icmp_br_ugt_i64(0, 1) == [0, 2]
+; run: %icmp_br_ugt_i64(1, 0) == [1, 1]
+; run: %icmp_br_ugt_i64(-1, 0) == [1, 1]
+; run: %icmp_br_ugt_i64(0, -1) == [0, 2]
+; run: %icmp_br_ugt_i64(0x8000000000000000, 0x7fffffffffffffff) == [1, 1]
+; run: %icmp_br_ugt_i64(0x7fffffffffffffff, 0x8000000000000000) == [0, 2]
+; run: %icmp_br_ugt_i64(0x8000000000000000, 0x8000000000000000) == [0, 2]
+
+function %icmp_ugt_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_imm_i64(-3) == 0
+; run: %icmp_ugt_imm_i64(-2) == 0
+; run: %icmp_ugt_imm_i64(-1) == 1
+; run: %icmp_ugt_imm_i64(0) == 0
+; run: %icmp_ugt_imm_i64(0x8000000000000000) == 0
+; run: %icmp_ugt_imm_i64(0x7fffffffffffffff) == 0
+; run: %icmp_ugt_imm_i64(1) == 0
+
+function %br_icmp_ugt_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_imm_i64(-3) == 2
+; run: %br_icmp_ugt_imm_i64(-2) == 2
+; run: %br_icmp_ugt_imm_i64(-1) == 1
+; run: %br_icmp_ugt_imm_i64(0) == 2
+; run: %br_icmp_ugt_imm_i64(0x8000000000000000) == 2
+; run: %br_icmp_ugt_imm_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_ugt_imm_i64(1) == 2
+
+function %icmp_ugt_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ugt v0, v1
+    return v2
+}
+; run: %icmp_ugt_imm64_i64(0x0000000123456788) == 0
+; run: %icmp_ugt_imm64_i64(0x0000000123456789) == 0
+; run: %icmp_ugt_imm64_i64(0x000000012345678a) == 1
+; run: %icmp_ugt_imm64_i64(0) == 0
+; run: %icmp_ugt_imm64_i64(0x8000000000000000) == 1
+; run: %icmp_ugt_imm64_i64(0x7fffffffffffffff) == 1
+; run: %icmp_ugt_imm64_i64(1) == 0
+
+function %br_icmp_ugt_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ugt_imm64_i64(0x0000000123456788) == 2
+; run: %br_icmp_ugt_imm64_i64(0x0000000123456789) == 2
+; run: %br_icmp_ugt_imm64_i64(0x000000012345678a) == 1
+; run: %br_icmp_ugt_imm64_i64(0) == 2
+; run: %br_icmp_ugt_imm64_i64(0x8000000000000000) == 1
+; run: %br_icmp_ugt_imm64_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_ugt_imm64_i64(1) == 2
+
+function %icmp_ule_i64(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_i64(0, 0) == 1
+; run: %icmp_ule_i64(0, 1) == 1
+; run: %icmp_ule_i64(1, 0) == 0
+; run: %icmp_ule_i64(-1, 0) == 0
+; run: %icmp_ule_i64(0, -1) == 1
+; run: %icmp_ule_i64(0x8000000000000000, 0x7fffffffffffffff) == 0
+; run: %icmp_ule_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %icmp_ule_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %icmp_ule_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %icmp_ule_i64(-1, -1) == 1
+; run: %icmp_ule_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %icmp_ule_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %icmp_ule_i64(-1, 1) == 0
+; run: %icmp_ule_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %br_icmp_ule_i64(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_i64(0, 0) == 1
+; run: %br_icmp_ule_i64(0, 1) == 1
+; run: %br_icmp_ule_i64(1, 0) == 2
+; run: %br_icmp_ule_i64(-1, 0) == 2
+; run: %br_icmp_ule_i64(0, -1) == 1
+; run: %br_icmp_ule_i64(0x8000000000000000, 0x7fffffffffffffff) == 2
+; run: %br_icmp_ule_i64(0x7fffffffffffffff, 0x8000000000000000) == 1
+; run: %br_icmp_ule_i64(0x8000000000000000, 0x8000000000000000) == 1
+; run: %br_icmp_ule_i64(0x7fffffffffffffff, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ule_i64(-1, -1) == 1
+; run: %br_icmp_ule_i64(0x8000000000000000, 0x8000000000000001) == 1
+; run: %br_icmp_ule_i64(0x7ffffffffffffffe, 0x7fffffffffffffff) == 1
+; run: %br_icmp_ule_i64(-1, 1) == 2
+; run: %br_icmp_ule_i64(0x123456789abcdef0, 0xf0123456789abcdf) == 1
+
+function %icmp_br_ule_i64(i64, i64) -> i8, i32 {
+block0(v0: i64, v1: i64):
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 2
+    return v2, v4
+}
+; run: %icmp_br_ule_i64(0, 0) == [1, 1]
+; run: %icmp_br_ule_i64(0, 1) == [1, 1]
+; run: %icmp_br_ule_i64(1, 0) == [0, 2]
+; run: %icmp_br_ule_i64(-1, 0) == [0, 2]
+; run: %icmp_br_ule_i64(0, -1) == [1, 1]
+; run: %icmp_br_ule_i64(0x8000000000000000, 0x7fffffffffffffff) == [0, 2]
+; run: %icmp_br_ule_i64(0x7fffffffffffffff, 0x8000000000000000) == [1, 1]
+; run: %icmp_br_ule_i64(0x8000000000000000, 0x8000000000000000) == [1, 1]
+
+function %icmp_ule_imm_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_imm_i64(-3) == 1
+; run: %icmp_ule_imm_i64(-2) == 1
+; run: %icmp_ule_imm_i64(-1) == 0
+; run: %icmp_ule_imm_i64(0) == 1
+; run: %icmp_ule_imm_i64(0x8000000000000000) == 1
+; run: %icmp_ule_imm_i64(0x7fffffffffffffff) == 1
+; run: %icmp_ule_imm_i64(1) == 1
+
+function %br_icmp_ule_imm_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0xfffffffffffffffe
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_imm_i64(-3) == 1
+; run: %br_icmp_ule_imm_i64(-2) == 1
+; run: %br_icmp_ule_imm_i64(-1) == 2
+; run: %br_icmp_ule_imm_i64(0) == 1
+; run: %br_icmp_ule_imm_i64(0x8000000000000000) == 1
+; run: %br_icmp_ule_imm_i64(0x7fffffffffffffff) == 1
+; run: %br_icmp_ule_imm_i64(1) == 1
+
+function %icmp_ule_imm64_i64(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ule v0, v1
+    return v2
+}
+; run: %icmp_ule_imm64_i64(0x0000000123456788) == 1
+; run: %icmp_ule_imm64_i64(0x0000000123456789) == 1
+; run: %icmp_ule_imm64_i64(0x000000012345678a) == 0
+; run: %icmp_ule_imm64_i64(0) == 1
+; run: %icmp_ule_imm64_i64(0x8000000000000000) == 0
+; run: %icmp_ule_imm64_i64(0x7fffffffffffffff) == 0
+; run: %icmp_ule_imm64_i64(1) == 1
+
+function %br_icmp_ule_imm64_i64(i64) -> i32 {
+block0(v0: i64):
+    v1 = iconst.i64 0x123456789
+    v2 = icmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %br_icmp_ule_imm64_i64(0x0000000123456788) == 1
+; run: %br_icmp_ule_imm64_i64(0x0000000123456789) == 1
+; run: %br_icmp_ule_imm64_i64(0x000000012345678a) == 2
+; run: %br_icmp_ule_imm64_i64(0) == 1
+; run: %br_icmp_ule_imm64_i64(0x8000000000000000) == 2
+; run: %br_icmp_ule_imm64_i64(0x7fffffffffffffff) == 2
+; run: %br_icmp_ule_imm64_i64(1) == 1

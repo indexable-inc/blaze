@@ -1,0 +1,69 @@
+[package]
+name = "blaze-macro-eval"
+description = "Proc macros run in process behind blaze's server of the real `proc_macro` bridge: a macro's wasm32-wasip1 module under Wasmtime, and the MIR evaluator as the reference its output is tested against"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+parking_lot.workspace = true
+rustc_lexer.workspace = true
+unicode-normalization.workspace = true
+
+base-db.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-wasi.workspace = true
+blaze-profile.workspace = true
+blaze-usercode.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+intern.workspace = true
+# Names a proc macro's machine code in CPU samples (`ix_prof::jit`).
+ix-prof.workspace = true
+blaze-lower.workspace = true
+parser.workspace = true
+proc-macro-api.workspace = true
+blaze-query.workspace = true
+span.workspace = true
+stdx.workspace = true
+tracing.workspace = true
+tt.workspace = true
+wasmtime.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-units.workspace = true
+blaze-vfs.workspace = true
+either.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# WebAssembly text for the host's tests' modules.
+wasmtime = { workspace = true, features = ["wat"] }
+# The binary of a test's module, whose custom sections the host reads itself.
+wat = "1.263.0"
+
+[lints]
+workspace = true

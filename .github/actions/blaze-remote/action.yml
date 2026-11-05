@@ -1,0 +1,85 @@
+# blaze's store and the shared remote (docs/remote-cache.md, slice 1): every run pulls what main
+# pushed through the gateway before it builds, and main alone pushes after its tests, so a pull
+# request or a merge-queue entry builds only what it changed. The pull is anonymous (the `blaze`
+# tenant is public), so fork pull requests need no secret. A remote that fails fails the step
+# (BLAZE_REMOTE_REQUIRED, the no-fallback rule) and says so in the job summary; it never goes
+# on quietly with an empty store. `.github/actions/blaze` sets BLAZE_CACHE first.
+name: blaze-remote
+description: pull blaze's store from the shared remote, or push it there (main only)
+inputs:
+  mode:
+    description: pull (before the build) or push (after the tests, main only)
+    required: true
+  project:
+    description: the project name of the remote's manifest; blaze-<os>-<arch> when empty, as each platform's packs are its own
+    default: ""
+  token:
+    description: the gateway write token (push only), secrets.BLAZE_CACHE_TOKEN of the cache-writer environment
+    default: ""
+  sign-key:
+    description: the key manifests are signed with (push only), secrets.BLAZE_CACHE_SIGN_KEY of cache-writer
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: blaze remote ${{ inputs.mode }}
+      shell: bash
+      env:
+        REMOTE: blaze+https://blaze-gateway.indexable.workers.dev/t/blaze/v3
+        BLAZE_REMOTE_REQUIRED: "1"
+        # The public half of blaze-ci-1; the secret half is BLAZE_CACHE_SIGN_KEY.
+        BLAZE_REMOTE_TRUST: 5a8e41ddc2c6e7c0f2de2e6aa4ed71b9e2b81115c3793a9f9b446d7bbfefbaf8
+        MODE: ${{ inputs.mode }}
+        PROJECT: ${{ inputs.project }}
+        TOKEN: ${{ inputs.token }}
+        SIGN_KEY: ${{ inputs.sign-key }}
+      run: |
+        set -o pipefail
+        refuse() {
+          echo "::error::blaze remote $MODE: $1"
+          echo "### blaze remote $MODE: refused: $1" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        }
+        [ -n "${BLAZE_CACHE:-}" ] || refuse "BLAZE_CACHE is not set: run .github/actions/blaze first"
+        PROJECT=${PROJECT:-blaze-$RUNNER_OS-$RUNNER_ARCH}
+        case "$MODE" in
+          pull)
+            export BLAZE_REMOTE_READONLY=1
+            ;;
+          push)
+            if [ "$GITHUB_REF" != refs/heads/main ]; then
+              refuse "push runs on main only, not $GITHUB_REF"
+            fi
+            if [ -z "$TOKEN" ] || [ -z "$SIGN_KEY" ]; then
+              refuse "push needs token and sign-key (the cache-writer environment)"
+            fi
+            export BLAZE_REMOTE_TOKEN="$TOKEN"
+            key="$RUNNER_TEMP/blaze-remote-sign.key"
+            (umask 077 && printf '%s\n' "$SIGN_KEY" > "$key")
+            trap 'rm -f "$key"' EXIT
+            export BLAZE_REMOTE_SIGN="$key"
+            ;;
+          *)
+            refuse "the mode is pull or push, not $MODE"
+            ;;
+        esac
+        log="$RUNNER_TEMP/blaze-remote-$MODE.log"
+        start=$(date +%s.%N)
+        # The exit status is said too: a blaze killed by a signal (137 for SIGKILL) says nothing.
+        if blaze-engine cache "$MODE" "$REMOTE" "$PROJECT" 2>&1 | tee "$log"; then
+          status=ok
+        else
+          status="failed (blaze-engine exit status ${PIPESTATUS[0]})"
+        fi
+        took=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+        {
+          echo "### blaze remote $MODE: $status (${took} s)"
+          echo
+          echo '```'
+          tail -n 20 "$log"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$status" != ok ]; then
+          echo "::error::blaze remote $MODE $status: see the job summary"
+          exit 1
+        fi

@@ -1,0 +1,66 @@
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    WHITESPACE " "
+    NAME
+      IDENT "f"
+    PARAM_LIST
+      L_PAREN "("
+      R_PAREN ")"
+    WHITESPACE " "
+    BLOCK_EXPR
+      STMT_LIST
+        L_CURLY "{"
+        WHITESPACE "\n    "
+        MATCH_EXPR
+          MATCH_KW "match"
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          WHITESPACE " "
+          MATCH_ARM_LIST
+            L_CURLY "{"
+            WHITESPACE "\n        "
+            MATCH_ARM
+              TUPLE_PAT
+                L_PAREN "("
+                R_PAREN ")"
+              WHITESPACE " "
+              FAT_ARROW "=>"
+              WHITESPACE " "
+              BIN_EXPR
+                MACRO_EXPR
+                  MACRO_CALL
+                    PATH
+                      PATH_SEGMENT
+                        NAME_REF
+                          IDENT "m"
+                    BANG "!"
+                    WHITESPACE " "
+                    TOKEN_TREE
+                      L_CURLY "{"
+                      R_CURLY "}"
+                WHITESPACE " "
+                PIPE "|"
+                WHITESPACE " "
+                LITERAL
+                  INT_NUMBER "1"
+              COMMA ","
+            WHITESPACE "\n        "
+            MATCH_ARM
+              TUPLE_PAT
+                L_PAREN "("
+                R_PAREN ")"
+              WHITESPACE " "
+              FAT_ARROW "=>"
+              WHITESPACE " "
+              BLOCK_EXPR
+                STMT_LIST
+                  L_CURLY "{"
+                  R_CURLY "}"
+            WHITESPACE "\n    "
+            R_CURLY "}"
+        WHITESPACE "\n"
+        R_CURLY "}"
+  WHITESPACE "\n"

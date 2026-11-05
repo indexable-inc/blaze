@@ -1,0 +1,188 @@
+{
+  "cases": {
+    "hashmap": { "group": "std", "tests": 2 },
+    "threads": { "group": "std", "tests": 2 },
+    "thread_local": { "group": "std", "tests": 2 },
+    "statics": { "group": "std", "tests": 2 },
+    "configured_out": { "group": "std", "tests": 1 },
+    "envfs": { "group": "std", "tests": 2, "args": ["one", "two words"], "env": { "SMOKE_VAR": "smoke" } },
+    "const_heap": { "group": "std", "tests": 0 },
+    "arbitrary_ints": { "group": "std", "tests": 0 },
+    "tokio_echo": { "group": "crates", "tests": 1 },
+    "serde_json": { "group": "crates", "tests": 2 },
+    "derives": { "group": "crates", "tests": 3, "args": ["--count", "2", "--shout", "yes", "greet", "smoke"] },
+    "ce_sha256": { "group": "crates", "tests": 0 },
+    "ce_toml": { "group": "crates", "tests": 0 },
+    "ce_inflate": { "group": "crates", "tests": 0 }
+  },
+  "projects": {
+    "ripgrep": {
+      "repo": "BurntSushi/ripgrep",
+      "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+      "input": "alpha\nbeta\ngamma\nalphabet\n",
+      "runs": [
+        { "args": ["--version"], "contains": "ripgrep 15.1.0" },
+        { "args": ["-n", "--color", "never", "alpha", "{input}"], "stdout": "1:alpha\n4:alphabet\n" }
+      ],
+      "test": []
+    },
+    "blaze": {
+      "repo": "indexable-inc/blaze",
+      "rev": "{blaze}",
+      "runs": [{ "select": ["-p", "blaze-engine", "--bin", "blaze-engine"], "args": ["--version"], "contains": "blaze " }],
+      "test": ["-p", "syntax-tree"]
+    },
+    "cargo": {
+      "group": "apps",
+      "repo": "rust-lang/cargo",
+      "rev": "ea2d97820c16195b0ca3fadb4319fe512c199a43",
+      "apt": ["libssl-dev", "pkg-config"],
+      "seconds": 7200,
+      "runs": [{ "select": ["-p", "cargo", "--bin", "cargo"], "args": ["--version"], "contains": "cargo 1.91.0 (ea2d97820" }],
+      "test": ["-p", "cargo-util", "-p", "cargo-platform"]
+    },
+    "zed": {
+      "group": "apps",
+      "repo": "zed-industries/zed",
+      "rev": "aed37547d8543000494fb69101c05daec5891068",
+      "note": "System libraries from its script/linux; on macOS its shaders build with Xcode's Metal compiler. `--help` is answered before a window opens. Its tests are those of the crates below gpui: the rest run on gpui's headless test platform, but the whole suite with dev and release builds is longer than a hosted runner's six hours.",
+      "apt": ["build-essential", "clang", "cmake", "curl", "elfutils", "g++", "gcc", "gettext-base", "git", "jq", "libasound2-dev",
+              "libfontconfig-dev", "libgit2-dev", "libglib2.0-dev", "libsqlite3-dev", "libssl-dev", "libstdc++-14-dev", "libva-dev",
+              "libvulkan1", "libwayland-dev", "libx11-xcb-dev", "libxkbcommon-x11-dev", "libzstd-dev", "lld", "llvm", "make",
+              "musl-dev", "musl-tools"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "zed", "--bin", "zed"], "args": ["--help"], "contains": "Usage:" }],
+      "test": ["-p", "util", "-p", "rope", "-p", "sum_tree", "-p", "text", "-p", "fuzzy", "-p", "clock"]
+    },
+    "servo": {
+      "group": "apps",
+      "repo": "servo/servo",
+      "rev": "aac43a3f31a259f04a574f5ec4e959c943ad7cc7",
+      "prepare": "servoprep",
+      "note": "v0.7.0. System libraries from its python/servo/platform (apt_common.txt, apt_ubuntu_only.txt, Brewfile); SpiderMonkey is mozjs's prebuilt archive. servoprep.py names stylo in `unsandboxed-build-scripts`: its build script writes the CSS properties' documentation into the target directory. Its tests are those of crates without a window or a GPU.",
+      "apt": ["build-essential", "ca-certificates", "clang", "cmake", "curl", "g++", "git", "gperf", "gstreamer1.0-libav",
+              "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-ugly",
+              "gstreamer1.0-tools", "libdbus-1-dev", "libegl1-mesa-dev", "libfreetype6-dev", "libges-1.0-dev", "libgl1-mesa-dri",
+              "libgles2-mesa-dev", "libglib2.0-dev", "libgstreamer-plugins-bad1.0-dev", "libgstreamer-plugins-base1.0-dev",
+              "libgstreamer-plugins-good1.0-dev", "libgstrtspserver-1.0-dev", "libharfbuzz-dev", "liblzma-dev", "libudev-dev",
+              "libunwind-dev", "libvulkan1", "libx11-dev", "libxcb-render0-dev", "libxcb-shape0-dev", "libxcb-xfixes0-dev",
+              "libxkbcommon-x11-0", "libxkbcommon0", "libxmu-dev", "libxmu6", "llvm-dev", "m4", "xorg-dev"],
+      "brew": ["cmake", "pkg-config"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "servoshell", "--bin", "servoshell"], "args": ["--version"], "contains": "Servo " }],
+      "test": ["-p", "servo-url", "-p", "servo-config", "-p", "servo-xpath"]
+    },
+    "bun": {
+      "group": "apps",
+      "repo": "oven-sh/bun",
+      "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+      "note": "bun's Rust port (bun-v1.4.3). bunprep.py builds its C and C++ once (in `nix develop .#bench-bun`, which has what that needs) and adds the member bun-exe, whose link takes them.",
+      "prepare": "bunprep",
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "bun-exe"], "args": ["-e", "console.log(1 + 2)"], "stdout": "3\n" }],
+      "test": ["-p", "bun_semver"]
+    },
+    "dynamo": {
+      "group": "apps",
+      "repo": "ai-dynamo/dynamo",
+      "rev": "0d9c24a8bf6db13c1a1223cf15fcbee9140d1ac3",
+      "note": "NVIDIA Dynamo v1.6.1, as its AGENTS.md builds it, on runners without a GPU: the workspace (`cargo build`; on macOS dynamo-llm without its Linux-only default feature), and the Python bindings, a workspace of their own that maturin builds with cargo, imported. CUDA is loaded at run time (cudarc's fallback-latest) and nixl-sys builds its stubs without NIXL, so the default features build. The build scripts need protoc and libclang (bindgen). The program run is the CPU-only vLLM mocker server.",
+      "apt": ["clang", "cmake", "libclang-dev", "libssl-dev", "pkg-config", "protobuf-compiler"],
+      "brew": ["cmake", "protobuf"],
+      "seconds": 18000,
+      "builds": [
+        { "args": ["--workspace"] },
+        {
+          "dir": "lib/bindings/python",
+          "then": ["python3", "-c", "import glob, importlib.machinery as m, importlib.util as u; p = [f for f in glob.glob('{target}/lib_core.*') if f.endswith(('.so', '.dylib'))][0]; l = m.ExtensionFileLoader('_core', p); s = u.spec_from_loader('_core', l); c = u.module_from_spec(s); l.exec_module(c); print('DistributedRuntime' in dir(c))"],
+          "stdout": "True\n"
+        }
+      ],
+      "runs": [{ "select": ["-p", "dynamo-vllm-mocker", "--bin", "dynamo-vllm-mocker-server"], "args": ["--help"], "contains": "CPU-only, Mocker-backed" }],
+      "test": ["-p", "dynamo-tokens", "-p", "dynamo-kv-hashing", "-p", "dynamo-truthy"],
+      "excluded": {
+        "dynamo-llm features cuda, nccl, testing-cuda, testing-nixl (testing-full)": "they need a GPU with CUDA, NCCL or NIXL at build or test time; the runners have none",
+        "lib/bindings/kvbm": "a workspace of its own whose default (block-manager) needs CUDA at run time; not built yet"
+      },
+      "macos": {
+        "builds": [
+          { "args": ["-p", "dynamo-llm", "--no-default-features"] },
+          {
+            "dir": "lib/bindings/python",
+            "then": ["python3", "-c", "import glob, importlib.machinery as m, importlib.util as u; p = [f for f in glob.glob('{target}/lib_core.*') if f.endswith(('.so', '.dylib'))][0]; l = m.ExtensionFileLoader('_core', p); s = u.spec_from_loader('_core', l); c = u.module_from_spec(s); l.exec_module(c); print('DistributedRuntime' in dir(c))"],
+            "stdout": "True\n"
+          }
+        ],
+        "excluded": {
+          "dynamo-llm features cuda, nccl, testing-cuda, testing-nixl (testing-full)": "they need a GPU with CUDA, NCCL or NIXL at build or test time; the runners have none",
+          "lib/bindings/kvbm": "a workspace of its own whose default (block-manager) needs CUDA at run time; not built yet",
+          "dynamo-llm's default feature block-manager, and so `--workspace`": "NIXL, NUMA and O_DIRECT code that dynamo builds on Linux only (its AGENTS.md: dynamo-llm with --no-default-features on macOS)"
+        }
+      }
+    },
+    "fff": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fff",
+      "rev": "95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+      "note": "v0.11.0 (formerly fff.nvim). Its default features (the `ripgrep` walker and glob matcher, pure Rust) need no Zig, which its CI's `zlob` feature does. The program is its MCP server, fff-mcp: the version, and its health check of a directory of its own. Its tests are those of fff-search and the crates below it, as its CI's (which leaves out the Neovim and Python bindings); they watch the file system, so they need inotify or FSEvents, not a GPU or the network.",
+      "seconds": 3600,
+      "runs": [
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"], "args": ["--version"], "contains": "fff-mcp 0.11.0" },
+        { "select": ["-p", "fff-mcp", "--bin", "fff-mcp"],
+          "args": ["--healthcheck", "--frecency-db", "{work}/frecency", "--history-db", "{work}/history", "--log-file", "{work}/fff.log", "{work}"],
+          "contains": "All checks passed." }
+      ],
+      "test": ["-p", "fff-query-parser", "-p", "fff-grep", "-p", "fff-search"],
+      "excluded": {
+        "the `zlob` feature (its CI's and release's glob matcher)": "Zig compiles it; the runners have no Zig",
+        "fff-nvim, fff-python, fff-c": "bindings for LuaJIT, CPython and C that its CI does not test with cargo either (Lua, Python and C suites of their own)"
+      }
+    },
+    "fframes": {
+      "group": "apps",
+      "repo": "dmtrKovalenko/fframes",
+      "rev": "69174f0187b5d8e92329246898f70250b59f08f2",
+      "note": "v1.3.0, a video rendering framework. System libraries from its README and CI (main.yml): the codecs FFmpeg links, nasm and libclang for ffmpeg-sys-fframes, fontconfig. Its build scripts download a prebuilt Skia (skia-bindings) and FFmpeg (ffmpeg-sys-fframes): a prebuilt static one for the tests' features, its source (a git clone of release/9.0) for the example's codecs, which have none; `fetches` has blaze lock them for both builds. The program is its hello-world example's renderer: the timeline, and one frame rendered to PNG by the CPU backend. Its tests are its CI's on Windows, the crates that need no GPU.",
+      "apt": ["clang", "libasound2-dev", "libclang-dev", "libfontconfig1-dev", "libopus-dev", "libvpx-dev", "libx264-dev", "libx265-dev",
+              "nasm", "ninja-build", "pkg-config", "yasm"],
+      "brew": ["libvpx", "nasm", "ninja", "opus", "pkg-config", "x264", "x265"],
+      "fetches": [["-p", "hello-world-example"],
+                  ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
+      "seconds": 7200,
+      "runs": [
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["timeline"], "contains": "1920x1080 @ 30 fps, 900 frames (30.00s)" },
+        { "select": ["-p", "hello-world-example", "--bin", "hello_world_example_bin"], "args": ["--renderer", "cpu", "frame", "1s", "-o", "{work}/frames"],
+          "file": "{work}/frames/1s.png", "starts": "\u0089PNG" }
+      ],
+      "test": ["-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"],
+      "excluded": {
+        "e2e (the frames of every example against snapshots), the Skia GPU renderer, the native player": "they need Vulkan or Metal and a display, or odiff from npm"
+      }
+    },
+    "flox": {
+      "group": "apps",
+      "repo": "flox/flox",
+      "rev": "87d931382dc5c53f32af662c9611c6a58d669952",
+      "note": "v1.19.2, the environment manager built on Nix. floxprep.py takes the environment of flox's own package build from its flake (the variables its crates read with env!, OpenSSL, krb5 and libclang for GSSAPI's bindgen), every path of it from cache.nixos.org or cache.flox.dev, so the runner needs Nix. floxprep.py also names factory-api-v1 in `unsandboxed-build-scripts`: its build script writes its OpenAPI client into its own src/. The program is the CLI, whose version is compiled in. Its tests are those of flox-core and flox-config, which need neither Nix nor the network.",
+      "prepare": "floxprep",
+      "env": { "FLOX_DISABLE_METRICS": "true" },
+      "seconds": 7200,
+      "runs": [{ "select": ["-p", "flox", "--bin", "flox"], "args": ["--version"], "stdout": "1.19.2\n" }],
+      "test": ["-p", "flox-core", "-p", "flox-config", "--features", "flox-core/tests"],
+      "excluded": {
+        "flox-rust-sdk, flox-manifest and flox's own tests": "they run Nix, reach FloxHub or the catalog, or read what `just build` made; flox's CI runs them in its Nix shell with its services"
+      }
+    },
+    "codex": {
+      "group": "apps",
+      "repo": "openai/codex",
+      "rev": "360319d8dee62d87e2d59fc0c21805d79519cfed",
+      "dir": "codex-rs",
+      "note": "OpenAI's Codex CLI, rust-v0.165.0: its Rust workspace is codex-rs, pinned to Rust 1.99.1 (rust-toolchain.toml), which bench.py's cargo builds with. System libraries from its rust-ci-full.yml (libcap for the Linux sandbox, ALSA for voice) and OpenSSL, which hosted runners have. Only the codex binary is built: v8, which codex-code-mode-runtime builds against V8 archives of codex's own (#1369), is not below it. `--version` needs no API key or network. Its tests are the unit and integration tests of crates that need neither a model, a network nor credentials.",
+      "apt": ["build-essential", "libasound2-dev", "libcap-dev", "libssl-dev", "pkg-config"],
+      "seconds": 18000,
+      "runs": [{ "select": ["-p", "codex-cli", "--bin", "codex"], "args": ["--version"], "stdout": "codex-cli 0.165.0\n" }],
+      "test": ["-p", "codex-apply-patch", "-p", "codex-protocol", "-p", "codex-execpolicy", "-p", "codex-features"]
+    }
+  }
+}

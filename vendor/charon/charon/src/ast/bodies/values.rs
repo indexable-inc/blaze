@@ -1,0 +1,725 @@
+//! Contains definitions for variables and constant values.
+use core::hash::Hash;
+use derive_generic_visitor::{Drive, DriveMut, DriveTwo};
+use enum_as_inner::EnumAsInner;
+use serde::{Deserialize, Serialize};
+use serde_state::{DeserializeState, SerializeState};
+use std::vec::Vec;
+
+use crate::ast::*;
+
+/// A constant expression.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
+pub struct ConstantExpr(pub HashConsed<WithCachedTypeInfo<(ConstantExprKind, Ty)>>);
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("C"))]
+pub enum ConstantExprKind {
+    /// Boolean value.
+    Bool(bool),
+    /// Integer value.
+    #[serde_state(stateless)]
+    Integer(IntegerValue),
+    /// Char value.
+    Char(char),
+    /// Float value.
+    #[serde_state(stateless)]
+    Float(FloatValue),
+    /// Value of an ADT (struct or enum).
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    Adt(Option<VariantId>, IndexVec<FieldId, ConstantExpr>),
+    /// Array value.
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    Array(Vec<ConstantExpr>),
+    /// A shared reference to a constant place.
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    Ref(GlobalPlace, Option<UnsizingMetadata>),
+    /// A raw pointer to a constant place.
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    Ptr(RefKind, GlobalPlace, Option<UnsizingMetadata>),
+    /// `str` value. This represents an unsized value of type `str` (and not `&str`).
+    Str(String),
+    /// Byte string value.
+    ByteStr(Vec<u8>),
+    /// ZST constant corresponding to the unique value of the type of a function item.
+    FnDef(FnPtr),
+    /// A function pointer value; this is a pointer (i.e. an address).
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    FnPtr(FnPtr),
+    /// Cast a constant value to another type (e.g. erase a vtable method pointer to `*const ()`).
+    Cast(ConstantExpr, CastKind),
+    /// A pointer with no provenance (e.g. 0 for the null pointer)
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    PtrNoProvenance(#[serde(with = "scalar_value_ser_de")] u128),
+    /// The address of a linker symbol, as a `*const ()`. The address may be null, if the
+    /// symbol wasn't defined at link time.
+    ExternSymbol(String),
+    /// The `TypeId` value for a type.
+    TypeId(Ty),
+    /// Raw memory value obtained from constant evaluation. Used when a more structured
+    /// representation isn't possible (e.g. for unions) or just isn't implemented yet.
+    RawMemory(Vec<Byte>),
+
+    /// A const generic var
+    Var(ConstGenericDbVar),
+    /// The value of a constant/static.
+    ///
+    /// This is eliminated inside functions if `--raw-consts` is off.
+    Global(GlobalDeclRef),
+    /// A call to a `const fn`.
+    Call(FnPtr, Vec<ConstantExpr>),
+    /// A trait associated constant.
+    ///
+    /// E.g.:
+    /// ```text
+    /// impl Foo for Bar {
+    ///   const C : usize = 32; // <-
+    /// }
+    /// ```
+    TraitConst(TraitRef, AssocConstId),
+    /// A reference to the vtable `static` item for this trait ref. This can be normalized if we
+    /// emitted a vtable item.
+    ///
+    /// This is eliminated if `--raw-consts` is off.
+    VTableRef(PolyTraitRef),
+    /// The integer discriminant value corresponding to this enum variant.
+    Discriminant(TypeDeclRef, VariantId),
+    /// Make an array of `count` copies of `value`. `value` does not need to be `Copy` or `Clone`.
+    Repeat {
+        value: ConstantExpr,
+        count: ConstantExpr,
+        /// Proof that the element type is `Sized`; absent with `--hide-marker-traits`.
+        value_is_sized: Option<TraitRef>,
+    },
+    /// The size of the given type.
+    SizeOf(Ty),
+    /// The alignment of the given type.
+    AlignOf(Ty),
+    /// The offset of the given field.
+    OffsetOf(TypeDeclRef, Option<VariantId>, FieldId),
+
+    /// A constant expression that Charon doesn't handle, along with the reason why.
+    Opaque(String),
+}
+
+/// The place a `Ref`/`Ptr` constant points to, e.g. `GLOBAL.0[1]`. This is a constant version of
+/// [`Place`].
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
+pub struct GlobalPlace {
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("global_place_kind"))]
+    pub kind: GlobalPlaceKind,
+    /// The type of the place.
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("global_place_ty"))]
+    pub ty: Ty,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("GlobalPlace"))]
+pub enum GlobalPlaceKind {
+    /// The allocation behind this provenance.
+    Global(GlobalProvenance),
+    /// A constant value that isn't stored in a global, e.g. the pointee of a reference in a const
+    /// generic argument. It has no projections.
+    // TODO: put these values in globals, to preserve sharing
+    Value(ConstantExpr),
+    /// A subplace of a place.
+    Projection(Box<GlobalPlace>, ConstProjectionElem),
+}
+
+impl GlobalPlace {
+    pub fn new_global(global: GlobalDeclRef, ty: Ty) -> Self {
+        GlobalPlace { kind: GlobalPlaceKind::Global(GlobalProvenance::Global(global)), ty }
+    }
+
+    pub fn new_value(value: ConstantExpr) -> Self {
+        GlobalPlace { ty: value.ty().clone(), kind: GlobalPlaceKind::Value(value) }
+    }
+
+    pub fn project(self, elem: ConstProjectionElem, ty: Ty) -> Self {
+        GlobalPlace { kind: GlobalPlaceKind::Projection(Box::new(self), elem), ty }
+    }
+}
+
+/// A projection inside the pointee of a `Ref`/`Ptr` constant. This is a constant version of
+/// [`ProjectionElem`].
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("CProj"))]
+pub enum ConstProjectionElem {
+    /// Project to the field of an ADT.
+    Field(Option<VariantId>, FieldId),
+    /// Project to the element of an array at the given index.
+    #[serde_state(stateless)]
+    Index(IntegerValue),
+    /// Project to the subarray `array[from..to]`.
+    #[serde_state(stateless)]
+    Subslice { from: IntegerValue, to: IntegerValue },
+    /// Like `ProjectionElem::Offset`: the place located `count * size_of::<ty>()` bytes after the
+    /// current place (or `count` bytes if `ty` is `None`). `pointee_is_sized` is the proof that the
+    /// pointee type is sized.
+    Offset {
+        count: IntegerValue,
+        ty: Option<Ty>,
+        in_bounds: bool,
+        pointee_is_sized: Option<TraitRef>,
+    },
+}
+
+/// A scalar value.
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    Serialize,
+    Deserialize,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Integer"))]
+#[serde_state(stateless)]
+pub enum IntegerValue {
+    Unsigned(UIntTy, #[serde(with = "scalar_value_ser_de")] u128),
+    Signed(IntTy, #[serde(with = "scalar_value_ser_de")] i128),
+}
+
+/// This is simlar to the Scalar value above. However, instead of storing
+/// the float value itself, we store its String representation. This allows
+/// to derive the Eq and Ord traits, which are not implemented for floats
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+pub struct FloatValue {
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("float_value"))]
+    pub value: String,
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("float_bits"))]
+    #[serde(with = "scalar_value_ser_de")]
+    pub bits: u128,
+    #[cfg_attr(feature = "charon_on_charon", charon::rename("float_ty"))]
+    pub ty: FloatTy,
+}
+
+/// Provenance is the location in memory a pointer (or the byte of a pointer, see [`Byte`])
+/// points to. `GlobalProvenance` represents a compile-time provenance.
+/// See <https://doc.rust-lang.org/std/ptr/index.html#provenance>
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+#[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Prov"))]
+pub enum GlobalProvenance {
+    Global(GlobalDeclRef),
+    /// A function, with the type of function pointers to it.
+    Function(FnPtr, Ty),
+    /// The allocation backing the `TypeId` of this type. Note that `TypeId`s always have 16 bytes
+    /// worth of provenance, regardless of the platform's pointer size, so [`Byte::Provenance`]'s byte index can
+    /// go up to 16! In other words, the bytes of a full `TypeId` are `Provenance(TypeId(ty), 0, 0..16)`.
+    TypeId(Ty),
+}
+
+/// A byte, in the MiniRust sense: it can either be uninitialized, a concrete u8 value,
+/// or part of a pointer with provenance (e.g. to a global or a function)
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
+pub enum Byte {
+    /// An uninitialized byte
+    Uninit,
+    /// A concrete byte value
+    Value(u8),
+    /// A byte that is part of a pointer with provenance, at the given offset into the pointee.
+    /// The u8 is the index of this byte within the pointer. Note that we do not have an actual
+    /// value for this pointer byte, unlike MiniRust, as that is non-deterministic.
+    Provenance(GlobalProvenance, IntegerValue, u8),
+}
+
+macro_rules! static_constant {
+    ($e:expr) => {{
+        use std::sync::LazyLock;
+        static CONSTANT: LazyLock<ConstantExpr> = LazyLock::new(|| $e);
+        CONSTANT.clone()
+    }};
+}
+
+impl ConstantExpr {
+    pub fn new(kind: ConstantExprKind, ty: Ty) -> Self {
+        Self(HashConsed::new(WithCachedTypeInfo::new((kind, ty))))
+    }
+
+    pub fn kind(&self) -> &ConstantExprKind {
+        &self.0.inner().0
+    }
+
+    pub fn ty(&self) -> &Ty {
+        &self.0.inner().1
+    }
+
+    pub fn with_contents_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut ConstantExprKind, &mut Ty) -> R,
+    ) -> R {
+        self.0.with_inner_mut(|contents| contents.with_value_mut(|(kind, ty)| f(kind, ty)))
+    }
+
+    pub fn mk_unit() -> Self {
+        static_constant!(ConstantExpr::new(
+            ConstantExprKind::Adt(None, IndexVec::new()),
+            Ty::mk_unit(),
+        ))
+    }
+
+    pub fn mk_usize(value: u128) -> Self {
+        if value == 0 {
+            static_constant!(IntegerValue::mk_usize(0).to_constant())
+        } else {
+            IntegerValue::mk_usize(value).to_constant()
+        }
+    }
+
+    pub fn as_usize_literal(&self) -> Option<u128> {
+        match self.kind() {
+            ConstantExprKind::Integer(IntegerValue::Unsigned(UIntTy::Usize, value)) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+impl ConstantExprKind {
+    pub fn from_bits(scalar_ty: &ScalarTy, bits: u128) -> Option<Self> {
+        match *scalar_ty {
+            ScalarTy::Integer(int_ty) => Some(Self::Integer(IntegerValue::from_bits(int_ty, bits))),
+            ScalarTy::Bool => match bits {
+                0 => Some(Self::Bool(false)),
+                1 => Some(Self::Bool(true)),
+                _ => None,
+            },
+            ScalarTy::Char => {
+                let bytes: [u8; 4] = bits.to_le_bytes()[0..4].try_into().unwrap();
+                Some(Self::Char(std::char::from_u32(u32::from_le_bytes(bytes)).unwrap()))
+            }
+            ScalarTy::Float(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for ConstantExpr {
+    type Target = WithCachedTypeInfo<(ConstantExprKind, Ty)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl IntegerValue {
+    fn ptr_size_max(ptr_size: ByteCount, signed: bool) -> u128 {
+        match ptr_size {
+            2 => {
+                if signed {
+                    i16::MAX as u128
+                } else {
+                    u16::MAX as u128
+                }
+            }
+            4 => {
+                if signed {
+                    i32::MAX as u128
+                } else {
+                    u32::MAX as u128
+                }
+            }
+            8 => {
+                if signed {
+                    i64::MAX as u128
+                } else {
+                    u64::MAX as u128
+                }
+            }
+            _ => panic!("`ptr_size_max`: unsupported ptr size {ptr_size}"),
+        }
+    }
+
+    fn ptr_size_min(ptr_size: ByteCount, signed: bool) -> i128 {
+        match ptr_size {
+            2 => {
+                if signed {
+                    i16::MIN as i128
+                } else {
+                    u16::MIN as i128
+                }
+            }
+            4 => {
+                if signed {
+                    i32::MIN as i128
+                } else {
+                    u32::MIN as i128
+                }
+            }
+            8 => {
+                if signed {
+                    i64::MIN as i128
+                } else {
+                    u64::MIN as i128
+                }
+            }
+            _ => panic!("`ptr_size_min`: unsupported ptr size {ptr_size}"),
+        }
+    }
+
+    pub fn ty(&self) -> IntegerTy {
+        match self {
+            IntegerValue::Signed(ty, _) => IntegerTy::Signed(*ty),
+            IntegerValue::Unsigned(ty, _) => IntegerTy::Unsigned(*ty),
+        }
+    }
+
+    pub fn is_int(&self) -> bool {
+        matches!(self, IntegerValue::Signed(_, _))
+    }
+
+    pub fn is_uint(&self) -> bool {
+        matches!(self, IntegerValue::Unsigned(_, _))
+    }
+
+    /// When computing the result of binary operations, we convert the values
+    /// to u128 then back to the target type (while performing dynamic checks
+    /// of course).
+    pub fn as_uint(&self) -> Option<u128> {
+        match self {
+            IntegerValue::Unsigned(_, v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn uint_is_in_bounds(ptr_size: ByteCount, ty: UIntTy, v: u128) -> bool {
+        match ty {
+            UIntTy::Usize => v <= Self::ptr_size_max(ptr_size, false),
+            UIntTy::U8 => v <= (u8::MAX as u128),
+            UIntTy::U16 => v <= (u16::MAX as u128),
+            UIntTy::U32 => v <= (u32::MAX as u128),
+            UIntTy::U64 => v <= (u64::MAX as u128),
+            UIntTy::U128 => true,
+        }
+    }
+
+    pub fn from_unchecked_uint(ty: UIntTy, v: u128) -> IntegerValue {
+        IntegerValue::Unsigned(ty, v)
+    }
+
+    pub fn from_uint(ptr_size: ByteCount, ty: UIntTy, v: u128) -> Option<Self> {
+        if !IntegerValue::uint_is_in_bounds(ptr_size, ty, v) {
+            None
+        } else {
+            Some(IntegerValue::from_unchecked_uint(ty, v))
+        }
+    }
+
+    pub fn mk_usize(value: u128) -> Self {
+        IntegerValue::Unsigned(UIntTy::Usize, value)
+    }
+
+    /// When computing the result of binary operations, we convert the values
+    /// to i128 then back to the target type (while performing dynamic checks
+    /// of course).
+    pub fn as_int(&self) -> Option<i128> {
+        match self {
+            IntegerValue::Signed(_, v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn int_is_in_bounds(ptr_size: ByteCount, ty: IntTy, v: i128) -> bool {
+        match ty {
+            IntTy::Isize => {
+                v >= Self::ptr_size_min(ptr_size, true)
+                    && v <= Self::ptr_size_max(ptr_size, true) as i128
+            }
+            IntTy::I8 => v >= (i8::MIN as i128) && v <= (i8::MAX as i128),
+            IntTy::I16 => v >= (i16::MIN as i128) && v <= (i16::MAX as i128),
+            IntTy::I32 => v >= (i32::MIN as i128) && v <= (i32::MAX as i128),
+            IntTy::I64 => v >= (i64::MIN as i128) && v <= (i64::MAX as i128),
+            IntTy::I128 => true,
+        }
+    }
+
+    pub fn from_unchecked_int(ty: IntTy, v: i128) -> IntegerValue {
+        IntegerValue::Signed(ty, v)
+    }
+
+    /// Most integers are represented as `u128` by rustc. We must be careful not to sign-extend.
+    pub fn to_bits(&self) -> u128 {
+        match *self {
+            IntegerValue::Unsigned(_, v) => v,
+            IntegerValue::Signed(_, v) => u128::from_le_bytes(v.to_le_bytes()),
+        }
+    }
+
+    /// Translates little endian bytes into a corresponding `IntegerValue`.
+    /// This needs to do the round-trip to the correct integer type to guarantee
+    /// that the values are correctly sign-extended (e.g. if the bytes encode -1i8, taking all 16 bytes
+    /// would lead to the value 255i128 instead of -1i128).
+    pub fn from_le_bytes(ty: IntegerTy, bytes: [u8; 16]) -> Self {
+        macro_rules! from_le_bytes {
+            ($m:ident, $b:ident, [$(($i_ty: ty, $i:ident, $s:ident, $n_ty:ty, $t:ty)),*]) => {
+                match $m {
+                    $(
+                        IntegerTy::$s(<$i_ty>::$i) => {
+                            let n = size_of::<$n_ty>();
+                            let b: [u8; _] = $b[0..n].try_into().unwrap();
+                            IntegerValue::$s(<$i_ty>::$i, <$n_ty>::from_le_bytes(b) as $t)
+                        }
+                    )*
+                }
+            }
+        }
+
+        from_le_bytes!(
+            ty,
+            bytes,
+            [
+                (IntTy, Isize, Signed, isize, i128),
+                (IntTy, I8, Signed, i8, i128),
+                (IntTy, I16, Signed, i16, i128),
+                (IntTy, I32, Signed, i32, i128),
+                (IntTy, I64, Signed, i64, i128),
+                (IntTy, I128, Signed, i128, i128),
+                (UIntTy, Usize, Unsigned, usize, u128),
+                (UIntTy, U8, Unsigned, u8, u128),
+                (UIntTy, U16, Unsigned, u16, u128),
+                (UIntTy, U32, Unsigned, u32, u128),
+                (UIntTy, U64, Unsigned, u64, u128),
+                (UIntTy, U128, Unsigned, u128, u128)
+            ]
+        )
+    }
+
+    pub fn from_bits(ty: IntegerTy, bits: u128) -> Self {
+        let bytes = bits.to_le_bytes();
+        Self::from_le_bytes(ty, bytes)
+    }
+
+    /// **Warning**: most constants are stored as u128 by rustc. When converting
+    /// to i128, it is not correct to do `v as i128`, we must reinterpret the
+    /// bits (see [IntegerValue::from_le_bytes]).
+    pub fn from_int(ptr_size: ByteCount, ty: IntTy, v: i128) -> Option<IntegerValue> {
+        if !IntegerValue::int_is_in_bounds(ptr_size, ty, v) {
+            None
+        } else {
+            Some(IntegerValue::from_unchecked_int(ty, v))
+        }
+    }
+
+    /// Increment the value, staying within the same integer type. Returns `None` on overflow.
+    pub fn add(self, n: u128) -> Option<Self> {
+        Some(match self {
+            IntegerValue::Unsigned(ty, v) => IntegerValue::Unsigned(ty, v.checked_add(n)?),
+            IntegerValue::Signed(ty, v) => {
+                IntegerValue::Signed(ty, v.checked_add(n.try_into().unwrap())?)
+            }
+        })
+    }
+
+    pub fn to_constant(self) -> ConstantExpr {
+        let scalar_ty = ScalarTy::Integer(self.ty());
+        ConstantExpr::new(ConstantExprKind::Integer(self), TyKind::Scalar(scalar_ty).into_ty())
+    }
+}
+
+/// Custom serializer that stores 128 bit integers as strings to avoid overflow.
+pub(crate) mod scalar_value_ser_de {
+    use std::{marker::PhantomData, str::FromStr};
+
+    use serde::de::{Deserializer, Error};
+
+    pub fn serialize<S, V>(val: &V, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+        V: ToString,
+    {
+        serializer.serialize_str(&val.to_string())
+    }
+
+    /// Stateful variant for types that derive `SerializeState`: the state is irrelevant for a
+    /// scalar, so we delegate to the stateless [`serialize`].
+    pub fn serialize_state<S, State: ?Sized, V>(
+        val: &V,
+        _state: &State,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+        V: ToString,
+    {
+        serialize(val, serializer)
+    }
+
+    pub fn deserialize<'de, D, V>(deserializer: D) -> Result<V, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: FromStr,
+    {
+        struct Visitor<V> {
+            _val: PhantomData<V>,
+        }
+        impl<'de, V> serde::de::Visitor<'de> for Visitor<V>
+        where
+            V: FromStr,
+        {
+            type Value = V;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "IntegerValue value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                v.parse().map_err(|_| E::custom("Could not parse 128 bit integer!"))
+            }
+        }
+        deserializer.deserialize_str(Visitor { _val: PhantomData })
+    }
+
+    /// Stateful variant for types that derive `DeserializeState`: the state is irrelevant for a
+    /// scalar, so we delegate to the stateless [`deserialize`].
+    pub fn deserialize_state<'de, D, State: ?Sized, V>(
+        _state: &State,
+        deserializer: D,
+    ) -> Result<V, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: FromStr,
+    {
+        deserialize(deserializer)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_big_endian_scalars() {
+        let u128 = 0x12345678901234567890123456789012u128;
+        let le_bytes = u128.to_le_bytes();
+
+        let le_scalar = IntegerValue::from_le_bytes(IntegerTy::Unsigned(UIntTy::U128), le_bytes);
+        assert_eq!(le_scalar, IntegerValue::Unsigned(UIntTy::U128, u128));
+
+        let i64 = 0x1234567890123456i64;
+        let le_bytes = (i64 as i128).to_le_bytes();
+        let le_scalar = IntegerValue::from_le_bytes(IntegerTy::Signed(IntTy::I64), le_bytes);
+        assert_eq!(le_scalar, IntegerValue::Signed(IntTy::I64, i64 as i128));
+    }
+}

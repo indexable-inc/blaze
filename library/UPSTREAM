@@ -1,0 +1,50 @@
+# blaze's standard library (library/) is the Rust project's at this commit, as the
+# nightly's rust-src has it: library/ of rust-lang/rust with the backtrace submodule,
+# std's third-party crates in vendor/ and .cargo/config.toml. Written by
+# harness/library.py from the nightly's channel manifest.
+repo https://github.com/rust-lang/rust
+commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977
+nightly nightly-2026-10-27
+rustc 1.101.0-nightly (16d1ffac1 2026-10-26)
+rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c
+#
+# blaze's changes to library/ (to be kept through each bump; `harness/library.py`'s rewrite must keep these lines):
+# - std/src/sys/env/unix.rs `walked`, called by `env()` and by `Command::spawn`/`exec`
+#   (std/src/sys/process/unix/unix.rs) when the child gets `environ` whole: a weak call of
+#   `__blaze_environ_walked`, which only blaze's sandbox interposers define, so a traced run is
+#   keyed by the whole environment only when the program reads it whole. Unresolved, nothing is
+#   called (v2/requests/usercode.md item 6, part 1).
+# - core/src/reflect.rs (new) with its `pub mod reflect;` in core/src/lib.rs and
+#   `pub use core::reflect;` in std/src/lib.rs: blaze's compile-time reflection,
+#   `#![feature(blaze_comptime)]` (`Struct`, `Enum`, `Field<Base>`, `Variant<Base>`, `Marked`,
+#   `Unmarked`, `fields_of`, `variants_of`, `FnItem`, `fn_info`). Every item is unstable under
+#   `blaze_comptime`, its lang items are `blaze_*`, and its intrinsics (`blaze_*`, private to the
+#   module) are answered only by blaze's const evaluator; nothing else in library/ refers to it,
+#   so a crate without the feature sees std as the nightly's
+#   (docs/v2/plan/design/comptime.md, phase 2).
+# - core/src/num/arbitrary.rs (new) with its `pub mod arbitrary;` in core/src/num/mod.rs,
+#   `pub use core::num::arbitrary;` in std/src/num/mod.rs, the `blaze_int_cast` intrinsic in
+#   core/src/intrinsics/mod.rs and `#![blaze::arbitrary_ints]` in core/src/lib.rs: the trait
+#   impls and inherent items of blaze's integers of any width (`u3`, `i24`), as blanket impls
+#   over the lang-item markers `ArbitraryInt`, `ArbitrarySigned`, `IntFrom<S>` and
+#   `IntTryFrom<S>`, which only blaze's trait solver answers and nothing can implement. Every
+#   impl's self type or argument must be such an integer, so no other type gains an impl
+#   (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+# - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
+#   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
+#   the attribute path `blaze::contract_test` names in every crate. Unstable under
+#   `blaze_verify`; nothing else in library/ refers to it
+#   (docs/v2/plan/lanes/contracts.md, part 2).
+# - wasm64-blaze-wasip1 (64-bit WASI preview 1): vendor/wasip1-1.0.0/src/lib_generated.rs takes
+#   every pointer and witx `size` argument of the raw imports as `usize` and imports them from
+#   `wasi_snapshot_preview1` on 32-bit and `wasi_snapshot_preview1_64` on 64-bit (wasm32 is
+#   unchanged); vendor/libc-0.2.191/src/wasi/mod.rs gives 64-bit WASI musl's 64-bit
+#   `tm.__tm_gmtoff` (c_long), pthread type sizes and UTIME_NOW/UTIME_OMIT. Both vendored crates'
+#   .cargo-checksum.json are updated.
+# - wasi_rt/ (new): that target's C runtime in Rust, in place of wasi-libc (which has no
+#   memory64 build): entry point, malloc, errno, environment, preopens and cwd, files,
+#   directories, descriptors, clocks, single-threaded pthread, mem functions. std depends on it
+#   only under cfg(all(target_os = "wasi", target_env = "p1", target_pointer_width = "64"))
+#   (std/Cargo.toml) and names it with `extern crate wasi_rt;` under the same cfg
+#   (std/src/lib.rs); Cargo.lock has its package and std's dependency on it. Every other
+#   target's std is unchanged.

@@ -1,0 +1,37 @@
+[package]
+name = "blaze-gc"
+description = "blaze's collector of what it keeps on disk under BLAZE_HOME and the machine's cache: a sans-IO planner (roots, leases, grace, budget, per-workspace caps) and the thin driver that scans, renames into trash and unlinks"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-spin.workspace = true
+crossbeam-queue.workspace = true
+blaze-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stdx.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+crossbeam-channel.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

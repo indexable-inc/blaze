@@ -1,0 +1,7 @@
+[profile.one]
+lto = false
+strip = "debuginfo"
+
+[profile.four]
+inherits = "two"
+incremental = true

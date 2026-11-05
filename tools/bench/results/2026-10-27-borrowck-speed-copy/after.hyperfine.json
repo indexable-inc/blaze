@@ -1,0 +1,1264 @@
+{
+ "hyperfine": {
+  "polonius": {
+   "bodies": 304,
+   "infer_ms": 2319.622,
+   "infer_warm_ms": 205.902,
+   "first_check_ms": 230.49,
+   "borrowck_ms": 81.123,
+   "borrowck_excl_mir_ms": 81.083,
+   "ratio_to_infer": 0.3937941350739672,
+   "per_body_us": {
+    "p50": 83,
+    "p99": 3807,
+    "max": 8451
+   },
+   "phases_ms": {
+    "constraints": 38.891,
+    "entry_sets": 1.428,
+    "errors": 0.379,
+    "infer": 1.923,
+    "liveness": 13.49,
+    "loans": 1.108,
+    "mir": 0.04,
+    "moves": 8.837,
+    "scopes": 2.846,
+    "setup": 0.214,
+    "walk": 8.06
+   },
+   "slowest": [
+    {
+     "name": "hyperfine::benchmark::<Benchmark<'a>>::run",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/mod.rs",
+     "us": 8451,
+     "infer_us": 22120,
+     "phases_us": {
+      "constraints": 4217,
+      "entry_sets": 139,
+      "errors": 43,
+      "infer": 169,
+      "liveness": 1481,
+      "loans": 111,
+      "mir": 3,
+      "moves": 725,
+      "scopes": 753,
+      "setup": 21,
+      "walk": 616
+     },
+     "counts": {
+      "blocks": 887,
+      "bodies": 15,
+      "constraints": 1954,
+      "loans": 84,
+      "localized": 1954,
+      "locals": 789,
+      "points": 3222,
+      "regions": 1638,
+      "universals": 115
+     }
+    },
+    {
+     "name": "hyperfine::output::report::print",
+     "path": "/root/bp/apps/hyperfine/src/output/report.rs",
+     "us": 5210,
+     "infer_us": 13083,
+     "phases_us": {
+      "constraints": 2239,
+      "entry_sets": 108,
+      "errors": 25,
+      "infer": 121,
+      "liveness": 1208,
+      "loans": 85,
+      "mir": 2,
+      "moves": 712,
+      "scopes": 243,
+      "setup": 13,
+      "walk": 336
+     },
+     "counts": {
+      "blocks": 642,
+      "bodies": 11,
+      "constraints": 1147,
+      "loans": 92,
+      "localized": 1147,
+      "locals": 686,
+      "points": 2576,
+      "regions": 1158,
+      "universals": 56
+     }
+    },
+    {
+     "name": "hyperfine::options::<Options>::from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/options.rs",
+     "us": 4993,
+     "infer_us": 9793,
+     "phases_us": {
+      "constraints": 2480,
+      "entry_sets": 90,
+      "errors": 22,
+      "infer": 82,
+      "liveness": 890,
+      "loans": 73,
+      "mir": 2,
+      "moves": 529,
+      "scopes": 65,
+      "setup": 20,
+      "walk": 628
+     },
+     "counts": {
+      "blocks": 619,
+      "bodies": 13,
+      "constraints": 675,
+      "loans": 19,
+      "localized": 673,
+      "locals": 457,
+      "points": 2082,
+      "regions": 723,
+      "universals": 55
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::build_from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 3807,
+     "infer_us": 15164,
+     "phases_us": {
+      "constraints": 2028,
+      "entry_sets": 56,
+      "errors": 25,
+      "infer": 97,
+      "liveness": 568,
+      "loans": 40,
+      "mir": 2,
+      "moves": 309,
+      "scopes": 101,
+      "setup": 10,
+      "walk": 488
+     },
+     "counts": {
+      "blocks": 361,
+      "bodies": 13,
+      "constraints": 1162,
+      "loans": 31,
+      "localized": 1156,
+      "locals": 323,
+      "points": 1238,
+      "regions": 925,
+      "universals": 77
+     }
+    },
+    {
+     "name": "build_script_build::build_command",
+     "path": "/root/bp/apps/hyperfine/build.rs",
+     "us": 2736,
+     "infer_us": 4801,
+     "phases_us": {
+      "constraints": 945,
+      "entry_sets": 54,
+      "errors": 8,
+      "infer": 51,
+      "liveness": 457,
+      "loans": 17,
+      "mir": 1,
+      "moves": 281,
+      "scopes": 51,
+      "setup": 2,
+      "walk": 813
+     },
+     "counts": {
+      "blocks": 545,
+      "bodies": 2,
+      "constraints": 684,
+      "loans": 28,
+      "localized": 682,
+      "locals": 369,
+      "points": 1390,
+      "regions": 645,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::cli::build_command",
+     "path": "/root/bp/apps/hyperfine/src/cli.rs",
+     "us": 2733,
+     "infer_us": 4660,
+     "phases_us": {
+      "constraints": 944,
+      "entry_sets": 52,
+      "errors": 8,
+      "infer": 50,
+      "liveness": 469,
+      "loans": 17,
+      "mir": 1,
+      "moves": 258,
+      "scopes": 49,
+      "setup": 2,
+      "walk": 826
+     },
+     "counts": {
+      "blocks": 545,
+      "bodies": 2,
+      "constraints": 684,
+      "loans": 28,
+      "localized": 682,
+      "locals": 369,
+      "points": 1390,
+      "regions": 645,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::export::csv::<CsvExporter>::serialize",
+     "path": "/root/bp/apps/hyperfine/src/export/csv.rs",
+     "us": 2567,
+     "infer_us": 8216,
+     "phases_us": {
+      "constraints": 1525,
+      "entry_sets": 41,
+      "errors": 12,
+      "infer": 45,
+      "liveness": 365,
+      "loans": 29,
+      "mir": 2,
+      "moves": 273,
+      "scopes": 58,
+      "setup": 9,
+      "walk": 146
+     },
+     "counts": {
+      "blocks": 265,
+      "bodies": 13,
+      "constraints": 431,
+      "loans": 28,
+      "localized": 429,
+      "locals": 245,
+      "points": 898,
+      "regions": 449,
+      "universals": 59
+     }
+    },
+    {
+     "name": "hyperfine::metric::<MetricSelection>::parse_list",
+     "path": "/root/bp/apps/hyperfine/src/metric.rs",
+     "us": 1478,
+     "infer_us": 3251,
+     "phases_us": {
+      "constraints": 815,
+      "entry_sets": 28,
+      "errors": 8,
+      "infer": 41,
+      "liveness": 229,
+      "loans": 25,
+      "mir": 1,
+      "moves": 139,
+      "scopes": 37,
+      "setup": 4,
+      "walk": 108
+     },
+     "counts": {
+      "blocks": 144,
+      "bodies": 5,
+      "constraints": 403,
+      "loans": 23,
+      "localized": 401,
+      "locals": 175,
+      "points": 646,
+      "regions": 401,
+      "universals": 30
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::run_command_and_measure_common",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 1185,
+     "infer_us": 2331,
+     "phases_us": {
+      "constraints": 442,
+      "entry_sets": 41,
+      "errors": 8,
+      "infer": 26,
+      "liveness": 248,
+      "loans": 25,
+      "mir": 1,
+      "moves": 159,
+      "scopes": 36,
+      "setup": 4,
+      "walk": 136
+     },
+     "counts": {
+      "blocks": 216,
+      "bodies": 4,
+      "constraints": 254,
+      "loans": 24,
+      "localized": 254,
+      "locals": 189,
+      "points": 767,
+      "regions": 305,
+      "universals": 13
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::<ShellExecutor<'_>>::run_command_and_measure",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 1168,
+     "infer_us": 1360,
+     "phases_us": {
+      "constraints": 805,
+      "entry_sets": 11,
+      "errors": 3,
+      "infer": 12,
+      "liveness": 106,
+      "loans": 23,
+      "mir": 0,
+      "moves": 79,
+      "scopes": 15,
+      "setup": 1,
+      "walk": 90
+     },
+     "counts": {
+      "blocks": 80,
+      "bodies": 1,
+      "constraints": 247,
+      "loans": 4,
+      "localized": 247,
+      "locals": 73,
+      "points": 309,
+      "regions": 158,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::run",
+     "path": "/root/bp/apps/hyperfine/src/main.rs",
+     "us": 1108,
+     "infer_us": 1850,
+     "phases_us": {
+      "constraints": 381,
+      "entry_sets": 34,
+      "errors": 5,
+      "infer": 22,
+      "liveness": 295,
+      "loans": 20,
+      "mir": 0,
+      "moves": 140,
+      "scopes": 46,
+      "setup": 2,
+      "walk": 126
+     },
+     "counts": {
+      "blocks": 217,
+      "bodies": 1,
+      "constraints": 215,
+      "loans": 24,
+      "localized": 215,
+      "locals": 142,
+      "points": 680,
+      "regions": 223,
+      "universals": 2
+     }
+    },
+    {
+     "name": "hyperfine::timer::execute_and_measure",
+     "path": "/root/bp/apps/hyperfine/src/timer/mod.rs",
+     "us": 1031,
+     "infer_us": 1532,
+     "phases_us": {
+      "constraints": 713,
+      "entry_sets": 10,
+      "errors": 2,
+      "infer": 8,
+      "liveness": 114,
+      "loans": 8,
+      "mir": 0,
+      "moves": 66,
+      "scopes": 11,
+      "setup": 1,
+      "walk": 78
+     },
+     "counts": {
+      "blocks": 89,
+      "bodies": 1,
+      "constraints": 152,
+      "loans": 4,
+      "localized": 152,
+      "locals": 52,
+      "points": 251,
+      "regions": 98,
+      "universals": 2
+     }
+    },
+    {
+     "name": "hyperfine::quantity::statistics::median",
+     "path": "/root/bp/apps/hyperfine/src/quantity/statistics.rs",
+     "us": 1005,
+     "infer_us": 1982,
+     "phases_us": {
+      "constraints": 817,
+      "entry_sets": 5,
+      "errors": 3,
+      "infer": 6,
+      "liveness": 47,
+      "loans": 6,
+      "mir": 1,
+      "moves": 37,
+      "scopes": 8,
+      "setup": 2,
+      "walk": 58
+     },
+     "counts": {
+      "blocks": 35,
+      "bodies": 2,
+      "constraints": 59,
+      "loans": 7,
+      "localized": 59,
+      "locals": 51,
+      "points": 164,
+      "regions": 59,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::export::markup::MarkupExporter::table_results",
+     "path": "/root/bp/apps/hyperfine/src/export/markup.rs",
+     "us": 991,
+     "infer_us": 2179,
+     "phases_us": {
+      "constraints": 360,
+      "entry_sets": 28,
+      "errors": 6,
+      "infer": 35,
+      "liveness": 240,
+      "loans": 22,
+      "mir": 1,
+      "moves": 135,
+      "scopes": 46,
+      "setup": 3,
+      "walk": 82
+     },
+     "counts": {
+      "blocks": 140,
+      "bodies": 2,
+      "constraints": 362,
+      "loans": 32,
+      "localized": 362,
+      "locals": 211,
+      "points": 717,
+      "regions": 393,
+      "universals": 8
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::<ShellExecutor<'_>>::calibrate",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 921,
+     "infer_us": 1788,
+     "phases_us": {
+      "constraints": 437,
+      "entry_sets": 20,
+      "errors": 4,
+      "infer": 16,
+      "liveness": 197,
+      "loans": 19,
+      "mir": 0,
+      "moves": 116,
+      "scopes": 21,
+      "setup": 1,
+      "walk": 64
+     },
+     "counts": {
+      "blocks": 129,
+      "bodies": 1,
+      "constraints": 217,
+      "loans": 18,
+      "localized": 217,
+      "locals": 114,
+      "points": 475,
+      "regions": 205,
+      "universals": 4
+     }
+    },
+    {
+     "name": "hyperfine::export::<ExportManager>::write_results",
+     "path": "/root/bp/apps/hyperfine/src/export/mod.rs",
+     "us": 892,
+     "infer_us": 1206,
+     "phases_us": {
+      "constraints": 328,
+      "entry_sets": 28,
+      "errors": 5,
+      "infer": 18,
+      "liveness": 231,
+      "loans": 15,
+      "mir": 1,
+      "moves": 138,
+      "scopes": 31,
+      "setup": 2,
+      "walk": 67
+     },
+     "counts": {
+      "blocks": 194,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 13,
+      "localized": 190,
+      "locals": 105,
+      "points": 554,
+      "regions": 181,
+      "universals": 13
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::get_parameter_scan_commands",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 887,
+     "infer_us": 1676,
+     "phases_us": {
+      "constraints": 365,
+      "entry_sets": 14,
+      "errors": 7,
+      "infer": 15,
+      "liveness": 160,
+      "loans": 11,
+      "mir": 1,
+      "moves": 95,
+      "scopes": 13,
+      "setup": 3,
+      "walk": 175
+     },
+     "counts": {
+      "blocks": 139,
+      "bodies": 3,
+      "constraints": 177,
+      "loans": 4,
+      "localized": 177,
+      "locals": 96,
+      "points": 433,
+      "regions": 146,
+      "universals": 16
+     }
+    },
+    {
+     "name": "hyperfine::metric::<Metric>::summarize",
+     "path": "/root/bp/apps/hyperfine/src/metric.rs",
+     "us": 868,
+     "infer_us": 3725,
+     "phases_us": {
+      "constraints": 592,
+      "entry_sets": 9,
+      "errors": 4,
+      "infer": 16,
+      "liveness": 81,
+      "loans": 6,
+      "mir": 1,
+      "moves": 69,
+      "scopes": 19,
+      "setup": 3,
+      "walk": 40
+     },
+     "counts": {
+      "blocks": 70,
+      "bodies": 4,
+      "constraints": 210,
+      "loans": 10,
+      "localized": 210,
+      "locals": 80,
+      "points": 260,
+      "regions": 179,
+      "universals": 18
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 857,
+     "infer_us": 1631,
+     "phases_us": {
+      "constraints": 367,
+      "entry_sets": 18,
+      "errors": 4,
+      "infer": 16,
+      "liveness": 156,
+      "loans": 13,
+      "mir": 1,
+      "moves": 92,
+      "scopes": 30,
+      "setup": 2,
+      "walk": 132
+     },
+     "counts": {
+      "blocks": 133,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 11,
+      "localized": 190,
+      "locals": 85,
+      "points": 391,
+      "regions": 142,
+      "universals": 8
+     }
+    },
+    {
+     "name": "hyperfine::command::parse_environment",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 790,
+     "infer_us": 1841,
+     "phases_us": {
+      "constraints": 324,
+      "entry_sets": 19,
+      "errors": 5,
+      "infer": 17,
+      "liveness": 162,
+      "loans": 15,
+      "mir": 1,
+      "moves": 131,
+      "scopes": 29,
+      "setup": 3,
+      "walk": 54
+     },
+     "counts": {
+      "blocks": 151,
+      "bodies": 4,
+      "constraints": 163,
+      "loans": 14,
+      "localized": 163,
+      "locals": 118,
+      "points": 488,
+      "regions": 182,
+      "universals": 15
+     }
+    }
+   ],
+   "secs": 18
+  },
+  "nll": {
+   "bodies": 304,
+   "infer_ms": 2319.622,
+   "infer_warm_ms": 205.902,
+   "first_check_ms": 230.49,
+   "borrowck_ms": 71.264,
+   "borrowck_excl_mir_ms": 71.24,
+   "ratio_to_infer": 0.34598983982671366,
+   "per_body_us": {
+    "p50": 68,
+    "p99": 3535,
+    "max": 7469
+   },
+   "phases_ms": {
+    "constraints": 35.023,
+    "entry_sets": 1.352,
+    "errors": 0.337,
+    "infer": 1.803,
+    "liveness": 12.512,
+    "loans": 0.989,
+    "mir": 0.024,
+    "moves": 8.001,
+    "scopes": 0.202,
+    "setup": 0.141,
+    "walk": 7.67
+   },
+   "slowest": [
+    {
+     "name": "hyperfine::benchmark::<Benchmark<'a>>::run",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/mod.rs",
+     "us": 7469,
+     "infer_us": 22120,
+     "phases_us": {
+      "constraints": 3975,
+      "entry_sets": 136,
+      "errors": 43,
+      "infer": 188,
+      "liveness": 1465,
+      "loans": 109,
+      "mir": 3,
+      "moves": 715,
+      "scopes": 47,
+      "setup": 20,
+      "walk": 612
+     },
+     "counts": {
+      "blocks": 887,
+      "bodies": 15,
+      "constraints": 1954,
+      "loans": 84,
+      "localized": 1954,
+      "locals": 789,
+      "points": 3222,
+      "regions": 1638,
+      "universals": 115
+     }
+    },
+    {
+     "name": "hyperfine::output::report::print",
+     "path": "/root/bp/apps/hyperfine/src/output/report.rs",
+     "us": 4860,
+     "infer_us": 13083,
+     "phases_us": {
+      "constraints": 2164,
+      "entry_sets": 107,
+      "errors": 24,
+      "infer": 117,
+      "liveness": 1197,
+      "loans": 81,
+      "mir": 9,
+      "moves": 695,
+      "scopes": 21,
+      "setup": 13,
+      "walk": 331
+     },
+     "counts": {
+      "blocks": 642,
+      "bodies": 11,
+      "constraints": 1147,
+      "loans": 92,
+      "localized": 1147,
+      "locals": 686,
+      "points": 2576,
+      "regions": 1158,
+      "universals": 56
+     }
+    },
+    {
+     "name": "hyperfine::options::<Options>::from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/options.rs",
+     "us": 4718,
+     "infer_us": 9793,
+     "phases_us": {
+      "constraints": 2363,
+      "entry_sets": 92,
+      "errors": 22,
+      "infer": 70,
+      "liveness": 809,
+      "loans": 71,
+      "mir": 2,
+      "moves": 540,
+      "scopes": 3,
+      "setup": 22,
+      "walk": 620
+     },
+     "counts": {
+      "blocks": 619,
+      "bodies": 13,
+      "constraints": 675,
+      "loans": 19,
+      "localized": 673,
+      "locals": 457,
+      "points": 2082,
+      "regions": 723,
+      "universals": 55
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::build_from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 3535,
+     "infer_us": 15164,
+     "phases_us": {
+      "constraints": 1922,
+      "entry_sets": 49,
+      "errors": 24,
+      "infer": 96,
+      "liveness": 548,
+      "loans": 38,
+      "mir": 2,
+      "moves": 305,
+      "scopes": 8,
+      "setup": 10,
+      "walk": 462
+     },
+     "counts": {
+      "blocks": 361,
+      "bodies": 13,
+      "constraints": 1162,
+      "loans": 31,
+      "localized": 1156,
+      "locals": 323,
+      "points": 1238,
+      "regions": 925,
+      "universals": 77
+     }
+    },
+    {
+     "name": "hyperfine::cli::build_command",
+     "path": "/root/bp/apps/hyperfine/src/cli.rs",
+     "us": 2557,
+     "infer_us": 4660,
+     "phases_us": {
+      "constraints": 893,
+      "entry_sets": 68,
+      "errors": 7,
+      "infer": 44,
+      "liveness": 444,
+      "loans": 16,
+      "mir": 0,
+      "moves": 248,
+      "scopes": 2,
+      "setup": 2,
+      "walk": 783
+     },
+     "counts": {
+      "blocks": 545,
+      "bodies": 2,
+      "constraints": 684,
+      "loans": 28,
+      "localized": 682,
+      "locals": 369,
+      "points": 1390,
+      "regions": 645,
+      "universals": 7
+     }
+    },
+    {
+     "name": "build_script_build::build_command",
+     "path": "/root/bp/apps/hyperfine/build.rs",
+     "us": 2537,
+     "infer_us": 4801,
+     "phases_us": {
+      "constraints": 885,
+      "entry_sets": 52,
+      "errors": 7,
+      "infer": 51,
+      "liveness": 444,
+      "loans": 17,
+      "mir": 0,
+      "moves": 242,
+      "scopes": 2,
+      "setup": 2,
+      "walk": 785
+     },
+     "counts": {
+      "blocks": 545,
+      "bodies": 2,
+      "constraints": 684,
+      "loans": 28,
+      "localized": 682,
+      "locals": 369,
+      "points": 1390,
+      "regions": 645,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::export::csv::<CsvExporter>::serialize",
+     "path": "/root/bp/apps/hyperfine/src/export/csv.rs",
+     "us": 2376,
+     "infer_us": 8216,
+     "phases_us": {
+      "constraints": 1443,
+      "entry_sets": 42,
+      "errors": 11,
+      "infer": 45,
+      "liveness": 362,
+      "loans": 28,
+      "mir": 2,
+      "moves": 215,
+      "scopes": 6,
+      "setup": 8,
+      "walk": 157
+     },
+     "counts": {
+      "blocks": 265,
+      "bodies": 13,
+      "constraints": 431,
+      "loans": 28,
+      "localized": 429,
+      "locals": 245,
+      "points": 898,
+      "regions": 449,
+      "universals": 59
+     }
+    },
+    {
+     "name": "hyperfine::metric::<MetricSelection>::parse_list",
+     "path": "/root/bp/apps/hyperfine/src/metric.rs",
+     "us": 1342,
+     "infer_us": 3251,
+     "phases_us": {
+      "constraints": 747,
+      "entry_sets": 28,
+      "errors": 8,
+      "infer": 40,
+      "liveness": 214,
+      "loans": 24,
+      "mir": 1,
+      "moves": 133,
+      "scopes": 3,
+      "setup": 4,
+      "walk": 104
+     },
+     "counts": {
+      "blocks": 144,
+      "bodies": 5,
+      "constraints": 403,
+      "loans": 23,
+      "localized": 401,
+      "locals": 175,
+      "points": 646,
+      "regions": 401,
+      "universals": 30
+     }
+    },
+    {
+     "name": "hyperfine::quantity::statistics::median",
+     "path": "/root/bp/apps/hyperfine/src/quantity/statistics.rs",
+     "us": 1187,
+     "infer_us": 1982,
+     "phases_us": {
+      "constraints": 1010,
+      "entry_sets": 5,
+      "errors": 3,
+      "infer": 6,
+      "liveness": 48,
+      "loans": 6,
+      "mir": 1,
+      "moves": 33,
+      "scopes": 1,
+      "setup": 1,
+      "walk": 59
+     },
+     "counts": {
+      "blocks": 35,
+      "bodies": 2,
+      "constraints": 59,
+      "loans": 7,
+      "localized": 59,
+      "locals": 51,
+      "points": 164,
+      "regions": 59,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::<ShellExecutor<'_>>::run_command_and_measure",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 1076,
+     "infer_us": 1360,
+     "phases_us": {
+      "constraints": 761,
+      "entry_sets": 10,
+      "errors": 3,
+      "infer": 12,
+      "liveness": 113,
+      "loans": 12,
+      "mir": 0,
+      "moves": 63,
+      "scopes": 1,
+      "setup": 1,
+      "walk": 83
+     },
+     "counts": {
+      "blocks": 80,
+      "bodies": 1,
+      "constraints": 247,
+      "loans": 4,
+      "localized": 247,
+      "locals": 73,
+      "points": 309,
+      "regions": 158,
+      "universals": 7
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::run_command_and_measure_common",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 1064,
+     "infer_us": 2331,
+     "phases_us": {
+      "constraints": 379,
+      "entry_sets": 30,
+      "errors": 7,
+      "infer": 38,
+      "liveness": 238,
+      "loans": 23,
+      "mir": 1,
+      "moves": 145,
+      "scopes": 4,
+      "setup": 4,
+      "walk": 159
+     },
+     "counts": {
+      "blocks": 216,
+      "bodies": 4,
+      "constraints": 254,
+      "loans": 24,
+      "localized": 254,
+      "locals": 189,
+      "points": 767,
+      "regions": 305,
+      "universals": 13
+     }
+    },
+    {
+     "name": "hyperfine::timer::execute_and_measure",
+     "path": "/root/bp/apps/hyperfine/src/timer/mod.rs",
+     "us": 959,
+     "infer_us": 1532,
+     "phases_us": {
+      "constraints": 667,
+      "entry_sets": 9,
+      "errors": 2,
+      "infer": 8,
+      "liveness": 108,
+      "loans": 7,
+      "mir": 0,
+      "moves": 58,
+      "scopes": 0,
+      "setup": 1,
+      "walk": 82
+     },
+     "counts": {
+      "blocks": 89,
+      "bodies": 1,
+      "constraints": 152,
+      "loans": 4,
+      "localized": 152,
+      "locals": 52,
+      "points": 251,
+      "regions": 98,
+      "universals": 2
+     }
+    },
+    {
+     "name": "hyperfine::run",
+     "path": "/root/bp/apps/hyperfine/src/main.rs",
+     "us": 937,
+     "infer_us": 1850,
+     "phases_us": {
+      "constraints": 315,
+      "entry_sets": 32,
+      "errors": 5,
+      "infer": 21,
+      "liveness": 264,
+      "loans": 19,
+      "mir": 0,
+      "moves": 129,
+      "scopes": 6,
+      "setup": 1,
+      "walk": 115
+     },
+     "counts": {
+      "blocks": 217,
+      "bodies": 1,
+      "constraints": 215,
+      "loans": 24,
+      "localized": 215,
+      "locals": 142,
+      "points": 680,
+      "regions": 223,
+      "universals": 2
+     }
+    },
+    {
+     "name": "hyperfine::export::markup::MarkupExporter::table_results",
+     "path": "/root/bp/apps/hyperfine/src/export/markup.rs",
+     "us": 858,
+     "infer_us": 2179,
+     "phases_us": {
+      "constraints": 314,
+      "entry_sets": 26,
+      "errors": 6,
+      "infer": 33,
+      "liveness": 217,
+      "loans": 19,
+      "mir": 0,
+      "moves": 128,
+      "scopes": 5,
+      "setup": 2,
+      "walk": 78
+     },
+     "counts": {
+      "blocks": 140,
+      "bodies": 2,
+      "constraints": 362,
+      "loans": 32,
+      "localized": 362,
+      "locals": 211,
+      "points": 717,
+      "regions": 393,
+      "universals": 8
+     }
+    },
+    {
+     "name": "hyperfine::benchmark::executor::<ShellExecutor<'_>>::calibrate",
+     "path": "/root/bp/apps/hyperfine/src/benchmark/executor.rs",
+     "us": 827,
+     "infer_us": 1788,
+     "phases_us": {
+      "constraints": 407,
+      "entry_sets": 20,
+      "errors": 4,
+      "infer": 16,
+      "liveness": 178,
+      "loans": 18,
+      "mir": 0,
+      "moves": 97,
+      "scopes": 2,
+      "setup": 1,
+      "walk": 61
+     },
+     "counts": {
+      "blocks": 129,
+      "bodies": 1,
+      "constraints": 217,
+      "loans": 18,
+      "localized": 217,
+      "locals": 114,
+      "points": 475,
+      "regions": 205,
+      "universals": 4
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::get_parameter_scan_commands",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 807,
+     "infer_us": 1676,
+     "phases_us": {
+      "constraints": 335,
+      "entry_sets": 14,
+      "errors": 6,
+      "infer": 14,
+      "liveness": 138,
+      "loans": 10,
+      "mir": 0,
+      "moves": 89,
+      "scopes": 0,
+      "setup": 2,
+      "walk": 174
+     },
+     "counts": {
+      "blocks": 139,
+      "bodies": 3,
+      "constraints": 177,
+      "loans": 4,
+      "localized": 177,
+      "locals": 96,
+      "points": 433,
+      "regions": 146,
+      "universals": 16
+     }
+    },
+    {
+     "name": "hyperfine::metric::<Metric>::summarize",
+     "path": "/root/bp/apps/hyperfine/src/metric.rs",
+     "us": 771,
+     "infer_us": 3725,
+     "phases_us": {
+      "constraints": 517,
+      "entry_sets": 9,
+      "errors": 4,
+      "infer": 15,
+      "liveness": 72,
+      "loans": 6,
+      "mir": 1,
+      "moves": 87,
+      "scopes": 2,
+      "setup": 2,
+      "walk": 37
+     },
+     "counts": {
+      "blocks": 70,
+      "bodies": 4,
+      "constraints": 210,
+      "loans": 10,
+      "localized": 210,
+      "locals": 80,
+      "points": 260,
+      "regions": 179,
+      "universals": 18
+     }
+    },
+    {
+     "name": "hyperfine::export::<ExportManager>::write_results",
+     "path": "/root/bp/apps/hyperfine/src/export/mod.rs",
+     "us": 760,
+     "infer_us": 1206,
+     "phases_us": {
+      "constraints": 285,
+      "entry_sets": 26,
+      "errors": 4,
+      "infer": 17,
+      "liveness": 198,
+      "loans": 14,
+      "mir": 0,
+      "moves": 124,
+      "scopes": 4,
+      "setup": 2,
+      "walk": 63
+     },
+     "counts": {
+      "blocks": 194,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 13,
+      "localized": 190,
+      "locals": 105,
+      "points": 554,
+      "regions": 181,
+      "universals": 13
+     }
+    },
+    {
+     "name": "hyperfine::command::<Commands<'a>>::from_cli_arguments",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 758,
+     "infer_us": 1631,
+     "phases_us": {
+      "constraints": 310,
+      "entry_sets": 17,
+      "errors": 4,
+      "infer": 15,
+      "liveness": 161,
+      "loans": 12,
+      "mir": 0,
+      "moves": 86,
+      "scopes": 3,
+      "setup": 2,
+      "walk": 123
+     },
+     "counts": {
+      "blocks": 133,
+      "bodies": 2,
+      "constraints": 190,
+      "loans": 11,
+      "localized": 190,
+      "locals": 85,
+      "points": 391,
+      "regions": 142,
+      "universals": 8
+     }
+    },
+    {
+     "name": "hyperfine::command::parse_environment",
+     "path": "/root/bp/apps/hyperfine/src/command.rs",
+     "us": 690,
+     "infer_us": 1841,
+     "phases_us": {
+      "constraints": 290,
+      "entry_sets": 19,
+      "errors": 5,
+      "infer": 17,
+      "liveness": 155,
+      "loans": 14,
+      "mir": 0,
+      "moves": 107,
+      "scopes": 3,
+      "setup": 2,
+      "walk": 52
+     },
+     "counts": {
+      "blocks": 151,
+      "bodies": 4,
+      "constraints": 163,
+      "loans": 14,
+      "localized": 163,
+      "locals": 118,
+      "points": 488,
+      "regions": 182,
+      "universals": 15
+     }
+    }
+   ],
+   "secs": 18
+  }
+ }
+}

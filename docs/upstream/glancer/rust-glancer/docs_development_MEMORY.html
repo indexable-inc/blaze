@@ -1,0 +1,503 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Memory approach - rust-glancer</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the rust-glancer Rust language server.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-b3d3e689.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-7b00988f.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rust-glancer</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/rust-glancer/rust-glancer" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/rust-glancer/rust-glancer/edit/main/docs/src/development/MEMORY.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="memory-approach"><a class="header" href="#memory-approach">Memory approach</a></h1>
+<p>This project cares a lot about memory allocations. This document outlines
+how this is done, and what tooling and techniques are commonly used for
+that purpose.</p>
+<h2 id="offloading--purging"><a class="header" href="#offloading--purging">Offloading &amp; purging</a></h2>
+<p>The two biggest memory savers in this project are offloading and memory purging.</p>
+<p>Offloading lets us write computed analysis data to disk and only load
+the relevant bits for the duration of the query.</p>
+<p>Purging is an allocator feature that lets us force the allocator to return
+memory to the system. System allocators are usually do not eagerly return
+the memory to the OS, but customized allocators give us a way to do it.
+This project supports two different allocators: <code>mimalloc</code> and <code>jemalloc</code>,
+both built with purging in mind. For <code>jemalloc</code>, purging is an on-demand action,
+which we make use of when the project is built with <code>jemalloc</code>; while <code>mimalloc</code>
+itself tries to return the memory to the system once it’s not needed. I still
+refer to <code>mimalloc</code> built-in behavior as “purging”, since it does basically the same
+thing automatically.</p>
+<p>That said, while these techniques reduce idle memory usage, they are not a replacement
+for optimizing the phase itself. Purging can reduce RSS across phases, but it does
+not reduce peak RSS within a phase per se.</p>
+<p>One of the caveats, for example, is memory fragmentation: if memory is
+significantly fragmented, purging will not help much, since the allocator will not
+be able to give big enough chunks back to the OS.</p>
+<p>So, the rest of the document is focused on the particular memory optimization
+techniques we use <em>outside</em> of purging and offloading.</p>
+<h3 id="allocator-choice"><a class="header" href="#allocator-choice">Allocator choice</a></h3>
+<p>Rust Glancer supports two main allocators:</p>
+<ul>
+<li><code>jemalloc</code></li>
+<li><code>mimalloc</code></li>
+</ul>
+<p><code>mimalloc</code> is the default one, since benchmarks show that it provides <em>significantly</em>
+better performance in nearly all the cases, while being generally as memory efficient
+as jemalloc. We use it without arenas: with arenas enabled, RSS is actually noticeably
+higher and performance boost is very modest. We also force collection with <code>mi_collect(true)</code>
+at indexing checkpoints and before the engine waits for work. This collects the calling
+thread’s heap, including deferred frees and retired pages that might otherwise stay around
+until more allocator activity. The setup and collection live in the
+<a href="https://github.com/rust-glancer/rust-glancer/blob/main/crates/rust-glancer/src/memory/mimalloc.rs"><code>mimalloc</code> backend</a>.
+Additionally, unlike <code>jemalloc</code>, <code>mimalloc</code> supports more platforms, e.g. Windows and OpenBSD.</p>
+<p><code>jemalloc</code> was used to build the application up until its first release, and for now it
+remains a supported option. It can offer lower peak RSS with <code>lower-peak-memory</code> configuration,
+but it’s generally its only advantage right now. If <code>mimalloc</code> allocations are too high for
+you even with <code>lower-peak-memory</code>, you might consider building the app with <code>jemalloc</code> and try it.
+Otherwise, it’s slower, and is mostly left “just in case”; there is a good chance that support
+will be removed in the future.</p>
+<h4 id="mimalloc-address-hints"><a class="header" href="#mimalloc-address-hints">Mimalloc address hints</a></h4>
+<p>Disabling arenas also means that requests for fresh allocator pages reach the OS more often.
+Mimalloc normally suggests aligned virtual addresses for these requests, advancing through
+new address ranges each time. Its two-level page map needs a 64 KiB lookup table for each
+512 MiB address region it visits. Freeing an allocation clears entries in that table, but
+the table itself stays allocated until allocator teardown. Repeated queries can therefore
+grow idle RSS even when their allocations have been freed. <code>mi_collect(true)</code> cannot release
+these tables. See <a href="https://github.com/rust-glancer/rust-glancer/issues/268">issue #268</a>.</p>
+<p>We build mimalloc with <code>MI_NO_ALIGNED_HINT=1</code> to let the OS choose addresses and reuse freed
+ranges. Allocation alignment is still enforced: if a mapping is not aligned, mimalloc can
+request a larger mapping and use an aligned part of it. This can cost extra OS calls, but
+avoiding retained metadata matters more for our idle-memory goal. The switch allows address
+reuse; it does not make page-map tables reclaimable or guarantee a fixed metadata size.</p>
+<p>The define is supplied through <code>CFLAGS</code> and <code>CXXFLAGS</code> in
+<a href="https://github.com/rust-glancer/rust-glancer/blob/main/.cargo/config.toml"><code>.cargo/config.toml</code></a>.
+Both are needed because the bindings compile mimalloc as C++ on MSVC. These flags also reach
+other native builds; the macro is specific to mimalloc. This keeps the allocator policy in
+the repository while using the published dependency unchanged.</p>
+<p>Cargo keeps existing environment values for these variables. If you set custom <code>CFLAGS</code> or
+<code>CXXFLAGS</code>, include <code>-DMI_NO_ALIGNED_HINT=1</code> in them. Build from the repository directory or
+one of its subdirectories so Cargo discovers the configuration; from elsewhere, pass
+<code>--config /path/to/rust-glancer/.cargo/config.toml</code> to Cargo explicitly.</p>
+<h3 id="startup-cache-loading"><a class="header" href="#startup-cache-loading">Startup cache loading</a></h3>
+<p>Honorary mention: we don’t only offload cache while LSP is active; since the cache
+is already on the filesystem, we try to reuse it on relaunch. Cache is fingerprinted, so
+on startup we’re evaluating whether the cache is compatible with the current state of
+the project, and if so, we can get indexed workspace at startup for free.</p>
+<p>This is intentionally opportunistic and per-package: the indexing remains reasonably
+fast anyway, so if package cache probing fails for any reason, we treat it as a miss and
+re-index the corresponding package from source.</p>
+<h2 id="memory-optimizations"><a class="header" href="#memory-optimizations">Memory optimizations</a></h2>
+<h3 id="allocator-stats--notation"><a class="header" href="#allocator-stats--notation">Allocator stats &amp; notation</a></h3>
+<p>The core command for analyzing memory allocations is <code>just analyze</code>, and it prints
+plenty of stats. The “default fixture” for that is <code>rust-analyzer</code> on a specific
+commit, since it’s a big enough, stable, and complex “real-world” project. It can
+be fetched by running <a href="https://github.com/rust-glancer/rust-glancer/blob/main/test_targets/bench_fixtures/fetch-rust-analyzer.sh"><code>test_targets/bench_fixtures/fetch-rust-analyzer.sh</code></a>.</p>
+<p>Note that alocator stats are bound to the allocator in use; <code>jemalloc</code> supports
+more metrics than <code>mimalloc</code>. This section primarily described <code>jemalloc</code> use case,
+since it supports more metrics, but remember that switching allocators might not
+transfer the behavior: what’s optimal for <code>jemalloc</code> might not be optimal for <code>mimalloc</code>.</p>
+<p>One key part of the output is the <code>project.build.checkpoints</code> profile table:</p>
+<pre><code class="language-bash">$ just analyze path/to/rust-analyzer --profile --package-residency all-offloadable -m
+# .. some parts omitted
+profile snapshot:
+ phase     elapsed    rg_sampled      rg_total   a_allocated      a_backed    a_resident      a_mapped  checkpoint
+150 ms      150 ms      60.8 MiB      60.8 MiB      70.6 MiB      76.9 MiB      83.3 MiB      85.7 MiB  after parse
+  0 ms      151 ms       2.3 KiB      60.8 MiB      70.6 MiB      76.9 MiB      83.3 MiB      85.7 MiB  after cache probe
+1.21 s      1.36 s     227.2 MiB     285.0 MiB     282.7 MiB     500.7 MiB     602.9 MiB     628.0 MiB  after item-tree
+ 58 ms      1.42 s      26.0 MiB     274.8 MiB     273.0 MiB     493.8 MiB     504.8 MiB     529.8 MiB  after item-tree syntax eviction
+157 ms      1.58 s      16.5 KiB     274.8 MiB     273.3 MiB     494.1 MiB     512.6 MiB     537.6 MiB  after cache source fingerprints
+3.80 s      5.38 s     126.8 MiB     402.4 MiB     396.9 MiB     641.8 MiB     660.4 MiB     683.8 MiB  after def-map
+253 ms      5.63 s     159.7 MiB     562.1 MiB     543.5 MiB     783.2 MiB     831.3 MiB     854.7 MiB  after semantic-ir
+145 ms      5.77 s             -     332.4 MiB     331.1 MiB     421.6 MiB     831.3 MiB     854.7 MiB  after item-tree drop
+1.92 s      7.70 s     278.1 MiB     613.4 MiB     610.0 MiB     691.7 MiB     711.0 MiB     733.7 MiB  after body-ir
+140 ms      7.84 s      26.0 MiB     600.5 MiB     593.1 MiB     663.1 MiB     714.5 MiB     737.2 MiB  after parse syntax eviction
+ 91 ms      7.93 s     603.7 MiB     603.7 MiB     591.8 MiB     660.8 MiB     714.5 MiB     737.2 MiB  before package cache write
+1.34 s      9.27 s     603.7 MiB     603.7 MiB     599.1 MiB     675.0 MiB     911.6 MiB    1001.6 MiB  after package cache write
+214 ms      9.48 s      36.0 MiB      36.0 MiB      46.2 MiB     110.5 MiB     675.8 MiB     698.2 MiB  after package payload offload
+ 17 ms      9.50 s       7.3 MiB       7.3 MiB      10.6 MiB      38.2 MiB     675.8 MiB     698.2 MiB  after package offload cleanup
+ 23 ms      9.52 s       7.3 MiB       7.3 MiB       7.8 MiB      33.3 MiB      53.0 MiB      75.3 MiB  after project
+</code></pre>
+<p>The information should be interpreted as follows:</p>
+<ul>
+<li><code>checkpoint</code> denotes the “logical checkpoint”</li>
+<li><code>phase</code> is the duration of this step <em>only</em></li>
+<li><code>elapsed</code> is the duration since the start of the indexing</li>
+<li><code>rg_sampled</code> is memory measured for the checkpoint’s main data structure</li>
+<li><code>rg_total</code> is memory measured for all known live build state</li>
+<li><code>a_allocated</code> is the allocator stat for memory the program is actually using</li>
+<li><code>a_backed</code> is the allocator stat for internal allocated pages that serve <code>a_allocated</code>.
+It is normal for it to be somewhat higher, since memory is allocated in pages, and
+<code>a_allocated</code> typically does not fully utilize each page.</li>
+<li><code>a_resident</code> is the allocator stat that includes allocator-internal state.</li>
+<li><code>a_mapped</code> is the mapped OS range, not necessarily fully allocated.</li>
+</ul>
+<p>Note: <code>rg_total</code> is an <em>estimate</em>, since we can’t count everything perfectly, but it should be
+<em>close enough</em> to <code>a_allocated</code>. The reason why it’s important is because our internal
+harness also records <em>what</em> is allocated and <em>where</em>: as long as it’s accurate, we can make
+educated guesses on where we can save on allocations themselves.</p>
+<p>Here are some heuristics that can be used to reason about this table:</p>
+<ol>
+<li><code>a_allocated &lt;&lt; a_backed ~= a_resident</code> – likely active memory fragmentation issue.
+Rough explanation: there are few allocations, but they take a lot of allocated pages.</li>
+<li><code>a_allocated &lt; a_backed &lt;&lt; a_resident</code> – purging might help; should generally not be the
+case with <code>mimalloc</code>.
+Rough explanation: we have experimented with different jemalloc configurations, but the default
+configuration appears to be a good fit for this project, so in most cases explicit purging is the
+lever we care about.</li>
+<li><code>a_resident &lt;&lt; a_mapped</code> – not necessarily bad, but might be worth investigation, might
+signal excessive transient allocations in the past and <em>could</em> signal unexpected peak RSS.</li>
+</ol>
+<p>Important caveat: this table prints data <em>after the phase</em>, so it does not represent <em>peak</em>
+allocation, which can be much higher during the phase because of transient allocations.
+For peak RSS, extra profiling might be required.</p>
+<h3 id="layered-allocations"><a class="header" href="#layered-allocations">Layered allocations</a></h3>
+<p>The core memory optimization we have is layered allocations. A typical expected
+flow for lowering would be per-package, e.g. do “item tree -&gt; defmap -&gt; semantic -&gt; body”
+for each package. This is expected, but it has a flaw: interleaving allocation lifetimes.</p>
+<p>Some of the data during lowering/resolution is transient, and it will be removed after the
+phase. If we do all the phases for each package separately, it will leave a lot of
+“holes” in memory, which will be filled by allocations from the newly processed packages,
+which… Well, in the end we will end up with highly fragmented memory.</p>
+<p>What we do instead is optimize for <em>memory allocation lifetime</em>. We lower the same phase
+for all the packages first, and then we shrink and compact it.</p>
+<p>During lowering, the most important bit to think about is whether the allocations from
+this phase will intersect with allocations from the next phase: it’s bad if they will.</p>
+<p>An example: during item tree lowering, we should not do parsing in parallel, since two
+phases have different lifetimes. We should <em>first</em> parse files, and <em>then</em> perform item
+tree lowering, since item tree lives longer than syntax, and parse syntax eviction should
+free up a continuous chunk of memory, not slots between item tree allocations.</p>
+<h3 id="compacting"><a class="header" href="#compacting">Compacting</a></h3>
+<p>Compacting is important: imagine that we have a <code>Vec</code> of interim <code>Builder</code> objects and
+we need to “freeze” it into a <code>Vec</code> of “built”/“frozen” objects. If we shrink
+the object and then allocate the “final” object right away, it will likely go to
+the just-freed memory space. And if we repeat it for every object, we will end up
+with a lot of holes between objects.</p>
+<p>Instead, we can shrink all the objects, and <em>while the old objects are alive</em> allocate
+a vector of new objects: these will be compact in memory, since we will allocate the
+whole chunk right away with no gaps. After that, it will be safe to drop the “old”
+objects – they will free up all the capacity. Given that this will happen at the end
+of the stage and will be followed by a purge, we’ll end up with cleaner memory layout.</p>
+<p>Note: bump allocators <em>could</em> help with transient storage, but they have their own costs;
+we’ve briefly experimented with these, and the result was that they yield similar results
+to manually optimized allocations, but have much worse ergonomics, and in some cases can
+worsen peak RSS due to arena allocation overhead.</p>
+<h3 id="eager-eviction"><a class="header" href="#eager-eviction">Eager eviction</a></h3>
+<p>It was already mentioned above, but eager eviction is also one of the major strategies:
+we keep data only while it’s needed. For example, parse syntax <em>globally</em> is only needed
+until we lower item tree. After that, we can lower semantic tree based on item tree only.
+For body layer, we will need syntax again, but on a per-file basis: we parse it for the
+file only, lower all the bodies, and then drop it.</p>
+<h3 id="parallelism-tweaking"><a class="header" href="#parallelism-tweaking">Parallelism tweaking</a></h3>
+<p>We use parallelism heavily for indexing, but while a higher thread count can make
+things faster, it can also increase the volume of transient allocations: more threads
+will consume more pages, while not keeping them fully utilized. This will be freed
+after the phase, of course, but it can increase the peak RSS quite heavily.</p>
+<p>The main current offender is declarative macro expansion: it allocates a lot of transient
+syntax trees, and on my current machine unconstrained macro expansion uses 16 threads and
+processes the defmap stage in ~3.2s with ~3.1GB peak RSS, while capping macro expansion to
+2 threads increases defmap time to ~3.9s, but lowers peak RSS to ~1.8GB.</p>
+<p>Here it’s a trade-off, so we let users choose what they value more: peak
+RSS or indexing speed.</p>
+<h2 id="memory-tooling--techniques"><a class="header" href="#memory-tooling--techniques">Memory tooling &amp; techniques</a></h2>
+<p>This section outlines the strategies you can use to analyze memory allocation
+patterns during development.</p>
+<h3 id="memorysize--shrink"><a class="header" href="#memorysize--shrink"><code>MemorySize</code> &amp; <code>Shrink</code></a></h3>
+<p>These traits and derive macros are core workspace infrastructure for memory measurement
+and compaction.</p>
+<ul>
+<li><code>MemorySize</code> allows recording the size of the object, including not only the shallow
+size of the object itself, but also the size of its children and approximate overhead.
+It can distinguish certain and approximate allocations, and it can record what is being
+allocated and where (e.g. object type and object scope). These measurements are not
+automatic, but derive support makes them convenient to add in all the necessary
+places. It is possible to forget it somewhere, but so far it’s pretty consistent, and
+through profiling it is possible to detect if counting becomes very inaccurate.</li>
+<li><code>Shrink</code> allows recursively shrinking allocations, where possible. It is mainly relevant
+for stored <code>std</code>-backed containers with a <code>shrink_to_fit</code> method. During indexing, quite
+a lot of containers might have unpredictable size and end up with spare allocated capacity.
+Based on experiments, so far it has proven to be a better solution ergonomically than bump
+allocators.</li>
+</ul>
+<p><code>MemorySize</code> and <code>Shrink</code> usually go hand in hand – if you want to measure something, you
+probably also want to shrink it, and if you want to shrink something, it is certainly worth
+measuring.</p>
+<h3 id="just-analyze"><a class="header" href="#just-analyze"><code>just analyze</code></a></h3>
+<p>This is the baseline command. For details, run <code>just analyze --help</code>.</p>
+<p>Useful flags:</p>
+<ul>
+<li><code>--profile [selectors]</code> collects dynamic profile data. Without a value, it uses
+the <code>default</code> alias, which records build checkpoints. <code>--profile all</code> collects
+every registered profile.</li>
+<li><code>-m</code> / <code>--memory</code> adds retained-memory and allocator stats to build checkpoints,
+plus the final retained-memory breakdown.</li>
+<li><code>--profile memory:def-map</code> records a detailed memory breakdown for the def-map
+checkpoint. Other available aliases and selectors are listed in <code>just analyze --help</code>.</li>
+<li><code>--package-residency &lt;policy&gt;</code> controls what remains resident after indexing.
+<code>all-offloadable</code> is useful for checking idle-memory behavior, while <code>all-resident</code>
+is useful when you want to remove offloading from the experiment.</li>
+<li><code>-l</code> / <code>--load</code> enables startup cache loading, so matching offloadable package
+artifacts can be reused instead of rebuilt.</li>
+<li><code>--indexing-preference &lt;preference&gt;</code> switches between <code>lower-peak-memory</code> and
+<code>faster-builds</code>.</li>
+<li><code>--profile macros</code> prints defmap macro-expansion counters, timings, and by-name tables.</li>
+<li><code>--format json</code> is useful if you want to compare reports with a script.</li>
+</ul>
+<p>Note: this command works for <em>both</em> performance and memory analysis, but memory
+analysis is not free – it makes indexing slower. So for accurate data on performance,
+use this command without <code>-m</code>/<code>--memory</code>.</p>
+<p>Samples:</p>
+<p>“Default go-to command” – analyze with full offloading</p>
+<pre><code>just analyze path/to/rust-analyzer --profile --package-residency all-offloadable -m
+</code></pre>
+<p>Exclude offloading from analysis:</p>
+<pre><code>just analyze path/to/rust-analyzer --profile --package-residency all-resident -m
+</code></pre>
+<p>Check what a real startup with cache hits looks like:</p>
+<pre><code>just analyze path/to/rust-analyzer --profile --package-residency all-offloadable --load -m
+</code></pre>
+<p>Inspect one suspicious checkpoint in more detail:</p>
+<pre><code>just analyze path/to/rust-analyzer --profile memory:def-map --package-residency all-offloadable -m
+</code></pre>
+<p>Compare the speed/memory trade-off for macro expansion:</p>
+<pre><code>just analyze path/to/rust-analyzer --profile --package-residency all-offloadable --indexing-preference faster-builds -m
+just analyze path/to/rust-analyzer --profile --package-residency all-offloadable --indexing-preference lower-peak-memory -m
+</code></pre>
+<p>If defmap is suspicious, add macro stats:</p>
+<pre><code>just analyze path/to/rust-analyzer --profile default,macros --package-residency all-offloadable -m
+</code></pre>
+<h3 id="peak-rss"><a class="header" href="#peak-rss">Peak RSS</a></h3>
+<p>The above commands will <em>not</em> give you peak RSS. For peak RSS, a good idea is to use
+<code>time</code>.</p>
+<p>For <code>zsh</code>:</p>
+<pre><code>TIMEFMT='%J  %U user %S system %P cpu %*E total %M max_rss'
+time just analyze path/to/rust-analyzer --profile --package-residency all-offloadable -m
+</code></pre>
+<p>Note that depending on platform, <code>max_rss</code> might be in KiB or MiB.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../development/DEVELOPMENT.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../development/PROFILING.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../development/DEVELOPMENT.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../development/PROFILING.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

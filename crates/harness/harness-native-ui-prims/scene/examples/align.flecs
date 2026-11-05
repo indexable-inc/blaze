@@ -1,0 +1,42 @@
+// Baseline alignment: a 56-point number, 11-point words and two wrapped lines of 13-point words on one first baseline,
+// against the same row centred. Centred, the small words float mid-number and the wrapped pair straddles it; on
+// FirstBaseline all three sit on the number's baseline. Then AlignSelf and AlignmentGuide in a column aligned to its start.
+
+@tree ChildOf
+ex {
+  prefab BaselineDemo : ex.Card {
+    label : ui.Label { Text: {s: "ALIGN FIRSTBASELINE VS CENTER"} }
+    base : ui.Row {
+      Flex: {axis: Row, gap: 6, align: FirstBaseline, justify: Start, wrap: false}
+      big : ui.Words, Strong { Text: {s: "42"}; TextStyle: {size: 56, line: 64, role: 0, bold: 1} }
+      small : ui.Words, Muted { Text: {s: "runs today"}; TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0} }
+      mid : ui.Words {
+        Text: {s: "since nine hundred"}
+        TextStyle: {size: 13, line: 16, role: 0, bold: 0}
+        Size: {w: {kind: Fixed, value: 64, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+    centre : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      big : ui.Words, Strong { Text: {s: "42"}; TextStyle: {size: 56, line: 64, role: 0, bold: 1} }
+      small : ui.Words, Muted { Text: {s: "runs today"}; TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0} }
+      mid : ui.Words {
+        Text: {s: "since nine hundred"}
+        TextStyle: {size: 13, line: 16, role: 0, bold: 0}
+        Size: {w: {kind: Fixed, value: 64, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+  }
+
+  prefab AlignSelfDemo : ex.Card {
+    label : ui.Label { Text: {s: "ALIGNSELF, ALIGNMENTGUIDE"} }
+    col : ui.Column {
+      Flex: {axis: Column, gap: 6, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      a : ex.Pill { words { Text: {s: "the column's Start"} } }
+      b : ex.Pill { AlignSelf: {align: Center}; words { Text: {s: "AlignSelf Center"} } }
+      c : ex.Pill { AlignSelf: {align: End}; words { Text: {s: "AlignSelf End"} } }
+      d : ex.Pill { AlignmentGuide: {dx: -40, dy: 0}; words { Text: {s: "AlignmentGuide dx -40"} } }
+    }
+  }
+}

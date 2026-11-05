@@ -1,0 +1,4 @@
+sum 49995000
+name worker
+channel [0, 10, 20, 30]
+scoped [2, 4, 6, 8]

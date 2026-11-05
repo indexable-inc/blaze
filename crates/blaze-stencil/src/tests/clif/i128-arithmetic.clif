@@ -1,0 +1,488 @@
+; Follows cranelift/filetests/filetests/runtests/i128-arithmetic.clif (and i128-extend.clif,
+; i128-concat-split.clif, i128-ireduce.clif), for the stencil set: `iadd`, `isub`, `imul`,
+; `ineg`, `iabs` and the four add and subtract overflow ops of `i128`, with carries and
+; borrows across the 64-bit halves (each overflow op in two functions, one returning the
+; value and one the flag, as a signature returns at most two integer registers); `iconcat`
+; and `isplit`; `uextend` and `sextend` to
+; `i128` from each width; `ireduce` from `i128` to each. `udiv`, `sdiv`, `urem` and `srem`
+; of `i128` are left out: the stencil set has none (the IR builder calls `__udivti3` and
+; friends), and so are `umul_overflow` and `smul_overflow` of it, for the same reason.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %iadd_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = iadd v0, v1
+    return v2
+}
+; run: %iadd_i128(1, 2) == 3
+; run: %iadd_i128(0x0000000000000000ffffffffffffffff, 1) == 0x00000000000000010000000000000000
+; run: %iadd_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x0000000000000001ffffffffffffffff
+; run: %iadd_i128(-1, 1) == 0
+; run: %iadd_i128(0x7fffffffffffffffffffffffffffffff, 1) == 0x80000000000000000000000000000000
+; run: %iadd_i128(0x80000000000000000000000000000000, -1) == 0x7fffffffffffffffffffffffffffffff
+; run: %iadd_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf13579be02468acefeca8641fdb97531
+; run: %iadd_i128(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0x00000000000000020000000000000005
+; run: %iadd_i128(-1, -1) == -2
+; run: %iadd_i128(0, 0) == 0
+
+function %isub_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = isub v0, v1
+    return v2
+}
+; run: %isub_i128(1, 2) == -1
+; run: %isub_i128(0x0000000000000000ffffffffffffffff, 1) == 0x0000000000000000fffffffffffffffe
+; run: %isub_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 1
+; run: %isub_i128(-1, 1) == -2
+; run: %isub_i128(0x7fffffffffffffffffffffffffffffff, 1) == 0x7ffffffffffffffffffffffffffffffe
+; run: %isub_i128(0x80000000000000000000000000000000, -1) == 0x80000000000000000000000000000001
+; run: %isub_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x1111111111111110feeeeeeeeeeeeeef
+; run: %isub_i128(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == -1
+; run: %isub_i128(-1, -1) == 0
+; run: %isub_i128(0, 0) == 0
+; run: %isub_i128(0, 1) == -1
+; run: %isub_i128(0x00000000000000010000000000000000, 1) == 0x0000000000000000ffffffffffffffff
+; run: %isub_i128(0x80000000000000000000000000000000, 1) == 0x7fffffffffffffffffffffffffffffff
+
+function %imul_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = imul v0, v1
+    return v2
+}
+; run: %imul_i128(1, 2) == 2
+; run: %imul_i128(0x0000000000000000ffffffffffffffff, 1) == 0x0000000000000000ffffffffffffffff
+; run: %imul_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0xffffffffffffffff0000000000000000
+; run: %imul_i128(-1, 1) == -1
+; run: %imul_i128(0x7fffffffffffffffffffffffffffffff, 1) == 0x7fffffffffffffffffffffffffffffff
+; run: %imul_i128(0x80000000000000000000000000000000, -1) == 0x80000000000000000000000000000000
+; run: %imul_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x6422871b7939f74acdeec6cd7a44a410
+; run: %imul_i128(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0x00000000000000050000000000000006
+; run: %imul_i128(-1, -1) == 1
+; run: %imul_i128(0, 0) == 0
+; run: %imul_i128(0x0000000000000000ffffffffffffffff, 0x0000000000000000ffffffffffffffff) == 0xfffffffffffffffe0000000000000001
+; run: %imul_i128(0x00000000000000010000000000000000, 0x00000000000000010000000000000000) == 0
+; run: %imul_i128(0x00000000000000010000000000000001, 3) == 0x00000000000000030000000000000003
+; run: %imul_i128(-1, 5) == -5
+; run: %imul_i128(0x80000000000000000000000000000000, -1) == 0x80000000000000000000000000000000
+
+function %ineg_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = ineg v0
+    return v1
+}
+; run: %ineg_i128(0) == 0
+; run: %ineg_i128(1) == -1
+; run: %ineg_i128(-1) == 1
+; run: %ineg_i128(0x0000000000000000ffffffffffffffff) == 0xffffffffffffffff0000000000000001
+; run: %ineg_i128(0x00000000000000010000000000000000) == 0xffffffffffffffff0000000000000000
+; run: %ineg_i128(0xffffffffffffffff0000000000000000) == 0x00000000000000010000000000000000
+; run: %ineg_i128(0x80000000000000000000000000000000) == 0x80000000000000000000000000000000
+; run: %ineg_i128(0x7fffffffffffffffffffffffffffffff) == 0x80000000000000000000000000000001
+; run: %ineg_i128(0x0123456789abcdeffedcba9876543210) == 0xfedcba98765432100123456789abcdf0
+; run: %ineg_i128(0xf0123456789abcdeffedcba987654321) == 0x0fedcba98765432100123456789abcdf
+
+function %iabs_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = iabs v0
+    return v1
+}
+; run: %iabs_i128(0) == 0
+; run: %iabs_i128(1) == 1
+; run: %iabs_i128(-1) == 1
+; run: %iabs_i128(0x0000000000000000ffffffffffffffff) == 0x0000000000000000ffffffffffffffff
+; run: %iabs_i128(0x00000000000000010000000000000000) == 0x00000000000000010000000000000000
+; run: %iabs_i128(0xffffffffffffffff0000000000000000) == 0x00000000000000010000000000000000
+; run: %iabs_i128(0x80000000000000000000000000000000) == 0x80000000000000000000000000000000
+; run: %iabs_i128(0x7fffffffffffffffffffffffffffffff) == 0x7fffffffffffffffffffffffffffffff
+; run: %iabs_i128(0x0123456789abcdeffedcba9876543210) == 0x0123456789abcdeffedcba9876543210
+; run: %iabs_i128(0xf0123456789abcdeffedcba987654321) == 0x0fedcba98765432100123456789abcdf
+
+function %uadd_overflow_i128_value(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2, v3 = uadd_overflow v0, v1
+    return v2
+}
+; run: %uadd_overflow_i128_value(1, 2) == 3
+; run: %uadd_overflow_i128_value(0x0000000000000000ffffffffffffffff, 1) == 0x00000000000000010000000000000000
+; run: %uadd_overflow_i128_value(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x0000000000000001ffffffffffffffff
+; run: %uadd_overflow_i128_value(-1, 1) == 0
+; run: %uadd_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, 1) == 0x80000000000000000000000000000000
+; run: %uadd_overflow_i128_value(0x80000000000000000000000000000000, -1) == 0x7fffffffffffffffffffffffffffffff
+; run: %uadd_overflow_i128_value(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf13579be02468acefeca8641fdb97531
+; run: %uadd_overflow_i128_value(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0x00000000000000020000000000000005
+; run: %uadd_overflow_i128_value(-1, -1) == -2
+; run: %uadd_overflow_i128_value(0, 0) == 0
+; run: %uadd_overflow_i128_value(0, 1) == 1
+; run: %uadd_overflow_i128_value(0x00000000000000010000000000000000, 1) == 0x00000000000000010000000000000001
+; run: %uadd_overflow_i128_value(0x80000000000000000000000000000000, 1) == 0x80000000000000000000000000000001
+; run: %uadd_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, -1) == 0x7ffffffffffffffffffffffffffffffe
+; run: %uadd_overflow_i128_value(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0x00000000000000030000000000000000
+
+function %uadd_overflow_i128_flag(i128, i128) -> i8 {
+block0(v0: i128, v1: i128):
+    v2, v3 = uadd_overflow v0, v1
+    return v3
+}
+; run: %uadd_overflow_i128_flag(1, 2) == 0
+; run: %uadd_overflow_i128_flag(0x0000000000000000ffffffffffffffff, 1) == 0
+; run: %uadd_overflow_i128_flag(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0
+; run: %uadd_overflow_i128_flag(-1, 1) == 1
+; run: %uadd_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, 1) == 0
+; run: %uadd_overflow_i128_flag(0x80000000000000000000000000000000, -1) == 1
+; run: %uadd_overflow_i128_flag(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0
+; run: %uadd_overflow_i128_flag(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0
+; run: %uadd_overflow_i128_flag(-1, -1) == 1
+; run: %uadd_overflow_i128_flag(0, 0) == 0
+; run: %uadd_overflow_i128_flag(0, 1) == 0
+; run: %uadd_overflow_i128_flag(0x00000000000000010000000000000000, 1) == 0
+; run: %uadd_overflow_i128_flag(0x80000000000000000000000000000000, 1) == 0
+; run: %uadd_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, -1) == 1
+; run: %uadd_overflow_i128_flag(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0
+
+function %sadd_overflow_i128_value(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2, v3 = sadd_overflow v0, v1
+    return v2
+}
+; run: %sadd_overflow_i128_value(1, 2) == 3
+; run: %sadd_overflow_i128_value(0x0000000000000000ffffffffffffffff, 1) == 0x00000000000000010000000000000000
+; run: %sadd_overflow_i128_value(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x0000000000000001ffffffffffffffff
+; run: %sadd_overflow_i128_value(-1, 1) == 0
+; run: %sadd_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, 1) == 0x80000000000000000000000000000000
+; run: %sadd_overflow_i128_value(0x80000000000000000000000000000000, -1) == 0x7fffffffffffffffffffffffffffffff
+; run: %sadd_overflow_i128_value(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf13579be02468acefeca8641fdb97531
+; run: %sadd_overflow_i128_value(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0x00000000000000020000000000000005
+; run: %sadd_overflow_i128_value(-1, -1) == -2
+; run: %sadd_overflow_i128_value(0, 0) == 0
+; run: %sadd_overflow_i128_value(0, 1) == 1
+; run: %sadd_overflow_i128_value(0x00000000000000010000000000000000, 1) == 0x00000000000000010000000000000001
+; run: %sadd_overflow_i128_value(0x80000000000000000000000000000000, 1) == 0x80000000000000000000000000000001
+; run: %sadd_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, -1) == 0x7ffffffffffffffffffffffffffffffe
+; run: %sadd_overflow_i128_value(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0x00000000000000030000000000000000
+
+function %sadd_overflow_i128_flag(i128, i128) -> i8 {
+block0(v0: i128, v1: i128):
+    v2, v3 = sadd_overflow v0, v1
+    return v3
+}
+; run: %sadd_overflow_i128_flag(1, 2) == 0
+; run: %sadd_overflow_i128_flag(0x0000000000000000ffffffffffffffff, 1) == 0
+; run: %sadd_overflow_i128_flag(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0
+; run: %sadd_overflow_i128_flag(-1, 1) == 0
+; run: %sadd_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, 1) == 1
+; run: %sadd_overflow_i128_flag(0x80000000000000000000000000000000, -1) == 1
+; run: %sadd_overflow_i128_flag(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0
+; run: %sadd_overflow_i128_flag(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0
+; run: %sadd_overflow_i128_flag(-1, -1) == 0
+; run: %sadd_overflow_i128_flag(0, 0) == 0
+; run: %sadd_overflow_i128_flag(0, 1) == 0
+; run: %sadd_overflow_i128_flag(0x00000000000000010000000000000000, 1) == 0
+; run: %sadd_overflow_i128_flag(0x80000000000000000000000000000000, 1) == 0
+; run: %sadd_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, -1) == 0
+; run: %sadd_overflow_i128_flag(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0
+
+function %usub_overflow_i128_value(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2, v3 = usub_overflow v0, v1
+    return v2
+}
+; run: %usub_overflow_i128_value(1, 2) == -1
+; run: %usub_overflow_i128_value(0x0000000000000000ffffffffffffffff, 1) == 0x0000000000000000fffffffffffffffe
+; run: %usub_overflow_i128_value(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 1
+; run: %usub_overflow_i128_value(-1, 1) == -2
+; run: %usub_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, 1) == 0x7ffffffffffffffffffffffffffffffe
+; run: %usub_overflow_i128_value(0x80000000000000000000000000000000, -1) == 0x80000000000000000000000000000001
+; run: %usub_overflow_i128_value(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x1111111111111110feeeeeeeeeeeeeef
+; run: %usub_overflow_i128_value(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == -1
+; run: %usub_overflow_i128_value(-1, -1) == 0
+; run: %usub_overflow_i128_value(0, 0) == 0
+; run: %usub_overflow_i128_value(0, 1) == -1
+; run: %usub_overflow_i128_value(0x00000000000000010000000000000000, 1) == 0x0000000000000000ffffffffffffffff
+; run: %usub_overflow_i128_value(0x80000000000000000000000000000000, 1) == 0x7fffffffffffffffffffffffffffffff
+; run: %usub_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, -1) == 0x80000000000000000000000000000000
+; run: %usub_overflow_i128_value(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0xffffffffffffffff0000000000000000
+
+function %usub_overflow_i128_flag(i128, i128) -> i8 {
+block0(v0: i128, v1: i128):
+    v2, v3 = usub_overflow v0, v1
+    return v3
+}
+; run: %usub_overflow_i128_flag(1, 2) == 1
+; run: %usub_overflow_i128_flag(0x0000000000000000ffffffffffffffff, 1) == 0
+; run: %usub_overflow_i128_flag(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0
+; run: %usub_overflow_i128_flag(-1, 1) == 0
+; run: %usub_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, 1) == 0
+; run: %usub_overflow_i128_flag(0x80000000000000000000000000000000, -1) == 1
+; run: %usub_overflow_i128_flag(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 1
+; run: %usub_overflow_i128_flag(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 1
+; run: %usub_overflow_i128_flag(-1, -1) == 0
+; run: %usub_overflow_i128_flag(0, 0) == 0
+; run: %usub_overflow_i128_flag(0, 1) == 1
+; run: %usub_overflow_i128_flag(0x00000000000000010000000000000000, 1) == 0
+; run: %usub_overflow_i128_flag(0x80000000000000000000000000000000, 1) == 0
+; run: %usub_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, -1) == 1
+; run: %usub_overflow_i128_flag(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 1
+
+function %ssub_overflow_i128_value(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2, v3 = ssub_overflow v0, v1
+    return v2
+}
+; run: %ssub_overflow_i128_value(1, 2) == -1
+; run: %ssub_overflow_i128_value(0x0000000000000000ffffffffffffffff, 1) == 0x0000000000000000fffffffffffffffe
+; run: %ssub_overflow_i128_value(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 1
+; run: %ssub_overflow_i128_value(-1, 1) == -2
+; run: %ssub_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, 1) == 0x7ffffffffffffffffffffffffffffffe
+; run: %ssub_overflow_i128_value(0x80000000000000000000000000000000, -1) == 0x80000000000000000000000000000001
+; run: %ssub_overflow_i128_value(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x1111111111111110feeeeeeeeeeeeeef
+; run: %ssub_overflow_i128_value(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == -1
+; run: %ssub_overflow_i128_value(-1, -1) == 0
+; run: %ssub_overflow_i128_value(0, 0) == 0
+; run: %ssub_overflow_i128_value(0, 1) == -1
+; run: %ssub_overflow_i128_value(0x00000000000000010000000000000000, 1) == 0x0000000000000000ffffffffffffffff
+; run: %ssub_overflow_i128_value(0x80000000000000000000000000000000, 1) == 0x7fffffffffffffffffffffffffffffff
+; run: %ssub_overflow_i128_value(0x7fffffffffffffffffffffffffffffff, -1) == 0x80000000000000000000000000000000
+; run: %ssub_overflow_i128_value(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0xffffffffffffffff0000000000000000
+
+function %ssub_overflow_i128_flag(i128, i128) -> i8 {
+block0(v0: i128, v1: i128):
+    v2, v3 = ssub_overflow v0, v1
+    return v3
+}
+; run: %ssub_overflow_i128_flag(1, 2) == 0
+; run: %ssub_overflow_i128_flag(0x0000000000000000ffffffffffffffff, 1) == 0
+; run: %ssub_overflow_i128_flag(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0
+; run: %ssub_overflow_i128_flag(-1, 1) == 0
+; run: %ssub_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, 1) == 0
+; run: %ssub_overflow_i128_flag(0x80000000000000000000000000000000, -1) == 0
+; run: %ssub_overflow_i128_flag(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0
+; run: %ssub_overflow_i128_flag(0x00000000000000010000000000000002, 0x00000000000000010000000000000003) == 0
+; run: %ssub_overflow_i128_flag(-1, -1) == 0
+; run: %ssub_overflow_i128_flag(0, 0) == 0
+; run: %ssub_overflow_i128_flag(0, 1) == 0
+; run: %ssub_overflow_i128_flag(0x00000000000000010000000000000000, 1) == 0
+; run: %ssub_overflow_i128_flag(0x80000000000000000000000000000000, 1) == 1
+; run: %ssub_overflow_i128_flag(0x7fffffffffffffffffffffffffffffff, -1) == 1
+; run: %ssub_overflow_i128_flag(0x00000000000000010000000000000000, 0x00000000000000020000000000000000) == 0
+
+function %iconcat(i64, i64) -> i128 {
+block0(v0: i64, v1: i64):
+    v2 = iconcat v0, v1
+    return v2
+}
+; run: %iconcat(1, 2) == 0x00000000000000020000000000000001
+; run: %iconcat(-1, 0) == 0x0000000000000000ffffffffffffffff
+; run: %iconcat(0, 0x8000000000000000) == 0x80000000000000000000000000000000
+; run: %iconcat(0xfedcba9876543210, 0x0123456789abcdef) == 0x0123456789abcdeffedcba9876543210
+; run: %iconcat(-1, -1) == -1
+
+function %isplit(i128) -> i64, i64 {
+block0(v0: i128):
+    v1, v2 = isplit v0
+    return v1, v2
+}
+; run: %isplit(1) == [1, 0]
+; run: %isplit(-1) == [-1, -1]
+; run: %isplit(0x0123456789abcdeffedcba9876543210) == [0xfedcba9876543210, 0x0123456789abcdef]
+; run: %isplit(0x80000000000000000000000000000000) == [0, 0x8000000000000000]
+; run: %isplit(0x00000000000000010000000000000000) == [0, 1]
+
+function %split_swap_concat(i128) -> i128 {
+block0(v0: i128):
+    v1, v2 = isplit v0
+    v3 = iconcat v2, v1
+    return v3
+}
+; run: %split_swap_concat(1) == 0x00000000000000010000000000000000
+; run: %split_swap_concat(0x0123456789abcdeffedcba9876543210) == 0xfedcba98765432100123456789abcdef
+; run: %split_swap_concat(0xf0123456789abcdeffedcba987654321) == 0xffedcba987654321f0123456789abcde
+; run: %split_swap_concat(0x80000000000000000000000000000000) == 0x00000000000000008000000000000000
+
+function %add_halves(i128) -> i64 {
+block0(v0: i128):
+    v1, v2 = isplit v0
+    v3 = iadd v1, v2
+    return v3
+}
+; run: %add_halves(0x00000000000000010000000000000001) == 2
+; run: %add_halves(-1) == -2
+; run: %add_halves(0x0123456789abcdeffedcba9876543210) == -1
+
+function %uextend_i8_i128(i8) -> i128 {
+block0(v0: i8):
+    v1 = uextend.i128 v0
+    return v1
+}
+; run: %uextend_i8_i128(0) == 0
+; run: %uextend_i8_i128(1) == 1
+; run: %uextend_i8_i128(-1) == 255
+; run: %uextend_i8_i128(-128) == 128
+; run: %uextend_i8_i128(127) == 127
+; run: %uextend_i8_i128(-17) == 239
+
+function %sextend_i8_i128(i8) -> i128 {
+block0(v0: i8):
+    v1 = sextend.i128 v0
+    return v1
+}
+; run: %sextend_i8_i128(0) == 0
+; run: %sextend_i8_i128(1) == 1
+; run: %sextend_i8_i128(-1) == -1
+; run: %sextend_i8_i128(-128) == -128
+; run: %sextend_i8_i128(127) == 127
+; run: %sextend_i8_i128(-17) == -17
+
+function %uextend_i16_i128(i16) -> i128 {
+block0(v0: i16):
+    v1 = uextend.i128 v0
+    return v1
+}
+; run: %uextend_i16_i128(0) == 0
+; run: %uextend_i16_i128(1) == 1
+; run: %uextend_i16_i128(-1) == 0x0000000000000000000000000000ffff
+; run: %uextend_i16_i128(0x8000) == 0x00000000000000000000000000008000
+; run: %uextend_i16_i128(0x7fff) == 0x00000000000000000000000000007fff
+; run: %uextend_i16_i128(0xcdef) == 0x0000000000000000000000000000cdef
+
+function %sextend_i16_i128(i16) -> i128 {
+block0(v0: i16):
+    v1 = sextend.i128 v0
+    return v1
+}
+; run: %sextend_i16_i128(0) == 0
+; run: %sextend_i16_i128(1) == 1
+; run: %sextend_i16_i128(-1) == -1
+; run: %sextend_i16_i128(0x8000) == 0xffffffffffffffffffffffffffff8000
+; run: %sextend_i16_i128(0x7fff) == 0x00000000000000000000000000007fff
+; run: %sextend_i16_i128(0xcdef) == 0xffffffffffffffffffffffffffffcdef
+
+function %uextend_i32_i128(i32) -> i128 {
+block0(v0: i32):
+    v1 = uextend.i128 v0
+    return v1
+}
+; run: %uextend_i32_i128(0) == 0
+; run: %uextend_i32_i128(1) == 1
+; run: %uextend_i32_i128(-1) == 0x000000000000000000000000ffffffff
+; run: %uextend_i32_i128(0x80000000) == 0x00000000000000000000000080000000
+; run: %uextend_i32_i128(0x7fffffff) == 0x0000000000000000000000007fffffff
+; run: %uextend_i32_i128(0x89abcdef) == 0x00000000000000000000000089abcdef
+
+function %sextend_i32_i128(i32) -> i128 {
+block0(v0: i32):
+    v1 = sextend.i128 v0
+    return v1
+}
+; run: %sextend_i32_i128(0) == 0
+; run: %sextend_i32_i128(1) == 1
+; run: %sextend_i32_i128(-1) == -1
+; run: %sextend_i32_i128(0x80000000) == 0xffffffffffffffffffffffff80000000
+; run: %sextend_i32_i128(0x7fffffff) == 0x0000000000000000000000007fffffff
+; run: %sextend_i32_i128(0x89abcdef) == 0xffffffffffffffffffffffff89abcdef
+
+function %uextend_i64_i128(i64) -> i128 {
+block0(v0: i64):
+    v1 = uextend.i128 v0
+    return v1
+}
+; run: %uextend_i64_i128(0) == 0
+; run: %uextend_i64_i128(1) == 1
+; run: %uextend_i64_i128(-1) == 0x0000000000000000ffffffffffffffff
+; run: %uextend_i64_i128(0x8000000000000000) == 0x00000000000000008000000000000000
+; run: %uextend_i64_i128(0x7fffffffffffffff) == 0x00000000000000007fffffffffffffff
+; run: %uextend_i64_i128(0x0123456789abcdef) == 0x00000000000000000123456789abcdef
+
+function %sextend_i64_i128(i64) -> i128 {
+block0(v0: i64):
+    v1 = sextend.i128 v0
+    return v1
+}
+; run: %sextend_i64_i128(0) == 0
+; run: %sextend_i64_i128(1) == 1
+; run: %sextend_i64_i128(-1) == -1
+; run: %sextend_i64_i128(0x8000000000000000) == 0xffffffffffffffff8000000000000000
+; run: %sextend_i64_i128(0x7fffffffffffffff) == 0x00000000000000007fffffffffffffff
+; run: %sextend_i64_i128(0x0123456789abcdef) == 0x00000000000000000123456789abcdef
+
+function %ireduce_i128_i8(i128) -> i8 {
+block0(v0: i128):
+    v1 = ireduce.i8 v0
+    return v1
+}
+; run: %ireduce_i128_i8(0x0123456789abcdeffedcba9876543210) == 16
+; run: %ireduce_i128_i8(0xf0123456789abcdeffedcba987654321) == 33
+; run: %ireduce_i128_i8(-1) == -1
+; run: %ireduce_i128_i8(0x80000000000000000000000000000000) == 0
+; run: %ireduce_i128_i8(0x0000000000000000ffffffffffffffff) == -1
+
+function %ireduce_i128_i16(i128) -> i16 {
+block0(v0: i128):
+    v1 = ireduce.i16 v0
+    return v1
+}
+; run: %ireduce_i128_i16(0x0123456789abcdeffedcba9876543210) == 0x3210
+; run: %ireduce_i128_i16(0xf0123456789abcdeffedcba987654321) == 0x4321
+; run: %ireduce_i128_i16(-1) == -1
+; run: %ireduce_i128_i16(0x80000000000000000000000000000000) == 0
+; run: %ireduce_i128_i16(0x0000000000000000ffffffffffffffff) == -1
+
+function %ireduce_i128_i32(i128) -> i32 {
+block0(v0: i128):
+    v1 = ireduce.i32 v0
+    return v1
+}
+; run: %ireduce_i128_i32(0x0123456789abcdeffedcba9876543210) == 0x76543210
+; run: %ireduce_i128_i32(0xf0123456789abcdeffedcba987654321) == 0x87654321
+; run: %ireduce_i128_i32(-1) == -1
+; run: %ireduce_i128_i32(0x80000000000000000000000000000000) == 0
+; run: %ireduce_i128_i32(0x0000000000000000ffffffffffffffff) == -1
+
+function %ireduce_i128_i64(i128) -> i64 {
+block0(v0: i128):
+    v1 = ireduce.i64 v0
+    return v1
+}
+; run: %ireduce_i128_i64(0x0123456789abcdeffedcba9876543210) == 0xfedcba9876543210
+; run: %ireduce_i128_i64(0xf0123456789abcdeffedcba987654321) == 0xffedcba987654321
+; run: %ireduce_i128_i64(-1) == -1
+; run: %ireduce_i128_i64(0x80000000000000000000000000000000) == 0
+; run: %ireduce_i128_i64(0x0000000000000000ffffffffffffffff) == -1
+
+function %iadd_uextend_i64(i128, i64) -> i128 {
+block0(v0: i128, v1: i64):
+    v2 = uextend.i128 v1
+    v3 = iadd v0, v2
+    return v3
+}
+; run: %iadd_uextend_i64(0x0000000000000000ffffffffffffffff, -1) == 0x0000000000000001fffffffffffffffe
+; run: %iadd_uextend_i64(-1, 1) == 0
+; run: %iadd_uextend_i64(0x0123456789abcdeffedcba9876543210, 0x8000000000000000) == 0x0123456789abcdf07edcba9876543210
+
+function %umul_wide(i64, i64) -> i64, i64 {
+block0(v0: i64, v1: i64):
+    v2 = uextend.i128 v0
+    v3 = uextend.i128 v1
+    v4 = imul v2, v3
+    v5, v6 = isplit v4
+    return v5, v6
+}
+; run: %umul_wide(-1, -1) == [1, -2]
+; run: %umul_wide(0x8000000000000000, 2) == [0, 1]
+; run: %umul_wide(0xfedcba9876543210, 0x0123456789abcdef) == [0x2236d88fe5618cf0, 0x0121fa00ad77d742]
+; run: %umul_wide(3, 5) == [15, 0]
+
+function %smul_wide(i64, i64) -> i64, i64 {
+block0(v0: i64, v1: i64):
+    v2 = sextend.i128 v0
+    v3 = sextend.i128 v1
+    v4 = imul v2, v3
+    v5, v6 = isplit v4
+    return v5, v6
+}
+; run: %smul_wide(-1, -1) == [1, 0]
+; run: %smul_wide(0x8000000000000000, 2) == [0, -1]
+; run: %smul_wide(0xfedcba9876543210, 0x0123456789abcdef) == [0x2236d88fe5618cf0, 0xfffeb49923cc0953]
+; run: %smul_wide(3, 5) == [15, 0]

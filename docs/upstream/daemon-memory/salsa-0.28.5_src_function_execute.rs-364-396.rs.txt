@@ -1,0 +1,33 @@
+impl MemoHeader {
+    fn previous_iteration(
+        &self,
+        database_key_index: DatabaseKeyIndex,
+        cancellation_count: u8,
+        has_value: bool,
+    ) -> Option<PreviousIteration> {
+        if self.revisions.iteration().cancellation_count() != cancellation_count {
+            return None;
+        }
+
+        // The `DependencyGraph` locking propagates panics when another thread is blocked on a panicking query.
+        // However, the locking doesn't handle the case where a thread fetches the result of a panicking
+        // cycle head query **after** all locks were released. That's what we do here.
+        // We could consider re-executing the entire cycle but:
+        // a) It's tricky to ensure that all queries participating in the cycle will re-execute
+        //    (we can't rely on `iteration` being updated for nested cycles because the nested cycles may have completed successfully).
+        // b) It's guaranteed that this query will panic again anyway.
+        // That's why we simply propagate the panic here. It simplifies our lives and it also avoids duplicate panic messages.
+        if !has_value {
+            tracing::warn!(
+                "Propagating panic for cycle head that panicked in an earlier execution in that revision"
+            );
+            Cancelled::PropagatedPanic.throw();
+        }
+
+        Some(PreviousIteration {
+            iteration: self.revisions.iteration(),
+            // Only use the last provisional memo if it was a cycle head in the last iteration. This is to
+            // force at least two executions.
+            reuse_as_provisional: self.cycle_heads().contains(&database_key_index),
+        })
+    }

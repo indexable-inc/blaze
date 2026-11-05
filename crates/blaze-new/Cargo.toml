@@ -1,0 +1,25 @@
+[package]
+name = "blaze-new"
+description = "cargo new and cargo init, made by blaze: the package's manifest, source, ignore file and repository written as cargo writes them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blaze-manifest.workspace = true
+cargo-util-schemas.workspace = true
+glob.workspace = true
+pathdiff.workspace = true
+toml_edit = { workspace = true, features = ["display", "parse"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "harness-native-api"
+description = "What den-native's host and its hot-swappable modules share: the components module systems use, their layout table, and the module ABI (manifest, entry points) (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
+harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
+harness-native-flecs = { path = "../harness-native-flecs" }
+hyperion-abi = { path = "../vendor/hyperion-abi" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+hyperion-manifest-types = { path = "../vendor/hyperion-manifest-types" }
+hyperion-panic = { path = "../vendor/hyperion-panic" }
+
+[lints.rust]
+# The module ABI is `extern "C"` entry points and a `no_mangle` manifest static.
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "warn"

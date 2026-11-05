@@ -1,0 +1,8 @@
+{"at_ns":0,"event":{"Began":{"build":4,"command":"build","root":"/root/tui/tmp/tmp.ZOTyZV7zQT/ripgrep"}}}
+{"at_ns":1768331,"event":{"Started":{"step":"BuildScripts","of":null}}}
+    Building build scripts and proc macros
+{"at_ns":11192519,"event":{"Progress":{"step":"BuildScripts","done":0,"total":14,"longest":null}}}
+{"at_ns":91376228,"event":{"Progress":{"step":"BuildScripts","done":14,"total":14,"longest":null}}}
+{"at_ns":91480145,"event":{"Ended":{"step":"BuildScripts","of":null}}}
+{"at_ns":93400782,"event":{"Finished":{"ok":true,"summary":{"took_ns":93400782,"crates":0,"fns":{"total":0,"done":0,"kept":0},"rebuilt":[],"more":0,"error":null,"cache":null,"slowest":[]}}}}
+    Finished `dev` profile [blaze] target(s) in 0.10s

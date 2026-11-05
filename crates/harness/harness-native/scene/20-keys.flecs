@@ -1,0 +1,396 @@
+// harness-native's keyboard: every binding is an entity (src/keys.rs reads them, src/app/keys.rs runs them). The menu bar
+// (and its key equivalents), the palette's hints and the sidebar's cmd+1-9 hints are made from these same entities, so
+// they cannot drift from what the keys do.
+//
+// A binding:  key { <name> { Keybind: {key, cmd, shift, opt, ctrl}; (Does, act.<Action>); [(When, ctx.<Context>)] } }
+//   (flecs 4.2 refuses dotted names in declarations, so a binding is declared inside a `key { }` block and referred to as
+//   key.<name>; statements on one line need `;` between them.)
+//   key: a character as typed without modifiers ("n", "[", "=") or a named key (left right up down return enter tab
+//   space backspace delete escape home end pageup pagedown f1..f12). Modifiers are 0 or 1 and must match exactly.
+//   No When: the binding holds everywhere (below every context). With When it holds only while that context is active;
+//   the innermost active context wins (ctx.Palette or ctx.Picker, ctx.Archive, then ctx.Tree over ctx.Terminal), then
+//   later bindings over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's
+//   search; the picker drops it).
+// An action: act.<Name>, run by the handler registered under its name, else its base's (`act.SpawnClaude : act.Spawn`).
+//   MenuItem puts it in the menu bar (bar order is first appearance; sep: 1 draws a separator above it); Selector sends an
+//   AppKit action up the responder chain instead of a handler.
+//
+// ~/.harness/keys.flecs ($HARNESS_HOME/keys.flecs) runs after this file and wins: set Keybind on an existing key.<name> to
+// remap it (`key { <name> { Keybind: {...} } }`), or add a key.<name> of your own (a later binding on the same keys and context shadows this file's).
+// It is reloaded when it changes.
+
+@tree ChildOf
+ctx {
+  Terminal {}
+  Tree {}
+  Palette {}
+  // The new-object picker (cmd+N) while it is open.
+  Picker {}
+  Archive {}
+  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
+  Chat {}
+}
+
+// ---- actions ----
+
+@tree ChildOf
+act {
+  Hide { Selector: {sel: "hide:"}
+    MenuItem: {bar: "harness", title: "Hide harness"} }
+  Quit { Selector: {sel: "terminate:"}
+    MenuItem: {bar: "harness", title: "Quit harness", sep: 1} }
+
+  // The picker (cmd+N): a row for each act.Spawn below with a `title`, in this order (the one picked last is highlighted
+  // when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
+  Picker { MenuItem: {bar: "File", title: "New…"} }
+  // A new object of `kind` in the selected object's directory (else home); `title` names it in the picker (none: not
+  // in the picker). The palette offers every one, by its menu title.
+  prefab Spawn
+  SpawnClaude : act.Spawn { SpawnKind: {kind: "claude", title: "Claude"}
+    MenuItem: {bar: "File", title: "New Claude"} }
+  // Claude in its own terminal UI (a PTY) instead of the chat pane; no title, so the palette and the menu offer it but
+  // the picker does not.
+  SpawnClaudeTui : act.Spawn { SpawnKind: {kind: "claude-tui"}
+    MenuItem: {bar: "File", title: "New Claude (Terminal)"} }
+  SpawnCodex : act.Spawn { SpawnKind: {kind: "codex", title: "Codex"}
+    MenuItem: {bar: "File", title: "New Codex"} }
+  SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor", title: "Cursor"}
+    MenuItem: {bar: "File", title: "New Cursor"} }
+  SpawnShell : act.Spawn { SpawnKind: {kind: "shell", title: "Shell"}
+    MenuItem: {bar: "File", title: "New Shell"} }
+  Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
+
+  Copy { Selector: {sel: "copy:"}
+    MenuItem: {bar: "Edit", title: "Copy"} }
+  Paste { Selector: {sel: "paste:"}
+    MenuItem: {bar: "Edit", title: "Paste"} }
+  SelectAll { MenuItem: {bar: "Edit", title: "Select All"} }
+  EmojiPicker { Selector: {sel: "orderFrontCharacterPalette:"}
+    MenuItem: {bar: "Edit", title: "Emoji & Symbols", sep: 1} }
+
+  ToggleSidebar { MenuItem: {bar: "View", title: "Toggle Sidebar"} }
+  Palette { MenuItem: {bar: "View", title: "Command Palette"} }
+  prefab Zoom
+  ZoomIn : act.Zoom { ZoomStep: {step: 1}
+    MenuItem: {bar: "View", title: "Zoom In", sep: 1} }
+  ZoomOut : act.Zoom { ZoomStep: {step: -1}
+    MenuItem: {bar: "View", title: "Zoom Out"} }
+  ZoomReset { MenuItem: {bar: "View", title: "Actual Size"} }
+  // F3's debug overlay (src/app/stats.rs), kept across launches in native.json `stats`.
+  ToggleStats { MenuItem: {bar: "View", title: "Debug Stats", sep: 1} }
+
+  // Back to the Archive after opening something from it, else the previous object.
+  PrevObject { MenuItem: {bar: "Go", title: "Previous Object"} }
+  NextObject { MenuItem: {bar: "Go", title: "Next Object"} }
+  prefab SelectIndex
+  Select1 : act.SelectIndex { SelectN: {n: 1} }
+  Select2 : act.SelectIndex { SelectN: {n: 2} }
+  Select3 : act.SelectIndex { SelectN: {n: 3} }
+  Select4 : act.SelectIndex { SelectN: {n: 4} }
+  Select5 : act.SelectIndex { SelectN: {n: 5} }
+  Select6 : act.SelectIndex { SelectN: {n: 6} }
+  Select7 : act.SelectIndex { SelectN: {n: 7} }
+  Select8 : act.SelectIndex { SelectN: {n: 8} }
+  Select9 : act.SelectIndex { SelectN: {n: 9} }
+
+  Minimize { Selector: {sel: "performMiniaturize:"}
+    MenuItem: {bar: "Window", title: "Minimize"} }
+
+  // The tree, while it has the keyboard (a row was pressed): Finder's and Xcode's arrows.
+  TreeUp {}
+  TreeDown {}
+  // Fold the selected row (or go to its parent); with Option, its siblings too.
+  TreeFold {}
+  TreeUnfold {}
+  // Hand the keyboard back to the terminal.
+  TreeLeave {}
+
+  // The palette's, and the picker's too (its rows are the palette's entries while it is open; its arrows go round).
+  PaletteClose {}
+  PaletteUp {}
+  PaletteDown {}
+  PaletteRun {}
+  PaletteErase {}
+
+  SearchClear {}
+  SearchErase {}
+  ArchiveOpenFirst {}
+
+  // Natural text editing (iTerm2's and Ghostty's preset), whatever the program's keyboard mode. Bytes are in caret
+  // notation: ^[ is escape, ^? is DEL, ^A..^_ are the control characters.
+  prefab SendBytes
+  WordLeft : act.SendBytes { Bytes: {bytes: "^[b"} }
+  WordRight : act.SendBytes { Bytes: {bytes: "^[f"} }
+  WordErase : act.SendBytes { Bytes: {bytes: "^[^?"} }
+  WordDelete : act.SendBytes { Bytes: {bytes: "^[d"} }
+  LineStart : act.SendBytes { Bytes: {bytes: "^A"} }
+  LineEnd : act.SendBytes { Bytes: {bytes: "^E"} }
+  LineErase : act.SendBytes { Bytes: {bytes: "^U"} }
+  Undo : act.SendBytes { Bytes: {bytes: "^_"} }
+
+  // The chat input's editing (src/app/chat.rs): each an EditOp.
+  prefab Edit
+  ChatSend : act.Edit { EditOp: {op: "send"} }
+  ChatNewline : act.Edit { EditOp: {op: "newline"} }
+  ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
+  ChatLeft : act.Edit { EditOp: {op: "left"} }
+  ChatRight : act.Edit { EditOp: {op: "right"} }
+  ChatUp : act.Edit { EditOp: {op: "up"} }
+  ChatDown : act.Edit { EditOp: {op: "down"} }
+  ChatWordLeft : act.Edit { EditOp: {op: "word_left"} }
+  ChatWordRight : act.Edit { EditOp: {op: "word_right"} }
+  ChatLineStart : act.Edit { EditOp: {op: "line_start"} }
+  ChatLineEnd : act.Edit { EditOp: {op: "line_end"} }
+  ChatDocStart : act.Edit { EditOp: {op: "doc_start"} }
+  ChatDocEnd : act.Edit { EditOp: {op: "doc_end"} }
+  ChatSelectLeft : act.Edit { EditOp: {op: "select_left"} }
+  ChatSelectRight : act.Edit { EditOp: {op: "select_right"} }
+  ChatSelectUp : act.Edit { EditOp: {op: "select_up"} }
+  ChatSelectDown : act.Edit { EditOp: {op: "select_down"} }
+  ChatSelectWordLeft : act.Edit { EditOp: {op: "select_word_left"} }
+  ChatSelectWordRight : act.Edit { EditOp: {op: "select_word_right"} }
+  ChatSelectLineStart : act.Edit { EditOp: {op: "select_line_start"} }
+  ChatSelectLineEnd : act.Edit { EditOp: {op: "select_line_end"} }
+  ChatBackspace : act.Edit { EditOp: {op: "backspace"} }
+  ChatDelete : act.Edit { EditOp: {op: "delete"} }
+  ChatWordErase : act.Edit { EditOp: {op: "word_erase"} }
+  ChatWordDelete : act.Edit { EditOp: {op: "word_delete"} }
+  ChatLineErase : act.Edit { EditOp: {op: "line_erase"} }
+  ChatCut : act.Edit { EditOp: {op: "cut"} }
+}
+
+// ---- bindings ----
+
+@tree ChildOf
+key {
+  hide { Keybind: {key: "h", cmd: 1}
+    (Does, act.Hide) }
+  quit { Keybind: {key: "q", cmd: 1}
+    (Does, act.Quit) }
+
+  pick_new { Keybind: {key: "n", cmd: 1}
+    (Does, act.Picker) }
+  new_shell { Keybind: {key: "n", cmd: 1, shift: 1}
+    (Does, act.SpawnShell) }
+  new_claude { Keybind: {key: "t", cmd: 1}
+    (Does, act.SpawnClaude) }
+  new_codex { Keybind: {key: "t", cmd: 1, shift: 1}
+    (Does, act.SpawnCodex) }
+  archive { Keybind: {key: "w", cmd: 1}
+    (Does, act.Archive) }
+
+  copy { Keybind: {key: "c", cmd: 1}
+    (Does, act.Copy) }
+  paste { Keybind: {key: "v", cmd: 1}
+    (Does, act.Paste) }
+  select_all { Keybind: {key: "a", cmd: 1}
+    (Does, act.SelectAll) }
+  emoji { Keybind: {key: "space", cmd: 1, ctrl: 1}
+    (Does, act.EmojiPicker) }
+
+  sidebar { Keybind: {key: "s", cmd: 1}
+    (Does, act.ToggleSidebar) }
+  palette { Keybind: {key: "k", cmd: 1}
+    (Does, act.Palette) }
+  zoom_in { Keybind: {key: "=", cmd: 1}
+    (Does, act.ZoomIn) }
+  // cmd+plus as most keyboards type it.
+  zoom_in_plus { Keybind: {key: "=", cmd: 1, shift: 1}
+    (Does, act.ZoomIn) }
+  zoom_out { Keybind: {key: "-", cmd: 1}
+    (Does, act.ZoomOut) }
+  zoom_reset { Keybind: {key: "0", cmd: 1}
+    (Does, act.ZoomReset) }
+  // Global (no When): it holds while the terminal has the keyboard too, and F3 never reaches the program.
+  stats { Keybind: {key: "f3"}
+    (Does, act.ToggleStats) }
+
+  prev { Keybind: {key: "[", cmd: 1}
+    (Does, act.PrevObject) }
+  next { Keybind: {key: "]", cmd: 1}
+    (Does, act.NextObject) }
+  select_1 { Keybind: {key: "1", cmd: 1}
+    (Does, act.Select1) }
+  select_2 { Keybind: {key: "2", cmd: 1}
+    (Does, act.Select2) }
+  select_3 { Keybind: {key: "3", cmd: 1}
+    (Does, act.Select3) }
+  select_4 { Keybind: {key: "4", cmd: 1}
+    (Does, act.Select4) }
+  select_5 { Keybind: {key: "5", cmd: 1}
+    (Does, act.Select5) }
+  select_6 { Keybind: {key: "6", cmd: 1}
+    (Does, act.Select6) }
+  select_7 { Keybind: {key: "7", cmd: 1}
+    (Does, act.Select7) }
+  select_8 { Keybind: {key: "8", cmd: 1}
+    (Does, act.Select8) }
+  select_9 { Keybind: {key: "9", cmd: 1}
+    (Does, act.Select9) }
+
+  minimize { Keybind: {key: "m", cmd: 1}
+    (Does, act.Minimize) }
+
+  tree_up { Keybind: {key: "up"}
+    (Does, act.TreeUp)
+    (When, ctx.Tree) }
+  tree_down { Keybind: {key: "down"}
+    (Does, act.TreeDown)
+    (When, ctx.Tree) }
+  tree_fold { Keybind: {key: "left"}
+    (Does, act.TreeFold)
+    (When, ctx.Tree) }
+  tree_fold_siblings { Keybind: {key: "left", opt: 1}
+    (Does, act.TreeFold)
+    (When, ctx.Tree) }
+  tree_unfold { Keybind: {key: "right"}
+    (Does, act.TreeUnfold)
+    (When, ctx.Tree) }
+  tree_unfold_siblings { Keybind: {key: "right", opt: 1}
+    (Does, act.TreeUnfold)
+    (When, ctx.Tree) }
+  tree_return { Keybind: {key: "return"}
+    (Does, act.TreeLeave)
+    (When, ctx.Tree) }
+  tree_escape { Keybind: {key: "escape"}
+    (Does, act.TreeLeave)
+    (When, ctx.Tree) }
+
+  palette_escape { Keybind: {key: "escape"}
+    (Does, act.PaletteClose)
+    (When, ctx.Palette) }
+  palette_up { Keybind: {key: "up"}
+    (Does, act.PaletteUp)
+    (When, ctx.Palette) }
+  palette_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Palette) }
+  palette_return { Keybind: {key: "return"}
+    (Does, act.PaletteRun)
+    (When, ctx.Palette) }
+  palette_enter { Keybind: {key: "enter"}
+    (Does, act.PaletteRun)
+    (When, ctx.Palette) }
+  palette_backspace { Keybind: {key: "backspace"}
+    (Does, act.PaletteErase)
+    (When, ctx.Palette) }
+
+  // The picker: arrows or Tab move the highlight, Return starts it, a digit (first, so the keycaps show it) or a letter
+  // starts one at once, Escape closes it.
+  picker_escape { Keybind: {key: "escape"}
+    (Does, act.PaletteClose)
+    (When, ctx.Picker) }
+  picker_up { Keybind: {key: "up"}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_tab { Keybind: {key: "tab"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_backtab { Keybind: {key: "tab", shift: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_return { Keybind: {key: "return"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_enter { Keybind: {key: "enter"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_1 { Keybind: {key: "1"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_2 { Keybind: {key: "2"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_3 { Keybind: {key: "3"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_4 { Keybind: {key: "4"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
+  picker_claude { Keybind: {key: "c"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_codex { Keybind: {key: "x"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_cursor { Keybind: {key: "u"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_shell { Keybind: {key: "s"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
+
+  archive_escape { Keybind: {key: "escape"}
+    (Does, act.SearchClear)
+    (When, ctx.Archive) }
+  archive_backspace { Keybind: {key: "backspace"}
+    (Does, act.SearchErase)
+    (When, ctx.Archive) }
+  archive_return { Keybind: {key: "return"}
+    (Does, act.ArchiveOpenFirst)
+    (When, ctx.Archive) }
+  archive_enter { Keybind: {key: "enter"}
+    (Does, act.ArchiveOpenFirst)
+    (When, ctx.Archive) }
+
+  word_left { Keybind: {key: "left", opt: 1}
+    (Does, act.WordLeft)
+    (When, ctx.Terminal) }
+  word_right { Keybind: {key: "right", opt: 1}
+    (Does, act.WordRight)
+    (When, ctx.Terminal) }
+  word_erase { Keybind: {key: "backspace", opt: 1}
+    (Does, act.WordErase)
+    (When, ctx.Terminal) }
+  word_delete { Keybind: {key: "delete", opt: 1}
+    (Does, act.WordDelete)
+    (When, ctx.Terminal) }
+  line_start { Keybind: {key: "left", cmd: 1}
+    (Does, act.LineStart)
+    (When, ctx.Terminal) }
+  line_end { Keybind: {key: "right", cmd: 1}
+    (Does, act.LineEnd)
+    (When, ctx.Terminal) }
+  line_erase { Keybind: {key: "backspace", cmd: 1}
+    (Does, act.LineErase)
+    (When, ctx.Terminal) }
+  undo { Keybind: {key: "z", cmd: 1}
+    (Does, act.Undo)
+    (When, ctx.Terminal) }
+
+  chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
+  chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
+  chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  chat_left { Keybind: {key: "left"}; (Does, act.ChatLeft); (When, ctx.Chat) }
+  chat_right { Keybind: {key: "right"}; (Does, act.ChatRight); (When, ctx.Chat) }
+  chat_up { Keybind: {key: "up"}; (Does, act.ChatUp); (When, ctx.Chat) }
+  chat_down { Keybind: {key: "down"}; (Does, act.ChatDown); (When, ctx.Chat) }
+  chat_word_left { Keybind: {key: "left", opt: 1}; (Does, act.ChatWordLeft); (When, ctx.Chat) }
+  chat_word_right { Keybind: {key: "right", opt: 1}; (Does, act.ChatWordRight); (When, ctx.Chat) }
+  chat_line_start { Keybind: {key: "left", cmd: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }
+  chat_line_end { Keybind: {key: "right", cmd: 1}; (Does, act.ChatLineEnd); (When, ctx.Chat) }
+  chat_ctrl_a { Keybind: {key: "a", ctrl: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }
+  chat_ctrl_e { Keybind: {key: "e", ctrl: 1}; (Does, act.ChatLineEnd); (When, ctx.Chat) }
+  chat_doc_start { Keybind: {key: "up", cmd: 1}; (Does, act.ChatDocStart); (When, ctx.Chat) }
+  chat_doc_end { Keybind: {key: "down", cmd: 1}; (Does, act.ChatDocEnd); (When, ctx.Chat) }
+  chat_sel_left { Keybind: {key: "left", shift: 1}; (Does, act.ChatSelectLeft); (When, ctx.Chat) }
+  chat_sel_right { Keybind: {key: "right", shift: 1}; (Does, act.ChatSelectRight); (When, ctx.Chat) }
+  chat_sel_up { Keybind: {key: "up", shift: 1}; (Does, act.ChatSelectUp); (When, ctx.Chat) }
+  chat_sel_down { Keybind: {key: "down", shift: 1}; (Does, act.ChatSelectDown); (When, ctx.Chat) }
+  chat_sel_word_left { Keybind: {key: "left", shift: 1, opt: 1}; (Does, act.ChatSelectWordLeft); (When, ctx.Chat) }
+  chat_sel_word_right { Keybind: {key: "right", shift: 1, opt: 1}; (Does, act.ChatSelectWordRight); (When, ctx.Chat) }
+  chat_sel_line_start { Keybind: {key: "left", shift: 1, cmd: 1}; (Does, act.ChatSelectLineStart); (When, ctx.Chat) }
+  chat_sel_line_end { Keybind: {key: "right", shift: 1, cmd: 1}; (Does, act.ChatSelectLineEnd); (When, ctx.Chat) }
+  chat_backspace { Keybind: {key: "backspace"}; (Does, act.ChatBackspace); (When, ctx.Chat) }
+  chat_delete { Keybind: {key: "delete"}; (Does, act.ChatDelete); (When, ctx.Chat) }
+  chat_word_erase { Keybind: {key: "backspace", opt: 1}; (Does, act.ChatWordErase); (When, ctx.Chat) }
+  chat_word_delete { Keybind: {key: "delete", opt: 1}; (Does, act.ChatWordDelete); (When, ctx.Chat) }
+  chat_line_erase { Keybind: {key: "backspace", cmd: 1}; (Does, act.ChatLineErase); (When, ctx.Chat) }
+  chat_cut { Keybind: {key: "x", cmd: 1}; (Does, act.ChatCut); (When, ctx.Chat) }
+}

@@ -1,0 +1,224 @@
+{
+ "about": "The real code blaze is judged on (AGENTS.md rule verify-on-real-projects; pins.py reads it). `crates`: top crates of crates.io for corpus.py, each pinned, fetched from static.crates.io as its .crate, checked against the sparse index's cksum, and its own tests run by `blaze test` and judged by their own verdicts; chosen so that no test needs the network, a service, trybuild or a rustc of its own; versions the newest unyanked release on 2026-10-29. `workspaces`: whole workspaces for realprojects.py, each at a commit and that commit's git tree id (looked up on GitHub on 2026-11-03), built with `blaze build --workspace --all-targets` and tested with `blaze test --workspace`; where blaze_cli.py pins the same project it pins the same commit.",
+ "crates": [
+  {"name": "adler2", "version": "2.0.1"},
+  {"name": "aho-corasick", "version": "1.1.5"},
+  {"name": "anstyle", "version": "1.0.14"},
+  {"name": "arrayvec", "version": "0.7.8"},
+  {"name": "base64", "version": "0.23.1"},
+  {"name": "byteorder", "version": "1.5.0"},
+  {"name": "bytes", "version": "1.12.1"},
+  {"name": "camino", "version": "1.2.6"},
+  {"name": "cfg-if", "version": "1.0.5"},
+  {"name": "crc32fast", "version": "1.5.3"},
+  {"name": "crossbeam-utils", "version": "0.8.23"},
+  {"name": "either", "version": "1.19.0"},
+  {"name": "equivalent", "version": "1.0.3"},
+  {"name": "fastrand", "version": "2.5.0"},
+  {"name": "fnv", "version": "1.0.7"},
+  {"name": "form_urlencoded", "version": "1.2.2"},
+  {"name": "hashbrown", "version": "0.17.1"},
+  {"name": "heck", "version": "0.5.0"},
+  {"name": "indexmap", "version": "2.14.2"},
+  {"name": "itertools", "version": "0.15.0"},
+  {"name": "itoa", "version": "1.0.18"},
+  {"name": "log", "version": "0.4.34"},
+  {"name": "memchr", "version": "2.8.3"},
+  {"name": "memoffset", "version": "0.9.1"},
+  {"name": "num-integer", "version": "0.1.47"},
+  {"name": "num-traits", "version": "0.2.19"},
+  {"name": "once_cell", "version": "1.21.4"},
+  {"name": "percent-encoding", "version": "2.3.2"},
+  {"name": "rand_chacha", "version": "0.10.0"},
+  {"name": "rand_core", "version": "0.10.1"},
+  {"name": "regex-syntax", "version": "0.8.11"},
+  {"name": "ryu", "version": "1.0.23"},
+  {"name": "same-file", "version": "1.0.6"},
+  {"name": "scopeguard", "version": "1.2.0"},
+  {"name": "semver", "version": "1.0.28"},
+  {"name": "sha2", "version": "0.11.1"},
+  {"name": "shlex", "version": "2.0.1"},
+  {"name": "siphasher", "version": "1.0.4"},
+  {"name": "smallvec", "version": "1.16.4"},
+  {"name": "static_assertions", "version": "1.1.0"},
+  {"name": "strsim", "version": "0.11.1"},
+  {"name": "tempfile", "version": "3.27.0"},
+  {"name": "typenum", "version": "1.20.1"},
+  {"name": "unicase", "version": "2.10.0"},
+  {"name": "unicode-bidi", "version": "0.3.18"},
+  {"name": "unicode-ident", "version": "1.0.27"},
+  {"name": "unicode-normalization", "version": "0.1.26"},
+  {"name": "unicode-segmentation", "version": "1.13.3"},
+  {"name": "unicode-width", "version": "0.2.3"},
+  {"name": "url", "version": "2.5.8"},
+  {"name": "utf8parse", "version": "0.2.2"},
+  {"name": "walkdir", "version": "2.5.0"}
+ ],
+ "workspaces": [
+  {
+   "name": "blaze",
+   "repo": "self",
+   "tag": "",
+   "rev": "",
+   "tree": "",
+   "lock": "committed",
+   "minutes": 180,
+   "why": "blaze builds blaze (rule blaze-builds-blaze): this repository at the run's commit, exported with git archive"
+  },
+  {
+   "name": "ripgrep",
+   "repo": "BurntSushi/ripgrep",
+   "tag": "15.1.0",
+   "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+   "tree": "d5761395cbe3c315222cae65865599512c2ed141",
+   "lock": "committed",
+   "minutes": 60,
+   "sandbox_tests": true,
+   "why": "a mid-size workspace with a build script, integration tests that run the binary, and blaze_cli.py's pin; its tests run in blaze's sandbox (`sandboxed-tests`)"
+  },
+  {
+   "name": "nushell",
+   "repo": "nushell/nushell",
+   "tag": "0.108.0",
+   "rev": "da141be11b3acaa55b39321e5f9651d02aa2ed6f",
+   "tree": "77049ad547dfa11deff81a5310e6b6aa36ad31fa",
+   "lock": "committed",
+   "minutes": 180,
+   "why": "40-odd crates, heavy proc macros (nu-protocol derives) and a large test suite; blaze_cli.py's pin"
+  },
+  {
+   "name": "helix",
+   "repo": "helix-editor/helix",
+   "tag": "25.07.1",
+   "rev": "a05c151bb6e8e9c65ec390b0ae2afe7a5efd619b",
+   "tree": "fb2aba551c6e716dc2e0213085924b819f62776a",
+   "lock": "committed",
+   "minutes": 120,
+   "env": [
+    {"name": "HELIX_DISABLE_AUTO_GRAMMAR_BUILD", "value": "1"}
+   ],
+   "why": "an editor with tree-sitter's C code built by build scripts; the grammars' own fetch and build is off as blaze_cli.py has it"
+  },
+  {
+   "name": "wasmtime",
+   "repo": "bytecodealliance/wasmtime",
+   "tag": "v49.0.3",
+   "rev": "f96eabaa11a06086e4fb779ed1c1688481067ab9",
+   "tree": "520fd9d4c09a647e9ee10f49feec90ac7368999e",
+   "lock": "committed",
+   "submodules": true,
+   "minutes": 240,
+   "env": [
+    {"name": "CARGO_PROFILE_DEV_DEBUG", "value": "0"},
+    {"name": "CARGO_PROFILE_TEST_DEBUG", "value": "0"}
+   ],
+   "why": "a JIT (Cranelift) and its spec test suite from submodules; debug info off as blaze_cli.py has it (8.5 GB of target with it)"
+  },
+  {
+   "name": "rust-analyzer",
+   "repo": "rust-lang/rust-analyzer",
+   "tag": "2026-10-12",
+   "rev": "2ad81e72b7e978cb800dffe1bcce5c9f98032acf",
+   "tree": "2637a0913e414672e73a5048e9256c7383ebe76e",
+   "lock": "committed",
+   "minutes": 180,
+   "why": "salsa, deep generics and expect-test snapshots; blaze_cli.py's pin"
+  },
+  {
+   "name": "cargo",
+   "repo": "rust-lang/cargo",
+   "tag": "0.99.0",
+   "rev": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+   "tree": "4007da55f36ad45f760b98668fc17807030ef22f",
+   "lock": "committed",
+   "minutes": 180,
+   "why": "cargo's workspace; its testsuite runs the cargo it built, never a host cargo; blaze_cli.py's cargo-lib pin"
+  },
+  {
+   "name": "bevy",
+   "repo": "bevyengine/bevy",
+   "tag": "v0.20.1",
+   "rev": "a0577b5c6a7b208719dd761c5c6a7a539e472a97",
+   "tree": "9c124ec0183f5626a6f0d98c012147a1f38fac3d",
+   "lock": "harness",
+   "minutes": 240,
+   "why": "an ECS with heavy generics, derive macros and trait-object plumbing; on Linux its build scripts need alsa, udev, wayland and xkbcommon's headers (realprojects.yaml installs them)"
+  },
+  {
+   "name": "tokio",
+   "repo": "tokio-rs/tokio",
+   "tag": "tokio-1.54.1",
+   "rev": "b53b2001ed2ccfd9b87e32a0c6da1a1eebdc80b8",
+   "tree": "2ee623ebd7bce8c2a541079a70f1fe819284c3b3",
+   "lock": "harness",
+   "minutes": 120,
+   "build_args": [
+    "--features",
+    "full"
+   ],
+   "test_args": [
+    "--features",
+    "full"
+   ],
+   "why": "the async runtime: atomics, unsafe, macros; `full` as tokio's CI tests it"
+  },
+  {
+   "name": "serde",
+   "repo": "serde-rs/serde",
+   "tag": "v1.0.229",
+   "rev": "7fc3b4c30c94f73a96ebd1553f2b090d928fc3a8",
+   "tree": "270b096a94762d4b952aa97f3e54f07f707fec28",
+   "lock": "harness",
+   "minutes": 60,
+   "why": "serde and serde_derive with test_suite's derive cases"
+  },
+  {
+   "name": "rayon",
+   "repo": "rayon-rs/rayon",
+   "tag": "v1.12.0",
+   "rev": "c9ced185ae3508246a9eb70c8407a1199bb1b77f",
+   "tree": "c8a22330fb9412e6df621f8b05484cbe8538f8da",
+   "lock": "harness",
+   "minutes": 60,
+   "why": "work stealing, threads, unwinding across them"
+  },
+  {
+   "name": "regex",
+   "repo": "rust-lang/regex",
+   "tag": "1.13.1",
+   "rev": "2b527599eb9eea0dcc288c704584f242f26a5c61",
+   "tree": "25bea9f6f55a4cf528afefaa00f5335c595c182c",
+   "lock": "harness",
+   "minutes": 90,
+   "why": "regex, regex-automata and regex-syntax with their large TOML-driven test suites"
+  },
+  {
+   "name": "hyper",
+   "repo": "hyperium/hyper",
+   "tag": "v1.12.0",
+   "rev": "7f67699ce32d717081deb7018b4da7d679277ac0",
+   "tree": "cabb742c03aa16901602eedc568ffe775602d5bd",
+   "lock": "harness",
+   "minutes": 90,
+   "build_args": [
+    "--features",
+    "full"
+   ],
+   "test_args": [
+    "--features",
+    "full"
+   ],
+   "why": "HTTP on tokio, tests over loopback sockets; `full` as hyper's CI tests it"
+  },
+  {
+   "name": "polars",
+   "repo": "pola-rs/polars",
+   "tag": "py-2.1.0",
+   "rev": "7f902bd3ffd27ff82d14278a09a295ff2f7aed92",
+   "tree": "cf904bbdb6e215fd2a27a8c8c5e1dcc425568f40",
+   "lock": "committed",
+   "minutes": 300,
+   "why": "a large dataframe engine: SIMD, arrow, very deep generics; the biggest workspace here (its rust-toolchain.toml is ignored, rule own-nightly)"
+  }
+ ]
+}

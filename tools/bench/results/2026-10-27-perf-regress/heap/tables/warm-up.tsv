@@ -1,0 +1,276 @@
+kind	count	fields	metadata	heap	name
+query	46646	26121760	49919792		InferenceResult < 'db >::for_body_
+query	52839	55797984	5412264		inlinable
+query	43211	18667152	20389544		compiled_instance
+struct	446852	12511856	23236304		row_place::interned_arguments
+query	446852	7149632	24576096		row_place
+query	48169	15799432	14151000		mir_body_query
+query	34831	15046992	11775752		compiled_root
+query	141001	18048128	5640040		ModuleScope < 'db >::name_
+query	47402	15547856	7170600		runtime_mir_body_query
+query	87742	13336784	9132424	0	Body::relative_
+query	87742	16846464	5147136		body_syntax
+query	261847	4189552	14920672		source_place
+struct	261847	5236940	13616044		source_place::interned_arguments
+query	147239	2355824	12000192		row_location_in_file
+query	61928	7926784	5567208		FunctionSignature::with_source_map_
+struct	147239	4122692	7656428		row_location_in_file::interned_arguments
+struct	19232	10616064	923136		ModuleScope
+struct	136162	3267888	7625072		SyntaxContextImpl
+query	34032	5172864	5130592	0	Body::with_source_map_
+struct	141001	2256016	7896056		ModuleScope < 'db >::name_::interned_arguments
+query	57308	6876960	2567072	0	MacroCallId::parse_macro_expansion_
+struct	61806	5933376	3461136		MacroCallId
+struct	123673	1978768	6925688		ModuleScope < 'db >::legacy_macro_::interned_arguments
+query	43203	1728120	6651248		fn_sig_for_fn
+query	24835	596040	7532856		lookup_impl_method_stored
+query	123673	1978768	5936304		ModuleScope < 'db >::legacy_macro_
+query	76648	1226368	6445336		layout_of_ty_query
+query	69303	2217696	5290280		GenericPredicates::query_with_diagnostics_
+query	17119	3423800	3841840		block_def_map
+query	51978	4574064	2546352		MacroCallId::macro_arg_
+query	52832	4649216	2097072	0	HirFileId::ast_id_map_
+query	102824	822592	5880128		AttrFlags::query_
+query	42888	1029312	5627200		instance_rows
+query	41810	334480	5800632		told_type
+struct	76648	1839552	4292288		layout_of_ty_query::interned_arguments
+query	13818	4532304	897880		monomorphized_runtime_mir_body_query
+struct	65472	1833216	3404544		FunctionId
+query	34831	835944	4367080		root_rows
+query	26569	1275312	3815224		instance_mark
+struct	52839	2113560	2958984		inlinable::interned_arguments
+query	24527	3139456	1829624		ImplSignature::with_source_map_
+query	43461	3129192	1738440		ExprScopes::body_expr_scopes_
+query	87742	701936	3757096		Body::of_
+query	29716	475456	3872656		layout_of_adt_query
+struct	43211	1728440	2419816		compiled_instance::interned_arguments
+struct	42888	1715520	2401728		instance_rows::interned_arguments
+query	46646	373168	3658528		body_upvars_mentioned
+query	24513	588312	3419032		impl_trait_with_diagnostics
+struct	40756	1630240	2282336		TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_::interned_arguments
+query	58624	468992	3374192		AttrFlags::export_name_
+struct	41810	1337920	2341360		told_type::interned_arguments
+query	49209	393672	3242880		trait_environment_query
+query	48169	1156056	2464368		failed_expansion
+query	38523	616368	2964376		debug_declaration_location
+query	24527	392432	3048192		impl_self_ty_with_diagnostics
+query	8918	499408	2821368		const_eval_query
+query	37906	1212992	2041576		body_print
+query	19020	2282400	760800		Modules < 'db >::module_
+query	61928	495424	2477120		FunctionSignature::of_
+query	26658	853056	2055304		ImplItems::of_
+struct	29716	1188640	1664096		layout_of_adt_query::interned_arguments
+query	2901	139248	2460424		borrowck
+struct	26569	1062760	1487864		instance_serial::interned_arguments
+struct	26569	1062760	1487864		instance_mark::interned_arguments
+query	40756	652096	1630240		TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_
+struct	24835	794720	1390760		lookup_impl_method_stored::interned_arguments
+struct	27289	654936	1528184		ImplId
+query	22048	352768	1587456		anchor_location
+query	26569	425104	1487864		instance_serial
+struct	17181	1099584	687240		Modules
+query	22057	352912	1411648		declaration_location
+struct	21930	614040	1140360		ConstId
+query	17119	821712	906944		block_item_tree_query
+query	6131	490480	1077088		prove_query
+struct	19857	397140	1032564		file_item_tree_query::interned_arguments
+query	22048	352768	1058304		anchor_rows
+struct	19020	304320	1065120		Modules < 'db >::module_::interned_arguments
+struct	13818	552720	773808		monomorphized_runtime_mir_body_query::interned_arguments
+query	19857	158856	1125360		file_item_tree_query
+query	15178	485696	782120		location_macros
+query	5913	756864	492744		ConstSignature::with_source_map_
+query	14924	477568	771952		located_concats
+struct	17119	273904	958664		block_item_tree_query::interned_arguments
+struct	19232	615424	615424		ModuleIdLt
+query	24527	196216	981080		ImplSignature::of_
+query	4663	223824	946848		root_mark
+query	804	450240	543264		InferenceResult < 'db >::for_anon_const_
+query	4638	593664	378992		TypeAliasSignature::with_source_map_
+struct	17119	410856	547808		BlockIdLt
+query	1633	535624	421216		mir_body_for_closure_query
+query	4511	577408	308352		VariantFields::with_source_map_
+query	5834	93344	781104		type_for_const_with_diagnostics
+query	1625	533000	333408		runtime_mir_body_for_closure_query
+query	4535	108840	694976		type_for_type_alias_with_diagnostics
+query	9317	74536	716816		impl_super_outlives
+struct	8918	285376	499408		const_eval_query::interned_arguments
+query	3601	460928	310072		StructSignature::with_source_map_
+query	2557	143192	567056		anon_const_eval_query
+query	4508	144256	559736		field_types_with_diagnostics
+query	6029	241160	419912		body_types
+query	9517	114204	504476		AssocItemId::assoc_visibility_
+struct	6131	245240	343336		prove_query::interned_arguments
+struct	6029	241160	337624		body_types::interned_arguments
+query	1430	469040	100880		monomorphized_promoted_mir_body_query
+query	4625	4625	558751		is_copy_query
+query	5301	5301	553507		specializes_query
+query	3355	80520	470312		wfcheck
+struct	6777	189756	352404		TypeAliasId
+struct	6390	153360	357840		UseId
+query	8430	134880	337200		ModuleScope < 'db >::traits_
+query	864	283392	172744		promoted_mir_body_query
+query	4328	138496	309376		const_param_types_with_diagnostics
+query	3307	79368	328880		elided_lifetimes
+query	5915	94640	306416		generic_defaults_with_diagnostics
+query	2633	2633	395447		drop_glue_query
+query	864	283392	108960		runtime_promoted_mir_body_query
+struct	5301	84816	296856		specializes_query::interned_arguments
+struct	4625	111000	259000		is_copy_query::interned_arguments
+query	4663	74608	261128		root_serial
+query	1250	40000	289912		normalize_query
+query	2767	44272	256808		source_location_in_file
+struct	3717	89208	208152		StructId
+query	5913	47304	236520		ConstSignature::of_
+query	2633	21064	259624		AttrFlags::link_name_
+query	2056	131584	140960		const_eval_discriminant_variant
+struct	4118	98832	164720		FileText
+query	56	448	237168		TraitImpls < 'db >::for_crate_
+struct	2874	68976	160944		ExternBlockId
+struct	2557	81824	143192		anon_const_eval_query::interned_arguments
+query	4638	37104	185520		TypeAliasSignature::of_
+query	2776	22208	199872		destructor
+query	4511	36088	180440		VariantFields::of_
+struct	2946	47136	164976		TraitImpls < 'db >::blanket_in_crate_and_deps_::interned_arguments
+struct	2633	63192	147448		drop_glue_query::interned_arguments
+query	2829	2829	198899		representability
+struct	2767	55340	143884		source_location_in_file::interned_arguments
+query	62	496	193920		crate_local_def_map
+struct	2180	69760	122080		EnumVariantId
+query	2385	57240	133912		VariantFields::field_visibilities_
+query	967	23208	149896		resolve_type_param_assoc_type_shorthand
+query	3601	28808	144040		StructSignature::of_
+query	2946	47136	117840		TraitImpls < 'db >::blanket_in_crate_and_deps_
+query	56	1792	154224		InherentImpls < 'db >::for_crate_
+query	2096	50304	104128		closures_around_query
+struct	2096	33536	117376		closures_around_query::interned_arguments
+struct	1703	54496	95368		AnonConstId
+struct	1430	57200	80080		monomorphized_promoted_mir_body_query::interned_arguments
+query	2354	4708	127116		extern_block_abi
+struct	4118	16472	115304		FileSourceRootInput
+struct	1476	47232	82656		InherentImpls < 'db >::in_crate_for_self_ty_::interned_arguments
+query	578	73984	50720		TraitSignature::with_source_map_
+query	1670	1670	118266		impl_has_unconstrained_params
+struct	1653	33060	85956		InternedClosureId
+query	56	110656	4248		lang_items
+struct	1250	40000	70000		normalize_query::interned_arguments
+query	767	55224	50184		drop_constraint
+query	476	60928	41808		EnumSignature::with_source_map_
+query	1422	45504	56880	0	EditionedFileId::parse_
+query	1378	33072	66144		real_span_map
+struct	967	38680	54152		resolve_type_param_assoc_type_shorthand::interned_arguments
+query	1119	17904	74376		params_in_repr
+query	1169	28056	61464		AttrFlags::repr_assume_has_
+struct	1547	6188	80444		EditionedFileId
+struct	1185	18960	66360		closure_exprs::interned_arguments
+query	239	13384	70072		const_eval_static_query
+query	1476	23616	59040		InherentImpls < 'db >::in_crate_for_self_ty_
+query	778	18672	62944		inferred_outlives
+query	1451	23216	58040		macro_definitions
+query	1249	9992	67528		variances_of_query
+query	251	40160	35160		compiled_static
+query	321	41088	27928		StaticSignature::with_source_map_
+query	1047	25128	41880		line_starts
+query	1185	18960	47400		closure_exprs
+query	583	18656	46464		TraitItems::query_with_diagnostics_
+query	669	21408	42552		AstId < ast :: Macro >::decl_macro_expander_
+struct	864	13824	48384		promoted_mir_body_query::interned_arguments
+struct	864	13824	48384		runtime_promoted_mir_body_query::interned_arguments
+struct	719	20132	37388		MacroRulesId
+struct	669	16056	37464		AstId < ast :: Macro >::decl_macro_expander_::interned_arguments
+query	1	16	52440		define_opaque_functions
+query	405	25920	22680		EnumVariants::of_
+struct	599	14376	33544		TraitId
+query	253	4048	42808		type_for_static_with_diagnostics
+query	409	29448	16360		ExprScopes::sig_expr_scopes_
+struct	549	13176	30744		EnumId
+query	420	3360	30488		signature_upvars_mentioned
+query	458	10992	22360		fn_sig_for_enum_variant_constructor
+query	428	15408	15408		MacroId::definition_
+query	393	9432	19376		fn_sig_for_struct_constructor
+query	578	4624	23120		TraitSignature::of_
+query	166	7968	18512		supertraits_info
+struct	329	9212	17108		StaticId
+query	476	3808	19040		EnumSignature::of_
+query	62	992	20488		include_macro_invoc
+query	321	2568	18040		AttrFlags::link_section_
+query	56	56	20304		declares_global_allocator
+struct	65	15600	4160		Crate
+query	18	288	19440		source_root_crates
+struct	62	15872	2480		DefMapPair
+query	47	752	16200		macros_writing_impls
+query	251	2008	14488		AttrFlags::linkage_
+query	281	4496	11240		impls_in_bodies
+query	321	2568	12840		StaticSignature::of_
+query	190	190	15034		generics_require_sized_self
+query	137	2192	12448		ItemBounds::of_
+query	96	2304	11560		type_alias_bounds_with_diagnostics
+query	56	896	10728		TraitImpls < 'db >::for_crate_and_deps_
+query	56	896	10608		loaded_crates
+query	164	2624	6560		define_opaque_at
+query	44	704	8224		crates_containing_incoherent_inherent_impls
+query	122	1952	6832		static_serial
+query	125	1000	7000		unstable_feature
+query	27	324	7156		dyn_compatibility_of_trait_query
+query	35	4480	2888		UnionSignature::with_source_map_
+query	52	416	6720		TraitImpls < 'db >::for_block_
+struct	89	2492	4628		Macro2Id
+query	46	4416	1840		target_data_layout_query
+query	93	1488	4504		AttrFlags::native_libs_
+query	89	712	5248		lang_item
+query	63	504	5168		AttrFlags::docs_
+struct	73	1168	4088		InternedOpaqueTyId
+query	59	1888	3304		target_features
+query	56	448	4448		crate_lang_items
+query	74	1184	3552		EditionedFileId::parse_errors_
+query	61	1464	2440		rpit_hidden_types
+struct	43	1032	2408		ExternCrateId
+query	29	2088	1160		ExprScopes::variant_scopes_
+query	32	1536	1536		UnstableFeatures::query_
+struct	38	912	2128		UnionId
+query	30	240	2200		variant_fields_upvars_mentioned
+struct	55	440	1760		SourceRootInput
+query	20	960	1120		generic_params_attr_flags
+query	1	24	1976		named_crates
+query	22	352	1384		AttrFlags::legacy_const_generic_indices_
+query	35	280	1400		UnionSignature::of_
+query	19	152	1072		ctor_variances_query
+struct	18	72	936		InternedSourceRootId
+query	3	72	864		tait_hidden_types
+struct	14	224	448		IncludedFile
+query	1	432	216		compiled_start
+query	2	64	552		deps_of
+query	4	32	448		InherentImpls < 'db >::for_block_
+query	1	328	64		monomorphized_runtime_mir_body_for_closure_query
+query	6	96	240		get_constrained_lifetimes
+query	3	48	144		define_opaque
+query	1	48	128		borrowck_anon_const
+struct	1	32	56		monomorphized_runtime_mir_body_for_closure_query::interned_arguments
+struct	1	32	32		LibraryRoots
+struct	1	32	32		LocalRoots
+struct	1	32	32		ProcessEnv
+struct	1	32	32		ProcMacros
+struct	1	0	56		named_crates::interned_arguments
+struct	1	16	32		AllCrates
+struct	1	8	32		FrozenDefMaps
+struct	1	8	32		FrozenLangItems
+struct	1	8	32		FrozenImpls
+struct	1	1	31		ExpandProcAttrMacros
+struct	0	0	0		BuiltinDeriveImplId
+struct	0	0	0		ProcMacroId
+struct	0	0	0		InternedCoroutineClosureId
+struct	0	0	0		InternedCoroutineId
+struct	0	0	0		InternedFileId
+struct	0	0	0		proc_macro_span::interned_arguments
+struct	0	0	0		monomorphized_mir_body_for_closure_query::interned_arguments
+struct	0	0	0		monomorphized_mir_body_for_coroutine_by_move_query::interned_arguments
+struct	0	0	0		monomorphized_mir_body_for_coroutine_query::interned_arguments
+struct	0	0	0		monomorphized_mir_body_query::interned_arguments
+struct	0	0	0		monomorphized_optimized_mir_body_for_closure_query::interned_arguments
+struct	0	0	0		monomorphized_optimized_mir_body_query::interned_arguments
+struct	0	0	0		optimized_mir_body_for_closure_query::interned_arguments
+struct	0	0	0		optimized_mir_body_query::interned_arguments
+struct	0	0	0		monomorphized_runtime_mir_body_for_coroutine_by_move_query::interned_arguments
+struct	0	0	0		monomorphized_runtime_mir_body_for_coroutine_query::interned_arguments
+struct	0	0	0		cache_code::interned_arguments
+struct	0	0	0		extern_prelude_symbols::interned_arguments

@@ -1,0 +1,56 @@
+[package]
+name = "hir-expand"
+version = "0.0.0"
+repository.workspace = true
+description = "Macro expansion for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+cov-mark.workspace = true
+tracing.workspace = true
+either.workspace = true
+itertools.workspace = true
+smallvec.workspace = true
+triomphe.workspace = true
+blaze-query.workspace = true
+thin-vec.workspace = true
+
+# local deps
+stdx.workspace = true
+intern.workspace = true
+base-db.workspace = true
+cfg.workspace = true
+syntax.workspace = true
+tt.workspace = true
+mbe.workspace = true
+span.workspace = true
+parser.workspace = true
+syntax-bridge.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+blaze-mem.workspace = true
+# The test fixture (`fixture`): a view's files, and the fixture text parser.
+blaze-vfs = { workspace = true, optional = true }
+test-utils = { workspace = true, optional = true }
+
+[dev-dependencies]
+expect-test.workspace = true
+blaze-alloc-count.workspace = true
+blaze-vfs.workspace = true
+syntax-bridge = { workspace = true, features = ["reference"] }
+test-utils.workspace = true
+
+[features]
+# `hir_expand::fixture`, for other crates' tests (as a dev-dependency).
+fixture = ["dep:blaze-vfs", "dep:test-utils"]
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+[workspace]
+members = ["base", "mid", "app"]
+resolver = "2"
+
+[profile.dev]
+debug = false

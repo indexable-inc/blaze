@@ -1,0 +1,15 @@
+// The build (gen/*.ts), run by Bun.
+{
+	"compilerOptions": {
+		"target": "esnext",
+		"lib": ["esnext"],
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"types": ["bun"],
+		"allowImportingTsExtensions": true,
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true
+	},
+	"include": ["**/*.ts"]
+}

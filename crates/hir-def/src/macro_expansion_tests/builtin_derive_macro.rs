@@ -1,0 +1,1151 @@
+//! Tests for `builtin_derive_macro.rs` from `hir_expand`.
+
+use expect_test::expect;
+
+use crate::macro_expansion_tests::{check, check_errors};
+
+#[test]
+fn test_copy_expand_simple() {
+    check(
+        r#"
+//- minicore: derive, copy
+#[derive(Copy)]
+struct Foo;
+"#,
+        expect![[r#"
+#[derive(Copy)]
+struct Foo;
+
+#[automatically_derived] impl <> $crate::marker::Copy for Foo< > where {}"#]],
+    );
+}
+
+#[test]
+fn test_copy_expand_in_core() {
+    check(
+        r#"
+//- /lib.rs crate:core
+#[rustc_builtin_macro]
+macro derive {}
+#[rustc_builtin_macro]
+macro Copy {}
+#[derive(Copy)]
+struct Foo;
+"#,
+        expect![[r#"
+#[rustc_builtin_macro]
+macro derive {}
+#[rustc_builtin_macro]
+macro Copy {}
+#[derive(Copy)]
+struct Foo;
+
+#[automatically_derived] impl <> $crate::marker::Copy for Foo< > where {}"#]],
+    );
+}
+
+#[test]
+fn test_copy_expand_with_type_params() {
+    check(
+        r#"
+//- minicore: derive, copy
+#[derive(Copy)]
+struct Foo<A, B>;
+"#,
+        expect![[r#"
+#[derive(Copy)]
+struct Foo<A, B>;
+
+#[automatically_derived] impl <A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<A, B, > where {}"#]],
+    );
+}
+
+#[test]
+fn test_copy_expand_with_lifetimes() {
+    // We currently just ignore lifetimes
+    check(
+        r#"
+//- minicore: derive, copy
+#[derive(Copy)]
+struct Foo<A, B, 'a, 'b>;
+"#,
+        expect![[r#"
+#[derive(Copy)]
+struct Foo<A, B, 'a, 'b>;
+
+#[automatically_derived] impl <'a, 'b, A: $crate::marker::Copy, B: $crate::marker::Copy, > $crate::marker::Copy for Foo<'a, 'b, A, B, > where {}"#]],
+    );
+}
+
+#[test]
+fn test_clone_expand() {
+    check(
+        r#"
+//- minicore: derive, clone
+#[derive(Clone)]
+enum Command<A, B> {
+    Move { x: A, y: B },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+#[derive(Clone)]
+enum Command<A, B> {
+    Move { x: A, y: B },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <A: $crate::clone::Clone, B: $crate::clone::Clone, > $crate::clone::Clone for Command<A, B, > where {
+    fn clone(&self ) -> Self {
+        match self {
+            Command::Move {
+                x: x_self, y: y_self,
+            }
+            =>Command::Move {
+                x: $crate::clone::Clone::clone(x_self), y: $crate::clone::Clone::clone(y_self),
+            }
+            , Command::Do(f0_self, )=>Command::Do($crate::clone::Clone::clone(f0_self), ), Command::Jump=>Command::Jump,
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_clone_expand_with_associated_types() {
+    check(
+        r#"
+//- minicore: derive, clone
+trait Trait {
+    type InWc;
+    type InFieldQualified;
+    type InFieldShorthand;
+    type InGenericArg;
+}
+trait Marker {}
+struct Vec<T>(T);
+
+#[derive(Clone)]
+struct Foo<T: Trait>
+where
+    <T as Trait>::InWc: Marker,
+{
+    qualified: <T as Trait>::InFieldQualified,
+    shorthand: T::InFieldShorthand,
+    generic: Vec<T::InGenericArg>,
+}
+"#,
+        expect![[r#"
+trait Trait {
+    type InWc;
+    type InFieldQualified;
+    type InFieldShorthand;
+    type InGenericArg;
+}
+trait Marker {}
+struct Vec<T>(T);
+
+#[derive(Clone)]
+struct Foo<T: Trait>
+where
+    <T as Trait>::InWc: Marker,
+{
+    qualified: <T as Trait>::InFieldQualified,
+    shorthand: T::InFieldShorthand,
+    generic: Vec<T::InGenericArg>,
+}
+
+#[automatically_derived] impl <T: $crate::clone::Clone, > $crate::clone::Clone for Foo<T, > where <T as Trait>::InWc: Marker, T: Trait, T::InFieldShorthand: $crate::clone::Clone, T::InGenericArg: $crate::clone::Clone, {
+    fn clone(&self ) -> Self {
+        match self {
+            Foo {
+                qualified: qualified_self, shorthand: shorthand_self, generic: generic_self,
+            }
+            =>Foo {
+                qualified: $crate::clone::Clone::clone(qualified_self), shorthand: $crate::clone::Clone::clone(shorthand_self), generic: $crate::clone::Clone::clone(generic_self),
+            }
+            ,
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_clone_expand_with_const_generics() {
+    check(
+        r#"
+//- minicore: derive, clone
+#[derive(Clone)]
+struct Foo<const X: usize, T>(u32);
+"#,
+        expect![[r#"
+#[derive(Clone)]
+struct Foo<const X: usize, T>(u32);
+
+#[automatically_derived] impl <const X: usize, T: $crate::clone::Clone, > $crate::clone::Clone for Foo<X, T, > where {
+    fn clone(&self ) -> Self {
+        match self {
+            Foo(f0_self, )=>Foo($crate::clone::Clone::clone(f0_self), ),
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_default_expand() {
+    check(
+        r#"
+//- minicore: derive, default
+#[derive(Default)]
+struct Foo {
+    field1: i32,
+    field2: (),
+}
+#[derive(Default)]
+enum Bar {
+    Foo(u8),
+    #[default]
+    Bar,
+}
+"#,
+        expect![[r#"
+#[derive(Default)]
+struct Foo {
+    field1: i32,
+    field2: (),
+}
+#[derive(Default)]
+enum Bar {
+    Foo(u8),
+    #[default]
+    Bar,
+}
+
+#[automatically_derived] impl <> $crate::default::Default for Foo< > where {
+    fn default() -> Self {
+        Foo {
+            field1: $crate::default::Default::default(), field2: $crate::default::Default::default(),
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::default::Default for Bar< > where {
+    fn default() -> Self {
+        Bar::Bar
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_partial_eq_expand() {
+    check(
+        r#"
+//- minicore: derive, eq
+#[derive(PartialEq, Eq)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+#[derive(PartialEq, Eq)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Command< > where {}
+#[automatically_derived] impl <> $crate::cmp::PartialEq for Command< > where {
+    fn eq(&self , other: &Self ) -> bool {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr && match (self , other) {
+            (Command::Move {
+                x: x_self, y: y_self,
+            }
+            , Command::Move {
+                x: x_other, y: y_other,
+            }
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), _unused=>true
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::cmp::Eq for Command< > where {}"#]],
+    );
+}
+
+#[test]
+fn test_partial_eq_expand_fieldless_enum() {
+    check(
+        r#"
+//- minicore: derive, eq
+#[derive(PartialEq)]
+enum Token {
+    Plus,
+    Minus,
+    Star,
+}
+"#,
+        expect![[r#"
+#[derive(PartialEq)]
+enum Token {
+    Plus,
+    Minus,
+    Star,
+}
+
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Token< > where {}
+#[automatically_derived] impl <> $crate::cmp::PartialEq for Token< > where {
+    fn eq(&self , other: &Self ) -> bool {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_partial_eq_expand_with_derive_const() {
+    check(
+        r#"
+//- minicore: derive, eq
+#[derive_const(PartialEq, Eq)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+#[derive_const(PartialEq, Eq)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <> $crate::marker::StructuralPartialEq for Command< > where {}
+#[automatically_derived] const impl <> $crate::cmp::PartialEq for Command< > where {
+    fn eq(&self , other: &Self ) -> bool {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr && match (self , other) {
+            (Command::Move {
+                x: x_self, y: y_self,
+            }
+            , Command::Move {
+                x: x_other, y: y_other,
+            }
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), _unused=>true
+        }
+    }
+}
+#[automatically_derived] const impl <> $crate::cmp::Eq for Command< > where {}"#]],
+    );
+}
+
+#[test]
+fn test_partial_ord_expand() {
+    check(
+        r#"
+//- minicore: derive, ord
+#[derive(PartialOrd, Ord)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+#[derive(PartialOrd, Ord)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <> $crate::cmp::PartialOrd for Command< > where {
+    fn partial_cmp(&self , other: &Self ) -> $crate::option::Option<$crate::cmp::Ordering> {
+        match $crate::cmp::PartialOrd::partial_cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
+            $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                match (self , other) {
+                    (Command::Move {
+                        x: x_self, y: y_self,
+                    }
+                    , Command::Move {
+                        x: x_other, y: y_other,
+                    }
+                    )=>match $crate::cmp::PartialOrd::partial_cmp(&x_self, &x_other) {
+                        $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                            match $crate::cmp::PartialOrd::partial_cmp(&y_self, &y_other) {
+                                $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                                    $crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                                }
+                                c=>return c,
+                            }
+                        }
+                        c=>return c,
+                    }
+                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match $crate::cmp::PartialOrd::partial_cmp(&f0_self, &f0_other) {
+                        $crate::option::Option::Some($crate::cmp::Ordering::Equal)=> {
+                            $crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                        }
+                        c=>return c,
+                    }
+                    , _unused=>$crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                }
+            }
+            c=>return c,
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::cmp::Ord for Command< > where {
+    fn cmp(&self , other: &Self ) -> $crate::cmp::Ordering {
+        match $crate::cmp::Ord::cmp(&$crate::intrinsics::discriminant_value(self ), &$crate::intrinsics::discriminant_value(other)) {
+            $crate::cmp::Ordering::Equal=> {
+                match (self , other) {
+                    (Command::Move {
+                        x: x_self, y: y_self,
+                    }
+                    , Command::Move {
+                        x: x_other, y: y_other,
+                    }
+                    )=>match $crate::cmp::Ord::cmp(&x_self, &x_other) {
+                        $crate::cmp::Ordering::Equal=> {
+                            match $crate::cmp::Ord::cmp(&y_self, &y_other) {
+                                $crate::cmp::Ordering::Equal=> {
+                                    $crate::cmp::Ordering::Equal
+                                }
+                                c=>return c,
+                            }
+                        }
+                        c=>return c,
+                    }
+                    , (Command::Do(f0_self, ), Command::Do(f0_other, ))=>match $crate::cmp::Ord::cmp(&f0_self, &f0_other) {
+                        $crate::cmp::Ordering::Equal=> {
+                            $crate::cmp::Ordering::Equal
+                        }
+                        c=>return c,
+                    }
+                    , _unused=>$crate::cmp::Ordering::Equal
+                }
+            }
+            c=>return c,
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_hash_expand() {
+    check(
+        r#"
+//- minicore: derive, hash
+use core::hash::Hash;
+
+#[derive(Hash)]
+struct Foo {
+    x: i32,
+    y: u64,
+    z: (i32, u64),
+}
+"#,
+        expect![[r#"
+use core::hash::Hash;
+
+#[derive(Hash)]
+struct Foo {
+    x: i32,
+    y: u64,
+    z: (i32, u64),
+}
+
+#[automatically_derived] impl <> $crate::hash::Hash for Foo< > where {
+    fn hash<__H: $crate::hash::Hasher>(&self , ra_expand_state: &mut __H) {
+        match self {
+            Foo {
+                x: x_self, y: y_self, z: z_self,
+            }
+            => {
+                $crate::hash::Hash::hash(x_self, ra_expand_state);
+                $crate::hash::Hash::hash(y_self, ra_expand_state);
+                $crate::hash::Hash::hash(z_self, ra_expand_state);
+            }
+            ,
+        }
+    }
+}"#]],
+    );
+    check(
+        r#"
+//- minicore: derive, hash
+use core::hash::Hash;
+
+#[derive(Hash)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+use core::hash::Hash;
+
+#[derive(Hash)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <> $crate::hash::Hash for Command< > where {
+    fn hash<__H: $crate::hash::Hasher>(&self , ra_expand_state: &mut __H) {
+        $crate::hash::Hash::hash(&$crate::mem::discriminant(self ), ra_expand_state);
+        match self {
+            Command::Move {
+                x: x_self, y: y_self,
+            }
+            => {
+                $crate::hash::Hash::hash(x_self, ra_expand_state);
+                $crate::hash::Hash::hash(y_self, ra_expand_state);
+            }
+            , Command::Do(f0_self, )=> {
+                $crate::hash::Hash::hash(f0_self, ra_expand_state);
+            }
+            , Command::Jump=> {}
+            ,
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn test_debug_expand() {
+    check(
+        r#"
+//- minicore: derive, fmt
+use core::fmt::Debug;
+
+#[derive(Debug)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+"#,
+        expect![[r#"
+use core::fmt::Debug;
+
+#[derive(Debug)]
+enum Command {
+    Move { x: i32, y: i32 },
+    Do(&'static str),
+    Jump,
+}
+
+#[automatically_derived] impl <> $crate::fmt::Debug for Command< > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
+        match self {
+            Command::Move {
+                x: x_self, y: y_self,
+            }
+            => {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "Move");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "x", &x_self);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "y", &y_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+            , Command::Do(f0_self, )=> {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_tuple(f, "Do");
+                $crate::fmt::DebugTuple::field(&mut ra_expand_builder, &f0_self);
+                $crate::fmt::DebugTuple::finish(&mut ra_expand_builder)
+            }
+            , Command::Jump=>$crate::fmt::Formatter::write_str(f, "Jump"),
+        }
+    }
+}"#]],
+    );
+}
+#[test]
+fn test_debug_expand_with_cfg() {
+    check(
+        r#"
+            //- minicore: derive, fmt
+            use core::fmt::Debug;
+
+            #[derive(Debug)]
+            struct HideAndShow {
+                #[cfg(never)]
+                always_hide: u32,
+                #[cfg(not(never))]
+                always_show: u32,
+            }
+            #[derive(Debug)]
+            enum HideAndShowEnum {
+                #[cfg(never)]
+                AlwaysHide,
+                #[cfg(not(never))]
+                AlwaysShow{
+                    #[cfg(never)]
+                    always_hide: u32,
+                    #[cfg(not(never))]
+                    always_show: u32,
+                }
+            }
+        "#,
+        expect![[r#"
+use core::fmt::Debug;
+
+#[derive(Debug)]
+struct HideAndShow {
+    #[cfg(never)]
+    always_hide: u32,
+    #[cfg(not(never))]
+    always_show: u32,
+}
+#[derive(Debug)]
+enum HideAndShowEnum {
+    #[cfg(never)]
+    AlwaysHide,
+    #[cfg(not(never))]
+    AlwaysShow{
+        #[cfg(never)]
+        always_hide: u32,
+        #[cfg(not(never))]
+        always_show: u32,
+    }
+}
+
+#[automatically_derived] impl <> $crate::fmt::Debug for HideAndShow< > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
+        match self {
+            HideAndShow {
+                always_show: always_show_self,
+            }
+            => {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "HideAndShow");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+            ,
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::fmt::Debug for HideAndShowEnum< > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
+        match self {
+            HideAndShowEnum::AlwaysShow {
+                always_show: always_show_self,
+            }
+            => {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "AlwaysShow");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "always_show", &always_show_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+            ,
+        }
+    }
+}"#]],
+    );
+}
+#[test]
+fn test_default_expand_with_cfg() {
+    check(
+        r#"
+//- minicore: derive, default
+#[derive(Default)]
+struct Foo {
+    field1: i32,
+    #[cfg(never)]
+    field2: (),
+    #[cfg(feature = "never")]
+    field3: (),
+    #[cfg(not(feature = "never"))]
+    field4: (),
+}
+#[derive(Default)]
+enum Bar {
+    Foo,
+    #[cfg_attr(not(never), default)]
+    Bar,
+}
+"#,
+        expect![[r##"
+#[derive(Default)]
+struct Foo {
+    field1: i32,
+    #[cfg(never)]
+    field2: (),
+    #[cfg(feature = "never")]
+    field3: (),
+    #[cfg(not(feature = "never"))]
+    field4: (),
+}
+#[derive(Default)]
+enum Bar {
+    Foo,
+    #[cfg_attr(not(never), default)]
+    Bar,
+}
+
+#[automatically_derived] impl <> $crate::default::Default for Foo< > where {
+    fn default() -> Self {
+        Foo {
+            field1: $crate::default::Default::default(), field4: $crate::default::Default::default(),
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::default::Default for Bar< > where {
+    fn default() -> Self {
+        Bar::Bar
+    }
+}"##]],
+    );
+}
+
+#[test]
+fn coerce_pointee_expansion() {
+    check(
+        r#"
+//- minicore: coerce_pointee
+
+use core::marker::CoercePointee;
+
+pub trait Trait<T: ?Sized> {}
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+pub struct Foo<'a, T: ?Sized + Trait<U>, #[pointee] U: ?Sized, const N: u32>(T)
+where
+    U: Trait<U> + ToString;"#,
+        expect![[r#"
+
+use core::marker::CoercePointee;
+
+pub trait Trait<T: ?Sized> {}
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+pub struct Foo<'a, T: ?Sized + Trait<U>, #[pointee] U: ?Sized, const N: u32>(T)
+where
+    U: Trait<U> + ToString;
+#[automatically_derived] impl <'a, T, U, const N: u32, __S> $crate::ops::DispatchFromDyn<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}
+#[automatically_derived] impl <'a, T, U, const N: u32, __S> $crate::ops::CoerceUnsized<Foo<'a, T, __S, N>> for Foo<'a, T, U, N, > where U: Trait<U> +ToString, T: Trait<__S>, __S: ?Sized, __S: Trait<__S> +ToString, U: ::core::marker::Unsize<__S>, T:?Sized+Trait<U>, U:?Sized, {}"#]],
+    );
+}
+
+#[test]
+fn coerce_pointee_errors() {
+    check_errors(
+        r#"
+//- minicore: coerce_pointee
+
+use core::marker::CoercePointee;
+
+#[derive(CoercePointee)]
+enum Enum {}
+
+#[derive(CoercePointee)]
+struct Struct1;
+
+#[derive(CoercePointee)]
+struct Struct2();
+
+#[derive(CoercePointee)]
+struct Struct3 {}
+
+#[derive(CoercePointee)]
+struct Struct4<T: ?Sized>(T);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct5(i32);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct6<#[pointee] T: ?Sized, #[pointee] U: ?Sized>(T, U);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct7<T: ?Sized, U: ?Sized>(T, U);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct8<#[pointee] T, U: ?Sized>(T);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct9<T>(T);
+
+#[derive(CoercePointee)]
+#[repr(transparent)]
+struct Struct9<#[pointee] T, U>(T) where T: ?Sized;
+"#,
+        &expect![[r#"
+            35..72: `CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`
+            74..114: `CoercePointee` can only be derived on `struct`s with at least one field
+            116..158: `CoercePointee` can only be derived on `struct`s with at least one field
+            160..202: `CoercePointee` can only be derived on `struct`s with at least one field
+            204..258: `derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout
+            260..326: `CoercePointee` can only be derived on `struct`s that are generic over at least one type
+            328..439: only one type parameter can be marked as `#[pointee]` when deriving `CoercePointee` traits
+            441..530: exactly one generic type parameter must be marked as `#[pointee]` to derive `CoercePointee` traits
+            532..621: `derive(CoercePointee)` requires `T` to be marked `?Sized`
+            623..690: `derive(CoercePointee)` requires `T` to be marked `?Sized`"#]],
+    );
+}
+
+#[test]
+fn reborrow_expansion() {
+    check(
+        r#"
+//- minicore: reborrow
+
+use core::marker::Reborrow;
+
+#[derive(Reborrow)]
+struct Foo<'a, 'b, T, const N: usize>
+where
+    T: 'a + 'b,
+{
+    left: &'a mut T,
+    right: &'b mut T,
+}"#,
+        expect![[r#"
+
+use core::marker::Reborrow;
+
+#[derive(Reborrow)]
+struct Foo<'a, 'b, T, const N: usize>
+where
+    T: 'a + 'b,
+{
+    left: &'a mut T,
+    right: &'b mut T,
+}
+#[automatically_derived] impl <'a, 'b, T, const N: usize, > $crate::marker::Reborrow for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
+    );
+}
+
+#[test]
+fn coerce_shared_expansion() {
+    check(
+        r#"
+//- minicore: reborrow
+
+use core::marker::CoerceShared;
+
+mod shared {
+    pub struct Shared<'a, 'b, T, const N: usize>(&'a T, &'b T, [(); N]);
+}
+
+#[derive(CoerceShared)]
+#[coerce_shared(shared::Shared<'a, 'b, (T, u8), N>)]
+struct Foo<'a, 'b, T, const N: usize>(&'a mut T, &'b mut T)
+where
+    T: 'a + 'b;"#,
+        expect![[r#"
+
+use core::marker::CoerceShared;
+
+mod shared {
+    pub struct Shared<'a, 'b, T, const N: usize>(&'a T, &'b T, [(); N]);
+}
+
+#[derive(CoerceShared)]
+#[coerce_shared(shared::Shared<'a, 'b, (T, u8), N>)]
+struct Foo<'a, 'b, T, const N: usize>(&'a mut T, &'b mut T)
+where
+    T: 'a + 'b;
+#[automatically_derived] impl <'a, 'b, T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (T, u8), N>> for Foo<'a, 'b, T, N, > where T:'a+'b, {}"#]],
+    );
+}
+
+#[test]
+fn const_param_ty_expansion() {
+    check(
+        r#"
+//- minicore: const_param_ty
+
+use core::marker::ConstParamTy;
+
+#[derive(ConstParamTy)]
+enum Requirement<T> { Connected, Not(T) }"#,
+        expect![[r#"
+
+use core::marker::ConstParamTy;
+
+#[derive(ConstParamTy)]
+enum Requirement<T> { Connected, Not(T) }
+#[automatically_derived] impl <T: $crate::marker::ConstParamTy_, > $crate::marker::ConstParamTy_ for Requirement<T, > where {}"#]],
+    );
+}
+
+#[test]
+fn from_expansion() {
+    check(
+        r#"
+//- minicore: derive_from
+
+use core::from::From;
+
+#[derive(From)]
+struct Meters(u32);
+
+#[derive(From)]
+struct Named<'a, T: Clone, const N: usize> where T: Copy { inner: &'a [T; N] }"#,
+        expect![[r#"
+
+use core::from::From;
+
+#[derive(From)]
+struct Meters(u32);
+
+#[derive(From)]
+struct Named<'a, T: Clone, const N: usize> where T: Copy { inner: &'a [T; N] }
+#[automatically_derived] impl <> $crate::convert::From<u32> for Meters< > where {
+    #[inline] fn from(value: u32) -> Self {
+        Self (value)
+    }
+}
+#[automatically_derived] impl <'a, T, const N: usize, > $crate::convert::From<&'a[T;
+N]> for Named<'a, T, N, > where T: Copy, T: Clone, {
+    #[inline] fn from(value:&'a[T;
+    N]) -> Self {
+        Self {
+            inner: value
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn from_errors() {
+    check_errors(
+        r#"
+//- minicore: derive_from
+
+use core::from::From;
+
+#[derive(From)]
+struct Empty;
+
+#[derive(From)]
+struct Two(u8, u8);
+
+#[derive(From)]
+enum Either { A(u8) }
+
+#[derive(From)]
+union Bits { a: u8 }
+"#,
+        &expect![[r#"
+            24..53: `#[derive(From)]` used on a struct with no fields
+            55..90: `#[derive(From)]` used on a struct with multiple fields
+            92..129: `#[derive(From)]` used on an enum
+            131..167: `#[derive(From)]` used on a union"#]],
+    );
+}
+
+#[test]
+fn coerce_shared_errors() {
+    check_errors(
+        r#"
+//- minicore: reborrow
+
+use core::marker::CoerceShared;
+
+#[derive(CoerceShared)]
+struct Missing<'a>(&'a mut ());
+
+#[derive(CoerceShared)]
+#[coerce_shared(Target<'a>)]
+#[coerce_shared(Target<'a>)]
+struct Duplicate<'a>(&'a mut ());
+
+#[derive(CoerceShared)]
+#[coerce_shared(Target<'a>, Other<'a>)]
+struct Malformed<'a>(&'a mut ());
+"#,
+        &expect![[r#"
+            34..89: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute
+            91..206: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute
+            208..305: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute"#]],
+    );
+}
+
+#[test]
+fn union_derive() {
+    check_errors(
+        r#"
+//- minicore: clone, copy, default, fmt, hash, ord, eq, derive
+
+#[derive(Copy)]
+union Foo1 { _v: () }
+#[derive(Clone)]
+union Foo2 { _v: () }
+#[derive(Default)]
+union Foo3 { _v: () }
+#[derive(Debug)]
+union Foo4 { _v: () }
+#[derive(Hash)]
+union Foo5 { _v: () }
+#[derive(Ord)]
+union Foo6 { _v: () }
+#[derive(PartialOrd)]
+union Foo7 { _v: () }
+#[derive(Eq)]
+union Foo8 { _v: () }
+#[derive(PartialEq)]
+union Foo9 { _v: () }
+    "#,
+        &expect![[r#"
+            78..118: this trait cannot be derived for unions
+            119..157: this trait cannot be derived for unions
+            158..195: this trait cannot be derived for unions
+            196..232: this trait cannot be derived for unions
+            233..276: this trait cannot be derived for unions
+            313..355: this trait cannot be derived for unions"#]],
+    );
+}
+
+#[test]
+fn default_enum_without_default_attr() {
+    check_errors(
+        r#"
+//- minicore: default, derive
+
+#[derive(Default)]
+enum Foo {
+    Bar,
+}
+    "#,
+        &expect!["1..41: `#[derive(Default)]` on enum with no `#[default]`"],
+    );
+}
+
+#[test]
+fn generic_enum_default() {
+    check(
+        r#"
+//- minicore: default, derive
+
+#[derive(Default)]
+enum Foo<T> {
+    Bar(T),
+    #[default]
+    Baz,
+}
+"#,
+        expect![[r#"
+
+#[derive(Default)]
+enum Foo<T> {
+    Bar(T),
+    #[default]
+    Baz,
+}
+
+#[automatically_derived] impl <T, > $crate::default::Default for Foo<T, > where {
+    fn default() -> Self {
+        Foo::Baz
+    }
+}"#]],
+    );
+}
+
+/// A field named by a word that is a keyword only in a later edition than the item's (`gen` in
+/// 2021, as streaming-iterator 0.1.9's `FromFn`) derives: the derive keeps the field's own span
+/// and syntax context, as rustc's derives keep `FieldDef::ident`, so the parser reads `gen` in
+/// its crate's edition and it stays `gen` with no `r#`; `Debug`'s output says `gen`. Each
+/// expansion is checked to parse (`check` refuses one with errors): before, each derive's output
+/// failed to parse ("expected identifier") at `gen`, read in the derive's 2024 context.
+#[test]
+fn a_field_named_by_a_later_editions_keyword_derives() {
+    check(
+        r#"
+//- minicore: derive, clone, fmt
+//- /main.rs edition:2021
+#[derive(Clone, Debug)]
+pub struct FromFn<T, F> {
+    gen: F,
+    item: Option<T>,
+}
+#[derive(Clone, Copy, Debug)]
+#[repr(packed)]
+pub struct P {
+    gen: u8,
+}
+"#,
+        expect![[r##"
+#[derive(Clone, Debug)]
+pub struct FromFn<T, F> {
+    gen: F,
+    item: Option<T>,
+}
+#[derive(Clone, Copy, Debug)]
+#[repr(packed)]
+pub struct P {
+    gen: u8,
+}
+
+#[automatically_derived] impl <T: $crate::clone::Clone, F: $crate::clone::Clone, > $crate::clone::Clone for FromFn<T, F, > where {
+    fn clone(&self ) -> Self {
+        match self {
+            FromFn {
+                gen: gen_self, item: item_self,
+            }
+            =>FromFn {
+                gen: $crate::clone::Clone::clone(gen_self), item: $crate::clone::Clone::clone(item_self),
+            }
+            ,
+        }
+    }
+}
+#[automatically_derived] impl <T: $crate::fmt::Debug, F: $crate::fmt::Debug, > $crate::fmt::Debug for FromFn<T, F, > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
+        match self {
+            FromFn {
+                gen: gen_self, item: item_self,
+            }
+            => {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "FromFn");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "gen", &gen_self);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "item", &item_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+            ,
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::clone::Clone for P< > where {
+    fn clone(&self ) -> Self {
+        *self
+    }
+}
+#[automatically_derived] impl <> $crate::marker::Copy for P< > where {}
+#[automatically_derived] impl <> $crate::fmt::Debug for P< > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result { {
+            let gen_self = {
+                self .gen
+            }
+            ; {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "P");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "gen", &&gen_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+        }
+    }
+}"##]],
+    );
+}

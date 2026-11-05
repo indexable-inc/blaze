@@ -1,0 +1,13 @@
+[package]
+name = "livebevy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A headless bevy app (ships, rocks and shots on bevy's ECS, generic systems) that takes edits while it runs; harness/live_latency.py edits it"
+
+[dependencies]
+blaze-live = { path = "../../crates/blaze-live" }
+bevy = { version = "0.20", default-features = false, features = ["std", "multi_threaded", "async_executor"] }
+
+# Its own workspace and lock, like demo/life.
+[workspace]

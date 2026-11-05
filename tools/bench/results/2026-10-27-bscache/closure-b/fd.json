@@ -1,0 +1,82 @@
+{
+ "project": "fd",
+ "rev": "d38148f0aabdd073b4080cde770f679f3197b920",
+ "status": 0,
+ "seconds": 4.92,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.98",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "crossbeam-utils",
+   "version": "0.8.21",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "fd-find",
+   "version": "10.3.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "getrandom",
+   "version": "0.3.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.174",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "nix",
+   "version": "0.30.1",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.95",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "1.0.7",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "tikv-jemalloc-sys",
+   "version": "0.6.0+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

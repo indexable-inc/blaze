@@ -1,0 +1,4 @@
+[package]
+name = "c_main"
+version = "0.1.0"
+edition = "2024"

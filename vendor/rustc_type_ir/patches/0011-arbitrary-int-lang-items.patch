@@ -1,0 +1,28 @@
+diff --git a/src/lang_items.rs b/src/lang_items.rs
+index 246d624..25b2497 100644
+--- a/src/lang_items.rs
++++ b/src/lang_items.rs
+@@ -29,6 +29,10 @@ pub enum SolverAdtLangItem {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+ pub enum SolverTraitLangItem {
+     // tidy-alphabetical-start
++    /// blaze: the arbitrary-width integers (`u3`, `i17`), a marker the solver answers.
++    ArbitraryInt,
++    /// blaze: the signed arbitrary-width integers.
++    ArbitrarySigned,
+     AsyncFn,
+     AsyncFnKindHelper,
+     AsyncFnMut,
+@@ -49,6 +53,12 @@ pub enum SolverTraitLangItem {
+     Freeze,
+     FusedIterator,
+     Future,
++    /// blaze: `Self: IntFrom<S>`, a lossless conversion between two integer types, one of them
++    /// arbitrary-width.
++    IntFrom,
++    /// blaze: `Self: IntTryFrom<S>`, a fallible conversion between two integer types, one of
++    /// them arbitrary-width.
++    IntTryFrom,
+     Iterator,
+     MetaSized,
+     PointeeSized,

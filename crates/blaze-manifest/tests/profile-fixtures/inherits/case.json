@@ -1,0 +1,12 @@
+{
+ "runs": [
+  {"args": ["build", "--profile", "one"]},
+  {"args": ["build", "--profile", "two"]},
+  {"args": ["test", "--profile", "two", "--no-run"]},
+  {"args": ["build", "--profile", "three"]},
+  {"args": ["build", "--profile", "four"]},
+  {"args": ["check", "--profile", "test"]},
+  {"args": ["build", "--profile", "debug"]},
+  {"args": ["build", "--profile", "two"], "env": {"CARGO_PROFILE_TWO_LTO": "thin"}}
+ ]
+}

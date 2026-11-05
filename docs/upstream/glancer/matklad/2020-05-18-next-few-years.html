@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en-US">
+
+<head>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Open+Sans:300,300italic,400,400italic,600">
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>Next Few Years</title>
+  <meta name="description"
+    content="rust-analyzer is a new "IDE backend" for the Rust programming language.Support rust-analyzer on Open Collective.">
+
+  <link rel="stylesheet" href="/css/asciidoctor.css">
+  <link rel="stylesheet" href="/css/rouge-github.css">
+  <link rel="stylesheet" href="/css/main.css">
+  <link rel="stylesheet" href="/css/font-awesome.min.css">
+  <!-- dark mode -->
+  <script type="module" src="/js/nightowl.js"></script>
+
+  <link rel="canonical" href="https://rust-analyzer.github.io//blog/2020/05/18/next-few-years.html">
+  <link rel="alternate" type="application/rss+xml" title="rust-analyzer"
+    href="https://rust-analyzer.github.io//feed.xml">
+
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/fav/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/fav/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/fav/favicon-16x16.png">
+  <link rel="manifest" href="/assets/site.webmanifest">
+  <link rel="mask-icon" href="/assets/fav/safari-pinned-tab.svg" color="#5bbad5">
+  <meta name="msapplication-TileColor" content="#ffc40d">
+  <meta name="theme-color" content="#ffffff">
+</head>
+
+<body>
+  
+  <header>
+    <div id="header-inner">
+      <div class="nightowl-daylight" id="header-left">
+        <a class="site-title" href="/">
+          <img src="/assets/rust-analyzer.svg" alt="rust analyzer" id="header-logo">
+        </a>
+      </div>
+      <div id="header-right">
+        <a class="nav-link" href="https://opencollective.com/rust-analyzer/">Sponsor</a>
+        <a class="nav-link" href="/manual.html">Docs</a>
+        <a class="nav-link" href="/blog">Blog</a>
+        <a class="nav-link" href="/thisweek">Changelog</a>
+      </div>
+    </div>
+  </header>
+  
+
+  <main>
+    <article>
+<h1>Next Few Years</h1>
+<div class="post-meta sect1">
+  @matklad, May 18, 2020
+</div>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>rust-analyzer is a new "IDE backend" for the <a href="https://www.rust-lang.org/">Rust</a> programming language.
+Support rust-analyzer on <a href="https://opencollective.com/rust-analyzer/">Open Collective</a>.</p>
+</div>
+<div class="paragraph">
+<p>During the past several months, I&#8217;ve been swamped with in-the-trenches rust-analyzer work.
+Today, I spontaneously decided to take a step back and think about longer-term "road map" for rust-analyzer.</p>
+</div>
+<div class="paragraph">
+<p>What follows is my (<a href="https://github.com/matklad/">@matklad</a>) personal thoughts on the matter, they not necessary reflect the consensus view of ide or compiler teams :-)</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="unexpected-success"><a class="anchor" href="#unexpected-success"></a>Unexpected Success</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>One of the most surprising aspects of rust-analyzer for me is how useful it already is.
+Today, I write Rust code enjoying fast code-completion, mostly correct go to definition and plethora of assists.
+Even syntax highlighting inside macros works!</p>
+</div>
+<div class="paragraph">
+<p>My original plan for rust-analyzer was to write a quick one-to-two-year hack to demonstrate a proof-of-concept IDE support, something to strive for rather than a finished product.
+Obviously, we have massively overshot this goal: people depend on rust-analyzer for productive Rust programming today.
+This creates its own opportunities and dangers, which inform this planning document.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="official-lsp-server"><a class="anchor" href="#official-lsp-server"></a>Official LSP Server</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>People write a ton of Rust today, and they deserve at least a baseline level of IDE support.
+I think our immediate goal is to make rust-analyzer easier to use in its current state, effectively implementing <a href="https://github.com/rust-lang/rfcs/pull/2912">RFC2912</a>.</p>
+</div>
+<div class="paragraph">
+<p>The amount of programming work on rust-analyzer side is relatively small here:
+we need to fix various protocol conformance issues,
+clean up various defaults to be less experimental,
+write documentation which doesn&#8217;t require a lot of enthusiasm to understand, etc.
+The amount of org stuff is much bigger&#8201;&#8212;&#8201;we need to package rust-analyzer with rustup, merge the RLS and rust-analyzer VS Code extensions, figure out repository structure, etc.</p>
+</div>
+<div class="paragraph">
+<p>Separately, I want to make sure that rust-analyzer is usable inside large non-Cargo based monorepos.
+We have some initial support for this already, but there&#8217;s a bunch of details we need to iron out.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="dangers-of-accidental-architecture"><a class="anchor" href="#dangers-of-accidental-architecture"></a>Dangers of Accidental Architecture</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The main danger I see is that rust-analyzer can ossify in its present state.
+This would be bad, because, although current rust-analyzer architecture is right in broad strokes, a lot of important and hard-to-change details are wrong.
+After we push rust-analyzer to the general public, we should focus on boring implementation &amp; design work, with relatively few shiny gifs and a lot of foundational work for the next decade.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="bringing-chalk-to-rustc"><a class="anchor" href="#bringing-chalk-to-rustc"></a>Bringing Chalk to Rustc</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>rust-analyzer has been using chalk as its trait solver for a long time now.
+It would be good to finish the work, and integrate it into rustc as well, <span class="line-through">and give people their GATs</span>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="single-parser-and-syntax-tree"><a class="anchor" href="#single-parser-and-syntax-tree"></a>Single Parser and Syntax Tree</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>We should share the parser between rustc and rust-analyzer already.
+Parsing is one of the most interesting bits of the compiler, from the IDE point of view.
+By transitioning rustc to a lossless syntax we&#8217;ll cross the most important barrier, and it will be a downhill road from that point on.
+The design space here I think is well-understood, but the amount of work to do is large.
+At some point, I should take a break from actively hacking on rust-analyzer and focus on sharing the parser.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="virtual-file-system"><a class="anchor" href="#virtual-file-system"></a>Virtual File System</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The most fundamental data structure in rust-analyzer, even more fundamental than a syntax tree, is the VFS, or Virtual File System.
+It serves two dual goals:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>providing consistent immutable snapshots of the file system,</p>
+</li>
+<li>
+<p>applying transactional changes to the state of the file system.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>This abstraction is the boundary between the pure-functional universe of rust-analyzer, and the messiness of the external world.
+It needs to bridge case-insensitive file systems, symlinks and cycles to a simpler model of "tree with utf8 paths" we want inside.
+Additionally it should work with non-path files: there are use-cases where we want to do analysis of Rust code, which doesn&#8217;t really reside on the file system.</p>
+</div>
+<div class="paragraph">
+<p>One specific aspect I am struggling with is dynamism.
+On the one hand, it seems that a good design is to require to specify the set of files in VFS upfront, as a set of globs.
+This is important because, to properly register file watchers without losing updates, you need to crawl the file-system eagerly.
+However, specifying a set of globs up-front makes changing this set later messy.</p>
+</div>
+<div class="paragraph">
+<p>I would be curious to hear about existing solutions in this area.
+One specific question I have is: "How does watchman handle dynamic addition/removal of projects?".
+If you have any experience to share, please comment on the VFS issue in rust-analyzer.
+Ideally, we turn VFS into just a crates.io crate, as it seems generally useful, and can encapsulate quite a bit of complexity.</p>
+</div>
+<div class="paragraph">
+<p>The current VFS is &#8230;&#8203; not great, I don&#8217;t feel comfortable building rust-analyzer on top of it.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="wasm-proc-macros"><a class="anchor" href="#wasm-proc-macros"></a>WASM proc macros</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>At the moment, proc-macros are implemented as dynamic libraries, loadable into the compiler process.
+This works ok-enough for the compiler, but is a pretty bad fit for an IDE:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>if a proc-macro crashes, it brings down the whole process,</p>
+</li>
+<li>
+<p>it&#8217;s hard to limit execution time of proc-macro,</p>
+</li>
+<li>
+<p>proc-macros can be non-deterministic, which breaks internal IDE invariants.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>At the moment, we paper over this by running proc-macros in a separate process and never invalidating proc-macro caches, but this feels like a hack and has high implementation complexity.
+it would be much better if proc-macros were deterministic and controllable by definition, and WASM can give us that.</p>
+</div>
+<div class="paragraph">
+<p>I am slightly worried that this will get push-back from folks who want to connect to databases over TCP at compile time :)
+Long term, I believe that guaranteeing deterministic compilation is hugely important, irrespective of IDE story.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="language-design-for-locality"><a class="anchor" href="#language-design-for-locality"></a>Language Design for Locality</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>There&#8217;s a very important language property that an IDE can leverage to massively improve performance:</p>
+</div>
+<div class="paragraph">
+<p><em>What happens inside a function, stays inside the function</em></p>
+</div>
+<div class="paragraph">
+<p>If it is possible to type-check the body of a function without looking at the bodies of other functions, you can speed up an IDE by drastically reducing the amount of work it needs to do.</p>
+</div>
+<div class="paragraph">
+<p>Rust mostly conforms to this property, but there are a couple of annoying violations:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>local inherent impls with publicly visible methods.</p>
+</li>
+<li>
+<p>local trait impls for non-local types.</p>
+</li>
+<li>
+<p><code>#[macro_export]</code> local macros.</p>
+</li>
+<li>
+<p>local out-of-line modules.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>If we want to have fast &amp; correct IDE support, we should phase out those from the language via edition mechanism.</p>
+</div>
+<div class="paragraph">
+<p>Note that auto-trait leakage of impl Trait is not nearly as problematic, as you only need to inspect a function&#8217;s body if you call the function.
+Of course, as an IDE author I&#8217;d love to require specifying auto-traits, but, as a language user, I much prefer the current design.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="compact-data-structures"><a class="anchor" href="#compact-data-structures"></a>Compact Data Structures</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>rust-analyzer uses a novel and rather high-tech query-based architecture for incremental computation.
+Today, it is clear that this general approach fits an IDE use-case really well.
+However, I have a lot of doubts about specific details.
+I feel that today rust-analyzer lacks mechanical sympathy and leaves a ton of performance on the table.
+A lot of internal data structures are heap-allocated <code>Arc</code>-droplets, we overuse hashing and underuse indexing, we don&#8217;t even intern identifiers!</p>
+</div>
+<div class="paragraph">
+<p>To get a feeling of how blazingly fast compiler front-ends can be, I highly recommend checking out Sorbet, type checker for Ruby.
+You can start with these two links:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><a href="https://blog.nelhage.com/post/why-sorbet-is-fast/" class="bare">https://blog.nelhage.com/post/why-sorbet-is-fast/</a></p>
+</li>
+<li>
+<p><a href="https://www.youtube.com/watch?v=Gdx6by6tcvw" class="bare">https://www.youtube.com/watch?v=Gdx6by6tcvw</a></p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>I am very inspired by this work, but also embarrassed by how far rust-analyzer is from that kind of raw performance and simplicity.</p>
+</div>
+<div class="paragraph">
+<p>Part of that I think is essential complexity&#8201;&#8212;&#8201;Rust&#8217;s name resolution and macro expansion are <strong>hard</strong>.
+But I also wonder if we can change salsa to use <code>Vec</code>-based arenas, rather than <code>Arc</code>s in <code>HashMap</code>s.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="parallel-and-fast-persistence"><a class="anchor" href="#parallel-and-fast-persistence"></a>Parallel and Fast &gt; Persistence</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>One of the current peculiarities of rust-analyzer is that it doesn&#8217;t persist caches to disk.
+Opening project in rust-analyzer means waiting a dozen seconds while we process standard library and dependencies.</p>
+</div>
+<div class="paragraph">
+<p>I think this "limitation" is actually a very valuable asset!
+It forces us to keep the non-incremental code-path reasonably fast.</p>
+</div>
+<div class="paragraph">
+<p>I think it is plausible that we don&#8217;t actually need persistent caches at all.
+rust-analyzer is basically text processing, and the size of input is in tens of megabytes (<em>and</em> we ignore most of those megabytes anyway).
+If we just don&#8217;t lose performance here and there, and throw the work onto all the cores, we should be able to load projects from scratch within a reasonable time budget.</p>
+</div>
+<div class="paragraph">
+<p>The first step here would be establishing the culture of continuous benchmarking and performance tuning.</p>
+</div>
+<div class="paragraph">
+<p>We&#8217;ve already successfully used rust-analyzer for forging an architecture which works in IDE at all.
+Now it&#8217;s time to experiment with architecture which works, <em>fast</em>, just as all Rust code should :-)</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="optimizing-build-times"><a class="anchor" href="#optimizing-build-times"></a>Optimizing Build Times</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>In my opinion the two important characteristics that determine long-term success of a project are:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>How long does it take to execute most of the tests?</p>
+</li>
+<li>
+<p>How long does it take to build a release version of the project for testing?</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>I am very happy with the testing speed of rust-analyzer.
+One of my mistakes in IntelliJ was adding a lot of tests that use Rust&#8217;s standard library and are slow for that reason.
+In rust-analyzer, there are only three uber-integrated tests that need the real libstd, all others work from in-memory fixtures which contain only the relevant bits of std.</p>
+</div>
+<div class="paragraph">
+<p>But the build times leave a lot to be desired.
+And this is hugely important&#8201;&#8212;&#8201;the faster you can build the code, the faster you can do everything else.
+Heck, even for improving build times you need fast build times!
+I was trying to do some compile-time optimizations in rust-analyzer recently, and measuring &#8220;is it faster to compile now?&#8221; takes a lot of time, so one has to try fewer different optimizations!</p>
+</div>
+<div class="paragraph">
+<p>The biggest problem here is that Rust, as a language, is hard to compile fast.
+One specific issue I hit constantly is that changing a deep dependency recompiles the world.
+This is in contrast to C/C++ where, if you don&#8217;t touch any <code>.h</code> files, changing a dependency requires only re-linking.
+In theory, we can have something like this in Rust, by automatically deriving public headers from crates.
+Though I fear that without explicit, physical &#8220;this is ABI&#8221; boundary, it will be much less effective at keeping compile times under control.</p>
+</div>
+<div class="paragraph">
+<p>As an aside, if Rust stuck with <code>.crate</code> files, implementing IDE support would have been much easier :-)</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="optimizing-rustc-build"><a class="anchor" href="#optimizing-rustc-build"></a>Optimizing rustc Build</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Nonetheless, rust-analyzer is much easier to build than rustc.
+I believe there&#8217;s a lot we can do for rustc build as well.</p>
+</div>
+<div class="paragraph">
+<p>I&#8217;ve written at length about this on <a href="https://internals.rust-lang.org/t/experience-report-contributing-to-rust-lang-rust/12012/17?u=matklad">irlo</a>.
+The gist is that I think we can split rustc into a front-end "text-processing" part, and backend "LLVM, linkers and real world" part.
+The front bit then could, in theory, be a bog standard Rust project, which doesn&#8217;t depend on IO, external tools or C++ code at all.</p>
+</div>
+<div class="paragraph">
+<p>One wrinkle here is that rustc test suite at the moment consists predominantly of UI and run-pass tests integration, which work by building the whole compiler.
+Such a test suite is ideal for testing conformance and catching regressions, but is not really well suited for rapid TDD.
+I think we should make an effort to build a unit test suite a-la rust-analyzer, such that it&#8217;s easy, for example, to test name resolution without building the type checker, and which doesn&#8217;t require stdlib.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="scaling-maintenance"><a class="anchor" href="#scaling-maintenance"></a>Scaling Maintenance</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Finally, all changes here represent deep cuts into an existing body of software.
+Pushing such ambitious projects to completion require people, who can dedicate significant amounts of their time and energy.
+To put it bluntly, we need more dedicated folks working on the IDE tooling as a full time, paid job.
+I am grateful to my colleagues at <a href="https://ferrous-systems.com/">Ferrous Systems</a> who put a lot of energy into making this a reality.</p>
+</div>
+<div class="paragraph">
+<p>If you find rust-analyzer useful and use it professionally, please consider asking your company to sponsor rust-analyzer via our <a href="https://opencollective.com/rust-analyzer/">Open Collective</a>.
+Sponsorships from individuals are also accepted (and greatly appreciated!).</p>
+</div>
+</div>
+</div>
+</article>
+
+  </main>
+
+  <footer>
+    <div id="footer-inner">
+      <div class="footer-by">
+        <a href="https://ferrous-systems.com/">
+          <img class="ferrous-logo" src="/assets/ferrous-logo.png">Ferrous Systems</a>
+        &
+        <a href="https://github.com/rust-analyzer/rust-analyzer/graphs/contributors">contributors</a>
+      </div>
+
+      <div id="footer-links">
+        <a href="/feed.xml" class="footer-link">
+          <i class="fa fa-rss"></i> rss
+        </a>
+        <a href="https://github.com/rust-analyzer/rust-analyzer.github.io" class="footer-link">
+          <i class="fa fa-github"></i> src
+        </a>
+        <a href="https://opencollective.com/rust-analyzer/" class="footer-link">
+          <i class="fa fa-github"></i> sponsor
+        </a>
+      </div>
+    </div>
+  </footer>
+</body>
+
+</html>

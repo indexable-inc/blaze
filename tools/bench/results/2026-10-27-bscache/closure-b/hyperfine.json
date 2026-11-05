@@ -1,0 +1,195 @@
+{
+ "project": "hyperfine",
+ "rev": "12fec42098642a19855ead34c8cb1e0be28c8ead",
+ "status": 0,
+ "seconds": 6.27,
+ "failed": [],
+ "stderr_tail": "",
+ "scripts": [
+  {
+   "package": "anyhow",
+   "version": "1.0.93",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "assert_cmd",
+   "version": "2.0.16",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "doc-comment",
+   "version": "0.3.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "hyperfine",
+   "version": "1.19.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "libc",
+   "version": "0.2.162",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "nix",
+   "version": "0.29.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "num-bigint",
+   "version": "0.2.6",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_20dd0be174b56cfd_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-bigint/4a9c148ec52cc2ce/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_20dd0be174b56cfd_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-bigint/4a9c148ec52cc2ce/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_20dd0be174b56cfd_2 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-bigint/4a9c148ec52cc2ce/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "num-complex",
+   "version": "0.2.4",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_156745210f84fe79_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-complex/96fbc994693cf5a6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_156745210f84fe79_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-complex/96fbc994693cf5a6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_156745210f84fe79_2 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-complex/96fbc994693cf5a6/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "num-rational",
+   "version": "0.2.4",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_56c493f7fe174a33_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-rational/7128c2c02f4145d5/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_56c493f7fe174a33_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-rational/7128c2c02f4145d5/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_56c493f7fe174a33_2 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-rational/7128c2c02f4145d5/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "num-traits",
+   "version": "0.2.19",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_006ba9a0e3bf23ff_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-traits/0124f84430fd5ddf/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_006ba9a0e3bf23ff_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-traits/0124f84430fd5ddf/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_006ba9a0e3bf23ff_2 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/num-traits/0124f84430fd5ddf/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "portable-atomic",
+   "version": "1.9.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "proc-macro2",
+   "version": "1.0.89",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rand",
+   "version": "0.6.5",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_89bd7c60f73b3b75_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand/400385bb89e4847b/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_89bd7c60f73b3b75_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand/400385bb89e4847b/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "rand_chacha",
+   "version": "0.1.1",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_051c338f38ce0a79_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand_chacha/f061e8d2a5d81c10/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_051c338f38ce0a79_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand_chacha/f061e8d2a5d81c10/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "rand_pcg",
+   "version": "0.1.2",
+   "ok": true,
+   "kept": true,
+   "notes": [
+    "error: blaze can't answer `rustc --crate-name autocfg_537023b6113cd427_0 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand_pcg/a2d74503e7bf22f3/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it",
+    "error: blaze can't answer `rustc --crate-name autocfg_537023b6113cd427_1 --crate-type=lib --out-dir /root/bs/cl/work/target/hyperfine/debug/build/rand_pcg/a2d74503e7bf22f3/out --emit=llvm-ir --target aarch64-unknown-linux-gnu -` for a build script: /root/.rustup/toolchains/nightly-2026-10-25-aarch64-unknown-linux-gnu has no source of the standard library, which blaze compiles from: `rustup component add rust-src` installs it"
+   ],
+   "tail": []
+  },
+  {
+   "package": "rust_decimal",
+   "version": "1.36.0",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "rustix",
+   "version": "0.38.40",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde",
+   "version": "1.0.214",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "serde_json",
+   "version": "1.0.132",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  },
+  {
+   "package": "thiserror",
+   "version": "2.0.3",
+   "ok": true,
+   "kept": true,
+   "notes": [],
+   "tail": []
+  }
+ ]
+}

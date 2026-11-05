@@ -1,0 +1,35 @@
+[package]
+name = "blaze-seed-run"
+description = "The bootstrap seed's runner: runs blaze-seed.wasm (memory64) under Wasmtime with blaze's WASI host at 64-bit pointers, a linear memory reserved whole and committed only where touched, and a decommit import for blaze-mem (docs/future/bootstrap.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-seed-run"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[dependencies]
+# `seed`: the seed's own calls, its fibers among them (Wasmtime's `async`).
+blaze-wasi = { workspace = true, features = ["seed"] }
+wasmtime.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# The binary of a test's module.
+wat = "1.263.0"
+
+[lints]
+workspace = true

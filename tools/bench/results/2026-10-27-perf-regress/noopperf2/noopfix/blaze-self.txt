@@ -1,0 +1,60 @@
+     0.75%  blaze                 [.] <core::str::pattern::StrSearcher as core::str::pattern::Searcher>::next_match
+     0.36%  blaze                 [.] _rjem_malloc
+     0.32%  [kernel.kallsyms]      [k] __d_lookup_rcu
+     0.31%  ld-linux-aarch64.so.1  [.] _dl_relocate_object_no_relro
+     0.25%  [kernel.kallsyms]      [k] __arch_copy_to_user
+     0.24%  libc.so.6              [.] __memcpy_generic
+     0.22%  [kernel.kallsyms]      [k] __pi_copy_page
+     0.21%  [kernel.kallsyms]      [k] next_uptodate_folio
+     0.20%  [kernel.kallsyms]      [k] _raw_spin_unlock_irqrestore
+     0.17%  blaze                 [.] _rjem_sdallocx
+     0.17%  [kernel.kallsyms]      [k] link_path_walk
+     0.15%  libc.so.6              [.] __memcmpeq
+     0.15%  blaze                 [.] <serde_json::read::StrRead as serde_json::read::Read>::parse_str
+     0.13%  blaze                 [.] rustls_pki_types::base64::decode_public
+     0.13%  [kernel.kallsyms]      [k] __rmqueue_pcplist
+     0.13%  blaze                 [.] rustls_pki_types::pem::from_buf_inner
+     0.12%  blaze                 [.] <toml_parser::lexer::Lexer as core::iter::traits::iterator::Iterator>::next
+     0.11%  [kernel.kallsyms]      [k] selinux_inode_permission
+     0.11%  blaze                 [.] <toml_parser::lexer::Lexer>::into_vec
+     0.10%  blaze                 [.] <serde_json::read::SliceRead>::skip_to_escape
+     0.10%  [kernel.kallsyms]      [k] el0_svc
+     0.10%  blaze                 [.] _rjem_je_arena_cache_bin_fill_small
+     0.09%  blaze                 [.] core::str::converts::from_utf8
+     0.08%  libc.so.6              [.] __aarch64_swp4_rel
+     0.08%  blaze                 [.] __aarch64_ldadd8_rel
+     0.08%  blaze                 [.] <alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::insert
+     0.08%  blaze                 [.] _rjem_je_tcache_bin_flush_small
+     0.07%  blaze                 [.] _rjem_je_arena_ralloc
+     0.07%  [kernel.kallsyms]      [k] el0_da
+     0.07%  blaze                 [.] im_rc::util::linear_search_by::<(blaze_resolve::package_id::PackageId, im_rc::ord::map::OrdMap<blaze_resolve::package_id::PackageId, std::collections::hash::set::HashSet<blaze_resolve::dependency::Dependency, rustc_hash::FxBuildHasher>>), &[(blaze_resolve::package_id::PackageId, im_rc::ord::map::OrdMap<blaze_resolve::package_id::PackageId, std::collections::hash::set::HashSet<blaze_resolve::dependency::Dependency, rustc_hash::FxBuildHasher>>)], <(blaze_resolve::package_id::PackageId, im_rc::ord::map::OrdMap<blaze_resolve::package_id::PackageId, std::collections::hash::set::HashSet<blaze_resolve::dependency::Dependency, rustc_hash::FxBuildHasher>>) as im_rc::nodes::btree::BTreeValue>::search_key<blaze_resolve::package_id::PackageId>::{closure#0}>
+     0.06%  [kernel.kallsyms]      [k] kmem_cache_alloc_noprof
+     0.06%  [kernel.kallsyms]      [k] _raw_spin_lock
+     0.06%  libc.so.6              [.] pthread_mutex_trylock@@GLIBC_2.34
+     0.05%  [kernel.kallsyms]      [k] xas_load
+     0.05%  blaze                 [.] toml_parser::decoder::string::decode_basic_string
+     0.05%  [kernel.kallsyms]      [k] kmem_cache_free
+     0.05%  blaze                 [.] <url::parser::Parser>::parse_path
+     0.05%  blaze                 [.] <serde_json::de::SeqAccess<_> as serde_core::de::SeqAccess>::next_element_seed::has_next_element::<serde_json::read::StrRead>
+     0.05%  blaze                 [.] tcache_bin_flush_edatas_lookup
+     0.05%  blaze                 [.] _rjem_je_arena_ralloc_no_move
+     0.05%  [kernel.kallsyms]      [k] ptep_clear_flush
+     0.04%  [kernel.kallsyms]      [k] filemap_get_entry
+     0.04%  [kernel.kallsyms]      [k] finish_task_switch.isra.0
+     0.04%  blaze                 [.] do_rallocx
+     0.04%  [kernel.kallsyms]      [k] __pi_memset_generic
+     0.04%  [kernel.kallsyms]      [k] mas_walk
+     0.04%  blaze                 [.] <toml::de::parser::key::State>::close_key
+     0.04%  [kernel.kallsyms]      [k] folio_add_file_rmap_ptes
+     0.04%  blaze                 [.] <url::parser::Parser>::after_double_slash
+     0.04%  blaze                 [.] __aarch64_ldadd8_relax
+     0.04%  blaze                 [.] <indexmap::map::entry::Entry<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>, serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>>>::new
+     0.04%  [kernel.kallsyms]      [k] filemap_get_read_batch
+     0.04%  [kernel.kallsyms]      [k] security_inode_getattr
+     0.04%  blaze                 [.] <&mut serde_json::de::Deserializer<serde_json::read::StrRead> as serde_core::de::Deserializer>::deserialize_seq::<<alloc::vec::Vec<_> as serde_core::de::Deserialize>::deserialize::VecVisitor<alloc::string::String>>
+     0.04%  blaze                 [.] <std::path::Path as core::hash::Hash>::hash::<rustc_hash::FxHasher>
+     0.04%  [kernel.kallsyms]      [k] lookup_fast
+     0.04%  [kernel.kallsyms]      [k] selinux_inode_getattr
+     0.04%  blaze                 [.] serde_json::ser::format_escaped_str_contents::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>
+     0.04%  blaze                 [.] toml::de::parser::document::document
+     0.04%  [kernel.kallsyms]      [k] generic_permission

@@ -1,0 +1,6 @@
+[workspace]
+members = ["gen", "core", "app"]
+resolver = "2"
+
+[profile.quick]
+inherits = "dev"

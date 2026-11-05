@@ -1,0 +1,37 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dep = { path = "dep" }
+pm = { path = "pm" }
+
+[build-dependencies]
+dep = { path = "dep" }
+bonly = { path = "bonly" }
+
+[profile.dev]
+opt-level = 1
+codegen-units = 4
+panic = "abort"
+
+[profile.dev.package.dep]
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+overflow-checks = false
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[profile.custom]
+inherits = "release"
+debug = 1
+incremental = true
+
+[profile.dev.build-override]
+opt-level = 3
+debug = 1

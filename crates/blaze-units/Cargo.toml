@@ -1,0 +1,45 @@
+[package]
+name = "blaze-units"
+description = "cargo's unit graph made by blaze: the units a build compiles and runs, with their features, profiles and edges, computed from blaze-resolve's resolve and blaze-manifest's workspace with no I/O"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-lint-defs.workspace = true
+blaze-radix.workspace = true
+blaze-protocol.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-source.workspace = true
+blaze-manifest.workspace = true
+blaze-resolve.workspace = true
+cargo-util-schemas.workspace = true
+rustc-stable-hash.workspace = true
+semver.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+blaze-sha256.workspace = true
+# The CPUs of `-C target-cpu` and their features (target_features::cpus).
+target-features.workspace = true
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-vfs.workspace = true
+
+[lints]
+workspace = true

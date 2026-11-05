@@ -1,0 +1,6 @@
+HELLO, SMOKE
+HELLO, SMOKE
+parse 7: Ok(7)
+parse 70: 70 is more than 10
+parse x: not a number: invalid digit found in string
+version 1.2.3

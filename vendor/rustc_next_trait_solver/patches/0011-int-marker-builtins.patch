@@ -1,0 +1,272 @@
+diff --git a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
+index f577fe0..edcc79c 100644
+--- a/src/solve/assembly/mod.rs
++++ b/src/solve/assembly/mod.rs
+@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
+ use super::trait_goals::TraitGoalProvenVia;
+ use super::{has_only_region_constraints, inspect};
+ use crate::delegate::SolverDelegate;
+-use crate::solve::assembly::structural_traits::AmbiguousOrRerunNonErased;
++use crate::solve::assembly::structural_traits::{AmbiguousOrRerunNonErased, IntMarker};
+ use crate::solve::inspect::ProbeKind;
+ use crate::solve::{
+     BuiltinImplSource, CandidateSource, CanonicalResponse, Certainty, EvalCtxt, Goal, GoalSource,
+@@ -428,6 +428,15 @@ where
+         ecx: &mut EvalCtxt<'_, D>,
+         goal: Goal<I, Self>,
+     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
++
++    /// blaze: `ArbitraryInt`, `ArbitrarySigned`, `IntFrom<S>` and `IntTryFrom<S>`, the markers
++    /// of `#[blaze::arbitrary_ints]`, answered from the types alone
++    /// ([`structural_traits::int_marker_holds`]).
++    fn consider_builtin_int_marker_candidate(
++        ecx: &mut EvalCtxt<'_, D>,
++        goal: Goal<I, Self>,
++        marker: structural_traits::IntMarker,
++    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
+ }
+ 
+ /// Allows callers of `assemble_and_evaluate_candidates` to choose whether to limit
+@@ -716,6 +725,18 @@ where
+                     G::consider_builtin_try_as_dyn_candidate(self, goal)
+                 }
+                 Some(SolverTraitLangItem::Field) => G::consider_builtin_field_candidate(self, goal),
++                Some(SolverTraitLangItem::ArbitraryInt) => {
++                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::Arbitrary)
++                }
++                Some(SolverTraitLangItem::ArbitrarySigned) => {
++                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::Signed)
++                }
++                Some(SolverTraitLangItem::IntFrom) => {
++                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::From)
++                }
++                Some(SolverTraitLangItem::IntTryFrom) => {
++                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::TryFrom)
++                }
+                 _ => Err(NoSolution.into()),
+             }
+         };
+diff --git a/src/solve/assembly/structural_traits.rs b/src/solve/assembly/structural_traits.rs
+index a7e02f0..936bbdd 100644
+--- a/src/solve/assembly/structural_traits.rs
++++ b/src/solve/assembly/structural_traits.rs
+@@ -19,6 +19,83 @@ use crate::solve::{
+     AdtDestructorKind, EvalCtxt, Goal, NoSolution, NoSolutionOrRerunNonErased, RerunNonErased,
+ };
+ 
++/// blaze: which marker of `#[blaze::arbitrary_ints]` a goal is of
++/// (`docs/v2/plan/lanes/frontend/arbitrary-ints.md`). Each is a lang-item trait of
++/// `core::num::arbitrary` that no impl may implement; [`int_marker_holds`] answers it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(in crate::solve) enum IntMarker {
++    /// `Self: ArbitraryInt`: `Self` is a `uN` or `iN` whose width is not a standard one.
++    Arbitrary,
++    /// `Self: ArbitrarySigned`: `Self` is such an `iN`.
++    Signed,
++    /// `Self: IntFrom<S>`: `Self` and `S` are two different integer types, one of them of an
++    /// arbitrary width, and every value of `S` is a value of `Self`.
++    From,
++    /// `Self: IntTryFrom<S>`: as `IntFrom`, where some value of `S` is not one of `Self`.
++    TryFrom,
++}
++
++/// An integer type as the markers see it: its signedness, its width in bits (`None` for
++/// `isize` and `usize`), and whether that width is an arbitrary one.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct IntShape {
++    signed: bool,
++    bits: Option<u64>,
++    arbitrary: bool,
++}
++
++fn int_shape<I: Interner>(ty: I::Ty) -> Option<IntShape> {
++    match ty.kind() {
++        ty::Int(int) => Some(IntShape {
++            signed: true,
++            bits: int.bit_width(),
++            arbitrary: int.arbitrary_width().is_some(),
++        }),
++        ty::Uint(uint) => Some(IntShape {
++            signed: false,
++            bits: uint.bit_width(),
++            arbitrary: uint.arbitrary_width().is_some(),
++        }),
++        _ => None,
++    }
++}
++
++/// Whether every value of `source` is a value of `target`, on every target. A pointer-sized
++/// source never is, and a pointer-sized target is taken as 16 bits, the least any target has:
++/// rustc's rule for which `From` impls `usize` and `isize` have.
++fn int_conversion_is_lossless(source: IntShape, target: IntShape) -> bool {
++    let Some(source_bits) = source.bits else { return false };
++    let target_bits = target.bits.unwrap_or(16);
++    match (source.signed, target.signed) {
++        (false, false) | (true, true) => source_bits <= target_bits,
++        (false, true) => source_bits < target_bits,
++        (true, false) => false,
++    }
++}
++
++/// Whether `marker` holds of `self_ty` and, for `IntFrom` and `IntTryFrom`, of `source`, both
++/// structurally normalized and neither a type variable. An integer variable is no integer type
++/// here: it is never an arbitrary width through trait selection alone, so a goal of one never
++/// holds.
++pub(in crate::solve) fn int_marker_holds<I: Interner>(
++    marker: IntMarker,
++    self_ty: I::Ty,
++    source: Option<I::Ty>,
++) -> bool {
++    let Some(target) = int_shape::<I>(self_ty) else { return false };
++    match marker {
++        IntMarker::Arbitrary => target.arbitrary,
++        IntMarker::Signed => target.arbitrary && target.signed,
++        IntMarker::From | IntMarker::TryFrom => {
++            let Some(source) = source.and_then(int_shape::<I>) else { return false };
++            if source == target || !(source.arbitrary || target.arbitrary) {
++                return false;
++            }
++            int_conversion_is_lossless(source, target) == (marker == IntMarker::From)
++        }
++    }
++}
++
+ // Calculates the constituent types of a type for `auto trait` purposes.
+ #[instrument(level = "trace", skip(ecx), ret)]
+ pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<D, I>(
+diff --git a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+index 2676816..b89f949 100644
+--- a/src/solve/effect_goals.rs
++++ b/src/solve/effect_goals.rs
+@@ -473,6 +473,29 @@ where
+     ) -> Result<Candidate<<D as SolverDelegate>::Interner>, NoSolutionOrRerunNonErased> {
+         unreachable!("Field is not const")
+     }
++
++    /// blaze: `ArbitraryInt` is a `const trait` (its default items are the arbitrary-width
++    /// integers' inherent items, callable in a `const fn`), and every arbitrary-width integer
++    /// is `const ArbitraryInt` and `const ArbitrarySigned` exactly when it is the plain one.
++    fn consider_builtin_int_marker_candidate(
++        ecx: &mut EvalCtxt<'_, D>,
++        goal: Goal<I, Self>,
++        marker: structural_traits::IntMarker,
++    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
++        use structural_traits::{IntMarker, int_marker_holds};
++
++        match marker {
++            IntMarker::Arbitrary | IntMarker::Signed => {}
++            IntMarker::From | IntMarker::TryFrom => {
++                unreachable!("`IntFrom` and `IntTryFrom` are not const: {:?}", goal)
++            }
++        }
++        if !int_marker_holds::<I>(marker, goal.predicate.self_ty(), None) {
++            return Err(NoSolution.into());
++        }
++        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
++            .enter(|ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))
++    }
+ }
+ 
+ impl<D, I> EvalCtxt<'_, D>
+diff --git a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+index 75654a8..2073e36 100644
+--- a/src/solve/normalizes_to.rs
++++ b/src/solve/normalizes_to.rs
+@@ -1107,6 +1107,17 @@ where
+     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+         unreachable!("try_as_dyn helper trait doesn't have assoc types")
+     }
++
++    /// blaze: the markers of `#[blaze::arbitrary_ints]` have no associated types. Their
++    /// associated constants (`ArbitraryInt::BITS`, `MIN`, `MAX`) are defaults, read by const
++    /// eval through the builtin impl, never normalized here.
++    fn consider_builtin_int_marker_candidate(
++        _ecx: &mut EvalCtxt<'_, D>,
++        goal: Goal<I, Self>,
++        _marker: structural_traits::IntMarker,
++    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
++        panic!("the `#[blaze::arbitrary_ints]` markers have no associated types: {:?}", goal)
++    }
+ }
+ 
+ impl<D, I> EvalCtxt<'_, D>
+diff --git a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
+index e7d67b6..70ac842 100644
+--- a/src/solve/trait_goals.rs
++++ b/src/solve/trait_goals.rs
+@@ -317,6 +317,22 @@ where
+             return cand;
+         }
+ 
++        // blaze: an integer of an arbitrary width (`#[blaze::arbitrary_ints]`) is `Copy` here,
++        // with no constituents: core cannot write `impl<T: ArbitraryInt> Copy for T` (E0206).
++        // Its `Clone` and `TrivialClone` are impls in core, as the standard widths' are.
++        let arbitrary_width = match goal.predicate.self_ty().kind() {
++            ty::Int(int) => int.arbitrary_width().is_some(),
++            ty::Uint(uint) => uint.arbitrary_width().is_some(),
++            _ => false,
++        };
++        if arbitrary_width
++            && ecx.cx().is_trait_lang_item(goal.predicate.def_id(), SolverTraitLangItem::Copy)
++        {
++            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
++                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
++            });
++        }
++
+         ecx.probe_and_evaluate_goal_for_constituent_tys(
+             CandidateSource::BuiltinImpl(BuiltinImplSource::Misc),
+             goal,
+@@ -918,6 +934,52 @@ where
+         })
+     }
+ 
++    /// blaze: a marker of `#[blaze::arbitrary_ints]`. Its self type is never a type variable
++    /// here (the goal is ambiguous before builtins are asked); a type variable as the source of
++    /// `IntFrom` or `IntTryFrom` is ambiguous. Every goal of a type that is not an integer is
++    /// refused before any probe.
++    fn consider_builtin_int_marker_candidate(
++        ecx: &mut EvalCtxt<'_, D>,
++        goal: Goal<I, Self>,
++        marker: structural_traits::IntMarker,
++    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
++        use structural_traits::{IntMarker, int_marker_holds};
++
++        if goal.predicate.polarity != ty::ClausePolarity::Positive {
++            return Err(NoSolution.into());
++        }
++        let self_ty = goal.predicate.self_ty();
++        match marker {
++            IntMarker::Arbitrary | IntMarker::Signed => {
++                if !int_marker_holds::<I>(marker, self_ty, None) {
++                    return Err(NoSolution.into());
++                }
++                ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
++                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
++                })
++            }
++            IntMarker::From | IntMarker::TryFrom => {
++                if !matches!(self_ty.kind(), ty::Int(_) | ty::Uint(_)) {
++                    return Err(NoSolution.into());
++                }
++                ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
++                    let source = ecx.structurally_normalize_ty(
++                        goal.param_env,
++                        goal.predicate.trait_ref.args.type_at(1),
++                    )?;
++                    if let ty::Infer(ty::TyVar(_)) = source.kind() {
++                        return ecx
++                            .evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
++                    }
++                    if !int_marker_holds::<I>(marker, self_ty, Some(source)) {
++                        return Err(NoSolution.into());
++                    }
++                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
++                })
++            }
++        }
++    }
++
+     fn consider_builtin_field_candidate(
+         ecx: &mut EvalCtxt<'_, D>,
+         goal: Goal<I, Self>,

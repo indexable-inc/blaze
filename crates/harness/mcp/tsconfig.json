@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ESNext", "module": "Preserve", "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"], "types": ["bun"],
+    "strict": true, "noEmit": true, "allowImportingTsExtensions": true, "skipLibCheck": true
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,128 @@
+# The release train: everything the merge gate (blaze.yaml) leaves out, on main after the merge,
+# and a release of main when it is all green. What runs where, and how long it takes, is in
+# docs/harness.md ("CI").
+#
+#   every harness of harness/ci.py's full tier, on Linux x86-64, Linux AArch64, macOS arm64 and
+#       Windows x86-64, each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (Linux x86-64, macOS) and the larger ones (AArch64); and the ripgrep
+#       bench (not blocking). nix-live.yaml (the flake's builds, the demo and live edits on macOS)
+#       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,
+#       and in the train's run it held main's next train that long
+#   green: when main has changes since the last release, the tag v0.YYYYMMDD.N (today's next
+#       release, N from 0) on main's commit as it is, and release.yaml on it
+#       (.github/scripts/train_release.py); no commit goes to main
+#   red: one issue, "Release train is red", opened or added to with the jobs that failed and the
+#       commits since the last green train; the next green train closes it
+#
+# When it runs on pushes to main (off for now, see `on:`), one train runs at a time; a push while it runs waits, and a
+# newer push replaces the one waiting, so the train runs on the newest commit of main as soon
+# as the one before is done. A run cancelled by each push (`cancel-in-progress`) would never end
+# while main takes a merge every few minutes, and a train takes about 45. Trains on release tags share one group (below);
+# any other ref has a group of its own: a train run by hand on a branch (contributing.md: before landing what the fast tier does not
+# cover) neither waits behind main's nor takes the place of main's waiting one.
+name: train
+# By hand only for now (2026-10-27): on every push it never finished (a run waited hours on
+# nushell while every newer one was cancelled) and was red for reasons the merge gate (`ci`)
+# does not share. Releases are cut by hand until it is turned back on.
+on:
+  workflow_dispatch:
+
+# Every train on a release tag shares one group: one runs at a time, and a newer tag's train
+# replaces the one waiting, so the train always moves on to the newest release once the running
+# one ends, and two releases' trains never share the runners.
+concurrency:
+  group: ${{ startsWith(github.ref, 'refs/tags/') && 'train-tags' || format('train-{0}', github.ref) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
+jobs:
+  linux-x64:
+    name: linux x64
+    uses: ./.github/workflows/blaze-platform.yaml
+    with:
+      platform: linux-x64
+      os: ubuntu-24.04
+      tier: full
+      blaze-cli: true
+      bench: true
+
+  linux-arm64:
+    name: linux arm64
+    uses: ./.github/workflows/blaze-platform.yaml
+    with:
+      platform: linux-arm64
+      os: ubuntu-24.04-arm
+      tier: full
+      projects: true
+
+  macos:
+    name: macos arm64
+    uses: ./.github/workflows/blaze-platform.yaml
+    with:
+      platform: macos-arm64
+      os: macos-15
+      tier: full
+      blaze-cli: true
+
+  windows:
+    name: windows x64
+    uses: ./.github/workflows/blaze-platform.yaml
+    with:
+      platform: windows-x64
+      os: windows-2025
+      tier: full
+
+  # The train's verdict: every job above.
+  train:
+    name: train
+    needs: [linux-x64, linux-arm64, macos, windows]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
+          ! echo "$NEEDS" | jq -e 'any(.[]; .result != "success")' > /dev/null
+
+  # Main's changes since the last release, as a tag on main's commit, when the train is green
+  # (.github/scripts/train_release.py). No commit goes to main: the release's build is told its
+  # version by `BLAZE_RELEASE` (release.yaml).
+  release:
+    name: release
+    needs: train
+    if: needs.train.result == 'success' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: |
+          python3 -I .github/scripts/train_release.py '{"push": true}'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  issue:
+    name: train issue
+    needs: [train, release]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/train-issue
+        with:
+          verdict: ${{ (needs.train.result == 'success' && needs.release.result != 'failure') && 'green' || 'red' }}

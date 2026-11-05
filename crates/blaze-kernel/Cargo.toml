@@ -1,0 +1,27 @@
+[package]
+name = "blaze-kernel"
+description = "blaze v2's kernel: registered pure compute steps from MIR down, each value kept in blaze-cas under its identity, its step's code and the narrow reads it made, verified on lookup"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-store-check.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

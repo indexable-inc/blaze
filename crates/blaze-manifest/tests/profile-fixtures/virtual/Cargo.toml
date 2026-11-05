@@ -1,0 +1,21 @@
+[workspace]
+members = ["a", "b"]
+exclude = ["ext"]
+resolver = "2"
+
+[profile.dev]
+split-debuginfo = "packed"
+debug = "limited"
+
+[profile.release.package.b]
+opt-level = 1
+
+[profile.release.package."*"]
+debug = 1
+
+[profile.release.build-override]
+codegen-units = 2
+opt-level = "z"
+
+[profile.bench]
+panic = "abort"

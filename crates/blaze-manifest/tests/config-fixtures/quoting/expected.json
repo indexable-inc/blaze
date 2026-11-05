@@ -1,0 +1,106 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "env.\"WITH SPACE\" = \"a b\"\nenv.apostrophe = \"it's\"\nenv.both = \"\"\"it's \"both\"\"\"\"\nenv.\"dotted.key\" = 'single \\ quoted'\nenv.empty = \"\"\nenv.multi = \"\"\"\nline one\nline two\"\"\"\nenv.tab = \"a\\tb\"\nenv.unicode = \"ünïcødé ✓\"\ntarget.'cfg(target_os = \"linux\")'.rustflags = [\"-C\", \"link-arg=-Wl,--as-needed\"]\n\"weird.table\". = 1\n# The following environment variables may affect the loaded values.\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "env.\"WITH SPACE\" = \"a b\" # $ROOT/.cargo/config.toml\nenv.apostrophe = \"it's\" # $ROOT/.cargo/config.toml\nenv.both = \"\"\"it's \"both\"\"\"\" # $ROOT/.cargo/config.toml\nenv.\"dotted.key\" = 'single \\ quoted' # $ROOT/.cargo/config.toml\nenv.empty = \"\" # $ROOT/.cargo/config.toml\nenv.multi = \"\"\"\nline one\nline two\"\"\" # $ROOT/.cargo/config.toml\nenv.tab = \"a\\tb\" # $ROOT/.cargo/config.toml\nenv.unicode = \"ünïcødé ✓\" # $ROOT/.cargo/config.toml\ntarget.'cfg(target_os = \"linux\")'.rustflags = [\n    \"-C\", # $ROOT/.cargo/config.toml\n    \"link-arg=-Wl,--as-needed\", # $ROOT/.cargo/config.toml\n]\n\"weird.table\". = 1 # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nenv.\"WITH SPACE\" = \"a b\"\nenv.apostrophe = \"it's\"\nenv.both = \"\"\"it's \"both\"\"\"\"\nenv.\"dotted.key\" = 'single \\ quoted'\nenv.empty = \"\"\nenv.multi = \"\"\"\nline one\nline two\"\"\"\nenv.tab = \"a\\tb\"\nenv.unicode = \"ünïcødé ✓\"\ntarget.'cfg(target_os = \"linux\")'.rustflags = [\"-C\", \"link-arg=-Wl,--as-needed\"]\n\"weird.table\". = 1\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config.toml\nenv.\"WITH SPACE\" = \"a b\" # $ROOT/.cargo/config.toml\nenv.apostrophe = \"it's\" # $ROOT/.cargo/config.toml\nenv.both = \"\"\"it's \"both\"\"\"\" # $ROOT/.cargo/config.toml\nenv.\"dotted.key\" = 'single \\ quoted' # $ROOT/.cargo/config.toml\nenv.empty = \"\" # $ROOT/.cargo/config.toml\nenv.multi = \"\"\"\nline one\nline two\"\"\" # $ROOT/.cargo/config.toml\nenv.tab = \"a\\tb\" # $ROOT/.cargo/config.toml\nenv.unicode = \"ünïcødé ✓\" # $ROOT/.cargo/config.toml\ntarget.'cfg(target_os = \"linux\")'.rustflags = [\n    \"-C\", # $ROOT/.cargo/config.toml\n    \"link-arg=-Wl,--as-needed\", # $ROOT/.cargo/config.toml\n]\n\"weird.table\". = 1 # $ROOT/.cargo/config.toml\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"env\":{\"WITH SPACE\":\"a b\",\"apostrophe\":\"it's\",\"both\":\"it's \\\"both\\\"\",\"dotted.key\":\"single \\\\ quoted\",\"empty\":\"\",\"multi\":\"line one\\nline two\",\"tab\":\"a\\tb\",\"unicode\":\"ünïcødé ✓\"},\"target\":{\"cfg(target_os = \\\"linux\\\")\":{\"rustflags\":[\"-C\",\"link-arg=-Wl,--as-needed\"]}},\"weird.table\":{\"\":1}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"env\":{\"WITH SPACE\":\"a b\",\"apostrophe\":\"it's\",\"both\":\"it's \\\"both\\\"\",\"dotted.key\":\"single \\\\ quoted\",\"empty\":\"\",\"multi\":\"line one\\nline two\",\"tab\":\"a\\tb\",\"unicode\":\"ünïcødé ✓\"},\"target\":{\"cfg(target_os = \\\"linux\\\")\":{\"rustflags\":[\"-C\",\"link-arg=-Wl,--as-needed\"]}},\"weird.table\":{\"\":1}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "env"
+  ],
+  "code": 0,
+  "stdout": "env.\"WITH SPACE\" = \"a b\"\nenv.apostrophe = \"it's\"\nenv.both = \"\"\"it's \"both\"\"\"\"\nenv.\"dotted.key\" = 'single \\ quoted'\nenv.empty = \"\"\nenv.multi = \"\"\"\nline one\nline two\"\"\"\nenv.tab = \"a\\tb\"\nenv.unicode = \"ünïcødé ✓\"\n# The following environment variables may affect the loaded values.\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "env.WITH SPACE"
+  ],
+  "code": 0,
+  "stdout": "env.\"WITH SPACE\" = \"a b\"\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "target"
+  ],
+  "code": 0,
+  "stdout": "target.'cfg(target_os = \"linux\")'.rustflags = [\"-C\", \"link-arg=-Wl,--as-needed\"]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "env"
+  ],
+  "code": 0,
+  "stdout": "{\"env\":{\"WITH SPACE\":\"a b\",\"apostrophe\":\"it's\",\"both\":\"it's \\\"both\\\"\",\"dotted.key\":\"single \\\\ quoted\",\"empty\":\"\",\"multi\":\"line one\\nline two\",\"tab\":\"a\\tb\",\"unicode\":\"ünïcødé ✓\"}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n"
+ },
+ {
+  "args": [
+   "env",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "env.\"WITH SPACE\" = \"a b\" # $ROOT/.cargo/config.toml\nenv.apostrophe = \"it's\" # $ROOT/.cargo/config.toml\nenv.both = \"\"\"it's \"both\"\"\"\" # $ROOT/.cargo/config.toml\nenv.\"dotted.key\" = 'single \\ quoted' # $ROOT/.cargo/config.toml\nenv.empty = \"\" # $ROOT/.cargo/config.toml\nenv.multi = \"\"\"\nline one\nline two\"\"\" # $ROOT/.cargo/config.toml\nenv.tab = \"a\\tb\" # $ROOT/.cargo/config.toml\nenv.unicode = \"ünïcødé ✓\" # $ROOT/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_ENV_X='it'\\''s $HOME and \"q\" '\\!'bang'\n",
+  "stderr": ""
+ }
+]

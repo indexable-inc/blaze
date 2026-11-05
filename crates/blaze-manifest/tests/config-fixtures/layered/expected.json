@@ -1,0 +1,267 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "alias.b = \"build\"\nbuild.incremental = true\nbuild.jobs = 4\nbuild.rustflags = [\"--cfg\", \"home\", \"--cfg\", \"more\", \"-C\", \"opt-level=1\", \"--cfg\", \"sub\"]\nbuild.target = [\"x86_64-unknown-linux-gnu\", \"spec.json\"]\nbuild.target-dir = \"tgt\"\ncargo-new.vcs = \"none\"\nenv.FOO = \"bar\"\nenv.REL.relative = true\nenv.REL.value = \"x/y\"\nenv.STR = \"\"\"\nit's a \"quote\"\nnewline\"\"\"\nhttp.timeout = 30\nnet.offline = false\nnet.retry = 3\nprofile.dev.opt-level = 2\nprofile.release.package.\"*\".debug = \"line-tables-only\"\nregistries.mine.index = \"sparse+https://example.com/index/\"\nsource.crates-io.replace-with = \"vendored\"\nsource.vendored.directory = \"vendor\"\ntarget.\"cfg(unix)\".rustflags = [\"-Dwarnings\"]\ntarget.x86_64-unknown-linux-gnu.linker = \"cc\"\ntarget.x86_64-unknown-linux-gnu.runner = [\"qemu\", \"-L\"]\nterm.color = \"never\"\n# The following environment variables may affect the loaded values.\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n# CARGO_ENV_FOO=zz\n# CARGO_HOME=$CARGO_HOME\n# CARGO_NET_OFFLINE=true\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "alias.b = \"build\" # $ROOT/ws/.cargo/config.toml\nbuild.incremental = true # $ROOT/ws/.cargo/more.toml\nbuild.jobs = 4 # $ROOT/ws/.cargo/config.toml\nbuild.rustflags = [\n    \"--cfg\", # $CARGO_HOME/config.toml\n    \"home\", # $CARGO_HOME/config.toml\n    \"--cfg\", # $ROOT/ws/.cargo/more.toml\n    \"more\", # $ROOT/ws/.cargo/more.toml\n    \"-C\", # $ROOT/ws/.cargo/config.toml\n    \"opt-level=1\", # $ROOT/ws/.cargo/config.toml\n    \"--cfg\", # $ROOT/ws/sub/.cargo/config.toml\n    \"sub\", # $ROOT/ws/sub/.cargo/config.toml\n]\nbuild.target = [\n    \"x86_64-unknown-linux-gnu\", # $ROOT/ws/sub/.cargo/config.toml\n    \"spec.json\", # $ROOT/ws/sub/.cargo/config.toml\n]\nbuild.target-dir = \"tgt\" # $ROOT/ws/.cargo/config.toml\ncargo-new.vcs = \"none\" # $CARGO_HOME/config.toml\nenv.FOO = \"bar\" # $ROOT/ws/.cargo/config.toml\nenv.REL.relative = true # $ROOT/ws/.cargo/config.toml\nenv.REL.value = \"x/y\" # $ROOT/ws/.cargo/config.toml\nenv.STR = \"\"\"\nit's a \"quote\"\nnewline\"\"\" # $ROOT/ws/sub/.cargo/config.toml\nhttp.timeout = 30 # $ROOT/ws/.cargo/more.toml\nnet.offline = false # $ROOT/ws/.cargo/config.toml\nnet.retry = 3 # $ROOT/ws/.cargo/config.toml\nprofile.dev.opt-level = 2 # $ROOT/ws/sub/.cargo/config.toml\nprofile.release.package.\"*\".debug = \"line-tables-only\" # $ROOT/ws/sub/.cargo/config.toml\nregistries.mine.index = \"sparse+https://example.com/index/\" # $ROOT/ws/.cargo/config.toml\nsource.crates-io.replace-with = \"vendored\" # $ROOT/ws/.cargo/config.toml\nsource.vendored.directory = \"vendor\" # $ROOT/ws/.cargo/config.toml\ntarget.\"cfg(unix)\".rustflags = [\n    \"-Dwarnings\", # $ROOT/ws/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.linker = \"cc\" # $ROOT/ws/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.runner = [\n    \"qemu\", # $ROOT/ws/.cargo/config.toml\n    \"-L\", # $ROOT/ws/.cargo/config.toml\n]\nterm.color = \"never\" # $ROOT/ws/sub/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n# CARGO_ENV_FOO=zz\n# CARGO_HOME=$CARGO_HOME\n# CARGO_NET_OFFLINE=true\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n# CARGO_ENV_FOO=zz\n# CARGO_HOME=$CARGO_HOME\n# CARGO_NET_OFFLINE=true\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n\n# $ROOT/ws/sub/.cargo/config.toml\nbuild.rustflags = [\"--cfg\", \"sub\"]\nbuild.target = [\"x86_64-unknown-linux-gnu\", \"spec.json\"]\nenv.STR = \"\"\"\nit's a \"quote\"\nnewline\"\"\"\nprofile.dev.opt-level = 2\nprofile.release.package.\"*\".debug = \"line-tables-only\"\nterm.color = \"never\"\n\n# $ROOT/ws/.cargo/more.toml\nbuild.incremental = true\nbuild.rustflags = [\"--cfg\", \"more\"]\nhttp.timeout = 30\n\n# $ROOT/ws/.cargo/config.toml\nalias.b = \"build\"\nbuild.jobs = 4\nbuild.rustflags = [\"-C\", \"opt-level=1\"]\nbuild.target-dir = \"tgt\"\nenv.FOO = \"bar\"\nenv.REL.relative = true\nenv.REL.value = \"x/y\"\ninclude = [{ optional = true, path = \"extra.toml\" }, \"more.toml\"]\nnet.offline = false\nnet.retry = 3\nregistries.mine.index = \"sparse+https://example.com/index/\"\nsource.crates-io.replace-with = \"vendored\"\nsource.vendored.directory = \"vendor\"\ntarget.\"cfg(unix)\".rustflags = [\"-Dwarnings\"]\ntarget.x86_64-unknown-linux-gnu.linker = \"cc\"\ntarget.x86_64-unknown-linux-gnu.runner = [\"qemu\", \"-L\"]\n\n# $CARGO_HOME/config.toml\nbuild.rustflags = [\"--cfg\", \"home\"]\ncargo-new.vcs = \"none\"\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n# CARGO_ENV_FOO=zz\n# CARGO_HOME=$CARGO_HOME\n# CARGO_NET_OFFLINE=true\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n\n# $ROOT/ws/sub/.cargo/config.toml\nbuild.rustflags = [\n    \"--cfg\", # $ROOT/ws/sub/.cargo/config.toml\n    \"sub\", # $ROOT/ws/sub/.cargo/config.toml\n]\nbuild.target = [\n    \"x86_64-unknown-linux-gnu\", # $ROOT/ws/sub/.cargo/config.toml\n    \"spec.json\", # $ROOT/ws/sub/.cargo/config.toml\n]\nenv.STR = \"\"\"\nit's a \"quote\"\nnewline\"\"\" # $ROOT/ws/sub/.cargo/config.toml\nprofile.dev.opt-level = 2 # $ROOT/ws/sub/.cargo/config.toml\nprofile.release.package.\"*\".debug = \"line-tables-only\" # $ROOT/ws/sub/.cargo/config.toml\nterm.color = \"never\" # $ROOT/ws/sub/.cargo/config.toml\n\n# $ROOT/ws/.cargo/more.toml\nbuild.incremental = true # $ROOT/ws/.cargo/more.toml\nbuild.rustflags = [\n    \"--cfg\", # $ROOT/ws/.cargo/more.toml\n    \"more\", # $ROOT/ws/.cargo/more.toml\n]\nhttp.timeout = 30 # $ROOT/ws/.cargo/more.toml\n\n# $ROOT/ws/.cargo/config.toml\nalias.b = \"build\" # $ROOT/ws/.cargo/config.toml\nbuild.jobs = 4 # $ROOT/ws/.cargo/config.toml\nbuild.rustflags = [\n    \"-C\", # $ROOT/ws/.cargo/config.toml\n    \"opt-level=1\", # $ROOT/ws/.cargo/config.toml\n]\nbuild.target-dir = \"tgt\" # $ROOT/ws/.cargo/config.toml\nenv.FOO = \"bar\" # $ROOT/ws/.cargo/config.toml\nenv.REL.relative = true # $ROOT/ws/.cargo/config.toml\nenv.REL.value = \"x/y\" # $ROOT/ws/.cargo/config.toml\ninclude = [\n    { optional = true, path = \"extra.toml\" }, # $ROOT/ws/.cargo/config.toml\n    \"more.toml\", # $ROOT/ws/.cargo/config.toml\n]\nnet.offline = false # $ROOT/ws/.cargo/config.toml\nnet.retry = 3 # $ROOT/ws/.cargo/config.toml\nregistries.mine.index = \"sparse+https://example.com/index/\" # $ROOT/ws/.cargo/config.toml\nsource.crates-io.replace-with = \"vendored\" # $ROOT/ws/.cargo/config.toml\nsource.vendored.directory = \"vendor\" # $ROOT/ws/.cargo/config.toml\ntarget.\"cfg(unix)\".rustflags = [\n    \"-Dwarnings\", # $ROOT/ws/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.linker = \"cc\" # $ROOT/ws/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.runner = [\n    \"qemu\", # $ROOT/ws/.cargo/config.toml\n    \"-L\", # $ROOT/ws/.cargo/config.toml\n]\n\n# $CARGO_HOME/config.toml\nbuild.rustflags = [\n    \"--cfg\", # $CARGO_HOME/config.toml\n    \"home\", # $CARGO_HOME/config.toml\n]\ncargo-new.vcs = \"none\" # $CARGO_HOME/config.toml\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"alias\":{\"b\":\"build\"},\"build\":{\"incremental\":true,\"jobs\":4,\"rustflags\":[\"--cfg\",\"home\",\"--cfg\",\"more\",\"-C\",\"opt-level=1\",\"--cfg\",\"sub\"],\"target\":[\"x86_64-unknown-linux-gnu\",\"spec.json\"],\"target-dir\":\"tgt\"},\"cargo-new\":{\"vcs\":\"none\"},\"env\":{\"FOO\":\"bar\",\"REL\":{\"relative\":true,\"value\":\"x/y\"},\"STR\":\"it's a \\\"quote\\\"\\nnewline\"},\"http\":{\"timeout\":30},\"net\":{\"offline\":false,\"retry\":3},\"profile\":{\"dev\":{\"opt-level\":2},\"release\":{\"package\":{\"*\":{\"debug\":\"line-tables-only\"}}}},\"registries\":{\"mine\":{\"index\":\"sparse+https://example.com/index/\"}},\"source\":{\"crates-io\":{\"replace-with\":\"vendored\"},\"vendored\":{\"directory\":\"vendor\"}},\"target\":{\"cfg(unix)\":{\"rustflags\":[\"-Dwarnings\"]},\"x86_64-unknown-linux-gnu\":{\"linker\":\"cc\",\"runner\":[\"qemu\",\"-L\"]}},\"term\":{\"color\":\"never\"}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_BUILD_JOBS=8\nCARGO_BUILD_RUSTFLAGS='-a -b'\nCARGO_ENV_FOO=zz\nCARGO_HOME=$CARGO_HOME\nCARGO_NET_OFFLINE=true\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"alias\":{\"b\":\"build\"},\"build\":{\"incremental\":true,\"jobs\":4,\"rustflags\":[\"--cfg\",\"home\",\"--cfg\",\"more\",\"-C\",\"opt-level=1\",\"--cfg\",\"sub\"],\"target\":[\"x86_64-unknown-linux-gnu\",\"spec.json\"],\"target-dir\":\"tgt\"},\"cargo-new\":{\"vcs\":\"none\"},\"env\":{\"FOO\":\"bar\",\"REL\":{\"relative\":true,\"value\":\"x/y\"},\"STR\":\"it's a \\\"quote\\\"\\nnewline\"},\"http\":{\"timeout\":30},\"net\":{\"offline\":false,\"retry\":3},\"profile\":{\"dev\":{\"opt-level\":2},\"release\":{\"package\":{\"*\":{\"debug\":\"line-tables-only\"}}}},\"registries\":{\"mine\":{\"index\":\"sparse+https://example.com/index/\"}},\"source\":{\"crates-io\":{\"replace-with\":\"vendored\"},\"vendored\":{\"directory\":\"vendor\"}},\"target\":{\"cfg(unix)\":{\"rustflags\":[\"-Dwarnings\"]},\"x86_64-unknown-linux-gnu\":{\"linker\":\"cc\",\"runner\":[\"qemu\",\"-L\"]}},\"term\":{\"color\":\"never\"}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_BUILD_JOBS=8\nCARGO_BUILD_RUSTFLAGS='-a -b'\nCARGO_ENV_FOO=zz\nCARGO_HOME=$CARGO_HOME\nCARGO_NET_OFFLINE=true\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='env A=1'\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "build"
+  ],
+  "code": 0,
+  "stdout": "build.incremental = true\nbuild.jobs = 4\nbuild.rustflags = [\"--cfg\", \"home\", \"--cfg\", \"more\", \"-C\", \"opt-level=1\", \"--cfg\", \"sub\"]\nbuild.target = [\"x86_64-unknown-linux-gnu\", \"spec.json\"]\nbuild.target-dir = \"tgt\"\n# The following environment variables may affect the loaded values.\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "build.rustflags",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.rustflags = [\n    \"--cfg\", # $CARGO_HOME/config.toml\n    \"home\", # $CARGO_HOME/config.toml\n    \"--cfg\", # $ROOT/ws/.cargo/more.toml\n    \"more\", # $ROOT/ws/.cargo/more.toml\n    \"-C\", # $ROOT/ws/.cargo/config.toml\n    \"opt-level=1\", # $ROOT/ws/.cargo/config.toml\n    \"--cfg\", # $ROOT/ws/sub/.cargo/config.toml\n    \"sub\", # $ROOT/ws/sub/.cargo/config.toml\n    \"-a\", # environment variable `CARGO_BUILD_RUSTFLAGS`\n    \"-b\", # environment variable `CARGO_BUILD_RUSTFLAGS`\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "build"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"incremental\":true,\"jobs\":4,\"rustflags\":[\"--cfg\",\"home\",\"--cfg\",\"more\",\"-C\",\"opt-level=1\",\"--cfg\",\"sub\"],\"target\":[\"x86_64-unknown-linux-gnu\",\"spec.json\"],\"target-dir\":\"tgt\"}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_BUILD_JOBS=8\nCARGO_BUILD_RUSTFLAGS='-a -b'\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value",
+   "build.jobs"
+  ],
+  "code": 0,
+  "stdout": "8\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "target.x86_64-unknown-linux-gnu.runner",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "target.x86_64-unknown-linux-gnu.runner = [\n    \"env\", # environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`\n    \"A=1\", # environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "env"
+  ],
+  "code": 0,
+  "stdout": "env.FOO = \"bar\"\nenv.REL.relative = true\nenv.REL.value = \"x/y\"\nenv.STR = \"\"\"\nit's a \"quote\"\nnewline\"\"\"\n# The following environment variables may affect the loaded values.\n# CARGO_ENV_FOO=zz\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "net.offline"
+  ],
+  "code": 0,
+  "stdout": "net.offline = true\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "nope"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: config value `nope` is not set\n"
+ },
+ {
+  "args": [
+   "build.rustflags.x"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: expected table for configuration key `build.rustflags`, but found array in $ROOT/ws/sub/.cargo/config.toml\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "build"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n\n# $ROOT/ws/sub/.cargo/config.toml\nbuild.rustflags = [\"--cfg\", \"sub\"]\nbuild.target = [\"x86_64-unknown-linux-gnu\", \"spec.json\"]\n\n# $ROOT/ws/.cargo/more.toml\nbuild.incremental = true\nbuild.rustflags = [\"--cfg\", \"more\"]\n\n# $ROOT/ws/.cargo/config.toml\nbuild.jobs = 4\nbuild.rustflags = [\"-C\", \"opt-level=1\"]\nbuild.target-dir = \"tgt\"\n\n# $CARGO_HOME/config.toml\nbuild.rustflags = [\"--cfg\", \"home\"]\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --merged=no, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "--format",
+   "yaml"
+  ],
+  "code": 1,
+  "stdout": "",
+  "stderr": "error: invalid value 'yaml' for '--format <format>'\n  [possible values: toml, json, json-value]\n\nFor more information, try '--help'.\n"
+ },
+ {
+  "args": [
+   "--config",
+   "build.jobs=2",
+   "build.jobs",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.jobs = 2 # --config cli option\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "build.rustflags=[\"-x\"]",
+   "build.rustflags",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.rustflags = [\n    \"--cfg\", # $CARGO_HOME/config.toml\n    \"home\", # $CARGO_HOME/config.toml\n    \"--cfg\", # $ROOT/ws/.cargo/more.toml\n    \"more\", # $ROOT/ws/.cargo/more.toml\n    \"-C\", # $ROOT/ws/.cargo/config.toml\n    \"opt-level=1\", # $ROOT/ws/.cargo/config.toml\n    \"--cfg\", # $ROOT/ws/sub/.cargo/config.toml\n    \"sub\", # $ROOT/ws/sub/.cargo/config.toml\n    \"-a\", # environment variable `CARGO_BUILD_RUSTFLAGS`\n    \"-b\", # environment variable `CARGO_BUILD_RUSTFLAGS`\n    \"-x\", # --config cli option\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "build.jobs",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to parse value from --config argument `build.jobs` as a dotted key expression\n\nCaused by:\n  TOML parse error at line 1, column 11\n    |\n  1 | build.jobs\n    |           ^\n  key with no value, expected `=`\n"
+ },
+ {
+  "args": [
+   "--config",
+   "[build]",
+   "build"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: --config argument `[build]` was not a TOML dotted key expression (such as `build.jobs = 2`)\n"
+ },
+ {
+  "args": [
+   "--config",
+   "registry.token=\"x\"",
+   "registry"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: registry.token cannot be set through --config for security reasons\n"
+ },
+ {
+  "args": [
+   "--config",
+   "a.b=1",
+   "--config",
+   "a.b=\"s\"",
+   "a"
+  ],
+  "code": 0,
+  "stdout": "a.b = \"s\"\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "../.cargo/more.toml",
+   "build",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.incremental = true # $ROOT/ws/sub/../.cargo/more.toml\nbuild.jobs = 4 # $ROOT/ws/.cargo/config.toml\nbuild.rustflags = [\n    \"--cfg\", # $CARGO_HOME/config.toml\n    \"home\", # $CARGO_HOME/config.toml\n    \"--cfg\", # $ROOT/ws/.cargo/more.toml\n    \"more\", # $ROOT/ws/.cargo/more.toml\n    \"-C\", # $ROOT/ws/.cargo/config.toml\n    \"opt-level=1\", # $ROOT/ws/.cargo/config.toml\n    \"--cfg\", # $ROOT/ws/sub/.cargo/config.toml\n    \"sub\", # $ROOT/ws/sub/.cargo/config.toml\n    \"--cfg\", # $ROOT/ws/sub/../.cargo/more.toml\n    \"more\", # $ROOT/ws/sub/../.cargo/more.toml\n]\nbuild.target = [\n    \"x86_64-unknown-linux-gnu\", # $ROOT/ws/sub/.cargo/config.toml\n    \"spec.json\", # $ROOT/ws/sub/.cargo/config.toml\n]\nbuild.target-dir = \"tgt\" # $ROOT/ws/.cargo/config.toml\n# The following environment variables may affect the loaded values.\n# CARGO_BUILD_JOBS=8\n# CARGO_BUILD_RUSTFLAGS='-a -b'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "include=\"../.cargo/more.toml\"",
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: failed to load --config include\n\nCaused by:\n  expected a list of strings or a list of tables, but found string at `include` in `--config cli option\n"
+ }
+]

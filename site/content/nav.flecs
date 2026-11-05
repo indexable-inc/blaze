@@ -1,0 +1,19 @@
+// The sidebar's sections, top to bottom by order (renderer core side.rs draws them). A page joins one with
+// Nav: {label, order}, Icon and (InGroup, nav.<section>); a Link child of a section is a row that goes elsewhere.
+// Learn comes first: the home page (the course path) and, after it, its lessons with the reader's progress. Everything
+// else is Reference, folded in the phone drawer until opened.
+// This file runs right after refs.flecs, so every page can name its section.
+nav {
+  learn {
+    Group: {"Learn", 0}
+    Icon: {"graduation-cap"}
+  }
+  reference {
+    Group: {"Reference", 1}
+    Icon: {"books"}
+    FoldOnPhone
+    Link github("GitHub", "https://github.com/indexable-inc/blaze", 9) {
+      Icon: {"github"}
+    }
+  }
+}

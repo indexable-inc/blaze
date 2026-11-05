@@ -1,0 +1,38 @@
+[package]
+name = "hir-ty-share"
+description = "The building blocks of compile identity: a type's fact (its layout and shape), the identity of types and constants by content, a body's code, a drop's key and the intrinsics' classes"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-query.workspace = true
+smallvec.workspace = true
+stdx.workspace = true
+
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+
+blaze-ids.workspace = true
+blaze-items.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

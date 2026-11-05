@@ -1,0 +1,85 @@
+// Pages the site cites. A block names one inline as [[name]] or [label][name], or with
+// (Cites, refs.name); each page lists what it cites under References.
+refs {
+  OrderedChildren
+
+  // Zig's I/O.
+  Ref zig_016(href: "https://ziglang.org/download/0.16.0/release-notes.html", label: "Zig 0.16.0 release notes", note: "std.Io ships: I/O as an interface value passed in, no async keywords.")
+  Ref kelley_io(href: "https://andrewkelley.me/post/zig-new-async-io-text-version.html", label: "Andrew Kelley, Zig's new async I/O", note: "Why the caller picks blocking or evented I/O by passing an Io.")
+  Ref cro_io(href: "https://kristoff.it/blog/zig-new-async-io/", label: "Loris Cro, Zig's new async I/O", note: "The same design from the user's side; the end of function colouring.")
+  Ref zig_25592(href: "https://github.com/ziglang/zig/pull/25592", label: "ziglang/zig#25592: std: Introduce Io interface", note: "Merged 2025-10-29.")
+  Ref zig_23446(href: "https://github.com/ziglang/zig/issues/23446", label: "ziglang/zig#23446: stackless coroutines as low-level primitives", note: "Open. How evented I/O gets stackless frames without async/await.")
+  Ref zig_23367(href: "https://github.com/ziglang/zig/issues/23367", label: "ziglang/zig#23367: restricted function types", note: "Open. Lets the compiler know every target of an indirect call.")
+  Ref zig_6025(href: "https://github.com/ziglang/zig/issues/6025", label: "ziglang/zig#6025: async/await/suspend/resume", note: "Closed as not planned on 2025-07-15: Zig will not bring back the keywords.")
+  Ref lwn_zig(href: "https://lwn.net/Articles/1046084/", label: "LWN: Zig's new I/O", note: "An outside summary of the design and its trade-offs.")
+
+  // Capabilities and effects.
+  Ref cap_std(href: "https://github.com/bytecodealliance/cap-std", label: "cap-std", note: "A capability-oriented version of Rust's std: no ambient filesystem or network.")
+  Ref sans_io(href: "https://sans-io.readthedocs.io/", label: "Sans-I/O", note: "Protocol code that never does I/O itself; the caller feeds it bytes and time.")
+  Ref firezone(href: "https://www.firezone.dev/blog/sans-io", label: "Firezone: sans-IO in Rust networking code", note: "The pattern in production Rust.")
+  Ref quinn(href: "https://github.com/quinn-rs/quinn", label: "quinn", note: "QUIC in Rust; quinn-proto is a sans-IO state machine under an async wrapper.")
+  Ref koka(href: "https://koka-lang.github.io/koka/doc/book.html", label: "Koka", note: "Effect types and handlers, compiled without a runtime for effects.")
+  Ref effekt(href: "https://effekt-lang.org/", label: "Effekt", note: "Effect handlers where effects are capabilities passed in, second-class.")
+  Ref unison(href: "https://www.unison-lang.org/docs/fundamentals/abilities/", label: "Unison abilities", note: "Effects in signatures, with handlers; pure code is cached by hash.")
+  Ref unison_idea(href: "https://www.unison-lang.org/docs/the-big-idea/", label: "Unison: the big idea", note: "Code identified by the hash of its content.")
+  Ref scala_cc(href: "https://docs.scala-lang.org/scala3/reference/experimental/cc.html", label: "Scala 3 capture checking", note: "Types track which capabilities a value captures.")
+  Ref wasi(href: "https://wasi.dev/", label: "WASI", note: "System interfaces for wasm, granted as capabilities by the host.")
+  Ref ocaml_fx(href: "https://ocaml.org/manual/5.2/effects.html", label: "OCaml 5 effect handlers", note: "Untyped effects on fibers: one stack per fiber, no colouring.")
+  Ref effects_init(href: "https://rust-lang.github.io/effects-initiative/", label: "Rust effects initiative", note: "The Rust project's work on const, async and other effect generics.")
+
+  // Linear and affine types.
+  Ref move_goal(href: "https://goals.rust-lang.org/2026/move-trait.html", label: "Rust 2026 goal: Move trait", note: "The project goal to add the trait hierarchy below Sized.")
+  Ref move_tracking(href: "https://github.com/rust-lang/rust/issues/149607", label: "rust-lang/rust#149607: tracking issue for Move", note: "Open.")
+  Ref niko_mdl(href: "https://smallcultfollowing.com/babysteps/blog/2025/10/21/move-destruct-leak/", label: "Niko Matsakis, Move, Destruct, Leak", note: "The proposed hierarchy, from types that cannot move to types that may be leaked.")
+  Ref rfc_forget(href: "https://github.com/rust-lang/rfcs/pull/3782", label: "rust-lang/rfcs#3782: Forget marker trait", note: "Open.")
+  Ref rfc_forgettable(href: "https://github.com/rust-lang/rfcs/pull/3867", label: "rust-lang/rfcs#3867: forgettable auto trait", note: "Closed 2025-10-05.")
+  Ref rfc_linear(href: "https://github.com/rust-lang/rfcs/issues/814", label: "rust-lang/rfcs#814: add a linear type facility", note: "Open since 2015.")
+  Ref rfc_sized(href: "https://github.com/rust-lang/rfcs/pull/3729", label: "rust-lang/rfcs#3729: hierarchy of Sized traits", note: "Open. The ?Trait machinery the new bounds would reuse.")
+  Ref yosh_linear(href: "https://blog.yoshuawuyts.com/linear-types-one-pager", label: "Yoshua Wuyts, linear types one-pager", note: "")
+  Ref unleakable(href: "https://rust-lang.github.io/effects-initiative/evaluation/unleakable-types.html", label: "Effects initiative: unleakable types", note: "")
+  Ref gankra_linear(href: "https://faultlore.com/blah/linear-rust/", label: "Aria Desires, The pain of real linear types in Rust", note: "Why it is hard: unwinding, generics, every std API.")
+  Ref boats_rules(href: "https://without.boats/blog/changing-the-rules-of-rust/", label: "without.boats, Changing the rules of Rust", note: "Adding a new auto trait across editions.")
+  Ref niko_leaks(href: "https://smallcultfollowing.com/babysteps/blog/2015/04/29/on-reference-counting-and-leaks/", label: "Niko Matsakis, On reference counting and leaks (2015)", note: "Why mem::forget became safe.")
+  Ref joinguard(href: "https://github.com/rust-lang/rust/issues/24292", label: "rust-lang/rust#24292: JoinGuard is unsound because of reference cycles", note: "The 2015 bug that made leaking safe.")
+  Ref austral(href: "https://austral-lang.org/", label: "Austral", note: "A systems language with linear types and capabilities.")
+  Ref ghc_linear(href: "https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/linear_types.html", label: "GHC LinearTypes", note: "")
+  Ref perceus(href: "https://www.microsoft.com/en-us/research/publication/perceus-garbage-free-reference-counting-with-reuse/", label: "Perceus: garbage-free reference counting with reuse", note: "Unique values updated in place by pure code.")
+
+  // blaze.
+  Ref fn_cache(href: "https://github.com/indexable-inc/blaze/blob/main/docs/fn-cache.md", label: "blaze: the function cache", note: "#[blaze::cache], and what makes a function ineligible.")
+  Ref sandbox(href: "https://github.com/indexable-inc/blaze/issues/147", label: "indexable-inc/blaze#147: sandbox build scripts and proc macros", note: "")
+  Ref borrowck(href: "https://github.com/indexable-inc/blaze/blob/main/docs/borrowck.md", label: "blaze: borrow checking", note: "")
+  Ref salsa(href: "https://github.com/salsa-rs/salsa", label: "salsa", note: "")
+
+  // Rust and Lean.
+  Ref verus(href: "https://github.com/verus-lang/verus", label: "Verus", note: "Verified Rust: specs and proofs in the Rust file, checked by an SMT solver.")
+  Ref aeneas(href: "https://github.com/AeneasVerif/aeneas", label: "Aeneas", note: "Translates safe Rust to Lean as pure functions; &mut becomes a value and a backward function.")
+  Ref charon(href: "https://github.com/AeneasVerif/charon", label: "Charon", note: "Extracts a crate's MIR into a form other tools read; Aeneas's front end.")
+  Ref creusot(href: "https://github.com/creusot-rs/creusot", label: "Creusot", note: "Deductive verification of Rust through Why3.")
+  Ref prusti(href: "https://github.com/prusti/prusti", label: "Prusti", note: "A static verifier for Rust, built on Viper.")
+  Ref kani(href: "https://github.com/model-checking/kani", label: "Kani", note: "A bounded model checker for Rust.")
+  Ref flux(href: "https://github.com/flux-rs/flux", label: "Flux", note: "Refinement types for Rust.")
+  Ref hax(href: "https://github.com/pereq-dev/hax", label: "hax", note: "Translates a subset of Rust to Lean, F* and Rocq.")
+  Ref minirust(href: "https://github.com/minirust/minirust", label: "MiniRust", note: "Ralf Jung's precise specification of a Rust core close to MIR.")
+  Ref verify_std(href: "https://github.com/model-checking/verify-rust-std", label: "verify-rust-std", note: "The challenge to verify Rust's standard library, announced by AWS in November 2024.")
+  Ref lean_repl(href: "https://github.com/leanprover-community/repl", label: "leanprover-community/repl", note: "A JSON REPL for Lean 4 that reports goals, errors and sorries.")
+  Ref lean_ffi(href: "https://lean-lang.org/doc/reference/latest/Run-Time-Code/Foreign-Function-Interface/", label: "Lean 4 reference: foreign function interface", note: "Calling C from Lean and Lean from C; marked unstable.")
+  Ref mathlib(href: "https://github.com/leanprover-community/mathlib4", label: "Mathlib", note: "Lean 4's library of mathematics.")
+
+  // Inferred specs.
+  Ref rust_book_fns(href: "https://doc.rust-lang.org/book/ch03-03-how-functions-work.html", label: "The Rust Programming Language: functions", note: "Type annotations in signatures are required, a deliberate decision in Rust's design.")
+  Ref rfc_impl_trait(href: "https://rust-lang.github.io/rfcs/1522-conservative-impl-trait.html", label: "RFC 1522: conservative impl Trait", note: "Auto traits like Send leak from the body through an impl Trait return type.")
+  Ref milner(href: "https://doi.org/10.1016/0022-0000(78)90014-4", label: "Robin Milner, A theory of type polymorphism in programming (1978)", note: "Algorithm W: ML infers every type.")
+  Ref damas_milner(href: "https://doi.org/10.1145/582153.582176", label: "Damas and Milner, Principal type-schemes for functional programs (1982)", note: "Every well-typed ML term has a most general type.")
+  Ref ocaml_modules(href: "https://ocaml.org/manual/5.2/moduleexamples.html", label: "OCaml manual: the module system", note: "An .mli file states a compilation unit's interface.")
+  Ref ocaml_comp(href: "https://ocaml.org/manual/5.2/comp.html", label: "OCaml manual: batch compilation", note: "ocamlc -i prints the interface the compiler inferred.")
+  Ref liquid_types(href: "https://doi.org/10.1145/1375581.1375602", label: "Rondon, Kawaguchi and Jhala, Liquid types (PLDI 2008)", note: "Hindley-Milner inference plus predicate abstraction infers refinement types.")
+  Ref liquid_haskell(href: "https://ucsd-progsys.github.io/liquidhaskell/", label: "LiquidHaskell", note: "Refinement types for Haskell, as a GHC plugin.")
+  Ref flux_paper(href: "https://arxiv.org/abs/2207.04034", label: "Lehmann et al., Flux: Liquid Types for Rust", note: "Synthesizes loop annotations by liquid inference.")
+  Ref infer_biabduction(href: "https://fbinfer.com/docs/separation-logic-and-bi-abduction", label: "Infer: separation logic and bi-abduction", note: "Bi-abduction splits the analysis of a large program into small independent analyses of its procedures.")
+  Ref daikon(href: "https://plse.cs.washington.edu/daikon/", label: "Daikon", note: "Reports likely invariants observed in runs of a program.")
+  Ref ikos(href: "https://github.com/NASA-SW-VnV/ikos", label: "IKOS", note: "NASA's static analyzer for C and C++, based on abstract interpretation.")
+  Ref autospec(href: "https://arxiv.org/abs/2404.00762", label: "AutoSpec: specification synthesis by LLMs with static analysis and verification", note: "An LLM proposes candidate specs; each round keeps only those the verifier accepts.")
+  Ref specgen(href: "https://arxiv.org/abs/2401.08807", label: "SpecGen: formal program specifications via LLMs", note: "LLM-generated specs for Java, mutated and filtered until they verify.")
+  Ref nl2postcond(href: "https://arxiv.org/abs/2310.01831", label: "nl2postcond: natural language intent to postconditions", note: "Endres et al.: can LLMs turn intent in comments into checkable postconditions?")
+}

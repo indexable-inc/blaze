@@ -1,0 +1,119 @@
+[package]
+name = "blaze-engine"
+description = "blaze: cargo build, test and run from a daemon that keeps your workspace compiled, with live edits"
+# Published by .github/scripts/publish_crates.py, which publishes the vendored crates it depends
+# on by path as `blaze-<name>` and rewrites this manifest to name them.
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["development-tools::build-utils", "compilers"]
+
+[lib]
+doctest = false
+
+# The program `blaze`, under the name tooling and the release archives know it by. `blaze`
+# itself is `src/bin/blaze.rs`. Their tests are the library's.
+[[bin]]
+name = "blaze-engine"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "blaze"
+path = "src/bin/blaze.rs"
+test = false
+
+# `cargo binstall blaze-engine`: the archive the release workflow makes for each target, named and
+# laid out as `blaze-v<version>-<target>/` in .github/workflows/release.yaml (and install.sh). A
+# target with no archive is built from source; a third party's build is never used.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/blaze-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "blaze-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
+
+[dependencies]
+# blaze's cargo: the client, the daemon, the sandbox launcher, the release this is.
+blaze-cargo.workspace = true
+anyhow.workspace = true
+# The host's target triple, which names the release archive a pin fetches (`versions.rs`).
+hir-ty-codegen.workspace = true
+blaze-graph.workspace = true
+# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on the huge pages `blaze-mem` chose (`huge.rs`).
+libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
+blaze-mem.workspace = true
+# Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.
+stdx.workspace = true
+# `IX_PROF=<dir>` samples blaze itself (`program.rs`): the profile a build of blaze is laid out by
+# (docs/v2/plan/lanes/layout/layout.md).
+ix-prof = { workspace = true, features = ["sampler"] }
+# A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
+# (`versions.rs`).
+parking_lot.workspace = true
+toml.workspace = true
+toml_edit = { workspace = true, features = ["display", "parse"] }
+# The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
+# every list of sums the release publishes: `B3SUMS` (blaze-ids) and `SHA256SUMS`.
+blaze-registry.workspace = true
+# blaze's home and its `config.toml` (`user_config`), read in one place.
+blaze-manifest.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-sha256.workspace = true
+tar = { workspace = true, features = ["default"] }
+flate2 = { workspace = true, features = ["rust_backend"] }
+url.workspace = true
+# blaze's own updates (`update.rs`): `latest.json` from blaze's site and the state the daemon keeps.
+serde_json.workspace = true
+# The update check's and install's spans (`update.rs`).
+tracing.workspace = true
+# A build script's `rustc` (`as_rustc.rs`): a probe loaded with the standard library, lowered
+# into the front end and checked as `blaze check` checks a crate.
+base-db.workspace = true
+blaze-diagnostics.workspace = true
+blaze-lower.workspace = true
+blaze-query.workspace = true
+blaze-units.workspace = true
+blaze-vfs.workspace = true
+cfg.workspace = true
+hir.workspace = true
+intern.workspace = true
+
+# `BLAZE_CODEGEN_CODE`, `BLAZE_FRONT_END_CODE` and `BLAZE_RECORD_CODE` (build.rs): the code
+# identities of the code generator, the front end and what makes a unit's record, each of the
+# packages it is built from, so a rebuild that edits none of them keeps what each keys.
+[build-dependencies]
+blaze-codegen-code.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+# as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
+blaze-codegen-code.workspace = true
+
+[features]
+default = ["native"]
+# Everything the native blaze has and the wasm seed leaves out, as one switch (blaze-cargo's
+# `native`: LLVM and its stencils, HTTPS, `blaze explore`, the terminal view, the daemon,
+# `blaze pprof`) and mimalloc as the general allocator, a heap per blaze-mem tag. LLVM is why
+# every real build has it: std and every opt-level 2/3 unit are compiled by LLVM alone.
+native = ["blaze-cargo/native", "dep:libmimalloc-sys"]
+# The wasm seed: `--no-default-features --features seed`, which has no C (docs/future/bootstrap.md,
+# "The seed has no C"): the committed stencil libraries (blaze-stencil's `prebuilt/`), std's
+# allocator, no network, and rsasm as the assembler, which has no LLVM. blake3 takes its wasm32
+# SIMD128 code on every wasm32 build (the root manifest).
+seed = ["hir-ty-codegen/rsasm"]
+
+# The global allocator's fast paths, in tasks and out (`benches/global_alloc.rs`).
+[[bench]]
+name = "global_alloc"
+harness = false
+
+[lints]
+workspace = true

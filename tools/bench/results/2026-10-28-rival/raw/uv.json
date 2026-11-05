@@ -1,0 +1,152 @@
+{
+ "project": "uv",
+ "repo": "astral-sh/uv",
+ "rev": "5b5a53e1803d426ba04f4af8ff7d6ff747548218",
+ "arms": {
+  "cargo": {
+   "kind": "cargo",
+   "phases": {
+    "cold": {
+     "build_s": 181.158,
+     "ready_s": 0.0,
+     "wall_s": 181.158,
+     "built": "cargo",
+     "states": [
+      "cargo"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.38,
+     "samples_s": [
+      0.38,
+      0.385,
+      0.381,
+      0.362,
+      0.372
+     ],
+     "built": [
+      "cargo"
+     ]
+    },
+    "body": {
+     "wall_s": 4.504,
+     "samples_s": [
+      4.478,
+      4.54,
+      4.504,
+      4.58,
+      4.481
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 4.504
+    },
+    "signature": {
+     "wall_s": 34.49,
+     "samples_s": [
+      34.49,
+      34.407,
+      34.513,
+      34.458,
+      34.87
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 34.521
+    },
+    "tests_first": {
+     "wall_s": 25.712
+    },
+    "tests": {
+     "wall_s": 1.242,
+     "status": 0,
+     "passed": 233,
+     "failed": 0,
+     "ignored": 0,
+     "built": "cargo"
+    }
+   },
+   "wrong": [],
+   "failed": null
+  },
+  "ours": {
+   "kind": "blaze",
+   "phases": {},
+   "wrong": [],
+   "failed": "cold build failed: s)\n    Building build scripts and proc macros: 32/136 steps (30.9s)\n    Building build scripts and proc macros: 44/136 steps (45.9s)\n    Building build scripts and proc macros: 90/136 steps (1m01s)\n    Building build scripts and proc macros: 94/136 steps (1m16s)\n    Building build scripts and proc macros: 98/136 steps (1m31s)\n    Building build scripts and proc macros: 104/136 steps (1m46s)\n    Building build scripts and proc macros: 109/136 steps (2m01s)\n    Building build scripts and proc macros: 113/136 steps (2m16s)\n    Building build scripts and proc macros: 120/136 steps (2m31s)\n       Built build scripts and proc macros in 2m36s\nerror: could not build `uv`: Failed to build the build scripts of /home/runner/work/_temp/work/uv/ours\n  blaze could not link the proc macro of `const-random-macro v0.1.16` for the load\n  the proc macro `const_random_macro` cannot run as WebAssembly: blaze did not build it (exit status: 1): Error: `const_random_macro` reaches 1 function blaze could not compile, and a build with nothing of rustc's has nothing else to compile it, so it is not built:\n    `blaze.94295b5d5b9636bd.getrandom::imp::getrandom_inner`: frontend: mir: UnresolvedMethod(\"map_err\")\n    name its package in `native-proc-macros` under [workspace.metadata.blaze] in /home/runner/work/_temp/work/uv/ours/Cargo.toml to expand it natively, or set BLAZE_PROC_MACRO_WASM=0 for every proc macro\n(what blaze said is in /home/runner/work/_temp/work/uv/home-ours/workers/f11363a31b448956/log)\n"
+  },
+  "astral": {
+   "kind": "astral",
+   "phases": {
+    "cold": {
+     "build_s": 452.017,
+     "ready_s": 0.054,
+     "wall_s": 452.071,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.045,
+     "samples_s": [
+      0.048,
+      0.043,
+      0.046,
+      0.043,
+      0.045
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 11.876,
+     "samples_s": [
+      12.746,
+      11.875,
+      12.45,
+      11.876,
+      11.681
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 11.777
+    },
+    "signature": {
+     "wall_s": 12.043,
+     "samples_s": [
+      49.053,
+      12.043,
+      11.524,
+      11.666,
+      12.321
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 11.984
+    },
+    "tests_first": {
+     "wall_s": 72.123
+    },
+    "tests": {
+     "wall_s": 9.419,
+     "status": 0,
+     "passed": 233,
+     "failed": 0,
+     "ignored": 0,
+     "built": "daemon",
+     "differs": "tests differ: blaze only [(('crates/uv-pep508/src/verbatim_url.rs - verbatim_url::VerbatimUrl (line 64) - compile fail', 'ran'), 1), (('crates/uv-pep508/src/lib.rs - Pep508Url (line 321) - compile fail', 'ran'), 1)], cargo only [(('crates/uv-pep508/src/lib.rs - Pep508Url (line 324) - compile fail', 'ran'), 1), (('crates/uv-pep508/src/verbatim_url.rs - verbatim_url::VerbatimUrl (line 67) - compile "
+    }
+   },
+   "wrong": [
+    "tests: tests differ: blaze only [(('crates/uv-pep508/src/verbatim_url.rs - verbatim_url::VerbatimUrl (line 64) - compile fail', 'ran'), 1), (('crates/uv-pep508/src/lib.rs - Pep508Url (line 321) - compile fail', 'ran'), 1)], cargo only [(('crates/uv-pep508/src/lib.rs - Pep508Url (line 324) - compile fail', 'ran'), 1), (('crates/uv-pep508/src/verbatim_url.rs - verbatim_url::VerbatimUrl (line 67) - c"
+   ],
+   "failed": null
+  }
+ }
+}

@@ -1,0 +1,1786 @@
+{
+ "host": "aarch64-apple-darwin",
+ "runs": [
+  {
+   "args": [
+    "build"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--release"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "z",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "test",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "test",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "bench",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "bench",
+       "opt_level": "z",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "check"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "check",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--target",
+    "x86_64-unknown-linux-gnu"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": "x86_64-unknown-linux-gnu",
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "test",
+    "--release",
+    "--no-run"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/a#0.1.0",
+      "target": {
+       "kind": [
+        "bin"
+       ],
+       "name": "a"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "test",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       },
+       {
+        "index": 4
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 5
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "3",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "z",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "--release",
+    "--manifest-path",
+    "../b/Cargo.toml"
+   ],
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "resolved": {
+         "Named": "debuginfo"
+        }
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "1",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 0,
+       "split_debuginfo": null,
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "release",
+       "opt_level": "z",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": 2,
+       "debuginfo": 1,
+       "split_debuginfo": "unpacked",
+       "debug_assertions": false,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  },
+  {
+   "args": [
+    "build",
+    "-p",
+    "b"
+   ],
+   "env": {
+    "CARGO_INCREMENTAL": "1"
+   },
+   "code": 0,
+   "warnings": [
+    "warning: Cargo.toml: `panic` setting is ignored for `bench` profile",
+    "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:"
+   ],
+   "graph": {
+    "units": [
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "b"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 2
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 3
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/b#0.1.0",
+      "target": {
+       "kind": [
+        "custom-build"
+       ],
+       "name": "build-script-build"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 1,
+       "split_debuginfo": null,
+       "debug_assertions": true,
+       "overflow_checks": false,
+       "rpath": false,
+       "incremental": false,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "run-custom-build",
+      "features": [],
+      "dependencies": [
+       {
+        "index": 1
+       }
+      ]
+     },
+     {
+      "pkg_id": "path+file://$ROOT/ext#0.5.0",
+      "target": {
+       "kind": [
+        "lib"
+       ],
+       "name": "ext"
+      },
+      "profile": {
+       "name": "dev",
+       "opt_level": "0",
+       "lto": "false",
+       "codegen_backend": null,
+       "codegen_units": null,
+       "debuginfo": 0,
+       "split_debuginfo": "packed",
+       "debug_assertions": true,
+       "overflow_checks": true,
+       "rpath": false,
+       "incremental": true,
+       "panic": "unwind",
+       "strip": {
+        "deferred": "None"
+       }
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": []
+     }
+    ],
+    "roots": [
+     0
+    ]
+   }
+  }
+ ]
+}

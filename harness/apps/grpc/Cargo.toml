@@ -1,0 +1,15 @@
+[package]
+name = "grpc"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[workspace]

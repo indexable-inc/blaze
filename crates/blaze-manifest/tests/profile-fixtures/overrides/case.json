@@ -1,0 +1,12 @@
+{
+ "runs": [
+  {"args": ["build", "--profile", "custom"]},
+  {"args": ["build", "--profile", "config-only"]},
+  {"args": ["build", "--config", "profile.dev.strip=true"]},
+  {"args": ["build"], "env": {"CARGO_PROFILE_DEV_DEBUG": "0"}},
+  {"args": ["build"], "env": {"CARGO_INCREMENTAL": "0"}},
+  {"args": ["build"], "env": {"CI": "1"}},
+  {"args": ["build", "--release"], "env": {"CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG": "true"}},
+  {"args": ["build"], "env": {"CARGO_PROFILE_DEV_PACKAGE_bonly_OPT_LEVEL": "s"}}
+ ]
+}

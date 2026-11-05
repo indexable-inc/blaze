@@ -1,0 +1,46 @@
+[package]
+name = "a"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+publish.workspace = true
+links = "a"
+default-run = "a"
+
+[dependencies]
+serde = { workspace = true, optional = true, features = ["rc"] }
+tokio = { workspace = true, features = ["rt"] }
+b = { workspace = true }
+gitdep.workspace = true
+pinned = { git = "https://github.com/example/pinned", rev = "0123abcd", package = "pinned-real" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.x86_64-pc-windows-msvc.build-dependencies]
+cc = "1"
+
+[build-dependencies]
+cc = { version = "1.0.80", optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+bee = { path = "../b", package = "b" }
+
+[features]
+default = ["x"]
+x = ["serde?/std", "dep:cc"]
+y = ["tokio/macros"]
+
+[package.metadata.q]
+k = "v"
+list = [3, 1, 2]

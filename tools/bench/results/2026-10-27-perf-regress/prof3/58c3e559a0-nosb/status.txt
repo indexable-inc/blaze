@@ -1,0 +1,5 @@
+plain cargo: not through blaze (`blaze enable` turns it on)
+daemon: pid 87693, version 0.1.0-da0af22a-b81f408-18e285f6df332a00, exits after 1800s idle, workers hold at most 7168 MB
+  worker: pid 87696, /root/perf/prof3-ws/58c3e559a0/rg/, holds 3391 MB, log /root/perf/prof3-ws/58c3e559a0/home/workers/dcbe857337981b04/log
+    /root/perf/prof3-ws/58c3e559a0/rg: ready
+store: 339 MB, at most 32768 MB (`blaze cache gc` collects it), /root/perf/prof3-ws/58c3e559a0/store

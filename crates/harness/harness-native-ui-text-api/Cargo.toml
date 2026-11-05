@@ -1,0 +1,13 @@
+[package]
+name = "harness-native-ui-text-api"
+description = "Words, glyph and picture content of primitives (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
+

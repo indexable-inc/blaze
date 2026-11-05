@@ -1,0 +1,188 @@
+; Shaped like what hir-ty-codegen makes for the atomic intrinsics behind
+; `AtomicU64::fetch_add`, `AtomicU32::compare_exchange` (the result `Result<u32, u32>` a
+; scalar pair, `Ok` 0 and `Err` 1), `AtomicU128` style `compare_exchange` on 16 aligned
+; bytes, `AtomicI64::fetch_max`, `AtomicU64::fetch_min`, `AtomicUsize::fetch_nand`,
+; `AtomicU8::fetch_or`, `AtomicU16::fetch_sub`, `AtomicBool::swap`, and a `SeqCst`
+; `store`, `fence`, `load`: the `SeqCst` orderings are Cranelift's (its atomics are all
+; sequentially consistent). Each function puts the atomic in a stack slot, does one
+; operation and reads the slot back, returning the old value and the memory after.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %fetch_add(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = atomic_rmw.i64 add v2, v1
+    v4 = load.i64 notrap aligned v2
+    return v3, v4
+}
+; run: %fetch_add(0, 1) == [0, 1]
+; run: %fetch_add(40, 2) == [40, 42]
+; run: %fetch_add(-1, 1) == [-1, 0]
+; run: %fetch_add(0x7fffffffffffffff, 1) == [0x7fffffffffffffff, 0x8000000000000000]
+; run: %fetch_add(5, -6) == [5, -1]
+; run: %fetch_add(0xffffffff, 1) == [0xffffffff, 0x100000000]
+
+function %compare_exchange(i32, i32, i32) -> i32, i64 {
+    ss0 = explicit_slot 4, align = 4
+
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = stack_addr.i64 ss0
+    store notrap aligned v0, v3
+    v4 = atomic_cas v3, v1, v2
+    v5 = icmp eq v4, v1
+    v6 = iconst.i32 0
+    v7 = iconst.i32 1
+    v8 = select v5, v6, v7
+    v9 = load.i32 notrap aligned v3
+    v10 = uextend.i64 v4
+    v11 = uextend.i64 v9
+    v12 = iconst.i64 32
+    v13 = ishl v11, v12
+    v14 = bor v10, v13
+    return v8, v14
+}
+; run: %compare_exchange(5, 5, 7) == [0, 0x0000000700000005]
+; run: %compare_exchange(5, 6, 7) == [1, 0x0000000500000005]
+; run: %compare_exchange(0, 0, 0) == [0, 0]
+; run: %compare_exchange(0xffffffff, 0xffffffff, 0) == [0, 0x00000000ffffffff]
+; run: %compare_exchange(0xffffffff, 0x7fffffff, 0) == [1, 0xffffffffffffffff]
+; run: %compare_exchange(0x80000000, 0x80000000, 0x7fffffff) == [0, 0x7fffffff80000000]
+
+function %compare_exchange_u128_old(i128, i128, i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+
+block0(v0: i128, v1: i128, v2: i128):
+    v3 = stack_addr.i64 ss0
+    store notrap aligned v0, v3
+    v4 = atomic_cas v3, v1, v2
+    return v4
+}
+; run: %compare_exchange_u128_old(1, 1, 2) == 1
+; run: %compare_exchange_u128_old(1, 3, 2) == 1
+; run: %compare_exchange_u128_old(-1, -1, 0) == -1
+; run: %compare_exchange_u128_old(0x10000000000000001, 1, 2) == 0x10000000000000001
+
+function %compare_exchange_u128_new(i128, i128, i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+
+block0(v0: i128, v1: i128, v2: i128):
+    v3 = stack_addr.i64 ss0
+    store notrap aligned v0, v3
+    v4 = atomic_cas v3, v1, v2
+    v5 = load.i128 notrap aligned v3
+    return v5
+}
+; run: %compare_exchange_u128_new(1, 1, 2) == 2
+; run: %compare_exchange_u128_new(1, 3, 2) == 1
+; run: %compare_exchange_u128_new(-1, -1, 0) == 0
+; run: %compare_exchange_u128_new(0x10000000000000001, 1, 2) == 0x10000000000000001
+; run: %compare_exchange_u128_new(0x10000000000000001, 0x10000000000000001, 0xffffffffffffffff0000000000000000) == 0xffffffffffffffff0000000000000000
+
+function %fetch_max_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = atomic_rmw.i64 smax v2, v1
+    v4 = load.i64 notrap aligned v2
+    return v3, v4
+}
+; run: %fetch_max_i64(-5, 3) == [-5, 3]
+; run: %fetch_max_i64(5, -3) == [5, 5]
+; run: %fetch_max_i64(0x8000000000000000, 0x7fffffffffffffff) == [0x8000000000000000, 0x7fffffffffffffff]
+; run: %fetch_max_i64(-1, 0x8000000000000000) == [-1, -1]
+
+function %fetch_min_u64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = atomic_rmw.i64 umin v2, v1
+    v4 = load.i64 notrap aligned v2
+    return v3, v4
+}
+; run: %fetch_min_u64(5, -1) == [5, 5]
+; run: %fetch_min_u64(-1, 5) == [-1, 5]
+; run: %fetch_min_u64(0x8000000000000000, 0x7fffffffffffffff) == [0x8000000000000000, 0x7fffffffffffffff]
+
+function %fetch_nand(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = atomic_rmw.i64 nand v2, v1
+    v4 = load.i64 notrap aligned v2
+    return v3, v4
+}
+; run: %fetch_nand(0xff00ff00ff00ff00, 0x0ff00ff00ff00ff0) == [0xff00ff00ff00ff00, 0xf0fff0fff0fff0ff]
+; run: %fetch_nand(-1, -1) == [-1, 0]
+; run: %fetch_nand(0, 0) == [0, -1]
+
+function %fetch_or_u8(i64, i8) -> i8, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = stack_addr.i64 ss0+3
+    v4 = atomic_rmw.i8 or v3, v1
+    v5 = load.i64 notrap aligned v2
+    return v4, v5
+}
+; run: %fetch_or_u8(0x1122334455667788, 0x0f) == [0x55, 0x112233445f667788]
+; run: %fetch_or_u8(0, 0x80) == [0, 0x0000000080000000]
+; run: %fetch_or_u8(-1, 0) == [0xff, -1]
+
+function %fetch_sub_u16(i64, i16) -> i16, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = stack_addr.i64 ss0+2
+    v4 = atomic_rmw.i16 sub v3, v1
+    v5 = load.i64 notrap aligned v2
+    return v4, v5
+}
+; run: %fetch_sub_u16(0, 1) == [0, 0x00000000ffff0000]
+; run: %fetch_sub_u16(0x1111222233334444, 0x1111) == [0x3333, 0x1111222222224444]
+; run: %fetch_sub_u16(0x0000000080000000, 1) == [0x8000, 0x000000007fff0000]
+
+function %swap_bool(i64, i8) -> i8, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = atomic_rmw.i8 xchg v2, v1
+    v4 = load.i64 notrap aligned v2
+    return v3, v4
+}
+; run: %swap_bool(0x0101010101010100, 1) == [0, 0x0101010101010101]
+; run: %swap_bool(0x0000000000000001, 0) == [1, 0]
+; run: %swap_bool(0x0000000000000001, 1) == [1, 1]
+
+function %store_fence_load(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 4
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    atomic_store v0, v2
+    v3 = stack_addr.i64 ss0+4
+    atomic_store v1, v3
+    fence
+    v4 = atomic_load.i32 v3
+    v5 = atomic_load.i32 v2
+    return v4, v5
+}
+; run: %store_fence_load(1, 2) == [2, 1]
+; run: %store_fence_load(0xffffffff, 0) == [0, 0xffffffff]

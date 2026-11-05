@@ -1,0 +1,64 @@
+{
+ "functions": 10116,
+ "total": 783776,
+ "over_4k": 4,
+ "largest": [
+  [
+   50128,
+   "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array9of_a_call"
+  ],
+  [
+   11648,
+   "_RNvCs72slTvEDM7j_8breakers3run"
+  ],
+  [
+   8272,
+   "_RNvNtCs72slTvEDM7j_8breakers10arg_frames5level"
+  ],
+  [
+   8256,
+   "blaze::try_from_fn_erased::4070"
+  ],
+  [
+   3360,
+   "blaze::join_generic_copy::1739"
+  ],
+  [
+   3360,
+   "blaze::join_generic_copy::100"
+  ],
+  [
+   3328,
+   "blaze::join_generic_copy::2950"
+  ],
+  [
+   3024,
+   "blaze::write::6136"
+  ],
+  [
+   2640,
+   "blaze::eq::1699"
+  ],
+  [
+   2208,
+   "_RNvNtCs72slTvEDM7j_8breakers13branch_frames6nested"
+  ]
+ ],
+ "of": {
+  "_RNvNtCsiH8WaMX6fR7_12breakers202121if_branch_temporaries6nested": 128,
+  "_RNvNtCs72slTvEDM7j_8breakers17moved_bits_unread6nested": 208,
+  "_RNvNtCs72slTvEDM7j_8breakers24array_in_tuple_moved_out4pair": 448,
+  "_RNvNtCs72slTvEDM7j_8breakers20promoted_constructor4pair": 0,
+  "_RNvNtCs72slTvEDM7j_8breakers16static_in_static6nested": 144,
+  "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array7recurse": 0,
+  "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array15through_closure": 0,
+  "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array4make": 16,
+  "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array9of_a_call": 50128,
+  "_RNvNtCs72slTvEDM7j_8breakers14frame_of_array3run": 112,
+  "_RNvNtCs72slTvEDM7j_8breakers17const_format_args4pair": 16,
+  "_RNvNtCs72slTvEDM7j_8breakers13blanket_in_fn6nested": 16,
+  "_RNvNtCs72slTvEDM7j_8breakers13future_states6nested": 16,
+  "_RNvNtCs72slTvEDM7j_8breakers13branch_frames4pair": 64,
+  "_RNvNtCs72slTvEDM7j_8breakers13branch_frames6nested": 2208
+ }
+}

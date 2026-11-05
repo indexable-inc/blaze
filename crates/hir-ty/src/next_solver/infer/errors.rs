@@ -1,0 +1,769 @@
+use std::{fmt, ops::ControlFlow};
+
+use hir_def::attrs::AttrFlags;
+use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt};
+use rustc_type_ir::{
+    ClausePolarity, Interner as _,
+    error::ExpectedFound,
+    inherent::IntoKind as _,
+    solve::{CandidateSource, Certainty, GoalSource, MaybeCause, MaybeInfo, NoSolution},
+};
+use tracing::{instrument, trace};
+
+use crate::{
+    Span,
+    next_solver::{
+        AliasTerm, AnyImplId, Binder, ClauseKind, Const, ConstKind, DbInterner, HostEffectClause,
+        PolyTraitClause, Predicate, PredicateKind, ProjectionClause, SolverContext, Term,
+        TraitClause, Ty, TyKind, TypeError,
+        fulfill::NextSolverError,
+        infer::{
+            InferCtxt,
+            select::SelectionError,
+            traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
+        },
+        inspect::{self, ProofTreeVisitor},
+        normalize::deeply_normalize_for_diagnostics,
+    },
+};
+
+#[derive(Debug)]
+pub struct FulfillmentError<'db> {
+    pub obligation: PredicateObligation<'db>,
+    pub code: FulfillmentErrorCode<'db>,
+    pub parent_trait_obligations: Vec<Predicate<'db>>,
+    /// For each of `parent_trait_obligations`, the impl whose where clause the next obligation
+    /// came from and that clause's index in the impl's predicates (rustc's `ImplDerived` with
+    /// its `impl_def_predicate_index`), or `None` where it didn't come from an impl.
+    pub parent_impls: Vec<Option<(AnyImplId, u32)>>,
+}
+
+impl FulfillmentError<'_> {
+    pub fn is_true_error(&self) -> bool {
+        match self.code {
+            FulfillmentErrorCode::Select(_)
+            | FulfillmentErrorCode::Project(_)
+            | FulfillmentErrorCode::Outlives
+            | FulfillmentErrorCode::Subtype(_, _)
+            | FulfillmentErrorCode::ConstEquate(_, _) => true,
+            FulfillmentErrorCode::Cycle(_) | FulfillmentErrorCode::Ambiguity { overflow: _ } => {
+                false
+            }
+        }
+    }
+}
+
+pub enum FulfillmentErrorCode<'db> {
+    /// Inherently impossible to fulfill; this trait is implemented if and only
+    /// if it is already implemented.
+    Cycle(PredicateObligations<'db>),
+    Select(SelectionError<'db>),
+    Project(MismatchedProjectionTypes<'db>),
+    /// An outlives constraint emitted for `-Zassumptions-on-binders` was unsatisfiable.
+    Outlives,
+    Subtype(ExpectedFound<Ty<'db>>, TypeError<'db>), // always comes from a SubtypePredicate
+    ConstEquate(ExpectedFound<Const<'db>>, TypeError<'db>),
+    Ambiguity {
+        /// Overflow is only `Some(suggest_recursion_limit)` when using the next generation
+        /// trait solver `-Znext-solver`. With the old solver overflow is eagerly handled by
+        /// emitting a fatal error instead.
+        overflow: Option<bool>,
+    },
+}
+
+impl<'db> fmt::Debug for FulfillmentErrorCode<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            FulfillmentErrorCode::Select(ref e) => write!(f, "{e:?}"),
+            FulfillmentErrorCode::Project(ref e) => write!(f, "{e:?}"),
+            FulfillmentErrorCode::Outlives => write!(f, "CodeOutlivesError"),
+            FulfillmentErrorCode::Subtype(ref a, ref b) => {
+                write!(f, "CodeSubtypeError({a:?}, {b:?})")
+            }
+            FulfillmentErrorCode::ConstEquate(ref a, ref b) => {
+                write!(f, "CodeConstEquateError({a:?}, {b:?})")
+            }
+            FulfillmentErrorCode::Ambiguity { overflow: None } => write!(f, "Ambiguity"),
+            FulfillmentErrorCode::Ambiguity { overflow: Some(suggest_increasing_limit) } => {
+                write!(f, "Overflow({suggest_increasing_limit})")
+            }
+            FulfillmentErrorCode::Cycle(ref cycle) => write!(f, "Cycle({cycle:?})"),
+        }
+    }
+}
+
+pub struct MismatchedProjectionTypes<'db> {
+    pub err: TypeError<'db>,
+}
+
+impl<'db> fmt::Debug for MismatchedProjectionTypes<'db> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MismatchedProjectionTypes({:?})", self.err)
+    }
+}
+
+impl<'db> NextSolverError<'db> {
+    pub fn into_fulfillment_error(self, infcx: &InferCtxt<'db>) -> FulfillmentError<'db> {
+        match self {
+            NextSolverError::TrueError(obligation) => {
+                fulfillment_error_for_no_solution(infcx, obligation)
+            }
+            NextSolverError::Ambiguity(obligation) => {
+                fulfillment_error_for_stalled(infcx, obligation)
+            }
+            NextSolverError::Overflow(obligation) => {
+                fulfillment_error_for_overflow(infcx, obligation)
+            }
+        }
+    }
+}
+
+fn fulfillment_error_for_no_solution<'db>(
+    infcx: &InferCtxt<'db>,
+    root_obligation: PredicateObligation<'db>,
+) -> FulfillmentError<'db> {
+    let interner = infcx.interner;
+    let (obligation, parent_trait_obligations, parent_impls) =
+        find_best_leaf_obligation(infcx, &root_obligation, false);
+
+    let code = match obligation.predicate.kind().skip_binder() {
+        PredicateKind::Clause(ClauseKind::Projection(_)) => {
+            FulfillmentErrorCode::Project(
+                // FIXME: This could be a `Sorts` if the term is a type
+                MismatchedProjectionTypes { err: TypeError::Mismatch },
+            )
+        }
+        PredicateKind::Clause(ClauseKind::ConstArgHasType(ct, expected_ty)) => {
+            let ct_ty = match ct.kind() {
+                ConstKind::Alias(_, alias_const) => alias_const.type_of(interner).skip_norm_wip(),
+                ConstKind::Param(param_ct) => param_ct.find_const_ty_from_env(obligation.param_env),
+                ConstKind::Value(cv) => cv.ty,
+                kind => panic!(
+                    "ConstArgHasWrongType failed but we don't know how to compute type for {kind:?}"
+                ),
+            };
+            FulfillmentErrorCode::Select(SelectionError::ConstArgHasWrongType {
+                ct,
+                ct_ty,
+                expected_ty,
+            })
+        }
+        PredicateKind::Subtype(pred) => {
+            let (a, b) = infcx.enter_forall_and_leak_universe(
+                obligation.predicate.kind().rebind((pred.a, pred.b)),
+            );
+            let expected_found = ExpectedFound::new(a, b);
+            FulfillmentErrorCode::Subtype(expected_found, TypeError::Sorts(expected_found))
+        }
+        PredicateKind::Coerce(pred) => {
+            let (a, b) = infcx.enter_forall_and_leak_universe(
+                obligation.predicate.kind().rebind((pred.a, pred.b)),
+            );
+            let expected_found = ExpectedFound::new(b, a);
+            FulfillmentErrorCode::Subtype(expected_found, TypeError::Sorts(expected_found))
+        }
+        PredicateKind::Clause(ClauseKind::RegionOutlives(_) | ClauseKind::TypeOutlives(_))
+            if interner.assumptions_on_binders() =>
+        {
+            FulfillmentErrorCode::Outlives
+        }
+        PredicateKind::Clause(_) | PredicateKind::DynCompatible(_) | PredicateKind::Ambiguous => {
+            FulfillmentErrorCode::Select(SelectionError::Unimplemented)
+        }
+        PredicateKind::ConstEquate(..) | PredicateKind::NormalizesTo(..) => {
+            panic!("unexpected goal: {obligation:?}")
+        }
+    };
+
+    FulfillmentError { obligation, code, parent_trait_obligations, parent_impls }
+}
+
+fn fulfillment_error_for_stalled<'db>(
+    infcx: &InferCtxt<'db>,
+    root_obligation: PredicateObligation<'db>,
+) -> FulfillmentError<'db> {
+    let (code, refine_obligation) = infcx.probe(|_| {
+        match <&SolverContext<'db>>::from(infcx).evaluate_root_goal(
+            root_obligation.as_goal(),
+            root_obligation.cause.span(),
+            None,
+        ) {
+            Ok(GoalEvaluation {
+                certainty: Certainty::Maybe(MaybeInfo { cause: MaybeCause::Ambiguity, .. }),
+                ..
+            }) => (FulfillmentErrorCode::Ambiguity { overflow: None }, true),
+            Ok(GoalEvaluation {
+                certainty:
+                    Certainty::Maybe(MaybeInfo {
+                        cause:
+                            MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: _ },
+                        ..
+                    }),
+                ..
+            }) => (
+                FulfillmentErrorCode::Ambiguity { overflow: Some(suggest_increasing_limit) },
+                // Don't look into overflows because we treat overflows weirdly anyways.
+                // We discard the inference constraints from overflowing goals, so
+                // recomputing the goal again during `find_best_leaf_obligation` may apply
+                // inference guidance that makes other goals go from ambig -> pass, for example.
+                //
+                // FIXME: We should probably just look into overflows here.
+                false,
+            ),
+            // FIXME: We should ICE here. See the following links for details
+            // - <https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/resolving.20equal.20regions/near/623484902>
+            // - <https://github.com/rust-lang/rust/issues/161669>
+            Ok(GoalEvaluation { certainty: Certainty::Yes, .. }) => {
+                (FulfillmentErrorCode::Ambiguity { overflow: None }, false)
+            }
+            Err(_) => {
+                panic!(
+                    "did not expect selection error when collecting ambiguity errors for `{:?}`",
+                    infcx.deeply_resolve_ignoring_regions(root_obligation.predicate),
+                )
+            }
+        }
+    });
+
+    let (obligation, parent_trait_obligations, parent_impls) = if refine_obligation {
+        find_best_leaf_obligation(infcx, &root_obligation, true)
+    } else {
+        // alloc: error path; empty `Vec`s do not allocate.
+        (root_obligation, Vec::new(), Vec::new())
+    };
+
+    FulfillmentError { obligation, code, parent_trait_obligations, parent_impls }
+}
+
+fn fulfillment_error_for_overflow<'db>(
+    infcx: &InferCtxt<'db>,
+    root_obligation: PredicateObligation<'db>,
+) -> FulfillmentError<'db> {
+    let (obligation, parent_trait_obligations, parent_impls) =
+        find_best_leaf_obligation(infcx, &root_obligation, true);
+    FulfillmentError {
+        parent_impls,
+        obligation,
+        code: FulfillmentErrorCode::Ambiguity { overflow: Some(true) },
+        parent_trait_obligations,
+    }
+}
+
+#[instrument(level = "debug", skip(infcx), ret)]
+fn find_best_leaf_obligation<'db>(
+    infcx: &InferCtxt<'db>,
+    obligation: &PredicateObligation<'db>,
+    consider_ambiguities: bool,
+) -> (PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<(AnyImplId, u32)>>) {
+    let obligation = infcx.deeply_resolve_ignoring_regions(*obligation);
+    // FIXME: we use a probe here as the `BestObligation` visitor does not
+    // check whether it uses candidates which get shadowed by where-bounds.
+    //
+    // We should probably fix the visitor to not do so instead, as this also
+    // means the leaf obligation may be incorrect.
+    let (obligation, parent_trait_obligations, parent_impls) = infcx
+        .fudge_inference_if_ok(|| {
+            let mut visitor = BestObligation {
+                obligation,
+                consider_ambiguities,
+                // alloc: error path; at most `max_depth` pushes, one per derived level.
+                parent_trait_obligations: Vec::new(),
+                // alloc: error path; one per entry of `parent_trait_obligations`.
+                parent_impls: Vec::new(),
+            };
+            infcx
+                .visit_proof_tree(obligation.as_goal(), &mut visitor)
+                .break_value()
+                .ok_or(())
+                // walk around the fact that the cause in `Obligation` is ignored by folders so that
+                // we can properly fudge the infer vars in cause code.
+                .map(|(obligation, parent_trait_obligations, parent_impls)| {
+                    (obligation.cause, (obligation, parent_trait_obligations, parent_impls))
+                })
+        })
+        .map(|(cause, (obligation, parent_trait_obligations, parent_impls))| {
+            (PredicateObligation { cause, ..obligation }, parent_trait_obligations, parent_impls)
+        })
+        // alloc: error path; empty `Vec`s do not allocate.
+        .unwrap_or((obligation, Vec::new(), Vec::new()));
+    let parent_trait_obligations =
+        deeply_normalize_for_diagnostics(infcx, obligation.param_env, parent_trait_obligations);
+    let obligation = deeply_normalize_for_diagnostics(infcx, obligation.param_env, obligation);
+    (obligation, parent_trait_obligations, parent_impls)
+}
+
+struct BestObligation<'db> {
+    obligation: PredicateObligation<'db>,
+    consider_ambiguities: bool,
+    parent_trait_obligations: Vec<Predicate<'db>>,
+    parent_impls: Vec<Option<(AnyImplId, u32)>>,
+}
+
+impl<'db> BestObligation<'db> {
+    /// `parent_impl`: the impl whose where clause `derived_obligation` is, if it is one.
+    fn with_derived_obligation(
+        &mut self,
+        derived_obligation: PredicateObligation<'db>,
+        parent_impl: Option<(AnyImplId, u32)>,
+        and_then: impl FnOnce(&mut Self) -> <Self as ProofTreeVisitor<'db>>::Result,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        let parent_predicate = self.obligation.predicate;
+        let should_push = parent_predicate.as_trait_clause().is_some()
+            && self.parent_trait_obligations.last() != Some(&parent_predicate);
+        if should_push {
+            self.parent_trait_obligations.push(parent_predicate);
+            self.parent_impls.push(parent_impl);
+        }
+        let old_obligation = std::mem::replace(&mut self.obligation, derived_obligation);
+        let result = and_then(self);
+        self.obligation = old_obligation;
+        if should_push {
+            self.parent_trait_obligations.pop();
+            self.parent_impls.pop();
+        }
+        result
+    }
+
+    fn break_with_current_obligation(&mut self) -> <Self as ProofTreeVisitor<'db>>::Result {
+        ControlFlow::Break((
+            self.obligation,
+            std::mem::take(&mut self.parent_trait_obligations),
+            std::mem::take(&mut self.parent_impls),
+        ))
+    }
+
+    /// Filter out the candidates that aren't interesting to visit for the
+    /// purposes of reporting errors. For ambiguities, we only consider
+    /// candidates that may hold. For errors, we only consider candidates that
+    /// *don't* hold and which have impl-where clauses that also don't hold.
+    fn non_trivial_candidates<'a>(
+        &self,
+        goal: &'a inspect::InspectGoal<'a, 'db>,
+    ) -> Vec<inspect::InspectCandidate<'a, 'db>> {
+        let mut candidates = goal.candidates();
+        match self.consider_ambiguities {
+            true => {
+                // If we have an ambiguous obligation, we must consider *all* candidates
+                // that hold, or else we may guide inference causing other goals to go
+                // from ambig -> pass/fail.
+                candidates.retain(|candidate| candidate.result().is_ok());
+            }
+            false => {
+                // We always handle rigid alias candidates separately as we may not add them for
+                // aliases whose trait bound doesn't hold.
+                candidates.retain(|c| !matches!(c.kind(), inspect::ProbeKind::RigidAlias { .. }));
+                // blaze: an impl over the markers of `#![blaze::arbitrary_ints]`
+                // (`impl<T: ArbitraryInt> Clone for T`) whose marker does not hold is as if it
+                // were never listed, as it is not for the types the impl index skips it for
+                // (`crate::arbitrary_ints`): the error of `T: Clone` for a parameter `T` stays
+                // the one it was without the impl.
+                candidates.retain(|candidate| !self.int_marker_fails(goal, candidate));
+                // If there are multiple candidates, we can still recurse into a single one if all
+                // others fail due to boring reasons. Currently that's if we fail to normalize
+                // while considering the candidate.
+                if candidates.len() > 1 {
+                    candidates.retain(|candidate| {
+                        goal.infcx().probe(|_| {
+                            !candidate
+                                .instantiate_nested_goals_from(self.span(), |source| {
+                                    source == GoalSource::Normalization
+                                })
+                                .iter()
+                                .any(|nested_goal| nested_goal.result().is_err())
+                        })
+                    });
+                }
+            }
+        }
+
+        candidates
+    }
+
+    /// blaze: whether `candidate` is an impl bounded by a marker of `#![blaze::arbitrary_ints]`
+    /// (`ArbitraryInt`, `ArbitrarySigned`, `IntFrom`, `IntTryFrom`) that does not hold.
+    fn int_marker_fails(
+        &self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+        candidate: &inspect::InspectCandidate<'_, 'db>,
+    ) -> bool {
+        let inspect::ProbeKind::TraitCandidate {
+            source: CandidateSource::Impl(AnyImplId::ImplId(impl_)),
+            ..
+        } = candidate.kind()
+        else {
+            return false;
+        };
+        let interner = goal.infcx().interner;
+        if crate::arbitrary_ints::int_gates(interner.db, impl_)
+            == crate::arbitrary_ints::IntGates::NONE
+        {
+            return false;
+        }
+        let lang = interner.lang_items();
+        let markers = [lang.ArbitraryInt, lang.ArbitrarySigned, lang.IntFrom, lang.IntTryFrom];
+        goal.infcx().probe(|_| {
+            candidate.instantiate_nested_goals(self.span()).iter().any(|nested| {
+                nested
+                    .goal()
+                    .predicate
+                    .as_trait_clause()
+                    .is_some_and(|it| markers.contains(&Some(it.def_id().0)))
+                    && nested.result().is_err()
+            })
+        })
+    }
+
+    /// HACK: We walk the nested obligations for a well-formed arg manually,
+    /// since there's nontrivial logic in `wf.rs` to set up an obligation cause.
+    /// Ideally we'd be able to track this better.
+    fn visit_well_formed_goal(
+        &mut self,
+        candidate: &inspect::InspectCandidate<'_, 'db>,
+        term: Term<'db>,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        let _ = (candidate, term);
+        // FIXME: rustc does this, but we don't process WF obligations yet:
+        // let infcx = candidate.goal().infcx();
+        // let param_env = candidate.goal().goal().param_env;
+        // let body_id = self.obligation.cause.body_id;
+
+        // for obligation in wf::unnormalized_obligations(infcx, param_env, term, self.span(), body_id)
+        //     .into_iter()
+        //     .flatten()
+        // {
+        //     let nested_goal = candidate.instantiate_proof_tree_for_nested_goal(
+        //         GoalSource::Misc,
+        //         obligation.as_goal(),
+        //         self.span(),
+        //     );
+        //     // Skip nested goals that aren't the *reason* for our goal's failure.
+        //     match (self.consider_ambiguities, nested_goal.result()) {
+        //         (true, Ok(Certainty::Maybe { cause: MaybeCause::Ambiguity, .. }))
+        //         | (false, Err(_)) => {}
+        //         _ => continue,
+        //     }
+
+        //     self.with_derived_obligation(obligation, None, |this| nested_goal.visit_with(this))?;
+        // }
+
+        self.break_with_current_obligation()
+    }
+
+    /// If a normalization of an associated item or a trait goal fails without trying any
+    /// candidates it's likely that normalizing its self type failed. We manually detect
+    /// such cases here.
+    fn detect_error_in_self_ty_normalization(
+        &mut self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+        self_ty: Ty<'db>,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        assert!(!self.consider_ambiguities);
+        let interner = goal.infcx().interner;
+        if let TyKind::Alias(_, alias) = self_ty.kind() {
+            let infer_term = goal.infcx().next_ty_var(self.obligation.cause.span());
+            let pred = ProjectionClause { projection_term: alias.into(), term: infer_term.into() };
+            let obligation =
+                Obligation::new(interner, self.obligation.cause, goal.goal().param_env, pred);
+            self.with_derived_obligation(obligation, None, |this| {
+                goal.infcx().visit_proof_tree_at_depth(
+                    goal.goal().with(interner, pred),
+                    goal.depth() + 1,
+                    this,
+                )
+            })
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// When a higher-ranked projection goal fails, check that the corresponding
+    /// higher-ranked trait goal holds or not. This is because the process of
+    /// instantiating and then re-canonicalizing the binder of the projection goal
+    /// forces us to be unable to see that the leak check failed in the nested
+    /// `NormalizesTo` goal, so we don't fall back to the rigid projection check
+    /// that should catch when a projection goal fails due to an unsatisfied trait
+    /// goal.
+    fn detect_trait_error_in_higher_ranked_projection(
+        &mut self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        let interner = goal.infcx().interner;
+        if let Some(projection_clause) = goal.goal().predicate.as_projection_clause()
+            && !projection_clause.bound_vars().is_empty()
+        {
+            let pred = projection_clause.map_bound(|proj| proj.projection_term.trait_ref(interner));
+            let obligation = Obligation::new(
+                interner,
+                self.obligation.cause,
+                goal.goal().param_env,
+                deeply_normalize_for_diagnostics(goal.infcx(), goal.goal().param_env, pred),
+            );
+            self.with_derived_obligation(obligation, None, |this| {
+                goal.infcx().visit_proof_tree_at_depth(
+                    goal.goal().with(interner, pred),
+                    goal.depth() + 1,
+                    this,
+                )
+            })
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// It is likely that `NormalizesTo` failed without any applicable candidates
+    /// because the alias is not well-formed.
+    ///
+    /// As we only enter `RigidAlias` candidates if the trait bound of the associated type
+    /// holds, we discard these candidates in `non_trivial_candidates` and always manually
+    /// check this here.
+    fn detect_non_well_formed_assoc_item(
+        &mut self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+        alias: AliasTerm<'db>,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        let interner = goal.infcx().interner;
+
+        let trait_ref = alias.trait_ref(interner);
+        let obligation =
+            Obligation::new(interner, self.obligation.cause, goal.goal().param_env, trait_ref);
+
+        self.with_derived_obligation(obligation, None, |this| {
+            goal.infcx().visit_proof_tree_at_depth(
+                goal.goal().with(interner, trait_ref),
+                goal.depth() + 1,
+                this,
+            )
+        })?;
+
+        let def_id = alias.expect_projection_def_id();
+
+        for clause in interner.own_clauses_of(def_id.into()).iter_instantiated(interner, alias.args)
+        {
+            let clause = clause.skip_norm_wip();
+
+            let obligation =
+                Obligation::new(interner, self.obligation.cause, goal.goal().param_env, clause);
+
+            self.with_derived_obligation(obligation, None, |this| {
+                goal.infcx().visit_proof_tree_at_depth(
+                    goal.goal().with(interner, clause),
+                    goal.depth() + 1,
+                    this,
+                )
+            })?;
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    /// If we have no candidates, then it's likely that there is a
+    /// non-well-formed alias in the goal.
+    fn detect_error_from_empty_candidates(
+        &mut self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+    ) -> <Self as ProofTreeVisitor<'db>>::Result {
+        let pred_kind = goal.goal().predicate.kind();
+
+        match pred_kind.no_bound_vars() {
+            Some(PredicateKind::Clause(ClauseKind::Trait(pred))) => {
+                self.detect_error_in_self_ty_normalization(goal, pred.self_ty())?;
+            }
+            Some(PredicateKind::Clause(ClauseKind::Projection(pred)))
+                if pred.projection_term.kind.is_trait_projection() =>
+            {
+                self.detect_error_in_self_ty_normalization(goal, pred.projection_term.self_ty())?;
+                self.detect_non_well_formed_assoc_item(goal, pred.projection_term)?;
+            }
+            Some(_) | None => {}
+        }
+
+        self.break_with_current_obligation()
+    }
+}
+
+impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
+    type Result =
+        ControlFlow<(PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<(AnyImplId, u32)>>)>;
+
+    fn span(&self) -> Span {
+        self.obligation.cause.span()
+    }
+
+    #[instrument(level = "trace", skip(self, goal), fields(goal = ?goal.goal()))]
+    fn visit_goal(&mut self, goal: &inspect::InspectGoal<'_, 'db>) -> Self::Result {
+        let interner = goal.infcx().interner;
+        // Skip goals that aren't the *reason* for our goal's failure.
+        match (self.consider_ambiguities, goal.result()) {
+            (true, Ok(Certainty::Maybe(MaybeInfo { cause: MaybeCause::Ambiguity, .. })))
+            | (false, Err(_)) => {}
+            _ => return ControlFlow::Continue(()),
+        }
+
+        let pred = goal.goal().predicate;
+
+        let candidates = self.non_trivial_candidates(goal);
+        let candidate = match candidates.as_slice() {
+            [candidate] => candidate,
+            [] => return self.detect_error_from_empty_candidates(goal),
+            _ => return self.break_with_current_obligation(),
+        };
+
+        // Don't walk into impls that have `do_not_recommend`.
+        if let inspect::ProbeKind::TraitCandidate {
+            source: CandidateSource::Impl(impl_def_id),
+            result: _,
+        } = candidate.kind()
+            && let AnyImplId::ImplId(impl_def_id) = impl_def_id
+            && AttrFlags::query(interner.db, impl_def_id.into())
+                .contains(AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND)
+        {
+            trace!("#[diagnostic::do_not_recommend] -> exit");
+            return self.break_with_current_obligation();
+        }
+
+        // FIXME: Also, what about considering >1 layer up the stack? May be necessary
+        // for normalizes-to.
+        let child_mode = match pred.kind().skip_binder() {
+            PredicateKind::Clause(ClauseKind::Trait(trait_pred)) => {
+                ChildMode::Trait(pred.kind().rebind(trait_pred))
+            }
+            PredicateKind::Clause(ClauseKind::HostEffect(host_clause)) => {
+                ChildMode::Host(pred.kind().rebind(host_clause))
+            }
+            PredicateKind::Clause(ClauseKind::Projection(projection))
+                if projection.projection_term.kind.is_trait_projection() =>
+            {
+                ChildMode::Trait(pred.kind().rebind(TraitClause {
+                    trait_ref: projection.projection_term.trait_ref(interner),
+                    polarity: ClausePolarity::Positive,
+                }))
+            }
+            PredicateKind::Clause(ClauseKind::WellFormed(term)) => {
+                return self.visit_well_formed_goal(candidate, term);
+            }
+            _ => ChildMode::PassThrough,
+        };
+
+        let nested_goals = candidate.instantiate_nested_goals(self.span());
+
+        // If the candidate requires some `T: FnPtr` bound which does not hold should not be treated as
+        // an actual candidate, instead we should treat them as if the impl was never considered to
+        // have potentially applied. As if `impl<A, R> Trait for for<..> fn(..A) -> R` was written
+        // instead of `impl<T: FnPtr> Trait for T`.
+        //
+        // We do this as a separate loop so that we do not choose to tell the user about some nested
+        // goal before we encounter a `T: FnPtr` nested goal.
+        for nested_goal in &nested_goals {
+            if let Some(poly_trait_pred) = nested_goal.goal().predicate.as_trait_clause()
+                && Some(poly_trait_pred.def_id().0) == interner.lang_items().FnPtrTrait
+                && let Err(NoSolution) = nested_goal.result()
+            {
+                return self.break_with_current_obligation();
+            }
+        }
+
+        let candidate_impl = match candidate.kind() {
+            inspect::ProbeKind::TraitCandidate {
+                source: CandidateSource::Impl(impl_id), ..
+            } => Some(impl_id),
+            _ => None,
+        };
+        let mut impl_where_bound_count = 0;
+        for nested_goal in nested_goals {
+            trace!(nested_goal = ?(nested_goal.goal(), nested_goal.source(), nested_goal.result()));
+
+            let nested_pred = nested_goal.goal().predicate;
+
+            let make_obligation = |cause| Obligation {
+                cause,
+                param_env: nested_goal.goal().param_env,
+                predicate: nested_pred,
+                recursion_depth: self.obligation.recursion_depth + 1,
+            };
+
+            let obligation;
+            let mut parent_impl = None;
+            match (child_mode, nested_goal.source()) {
+                (
+                    ChildMode::Trait(_) | ChildMode::Host(_),
+                    GoalSource::Misc | GoalSource::Normalization,
+                ) => {
+                    continue;
+                }
+                (ChildMode::Trait(parent_trait_pred), GoalSource::ImplWhereBound) => {
+                    obligation = make_obligation(derive_cause(
+                        interner,
+                        candidate.kind(),
+                        self.obligation.cause,
+                        impl_where_bound_count,
+                        parent_trait_pred,
+                    ));
+                    parent_impl = candidate_impl.map(|it| (it, impl_where_bound_count as u32));
+                    impl_where_bound_count += 1;
+                }
+                (
+                    ChildMode::Host(parent_host_clause),
+                    GoalSource::ImplWhereBound | GoalSource::AliasBoundConstCondition,
+                ) => {
+                    obligation = make_obligation(derive_host_cause(
+                        interner,
+                        candidate.kind(),
+                        self.obligation.cause,
+                        impl_where_bound_count,
+                        parent_host_clause,
+                    ));
+                    parent_impl = candidate_impl.map(|it| (it, impl_where_bound_count as u32));
+                    impl_where_bound_count += 1;
+                }
+                (ChildMode::PassThrough, _)
+                | (_, GoalSource::AliasWellFormed | GoalSource::AliasBoundConstCondition) => {
+                    obligation = make_obligation(self.obligation.cause);
+                }
+            }
+
+            self.with_derived_obligation(obligation, parent_impl, |this| {
+                nested_goal.visit_with(this)
+            })?;
+        }
+
+        self.detect_trait_error_in_higher_ranked_projection(goal)?;
+
+        self.break_with_current_obligation()
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ChildMode<'db> {
+    // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
+    // and skip all `GoalSource::Misc`, which represent useless obligations
+    // such as alias-eq which may not hold.
+    Trait(PolyTraitClause<'db>),
+    // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
+    // and skip all `GoalSource::Misc`, which represent useless obligations
+    // such as alias-eq which may not hold.
+    Host(Binder<'db, HostEffectClause<'db>>),
+    // Skip trying to derive an `ObligationCause` from this obligation, and
+    // report *all* sub-obligations as if they came directly from the parent
+    // obligation.
+    PassThrough,
+}
+
+fn derive_cause<'db>(
+    _interner: DbInterner<'db>,
+    _candidate_kind: inspect::ProbeKind<DbInterner<'db>>,
+    cause: ObligationCause,
+    _idx: usize,
+    _parent_trait_pred: PolyTraitClause<'db>,
+) -> ObligationCause {
+    cause
+}
+
+fn derive_host_cause<'db>(
+    _interner: DbInterner<'db>,
+    _candidate_kind: inspect::ProbeKind<DbInterner<'db>>,
+    cause: ObligationCause,
+    _idx: usize,
+    _parent_host_clause: Binder<'db, HostEffectClause<'db>>,
+) -> ObligationCause {
+    cause
+}

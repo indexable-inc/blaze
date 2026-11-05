@@ -1,0 +1,16 @@
+[package]
+name = "flecs-c"
+description = "Flecs's amalgamated C (flecs/) built with cc, plus the declarations Rust calls it through"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+links = "flecs"
+
+[features]
+# Native only: Flecs's REST API (and the HTTP, JSON and pipeline addons it needs) and `glue_rest_*`, a read-only REST
+# server a host feeds requests to. wasm32 builds refuse it (build.rs).
+rest = []
+
+[build-dependencies]
+cc = "1"

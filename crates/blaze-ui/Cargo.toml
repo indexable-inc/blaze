@@ -1,0 +1,35 @@
+[package]
+name = "blaze-ui"
+description = "How blaze shows a build: its records from the daemon rendered live on a terminal, as lines elsewhere, and summed up"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-api.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-protocol.workspace = true
+blaze-query.workspace = true
+blaze-report.workspace = true
+blaze-v2-proof.workspace = true
+blaze-vfs.workspace = true
+hashbrown.workspace = true
+# `test_view`: the live view of `blaze test`, drawn into a buffer.
+ratatui = { workspace = true, features = ["std"] }
+unicode-width.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,217 @@
+{
+ "project": "ripgrep",
+ "repo": "BurntSushi/ripgrep",
+ "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+ "arms": {
+  "cargo": {
+   "kind": "cargo",
+   "phases": {
+    "cold": {
+     "build_s": 9.878,
+     "ready_s": 0.0,
+     "wall_s": 9.878,
+     "built": "cargo",
+     "states": [
+      "cargo"
+     ]
+    },
+    "no-op": {
+     "wall_s": 1.88,
+     "samples_s": [
+      1.921,
+      1.99,
+      1.878,
+      1.88,
+      1.873
+     ],
+     "built": [
+      "cargo"
+     ]
+    },
+    "body": {
+     "wall_s": 1.911,
+     "samples_s": [
+      1.88,
+      1.891,
+      1.911,
+      1.936,
+      1.933
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 1.922
+    },
+    "signature": {
+     "wall_s": 2.342,
+     "samples_s": [
+      2.366,
+      2.334,
+      2.36,
+      2.342,
+      2.336
+     ],
+     "built": [
+      "cargo"
+     ],
+     "back_s": 2.367
+    },
+    "tests_first": {
+     "wall_s": 15.192
+    },
+    "tests": {
+     "wall_s": 8.596,
+     "status": 0,
+     "passed": 1165,
+     "failed": 0,
+     "ignored": 3,
+     "built": "cargo"
+    }
+   },
+   "wrong": [],
+   "failed": null
+  },
+  "ours": {
+   "kind": "blaze",
+   "phases": {
+    "cold": {
+     "build_s": 24.714,
+     "ready_s": 0.031,
+     "wall_s": 24.745,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.014,
+     "samples_s": [
+      0.015,
+      0.014,
+      0.016,
+      0.014,
+      0.014
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 0.21,
+     "samples_s": [
+      0.359,
+      0.21,
+      0.204,
+      0.23,
+      0.199
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.195
+    },
+    "signature": {
+     "wall_s": 0.16,
+     "samples_s": [
+      0.181,
+      0.166,
+      0.16,
+      0.16,
+      0.16
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.145
+    },
+    "tests_first": {
+     "wall_s": 126.582
+    },
+    "tests": {
+     "wall_s": 9.922,
+     "status": 0,
+     "passed": 1165,
+     "failed": 0,
+     "ignored": 3,
+     "built": "daemon",
+     "differs": "tests differ: blaze only [(('crates/ignore/src/types.rs - types (line 16)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 51)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 34)', 'ran'), 1)], cargo only [(('crates/ignore/src/types.rs - types (line 17)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 52)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 35)', '"
+    }
+   },
+   "wrong": [
+    "tests: tests differ: blaze only [(('crates/ignore/src/types.rs - types (line 16)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 51)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 34)', 'ran'), 1)], cargo only [(('crates/ignore/src/types.rs - types (line 17)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line 52)', 'ran'), 1), (('crates/ignore/src/types.rs - types (line "
+   ],
+   "failed": null
+  },
+  "astral": {
+   "kind": "astral",
+   "phases": {
+    "cold": {
+     "build_s": 30.928,
+     "ready_s": 0.01,
+     "wall_s": 30.937,
+     "built": "daemon",
+     "states": [
+      "ready"
+     ]
+    },
+    "no-op": {
+     "wall_s": 0.034,
+     "samples_s": [
+      0.034,
+      0.034,
+      0.034,
+      0.035,
+      0.034
+     ],
+     "built": [
+      "daemon"
+     ]
+    },
+    "body": {
+     "wall_s": 0.1,
+     "samples_s": [
+      0.109,
+      0.097,
+      0.095,
+      0.1,
+      0.1
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.094
+    },
+    "signature": {
+     "wall_s": 0.192,
+     "samples_s": [
+      1.482,
+      0.198,
+      0.192,
+      0.188,
+      0.19
+     ],
+     "built": [
+      "daemon"
+     ],
+     "back_s": 0.195
+    },
+    "tests_first": {
+     "wall_s": 79.82
+    },
+    "tests": {
+     "wall_s": 8.084,
+     "status": 0,
+     "passed": 1165,
+     "failed": 0,
+     "ignored": 3,
+     "built": "daemon",
+     "differs": "tests differ: blaze only [(('crates/globset/src/lib.rs - (line 18)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 34)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 50)', 'ran'), 1)], cargo only [(('crates/globset/src/lib.rs - (line 19)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 35)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 51)', 'ran'), 1)]"
+    }
+   },
+   "wrong": [
+    "tests: tests differ: blaze only [(('crates/globset/src/lib.rs - (line 18)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 34)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 50)', 'ran'), 1)], cargo only [(('crates/globset/src/lib.rs - (line 19)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 35)', 'ran'), 1), (('crates/globset/src/lib.rs - (line 51)', 'ran'), 1)]"
+   ],
+   "failed": null
+  }
+ }
+}

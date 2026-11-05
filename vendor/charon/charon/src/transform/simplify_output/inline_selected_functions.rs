@@ -1,0 +1,204 @@
+use std::{collections::HashMap, mem};
+
+use crate::transform::CowBox;
+use crate::transform::{TransformCtx, ctx::UllbcPass};
+use crate::ullbc_ast::*;
+
+pub struct Transform {
+    to_inline: HashMap<FunDeclId, FunDecl>,
+}
+
+impl Transform {
+    pub fn new(ctx: &mut TransformCtx) -> CowBox<dyn UllbcPass> {
+        let panic_name = Name::from_path(names::EXPLICIT_PANIC_NAME);
+        let panic_explicit = ctx
+            .translated
+            .fun_decls
+            .iter_indexed()
+            .find(|(_, decl)| decl.item_meta.name == panic_name)
+            .map(|(id, _)| id);
+
+        let repeated_globals =
+            super::anon_const_to_call::globals_in_constant_repeats(&ctx.translated);
+
+        // Collect and remove the functions that we want to inline.
+        let to_inline = ctx
+            .translated
+            .fun_decls
+            .extract(|_, decl| {
+                decl.body.as_unstructured().is_some_and(|body| {
+                    // `panic!` generates a function item named `panic_cold_explicit` that calls
+                    // `panic_explicit`. We inline that function.
+                    let block = &body.body[START_BLOCK_ID];
+                    let is_local_panic_fn = if decl.item_meta.name.short_str()
+                        == Some("panic_cold_explicit")
+                        && matches!(body.body.len(), 2 | 3)
+                        && block.statements.is_empty()
+                        && let TerminatorKind::Call { call, .. } = &block.terminator.kind
+                        && let FnOperand::Regular(fn_ptr) = &call.func
+                        && let FnPtrKind::Fun(id) = fn_ptr.kind.as_ref()
+                        && Some(*id) == panic_explicit
+                    {
+                        body.body.iter_enumerated().all(|(id, block)| {
+                            id == START_BLOCK_ID
+                                || block.statements.is_empty()
+                                    && matches!(
+                                        block.terminator.kind,
+                                        TerminatorKind::UnwindResume
+                                            | TerminatorKind::UnwindTerminate
+                                            | TerminatorKind::UndefinedBehavior
+                                    )
+                        })
+                    } else {
+                        false
+                    };
+                    // The `anon_consts_to_call` pass transformed references to anon consts into
+                    // calls to their initializers, so we only have to inline these. Keep those
+                    // that are still needed because they're inside a repeat operation.
+                    let is_inlineable_anon_const = if let FunSource::GlobalInitializer(global) =
+                        &decl.src
+                        && let Some(gdecl) = ctx.translated.global_decls.get(global.id)
+                    {
+                        matches!(gdecl.global_kind, GlobalKind::AnonConst)
+                            && !repeated_globals.contains(&global.id)
+                    } else {
+                        false
+                    };
+                    let is_vec_construction_fn = decl.item_meta.diagnostic_item.as_deref()
+                        == Some(names::BOX_ASSUME_INIT_INTO_VEC_UNSAFE);
+                    is_local_panic_fn
+                        || (is_inlineable_anon_const && ctx.options.inline_anon_consts)
+                        || (is_vec_construction_fn && ctx.options.treat_box_as_builtin)
+                })
+            })
+            .collect();
+
+        CowBox::Owned(Box::new(Transform { to_inline }))
+    }
+}
+impl UllbcPass for Transform {
+    fn should_run(&self, _options: &crate::options::TranslateOptions) -> bool {
+        !self.to_inline.is_empty()
+    }
+    fn apply_preceding_passes(&mut self, ctx: &mut TransformCtx, passes: &[CowBox<dyn UllbcPass>]) {
+        for decl in self.to_inline.values_mut() {
+            for pass in passes {
+                pass.transform_item(ctx, ItemRefMut::Fun(decl));
+            }
+        }
+    }
+    fn transform_body(&self, _ctx: &mut TransformCtx, outer_body: &mut ullbc_ast::ExprBody) {
+        for block_id in outer_body.body.indices() {
+            let Some(block) = outer_body.body.get_mut(block_id) else {
+                continue;
+            };
+            let TerminatorKind::Call { call: Call { func, args, .. }, dest, target, on_unwind } =
+                &mut block.terminator.kind
+            else {
+                continue;
+            };
+            let target = *target;
+            let on_unwind = *on_unwind;
+            let kind = block.kind;
+            let dest_place = dest.clone();
+            let args = args.clone();
+            let FnOperand::Regular(fn_ptr) = &func else {
+                continue;
+            };
+            let FnPtrKind::Fun(fun_id) = fn_ptr.kind.as_ref() else {
+                continue;
+            };
+            let Some(initializer) = self.to_inline.get(fun_id) else {
+                continue;
+            };
+            let span = initializer.item_meta.span;
+            let Some(inner_body) = initializer.body.as_unstructured() else {
+                continue;
+            };
+
+            // We inline the required body by shifting its local ids and block ids
+            // and adding its blocks to the outer body. The inner body's return
+            // local becomes a normal local that we can read from. We redirect some
+            // gotos so that the inner body is executed before the current block.
+            let mut inner_body = {
+                let mut inner_body = inner_body.clone();
+                let inner_bound = inner_body.bound_body_regions;
+
+                // Shift all the body regions in the inner body BEFORE substitution,
+                // so that we only shift the inner body's own regions.
+                inner_body.dyn_visit_mut(|r: &mut Region| {
+                    if let Region::Body(v) = r {
+                        *v += outer_body.bound_body_regions;
+                    }
+                });
+                outer_body.bound_body_regions += inner_bound;
+
+                // Now substitute generics. This may inject outer-body Region::Body
+                // IDs, which is correct since they don't need shifting.
+                inner_body.substitute(&fn_ptr.generics)
+            };
+
+            let return_local = outer_body.locals.locals.next_idx();
+            inner_body.dyn_visit_in_body_mut(|l: &mut LocalId| {
+                *l += return_local;
+            });
+            outer_body.locals.locals.extend(mem::take(&mut inner_body.locals.locals));
+
+            // The inner body assumes the arg places are live; allocate them, and initialize the
+            // args.
+            inner_body.body[0].statements.splice(
+                0..0,
+                args.into_iter()
+                    .enumerate()
+                    .flat_map(|(i, arg)| {
+                        let arg_local = return_local + i + 1;
+                        let arg_place = outer_body.locals.place_for_var(arg_local);
+                        [
+                            StatementKind::StorageLive(arg_local),
+                            StatementKind::Assign(arg_place, Rvalue::Use(arg, WithRetag::Yes)),
+                        ]
+                    })
+                    .map(|kind| Statement::new(span, kind)),
+            );
+
+            let mut final_block = BlockData::new_goto(span, target, kind);
+
+            // The inner body will write to `return_place`, but the outer body expects the value at
+            // `dest_place`.
+            let return_place = outer_body.locals.place_for_var(return_local);
+            final_block.statements.push(Statement::new(
+                span,
+                StatementKind::Assign(
+                    dest_place,
+                    Rvalue::Use(Operand::Move(return_place), WithRetag::Yes),
+                ),
+            ));
+            let final_block = outer_body.body.push(final_block);
+
+            // Shift all block ids in the inner body and point return/unwind to where they should.
+            let start_block = outer_body.body.next_idx();
+            inner_body.visit_block_ids_mut(|b: &mut BlockId| {
+                *b += start_block;
+            });
+            inner_body.body.dyn_visit_in_body_mut(|t: &mut Terminator| match t.kind {
+                TerminatorKind::Return => {
+                    t.kind = TerminatorKind::Goto { target: final_block };
+                }
+                TerminatorKind::UnwindResume => {
+                    t.kind = TerminatorKind::Goto { target: on_unwind };
+                }
+                _ => (),
+            });
+            if kind == UnwindKind::Cleanup {
+                for block in &mut inner_body.body {
+                    block.kind = block.kind.further_unwind_kind();
+                }
+            }
+            // At the end of the current block, start evaluating the inner body.
+            outer_body.body[block_id].terminator.kind =
+                TerminatorKind::Goto { target: start_block };
+            // Add the blocks for the inner body.
+            outer_body.body.extend(inner_body.body);
+        }
+    }
+}

@@ -1,0 +1,14 @@
+base cold exit 0 in 39242ms
+standard library: `std-aarch64-unknown-linux-gnu-050f48759a7c3526` has no manifest on the remote: nothing fetched from /root/perf/work/base-cranelift/std-cranelift in 4.2ms
+resolve: 56 crates in 3.2s
+frozen, of 47 crates: def maps of 0, impls of 0, lang items of 0 from the store, 141 written in 138.4ms
+standard library: 17 crates, compiled 30168 of 30168 fns (+16290 instances) in 12.0s (+1.5µs emit)
+store: 0 functions found, 46466 compiled and added
+standard library: 17 parts in 142.3ms
+store: 17729 functions found, 13584 compiled and added
+stdkey cold exit 0 in 21699ms
+resolve: 56 crates in 821.6ms
+frozen, of 47 crates: def maps of 22, impls of 22, lang items of 22 from the store, 75 written in 42.8ms
+standard library: from the store, 17 crates
+store: 17820 functions found, 13490 compiled and added
+STDCHECK DONE

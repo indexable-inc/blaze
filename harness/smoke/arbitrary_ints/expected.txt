@@ -1,0 +1,35 @@
+u3 3 + 4: ok
+u3 7 + 1: ok
+u3 0 - 1: ok
+u3 3 * 3: ok
+u3 7 / 2: ok
+u3 7 / 0: ok
+u3 7 % 0: ok
+u3 5 << 1: ok
+u3 3 << 4: ok
+u3 6 >> 3: ok
+u3 !5: ok
+i7 -64 + 63: ok
+i7 63 + 1: ok
+i7 -64 - 1: ok
+i7 9 * 8: ok
+i7 -64 * -1: ok
+i7 -(-64): ok
+i7 -63 / 2: ok
+i7 -64 / -1: ok
+i7 -64 % -1: ok
+i7 1 % 0: ok
+i7 -64 >> 6: ok
+i7 1 << 13: ok
+i7 !0: ok
+13u8 as u3: ok
+200u8 as i7: ok
+-1i7 as u8: ok
+-3i7 as u3: ok
+7u3 as i7: ok
+-5i7 as i16: ok
+9.5f64 as u3: ok
+NaN as u3: ok
+-1000f32 as i7: ok
+63.9f32 as i7: ok
+size_of u3 1, i7 1, u24 4, u65 16, Option<u7> 1

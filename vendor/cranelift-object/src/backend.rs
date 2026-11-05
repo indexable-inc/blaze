@@ -1,0 +1,1420 @@
+//! Defines `ObjectModule`.
+
+use anyhow::anyhow;
+use cranelift_codegen::binemit::{Addend, CodeOffset, Reloc};
+use cranelift_codegen::entity::SecondaryMap;
+use cranelift_codegen::ir;
+use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
+use cranelift_control::ControlPlane;
+use cranelift_module::{
+    DataDescription, DataId, FuncId, Init, Linkage, Module, ModuleDeclarations, ModuleError,
+    ModuleReloc, ModuleRelocTarget, ModuleResult,
+};
+use log::{info, warn};
+use object::write::{
+    Object, Relocation, SectionId, StandardSection, Symbol, SymbolId, SymbolSection,
+};
+use object::{
+    BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionFlags, SectionKind,
+    SymbolFlags, SymbolKind, SymbolScope, elf, macho,
+};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::fmt::Write as _;
+use std::mem;
+use target_lexicon::{PointerWidth, Triple};
+
+/// A builder for `ObjectModule`.
+pub struct ObjectBuilder {
+    isa: OwnedTargetIsa,
+    binary_format: object::BinaryFormat,
+    architecture: object::Architecture,
+    flags: object::FileFlags,
+    endian: object::Endianness,
+    name: Vec<u8>,
+    libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
+    per_function_section: bool,
+    per_data_object_section: bool,
+    #[cfg(feature = "unwind")]
+    unwind_info: bool,
+}
+
+impl ObjectBuilder {
+    /// Create a new `ObjectBuilder` using the given Cranelift target, that
+    /// can be passed to [`ObjectModule::new`].
+    ///
+    /// The `libcall_names` function provides a way to translate `cranelift_codegen`'s [`ir::LibCall`]
+    /// enum to symbols. LibCalls are inserted in the IR as part of the legalization for certain
+    /// floating point instructions, and for stack probes. If you don't know what to use for this
+    /// argument, use [`cranelift_module::default_libcall_names`].
+    pub fn new<V: Into<Vec<u8>>>(
+        isa: OwnedTargetIsa,
+        name: V,
+        libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
+    ) -> ModuleResult<Self> {
+        let mut file_flags = object::FileFlags::None;
+        let binary_format = match isa.triple().binary_format {
+            target_lexicon::BinaryFormat::Elf => object::BinaryFormat::Elf,
+            target_lexicon::BinaryFormat::Coff => object::BinaryFormat::Coff,
+            target_lexicon::BinaryFormat::Macho => object::BinaryFormat::MachO,
+            target_lexicon::BinaryFormat::Wasm => {
+                return Err(ModuleError::Backend(anyhow!(
+                    "binary format wasm is unsupported",
+                )));
+            }
+            target_lexicon::BinaryFormat::Unknown => {
+                return Err(ModuleError::Backend(anyhow!("binary format is unknown")));
+            }
+            other => {
+                return Err(ModuleError::Backend(anyhow!(
+                    "binary format {other} not recognized"
+                )));
+            }
+        };
+        let architecture = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_32(_) => object::Architecture::I386,
+            target_lexicon::Architecture::X86_64 => object::Architecture::X86_64,
+            target_lexicon::Architecture::Arm(_) => object::Architecture::Arm,
+            target_lexicon::Architecture::Aarch64(_) => object::Architecture::Aarch64,
+            target_lexicon::Architecture::Riscv64(_) => {
+                if binary_format != object::BinaryFormat::Elf {
+                    return Err(ModuleError::Backend(anyhow!(
+                        "binary format {binary_format:?} is not supported for riscv64",
+                    )));
+                }
+
+                // FIXME(#4994): Get the right float ABI variant from the TargetIsa
+                let mut eflags = object::elf::EF_RISCV_FLOAT_ABI_DOUBLE;
+
+                // Set the RVC eflag if we have the C extension enabled.
+                let has_c = isa
+                    .isa_flags()
+                    .iter()
+                    .filter(|f| f.name == "has_zca" || f.name == "has_zcd")
+                    .all(|f| f.as_bool().unwrap_or_default());
+                if has_c {
+                    eflags |= object::elf::EF_RISCV_RVC;
+                }
+
+                file_flags = object::FileFlags::Elf {
+                    os_abi: object::elf::ELFOSABI_NONE,
+                    abi_version: 0,
+                    e_flags: eflags,
+                };
+                object::Architecture::Riscv64
+            }
+            target_lexicon::Architecture::S390x => object::Architecture::S390x,
+            architecture => {
+                return Err(ModuleError::Backend(anyhow!(
+                    "target architecture {architecture:?} is unsupported",
+                )));
+            }
+        };
+        let endian = match isa.triple().endianness().unwrap() {
+            target_lexicon::Endianness::Little => object::Endianness::Little,
+            target_lexicon::Endianness::Big => object::Endianness::Big,
+        };
+        Ok(Self {
+            isa,
+            binary_format,
+            architecture,
+            flags: file_flags,
+            endian,
+            name: name.into(),
+            libcall_names,
+            per_function_section: false,
+            per_data_object_section: false,
+            #[cfg(feature = "unwind")]
+            unwind_info: false,
+        })
+    }
+
+    /// Set if every function should end up in their own section.
+    pub fn per_function_section(&mut self, per_function_section: bool) -> &mut Self {
+        self.per_function_section = per_function_section;
+        self
+    }
+
+    /// Set if every data object should end up in their own section.
+    pub fn per_data_object_section(&mut self, per_data_object_section: bool) -> &mut Self {
+        self.per_data_object_section = per_data_object_section;
+        self
+    }
+
+    /// Emit a DWARF `.eh_frame` section describing the unwind information for
+    /// each compiled function.
+    ///
+    /// When enabled, ELF and COFF object files gain a `.eh_frame` section
+    /// containing one Common Information Entry and one Frame Description
+    /// Entry per function, suitable for unwinding by libgcc / libunwind.
+    ///
+    /// On Windows targets cranelift emits `.pdata`/`.xdata`-style info rather
+    /// than System V FDEs, so enabling this option is a silent no-op there.
+    /// Mach-O `__TEXT,__eh_frame` emission is not yet implemented; calling
+    /// `finish` on a Mach-O target with this enabled will panic with a
+    /// descriptive error.
+    ///
+    /// Only functions defined through [`Module::define_function`] are
+    /// captured. Functions provided as pre-compiled bytes through
+    /// [`Module::define_function_bytes`] are skipped, since their unwind
+    /// information is not available to the backend.
+    ///
+    /// Requires the `unwind` feature (enabled by default). Without it this
+    /// method does not exist, mirroring `cranelift-codegen`'s gating of
+    /// `CompiledCode::create_unwind_info`.
+    ///
+    /// [`Module::define_function`]: cranelift_module::Module::define_function
+    /// [`Module::define_function_bytes`]: cranelift_module::Module::define_function_bytes
+    #[cfg(feature = "unwind")]
+    pub fn unwind_info(&mut self, unwind_info: bool) -> &mut Self {
+        self.unwind_info = unwind_info;
+        self
+    }
+}
+
+/// See the following for details:
+/// <https://github.com/rust-lang/rust/blob/1.95.0/compiler/rustc_codegen_ssa/src/back/metadata.rs#L408-L425>
+fn macho_build_version(triple: &Triple) -> Option<object::write::MachOBuildVersion> {
+    use target_lexicon::OperatingSystem::*;
+
+    match triple.operating_system {
+        Darwin(v) | MacOSX(v) | IOS(v) | TvOS(v) | VisionOS(v) | WatchOS(v) | XROS(v) => {
+            use object::macho::*;
+            use target_lexicon::Environment::*;
+            // Same as https://github.com/rust-lang/rust/blob/1.95.0/compiler/rustc_codegen_ssa/src/back/apple.rs#L36-L50.
+            //
+            // TODO(madsmtm): Properly support simulator after
+            // https://github.com/bytecodealliance/target-lexicon/pull/130
+            let platform = match (triple.operating_system, triple.environment) {
+                // Sometimes the target is macOS but the environment is Darwin,
+                // and sometimes it's the other way around. Support both.
+                (Darwin(_), _) => PLATFORM_MACOS,
+                (MacOSX(_), _) => PLATFORM_MACOS,
+                (_, Macabi) => PLATFORM_MACCATALYST,
+                (IOS(_), Sim) => PLATFORM_IOSSIMULATOR,
+                (IOS(_), _) => PLATFORM_IOS,
+                (TvOS(_), Sim) => PLATFORM_TVOSSIMULATOR,
+                (TvOS(_), _) => PLATFORM_TVOS,
+                (VisionOS(_) | XROS(_), Sim) => PLATFORM_XROSSIMULATOR,
+                (VisionOS(_) | XROS(_), _) => PLATFORM_XROS,
+                (WatchOS(_), Sim) => PLATFORM_WATCHOSSIMULATOR,
+                (WatchOS(_), _) => PLATFORM_WATCHOS,
+                _ => {
+                    warn!("unsupported OS/environment: {triple}");
+                    PLATFORM_UNKNOWN
+                }
+            };
+
+            let mut build_version = object::write::MachOBuildVersion::default();
+            build_version.platform = platform;
+
+            build_version.minos = if let Some(v) = v {
+                macho::Version::new(v.major, v.minor, v.patch)
+            } else {
+                // The `minos` in object files is useful for diagnostics, as
+                // it tells the linker whether the file supports a given OS -
+                // if the `minos` is higher than what you're linking against,
+                // that's a signal that something has gone wrong.
+                //
+                // Using `0.0.0` here should be fine if we don't have the data
+                // available.
+                macho::Version(0)
+            };
+
+            // Setting a 0 SDK version is fine, it's only relevant for the
+            // final linked binary.
+            build_version.sdk = macho::Version(0);
+
+            Some(build_version)
+        }
+        _ => None,
+    }
+}
+
+/// An `ObjectModule` implements `Module` and emits ".o" files using the `object` library.
+///
+/// See the `ObjectBuilder` for a convenient way to construct `ObjectModule` instances.
+pub struct ObjectModule {
+    isa: OwnedTargetIsa,
+    object: Object<'static>,
+    declarations: ModuleDeclarations,
+    functions: SecondaryMap<FuncId, Option<(SymbolId, bool)>>,
+    data_objects: SecondaryMap<DataId, Option<(SymbolId, bool)>>,
+    relocs: Vec<SymbolRelocs>,
+    libcalls: HashMap<ir::LibCall, SymbolId>,
+    libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
+    known_symbols: HashMap<ir::KnownSymbol, SymbolId>,
+    known_labels: HashMap<(FuncId, CodeOffset), SymbolId>,
+    per_function_section: bool,
+    per_data_object_section: bool,
+    // blaze: the custom sections defined so far, for data objects naming the same one to share it.
+    custom_sections: HashMap<CustomSection, SectionId>,
+    #[cfg(feature = "unwind")]
+    unwind: Option<crate::unwind::UnwindBuilder>,
+}
+
+/// What a custom section is told apart by: data objects that agree on all of it share one.
+#[derive(PartialEq, Eq, Hash)]
+struct CustomSection {
+    segment: Vec<u8>,
+    name: Vec<u8>,
+    kind: SectionKind,
+    macho_flags: u32,
+}
+
+impl ObjectModule {
+    /// Create a new `ObjectModule` using the given Cranelift target.
+    pub fn new(builder: ObjectBuilder) -> Self {
+        let mut object = Object::new(builder.binary_format, builder.architecture, builder.endian);
+        object.flags = builder.flags;
+        object.set_subsections_via_symbols();
+        object.add_file_symbol(builder.name);
+        if let Some(info) = macho_build_version(builder.isa.triple()) {
+            // Set LC_BUILD_VERSION.
+            //
+            // Required when linking Apple targets to avoid warning, see:
+            // https://github.com/bytecodealliance/wasmtime/issues/8730
+            object.set_macho_build_version(info);
+        }
+        #[cfg(feature = "unwind")]
+        let unwind = builder
+            .unwind_info
+            .then(|| crate::unwind::UnwindBuilder::new(builder.endian));
+        Self {
+            isa: builder.isa,
+            object,
+            declarations: ModuleDeclarations::default(),
+            functions: SecondaryMap::new(),
+            data_objects: SecondaryMap::new(),
+            relocs: Vec::new(),
+            libcalls: HashMap::new(),
+            libcall_names: builder.libcall_names,
+            known_symbols: HashMap::new(),
+            known_labels: HashMap::new(),
+            per_function_section: builder.per_function_section,
+            per_data_object_section: builder.per_data_object_section,
+            custom_sections: HashMap::new(),
+            #[cfg(feature = "unwind")]
+            unwind,
+        }
+    }
+}
+
+fn validate_symbol(name: &str) -> ModuleResult<()> {
+    // null bytes are not allowed in symbol names and will cause the `object`
+    // crate to panic. Let's return a clean error instead.
+    if name.contains("\0") {
+        return Err(ModuleError::Backend(anyhow::anyhow!(
+            "Symbol {name:?} has a null byte, which is disallowed"
+        )));
+    }
+    Ok(())
+}
+
+impl Module for ObjectModule {
+    fn isa(&self) -> &dyn TargetIsa {
+        &*self.isa
+    }
+
+    fn declarations(&self) -> &ModuleDeclarations {
+        &self.declarations
+    }
+
+    fn declare_function(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        signature: &ir::Signature,
+    ) -> ModuleResult<FuncId> {
+        validate_symbol(name)?;
+
+        let (id, linkage) = self
+            .declarations
+            .declare_function(name, linkage, signature)?;
+
+        let (scope, weak) = translate_linkage(linkage);
+
+        if let Some((function, _defined)) = self.functions[id] {
+            let symbol = self.object.symbol_mut(function);
+            symbol.scope = scope;
+            symbol.weak = weak;
+        } else {
+            let symbol_id = self.object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Text,
+                scope,
+                weak,
+                section: SymbolSection::Undefined,
+                flags: SymbolFlags::None,
+            });
+            self.functions[id] = Some((symbol_id, false));
+        }
+
+        Ok(id)
+    }
+
+    fn declare_anonymous_function(&mut self, signature: &ir::Signature) -> ModuleResult<FuncId> {
+        let id = self.declarations.declare_anonymous_function(signature)?;
+
+        let symbol_id = self.object.add_symbol(Symbol {
+            name: self
+                .declarations
+                .get_function_decl(id)
+                .linkage_name(id)
+                .into_owned()
+                .into_bytes(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        self.functions[id] = Some((symbol_id, false));
+
+        Ok(id)
+    }
+
+    fn declare_data(
+        &mut self,
+        name: &str,
+        linkage: Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> ModuleResult<DataId> {
+        validate_symbol(name)?;
+
+        let (id, linkage) = self
+            .declarations
+            .declare_data(name, linkage, writable, tls)?;
+
+        // Merging declarations with conflicting values for tls is not allowed, so it is safe to use
+        // the passed in tls value here.
+        let kind = if tls {
+            SymbolKind::Tls
+        } else {
+            SymbolKind::Data
+        };
+        let (scope, weak) = translate_linkage(linkage);
+
+        if let Some((data, _defined)) = self.data_objects[id] {
+            let symbol = self.object.symbol_mut(data);
+            symbol.kind = kind;
+            symbol.scope = scope;
+            symbol.weak = weak;
+        } else {
+            let symbol_id = self.object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind,
+                scope,
+                weak,
+                section: SymbolSection::Undefined,
+                flags: SymbolFlags::None,
+            });
+            self.data_objects[id] = Some((symbol_id, false));
+        }
+
+        Ok(id)
+    }
+
+    fn declare_anonymous_data(&mut self, writable: bool, tls: bool) -> ModuleResult<DataId> {
+        let id = self.declarations.declare_anonymous_data(writable, tls)?;
+
+        let kind = if tls {
+            SymbolKind::Tls
+        } else {
+            SymbolKind::Data
+        };
+
+        let symbol_id = self.object.add_symbol(Symbol {
+            name: self
+                .declarations
+                .get_data_decl(id)
+                .linkage_name(id)
+                .into_owned()
+                .into_bytes(),
+            value: 0,
+            size: 0,
+            kind,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        self.data_objects[id] = Some((symbol_id, false));
+
+        Ok(id)
+    }
+
+    fn define_function_with_control_plane(
+        &mut self,
+        func_id: FuncId,
+        ctx: &mut cranelift_codegen::Context,
+        ctrl_plane: &mut ControlPlane,
+    ) -> ModuleResult<()> {
+        info!("defining function {}: {}", func_id, ctx.func.display());
+
+        let res = ctx.compile(self.isa(), ctrl_plane)?;
+        let alignment = res.buffer.min_alignment as u64;
+
+        let compiled = ctx.compiled_code().unwrap();
+        #[cfg(feature = "unwind")]
+        let unwind_info = if self.unwind.is_some() {
+            compiled.create_unwind_info(self.isa())?
+        } else {
+            None
+        };
+        let buffer = &compiled.buffer;
+        let relocs = buffer
+            .relocs()
+            .iter()
+            .map(|reloc| {
+                self.process_reloc(&ModuleReloc::from_mach_reloc(&reloc, &ctx.func, func_id))
+            })
+            .collect::<ModuleResult<Vec<_>>>()?;
+        self.define_function_inner(func_id, alignment, buffer.data(), relocs)?;
+        #[cfg(feature = "unwind")]
+        if let (Some(builder), Some(info)) = (self.unwind.as_mut(), unwind_info) {
+            let symbol = self.functions[func_id].unwrap().0;
+            builder.add_function(&*self.isa, symbol, info);
+        }
+        Ok(())
+    }
+
+    fn define_function_bytes(
+        &mut self,
+        func_id: FuncId,
+        alignment: u64,
+        bytes: &[u8],
+        relocs: &[ModuleReloc],
+    ) -> ModuleResult<()> {
+        let relocs = relocs
+            .iter()
+            .map(|reloc| self.process_reloc(reloc))
+            .collect::<ModuleResult<Vec<_>>>()?;
+        self.define_function_inner(func_id, alignment, bytes, relocs)
+    }
+
+    fn define_data(&mut self, data_id: DataId, data: &DataDescription) -> ModuleResult<()> {
+        let decl = self.declarations.get_data_decl(data_id);
+        if !decl.linkage.is_definable() {
+            return Err(ModuleError::InvalidImportDefinition(
+                decl.linkage_name(data_id).into_owned(),
+            ));
+        }
+
+        let &mut (symbol, ref mut defined) = self.data_objects[data_id].as_mut().unwrap();
+        if *defined {
+            return Err(ModuleError::DuplicateDefinition(
+                decl.linkage_name(data_id).into_owned(),
+            ));
+        }
+        *defined = true;
+
+        let &DataDescription {
+            ref init,
+            function_decls: _,
+            data_decls: _,
+            function_relocs: _,
+            data_relocs: _,
+            ref custom_section,
+            align,
+            used,
+        } = data;
+
+        let pointer_reloc = match self.isa.triple().pointer_width().unwrap() {
+            PointerWidth::U16 => {
+                return Err(ModuleError::Backend(anyhow!(
+                    "data with pointers on a target with 16-bit pointers"
+                )));
+            }
+            PointerWidth::U32 => Reloc::Abs4,
+            PointerWidth::U64 => Reloc::Abs8,
+        };
+        let relocs = data
+            .all_relocs(pointer_reloc)
+            .map(|record| self.process_reloc(&record))
+            .collect::<ModuleResult<Vec<_>>>()?;
+
+        let section = if custom_section.is_none() {
+            let section_kind = if let Init::Zeros { .. } = *init {
+                if decl.tls {
+                    StandardSection::UninitializedTls
+                } else {
+                    StandardSection::UninitializedData
+                }
+            } else if decl.tls {
+                StandardSection::Tls
+            } else if decl.writable {
+                StandardSection::Data
+            } else if relocs.is_empty() {
+                StandardSection::ReadOnlyData
+            } else {
+                StandardSection::ReadOnlyDataWithRel
+            };
+            if self.per_data_object_section || used {
+                // FIXME pass empty symbol name once add_subsection produces `.text` as section name
+                // instead of `.text.` when passed an empty symbol name. (object#748) Until then
+                // pass `subsection` to produce `.text.subsection` as section name to reduce
+                // confusion.
+                self.object.add_subsection(section_kind, b"subsection")
+            } else {
+                self.object.section_id(section_kind)
+            }
+        } else {
+            if decl.tls {
+                return Err(cranelift_module::ModuleError::Backend(anyhow::anyhow!(
+                    "Custom section not supported for TLS"
+                )));
+            }
+            let (segment, section, macho_flags) =
+                parse_section(custom_section.as_ref().unwrap(), self.object.format())
+                    .map_err(ModuleError::Backend)?;
+            let key = CustomSection {
+                segment: segment.as_bytes().to_vec(),
+                name: section.as_bytes().to_vec(),
+                kind: if decl.writable {
+                    SectionKind::Data
+                } else if relocs.is_empty() {
+                    SectionKind::ReadOnlyData
+                } else {
+                    SectionKind::ReadOnlyDataWithRel
+                },
+                macho_flags: macho_flags.0,
+            };
+            // blaze: as `add_subsection` does for the standard sections, a data object gets a
+            // section of its own only where the section is what the linker keeps or drops. A
+            // Mach-O object has room for 255 sections, and its linker goes by symbols. A COFF
+            // symbol does not say how large it is, and its section is all that does: there
+            // every data object keeps one of its own, as upstream.
+            let own = match self.object.format() {
+                BinaryFormat::MachO => false,
+                BinaryFormat::Coff => true,
+                _ => self.per_data_object_section || used,
+            };
+            match self.custom_sections.get(&key) {
+                Some(&section) if !own => section,
+                _ => {
+                    let section =
+                        self.object
+                            .add_section(key.segment.clone(), key.name.clone(), key.kind);
+                    self.set_macho_flags(section, macho_flags);
+                    if !own {
+                        self.custom_sections.insert(key, section);
+                    }
+                    section
+                }
+            }
+        };
+        let custom = custom_section.is_some();
+
+        let align = std::cmp::max(align.unwrap_or(1), self.isa.symbol_alignment());
+        let offset = match *init {
+            Init::Uninitialized => {
+                panic!("data is not initialized yet");
+            }
+            // blaze: a custom section is not one of uninitialized data, and may be shared.
+            Init::Zeros { size } if custom => {
+                self.object
+                    .add_symbol_data(symbol, section, &vec![0; size], align)
+            }
+            Init::Zeros { size } => self
+                .object
+                .add_symbol_bss(symbol, section, size as u64, align),
+            Init::Bytes { ref contents } => self
+                .object
+                .add_symbol_data(symbol, section, &contents, align),
+        };
+        if !relocs.is_empty() {
+            self.relocs.push(SymbolRelocs {
+                section,
+                offset,
+                relocs,
+            });
+        }
+
+        if used {
+            match self.object.format() {
+                object::BinaryFormat::Elf => match self.object.section_flags_mut(section) {
+                    SectionFlags::Elf { sh_flags, .. } => *sh_flags |= elf::SHF_GNU_RETAIN,
+                    _ => unreachable!(),
+                },
+                object::BinaryFormat::Coff => {}
+                object::BinaryFormat::MachO => match self.object.symbol_flags_mut(symbol) {
+                    SymbolFlags::MachO { n_desc, .. } => *n_desc |= macho::N_NO_DEAD_STRIP,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ObjectModule {
+    fn set_macho_flags(&mut self, section: SectionId, macho_flags: macho::SectionFlags) {
+        match self.object.section_flags_mut(section) {
+            SectionFlags::MachO { flags, .. } => {
+                // There are no default flags for the `SectionKind`s that
+                // we've specified above, so it's fine to override.
+                //
+                // (If we don't want to override, we'll have to be careful
+                // with how we set these, to ensure we set the section
+                // type properly).
+                assert_eq!(flags.0, 0);
+                *flags = macho_flags;
+            }
+            _ => {
+                if macho_flags.0 != 0 {
+                    unreachable!("unsupported Mach-O flags for this platform: {macho_flags:?}");
+                }
+            }
+        }
+    }
+
+    fn define_function_inner(
+        &mut self,
+        func_id: FuncId,
+        alignment: u64,
+        bytes: &[u8],
+        relocs: Vec<ObjectRelocRecord>,
+    ) -> Result<(), ModuleError> {
+        info!("defining function {func_id} with bytes");
+        let decl = self.declarations.get_function_decl(func_id);
+        let decl_name = decl.linkage_name(func_id);
+        if !decl.linkage.is_definable() {
+            return Err(ModuleError::InvalidImportDefinition(decl_name.into_owned()));
+        }
+
+        let &mut (symbol, ref mut defined) = self.functions[func_id].as_mut().unwrap();
+        if *defined {
+            return Err(ModuleError::DuplicateDefinition(decl_name.into_owned()));
+        }
+        *defined = true;
+
+        let align = alignment.max(self.isa.symbol_alignment());
+        let section = if self.per_function_section {
+            // FIXME pass empty symbol name once add_subsection produces `.text` as section name
+            // instead of `.text.` when passed an empty symbol name. (object#748) Until then pass
+            // `subsection` to produce `.text.subsection` as section name to reduce confusion.
+            self.object
+                .add_subsection(StandardSection::Text, b"subsection")
+        } else {
+            self.object.section_id(StandardSection::Text)
+        };
+        let offset = self.object.add_symbol_data(symbol, section, bytes, align);
+
+        if !relocs.is_empty() {
+            self.relocs.push(SymbolRelocs {
+                section,
+                offset,
+                relocs,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Finalize all relocations and output an object.
+    pub fn finish(mut self) -> ObjectProduct {
+        if cfg!(debug_assertions) {
+            for (func_id, decl) in self.declarations.get_functions() {
+                if !decl.linkage.requires_definition() {
+                    continue;
+                }
+
+                assert!(
+                    self.functions[func_id].unwrap().1,
+                    "function \"{}\" with linkage {:?} must be defined but is not",
+                    decl.linkage_name(func_id),
+                    decl.linkage,
+                );
+            }
+
+            for (data_id, decl) in self.declarations.get_data_objects() {
+                if !decl.linkage.requires_definition() {
+                    continue;
+                }
+
+                assert!(
+                    self.data_objects[data_id].unwrap().1,
+                    "data object \"{}\" with linkage {:?} must be defined but is not",
+                    decl.linkage_name(data_id),
+                    decl.linkage,
+                );
+            }
+        }
+
+        let symbol_relocs = mem::take(&mut self.relocs);
+        for symbol in symbol_relocs {
+            for &ObjectRelocRecord {
+                offset,
+                ref name,
+                flags,
+                addend,
+            } in &symbol.relocs
+            {
+                let target_symbol = self.get_symbol(name);
+                self.object
+                    .add_relocation(
+                        symbol.section,
+                        Relocation {
+                            offset: symbol.offset + u64::from(offset),
+                            flags,
+                            symbol: target_symbol,
+                            addend,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        // Indicate that this object has a non-executable stack.
+        if self.object.format() == object::BinaryFormat::Elf {
+            self.object.add_section(
+                vec![],
+                ".note.GNU-stack".as_bytes().to_vec(),
+                SectionKind::Linker,
+            );
+        }
+
+        #[cfg(feature = "unwind")]
+        if let Some(unwind) = self.unwind.take() {
+            unwind
+                .finish(&mut self.object, &*self.isa)
+                .expect("failed to emit .eh_frame section");
+        }
+
+        ObjectProduct {
+            object: self.object,
+            functions: self.functions,
+            data_objects: self.data_objects,
+        }
+    }
+
+    /// This should only be called during finish because it creates
+    /// symbols for missing libcalls.
+    fn get_symbol(&mut self, name: &ModuleRelocTarget) -> SymbolId {
+        match *name {
+            ModuleRelocTarget::User { .. } => {
+                if ModuleDeclarations::is_function(name) {
+                    let id = FuncId::from_name(name);
+                    self.functions[id].unwrap().0
+                } else {
+                    let id = DataId::from_name(name);
+                    self.data_objects[id].unwrap().0
+                }
+            }
+            ModuleRelocTarget::LibCall(ref libcall) => {
+                let name = (self.libcall_names)(*libcall);
+                if let Some(symbol) = self.object.symbol_id(name.as_bytes()) {
+                    symbol
+                } else if let Some(symbol) = self.libcalls.get(libcall) {
+                    *symbol
+                } else {
+                    let symbol = self.object.add_symbol(Symbol {
+                        name: name.as_bytes().to_vec(),
+                        value: 0,
+                        size: 0,
+                        kind: SymbolKind::Text,
+                        scope: SymbolScope::Unknown,
+                        weak: false,
+                        section: SymbolSection::Undefined,
+                        flags: SymbolFlags::None,
+                    });
+                    self.libcalls.insert(*libcall, symbol);
+                    symbol
+                }
+            }
+            // These are "magic" names well-known to the linker.
+            // They require special treatment.
+            ModuleRelocTarget::KnownSymbol(ref known_symbol) => {
+                if let Some(symbol) = self.known_symbols.get(known_symbol) {
+                    *symbol
+                } else {
+                    let symbol = self.object.add_symbol(match known_symbol {
+                        ir::KnownSymbol::ElfGlobalOffsetTable => Symbol {
+                            name: b"_GLOBAL_OFFSET_TABLE_".to_vec(),
+                            value: 0,
+                            size: 0,
+                            kind: SymbolKind::Data,
+                            scope: SymbolScope::Unknown,
+                            weak: false,
+                            section: SymbolSection::Undefined,
+                            flags: SymbolFlags::None,
+                        },
+                        ir::KnownSymbol::CoffTlsIndex => Symbol {
+                            name: b"_tls_index".to_vec(),
+                            value: 0,
+                            size: 32,
+                            kind: SymbolKind::Tls,
+                            scope: SymbolScope::Unknown,
+                            weak: false,
+                            section: SymbolSection::Undefined,
+                            flags: SymbolFlags::None,
+                        },
+                    });
+                    self.known_symbols.insert(*known_symbol, symbol);
+                    symbol
+                }
+            }
+
+            ModuleRelocTarget::FunctionOffset(func_id, offset) => {
+                match self.known_labels.entry((func_id, offset)) {
+                    Entry::Occupied(o) => *o.get(),
+                    Entry::Vacant(v) => {
+                        let func_symbol_id = self.functions[func_id].unwrap().0;
+                        let func_symbol = self.object.symbol(func_symbol_id);
+
+                        let name = format!(".L{}_{}", func_id.as_u32(), offset);
+                        let symbol_id = self.object.add_symbol(Symbol {
+                            name: name.as_bytes().to_vec(),
+                            value: func_symbol.value + offset as u64,
+                            size: 0,
+                            kind: SymbolKind::Label,
+                            scope: SymbolScope::Compilation,
+                            weak: false,
+                            section: SymbolSection::Section(func_symbol.section.id().unwrap()),
+                            flags: SymbolFlags::None,
+                        });
+
+                        v.insert(symbol_id);
+                        symbol_id
+                    }
+                }
+            }
+        }
+    }
+
+    // blaze: a relocation the object format has no form for is an error naming both.
+    fn process_reloc(&self, record: &ModuleReloc) -> ModuleResult<ObjectRelocRecord> {
+        let unsupported = |reloc: Reloc| {
+            ModuleError::Backend(anyhow!(
+                "the relocation {reloc:?} in a {:?} object",
+                self.object.format()
+            ))
+        };
+        let flags = match record.kind {
+            Reloc::Abs4 => RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::Abs8 => RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: 64,
+            },
+            Reloc::X86PCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::X86CallPCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::X86Branch,
+                size: 32,
+            },
+            // TODO: Get Cranelift to tell us when we can use
+            // R_X86_64_GOTPCRELX/R_X86_64_REX_GOTPCRELX.
+            Reloc::X86CallPLTRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::PltRelative,
+                encoding: RelocationEncoding::X86Branch,
+                size: 32,
+            },
+            Reloc::X86SecRel => RelocationFlags::Generic {
+                kind: RelocationKind::SectionOffset,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::X86GOTPCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::GotRelative,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::Arm64Call => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::AArch64Call,
+                size: 26,
+            },
+            Reloc::ElfX86_64TlsGd => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "ElfX86_64TlsGd is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_X86_64_TLSGD,
+                }
+            }
+            Reloc::MachOX86_64Tlv => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::MachO,
+                    "MachOX86_64Tlv is not supported for this file format"
+                );
+                RelocationFlags::MachO {
+                    r_type: object::macho::X86_64_RELOC_TLV,
+                    r_pcrel: true,
+                    r_length: 2,
+                }
+            }
+            Reloc::MachOAarch64TlsAdrPage21 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::MachO,
+                    "MachOAarch64TlsAdrPage21 is not supported for this file format"
+                );
+                RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21,
+                    r_pcrel: true,
+                    r_length: 2,
+                }
+            }
+            Reloc::MachOAarch64TlsAdrPageOff12 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::MachO,
+                    "MachOAarch64TlsAdrPageOff12 is not supported for this file format"
+                );
+                RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+                    r_pcrel: false,
+                    r_length: 2,
+                }
+            }
+            Reloc::Aarch64TlsDescAdrPage21 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescAdrPage21 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_ADR_PAGE21,
+                }
+            }
+            Reloc::Aarch64TlsDescLd64Lo12 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescLd64Lo12 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_LD64_LO12,
+                }
+            }
+            Reloc::Aarch64TlsDescAddLo12 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescAddLo12 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_ADD_LO12,
+                }
+            }
+            Reloc::Aarch64TlsDescCall => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescCall is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_CALL,
+                }
+            }
+
+            Reloc::Aarch64AdrGotPage21 => match self.object.format() {
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_ADR_GOT_PAGE,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                    r_pcrel: true,
+                    r_length: 2,
+                },
+                _ => return Err(unsupported(record.kind)),
+            },
+            Reloc::Aarch64Ld64GotLo12Nc => match self.object.format() {
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_LD64_GOT_LO12_NC,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+                    r_pcrel: false,
+                    r_length: 2,
+                },
+                _ => return Err(unsupported(record.kind)),
+            },
+            Reloc::Aarch64AdrPrelPgHi21 => match self.object.format() {
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_ADR_PREL_PG_HI21,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_PAGE21,
+                    r_pcrel: true,
+                    r_length: 2,
+                },
+                _ => return Err(unsupported(record.kind)),
+            },
+            Reloc::Aarch64AddAbsLo12Nc => match self.object.format() {
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_ADD_ABS_LO12_NC,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_PAGEOFF12,
+                    r_pcrel: false,
+                    r_length: 2,
+                },
+                _ => return Err(unsupported(record.kind)),
+            },
+            Reloc::S390xPCRel32Dbl => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::S390xDbl,
+                size: 32,
+            },
+            Reloc::S390xPLTRel32Dbl => RelocationFlags::Generic {
+                kind: RelocationKind::PltRelative,
+                encoding: RelocationEncoding::S390xDbl,
+                size: 32,
+            },
+            Reloc::S390xTlsGd64 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "S390xTlsGd64 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_390_TLS_GD64,
+                }
+            }
+            Reloc::S390xTlsGdCall => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "S390xTlsGdCall is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_390_TLS_GDCALL,
+                }
+            }
+            Reloc::RiscvCallPlt => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvCallPlt is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_CALL_PLT,
+                }
+            }
+            Reloc::RiscvTlsGdHi20 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvTlsGdHi20 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_TLS_GD_HI20,
+                }
+            }
+            Reloc::RiscvPCRelLo12I => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvPCRelLo12I is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_PCREL_LO12_I,
+                }
+            }
+            Reloc::RiscvGotHi20 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvGotHi20 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_GOT_HI20,
+                }
+            }
+            Reloc::RiscvPCRelHi20 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvPCRelHi20 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_PCREL_HI20,
+                }
+            }
+            reloc => return Err(unsupported(reloc)),
+        };
+
+        Ok(ObjectRelocRecord {
+            offset: record.offset,
+            name: record.name.clone(),
+            flags,
+            addend: record.addend,
+        })
+    }
+}
+
+fn translate_linkage(linkage: Linkage) -> (SymbolScope, bool) {
+    let scope = match linkage {
+        Linkage::Import => SymbolScope::Unknown,
+        Linkage::Local => SymbolScope::Compilation,
+        Linkage::Hidden => SymbolScope::Linkage,
+        Linkage::Export | Linkage::Preemptible => SymbolScope::Dynamic,
+    };
+    // TODO: this matches rustc_codegen_cranelift, but may be wrong.
+    let weak = linkage == Linkage::Preemptible;
+    (scope, weak)
+}
+
+/// This is the output of `ObjectModule`'s
+/// [`finish`](../struct.ObjectModule.html#method.finish) function.
+/// It contains the generated `Object` and other information produced during
+/// compilation.
+pub struct ObjectProduct {
+    /// Object artifact with all functions and data from the module defined.
+    pub object: Object<'static>,
+    /// Symbol IDs for functions (both declared and defined).
+    pub functions: SecondaryMap<FuncId, Option<(SymbolId, bool)>>,
+    /// Symbol IDs for data objects (both declared and defined).
+    pub data_objects: SecondaryMap<DataId, Option<(SymbolId, bool)>>,
+}
+
+impl ObjectProduct {
+    /// Return the `SymbolId` for the given function.
+    #[inline]
+    pub fn function_symbol(&self, id: FuncId) -> SymbolId {
+        self.functions[id].unwrap().0
+    }
+
+    /// Return the `SymbolId` for the given data object.
+    #[inline]
+    pub fn data_symbol(&self, id: DataId) -> SymbolId {
+        self.data_objects[id].unwrap().0
+    }
+
+    /// Write the object bytes in memory.
+    #[inline]
+    pub fn emit(self) -> Result<Vec<u8>, object::write::Error> {
+        self.object.write()
+    }
+}
+
+#[derive(Clone)]
+struct SymbolRelocs {
+    section: SectionId,
+    offset: u64,
+    relocs: Vec<ObjectRelocRecord>,
+}
+
+#[derive(Clone)]
+struct ObjectRelocRecord {
+    offset: CodeOffset,
+    name: ModuleRelocTarget,
+    flags: RelocationFlags,
+    addend: Addend,
+}
+
+fn parse_section(
+    section: &str,
+    binary_format: BinaryFormat,
+) -> Result<(&str, &str, macho::SectionFlags), anyhow::Error> {
+    match binary_format {
+        // See https://github.com/llvm/llvm-project/blob/main/llvm/lib/MC/MCSectionMachO.cpp
+        BinaryFormat::MachO => {
+            let mut parts = section.split(',');
+
+            let section_err = |msg| {
+                Err(anyhow!(
+                    "section `{section}` is not valid for Mach-O target: {msg}"
+                ))
+            };
+
+            let segment_name = parts.next().unwrap();
+            if segment_name.len() > 16 {
+                return section_err("segment name larger than 16 bytes");
+            }
+
+            let Some(section_name) = parts.next() else {
+                return section_err("must be segment and section separated by comma");
+            };
+            if section_name.len() > 16 {
+                return section_err("section name larger than 16 bytes");
+            }
+
+            let section_type = parts.next().unwrap_or("regular");
+
+            // The custom Mach-O section flags. This is the section type
+            // (8 bits) packed together with the attributes (24 bits).
+            let mut macho_flags = if let Some((_, val)) = MACHO_SECTION_TYPES
+                .iter()
+                .find(|(name, _)| *name == section_type)
+            {
+                (*val).into()
+            } else {
+                let types = list_valid_values(MACHO_SECTION_TYPES);
+                return section_err(&format!(
+                    "unsupported section type `{section_type}`, valid values are {types}"
+                ));
+            };
+
+            if let Some(section_attributes) = parts.next() {
+                for attr in section_attributes.split('+') {
+                    macho_flags |= if let Some((_, val)) = MACHO_SECTION_ATTRIBUTES
+                        .iter()
+                        .find(|(name, _)| *name == attr)
+                    {
+                        *val
+                    } else {
+                        let attributes = list_valid_values(MACHO_SECTION_ATTRIBUTES);
+                        return section_err(&format!(
+                            "unsupported section attribute `{attr}`, valid values are {attributes}"
+                        ));
+                    };
+                }
+            }
+
+            if parts.next().is_some() {
+                return section_err("too many components");
+            }
+
+            Ok((segment_name, section_name, macho_flags))
+        }
+        // Otherwise, assume no segment and flags.
+        _ => Ok(("", section, macho::S_REGULAR.into())),
+    }
+}
+
+// We support the same custom section type / attrs naming as LLVM:
+// <https://github.com/llvm/llvm-project/blob/llvmorg-22.1.3/llvm/lib/MC/MCSectionMachO.cpp#L23-L91>
+// <https://github.com/llvm/llvm-project/blob/llvmorg-22.1.3/llvm/include/llvm/BinaryFormat/MachO.h#L120-L223>
+//
+// See also the Mac OS X Assembler Reference:
+// <https://leopard-adc.pepas.com/documentation/DeveloperTools/Reference/Assembler/040-Assembler_Directives/asm_directives.html#//apple_ref/doc/uid/TP30000823-TPXREF102>
+#[rustfmt::skip]
+const MACHO_SECTION_TYPES: &[(&str, macho::SectionType)] = {
+    use object::macho::*;
+    &[
+        ("regular", S_REGULAR),
+        ("zerofill", S_ZEROFILL),
+        ("cstring_literals", S_CSTRING_LITERALS),
+        ("4byte_literals", S_4BYTE_LITERALS),
+        ("8byte_literals", S_8BYTE_LITERALS),
+        ("literal_pointers", S_LITERAL_POINTERS),
+        ("non_lazy_symbol_pointers", S_NON_LAZY_SYMBOL_POINTERS),
+        ("lazy_symbol_pointers", S_LAZY_SYMBOL_POINTERS),
+        // ("symbol_stubs", S_SYMBOL_STUBS) (requires extra param stub size)
+        ("mod_init_funcs", S_MOD_INIT_FUNC_POINTERS),
+        ("mod_term_funcs", S_MOD_TERM_FUNC_POINTERS),
+        ("coalesced", S_COALESCED),
+        // S_GB_ZEROFILL (not supported by LLVM)
+        ("interposing", S_INTERPOSING),
+        ("16byte_literals", S_16BYTE_LITERALS),
+        // S_DTRACE_DOF (not supported by LLVM)
+        // S_LAZY_DYLIB_SYMBOL_POINTERS (not supported by LLVM)
+        ("thread_local_regular", S_THREAD_LOCAL_REGULAR),
+        ("thread_local_zerofill", S_THREAD_LOCAL_ZEROFILL),
+        ("thread_local_variables", S_THREAD_LOCAL_VARIABLES),
+        ("thread_local_variable_pointers", S_THREAD_LOCAL_VARIABLE_POINTERS),
+        ("thread_local_init_function_pointers", S_THREAD_LOCAL_INIT_FUNCTION_POINTERS),
+        // S_INIT_FUNC_OFFSETS (not supported by LLVM)
+    ]
+};
+
+const MACHO_SECTION_ATTRIBUTES: &[(&str, macho::SectionFlags)] = {
+    use object::macho::*;
+    &[
+        ("pure_instructions", S_ATTR_PURE_INSTRUCTIONS),
+        ("no_toc", S_ATTR_NO_TOC),
+        ("strip_static_syms", S_ATTR_STRIP_STATIC_SYMS),
+        ("no_dead_strip", S_ATTR_NO_DEAD_STRIP),
+        ("live_support", S_ATTR_LIVE_SUPPORT),
+        ("self_modifying_code", S_ATTR_SELF_MODIFYING_CODE),
+        ("debug", S_ATTR_DEBUG),
+        // System settable attributes are not supported by LLVM:
+        // S_ATTR_SOME_INSTRUCTIONS
+        // S_ATTR_EXT_RELOC
+        // S_ATTR_LOC_RELOC
+    ]
+};
+
+fn list_valid_values<T>(items: &[(&str, T)]) -> String {
+    let mut items = items.iter().peekable();
+    let mut result = String::new();
+    if let Some((item, _)) = items.next() {
+        write!(&mut result, "`{item}`").unwrap();
+    }
+    while let Some((item, _)) = items.next() {
+        if items.peek().is_none() {
+            write!(&mut result, " and `{item}`").unwrap();
+        } else {
+            write!(&mut result, ", `{item}`").unwrap();
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object::macho::*;
+
+    #[test]
+    fn section() {
+        assert_eq!(
+            parse_section("__DATA,__mod_init_func,mod_init_funcs", BinaryFormat::MachO).unwrap(),
+            ("__DATA", "__mod_init_func", S_MOD_INIT_FUNC_POINTERS.into()),
+        );
+        assert_eq!(
+            parse_section(
+                "__OBJC,__module_info,regular,no_dead_strip",
+                BinaryFormat::MachO,
+            )
+            .unwrap(),
+            ("__OBJC", "__module_info", S_REGULAR | S_ATTR_NO_DEAD_STRIP),
+        );
+
+        assert_eq!(
+            parse_section("__TEXT,__text", BinaryFormat::MachO).unwrap(),
+            ("__TEXT", "__text", S_REGULAR.into()),
+        );
+        assert_eq!(
+            parse_section("__TEXT,__text,regular", BinaryFormat::MachO).unwrap(),
+            ("__TEXT", "__text", S_REGULAR.into()),
+        );
+        assert_eq!(
+            parse_section(
+                "foo,bar,literal_pointers,no_toc+no_dead_strip",
+                BinaryFormat::MachO
+            )
+            .unwrap(),
+            (
+                "foo",
+                "bar",
+                S_LITERAL_POINTERS | S_ATTR_NO_TOC | S_ATTR_NO_DEAD_STRIP
+            ),
+        );
+
+        assert!(parse_section("foo", BinaryFormat::MachO).is_err());
+        assert!(parse_section("12345678901234567,bar", BinaryFormat::MachO).is_err());
+        assert!(parse_section("foo,12345678901234567", BinaryFormat::MachO).is_err());
+        assert!(parse_section("foo,bar,unknown", BinaryFormat::MachO).is_err());
+        assert!(parse_section("foo,bar,regular,unknown", BinaryFormat::MachO).is_err());
+        assert!(
+            parse_section("foo,bar,regular,no_dead_strip+unknown", BinaryFormat::MachO).is_err()
+        );
+        assert!(
+            parse_section("foo,bar,regular,no_dead_strip,unknown", BinaryFormat::MachO).is_err()
+        );
+    }
+}

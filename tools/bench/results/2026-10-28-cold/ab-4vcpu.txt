@@ -1,0 +1,4 @@
+tstep-anim-1 64.08 | Took 1m03s: building build scripts and proc macros 29.2s, compiling functions 14.3s, loading workspace 7.62s
+tstep-anim-2 63.57 | Took 1m03s: building build scripts and proc macros 28.6s, compiling functions 14.3s, loading workspace 7.90s
+tstep2-anim-1 62.32 | Took 1m02s: building build scripts and proc macros 29.1s, compiling functions 14.5s, loading workspace 7.91s
+tstep2-anim-2 62.29 | Took 1m02s: building build scripts and proc macros 28.5s, compiling functions 15.0s, loading workspace 8.05s

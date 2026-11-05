@@ -1,0 +1,25 @@
+{
+  "version": "23.1.4",
+  "repo": "https://github.com/indexable-inc/llvm",
+  "ref": "ix/23.x",
+  "commit": "e152d9fa2bc259b3f831769ba1e1b17cf71d45da",
+  "release": "https://github.com/indexable-inc/blaze/releases/download/llvm-23.1.4-e152d9fa2bc2",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "name": "blaze-llvm-23.1.4-e152d9fa2bc2-aarch64-apple-darwin-e95fc3b4bd332691.tar.xz",
+      "sha256": "e95fc3b4bd332691ec96b022850b5e5b8684b4a2060c05c31b481c31f0f1a866"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "name": "blaze-llvm-23.1.4-e152d9fa2bc2-aarch64-unknown-linux-gnu-918ef5bdb006b29b.tar.xz",
+      "sha256": "918ef5bdb006b29b96d8f87dbbbac422593c6abf916cb7ad9afed17672648087"
+    },
+    "x86_64-pc-windows-msvc": {
+      "name": "blaze-llvm-23.1.4-e152d9fa2bc2-x86_64-pc-windows-msvc-6f971a56baedd598.tar.xz",
+      "sha256": "6f971a56baedd598eb1654462b5bd6d9a3ef5c3a53566472d3e72f021d5f1085"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "name": "blaze-llvm-23.1.4-e152d9fa2bc2-x86_64-unknown-linux-gnu-11933c773079f254.tar.xz",
+      "sha256": "11933c773079f2543f4735ddfa42f7e870231669a62eeb2012077083cab73f73"
+    }
+  }
+}

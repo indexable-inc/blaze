@@ -1,0 +1,42 @@
+[package]
+name = "blaze-usercode"
+description = "blaze v2's user code: build scripts and proc macros in sandboxes that trace what they read, keyed by exactly that; wasm proc macros; a warm process pool; tests selected by the code they reach"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aho-corasick.workspace = true
+blaze-build-script.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-inproc = { workspace = true, features = ["host"] }
+blaze-items.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-vfs.workspace = true
+memchr.workspace = true
+postcard.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

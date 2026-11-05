@@ -1,0 +1,9 @@
+daemon: pid 445883, version 0.20261028.3-780eaea7-7dde190-18e2af1e6066c275, exits after 1800s idle, workers hold at most 8007 MB
+  worker: pid 445887, /root/tui/tmp/tmp.ZOTyZV7zQT/ripgrep/, holds 3088 MB, log /root/tui/tmp/tmp.ZOTyZV7zQT/home/workers/ebd18d46ae72c649/log
+    /root/tui/tmp/tmp.ZOTyZV7zQT/ripgrep: ready
+  build of /root/tui/tmp/tmp.ZOTyZV7zQT/ripgrep (last):
+    Building build scripts and proc macros
+   Compiling rg
+     Linking rg
+     Rebuilt 1 fn: search (crates/core/main.rs edited); 0.11s
+store: 260 MB, at most 32768 MB (`blaze cache gc` collects it), /root/tui/tmp/tmp.ZOTyZV7zQT/cache/blaze/store

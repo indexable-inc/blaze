@@ -1,0 +1,49 @@
+[package]
+name = "blaze-manifest"
+description = "Cargo.toml and .cargo/config.toml read as the pinned nightly's cargo reads them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+# The version cargo 1.99 renders its manifest diagnostics with, so that they read the same.
+annotate-snippets.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-resolve.workspace = true
+blaze-serde.workspace = true
+blaze-source.workspace = true
+cargo-platform.workspace = true
+# cargo 1.99's own schema of Cargo.toml, so that what deserializes and the messages of what does
+# not are cargo's: docs/resolve.md, "Decisions".
+cargo-util-schemas.workspace = true
+glob.workspace = true
+pathdiff.workspace = true
+semver.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde-untagged.workspace = true
+# The versions cargo 1.99 prints `cargo config get` with.
+shell-escape.workspace = true
+stdx.workspace = true
+toml_edit = { workspace = true, features = ["display"] }
+# `preserve_order`: `package.metadata` and `workspace.metadata` keep the manifest's order, as
+# cargo's do.
+toml = { workspace = true, features = ["preserve_order"] }
+url.workspace = true
+
+[dev-dependencies]
+dunce.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

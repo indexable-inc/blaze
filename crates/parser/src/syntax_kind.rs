@@ -1,0 +1,56 @@
+//! Defines [`SyntaxKind`] -- a fieldless enum of all possible syntactic
+//! constructs of the Rust language.
+
+#[rustfmt::skip]
+mod generated;
+pub(crate) mod keywords;
+#[allow(unsafe_code)]
+mod raw;
+
+use crate::Edition;
+
+#[allow(unreachable_pub)]
+pub use self::generated::SyntaxKind;
+
+impl From<SyntaxKind> for u16 {
+    #[inline]
+    fn from(k: SyntaxKind) -> u16 {
+        k as u16
+    }
+}
+
+impl SyntaxKind {
+    #[inline]
+    pub fn is_trivia(self) -> bool {
+        matches!(self, SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
+    }
+
+    /// Returns true if this is an identifier or a keyword.
+    #[inline]
+    pub fn is_any_identifier(self) -> bool {
+        // Assuming no edition removed keywords...
+        self == SyntaxKind::IDENT || self.is_keyword(Edition::LATEST)
+    }
+
+    #[inline]
+    pub fn is_l_delimiter(self) -> bool {
+        matches!(self, SyntaxKind::L_CURLY | Self::L_PAREN | Self::L_BRACK)
+    }
+
+    #[inline]
+    pub fn is_r_delimiter(self) -> bool {
+        matches!(self, SyntaxKind::R_CURLY | Self::R_PAREN | Self::R_BRACK)
+    }
+
+    #[inline]
+    pub fn is_delimiter(self) -> bool {
+        self.is_l_delimiter() || self.is_r_delimiter()
+    }
+
+    /// The text of every identifier [`SyntaxKind::from_keyword`] or
+    /// [`SyntaxKind::from_contextual_keyword`] gives a kind for in some edition: for tables
+    /// that recognize keywords by something other than their text.
+    pub fn keyword_texts() -> impl Iterator<Item = &'static str> {
+        keywords::texts()
+    }
+}

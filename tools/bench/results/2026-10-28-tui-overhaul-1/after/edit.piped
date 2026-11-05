@@ -1,0 +1,6 @@
+    Building build scripts and proc macros
+   Compiling rg
+     Linking rg
+     Rebuilt 1 fn: search (crates/core/main.rs edited); 0.11s
+   Compiling ripgrep v15.1.0 (/root/tui/tmp/tmp.BzJuEsbjKD/ripgrep)
+    Finished `dev` profile [blaze] target(s) in 0.12s

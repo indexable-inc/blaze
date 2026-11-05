@@ -1,0 +1,74 @@
+// Lesson 5: sharing work. The local store (docs/cache.md, "The disk store"), remotes and push/pull ("The remote"),
+// content addressing and signing ("Trust and signing"). CI doesn't fill a shared cache yet, and remote execution is
+// neither built nor planned (docs/remote-cache.md, "Non-goals").
+site {
+  learn {
+    sharing : Page {
+      Narrow
+      Lesson: {5, "One store for your own work, and a shared one for your team.", "store"}
+      (InTheme, themes.basics)
+      (Requires, site.learn.hermetic)
+      Title: {"Sharing work"}
+      Description: {"Lesson 5: blaze's store, sharing it with your team, and what's planned next."}
+
+      Step store("Your store") {
+        P holds("Everything blaze compiles goes into a **store** on your disk: compiled functions, macro expansions, build-script runs, the standard library and, if you opt in, test passes.")
+        P one("Every checkout of yours uses the same store.")
+      }
+
+      Step lookup("Look before you compile") {
+        P first("Each entry is filed under its key. Before compiling anything, blaze looks the key up: if it's in the store, the work is already done.")
+      }
+
+      Step branch("An old branch") {
+        Quiz q(prompt: "You switch back to a branch you built yesterday, with the same blaze, and nothing on it has changed since. What happens to its functions?") {
+          Choice again("It's compiled again, to be safe.", "Same inputs give the same key and the same result, so compiling again would only make the same thing.")
+          Choice found("Each is found in the store under the same key, and used as is.", "Each crate's source hashes the same as yesterday, so every key matches again and yesterday's results are used.") {
+            Right
+          }
+          Choice ask("blaze asks you which version to use.", "There's nothing to choose: the key says exactly which result fits.")
+        }
+      }
+
+      Step shared("A shared store") {
+        P where("A store can also live somewhere else: a shared folder, an S3 bucket or blaze's cache server. Pushing sends your entries there; pulling brings other people's back.")
+        Figure flow(piece: "share", label: "Your laptop builds and pushes to a shared store; a teammate's build of the same code finds the work there instead of compiling it.")
+        Dim auto("With `BLAZE_REMOTE` set, blaze pulls when it starts and pushes as it goes; no build waits on the network.")
+      }
+
+      Step teammate("A teammate's store") {
+        Quiz q(prompt: "A teammate pushed their work. You pull, then build the same commit with the same blaze. What happens?") {
+          Choice everything("blaze compiles everything again, because it was built on another machine.", "The machine isn't part of the key: the same blaze, target and source give the same key, and the same result.")
+          Choice edits("You also get their uncommitted edits.", "Keys come from inputs. Different source gives different keys, so their edits never match your code.")
+          Choice reuse("Their compiled functions come from the store, and only what's missing is compiled.", "Their results have the same keys as yours would, so they fit.") {
+            Right
+          }
+        }
+      }
+
+      Step trust("Names you can check") {
+        P named("The files a store sends are named by a hash of their bytes, so neither the store nor the network can swap them unnoticed. But anyone who can write to a shared store could add wrong code under real keys.")
+        Dim signed("To stop that, a shared store's manifests can be signed, and blaze can refuse any not signed by a key you trust.")
+      }
+
+      Step farm("Running work elsewhere") {
+        P goal("Sending long builds and test runs off to other machines is called **remote execution**. blaze doesn't do it.")
+        Art art(piece: "remote", label: "One block sends work along lines to a column of blocks, each works for a while and sends its result back, and the results stack up beside the first block.")
+        Dim planned("It isn't built or designed yet: the shared store comes first. blaze's own CI doesn't fill a shared store yet either.")
+      }
+
+      Step today("Which works today?") {
+        Quiz q(prompt: "Which of these can blaze do today?") {
+          Choice farm("Run your test suite on a farm of other machines.", "That's remote execution, which isn't built.")
+          Choice push("Push compiled work to a shared store, and pull it back.", "Push and pull work today, to a shared folder, an S3 bucket or blaze's cache server.") {
+            Right
+          }
+        }
+      }
+
+      Step next("Where to go next") {
+        P install("Installing is one line: `curl -fsSL https://ix.dev/blaze | sh`. [Install](/install) has the other ways in, [Usage](/usage) the day to day. The [course map](/) shows what you've done.")
+      }
+    }
+  }
+}

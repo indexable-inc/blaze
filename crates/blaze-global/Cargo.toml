@@ -1,0 +1,45 @@
+[package]
+name = "blaze-global"
+description = "blaze v2's global cache: values made only from public inputs (crates.io crates, std, sandboxed build scripts and proc macros, dependencies' front-end results, their functions' code) computed once by blaze's builders, signed, and fetched by any machine over HTTPS, verified by signature and content hash before the store keeps them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-diagnostics.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
+blaze-usercode.workspace = true
+hir-ty.workspace = true
+hir-ty-borrowck.workspace = true
+memchr.workspace = true
+ring = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+toml.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[features]
+default = ["net"]
+# The cache over the network: client, server, TLS (rustls on ring) and Ed25519 signatures.
+# Without it (the seed profile) only `public`, what may be published, is built.
+net = ["dep:ring", "dep:rustls", "dep:rustls-native-certs"]
+
+[lints]
+workspace = true

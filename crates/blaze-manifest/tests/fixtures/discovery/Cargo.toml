@@ -1,0 +1,5 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/skip"]
+default-members = ["crates/app"]
+resolver = "3"

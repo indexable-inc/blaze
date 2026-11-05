@@ -1,0 +1,50 @@
+use crate::transform::TransformCtx;
+use crate::transform::ctx::{BodyTransformCtx, UllbcPass};
+use crate::ullbc_ast::*;
+
+pub struct Transform;
+impl UllbcPass for Transform {
+    fn transform_function(&self, ctx: &mut TransformCtx, decl: &mut FunDecl) {
+        decl.transform_ullbc_terminators(ctx, |ctx, term| {
+            let TerminatorKind::Call { call, dest, target, .. } = &term.kind else {
+                return;
+            };
+            let FnOperand::Regular(fn_ptr) = &call.func else {
+                return;
+            };
+            let FnPtrKind::Fun(fun_id) = fn_ptr.kind.as_ref() else {
+                return;
+            };
+            let Some(fun_decl) = ctx.ctx.translated.fun_decls.get(*fun_id) else {
+                return;
+            };
+            if fun_decl.item_meta.lang_item.as_ref() == Some(&from_rustc::LangItem::OffsetOf)
+                && let generics = fn_ptr.pre_mono_generics(&ctx.ctx.translated)
+                && let Some(ty) = generics.types.get(TypeVarId::ZERO)
+                && let TyKind::Adt(tref) = ty.kind()
+                && let [Operand::Const(arg0), Operand::Const(arg1)] = call.args.as_slice()
+                && let ConstantExprKind::Integer(IntegerValue::Unsigned(UIntTy::U32, variant_id)) =
+                    arg0.kind()
+                && let ConstantExprKind::Integer(IntegerValue::Unsigned(UIntTy::U32, field_id)) =
+                    arg1.kind()
+                && let Some(tdecl) = ctx.ctx.translated.type_decls.get(tref.id)
+            {
+                let variant_id = if tdecl.kind.is_enum() {
+                    Some(VariantId::from_usize(*variant_id as usize))
+                } else {
+                    None
+                };
+                let field_id = FieldId::from_usize(*field_id as usize);
+                let constant = ConstantExpr::new(
+                    ConstantExprKind::OffsetOf(tref.clone(), variant_id, field_id),
+                    Ty::mk_usize(),
+                );
+                ctx.insert_assn_stmt(
+                    dest.clone(),
+                    Rvalue::Use(Operand::Const(constant), WithRetag::No),
+                );
+                term.kind = TerminatorKind::Goto { target: *target };
+            }
+        });
+    }
+}

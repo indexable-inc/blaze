@@ -1,0 +1,13 @@
+[package]
+name = "real"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+semver = "1"
+heck = "0.5"
+itoa = "1"
+hex = "0.4"
+httparse = "1"
+
+[workspace]

@@ -1,0 +1,21 @@
+// A page that is right: no errors.
+site {
+  demo_good : Doc {
+    Title: {text: "Charter"}
+    Lede intro("What blaze is for, after [[zig_016]].")
+    P why(text: "Because [the release notes][zig_016] say so.")
+    Ul list {
+      Li one("first")
+      Li two("second")
+    }
+    Img logo("/logo.svg", "logo", 32, 32)
+  }
+  demo_rfcs : Page {
+    io : Rfc {
+      Title: {text: "I/O as a value"}
+      (DependsOn, site.demo_good)
+      (Cites, refs.kelley_io)
+      P a("Pass the Io in.")
+    }
+  }
+}

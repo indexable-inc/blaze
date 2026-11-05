@@ -1,0 +1,64 @@
+    10.46%     0.00%  [.] _start
+    10.41%     0.00%  [.] __libc_start_main@@GLIBC_2.34
+    10.30%     0.00%  [.] main
+    10.30%     0.00%  [.] __libc_start_call_main
+    10.30%     0.00%  [.] std::rt::lang_start_internal
+    10.26%     0.00%  [.] std::rt::lang_start::<core::result::Result<(), anyhow::Error>>::{closure#0}
+    10.25%     0.00%  [.] std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> core::result::Result<(), anyhow::Error>, core::result::Result<(), anyhow::Error>>
+    10.24%     0.00%  [.] blaze::main
+     9.10%     0.00%  [.] blaze::cargo::command::<core::iter::adapters::skip::Skip<std::env::Args>>
+     6.61%     0.00%  [.] blaze::cargo::whole::planned
+     6.53%     0.00%  [.] blaze::cargo::metadata::programs
+     5.98%     0.00%  [.] blaze_metadata::programs
+     5.69%     0.00%  [.] blaze_metadata::made
+     4.47%     0.00%  [.] el0t_64_sync
+     4.47%     0.00%  [.] el0t_64_sync_handler
+     3.11%     0.10%  [.] el0_svc
+     3.01%     0.01%  [.] do_el0_svc
+     2.97%     0.02%  [.] invoke_syscall.constprop.0
+     2.58%     0.00%  [.] blaze_metadata::fetch
+     2.44%     0.00%  [.] blaze_manifest::manifest::read_manifest
+     1.81%     0.00%  [.] blaze::cargo::state::rustc_says
+     1.80%     0.00%  [.] blaze::answers::answer
+     1.80%     0.00%  [.] blaze::answers::own_answer
+     1.77%     0.00%  [.] blaze::answers::own::answer
+     1.34%     0.01%  [.] start_thread
+     1.34%     0.00%  [.] thread_start
+     1.30%     0.00%  [.] toml::de::from_str::<cargo_util_schemas::manifest::TomlManifest>
+     1.30%     0.00%  [.] do_mem_abort
+     1.29%     0.02%  [.] do_page_fault
+     1.28%     0.00%  [.] blaze::cargo::toolchain::settle
+     1.20%     0.02%  [.] handle_mm_fault
+     1.20%     0.00%  [.] do_translation_fault
+     1.19%     0.00%  [.] <std::sys::sync::once::futex::Once>::call
+     1.18%     0.02%  [.] __handle_mm_fault
+     1.07%     0.00%  [.] blaze::run_holding
+     1.04%     0.00%  [.] _start
+     1.04%     0.01%  [.] std::sys::fs::metadata
+     1.04%     0.00%  [.] _dl_start
+     1.03%     0.00%  [.] std::sys::fs::unix::try_statx
+     1.03%     0.00%  [.] _dl_sysdep_start
+     1.02%     0.00%  [.] dl_main
+     1.02%     0.03%  [.] statx
+     1.02%     0.07%  [.] el0_da
+     1.02%     0.01%  [.] <std::sys::thread::unix::Thread>::new::thread_start
+     0.98%     0.00%  [.] <blaze_manifest::workspace::Workspace>::new
+     0.97%     0.00%  [.] <toml::map::Map<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>, serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>>>::parse
+     0.97%     0.00%  [.] toml::de::parser::parse_document
+     0.93%     0.00%  [.] <toml::de::deserializer::Deserializer>::parse
+     0.92%     0.01%  [.] __arm64_sys_statx
+     0.90%     0.31%  [.] _dl_relocate_object_no_relro
+     0.90%     0.00%  [.] _dl_relocate_object
+     0.85%     0.00%  [.] <blaze::Checkouts>::stale
+     0.84%     0.01%  [.] blaze::inputs::stamp_into
+     0.84%     0.00%  [.] <blaze::inputs::Inputs>::stale
+     0.83%     0.00%  [.] do_fault
+     0.82%     0.00%  [.] <alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::iter::adapters::filter::Filter<core::ops::range::Range<usize>, <blaze::inputs::Scripts>::changed::{closure#0}>>>::from_iter
+     0.81%     0.01%  [.] do_statx
+     0.80%     0.00%  [.] blaze_resolve::workspace_resolve::resolve_ws::<blaze_resolve::registry::MemRegistry>
+     0.79%     0.01%  [.] blaze_resolve::workspace_resolve::resolve_with_previous::<blaze_resolve::registry::MemRegistry>
+     0.78%     0.00%  [.] <blaze_manifest::workspace::Workspace>::load
+     0.76%     0.00%  [.] blaze::cargo::metadata::no_deps
+     0.76%     0.75%  [.] <core::str::pattern::StrSearcher as core::str::pattern::Searcher>::next_match
+     0.74%     0.00%  [.] vfs_statx
+     0.71%     0.00%  [.] blaze_resolve::resolver::resolve::<blaze_resolve::workspace_resolve::PackageRegistry<blaze_resolve::registry::MemRegistry>>

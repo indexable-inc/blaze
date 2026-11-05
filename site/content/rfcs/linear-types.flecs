@@ -1,0 +1,99 @@
+// RFC 0002: linear and affine types.
+site {
+  rfcs {
+    "linear-types" : Rfc {
+      Title: {"Values that must be used"}
+      Description: {"Types that cannot be forgotten or silently dropped, following Rust's 2026 Move/Destruct/Forget goal, in the new edition."}
+      Number: {2}
+      (DependsOn, site.charter)
+      (DependsOn, site.rfcs.capabilities)
+
+      Lede summary("Every Rust value today can be dropped without a word and leaked with `mem::forget`, safely. In the new edition, a type can opt out: a transaction that must be committed or rolled back, a task handle that must be joined, an effect that must be handled. We follow the Rust 2026 goal's design and names, so this can go back upstream.") {
+        (Cites, refs.move_goal)
+      }
+
+      Section status_quo(title: "Where Rust is") {
+        P affine("Rust's types are affine: a value is used at most once. Nothing makes you use it at least once. Drop runs at the end of scope, but `mem::forget`, `Box::leak` and reference cycles can skip it, and all of them are safe.")
+        P leakpocalypse("That was decided in 2015, when a reference cycle through `Rc` let a scoped thread outlive its borrows (`JoinGuard`). Making leaks safe was the fix; guaranteed destructors went away with it.") { (Cites, refs.joinguard); (Cites, refs.niko_leaks) }
+        P workaround("Since then, APIs that must run cleanup keep ownership themselves: `thread::scope(|s| ...)` never hands the scope out. That works for sync code. It does not work for `async`, where the future is a value the caller can forget.") { (Cites, refs.niko_mdl) }
+      }
+
+      Section proposal(title: "Proposal") {
+        P adopt("Adopt the hierarchy from the Rust 2026 project goal and Niko Matsakis's design, unchanged, in the new edition:") { (Cites, refs.move_goal); (Cites, refs.niko_mdl) }
+        Code traits(lang: "rust", text: `trait Forget: Destruct \{}  // can be forgotten: mem::forget, Box::leak
+        trait Destruct: Move \{}    // can be dropped implicitly at end of scope
+        trait Move: Pointee \{}     // can be moved
+        trait Pointee \{}           // any value`)
+        P defaults("Every generic parameter keeps a default `Forget` bound, so every existing signature means what it means today. Writing a weaker bound opts out of the default, the way RFC 3729 does for `Sized`: `T: Destruct` accepts values that may not be forgotten, `T: Move` accepts values that must be consumed explicitly.") { (Cites, refs.rfc_sized) }
+        P checks("The borrow checker enforces it: a value going out of scope needs `Destruct`, a moved value needs `Move`, and `mem::forget` asks for `Forget`. blaze has its own borrow checker, so it can implement and test this now, on real code, without waiting for rustc.") { (Cites, refs.borrowck) }
+        Code transaction(lang: "rust", text: `struct Transaction \{ /* ... */ }
+        impl !Forget for Transaction \{}
+        impl !Destruct for Transaction \{}   // must call commit or rollback
+
+        impl Transaction \{
+            fn commit(self) -> Result<(), Error> \{ /* ... */ }
+            fn rollback(self) \{ /* ... */ }
+        }
+
+        fn transfer(db: &Db) -> Result<(), Error> / Db \{
+            let tx = db.begin();
+            tx.debit(a, 10)?;   // error: \`tx\` is dropped on this path
+            tx.commit()
+        }`)
+        P names("Names, syntax and the order of the traits follow upstream. Where upstream changes, this RFC changes with it.")
+      }
+
+      Section why(title: "Why blaze wants it") {
+        Ul list {
+          Li scoped("**Scoped async tasks** that borrow from the stack: the handle cannot be forgotten, so the join is guaranteed.")
+          Li effects("**Effects that must be handled.** With [capabilities](/rfcs/capabilities), a pending write or an open connection can be a value that has to be finished or explicitly abandoned, not silently dropped.")
+          Li resources("**GPU, DMA and FFI resources** whose cleanup must run, or must run with arguments.")
+          Li reuse("**In-place updates in pure code.** A value the compiler knows is unique can be updated in place by a pure function, which makes pure, cacheable code cheaper.") { (Cites, refs.perceus) }
+        }
+      }
+
+      Section prior(title: "Prior art") {
+        Ul list {
+          Li upstream("[[move_goal]], [[move_tracking]], [[niko_mdl]]: the design this RFC adopts.")
+          Li rfcs("[[rfc_linear]], [[rfc_forget]], [[rfc_forgettable]], [[rfc_sized]]: the RFCs around it.")
+          Li writing("[[yosh_linear]], [[unleakable]], [[gankra_linear]], [[boats_rules]]: why it is hard and how editions can carry it.")
+          Li history("[[joinguard]], [[niko_leaks]]: how Rust got here.")
+          Li langs("[[austral]] (linear types and capabilities together), [[ghc_linear]], [[perceus]].")
+        }
+      }
+
+      Section issues(title: "Open issues") {
+        Issue unwinding(title: "Panics and unwinding") {
+          (Status, Open)
+          P q("A panic between creating a `!Destruct` value and consuming it would drop it. Either such functions must not panic (pressure to track panics, see RFC 0001), or unwinding gets a separate cleanup path, or `!Destruct` code requires `panic = abort`.")
+        }
+        Issue cycles(title: "Rc and Arc cycles") {
+          (Status, Open)
+          P q("A cycle leaks without calling `forget`. `Rc<T>` and `Arc<T>` need `T: Forget`, or something weaker that still rules out cycles.")
+        }
+        Issue std_bounds(title: "Which std bounds to weaken") {
+          (Status, Open)
+          P q("`Vec`, `Option`, `Box` and channels should accept `!Forget` values, but every container that can leak (a `Vec` you `mem::forget`) has to be checked. Upstream's goal does this work; we take its answers.")
+        }
+        Issue editions(title: "Old-edition generics") {
+          (Status, Open)
+          P q("Generic code in editions 2015 to 2024 assumes `Forget` everywhere. A `!Forget` type can only be passed to it if it does not actually forget; the default bound stays, so it cannot, and old crates are not usable with these types until they relax their bounds.")
+        }
+        Issue closures(title: "Closures and captures") {
+          (Status, Open)
+          P q("A closure that captures a `!Destruct` value is itself `!Destruct`, and an `FnMut` that may run zero times cannot consume it. How do `Fn` traits carry these bounds?")
+        }
+        Issue futures(title: "Futures and cancellation") {
+          (Status, Open)
+          P q("Dropping a future cancels it. A `!Destruct` future cannot be cancelled by drop. That is the point for scoped tasks, but executors and `select!` assume they can drop futures. Upstream leaves the `Future` trait out of scope for now.")
+        }
+        Issue cache(title: "The function cache") {
+          (Status, Open)
+          P q("A cached call returns a stored copy of its result. A `!Forget` or `!Destruct` result cannot be duplicated or cached; the [[fn_cache]] has to refuse such functions.")
+        }
+      }
+
+      References refs
+    }
+  }
+}

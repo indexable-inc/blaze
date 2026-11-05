@@ -1,0 +1,16 @@
+//@ dbsp-edits 1
+// One impl added at a time, in the file's own module, an inline module and a file module, of a
+// trait defined beside it and of one defined elsewhere: each `add_impl` step is held to design
+// section 10's cost (each maintainer one op, at most two slices, nothing in another crate).
+add_trait(top, DbspT1);
+add_struct(top, DbspS1);
+add_impl(top, DbspT1, DbspS1); // keep
+add_mod(dbsp_m1, inline);
+add_struct(dbsp_m1, DbspS2);
+add_impl(dbsp_m1, DbspT1, DbspS2); // keep
+add_mod(dbsp_m2, file);
+add_trait(dbsp_m2, DbspT2);
+add_impl(dbsp_m2, DbspT2, DbspS1); // keep
+add_impl(top, DbspT2, DbspS2); // keep
+remove_impl(top, DbspT1, DbspS1); // keep
+add_impl(top, DbspT1, DbspS1); // keep

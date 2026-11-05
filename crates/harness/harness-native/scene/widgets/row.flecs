@@ -1,0 +1,56 @@
+// The Row interface every row template implements, and the tree rows' hanging disclosure. Templates and fns only: in
+// flecs 4.2.0 a `fn` or `template` after a prefab in the same script aborts the load (flecs_ordered_entities_append),
+// so prefabs live in other files.
+using flecs.script
+
+// A tree row's left padding: in by its depth, its icon at the section label's edge at depth 0.
+fn indent(depth: i32, pad: f64, step: f64) -> f64 {
+  pad + depth * step
+}
+
+@tree ChildOf
+hn {
+  // The interface every row of a list shares: the object it stands for (its entity id: the row's actions name it), its
+  // name on one line, whether it is the selection, how deep it sits, and whether it has rows under it and they show.
+  struct Row(obj: u64, name: string, selected: bool, depth: i32, kids: bool, open: bool)
+
+
+  // A tree row's hanging disclosure, Finder's: a layer over the whole row (out of its flow), padded so its slot ends at
+  // the row's icon (negative at depth 0, where the chevron hangs in the sidebar's margin). With rows under the row it is a
+  // chevron that folds them (turned open or not; on the row's hover, or always while folded), its hit target the full
+  // slot; else an empty slot, and no hit target (the row takes the press). Its click is script (flecs.script.input):
+  // `hn.act` hands the host the toggle, with Option for every sibling.
+  @tree ChildOf
+  template Hang : Row {
+    (IsA, ui.Row)
+    Overlay
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Padding: {l: indent($depth, $row_pad, $indent_step) - $disclose_w, r: 0, t: 0, b: 0}
+    disclose : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 0, b: 0}
+      if $kids {
+        Pressable
+        Hoverable
+        Focusable
+      }
+      icon : ui.Symbol, Faint {
+        Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+        if $kids {
+          Icon: {glyph: ""}
+          Disclose: {open: $open}
+          HoverShow: {row: 0, keep: !$open}
+        } else {
+          Icon: {glyph: ""}
+        }
+      }
+      async {
+        while true {
+          const e = await on.click(this)
+          await hn.act("toggle:{obj}", e.alt)
+        }
+      }
+    }
+  }
+}

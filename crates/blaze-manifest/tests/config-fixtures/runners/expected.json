@@ -1,0 +1,121 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "registry.credential-provider = [\"cargo:token\", \"cargo:libsecret\"]\ntarget.aarch64-apple-darwin.runner = [\"inner\"]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\"\ntarget.x86_64-unknown-linux-gnu.rustflags = [\"-Couter\", \"-Cinner\"]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "registry.credential-provider = [\n    \"cargo:token\", # $ROOT/.cargo/config.toml\n    \"cargo:libsecret\", # $ROOT/a/.cargo/config.toml\n]\ntarget.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\" # $ROOT/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n\n# $ROOT/a/.cargo/config.toml\nregistry.credential-provider = [\"cargo:libsecret\"]\ntarget.aarch64-apple-darwin.runner = [\"inner\"]\ntarget.x86_64-unknown-linux-gnu.rustflags = [\"-Cinner\"]\n\n# $ROOT/.cargo/config.toml\nregistry.credential-provider = [\"cargo:token\"]\ntarget.aarch64-apple-darwin.runner = [\"outer\", \"-x\"]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\"\ntarget.x86_64-unknown-linux-gnu.rustflags = [\"-Couter\"]\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n\n# $ROOT/a/.cargo/config.toml\nregistry.credential-provider = [\n    \"cargo:libsecret\", # $ROOT/a/.cargo/config.toml\n]\ntarget.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n]\n\n# $ROOT/.cargo/config.toml\nregistry.credential-provider = [\n    \"cargo:token\", # $ROOT/.cargo/config.toml\n]\ntarget.aarch64-apple-darwin.runner = [\n    \"outer\", # $ROOT/.cargo/config.toml\n    \"-x\", # $ROOT/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\" # $ROOT/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n]\n\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:token\",\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\nCARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:token\",\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
+  "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\nCARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ },
+ {
+  "args": [
+   "target",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "target.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\" # $ROOT/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n]\n# The following environment variables may affect the loaded values.\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "target.aarch64-apple-darwin.runner",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "target.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "target.x86_64-unknown-linux-gnu.rustflags",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "target.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n    \"-Cenv1\", # environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`\n    \"-Cenv2\", # environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "registry.credential-provider",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "registry.credential-provider = [\n    \"cargo:wincred\", # environment variable `CARGO_REGISTRY_CREDENTIAL_PROVIDER`\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "target.aarch64-apple-darwin.runner=[\"cli\"]",
+   "target.aarch64-apple-darwin.runner",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "target.aarch64-apple-darwin.runner = [\n    \"cli\", # --config cli option\n]\n",
+  "stderr": ""
+ },
+ {
+  "args": [
+   "--config",
+   "registry.credential-provider=[\"cli\"]",
+   "registry",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "registry.credential-provider = [\n    \"cli\", # --config cli option\n]\n# The following environment variables may affect the loaded values.\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n",
+  "stderr": ""
+ }
+]

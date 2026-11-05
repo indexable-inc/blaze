@@ -1,0 +1,8 @@
+fn run(vm: &Vm) {
+    let control = Control {
+        block_stop: vm.device_manager().pci_devices.iter().map(|s| s.x()).collect(),
+        memory_handle: vm.memory_handle().cloned(),
+        balloons: vm.device_manager().balloon_counter_handles(),
+    };
+    call(self.state.lock().a, self.state.lock().b);
+}

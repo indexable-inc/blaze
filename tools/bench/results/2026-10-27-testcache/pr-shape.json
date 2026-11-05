@@ -1,0 +1,378 @@
+{
+ "ripgrep": {
+  "edit": "crates/matcher/src/lib.rs: pub fn len(&self) -> usize {",
+  "main": {
+   "code": 101,
+   "secs": 16.2,
+   "ran": 443,
+   "failed": 320,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 101,
+   "secs": 13.2,
+   "ran": 443,
+   "failed": 320,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 101,
+   "secs": 18.9,
+   "ran": 320,
+   "failed": 320,
+   "cached": 123,
+   "cached_from": [
+    "main of ripgrep"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 101,
+   "secs": 18.9,
+   "ran": 443,
+   "failed": 320,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "123",
+     "123"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "fd": {
+  "edit": "src/dir_entry.rs: pub fn path(&self) -> &Path {",
+  "main": {
+   "code": 101,
+   "secs": 57.0,
+   "ran": 237,
+   "failed": 99,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 101,
+   "secs": 43.0,
+   "ran": 237,
+   "failed": 99,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 101,
+   "secs": 47.3,
+   "ran": 99,
+   "failed": 99,
+   "cached": 138,
+   "cached_from": [
+    "main of fd"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 101,
+   "secs": 48.8,
+   "ran": 237,
+   "failed": 99,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "138",
+     "138"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "just": {
+  "edit": "src/lexer.rs:   fn lexeme(&self) -> &'src str {",
+  "main": {
+   "code": 101,
+   "secs": 55.1,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 101,
+   "secs": 32.8,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 101,
+   "secs": 44.3,
+   "ran": 1272,
+   "failed": 928,
+   "cached": 171,
+   "cached_from": [
+    "main of just"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 101,
+   "secs": 44.0,
+   "ran": 1443,
+   "failed": 928,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "515",
+     "515"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "hyperfine": {
+  "edit": "src/command.rs: pub fn get_command_line(&self) -> String {",
+  "main": {
+   "code": 101,
+   "secs": 52.7,
+   "ran": 105,
+   "failed": 54,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 101,
+   "secs": 23.0,
+   "ran": 105,
+   "failed": 54,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 101,
+   "secs": 36.8,
+   "ran": 62,
+   "failed": 54,
+   "cached": 43,
+   "cached_from": [
+    "main of hyperfine"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 101,
+   "secs": 29.5,
+   "ran": 105,
+   "failed": 54,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "51",
+     "51"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "axum": {
+  "edit": "axum-core/src/body.rs: pub fn empty() -> Self {",
+  "main": {
+   "code": 0,
+   "secs": 22.6,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 0,
+   "secs": 13.1,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 0,
+   "secs": 20.6,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 0,
+   "secs": 20.7,
+   "ran": 6,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "6",
+     "6"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "cargo": {
+  "edit": "crates/cargo-util/src/paths.rs: pub fn normalize_path(path: &Path) -> PathBuf {",
+  "main": {
+   "code": 0,
+   "secs": 7.1,
+   "ran": 8,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 0,
+   "secs": 4.8,
+   "ran": 8,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 0,
+   "secs": 5.2,
+   "ran": 0,
+   "failed": 0,
+   "cached": 8,
+   "cached_from": [
+    "main of cargo"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 0,
+   "secs": 5.4,
+   "ran": 8,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "8",
+     "8"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ },
+ "nushell": {
+  "edit": "crates/nu-path/src/components.rs: pub fn components(path: &Path) -> impl Iterator<Item = Component<'_>> {",
+  "main": {
+   "code": 0,
+   "secs": 27.4,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr all": {
+   "code": 0,
+   "secs": 17.2,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr affected": {
+   "code": 0,
+   "secs": 21.3,
+   "ran": 42,
+   "failed": 0,
+   "cached": 25,
+   "cached_from": [
+    "main of nushell"
+   ],
+   "verified": [],
+   "denied": 0,
+   "served": false
+  },
+  "pr verify": {
+   "code": 0,
+   "secs": 23.4,
+   "ran": 67,
+   "failed": 0,
+   "cached": 0,
+   "cached_from": [],
+   "verified": [
+    [
+     "67",
+     "67"
+    ]
+   ],
+   "denied": 0,
+   "served": false
+  }
+ }
+}

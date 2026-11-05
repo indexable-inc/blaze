@@ -1,0 +1,9 @@
+# blaze-gateway blob store from rcache-worker (aarch64), private tenant (HMAC path), 2026-10-27T11:18Z
+metric	value	unit	n	detail
+put_4KiB_blobs	6.421	MiB/s	1	21250 blobs, 31.0 MiB stream, 4.82 s, time to first byte 4.82 s
+put_small_blobs	3.883	MiB/s	1	20000 blobs, 9.5 MiB stream, 2.45 s, time to first byte 2.45 s
+get_1stream	12.677	MiB/s	3	29.1 MiB answer of 20000 blobs, first byte 1.43 s (D1 814 ms); runs 12.7, 13.9, 12.5
+get_16parallel	18.447	MiB/s	3	16 /get of 1.9 MiB; runs 18.4, 21.2, 7.5
+has_1_p50	51.323	ms	30	first byte after TLS, new connection; D1 22 ms of it
+has_1000_p50	126.823	ms	10	first byte after TLS, new connection; D1 84 ms of it
+has_20000_p50	1144.687	ms	10	first byte after TLS, new connection; D1 780 ms of it

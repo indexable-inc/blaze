@@ -1,0 +1,1066 @@
+{
+ "toolchain": "1.99.0",
+ "machine": "aarch64",
+ "cores": 96,
+ "runs": 3,
+ "cold_runs": 1,
+ "commit": "ac1ee2dd682b7d321ba75a67924aaf95609572f0",
+ "date": "2026-10-23T08:43:38Z",
+ "host": {
+  "name": "AWS c8g.24xlarge (dev-aws-eph-blaze-arm64bun), pinned to 16 cores with taskset",
+  "cpu": "Neoverse-V2",
+  "cores": 16,
+  "machine_cores": 96,
+  "load": "6.9, 5.2, 3.0",
+  "memory_gib": 185,
+  "os": "Linux",
+  "arch": "aarch64",
+  "kernel": "6.18.53",
+  "rustc": "rustc 1.100.0-nightly (574ff7d98 2026-09-14)",
+  "cc": "gcc (GCC) 16.2.0",
+  "ld": "GNU ld (GNU Binutils) 2.46",
+  "llvm": "23.1.3",
+  "incremental": "profile default (on for dev)",
+  "wrapper": null,
+  "linker": "the toolchain's default (cc)",
+  "library_dirs": 88
+ },
+ "backends": {
+  "cranelift": {
+   "BLAZE_BACKEND": "cranelift"
+  },
+  "llvm": {
+   "BLAZE_BACKEND": "llvm",
+   "BLAZE_OPT": "2",
+   "BLAZE_EMIT": "fast"
+  }
+ },
+ "setups": {},
+ "results": {
+  "bun/cranelift": {
+   "phases": {
+    "cold": {
+     "wall_s": 91.443,
+     "cargo_s": 89.033,
+     "rss_mb": 36189,
+     "built": "cargo",
+     "build_s": 87.684,
+     "warm_s": 3.759,
+     "samples_s": [
+      91.443
+     ],
+     "cargo_samples_s": [
+      89.033
+     ],
+     "build_samples_s": [
+      87.684
+     ],
+     "setups": {},
+     "compiled": 0,
+     "steps_s": {
+      "load": 84.9,
+      "resolve": 2.1
+     },
+     "threads_s": {},
+     "started_over": [],
+     "memory": {
+      "blaze": {
+       "peak_mb": 15837,
+       "peak_max_mb": 15837,
+       "largest_mb": 12245,
+       "resident_mb": 12309
+      },
+      "cargo": {
+       "peak_mb": 4499,
+       "peak_max_mb": 4499,
+       "largest_mb": 3241
+      }
+     },
+     "disk_mb": {
+      "target": 6565,
+      "store": 88,
+      "home": 1,
+      "cargo target": 5060
+     },
+     "warm_store_build_s": 87.493,
+     "warm_store_s": 90.717,
+     "warm_store_samples_s": [
+      90.717
+     ],
+     "warm_store_memory": {
+      "peak_mb": 15925,
+      "resident_mb": 12186
+     }
+    },
+    "no-op": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27689,
+       "peak_max_mb": 28275,
+       "largest_mb": 27561,
+       "resident_mb": 27662
+      },
+      "cargo": {
+       "peak_mb": 60,
+       "peak_max_mb": 60,
+       "largest_mb": 60
+      }
+     },
+     "wall_s": 0.021,
+     "cargo_s": 0.09,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "compiled": 0,
+     "samples_s": [
+      0.022,
+      0.021,
+      0.021
+     ],
+     "cargo_samples_s": [
+      0.09,
+      0.09,
+      0.09
+     ],
+     "setups": {}
+    },
+    "body": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27716,
+       "peak_max_mb": 27719,
+       "largest_mb": 27594,
+       "resident_mb": 27687
+      },
+      "cargo": {
+       "peak_mb": 3524,
+       "peak_max_mb": 3528,
+       "largest_mb": 3241
+      }
+     },
+     "wall_s": 0.486,
+     "cargo_s": 10.632,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 1,
+     "places": 1,
+     "steps_ms": {
+      "settle": 0.54,
+      "read": 11.34,
+      "apply": 45.72,
+      "roots": 6.06,
+      "check": 163.56,
+      "reach": 2.36,
+      "resolve": 0.06,
+      "define": 0.0,
+      "object": 0.16,
+      "discarded": 0.0,
+      "statics": 2.9,
+      "setup": 0.52,
+      "compile-rest": 2.87,
+      "write": 191.27,
+      "build-rest": 36.62,
+      "report": 3.69,
+      "refuse": 5.06,
+      "link": 2.65
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.0
+     },
+     "started_over": [],
+     "slowest_s": 0.497,
+     "back_s": 0.485,
+     "back_cargo_s": 10.632,
+     "back_link": "spliced",
+     "samples_s": [
+      0.497,
+      0.483,
+      0.486
+     ],
+     "cargo_samples_s": [
+      10.647,
+      10.632,
+      10.591
+     ],
+     "setups": {}
+    },
+    "signature": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27734,
+       "peak_max_mb": 27735,
+       "largest_mb": 27608,
+       "resident_mb": 27695
+      },
+      "cargo": {
+       "peak_mb": 3522,
+       "peak_max_mb": 3526,
+       "largest_mb": 3239
+      }
+     },
+     "wall_s": 0.629,
+     "cargo_s": 10.674,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 3,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.58,
+      "read": 10.47,
+      "apply": 43.64,
+      "roots": 154.16,
+      "check": 234.56,
+      "reach": 2.29,
+      "resolve": 0.69,
+      "define": 0.03,
+      "object": 2.9,
+      "discarded": 0.0,
+      "statics": 2.84,
+      "setup": 0.53,
+      "compile-rest": 14.53,
+      "write": 188.7,
+      "build-rest": 36.4,
+      "report": 3.65,
+      "refuse": 4.21,
+      "link": 2.29
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.006,
+      "monomorphize": 0.0,
+      "translate": 0.006,
+      "describe": 0.014,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.008
+     },
+     "started_over": [],
+     "slowest_s": 0.725,
+     "back_s": 0.613,
+     "back_cargo_s": 10.66,
+     "back_link": "spliced",
+     "samples_s": [
+      0.725,
+      0.611,
+      0.629
+     ],
+     "cargo_samples_s": [
+      10.681,
+      10.659,
+      10.674
+     ],
+     "setups": {}
+    },
+    "leaf": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27720,
+       "peak_max_mb": 27731,
+       "largest_mb": 27606,
+       "resident_mb": 27696
+      },
+      "cargo": {
+       "peak_mb": 3560,
+       "peak_max_mb": 3562,
+       "largest_mb": 3245
+      }
+     },
+     "wall_s": 0.477,
+     "cargo_s": 19.636,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 1,
+     "places": 1,
+     "steps_ms": {
+      "settle": 1.96,
+      "read": 3.62,
+      "apply": 4.84,
+      "roots": 5.91,
+      "check": 142.44,
+      "reach": 2.5,
+      "resolve": 0.28,
+      "define": 0.04,
+      "object": 0.27,
+      "discarded": 0.0,
+      "statics": 2.97,
+      "setup": 0.52,
+      "compile-rest": 3.69,
+      "write": 242.24,
+      "build-rest": 36.35,
+      "report": 3.67,
+      "refuse": 3.45,
+      "link": 4.3
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.0
+     },
+     "started_over": [],
+     "slowest_s": 0.48,
+     "back_s": 0.473,
+     "back_cargo_s": 19.638,
+     "back_link": "spliced",
+     "samples_s": [
+      0.48,
+      0.477,
+      0.477
+     ],
+     "cargo_samples_s": [
+      19.631,
+      19.636,
+      19.664
+     ],
+     "setups": {}
+    },
+    "generic": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27716,
+       "peak_max_mb": 27728,
+       "largest_mb": 27600,
+       "resident_mb": 27687
+      },
+      "cargo": {
+       "peak_mb": 3552,
+       "peak_max_mb": 3552,
+       "largest_mb": 3247
+      }
+     },
+     "wall_s": 0.503,
+     "cargo_s": 19.973,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 14,
+     "places": 1,
+     "steps_ms": {
+      "settle": 2.29,
+      "read": 6.47,
+      "apply": 9.68,
+      "roots": 6.0,
+      "check": 144.53,
+      "reach": 10.25,
+      "resolve": 0.85,
+      "define": 0.48,
+      "object": 4.77,
+      "discarded": 0.0,
+      "statics": 2.93,
+      "setup": 0.5,
+      "compile-rest": 5.41,
+      "write": 241.48,
+      "build-rest": 36.53,
+      "report": 3.7,
+      "refuse": 4.35,
+      "link": 5.22
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.072,
+      "describe": 0.005,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.003
+     },
+     "started_over": [],
+     "slowest_s": 0.508,
+     "back_s": 0.484,
+     "back_cargo_s": 19.878,
+     "back_link": "spliced",
+     "samples_s": [
+      0.508,
+      0.501,
+      0.503
+     ],
+     "cargo_samples_s": [
+      20.033,
+      19.957,
+      19.973
+     ],
+     "setups": {}
+    },
+    "newfn": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27735,
+       "peak_max_mb": 27738,
+       "largest_mb": 27616,
+       "resident_mb": 27717
+      },
+      "cargo": {
+       "peak_mb": 3526,
+       "peak_max_mb": 3528,
+       "largest_mb": 3243
+      }
+     },
+     "wall_s": 0.735,
+     "cargo_s": 14.748,
+     "rss_mb": 36189,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 3,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.57,
+      "read": 11.89,
+      "apply": 171.77,
+      "roots": 41.05,
+      "check": 243.39,
+      "reach": 2.52,
+      "resolve": 0.08,
+      "define": 0.02,
+      "object": 0.15,
+      "discarded": 0.0,
+      "statics": 2.87,
+      "setup": 0.52,
+      "compile-rest": 2.96,
+      "write": 188.88,
+      "build-rest": 36.36,
+      "report": 3.63,
+      "refuse": 5.03,
+      "link": 2.39
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.001,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "cranelift": 0.001
+     },
+     "started_over": [],
+     "slowest_s": 0.738,
+     "back_s": 0.728,
+     "back_cargo_s": 14.8,
+     "back_link": "spliced",
+     "samples_s": [
+      0.738,
+      0.735,
+      0.731
+     ],
+     "cargo_samples_s": [
+      15.133,
+      14.748,
+      14.737
+     ],
+     "setups": {}
+    }
+   },
+   "wrong": [],
+   "tag": "bun-v1.4.3",
+   "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+   "store_mb": 92,
+   "store_added_mb": 92,
+   "cold_runs": 1,
+   "resident": {
+    "ready_mb": 12309,
+    "after": [
+     {
+      "phase": "no-op",
+      "builds": 3,
+      "mb": 27662
+     },
+     {
+      "phase": "body",
+      "builds": 9,
+      "mb": 27687
+     },
+     {
+      "phase": "signature",
+      "builds": 15,
+      "mb": 27695
+     },
+     {
+      "phase": "leaf",
+      "builds": 21,
+      "mb": 27696
+     },
+     {
+      "phase": "generic",
+      "builds": 27,
+      "mb": 27687
+     },
+     {
+      "phase": "newfn",
+      "builds": 33,
+      "mb": 27717
+     }
+    ],
+    "end_mb": 27717,
+    "builds": 33
+   },
+   "disk_mb": {
+    "target": 6570,
+    "store": 88,
+    "home": 1,
+    "cargo target": 5583
+   },
+   "toolchain": "nightly-2026-09-15",
+   "runtime": {
+    "command": [
+     "bun",
+     "-e",
+     "const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"
+    ],
+    "blaze": {
+     "median_s": 3.5132,
+     "min_s": 3.5115,
+     "max_s": 3.5175,
+     "runs": 10,
+     "peak_mb": 105,
+     "peak_max_mb": 105,
+     "size_mb": 601.0
+    },
+    "cargo debug": {
+     "median_s": 2.0286,
+     "min_s": 2.028,
+     "max_s": 2.0295,
+     "runs": 10,
+     "peak_mb": 105,
+     "peak_max_mb": 105,
+     "size_mb": 408.4
+    },
+    "cargo release": {
+     "median_s": 0.1886,
+     "min_s": 0.1883,
+     "max_s": 0.1889,
+     "runs": 10,
+     "peak_mb": 105,
+     "peak_max_mb": 105,
+     "size_mb": 318.7
+    }
+   }
+  },
+  "bun/llvm": {
+   "phases": {
+    "cold": {
+     "wall_s": 92.666,
+     "cargo_s": 94.967,
+     "rss_mb": 34829,
+     "built": "cargo",
+     "build_s": 89.03,
+     "warm_s": 3.636,
+     "samples_s": [
+      92.666
+     ],
+     "cargo_samples_s": [
+      94.967
+     ],
+     "build_samples_s": [
+      89.03
+     ],
+     "setups": {},
+     "compiled": 0,
+     "steps_s": {
+      "load": 86.2,
+      "resolve": 2.1
+     },
+     "threads_s": {},
+     "started_over": [],
+     "memory": {
+      "blaze": {
+       "peak_mb": 15793,
+       "peak_max_mb": 15793,
+       "largest_mb": 12056,
+       "resident_mb": 12178
+      },
+      "cargo": {
+       "peak_mb": 4506,
+       "peak_max_mb": 4506,
+       "largest_mb": 3242
+      }
+     },
+     "disk_mb": {
+      "target": 6350,
+      "store": 56,
+      "home": 1,
+      "cargo target": 5060
+     },
+     "warm_store_build_s": 87.377,
+     "warm_store_s": 90.46,
+     "warm_store_samples_s": [
+      90.46
+     ],
+     "warm_store_memory": {
+      "peak_mb": 15724,
+      "resident_mb": 11592
+     }
+    },
+    "no-op": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27231,
+       "peak_max_mb": 27776,
+       "largest_mb": 27061,
+       "resident_mb": 27194
+      },
+      "cargo": {
+       "peak_mb": 105,
+       "peak_max_mb": 105,
+       "largest_mb": 105
+      }
+     },
+     "wall_s": 0.032,
+     "cargo_s": 0.09,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "compiled": 0,
+     "samples_s": [
+      0.043,
+      0.031,
+      0.032
+     ],
+     "cargo_samples_s": [
+      0.09,
+      0.09,
+      0.09
+     ],
+     "setups": {}
+    },
+    "body": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27287,
+       "peak_max_mb": 27301,
+       "largest_mb": 27090,
+       "resident_mb": 27213
+      },
+      "cargo": {
+       "peak_mb": 3523,
+       "peak_max_mb": 3527,
+       "largest_mb": 3242
+      }
+     },
+     "wall_s": 0.493,
+     "cargo_s": 10.657,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 1,
+     "places": 1,
+     "steps_ms": {
+      "settle": 0.61,
+      "read": 11.41,
+      "apply": 40.48,
+      "roots": 5.93,
+      "check": 168.02,
+      "reach": 2.15,
+      "resolve": 0.06,
+      "define": 0.0,
+      "object": 0.16,
+      "discarded": 0.0,
+      "statics": 2.94,
+      "setup": 0.53,
+      "compile-rest": 2.62,
+      "write": 192.79,
+      "build-rest": 36.62,
+      "report": 3.61,
+      "refuse": 5.13,
+      "link": 3.16
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "llvm": 0.002
+     },
+     "started_over": [],
+     "slowest_s": 0.508,
+     "back_s": 0.493,
+     "back_cargo_s": 10.663,
+     "back_link": "spliced",
+     "samples_s": [
+      0.508,
+      0.493,
+      0.49
+     ],
+     "cargo_samples_s": [
+      10.673,
+      10.649,
+      10.657
+     ],
+     "setups": {}
+    },
+    "signature": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27287,
+       "peak_max_mb": 27314,
+       "largest_mb": 27086,
+       "resident_mb": 27217
+      },
+      "cargo": {
+       "peak_mb": 3525,
+       "peak_max_mb": 3527,
+       "largest_mb": 3242
+      }
+     },
+     "wall_s": 0.609,
+     "cargo_s": 10.722,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 3,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.6,
+      "read": 10.46,
+      "apply": 43.32,
+      "roots": 152.67,
+      "check": 215.27,
+      "reach": 1.99,
+      "resolve": 0.63,
+      "define": 0.02,
+      "object": 3.08,
+      "discarded": 0.0,
+      "statics": 2.84,
+      "setup": 0.54,
+      "compile-rest": 13.95,
+      "write": 186.92,
+      "build-rest": 36.51,
+      "report": 3.65,
+      "refuse": 4.26,
+      "link": 2.9
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.007,
+      "monomorphize": 0.0,
+      "translate": 0.007,
+      "describe": 0.014,
+      "store read": 0.0,
+      "store write": 0.0,
+      "llvm": 0.002,
+      "cranelift": 0.007
+     },
+     "started_over": [],
+     "slowest_s": 0.714,
+     "back_s": 0.6,
+     "back_cargo_s": 10.698,
+     "back_link": "spliced",
+     "samples_s": [
+      0.714,
+      0.608,
+      0.609
+     ],
+     "cargo_samples_s": [
+      10.722,
+      10.67,
+      10.742
+     ],
+     "setups": {}
+    },
+    "leaf": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27281,
+       "peak_max_mb": 27281,
+       "largest_mb": 27082,
+       "resident_mb": 27216
+      },
+      "cargo": {
+       "peak_mb": 3551,
+       "peak_max_mb": 3557,
+       "largest_mb": 3236
+      }
+     },
+     "wall_s": 0.483,
+     "cargo_s": 19.656,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 1,
+     "places": 1,
+     "steps_ms": {
+      "settle": 1.92,
+      "read": 3.71,
+      "apply": 4.96,
+      "roots": 5.79,
+      "check": 147.76,
+      "reach": 2.47,
+      "resolve": 0.28,
+      "define": 0.02,
+      "object": 0.29,
+      "discarded": 0.0,
+      "statics": 2.93,
+      "setup": 0.52,
+      "compile-rest": 3.27,
+      "write": 240.31,
+      "build-rest": 36.53,
+      "report": 3.62,
+      "refuse": 3.3,
+      "link": 3.15
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "llvm": 0.003
+     },
+     "started_over": [],
+     "slowest_s": 0.494,
+     "back_s": 0.481,
+     "back_cargo_s": 19.684,
+     "back_link": "spliced",
+     "samples_s": [
+      0.494,
+      0.483,
+      0.481
+     ],
+     "cargo_samples_s": [
+      19.74,
+      19.656,
+      19.594
+     ],
+     "setups": {}
+    },
+    "generic": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27298,
+       "peak_max_mb": 27301,
+       "largest_mb": 27087,
+       "resident_mb": 27218
+      },
+      "cargo": {
+       "peak_mb": 3539,
+       "peak_max_mb": 3544,
+       "largest_mb": 3242
+      }
+     },
+     "wall_s": 0.518,
+     "cargo_s": 19.972,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 14,
+     "places": 1,
+     "steps_ms": {
+      "settle": 2.37,
+      "read": 6.48,
+      "apply": 9.81,
+      "roots": 6.0,
+      "check": 150.0,
+      "reach": 9.61,
+      "resolve": 0.88,
+      "define": 0.31,
+      "object": 11.73,
+      "discarded": 0.0,
+      "statics": 2.95,
+      "setup": 0.51,
+      "compile-rest": 5.44,
+      "write": 243.09,
+      "build-rest": 36.62,
+      "report": 3.65,
+      "refuse": 4.39,
+      "link": 4.4
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.073,
+      "describe": 0.012,
+      "store read": 0.0,
+      "store write": 0.0,
+      "llvm": 0.027
+     },
+     "started_over": [],
+     "slowest_s": 0.529,
+     "back_s": 0.495,
+     "back_cargo_s": 19.876,
+     "back_link": "spliced",
+     "samples_s": [
+      0.529,
+      0.518,
+      0.518
+     ],
+     "cargo_samples_s": [
+      20.038,
+      19.972,
+      19.918
+     ],
+     "setups": {}
+    },
+    "newfn": {
+     "memory": {
+      "blaze": {
+       "peak_mb": 27312,
+       "peak_max_mb": 27315,
+       "largest_mb": 27107,
+       "resident_mb": 27232
+      },
+      "cargo": {
+       "peak_mb": 3522,
+       "peak_max_mb": 3524,
+       "largest_mb": 3240
+      }
+     },
+     "wall_s": 0.711,
+     "cargo_s": 14.797,
+     "rss_mb": 34829,
+     "built": "daemon",
+     "link": "spliced",
+     "compiled": 2,
+     "places": 2,
+     "steps_ms": {
+      "settle": 0.6,
+      "read": 12.1,
+      "apply": 172.01,
+      "roots": 43.34,
+      "check": 214.54,
+      "reach": 3.92,
+      "resolve": 0.08,
+      "define": 0.0,
+      "object": 0.15,
+      "discarded": 0.0,
+      "statics": 2.96,
+      "setup": 0.56,
+      "compile-rest": 3.01,
+      "write": 187.56,
+      "build-rest": 36.7,
+      "report": 3.63,
+      "refuse": 5.03,
+      "link": 2.84
+     },
+     "threads_s": {
+      "infer": 0.0,
+      "mir": 0.0,
+      "monomorphize": 0.0,
+      "translate": 0.0,
+      "describe": 0.0,
+      "store read": 0.0,
+      "store write": 0.0,
+      "llvm": 0.003
+     },
+     "started_over": [],
+     "slowest_s": 0.721,
+     "back_s": 0.706,
+     "back_cargo_s": 14.811,
+     "back_link": "spliced",
+     "samples_s": [
+      0.721,
+      0.71,
+      0.711
+     ],
+     "cargo_samples_s": [
+      15.092,
+      14.793,
+      14.797
+     ],
+     "setups": {}
+    }
+   },
+   "wrong": [],
+   "tag": "bun-v1.4.3",
+   "rev": "c6da4a4d3010e5553438c60f6bd76d981976867c",
+   "store_mb": 60,
+   "store_added_mb": 60,
+   "cold_runs": 1,
+   "resident": {
+    "ready_mb": 12178,
+    "after": [
+     {
+      "phase": "no-op",
+      "builds": 3,
+      "mb": 27194
+     },
+     {
+      "phase": "body",
+      "builds": 9,
+      "mb": 27213
+     },
+     {
+      "phase": "signature",
+      "builds": 15,
+      "mb": 27217
+     },
+     {
+      "phase": "leaf",
+      "builds": 21,
+      "mb": 27216
+     },
+     {
+      "phase": "generic",
+      "builds": 27,
+      "mb": 27218
+     },
+     {
+      "phase": "newfn",
+      "builds": 33,
+      "mb": 27232
+     }
+    ],
+    "end_mb": 27232,
+    "builds": 33
+   },
+   "disk_mb": {
+    "target": 6364,
+    "store": 56,
+    "home": 1,
+    "cargo target": 5583
+   },
+   "toolchain": "nightly-2026-09-15",
+   "runtime": {
+    "command": [
+     "bun",
+     "-e",
+     "const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process'].map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; for (let i = 0; i < 20; i++) for (const s of sources) n += t.transformSync(s).length; console.log(n)"
+    ],
+    "blaze": {
+     "median_s": 1.896,
+     "min_s": 1.8941,
+     "max_s": 1.9018,
+     "runs": 10,
+     "peak_mb": 131,
+     "peak_max_mb": 131,
+     "size_mb": 538.2
+    },
+    "cargo debug": {
+     "median_s": 2.0299,
+     "min_s": 2.0282,
+     "max_s": 2.062,
+     "runs": 10,
+     "peak_mb": 131,
+     "peak_max_mb": 131,
+     "size_mb": 408.4
+    },
+    "cargo release": {
+     "median_s": 0.1886,
+     "min_s": 0.1879,
+     "max_s": 0.19,
+     "runs": 10,
+     "peak_mb": 131,
+     "peak_max_mb": 131,
+     "size_mb": 318.7
+    }
+   }
+  }
+ }
+}

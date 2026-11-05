@@ -1,0 +1,11 @@
+{
+  "compilerOptions": { "strict": true, "noEmit": true, "types": [], "lib": ["es2024"] },
+  "contentMappers": [
+    {
+      "package": "flecs-content-mapper",
+      "extensions": [".flecs"],
+      "options": { "scripts": ["../../content", "pages"] }
+    }
+  ],
+  "include": ["../../content/**/*.flecs", "pages/*.flecs", "broken/*.flecs"]
+}

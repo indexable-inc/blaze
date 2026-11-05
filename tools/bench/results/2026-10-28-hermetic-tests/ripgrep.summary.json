@@ -1,0 +1,263 @@
+{
+  "v": 1,
+  "tests": 1144,
+  "hermetic": 363,
+  "not_hermetic": 781,
+  "cached": {
+    "hit": 363,
+    "never": 781
+  },
+  "results": {
+    "cached": 363,
+    "passed": 781
+  },
+  "by_kind": {
+    "env": 371,
+    "ffi": 5,
+    "fs": 464,
+    "global-state": 780,
+    "process": 329
+  },
+  "top_reasons": [
+    {
+      "kind": "env",
+      "what": "getenv",
+      "tests": 371,
+      "example": "ignore lib dir::tests::absolute_parent"
+    },
+    {
+      "kind": "global-state",
+      "what": "integration::util::NEXT_ID",
+      "tests": 329,
+      "example": "ripgrep test:integration binary::after_match1_explicit"
+    },
+    {
+      "kind": "process",
+      "what": "posix_spawnp",
+      "tests": 329,
+      "example": "ripgrep test:integration binary::after_match1_explicit"
+    },
+    {
+      "kind": "fs",
+      "what": "readlink",
+      "tests": 328,
+      "example": "ripgrep test:integration binary::after_match1_explicit"
+    },
+    {
+      "kind": "global-state",
+      "what": "log::MAX_LOG_LEVEL_FILTER",
+      "tests": 264,
+      "example": "globset lib glob::tests::match1"
+    },
+    {
+      "kind": "global-state",
+      "what": "regex_automata::util::pool::inner::COUNTER",
+      "tests": 151,
+      "example": "globset lib tests::default_set_is_empty_works"
+    },
+    {
+      "kind": "fs",
+      "what": "realpath",
+      "tests": 93,
+      "example": "grep-printer lib standard::tests::byte_offset"
+    },
+    {
+      "kind": "global-state",
+      "what": "ignore::tests::COUNTER",
+      "tests": 36,
+      "example": "ignore lib dir::tests::absolute_parent"
+    },
+    {
+      "kind": "fs",
+      "what": "mkdir",
+      "tests": 21,
+      "example": "ignore lib dir::tests::absolute_parent"
+    },
+    {
+      "kind": "fs",
+      "what": "open64",
+      "tests": 18,
+      "example": "ignore lib dir::tests::custom_ignore"
+    },
+    {
+      "kind": "ffi",
+      "what": "pcre2_compile_context_create_8",
+      "tests": 4,
+      "example": "grep-pcre2 lib matcher::tests::candidate_lines"
+    },
+    {
+      "kind": "fs",
+      "what": "stat64",
+      "tests": 3,
+      "example": "ignore lib dir::tests::not_present_empty"
+    },
+    {
+      "kind": "ffi",
+      "what": "sysconf",
+      "tests": 1,
+      "example": "grep-cli lib hostname::tests::print_hostname"
+    },
+    {
+      "kind": "fs",
+      "what": "unlink",
+      "tests": 1,
+      "example": "ignore lib dir::tests::git_info_exclude_in_linked_worktree"
+    }
+  ],
+  "top_helpers": [
+    {
+      "fn": "log::max_level",
+      "file": "src/lib.rs",
+      "line": 1398,
+      "col": 29,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 264,
+      "only_through_it": 161
+    },
+    {
+      "fn": "regex_automata::util::pool::inner::THREAD_ID::__rust_std_internal_init_fn",
+      "file": "src/util/pool.rs",
+      "line": 336,
+      "col": 24,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 151,
+      "only_through_it": 146
+    },
+    {
+      "fn": "grep_cli::hostname::gethostname",
+      "file": "crates/cli/src/hostname.rs",
+      "line": 41,
+      "col": 26,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 1,
+      "only_through_it": 1
+    },
+    {
+      "fn": "a closure in `std::sys::env::unix::getenv",
+      "file": "std/src/sys/env/unix.rs",
+      "line": 117,
+      "col": 26,
+      "kinds": [
+        "env"
+      ],
+      "tests": 371,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<integration::util::Dir>::new",
+      "file": "tests/util.rs",
+      "line": 71,
+      "col": 18,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 329,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<std::sys::process::unix::common::Command>::posix_spawn",
+      "file": "std/src/sys/process/unix/unix.rs",
+      "line": 783,
+      "col": 28,
+      "kinds": [
+        "process"
+      ],
+      "tests": 329,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::readlink",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2049,
+      "col": 26,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 328,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::canonicalize",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2136,
+      "col": 22,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 93,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<ignore::tests::TempDir>::new",
+      "file": "crates/ignore/src/lib.rs",
+      "line": 526,
+      "col": 29,
+      "kinds": [
+        "global-state"
+      ],
+      "tests": 36,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::DirBuilder>::mkdir",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1732,
+      "col": 49,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 21,
+      "only_through_it": 0
+    },
+    {
+      "fn": "a closure in `<std::sys::fs::unix::File>::open_c",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1244,
+      "col": 36,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 18,
+      "only_through_it": 0
+    },
+    {
+      "fn": "<pcre2::ffi::CompileContext>::new",
+      "file": "src/ffi.rs",
+      "line": 266,
+      "col": 28,
+      "kinds": [
+        "ffi"
+      ],
+      "tests": 4,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::stat",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 2114,
+      "col": 18,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 3,
+      "only_through_it": 0
+    },
+    {
+      "fn": "std::sys::fs::unix::unlink",
+      "file": "std/src/sys/fs/unix.rs",
+      "line": 1887,
+      "col": 18,
+      "kinds": [
+        "fs"
+      ],
+      "tests": 1,
+      "only_through_it": 0
+    }
+  ]
+}

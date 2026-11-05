@@ -1,0 +1,30 @@
+[package]
+name = "blaze-source"
+description = "where a package comes from, as cargo 1.99 names it: SourceId and the names of the directories cargo keeps a source in, with no I/O"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+# The hasher cargo names a source's directories with.
+rustc-stable-hash.workspace = true
+semver.workspace = true
+serde.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

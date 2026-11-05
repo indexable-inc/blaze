@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "error: could not load Cargo configuration\n\nCaused by:\n  failed to load TOML configuration from `$ROOT/.cargo/config.toml`\n\nCaused by:\n  failed to parse config at `a`\n\nCaused by:\n  unsupported TOML configuration type `datetime`\n"
+ }
+]

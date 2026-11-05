@@ -1,0 +1,26 @@
+[package]
+name = "blaze-hashcons"
+description = "blaze v2's hash-consing of query values: equal values stored once in sharded append-only arenas, compared by ID, their content fingerprint computed once at intern, persisted by content and interned again on load"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

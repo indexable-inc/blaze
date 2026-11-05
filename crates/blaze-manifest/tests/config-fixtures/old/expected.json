@@ -1,0 +1,63 @@
+[
+ {
+  "args": [],
+  "code": 0,
+  "stdout": "build.jobs = 2\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\n"
+ },
+ {
+  "args": [
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "build.jobs = 2 # $ROOT/.cargo/config\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config\nbuild.jobs = 2\n\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\nwarning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\n"
+ },
+ {
+  "args": [
+   "--merged",
+   "no",
+   "--show-origin"
+  ],
+  "code": 0,
+  "stdout": "# Environment variables\n# CARGO_HOME=$CARGO_HOME\n\n# $ROOT/.cargo/config\nbuild.jobs = 2 # $ROOT/.cargo/config\n\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\nwarning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"jobs\":2}}\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json-value"
+  ],
+  "code": 0,
+  "stdout": "{\"build\":{\"jobs\":2}}\n",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\nnote: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\n"
+ },
+ {
+  "args": [
+   "--format",
+   "json",
+   "--show-origin"
+  ],
+  "code": 101,
+  "stdout": "",
+  "stderr": "warning: `$ROOT/.cargo/config` is deprecated in favor of `config.toml`\n  |\n  = help: if you need to support cargo 1.38 or earlier, you can symlink `config` to `config.toml`\nerror: the `json` format does not support --show-origin, try the `toml` format instead\n"
+ }
+]

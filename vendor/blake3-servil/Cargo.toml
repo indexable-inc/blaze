@@ -1,0 +1,122 @@
+[package]
+name = "blake3-servil"
+# The fork's own version series, from 0.1.0, based on upstream BLAKE3 1.8.7:
+# tools/gen-ver.py sets X.Y.Z+<commit> here and tags vX.Y.Z+<commit>.
+version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
+authors = ["Jack O'Connor <oconnor663@gmail.com>", "Samuel Neves", "John Servil"]
+description = "the BLAKE3 hash function, with SME2 and integer + NEON kernels for AArch64 and a shared thread pool"
+repository = "https://github.com/johnservil/BLAKE3"
+license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+readme = "README.md"
+edition = "2024"
+# What a build from crates.io needs: the library, its assembly and build
+# script, the pages users read, the licences, and the file the tests include.
+include = ["/src", "/c", "/build.rs", "/README.md", "/CHANGELOG.md", "/QUALITY.md", "/LICENSE_*", "/tools/require_nextest.rs"]
+
+[features]
+default = ["std"]
+
+# Enables std::io traits, including impl Write for Hasher, impl Read and Seek
+# for OutputReader, and the Hasher::update_reader method. This feature is
+# enabled by default. (Previously this also controlled runtime CPU feature
+# detection on x86, which now reads CPUID directly, with or without std.)
+# Also enables the `std` feature of the `constant_time_eq` dependency, which
+# toggles a runtime feature check on 64-bit ARM targets.
+std = ["constant_time_eq/std"]
+
+# Implement the zeroize::Zeroize trait for types in this crate.
+zeroize = ["dep:zeroize", "arrayvec/zeroize"]
+
+[package.metadata.docs.rs]
+# Document the Serialize/Deserialize/Zeroize impls on docs.rs.
+features = ["serde", "zeroize"]
+
+# The integration tests exercise the pool and the queue, which need std.
+[[test]]
+name = "api_plan"
+required-features = ["std"]
+
+[[test]]
+name = "stream_one_cpu"
+required-features = ["std"]
+
+[[test]]
+name = "forked_child"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_no_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_one_worker"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_parked_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_finish_parked_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_with_workers"
+required-features = ["std"]
+
+[[test]]
+name = "initialize_multithreaded_contract"
+required-features = ["std"]
+
+[dependencies]
+arrayvec = { version = "0.7.4", default-features = false }
+constant_time_eq = { version = "0.4.2", default-features = false }
+cfg-if = "1.0.0"
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+zeroize = { version = "1", default-features = false, optional = true }
+
+[target.'cfg(all(target_arch = "aarch64", any(target_vendor = "apple", target_os = "linux")))'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+# The guard-page tests (src/test.rs) on x86-64 too.
+[target.'cfg(all(target_arch = "x86_64", any(target_vendor = "apple", target_os = "linux")))'.dev-dependencies]
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+# Official BLAKE3, the tests' independent implementation: it generates their
+# fixed expected values (BLAKE3_GOLDEN=1, src/test.rs's `golden`), and the
+# co-linking test checks its native symbols never replace ours.
+blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
+rand = "0.10.0"
+hmac = "0.13.0"
+hex = "0.4.2"
+clocks = { path = "./clocks" }
+tempfile = "3.8.0"
+serde_json = "1.0.107"
+ciborium = "0.2.2"
+# tests/shuttle_*.rs: the pool's handshakes under a model checker.
+shuttle = "0.8"
+
+[build-dependencies]
+cc = "1.1.12"
+
+# Tests built as users' release build is (opt-level 3, 16 codegen units,
+# no incremental compilation, no debug info), with its checks on: debug
+# assertions and overflow checks, which name a broken assumption where
+# users' build would pass it silently. `cargo test --release` runs users'
+# build exactly.
+[profile.test]
+opt-level = 3
+codegen-units = 16
+incremental = false
+debug = false
+debug-assertions = true
+overflow-checks = true
+
+# Mutation testing (tools/mutants/check.py) builds what users run: a mutant
+# that only a debug assertion or an overflow check would catch is uncaught
+# in a release. Built incrementally, since cargo-mutants rebuilds the crate
+# once per mutant (opt-level 1 made a whole run no faster, October 21).
+[profile.mutants]
+inherits = "release"
+incremental = true

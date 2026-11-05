@@ -1,0 +1,433 @@
+diff --git a/src/binder.rs b/src/binder.rs
+index d9b5ec7..18e3a0e 100644
+--- a/src/binder.rs
++++ b/src/binder.rs
+@@ -82,16 +82,24 @@ impl<I: Interner, T: TypeFoldable<I>> TypeSuperFoldable<I> for Binder<I, T> {
+         self,
+         folder: &mut F,
+     ) -> Result<Self, F::Error> {
+-        self.try_map_bound(|t| t.try_fold_with(folder))
++        // blaze: a reflected variable's container is inside the binder, and folds with it.
++        let bound_vars = crate::reflect::try_fold_reflected_containers(self.bound_vars, folder)?;
++        Ok(Binder { value: self.value.try_fold_with(folder)?, bound_vars })
+     }
+ 
+     fn super_fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
+-        self.map_bound(|t| t.fold_with(folder))
++        let bound_vars = crate::reflect::fold_reflected_containers(self.bound_vars, folder);
++        Binder { value: self.value.fold_with(folder), bound_vars }
+     }
+ }
+ 
+ impl<I: Interner, T: TypeVisitable<I>> TypeSuperVisitable<I> for Binder<I, T> {
+     fn super_visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
++        // blaze: a reflected variable's container is inside the binder.
++        crate::visit::try_visit!(crate::reflect::visit_reflected_containers(
++            self.bound_vars,
++            visitor
++        ));
+         self.as_ref().skip_binder().visit_with(visitor)
+     }
+ }
+@@ -1080,6 +1088,9 @@ pub enum BoundVariableKind<I: Interner> {
+     Ty(BoundTyKind<I>),
+     Region(BoundRegionKind<I>),
+     Const,
++    /// blaze: a type variable of a field binder, `F` of `for<F: Field<T>>`, ranging over the
++    /// members of its container only (`crate::reflect`).
++    Reflected(crate::reflect::ReflectedVar<I>),
+ }
+ 
+ impl<I: Interner> BoundVariableKind<I> {
+@@ -1093,6 +1104,8 @@ impl<I: Interner> BoundVariableKind<I> {
+     pub fn expect_ty(self) -> BoundTyKind<I> {
+         match self {
+             BoundVariableKind::Ty(ty) => ty,
++            // A reflected variable is a type variable everywhere but where it is instantiated.
++            BoundVariableKind::Reflected(var) => var.kind,
+             _ => panic!("expected a type, but found another kind"),
+         }
+     }
+diff --git a/src/flags.rs b/src/flags.rs
+index 4af4f14..cb061c9 100644
+--- a/src/flags.rs
++++ b/src/flags.rs
+@@ -236,6 +236,12 @@ impl<I: Interner> FlagComputation<I> {
+         if !value.bound_vars().is_empty() {
+             computation.add_flags(TypeFlags::HAS_BINDER_VARS);
+         }
++        // blaze: a reflected variable's container is inside the binder.
++        for var in value.bound_vars().iter() {
++            if let ty::BoundVariableKind::Reflected(var) = var {
++                computation.add_ty(var.container);
++            }
++        }
+ 
+         f(&mut computation, value.skip_binder());
+ 
+diff --git a/src/interner.rs b/src/interner.rs
+index dd50172..306f884 100644
+--- a/src/interner.rs
++++ b/src/interner.rs
+@@ -478,6 +478,46 @@ pub trait Interner:
+ 
+     fn as_adt_lang_item(self, def_id: Self::AdtId) -> Option<SolverAdtLangItem>;
+ 
++    /// blaze: compile-time reflection (`#![feature(blaze_comptime)]`, [`crate::reflect`]).
++    /// The members `domain` ranges over in the rigid ADT or tuple `container`, in declaration
++    /// order: field representing types (`Fields`) or variant representing types (`Variants`).
++    /// Empty when `container` has none to reflection: not a `core::reflect::Struct` for
++    /// `Fields`, not an enum for `Variants`.
++    fn reflect_members(
++        self,
++        container: Self::Ty,
++        domain: crate::reflect::ReflectedDomain,
++    ) -> Self::Tys;
++
++    /// blaze: the container `member` is a member of in `domain` ([`Self::reflect_members`]),
++    /// as `F: Field<C>` and `V: Variant<C>` ask.
++    fn reflect_container_of(
++        self,
++        member: Self::Ty,
++        domain: crate::reflect::ReflectedDomain,
++    ) -> crate::reflect::ReflectContainer<Self>;
++
++    /// blaze: whether the ADT type `ty` is `core::reflect::Struct` (a struct whose every field
++    /// is `pub` or one written `#[blaze::reflect]`, not `repr(packed)`; a variant view of an
++    /// existing variant); `None` while an inference variable decides it. Tuples are the
++    /// solver's.
++    fn reflect_is_struct(self, ty: Self::Ty) -> Option<bool>;
++
++    /// blaze: `<V as core::reflect::Variant<E>>::View` of the variant representing type `V` of
++    /// an existing variant `v`: `VariantOf<E, v>`. `None` for any other type.
++    fn reflect_variant_view(self, member: Self::Ty) -> Option<Self::Ty>;
++
++    /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
++    fn reflect_is_enum(self, ty: Self::Ty) -> bool;
++
++    /// blaze: `env` with `clauses` added, for a member of a field binder entering the
++    /// environment (`rustc_next_trait_solver`'s `env_with_reflected_member`).
++    fn param_env_with_clauses(
++        self,
++        env: Self::ParamEnv,
++        clauses: impl IntoIterator<Item = Self::Clause>,
++    ) -> Self::ParamEnv;
++
+     fn associated_type_def_ids(
+         self,
+         def_id: Self::TraitId,
+diff --git a/src/lang_items.rs b/src/lang_items.rs
+index 25b2497..746614e 100644
+--- a/src/lang_items.rs
++++ b/src/lang_items.rs
+@@ -13,6 +13,8 @@ pub enum SolverProjectionLangItem {
+     FieldType,
+     FutureOutput,
+     Metadata,
++    /// blaze: `<V as core::reflect::Variant<E>>::View`, the variant view `VariantOf<E, v>`.
++    ReflectVariantView,
+     // tidy-alphabetical-end
+ }
+ 
+@@ -63,6 +65,19 @@ pub enum SolverTraitLangItem {
+     MetaSized,
+     PointeeSized,
+     PointeeTrait,
++    /// blaze: `core::reflect::Enum` (`#![feature(blaze_comptime)]`): every enum.
++    ReflectEnum,
++    /// blaze: `F: core::reflect::Field<C>`: `F` is the field representing type of a field of
++    /// the struct, tuple or variant view `C`.
++    ReflectField,
++    /// blaze: `core::reflect::FnItem`: fn item and closure types.
++    ReflectFnItem,
++    /// blaze: `core::reflect::Struct`: a struct whose fields reflection may read, a tuple, or
++    /// a variant view.
++    ReflectStruct,
++    /// blaze: `V: core::reflect::Variant<E>`: `V` is the variant representing type of a variant
++    /// of the enum `E`.
++    ReflectVariant,
+     Sized,
+     TransmuteTrait,
+     TrivialClone,
+diff --git a/src/lib.rs b/src/lib.rs
+index d68ab06..8412217 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -64,6 +64,7 @@ pub mod ir_print;
+ pub mod lang_items;
+ pub mod lift;
+ pub mod outlives;
++pub mod reflect;
+ pub mod region_constraint;
+ pub mod relate;
+ pub mod search_graph;
+diff --git a/src/macros.rs b/src/macros.rs
+index d9f943a..62c894d 100644
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -77,6 +77,7 @@ TrivialTypeTraversalImpls! {
+     crate::UintTy,
+     crate::UniverseIndex,
+     crate::Variance,
++    crate::reflect::ReflectedDomain,
+     crate::region_constraint::NoSpan,
+     crate::solve::BuiltinImplSource,
+     crate::solve::Certainty,
+diff --git b/src/reflect.rs b/src/reflect.rs
+new file mode 100644
+index 0000000..7b9084e
+--- /dev/null
++++ b/src/reflect.rs
+@@ -0,0 +1,252 @@
++//! blaze: the field binders of compile-time reflection (`#![feature(blaze_comptime)]`,
++//! docs/v2/plan/design/comptime.md, phase 2).
++//!
++//! `where for<F: Field<T>> F::Type: Hash` is an ordinary binder whose variable `F` is a
++//! [`BoundVariableKind::Reflected`]: it ranges over the fields of `T` (the variable's
++//! `container`), not over every type. The container rides in the binder's variable list, not
++//! in a side table, so that it folds with the clause: the where clause of `hash_fields::<S>` is
++//! the item's clause with `T := S`, and its variable's container must say `S` too.
++//! `Binder`'s fold, visit and flag computation include the containers
++//! ([`fold_reflected_containers`], [`visit_reflected_containers`]).
++//!
++//! A container is written inside its binder: it may name the binder's earlier variables at
++//! `INNERMOST` (`for<V: Variant<T>, F: Field<V::View>>`), never its own or a later one.
++//!
++//! The solver proves such a binder by expanding it over the container's members
++//! (`rustc_next_trait_solver`'s `compute_reflected_forall_goal`) and uses one in the
++//! environment only through its members ([`instantiate_reflected_var`]), never by
++//! instantiating `F` with an inference variable: nothing but a member may stand for `F`.
++
++use derive_where::derive_where;
++#[cfg(feature = "nightly")]
++use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
++use rustc_type_ir_macros::{GenericTypeVisitable, Lift_Generic};
++use smallvec::SmallVec;
++
++use crate::fold::{FallibleTypeFolder, FnMutDelegate, TypeFoldable, TypeFolder};
++use crate::inherent::*;
++use crate::visit::{TypeVisitable, TypeVisitableExt, TypeVisitor, VisitorResult, try_visit};
++use crate::{
++    self as ty, Binder, BoundTyKind, BoundVar, BoundVariableKind, Const, Interner, Region,
++};
++
++/// What a reflected variable ranges over.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
++#[cfg_attr(
++    feature = "nightly",
++    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
++)]
++pub enum ReflectedDomain {
++    /// `F: core::reflect::Field<C>`: the fields of the struct, tuple or variant view `C`, in
++    /// declaration order, as their field representing types.
++    Fields,
++    /// `V: core::reflect::Variant<C>`: the variants of the enum `C`, in declaration order, as
++    /// their variant representing types.
++    Variants,
++}
++
++/// What `Interner::reflect_container_of` answers.
++#[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
++pub enum ReflectContainer<I: Interner> {
++    /// The member's container.
++    Of(I::Ty),
++    /// The type is no member of any container in this domain.
++    Not,
++    /// An inference variable (the base or an index) decides it.
++    Unknown,
++}
++
++/// A variable of a field binder: `F` of `for<F: Field<C>>`.
++#[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
++#[derive(Lift_Generic, GenericTypeVisitable)]
++#[cfg_attr(
++    feature = "nightly",
++    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
++)]
++pub struct ReflectedVar<I: Interner> {
++    /// The variable as a type variable: what a `ty::Bound` of it carries.
++    pub kind: BoundTyKind<I>,
++    #[lift(identity)]
++    pub domain: ReflectedDomain,
++    /// `C`, written inside the binder.
++    pub container: I::Ty,
++}
++
++/// The first reflected variable of `vars`, with its index.
++pub fn first_reflected_var<I: Interner>(
++    vars: I::BoundVarKinds,
++) -> Option<(usize, ReflectedVar<I>)> {
++    vars.iter().enumerate().find_map(|(index, var)| match var {
++        BoundVariableKind::Reflected(var) => Some((index, var)),
++        _ => None,
++    })
++}
++
++/// Whether any variable of `vars` is reflected.
++#[inline]
++pub fn has_reflected_vars<I: Interner>(vars: I::BoundVarKinds) -> bool {
++    vars.iter()
++        .any(|var| matches!(var, BoundVariableKind::Reflected(_)))
++}
++
++/// `vars` with every reflected variable's container folded by `folder`, which is inside the
++/// binder (`Binder::super_fold_with`). The list itself when it has none, the common case.
++pub fn fold_reflected_containers<I: Interner, F: TypeFolder<I>>(
++    vars: I::BoundVarKinds,
++    folder: &mut F,
++) -> I::BoundVarKinds {
++    if !has_reflected_vars::<I>(vars) {
++        return vars;
++    }
++    let folded = vars
++        .iter()
++        .map(|var| match var {
++            BoundVariableKind::Reflected(var) => BoundVariableKind::Reflected(ReflectedVar {
++                container: var.container.fold_with(folder),
++                ..var
++            }),
++            var => var,
++        })
++        .collect::<SmallVec<[_; 4]>>();
++    I::BoundVarKinds::from_vars(folder.cx(), folded)
++}
++
++/// [`fold_reflected_containers`] for a fallible folder.
++pub fn try_fold_reflected_containers<I: Interner, F: FallibleTypeFolder<I>>(
++    vars: I::BoundVarKinds,
++    folder: &mut F,
++) -> Result<I::BoundVarKinds, F::Error> {
++    if !has_reflected_vars::<I>(vars) {
++        return Ok(vars);
++    }
++    let folded = vars
++        .iter()
++        .map(|var| {
++            Ok(match var {
++                BoundVariableKind::Reflected(var) => BoundVariableKind::Reflected(ReflectedVar {
++                    container: var.container.try_fold_with(folder)?,
++                    ..var
++                }),
++                var => var,
++            })
++        })
++        .collect::<Result<SmallVec<[_; 4]>, F::Error>>()?;
++    Ok(I::BoundVarKinds::from_vars(folder.cx(), folded))
++}
++
++/// Visits every reflected variable's container of `vars` (`Binder::super_visit_with`).
++pub fn visit_reflected_containers<I: Interner, V: TypeVisitor<I>>(
++    vars: I::BoundVarKinds,
++    visitor: &mut V,
++) -> V::Result {
++    for var in vars.iter() {
++        if let BoundVariableKind::Reflected(var) = var {
++            try_visit!(var.container.visit_with(visitor));
++        }
++    }
++    V::Result::output()
++}
++
++/// `binder` with its variable `index` (a reflected one) replaced by `member`, which names no
++/// variable of `binder`: the binder of the remaining variables, renumbered in order, with their
++/// containers instantiated the same way. `for<V: Variant<T>, F: Field<V::View>> P(V, F)` with
++/// `V := VariantRepresentingType<T, 1>` is
++/// `for<F: Field<<VariantRepresentingType<T, 1> as Variant<T>>::View>> P(.., F)`; a binder with
++/// no variable left is `Binder::dummy` of its value.
++///
++/// Both of the solver's rules over a field binder go through here: proving one expands it over
++/// its container's members, and assuming one (a member `!F` of a generic container entering
++/// the environment) instantiates it with the member.
++pub fn instantiate_reflected_var<I: Interner, T: TypeFoldable<I>>(
++    cx: I,
++    binder: Binder<I, T>,
++    index: usize,
++    member: I::Ty,
++) -> Binder<I, T> {
++    let vars = binder.bound_vars();
++    assert!(
++        matches!(vars.get(index), Some(BoundVariableKind::Reflected(_))),
++        "variable {index} of {vars:?} is not a reflected variable"
++    );
++    assert!(
++        !member.has_escaping_bound_vars(),
++        "the member {member:?} instantiating variable {index} of {vars:?} names a bound variable"
++    );
++    // The remaining variables keep their order: a variable after `index` moves down by one.
++    let renumber = |var: BoundVar| {
++        let at = var.as_usize();
++        BoundVar::from_usize(if at > index { at - 1 } else { at })
++    };
++    let mut regions = |br: ty::BoundRegion<I>| {
++        Region::new_bound(
++            cx,
++            ty::INNERMOST,
++            ty::BoundRegion {
++                var: renumber(br.var),
++                kind: br.kind,
++            },
++        )
++    };
++    let mut types = |bt: ty::BoundTy<I>| {
++        if bt.var.as_usize() == index {
++            member
++        } else {
++            I::Ty::new_bound(
++                cx,
++                ty::INNERMOST,
++                ty::BoundTy {
++                    var: renumber(bt.var),
++                    kind: bt.kind,
++                },
++            )
++        }
++    };
++    let mut consts = |bc: ty::BoundConst<I>| {
++        Const::new_bound(cx, ty::INNERMOST, ty::BoundConst::new(renumber(bc.var)))
++    };
++    let rest = vars
++        .iter()
++        .enumerate()
++        .filter(|&(at, _)| at != index)
++        .map(|(at, var)| match var {
++            BoundVariableKind::Reflected(var) => {
++                assert!(
++                    at > index || !var.container.has_escaping_bound_vars(),
++                    "the container of variable {at} of {vars:?} names a variable of its binder"
++                );
++                BoundVariableKind::Reflected(ReflectedVar {
++                    container: replace(cx, var.container, &mut regions, &mut types, &mut consts),
++                    ..var
++                })
++            }
++            var => var,
++        })
++        .collect::<SmallVec<[_; 4]>>();
++    let value = replace(
++        cx,
++        binder.skip_binder(),
++        &mut regions,
++        &mut types,
++        &mut consts,
++    );
++    Binder::bind_with_vars(value, I::BoundVarKinds::from_vars(cx, rest))
++}
++
++/// `value` with its variables bound at `INNERMOST` replaced as the three functions say.
++fn replace<I: Interner, T: TypeFoldable<I>>(
++    cx: I,
++    value: T,
++    regions: &mut dyn FnMut(ty::BoundRegion<I>) -> Region<I>,
++    types: &mut dyn FnMut(ty::BoundTy<I>) -> I::Ty,
++    consts: &mut dyn FnMut(ty::BoundConst<I>) -> Const<I>,
++) -> T {
++    crate::fold::replace_escaping_bound_vars_uncached(
++        cx,
++        value,
++        FnMutDelegate {
++            regions,
++            types,
++            consts,
++        },
++    )
++}

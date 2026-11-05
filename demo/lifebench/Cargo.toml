@@ -1,0 +1,13 @@
+[package]
+name = "lifebench"
+version = "0.1.0"
+description = "The Game of Life of demo/life on a large grid, run flat out without a window: what tiering is measured on"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+blaze-live = { path = "../../crates/blaze-live" }
+
+# Not part of the blaze workspace: it has its own lock, like demo/life.
+[workspace]

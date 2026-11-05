@@ -1,0 +1,58 @@
+// /usage: using blaze day to day, trimmed from docs/usage.md (every command and setting: docs/cargo.md).
+site {
+  usage : Page {
+    Title: {"Usage"}
+    Nav: {"Usage", 2}
+    Icon: {"terminal"}
+    (InGroup, nav.reference)
+    Description: {"Using blaze day to day: cargo's commands, rebuild on save, plain cargo through blaze, live edits, and what works yet."}
+
+    Lede lede("Type `blaze` wherever you'd type `cargo`. Not installed yet: [Install](/install). Every command and setting in detail: [cargo.md](https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md).")
+
+    Section project(title: "Use it on your project") {
+      Code build(lang: "bash", text: `cd my-project
+        blaze build`)
+      P daemon("The first build starts a background process, the daemon, which loads your project and compiles every crate of it from source; no `cargo build` runs. From then on, an edit builds like this:")
+      Code finished(lang: "", text: `\$ blaze build
+            Finished \`dev\` profile [blaze] target(s) in 0.02s`)
+      P where("`[blaze]` means blaze built it. The program is where cargo would have put it, under `target/`.")
+      Ul commands {
+        Li build_run_test("`blaze build`, `run` and `test` take cargo's flags and do what cargo's commands do: `run` passes what follows `--` to your program, and `test` runs and reports the tests as `cargo test` does.")
+        Li check("`blaze check` reports the errors a build would fail with.")
+        Li status("`blaze status` shows what the daemon has loaded and how many builds it did.")
+        Li stop("`blaze stop` stops the daemon. It also stops by itself after 30 minutes without a build.")
+      }
+      P others("Every other subcommand is blaze's own too (`fmt`, `clippy`, `doc`, `tree` and the rest), and none of them runs cargo. A build blaze can't do yet fails with the reason, `blaze does not build ... yet`, and is not handed to cargo; each such case is a bug ([the plan](https://github.com/indexable-inc/blaze/blob/main/docs/no-rustc.md)).")
+    }
+
+    Section watch(title: "Rebuild on every save") {
+      Code watchexec(lang: "bash", text: "watchexec -e rs -- blaze build")
+    }
+
+    Section live(title: "Change a running program") {
+      Code dep(lang: "toml", text: `[dependencies]
+        blaze-live = "0.1"`)
+      Code poll(lang: "rust", text: `let mut live = blaze_live::Live::start().ok();
+        loop \{
+            if let Some(outcome) = live.as_mut().and_then(|it| it.poll()) \{
+                eprintln!("blaze: \{outcome}");
+            }
+            // ...one frame of your program
+        }`)
+      P run("Start it with `blaze run`. In another terminal, build after each edit with `blaze build` (or the `watchexec` line above). The next `poll` swaps in the functions that changed, usually in under a millisecond, and prints `blaze: edit ... applied: 1 functions in 745.4µs`. An edit that changes a type the program is holding, such as a struct's fields, can't be applied to data that already exists, so `poll` asks for a restart instead.")
+      Dim platforms("Live edits work on macOS on Apple silicon. Linux x86-64 and Windows x86-64 support is on main and comes with the next release. How it works: [live.md](https://github.com/indexable-inc/blaze/blob/main/docs/live.md).")
+    }
+
+    Section limits(title: "What works and what doesn't yet") {
+      Ul list {
+        Li platforms("**Platforms.** macOS on Apple silicon, Linux x86-64 and Linux ARM64 are measured ([benchmarks](/bench)). Windows x86-64 (MSVC) builds and takes live edits through blaze too, run by hand and not in CI. Intel Macs are not supported.")
+        Li toolchain("**One Rust version, the latest nightly.** blaze builds with the dated nightly it pins, whatever toolchain the project pins. Stable code and `#![feature(...)]` code both build; code that needs what that nightly lacks fails with rustc's error.")
+        Li unsupported("**Not everything builds yet.** Under `blaze`, a few flags (such as `--message-format` and several `--target`s at once) and code blaze can't compile yet fail the build with the reason; nothing goes to cargo.")
+        Li borrowck("**Errors.** A type error fails the build, as under cargo. blaze has its own borrow checker, which agrees with rustc on most of rustc's tests but still misses some errors: keep `cargo check` or your CI as the final word ([borrowck.md](https://github.com/indexable-inc/blaze/blob/main/docs/borrowck.md)).")
+        Li memory("**Memory and disk.** The daemon holds several times the memory cargo uses while building, and a build keeps more on disk than cargo's does.")
+        Li correctness("**Correctness.** Every change to blaze is checked by comparing what it builds with what rustc builds, on rustc's own tests and on real projects, but it is young: if a program behaves differently under blaze, that's a bug, and an [issue](https://github.com/indexable-inc/blaze/issues) is welcome.")
+      }
+      Dim more("What is supported in detail: [support.md](https://github.com/indexable-inc/blaze/blob/main/docs/support.md).")
+    }
+  }
+}

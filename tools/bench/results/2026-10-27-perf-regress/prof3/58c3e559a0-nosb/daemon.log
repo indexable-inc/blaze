@@ -1,0 +1,3 @@
+daemon 0.1.0-da0af22a-b81f408-18e285f6df332a00 (blaze 0.1.0 (58c3e55)) of pid 87693 listens on /root/perf/prof3-ws/58c3e559a0/home/daemon.sock
+worker dcbe857337981b04 of pid 87696 for /root/perf/prof3-ws/58c3e559a0/rg/
+/root/perf/prof3-ws/58c3e559a0/rg: ready

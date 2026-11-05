@@ -1,0 +1,15 @@
+[env]
+"WITH SPACE" = "a b"
+"dotted.key" = 'single \ quoted'
+unicode = "ünïcødé ✓"
+tab = "a\tb"
+empty = ""
+multi = """
+line one
+line two"""
+apostrophe = "it's"
+both = "it's \"both\""
+[target."cfg(target_os = \"linux\")"]
+rustflags = ["-C", "link-arg=-Wl,--as-needed"]
+["weird.table"]
+"" = 1

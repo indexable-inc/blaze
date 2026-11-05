@@ -1,0 +1,3 @@
+daemon.log
+daemon.sock.lock
+workers
