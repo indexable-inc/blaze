@@ -170,6 +170,17 @@ pub enum Unit {
     Line,
 }
 
+impl Unit {
+    /// What the `clicks`th press in a row selects by: a single press cells, a double words, a triple or more lines.
+    pub fn of_clicks(clicks: isize) -> Self {
+        match clicks {
+            ..=1 => Unit::Cell,
+            2 => Unit::Word,
+            _ => Unit::Line,
+        }
+    }
+}
+
 /// The selection, in screen rows (0 the top visible row at scroll 0, negative into the history) and columns; the drag
 /// making it; the unit it selects by and the span the press selected (a drag keeps it whole).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]

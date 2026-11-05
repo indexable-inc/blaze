@@ -720,11 +720,7 @@ impl App {
             return;
         }
         let at = (vr - self.get::<TermScroll>(t).shift, col);
-        let unit = match clicks {
-            ..=1 => Unit::Cell,
-            2 => Unit::Word,
-            _ => Unit::Line,
-        };
+        let unit = Unit::of_clicks(clicks);
         let anchor = self.unit_span(t, at, unit);
         self.put(t, TermSelection { sel: Some(anchor), selecting: true, unit, anchor });
     }

@@ -1698,26 +1698,9 @@ impl App {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
                 self.genui_action(ev);
-            } else if let Some(url) = a.strip_prefix("open:") {
-                // A link in a view: the browser opens it; a file (a cell's FileRef: an absolute path) opens in the app
-                // the system gives its kind, and one that would run (an executable, an app) is shown in the Finder
-                // instead. Anything else stays put, said.
-                let args: Option<Vec<&str>> = if url.starts_with("https://") || url.starts_with("http://") {
-                    Some(vec![url])
-                } else if url.starts_with('/') {
-                    use std::os::unix::fs::PermissionsExt;
-                    let runs = std::fs::metadata(url).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                        || [".app", ".command", ".tool", ".terminal"].iter().any(|x| url.trim_end_matches('/').ends_with(x));
-                    Some(if runs { vec!["-R", url] } else { vec![url] })
-                } else {
-                    eprintln!("harness-native: open {url:?}: not a web link or an absolute path");
-                    None
-                };
-                if let Some(args) = args
-                    && let Err(e) = std::process::Command::new("/usr/bin/open").args(&args).spawn()
-                {
-                    eprintln!("harness-native: open {url}: {e}");
-                }
+            } else if let Some(target) = a.strip_prefix("open:") {
+                // A link in a view (the browser), or a file (a cell's FileRef) in the app its kind opens in, at its line.
+                crate::open::open(target);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

@@ -10,7 +10,7 @@
 use super::*;
 use crate::link::Link;
 use harness_native_ui_input_api::{Focused, Pressable};
-use harness_native_ui_layout_api::LayoutPriority;
+use harness_native_ui_layout_api::{LayoutPriority, ScrollState, scroll_quietly};
 use harness_native_ui_look_api::Edge;
 use harness_native_ui_motion_api::Pose;
 use std::collections::BTreeMap;
@@ -155,6 +155,15 @@ pub struct Live {
     pub(super) pending: Vec<(String, String, Value)>,
     /// Something drawn moves on the clock (a spinner, a skeleton, a toast's time): keep drawing.
     pub(super) anim: bool,
+    /// Each split dragged here, by its element's entity: where it was let go, over the ratio the tree said then. It holds
+    /// until the tree says another ratio (its onChange's echo, or the cell's own change).
+    splits: BTreeMap<u64, Kept>,
+}
+
+/// A split's ratio as dragged (`at`) while the tree still says `from`.
+struct Kept {
+    from: f64,
+    at: f64,
 }
 
 /// An open float: its cell, what closes it (the events to send), and whether it is modal (a dialog or a sheet: only
@@ -183,6 +192,9 @@ struct Field {
     /// words: the kernel cleared or rewrote the field. Typing again ends it.
     adopt: bool,
     echoes: Vec<String>,
+    /// A press on it is held: the unit it selects by and the span it selected, which a drag extends from and keeps whole
+    /// ([`Draft::drag_to`]). Held, it keeps the keys until the input pass has given it focus.
+    drag: Option<(Unit, (usize, usize))>,
 }
 
 struct Slide {
@@ -622,15 +634,25 @@ fn slider(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
 }
 
 /// A Split (genui.flecs `hn.GenSplit`, `hn.GenSplitDown` when vertical): its two panes `a` and `b` shared by the ratio
-/// (their Grow weights), the one the pointer has while its rule is dragged; the rule armed to be dragged when it has an
-/// onChange. The rule is [`SPLIT_HIT`] wide.
+/// (their Grow weights). Its rule always drags: the ratio is the pointer's while it is dragged, then where it was let go
+/// ([`Kept`], the split's own state) until the tree says another; an onChange only hears of it.
 pub(super) fn split(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let h = handler(node, "onChange");
     let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Split, change: h, submit: None, min: 0.05, max: 0.95, step: 0.001 };
-    let mut ratio = number(node, "ratio").unwrap_or(0.5).clamp(0.05, 0.95);
-    if let Some(s) = b.live.as_deref_mut().and_then(|l| l.slide.as_mut()).filter(|s| s.spec.node == v.id()) {
-        s.spec = spec.clone();
-        ratio = s.value;
+    let said = number(node, "ratio").unwrap_or(0.5).clamp(0.05, 0.95);
+    let mut ratio = said;
+    if let Some(live) = b.live.as_deref_mut() {
+        if let Some(s) = live.slide.as_mut().filter(|s| s.spec.node == v.id()) {
+            s.spec = spec.clone();
+            ratio = s.value;
+            live.splits.insert(v.id(), Kept { from: said, at: ratio });
+        } else if let Some(k) = live.splits.get(&v.id()) {
+            if (k.from - said).abs() < 1e-9 {
+                ratio = k.at;
+            } else {
+                live.splits.remove(&v.id());
+            }
+        }
     }
     let down = v.entity().try_cloned::<&Flex>().is_some_and(|f| f.axis == harness_native_ui_layout_api::FlexAxis::Column);
     for (part, share) in [("a", ratio as f32), ("b", 1.0 - ratio as f32)] {
@@ -643,7 +665,7 @@ pub(super) fn split(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b:
         }
     }
     if let Some(rule) = v.part("rule") {
-        arm(rule, spec.change.is_some().then(|| spec.action()).as_deref());
+        arm(rule, Some(&spec.action()));
     }
     for (part, kid) in [("a", kids.first()), ("b", kids.get(1))] {
         if let (Some(p), Some(kid)) = (v.part(part), kid) {
@@ -732,6 +754,29 @@ fn field(bx: View<'_>, edged: View<'_>, spec: &Spec, value: String, placeholder:
     if let Some(h) = bx.part("hint") {
         h.text(if shown.is_empty() { placeholder } else { "" });
     }
+    // One line (an Input, a number's box): while it has the keys its box scrolls (a ScrollState, so layout gives its
+    // words their whole length instead of cutting them with an ellipsis) and they slide sideways to keep the caret in
+    // view, moved as little as they can from where they were (the box as laid out last frame). As it lets the keys go
+    // the box stops scrolling: its words show from their start again, cut to fit. A TextArea grows with its words.
+    if spec.k != Kind::Area {
+        let e = bx.entity();
+        match (edit, bx.part("text")) {
+            (Some(([caret, ..], ..)), Some(t)) => {
+                let from = e.try_cloned::<&ScrollState>().unwrap_or_default();
+                let room = e.try_cloned::<&Laid>().map_or(0.0, |l| {
+                    let pad = e.try_cloned::<&Padding>().unwrap_or_default();
+                    l.w - pad.l - pad.r
+                });
+                let style = t.entity().try_cloned::<&TextStyle>().unwrap_or_default();
+                let at = (*b.measure)(&shown[..byte_of(&shown, caret as usize)], &style, false);
+                let len = (*b.measure)(&shown, &style, false);
+                let x = if room > 0.0 { keep_in_view(from.x, at, room, len) } else { 0.0 };
+                scroll_quietly(e, ScrollState { x, y: 0.0 });
+            }
+            _ if e.has(ScrollState::id()) => _ = e.remove(ScrollState::id()),
+            _ => {}
+        }
+    }
     let world = bx.entity().world();
     let rest = view::prefab(world, prefab).and_then(|p| p.try_cloned::<&Edge>());
     let want = if edit.is_some() { edge_of(world, "hn.GenCheckboxOn", "box") } else { rest };
@@ -813,6 +858,10 @@ impl App {
                         let at = self.drag_at(&spec);
                         let mut live = self.genui.borrow_mut();
                         let sent = live.slide.take().filter(|s| s.spec.node == spec.node).and_then(|s| s.sent);
+                        // A split keeps where it was let go.
+                        if let (Some(v), Some(k)) = (at, live.splits.get_mut(&spec.node)) {
+                            k.at = v;
+                        }
                         drop(live);
                         if let Some(v) = at.filter(|v| sent != Some(*v)) {
                             flush(&self.link, Out::new(&spec, spec.change.as_ref(), num_value(v)).into_iter().collect());
@@ -858,38 +907,90 @@ impl App {
         Some(snap(spec.min + frac * (spec.max - spec.min), spec.min, spec.max, spec.step))
     }
 
-    /// Field `spec` was pressed: it has the keys now, the caret where the press was (a double press its word, a triple
-    /// its line).
-    fn field_press(&mut self, spec: Spec) {
+    /// Field `spec` was pressed and let go over itself: it has the keys. It took them at the press, the caret where the
+    /// press was ([`Self::genui_pointer_down`]), so a drag's selection stands.
+    fn field_press(&self, spec: Spec) {
         self.genui_begin(&spec);
-        let (x, y) = (self.pointer.x, self.pointer.y);
+    }
+
+    /// A left press (before the chat's: [`App::chat_pointer_down`]) on a cell's field, the hovered node or one around
+    /// it: the field takes the keys now (the input pass focuses it after) and the caret goes where the press was, a
+    /// double press selecting its word and a triple its line, held so a drag extends it ([`Self::genui_pointer_drag`]).
+    /// Whether the press was on a field.
+    pub(in crate::app) fn genui_pointer_down(&mut self, clicks: isize) -> bool {
         let w = self.world.world_ref();
-        let Some(t) = text_node(w, &spec) else { return };
-        let Some((lay, l)) = words_layout(&mut self.paint.borrow_mut(), t.entity()) else { return };
-        let u = lay.index_at(x - l.x, y - l.y);
-        let unit = match self.press.0 {
-            ..=1 => Unit::Cell,
-            2 => Unit::Word,
-            _ => Unit::Line,
-        };
+        let Some(h) = w.entity_named(APP).target(Hovered::id(), 0) else { return false };
+        let spec = std::iter::successors(Some(h), |n| n.parent()).take(4).find_map(Spec::of);
+        let Some(spec) = spec.filter(|s| s.k.typed()) else { return false };
+        self.genui_begin(&spec);
+        let unit = Unit::of_clicks(clicks);
+        let at = self.field_index(&spec);
         let now = self.time;
         if let Some(f) = self.genui.borrow_mut().field.as_mut().filter(|f| f.spec.node == spec.node)
             && f.draft.marked.is_none()
+            && let Some(i) = at
         {
-            let i = byte_of(&f.draft.text, u);
-            let (a, c) = f.draft.span(i, unit);
-            (f.draft.anchor, f.draft.caret, f.draft.goal) = (a, c, None);
+            f.drag = Some((unit, f.draft.press(i, unit)));
             f.since = now;
         }
+        self.poke();
+        true
     }
 
-    /// Field `spec` takes the keys (unless it has them): its words are the tree's as shown.
+    /// The pointer moved with a press on a cell's field held: its selection follows, the pressed span kept whole
+    /// ([`Draft::drag_to`]). Whether a field's press is held.
+    pub(in crate::app) fn genui_pointer_drag(&mut self) -> bool {
+        let held = self.genui.borrow().field.as_ref().and_then(|f| Some((f.spec.clone(), f.drag?)));
+        let Some((spec, (unit, span))) = held else { return false };
+        let at = self.field_index(&spec);
+        let now = self.time;
+        if let Some(f) = self.genui.borrow_mut().field.as_mut()
+            && let Some(i) = at
+        {
+            f.draft.drag_to(i, unit, span);
+            f.since = now;
+        }
+        self.poke();
+        true
+    }
+
+    /// The press let go: a field's drag ends. Whether one was held.
+    pub(in crate::app) fn genui_pointer_up(&mut self) -> bool {
+        let held = self.genui.borrow_mut().field.as_mut().is_some_and(|f| f.drag.take().is_some());
+        if held {
+            self.poke();
+        }
+        held
+    }
+
+    /// The byte of field `spec`'s words nearest the pointer, on its words as laid out (shifted as its box scrolls them
+    /// sideways). None while it does not have the keys or is not laid out.
+    fn field_index(&self, spec: &Spec) -> Option<usize> {
+        let t = text_node(self.world.world_ref(), spec)?;
+        let (lay, l) = words_layout(&mut self.paint.borrow_mut(), t.entity())?;
+        let u = lay.index_at(self.pointer.x - l.x, self.pointer.y - l.y);
+        let live = self.genui.borrow();
+        let f = live.field.as_ref().filter(|f| f.spec.node == spec.node)?;
+        Some(byte_of(&f.draft.text, u))
+    }
+
+    /// Where the field that has the keys shows its caret (window points, unzoomed: [`words_caret`]), for the input
+    /// method's candidate window; Some(None) while its words are not laid out. None when no field has the keys.
+    pub(in crate::app) fn genui_caret(&self) -> Option<Option<[f32; 4]>> {
+        let spec = self.genui.borrow().field.as_ref()?.spec.clone();
+        let t = text_node(self.world.world_ref(), &spec);
+        Some(t.and_then(|t| words_caret(&mut self.paint.borrow_mut(), t.entity())))
+    }
+
+    /// Field `spec` takes the keys (unless it has them): its words are the tree's as shown. The field that had them lets
+    /// them go first, sending its words.
     fn genui_begin(&self, spec: &Spec) {
         let w = self.world.world_ref();
         let mut live = self.genui.borrow_mut();
         if live.field.as_ref().is_some_and(|f| f.spec.node == spec.node) {
             return;
         }
+        let out: Vec<Out> = live.field.take().and_then(|f| commit(&f)).into_iter().collect();
         let text = text_node(w, spec).and_then(|t| t.entity().try_cloned::<&Text>()).map(|t| t.s.as_str().to_owned()).unwrap_or_default();
         let n = text.len();
         live.field = Some(Field {
@@ -900,7 +1001,10 @@ impl App {
             since: self.time,
             adopt: false,
             echoes: Vec::new(),
+            drag: None,
         });
+        drop(live);
+        flush(&self.link, out);
     }
 
     /// Step the controls a frame (before the view is filled): a field takes or lets go of the keys as focus moves (letting
@@ -920,11 +1024,15 @@ impl App {
             let mut live = self.genui.borrow_mut();
             live.now = now;
             live.blink = self.focused && self.look.themes[usize::from(self.dark)].blink;
-            // Focus went elsewhere: the field lets go of the keys and sends its words.
-            if let Some(f) = live.field.take_if(|f| focused.as_ref().is_none_or(|s| s.node != f.spec.node)) {
+            // Focus went elsewhere: the field lets go of the keys and sends its words. Not while a press is new (this
+            // frame's input pass moves focus to what it pressed, after this step): a field pressed took the keys at the
+            // press (`genui_pointer_down`), before focus reaches it.
+            let settled = !went_down;
+            if settled && let Some(f) = live.field.take_if(|f| focused.as_ref().is_none_or(|s| s.node != f.spec.node)) {
                 out.extend(commit(&f));
             }
-            if live.field.is_none()
+            if settled
+                && live.field.is_none()
                 && let Some(s) = &focused
             {
                 drop(live);
@@ -1202,6 +1310,7 @@ fn prune(w: WorldRef<'_>, live: &mut Live) {
         e.is_alive() && (View::of(e).part("float").is_some() || View::of(e).part("scrim").is_some())
     });
     live.toasts.retain(|el, _| w.entity_from_id(*el).is_alive());
+    live.splits.retain(|el, _| w.entity_from_id(*el).is_alive());
 }
 
 /// A number typed into `spec`'s field, bounded; None when it is not one.

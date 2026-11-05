@@ -273,7 +273,8 @@ pub(super) fn element(v: View<'_>, node: &Value, kind: &str, kids: &[&Value], de
             if v.entity().try_cloned::<&Tooltip>() != Some(tip.clone()) {
                 v.set(tip);
             }
-            arm(v, Some(&format!("open:{path}")));
+            // `open:<line>:<path>` opens it at its line (src/open.rs).
+            arm(v, Some(&line.map_or_else(|| format!("open:{path}"), |n| format!("open:{n}:{path}"))));
         }
         _ => {}
     }

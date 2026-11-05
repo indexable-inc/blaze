@@ -138,6 +138,23 @@ pub(super) fn fill(row: View<'_>, ui: &Value, cell: &str, live: Option<&std::cel
     }
 }
 
+/// Whether tree `ui` has a Dialog or a Sheet open (within the caps a drawing keeps to): its row must stay while it does.
+pub(super) fn holds_modal(ui: &Value) -> bool {
+    fn walk(node: &Value, depth: usize, left: &mut usize) -> bool {
+        match node {
+            Value::Array(a) => a.iter().any(|n| walk(n, depth, left)),
+            Value::Object(_) if *left > 0 && depth < MAX_DEPTH => {
+                *left -= 1;
+                let modal = matches!(node["type"].as_str(), Some("Dialog" | "Sheet")) && prop(node, "open") == &Value::Bool(true);
+                modal || walk(&node["children"], depth + 1, left)
+            }
+            _ => false,
+        }
+    }
+    let mut left = MAX_ELEMENTS;
+    walk(ui, 0, &mut left)
+}
+
 fn prefab_of(kind: &str) -> &'static str {
     ELEMENTS.iter().find(|(k, _)| *k == kind).map_or(UNKNOWN, |(_, p)| p)
 }
@@ -671,10 +688,10 @@ mod tests {
     /// is armed with the events it sends (a tab its value, a disclosure's head `!open`, an accordion's closed head the open
     /// one's close then its own open, a popover's trigger and its button `!open`, a menu row its pick then the close, a
     /// dialog's scrim onClose(false) and a sheet's that may not be dismissed nothing, a chip its value or `!selected`, a
-    /// tile its value, a file chip `open:` its path, a split's rule its drag), what floats is placed over the pane (a
-    /// popover's plate under its trigger, a dialog's plate on its scrim) and noted to close, misplaced or wrong props are
-    /// refused in words, a toast's time runs out into onDismiss(null), and real presses through the input pass activate
-    /// a dialog's scrim, a tab and an accordion's head with those events.
+    /// tile its value, a file chip `open:` its path and line, a split's rule its drag, with an onChange or without), what
+    /// floats is placed over the pane (a popover's plate under its trigger, a dialog's plate on its scrim) and noted to
+    /// close, misplaced or wrong props are refused in words, a toast's time runs out into onDismiss(null), and real
+    /// presses through the input pass activate a dialog's scrim, a tab and an accordion's head with those events.
     #[test]
     fn tier_three_draws_and_sends() {
         use harness_native_ui_input_api::{Action, Activated, PointerState};
@@ -808,7 +825,8 @@ mod tests {
         assert!((sa.w / (sa.w + sb.w) - 0.4).abs() < 0.01, "panes by the ratio: {sa:?} {sb:?}");
         let rule = action(part(el(4), "rule")).unwrap_or_default();
         assert!(rule.starts_with("ui:{") && rule.contains(r#""k":"split""#) && rule.contains(r#""change":"h6""#), "the rule drags: {rule}");
-        assert_eq!(action(part(el(21), "rule")), None, "a split with no onChange does not drag");
+        let quiet = action(part(el(21), "rule")).unwrap_or_default();
+        assert!(quiet.contains(r#""k":"split""#) && quiet.contains(r#""change":null"#), "a split with no onChange drags all the same: {quiet}");
         assert_eq!(action(part(el(5), "bar.tabs.t0")), Some(one("h1", "\"a\"")));
         assert!(is(part(el(5), "bar.tabs.t1"), "hn.GenTabOn") && words_of(part(el(5), "bar.tabs.t1.head.label")) == "Bee");
         laid(part(el(5), "body.g0"), "the tab's body");
@@ -846,7 +864,7 @@ mod tests {
         assert!(is(part(el(14), "b1"), "hn.GenBoneShort") && laid(part(el(14), "b1"), "a bone").w < laid(part(el(14), "b0"), "a bone").w);
         assert_eq!(el(15).entity().try_cloned::<&Icon>().map(|i| i.glyph.as_str().to_owned()).as_deref(), Some("\u{E7A8}"), "rust is a file kind");
         assert_eq!(action(el(16)), Some(one("h5", "\"icon\"")));
-        assert_eq!(action(el(17)).as_deref(), Some("open:/x/src/tree.ts"));
+        assert_eq!(action(el(17)).as_deref(), Some("open:60:/x/src/tree.ts"), "a file chip opens its file at its line");
         assert_eq!((words_of(part(el(17), "name")), words_of(part(el(17), "line"))), ("tree.ts".to_owned(), ":60".to_owned()));
         for (i, says) in [(18, "<Layer> is not in a Stack"), (19, "<Icon> name"), (20, "<Grid> has no prop \u{201C}foo\u{201D}")] {
             let t = words_of(el(i));
