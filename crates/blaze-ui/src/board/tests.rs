@@ -1,4 +1,6 @@
-use blaze_protocol::now::{Blocker, Busy, Download, Memory, Now, Phase, Span, Tally, Task, Took};
+use blaze_protocol::now::{
+    Blocker, Busy, Download, Expansion, Memory, Now, Phase, Running, Span, Tally, Task, Took,
+};
 use expect_test::expect_file;
 use ratatui::{buffer::Buffer, layout::Rect};
 
@@ -26,7 +28,7 @@ fn andrew() -> Now {
         at_ms: 914_000,
         phase: Phase::Compiling,
         stage: String::new(),
-        tally: Tally { waiting: 81, ready: 0, running: 1, done: 488, failed: 0, total: 570 },
+        tally: Tally { waiting: 80, ready: 0, running: 3, done: 487, failed: 0, total: 570 },
         workers: 16,
         busy: vec![Busy {
             thread: "blaze-worker-3".to_owned(),
@@ -34,6 +36,52 @@ fn andrew() -> Now {
             span: span.clone(),
             path: vec!["task".to_owned(), "codegen".to_owned(), "copy_prop".to_owned()],
         }],
+        recent: 0,
+        running: vec![
+            Running {
+                task: task(7, "codegen", "core 0.0.0 lib (host)"),
+                for_ms: 270_000,
+                thread: Some("blaze-worker-3".to_owned()),
+                span: Some(span.clone()),
+                path: vec!["copy_prop".to_owned()],
+            },
+            Running {
+                task: task(9, "test", "blaze-ui 0.1.0 lib test (host)"),
+                for_ms: 121_000,
+                thread: Some("blaze-worker-5".to_owned()),
+                span: Some(Span {
+                    name: "test run".to_owned(),
+                    item: None,
+                    krate: None,
+                    awaits: Some("the test process".to_owned()),
+                    for_ms: 121_000,
+                }),
+                path: Vec::new(),
+            },
+            Running {
+                task: task(11, "script-run", "ring 0.17.8 build-script (host)"),
+                for_ms: 31_000,
+                thread: None,
+                span: None,
+                path: Vec::new(),
+            },
+        ],
+        failures: Vec::new(),
+        expanding: Expansion {
+            threads: 32,
+            busy: vec![Busy {
+                thread: "blaze wasm expansion".to_owned(),
+                task: None,
+                span: Span {
+                    name: "proc macro expansion".to_owned(),
+                    item: Some("serde_derive::Serialize".to_owned()),
+                    krate: Some("blaze-api".to_owned()),
+                    awaits: None,
+                    for_ms: 1_200,
+                },
+                path: Vec::new(),
+            }],
+        },
         blockers: vec![Blocker {
             task: task(7, "codegen", "core"),
             running: true,

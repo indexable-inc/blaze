@@ -835,6 +835,44 @@ fn applied_units(units: &[blaze_units::schema::Unit]) -> Vec<u32> {
     (0u32..).zip(units).filter(|(_, unit)| applied(unit)).map(|(at, _)| at).collect()
 }
 
+/// Writes into `name` (cleared first) a unit's plane-node name, the one every phase of it
+/// carries and the build view shows: the package's name and version, the target as a person
+/// says it, and what it is built for, `object 0.36.7 build-script (host)`,
+/// `serde_derive 1.0.219 proc-macro (macro)`, `blaze-ui 0.1.0 lib test (aarch64-unknown-linux-gnu)`.
+/// A package the plan does not list is named by its id.
+fn node_name(
+    name: &mut String,
+    unit: &blaze_units::schema::Unit,
+    packages: &HashMap<&str, (&str, &str), Global>,
+) {
+    use std::fmt::Write as _;
+    name.clear();
+    match packages.get(unit.pkg_id.as_str()) {
+        Some((package, version)) => _ = write!(name, "{package} {version}"),
+        None => name.push_str(&unit.pkg_id),
+    }
+    let target = &unit.target;
+    if target.is_custom_build() {
+        name.push_str(" build-script");
+    } else if target.is_proc_macro() {
+        name.push_str(" proc-macro");
+    } else if target.is_lib() {
+        name.push_str(" lib");
+    } else {
+        let kind = target.kind.first().map_or("bin", String::as_str);
+        _ = write!(name, " {kind} {}", target.name);
+    }
+    let tested = unit.mode == UnitMode::Test || unit.checked_as_test;
+    if tested && !target.kind.iter().any(|it| it == "test" || it == "bench") {
+        name.push_str(" test");
+    }
+    match (&unit.platform, unit.macro_wasm) {
+        (_, true) => name.push_str(" (macro)"),
+        (Some(triple), false) => _ = write!(name, " ({triple})"),
+        (None, false) => name.push_str(" (host)"),
+    }
+}
+
 /// The proc macros among the units `picked` of `units`, each `name version`, sorted, for the
 /// span of a reach that waits on them.
 fn macro_names(units: &Units, picked: &[u32]) -> String {
@@ -4462,6 +4500,13 @@ impl<S: Steps> Jobs<S> {
         let fresh_units = vec![None; all.len()]; // alloc: once per build
         let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
+        // Each package's `name version` by its id, what a node is named by.
+        let mut packages = HashMap::new_in(Global); // alloc: once per build, a package an entry
+        for package in &input.units.packages {
+            packages.insert(package.id.as_str(), (package.name.as_str(), package.version.as_str()));
+        }
+        // alloc: a name buffer, once per build, reused by every unit
+        let mut name = String::new();
         let (mut names, mut all_deps) = (0, 0);
         for offset in 0..built {
             let at = unit_at(offset);
@@ -4469,15 +4514,16 @@ impl<S: Steps> Jobs<S> {
             let count = phases_of(unit).len().max(1);
             units_of.extend(std::iter::repeat_n(at as u32, count));
             last[at] = u32::try_from(units_of.len() - 1).expect("under 2^32 nodes");
-            names += count * (unit.pkg_id.len() + 1 + unit.target.name.len());
+            node_name(&mut name, unit, &packages);
+            names += count * name.len();
             // A phase waits for at most two of its unit's before it.
             all_deps += unit.dependencies.len() + 2 * count;
         }
         let count = u32::try_from(units_of.len()).expect("under 2^32 nodes");
         let mut nodes = w.plane.fresh(count, names, all_deps);
         let first = nodes.first();
-        // alloc: a name and a deps buffer, once per build, reused by every unit
-        let (mut name, mut deps) = (String::new(), Vec::new());
+        // alloc: a deps buffer, once per build, reused by every unit
+        let mut deps = Vec::new();
         let mut next = first.0;
         // Each unit's source bytes, what its phases' memory is predicted from
         // (`Plane::push_sized`): a stat of each `.rs` file under its modules' directories,
@@ -4487,10 +4533,7 @@ impl<S: Steps> Jobs<S> {
         for offset in 0..built {
             let at = unit_at(offset);
             let unit = &all[at];
-            name.clear();
-            name.push_str(&unit.pkg_id);
-            name.push(' ');
-            name.push_str(&unit.target.name);
+            node_name(&mut name, unit, &packages);
             deps.clear();
             deps.extend(
                 unit.dependencies.iter().map(|dep| NodeId(first.0 + last[dep.index as usize])),

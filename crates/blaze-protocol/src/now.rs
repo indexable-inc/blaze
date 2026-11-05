@@ -78,6 +78,15 @@ pub struct Now {
     pub workers: u32,
     /// Each busy worker, the one inside its span longest first.
     pub busy: Vec<Busy>,
+    /// Every running task, the one running longest first, then by id: at most [`RUNNING`].
+    /// What a view lists a row each, so everything under way is seen at once.
+    pub running: Vec<Running>,
+    /// How many tasks settled in the last [`RECENT_MS`] (or since the clock began, when that
+    /// is shorter): the build's rate, counted, never extrapolated.
+    pub recent: u32,
+    /// The tasks that failed (not those cancelled), in the order they failed: at most
+    /// [`FAILURES`].
+    pub failures: Vec<Task>,
     /// The unfinished tasks whose inputs are all done (running or ready), the one holding the
     /// most back first ([`Blocker`]). At most [`BLOCKERS`].
     pub blockers: Vec<Blocker>,
@@ -85,12 +94,14 @@ pub struct Now {
     pub downloads: Vec<Download>,
     /// The settled tasks that took longest, longest first. At most [`SLOWEST`].
     pub slowest: Vec<Took>,
-    /// How long since a task settled, a download got a byte or a span closed.
+    /// How long since a task settled or a download got a byte.
     pub quiet_ms: u64,
     /// The daemon's memory against its ceiling, and how pressed it is.
     pub memory: Memory,
+    /// The proc-macro expansion threads: how many there are and what the busy ones expand.
+    pub expanding: Expansion,
 }
-keys [busy, at_ms, phase, stage, tally, memory, slowest, workers, blockers, quiet_ms, downloads]
+keys [busy, at_ms, phase, stage, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
 }
 
 impl Default for Phase {
@@ -105,13 +116,21 @@ impl Now {
         self.workers.saturating_sub(self.busy.len() as u32)
     }
 
-    /// Whether nothing moves: no worker is busy, no download in flight, and nothing settled
-    /// for [`STALL_MS`]. With a worker busy the build is slow, not stalled.
+    /// Whether nothing moves: no worker is busy, no download in flight, no process runs (a
+    /// build script's or a test's), and nothing settled for [`STALL_MS`]. With a worker busy
+    /// or a process running the build is slow, not stalled.
     pub fn stalled(&self) -> bool {
-        self.quiet_ms >= STALL_MS && self.busy.is_empty() && self.downloads.is_empty()
+        let process = |it: &Running| {
+            matches!(it.task.kind.as_str(), "script-run" | "test") && it.thread.is_none()
+        };
+        self.quiet_ms >= STALL_MS
+            && self.busy.is_empty()
+            && self.downloads.is_empty()
+            && !self.running.iter().any(process)
     }
 
-    /// Whether nothing settled for [`STALL_MS`] while a worker is busy or a download runs.
+    /// Whether nothing settled for [`STALL_MS`] while a worker is busy, a process runs or a
+    /// download moves.
     pub fn slow(&self) -> bool {
         self.quiet_ms >= STALL_MS && !self.stalled()
     }
@@ -136,7 +155,9 @@ pub struct Memory {
     pub over: Option<String>,
     /// Tasks ready to run that admission keeps waiting until memory frees.
     pub held_back: u32,
-    /// Releases (front-end memory let go under pressure) during this build.
+    /// Releases (front-end memory let go under pressure) during this build. A [`Look`] carries
+    /// the daemon's count since it started; the fold says how many came since the build's
+    /// first look.
     pub releases: u32,
 }
 keys [held, over, peak, limit, releases, held_back]
@@ -188,6 +209,15 @@ pub const SLOWEST: usize = 10;
 /// The most tasks a [`Blocker`] names as held behind it.
 pub const BEHIND: usize = 4;
 
+/// The most running tasks a [`Now`] lists; the rest are in [`Tally::running`].
+pub const RUNNING: usize = 256;
+
+/// The most failed tasks a [`Now`] names.
+pub const FAILURES: usize = 16;
+
+/// The window [`Now::recent`] counts settles over.
+pub const RECENT_MS: u64 = 30_000;
+
 crate::in_key_order! {
 /// How many of the build's tasks are where.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -211,7 +241,8 @@ pub struct Task {
     pub id: u64,
     /// Its layer's label: for a build, the [`NodeKind`]'s name (`codegen`, `script-run`).
     pub kind: String,
-    /// For a build, `<package> <target>`, as the plane names it.
+    /// For a build, the unit as the plane names it: `object 0.36.7 build-script (host)`, its
+    /// package, version, target and what it is built for.
     pub name: String,
 }
 keys [id, kind, name]
@@ -321,6 +352,38 @@ keys [path, span, task, thread]
 }
 
 crate::in_key_order! {
+/// The proc-macro expansion lane: its threads (`blaze wasm expansion`), which are no pool
+/// workers and serve every build at once, and the busy ones, each with what it expands (the
+/// macro by path, the crate it expands in).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct Expansion {
+    pub threads: u32,
+    /// The ones inside a span that is no wait, the one in it longest first.
+    pub busy: Vec<Busy>,
+}
+keys [busy, threads]
+}
+
+crate::in_key_order! {
+/// A running task: since when, and, when a worker is inside it, that worker's innermost span.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Running {
+    pub task: Task,
+    /// Since it began running.
+    pub for_ms: u64,
+    /// The worker inside it, by thread name; `None` for a task no worker thread is inside (a
+    /// process it waits on, a task that runs on the plane's loop, a job parked on its fiber).
+    pub thread: Option<String>,
+    /// That worker's innermost span: a wait ([`Span::awaits`]) when the task is under way but
+    /// its thread waits, which a view says as waiting, not as work.
+    pub span: Option<Span>,
+    /// That worker's spans strictly between its outermost and its innermost ([`Busy::path`]).
+    pub path: Vec<String>,
+}
+keys [path, span, task, for_ms, thread]
+}
+
+crate::in_key_order! {
 /// An unfinished task whose inputs are all done, and what waits on it.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Blocker {
@@ -398,11 +461,13 @@ pub struct Look<'a> {
     pub downloads: &'a [Download],
     /// The stage's words, empty while the units build ([`Now::stage`]).
     pub stage: &'a str,
-    /// Spans closed on the build's threads since the last look: progress.
-    pub closed: u64,
-    /// The daemon's memory now ([`Memory::peak`] and [`Memory::releases`] are the fold's to
-    /// keep: the look's are ignored).
+    /// The daemon's memory now: [`Memory::peak`] is the fold's to keep (the look's is ignored),
+    /// and [`Memory::releases`] is the daemon's count since it started.
     pub memory: &'a Memory,
+    /// The proc-macro expansion threads, each with its open spans (none for an idle one).
+    pub expanders: &'a [Worker],
+    /// How many expansion threads there are, idle ones included.
+    pub expansion_threads: u32,
 }
 
 /// The sans-IO core: folds a program's tasks, their moves and looks into [`Now`]s.
@@ -445,14 +510,18 @@ pub struct Fold {
     now_ns: u64,
     /// Whether the clock was set: the quiet time counts from its first setting.
     clocked: bool,
-    /// When a task last settled, a download last got a byte or a look said a span closed.
+    /// When a task last settled or a download last got a byte.
     moved_ns: u64,
     /// The tasks, in the order first said.
     tasks: Vec<Slot>,
     /// Each task's slot in `tasks`, by id. Asked, never iterated.
     slots: HashMap<u64, u32, Global>,
-    /// Releases counted ([`Memory::releases`]).
-    releases: u32,
+    /// The daemon's release count at the build's first look ([`Memory::releases`]).
+    releases_base: Option<u32>,
+    /// When each task settled in the last [`RECENT_MS`], oldest first ([`Now::recent`]).
+    settles: std::collections::VecDeque<u64>,
+    /// The failed tasks' ids, in the order they failed: at most [`FAILURES`].
+    failures: Vec<u64>,
     /// The most memory held at any look ([`Memory::peak`]).
     peak: u64,
     /// The slowest settled tasks that ran, as how long each ran and its id, longest first and
@@ -648,6 +717,12 @@ impl Fold {
             State::Done | State::Failed | State::Cancelled if was.unfinished() => {
                 self.moved_ns = self.moved_ns.max(now);
                 ran = slot.running_ns.map(|began| now.saturating_sub(began));
+                // alloc: the settles of the last RECENT_MS, pruned at each look.
+                self.settles.push_back(now);
+                if state == State::Failed && self.failures.len() < FAILURES {
+                    // alloc: at most FAILURES ids.
+                    self.failures.push(id);
+                }
             }
             _ => {}
         }
@@ -676,15 +751,11 @@ impl Fold {
         }
     }
 
-    /// A release ran (memory let go under pressure): counted in [`Memory::releases`].
-    pub fn released(&mut self) {
-        self.releases = self.releases.saturating_add(1);
-    }
-
     /// The build as of the clock, with what this look found.
     pub fn look(&mut self, look: &Look<'_>) -> Now {
         let tally = self.tally();
         self.peak = self.peak.max(look.memory.held);
+        let base = *self.releases_base.get_or_insert(look.memory.releases);
         let memory = Memory {
             held: look.memory.held,
             peak: self.peak,
@@ -692,9 +763,16 @@ impl Fold {
             // alloc: the look's answer owns its strings.
             over: look.memory.over.clone(),
             held_back: look.memory.held_back,
-            releases: self.releases,
+            releases: look.memory.releases.saturating_sub(base),
         };
         let busy = self.busy(look.threads);
+        let running = self.running(look.threads);
+        let expanding = Expansion { threads: look.expansion_threads, busy: self.busy(look.expanders) };
+        let since = self.now_ns.saturating_sub(RECENT_MS * MS);
+        while self.settles.front().is_some_and(|&at| at < since) {
+            self.settles.pop_front();
+        }
+        let failures = self.failures.iter().filter_map(|&id| self.task(id)).collect(); // alloc: at most FAILURES
         let blockers = blockers(&self.tasks, &self.slots, self.now_ns, &mut self.walk, &busy);
         let phase = self.phase(&tally, look);
         let quiet_ms = self.quiet_ms(look);
@@ -706,12 +784,16 @@ impl Fold {
             tally,
             workers: look.workers,
             busy,
+            running,
+            recent: self.settles.len() as u32,
+            failures,
             blockers,
             // alloc: the look's answer owns its downloads.
             downloads: look.downloads.to_vec(),
             slowest: self.slowest_tasks(),
             quiet_ms,
             memory,
+            expanding,
         }
     }
 
@@ -780,11 +862,15 @@ impl Fold {
         tally
     }
 
-    /// The busy workers: each with an open span, its innermost span and its task, the one in
-    /// its outermost span longest first, then by thread.
+    /// The busy workers: each inside a span whose innermost is no wait, with the span it is
+    /// shown by ([`shown`]) and its task, the one in its outermost span longest first, then by
+    /// thread.
     fn busy(&self, threads: &[Worker]) -> Vec<Busy> {
         // alloc: the busy workers of one look, a few dozen at most.
-        let mut on: Vec<&Worker> = threads.iter().filter(|it| !it.open.is_empty()).collect();
+        let mut on: Vec<&Worker> = threads
+            .iter()
+            .filter(|it| it.open.last().is_some_and(|span| span.awaits.is_none()))
+            .collect();
         on.sort_by(|a, b| {
             let outer = |it: &Worker| it.open.first().map_or(0, |span| span.for_ms);
             outer(b)
@@ -795,20 +881,57 @@ impl Fold {
         // alloc: the look's answer, one entry a busy worker.
         let mut busy = Vec::with_capacity(on.len());
         for worker in on {
-            let Some((span, outer)) = worker.open.split_last() else { continue };
-            // The spans strictly between the outermost (the `task` span) and the innermost.
-            let between = outer.get(1..).unwrap_or(&[]);
+            let (span, path) = shown(&worker.open);
             busy.push(Busy {
                 // alloc: the look's answer owns its strings.
                 thread: worker.thread.clone(),
                 task: worker.task.and_then(|id| self.task(id)),
-                // alloc: the look's answer owns its spans.
-                span: span.clone(),
-                // alloc: the look's answer owns its span names.
-                path: between.iter().map(|it| it.name.clone()).collect(),
+                span,
+                path,
             });
         }
         busy
+    }
+
+    /// Every running task, longest first, then by id, at most [`RUNNING`]; each with the busy
+    /// worker inside it, when one is.
+    fn running(&self, threads: &[Worker]) -> Vec<Running> {
+        // alloc: one look's running tasks, a few dozen to a few hundred.
+        let mut on: Vec<(u64, u64, &Slot)> = self
+            .tasks
+            .iter()
+            .filter(|slot| slot.state == State::Running)
+            .map(|slot| (slot.running_ns.unwrap_or(slot.seen_ns), slot.id, slot))
+            .collect();
+        on.sort_unstable_by_key(|&(began, id, _)| (began, id));
+        on.truncate(RUNNING);
+        on.into_iter()
+            .map(|(began, id, slot)| {
+                let worker = threads
+                    .iter()
+                    .filter(|it| it.task == Some(id) && !it.open.is_empty())
+                    // A thread doing its work before one waiting, then by name.
+                    .min_by_key(|it| {
+                        (it.open.last().is_some_and(|span| span.awaits.is_some()), &it.thread)
+                    });
+                let (span, path) = match worker {
+                    Some(it) => {
+                        let (span, path) = shown(&it.open);
+                        (Some(span), path)
+                    }
+                    None => (None, Vec::new()), // alloc: none, empty
+                };
+                Running {
+                    task: slot.task(),
+                    for_ms: self.now_ns.saturating_sub(began) / MS,
+                    // alloc: the look's answer owns its strings.
+                    thread: worker.map(|it| it.thread.clone()),
+                    span,
+                    path,
+                }
+            })
+            // alloc: the look's answer, at most RUNNING.
+            .collect()
     }
 
     fn task(&self, id: u64) -> Option<Task> {
@@ -857,12 +980,9 @@ impl Fold {
         Phase::Compiling
     }
 
-    /// How long nothing moved: since a task settled, this look said a span closed, or a
-    /// download got a byte. 0 before the clock is set.
+    /// How long nothing moved: since a task settled or a download got a byte. 0 before the
+    /// clock is set.
     fn quiet_ms(&mut self, look: &Look<'_>) -> u64 {
-        if look.closed > 0 {
-            self.moved_ns = self.now_ns;
-        }
         for download in look.downloads {
             let byte = self.now_ns.saturating_sub(download.idle_ms.saturating_mul(MS));
             self.moved_ns = self.moved_ns.max(byte);
@@ -880,6 +1000,48 @@ impl Fold {
             // alloc: the look's answer, at most SLOWEST.
             .collect()
     }
+}
+
+/// Whether a span only wraps the work under it: a pool job or scope span, named by its closure's
+/// type (`Pool::submit<...>::{{closure}}`), with no item or crate of its own. A view names the
+/// work by the innermost span that is not one.
+fn wrapper(span: &Span) -> bool {
+    let named = |it: &str| {
+        it == "job" || it.contains("submit") || it.contains("{{closure}}") || it.contains("::spawn")
+    };
+    span.krate.is_none()
+        && (named(&span.name) || span.item.as_deref().is_some_and(named))
+}
+
+/// The span a worker is shown by, of its open spans (outermost first, at least one), and the
+/// names of those strictly between its outermost and it: its innermost span, or, when that only
+/// wraps a pool job ([`wrapper`]), the innermost one that does not, its wait kept (an
+/// `awaits` on the innermost stays on the one shown). With every span a wrapper, the innermost
+/// is named `pool job`, never by its closure's type.
+fn shown(open: &[Span]) -> (Span, Vec<String>) {
+    let last = open.len().saturating_sub(1);
+    let at = open.iter().rposition(|it| !wrapper(it));
+    // alloc: the look's answer owns its spans.
+    let mut span = open[at.unwrap_or(last)].clone();
+    if at.is_none() {
+        // alloc: as above.
+        span.name = "pool job".to_owned();
+        span.item = None;
+    }
+    if span.awaits.is_none() {
+        // alloc: as above.
+        span.awaits = open[last].awaits.clone();
+    }
+    let end = at.unwrap_or(last);
+    let path = open
+        .get(1..end)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|it| !wrapper(it))
+        // alloc: the look's answer owns its span names.
+        .map(|it| it.name.clone())
+        .collect();
+    (span, path)
 }
 
 /// Whether `words` has `word` in it, ignoring ASCII case.

@@ -41,7 +41,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::{alloc::Global, hash::Hash};
+use std::{alloc::Global, hash::Hash, sync::atomic::{AtomicU32, Ordering}};
+
+/// The front end releases run since the daemon started, every build's: the build view's
+/// `releases` ([`crate::serve::job::doing::memory`]), a counter that only a release moves.
+pub(crate) static RELEASES: AtomicU32 = AtomicU32::new(0);
 
 use base_db::Crate;
 use blaze_graph::admission::{self, Pressure, Squeeze};
@@ -182,6 +186,7 @@ impl Release<Crate> {
     /// what it let go and what blaze held before and after (rule 14).
     pub(crate) fn release(&mut self, lowered: &mut Lowered) {
         let Some(Plan { crates, mir, pressed, ended }) = self.plan() else { return };
+        RELEASES.fetch_add(1, Ordering::Relaxed);
         let before = Pressure::now();
         let span = tracing::info_span!(
             target: "blaze",

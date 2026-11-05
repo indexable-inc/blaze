@@ -186,22 +186,28 @@ impl<'a> Seen<'a> {
     /// The build's live model now: its plane request's fold looked at with its busy workers,
     /// the downloads, its stage's words and the daemon's memory.
     ///
-    /// A worker is a thread of the build whose innermost span is work, not a wait: the rule
-    /// [`Doing::running`] names a busy worker by, so a thread parked on what another computes
-    /// is not counted busy twice. Its task is the plane node of its `task` span
+    /// Every thread of the build goes to the fold, waiting ones too: the fold counts a worker
+    /// busy only while its innermost span is work, not a wait, so a thread parked on what
+    /// another computes is not counted busy twice, and shows a running task whose thread waits
+    /// as waiting on what it names. A thread's task is the plane node of its `task` span
     /// ([`OpenSpan::node`]), its spans those from its outermost of the build in.
     ///
-    /// `closed` is 0: the flight recorder counts no spans closed per build that a look could
-    /// read without walking every ring's closed spans, so the model's quiet time counts from
-    /// the last task settled or download byte.
+    /// The proc-macro lane is every `blaze wasm expansion` thread inside a span, of any build:
+    /// those threads serve every build at once and are no pool workers.
     fn now<S: Steps>(&self, job: &Job<S>, look: &Look<'_>, folds: &mut Folds) -> Now {
         let build = self.request.unwrap_or(0);
         // alloc: a look, once a second while a build runs
         let threads: Vec<now::Worker> = self
             .threads
             .iter()
-            .filter(|thread| thread.open.last().is_some_and(|span| span.awaits.is_none()))
             .map(|thread| worker(thread, build))
+            .collect();
+        // alloc: a look, once a second, the expansion threads inside a span
+        let expanders: Vec<now::Worker> = look
+            .threads
+            .iter()
+            .filter(|thread| thread.name == EXPANSION_THREAD)
+            .map(|thread| worker(thread, u32::MAX))
             .collect();
         let stage = match &job.stage {
             Stage::Units(_) => String::new(), // alloc: none, empty
@@ -212,8 +218,9 @@ impl<'a> Seen<'a> {
             threads: &threads,
             downloads: look.fetching,
             stage: &stage,
-            closed: 0,
             memory: look.memory,
+            expanders: &expanders,
+            expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads()).unwrap_or(u32::MAX),
         };
         match job.request {
             Some(request) => folds.look(request, look.now, &model).unwrap_or_else(|| {
@@ -273,8 +280,12 @@ impl<'a> Seen<'a> {
     }
 }
 
+/// The name every proc-macro expansion thread carries (`blaze_macro_eval`'s wasm threads).
+const EXPANSION_THREAD: &str = "blaze wasm expansion";
+
 /// A thread of build `build` as the live model reads it: its name, the plane node of its
-/// `task` span, and its spans from its outermost of the build in.
+/// `task` span, and its spans from its outermost of the build in (all of them for a build it
+/// has no span of).
 fn worker(thread: &ThreadNow, build: u32) -> now::Worker {
     let outer = thread.open.iter().position(|span| span.build == build).unwrap_or(0);
     let open = &thread.open[outer..];
@@ -317,8 +328,9 @@ pub fn fetching(downloads: &[Shown]) -> Vec<now::Download> {
 /// ([`blaze_graph::arena::own`], what `blaze status` says it holds), its limit (0 for none),
 /// and the subsystem over its share. `held_back` is 0: the plane says how many bytes held back
 /// a task for memory in its last dispatch ([`blaze_graph::Plane::short`]), not how many tasks
-/// it held back. `peak` and `releases` are the fold's to keep, and `releases` stays 0: a release
-/// runs inside a front end's writer (`serve::unit::release`), which reaches no build's fold.
+/// it held back. `peak` is the fold's to keep; `releases` is the front ends' releases since the
+/// daemon started ([`crate::serve::unit::release::RELEASES`]), which each fold turns into its
+/// build's own.
 pub fn memory() -> now::Memory {
     let limit = blaze_graph::admission::limit();
     now::Memory {
@@ -327,7 +339,7 @@ pub fn memory() -> now::Memory {
         limit: if limit == u64::MAX { 0 } else { limit },
         over: blaze_graph::admission::Pressure::now().over.map(|tag| tag.name().to_owned()), // alloc: a look, once a second
         held_back: 0,
-        releases: 0,
+        releases: crate::serve::unit::release::RELEASES.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

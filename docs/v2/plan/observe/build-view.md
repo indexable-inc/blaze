@@ -128,25 +128,57 @@ keeps only what stays: diagnostics as they come are printed after the view leave
 summary). What it shows, top to bottom, each section only when it has rows:
 
 ```text
- blaze test  compiling                                          488 of 570 tasks   15m14s
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────  1 running · 81 waiting
+ blaze test  compiling                  487 of 570 tasks done · 12 in the last 30s   15m14s
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  3 running · 80 waiting
+ 3 of 16 workers busy · 13 idle
+ memory  106.3 GB, no limit
  ⚠ slow: no task settled for 4m30s; 1 of 16 workers busy
+ ⚠ longest: codegen core 1.0.0 lib (host), 4m30s, on blaze-worker-3 in core::ptr::is_freeze
 
- workers  1 busy · 15 idle
-   blaze-worker-3  codegen  core::ptr::is_freeze  core  copy_prop > is_freeze      4m30s
+ running 3, longest first
+   4m30s  codegen     core 1.0.0 lib (host)             blaze-worker-3  core::ptr::is_freeze  core
+   2m01s  test        blaze-ui 0.1.0 lib test (host)    waiting on the test process  blaze-worker-5
+   31.0s  script-run  ring 0.17.8 build-script (host)   a process, on no worker
 
- blocked on
-   codegen core                 running 4m30s   holds 82  chain 41
+ proc macros  1 of 32 expanding
+   serde_derive::Serialize  in blaze-api                                                1.2s
+
+ waiting  80 on their inputs · 3 ready for a worker · 2 held back for memory
+   codegen core 1.0.0 lib (host)   running 4m30s   holds 82  chain 41
      std build script, libc build script, alloc lib, +79
 
  downloads
    llvm-21.1.8-aarch64-apple-darwin.tar.xz  ━━━━━──────  34.0 of 410.0 MB  260 kB/s  24m10s left
+
+ failed 1
+   bodies foo 0.1.0 lib (host)
 
  slowest so far
    bodies hir-ty 1m12s · codegen syntax 48s · script-run ring 31s
 
  e expand · blaze explore for the graph · blaze debug live for every thread
 ```
+
+Every number is labelled. A task's name is the unit it serves, as a person says it: package,
+version, target and what it is built for (`object 0.36.7 build-script (host)`, `serde_derive
+1.0.219 proc-macro (macro)`), so two units of one package never share a row's name.
+
+Running and waiting stay apart. A worker is busy only while its innermost span is work: a
+thread parked on what another computes is not counted, and a running task whose thread waits
+says `waiting on` what its span awaits. A task no worker thread is inside says what it is (a
+build script's or a test's process, a download, or a fiber parked). A pool job is named by the
+innermost span under it that names an item or a crate, never by its closure's type
+(`Pool::submit<...>::{{closure}}`); with none, it is `pool job`. The running section takes the
+rows the rest leaves, one task a row, longest first, the rest counted (`… 12 more running`).
+
+The proc macros have their own lane: the `blaze wasm expansion` threads are no pool workers and
+serve every build at once, so they are counted apart (`1 of 32 expanding`), each busy one with
+its macro and the crate it expands in.
+
+The rate is honest: the tasks settled in the last 30 s, never an ETA for the build, whose
+remaining work is not known until its plan settles. `releases` is the front ends' releases
+since the build began (a daemon counter the fold takes the difference of). `held_back` stays 0
+until the plane counts tasks it held back for memory rather than bytes.
 
 `e` expands every section to all its rows (every busy worker, every blocker, the slowest ten)
 and back; collapsed, each keeps to a few rows so the screen never scrolls. Keys are read in raw
@@ -155,15 +187,21 @@ mode by the driver, which turns Ctrl-C into the same cancel the signal gives.
 The memory line is always there, colored by pressure (calm dim, rising yellow, squeezed and
 over red and bold). Over the limit, it moves above the header.
 
-**Inline** (a smaller terminal, or `BLAZE_UI=inline`): the same model in at most six lines under
-the scrollback: the header with the memory (`mem 20.1/24.0 GB`), the stall line when there is one, the busy workers' spans (two), the
-first blocker, the first download.
+**Inline** (a smaller terminal, or `BLAZE_UI=inline`): the same model in at most ten lines under
+the scrollback: the header with the workers busy and the memory (`3 of 16 busy  mem 20.1/24.0
+GB`), the stall line when there is one, the longest running tasks in the rows left, the first
+blocker, the first download.
+
+When the board ends, the scrollback keeps its summary: the build's time and tasks done, the
+five slowest tasks and every failed one, then the tests' summary for `blaze test`. Under the
+board, the test view draws only the tests' own rows: its header, build row and held row are the
+board's.
 
 **Compact** (off a terminal: CI, a pipe, an agent; `BLAZE_UI=plain`): one line when the phase or
 the first blocker changes and otherwise every 10 s:
 
 ```text
-[15m14s] compiling 488/570 · 1/16 busy · mem 20.1/24.0 GB squeezed · on codegen core (core::ptr::is_freeze, 4m30s), holds 82 · slow: nothing settled for 4m30s
+[15m14s] compiling 487 of 570 done · 1 of 16 busy · 3 running: codegen core 1.0.0 lib (host) 4m30s, test blaze-ui 0.1.0 lib test (host) 2m01s waiting, script-run ring 0.17.8 build-script (host) 31.0s · mem 20.1/24.0 GB squeezed · on codegen core (core::ptr::is_freeze, 4m30s), holds 82 · slow: nothing settled for 4m30s
 ```
 
 A change of pressure is also due a line, so a log says when memory went from calm to squeezed.
