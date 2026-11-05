@@ -167,6 +167,7 @@ pub fn run(path: &str) -> Result<(), String> {
             press(&mut app, &k);
         }
         if up_next {
+            eprintln!("harness-native: drag let go at {:.0} window shift {:.1}", at.0, app.window_shift());
             app.pointer_up(at.0, at.1, left, none);
             up_next = false;
         } else if let Some(d) = drag.take_if(|d| t >= d.get(4).copied().unwrap_or(0.8)) {
@@ -175,6 +176,10 @@ pub fn run(path: &str) -> Result<(), String> {
                 let f = k as f32 / 8.0;
                 at = (d[0] + (d[2] - d[0]) * f, d[1] + (d[3] - d[1]) * f);
                 app.pointer_move(at.0, at.1, none);
+                // The trackpad pulses the drag asked for (window.rs plays them; here they are logged).
+                for h in app.take_haptics() {
+                    eprintln!("harness-native: haptic {h:?} at {:.0}", at.0);
+                }
             }
             up_next = true;
         } else if clicks.first().is_some_and(|c| t >= c.0) {
@@ -197,7 +202,7 @@ pub fn run(path: &str) -> Result<(), String> {
                 (w * backing) as u32,
                 (h * backing) as u32,
             )?;
-            eprintln!("harness-native: seq t={t:.3} {}", app.probe());
+            eprintln!("harness-native: seq t={t:.3} {} shift={:.2}", app.probe(), app.window_shift());
         }
         if t >= secs {
             renderer.render(&draw, Dest::Texture(tex.clone()));

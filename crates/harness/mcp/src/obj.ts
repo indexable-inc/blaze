@@ -6,6 +6,7 @@ import { req } from "./daemon.ts";
 import { sql } from "./sql.ts";
 import { table, type Table } from "./table.ts";
 import { effect, oneLine } from "./effects.ts";
+import { messageRows, readLog, type Event, type Msg } from "./wire.ts";
 
 export type Kind = "claude" | "codex" | "cursor" | "shell" | "proc";
 export type ObjInfo = {
@@ -20,7 +21,7 @@ export type SpawnOpts = {
   /** proc: initial stdin text; the pipe stays open for .stdin() unless liveStdin: false. */
   stdin?: string; liveStdin?: boolean; cols?: number; rows?: number;
 };
-export type Msg = { n: number; role: string; kind: string; tool: string | null; text: string; ts_ms: number | null };
+export type { Msg };
 export type SliceOpts = { from?: number; to?: number; tail?: number; new?: boolean; cursor?: string };
 export type WaitOpts = { status?: string; match?: string | RegExp; timeoutMs?: number };
 
@@ -122,6 +123,13 @@ export class Obj {
   }
 
   #messages(): Msg[] {
+    // A chat session's rows are projected from its log; a TUI session's are its transcript's `messages` file.
+    const chat = `${HOME()}/objects/${this.id}/chat`;
+    if (existsSync(chat)) {
+      const log = readLog(new Uint8Array(readFileSync(chat)));
+      if ("notALog" in log) throw new Error(`${this.id}: ${chat} is ${log.notALog}`);
+      return messageRows(this.id, log.records.flatMap((r): Event[] => (r.event ? [r.event] : []))).map(({ object: _, ...m }) => m);
+    }
     const out: Msg[] = [];
     for (const line of read(`${HOME()}/objects/${this.id}/messages`).split("\n")) {
       if (!line) continue;

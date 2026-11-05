@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 serde_json = "1"
+harness-proto = { path = "../harness-proto" }

@@ -617,14 +617,8 @@ impl App {
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
         self.set_pointer(x, y);
         self.mods = m;
-        if self.resizing {
-            if let Some(side) = self.sidebar() {
-                let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
-                let v = (self.pointer.x - left).clamp(SIDE_MIN, SIDE_MAX).round();
-                set_side_width(side, v);
-                self.side_w = Some(v);
-            }
-            self.poke();
+        if self.drag.active() {
+            self.side_drag_move();
             return;
         }
         if self.chat_pointer_drag() {
@@ -665,9 +659,9 @@ impl App {
         self.mods = m;
         self.poke();
         self.press = (clicks, m);
-        // On the sidebar's right edge: drag it wider or narrower.
+        // On the sidebar's right edge (or the window's left edge, folded): drag it wider, narrower, shut or open.
         if b == Button::Left && self.on_side_edge() {
-            self.resizing = true;
+            self.side_drag_start();
             return;
         }
         if b == Button::Left {
@@ -718,15 +712,8 @@ impl App {
     pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
         self.set_pointer(x, y);
         self.mods = m;
-        if self.resizing {
-            self.resizing = false;
-            // Kept for the next launch, but not from an offscreen shot's drag (`persist` off).
-            if self.persist
-                && let Some(v) = self.side_w
-            {
-                crate::prefs::set("sidebar_width", serde_json::json!(v));
-            }
-            self.poke();
+        if self.drag.active() {
+            self.side_drag_end();
             return;
         }
         if b == Button::Left {
