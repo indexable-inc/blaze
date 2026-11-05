@@ -14,10 +14,14 @@
 //!   `hello`, answers and live headers come out typed, ids, hashes and `_ns` as `u64`/`i64`.
 //! - [`live`]: each live table's one long-lived IPC stream for the session, kept across frames
 //!   and begun anew after the end-of-stream marker, and its rows as typed structs
-//!   ([`live::OpenRow`], [`live::SpanRow`], [`live::CounterRow`]).
+//!   ([`live::OpenRow`], [`live::SpanRow`], [`live::CounterRow`], [`live::TaskRow`],
+//!   [`live::EdgeRow`]).
 //! - [`state`]: the live state the page needs: each thread's open span chain, its name and
-//!   whether it is a pool worker, recent closed spans, the counters' latest values; and
-//!   [`state::Session::running`], the seam where `blaze_protocol::now::Fold` takes over.
+//!   whether it is a pool worker, recent closed spans, the counters' latest values, and the
+//!   live tasks; [`state::Session::look`] is the one model of the moment
+//!   (`blaze_protocol::now::Now`, folded by `now::Fold`, as `blaze status` folds the plane).
+//! - [`tasks`]: the `tasks` and `task_edges` rows, upserted, evicted 60 s after they settle,
+//!   and folded through `now::Fold`; downloads as the look's downloads.
 //! - [`view`]: view models, display-ready, in deterministic CBOR (blaze-protocol's codec):
 //!   ids as decimal strings, durations as integer milliseconds.
 //! - [`abi`]: the C ABI the page calls over linear memory, no wasm-bindgen.
@@ -30,6 +34,7 @@
 pub mod abi;
 pub mod live;
 pub mod state;
+pub mod tasks;
 pub mod view;
 pub mod wire;
 

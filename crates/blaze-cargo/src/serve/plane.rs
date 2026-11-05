@@ -694,10 +694,18 @@ pub struct Plane<W: Work, P: Predict> {
 /// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/observe/build-view.md):
 /// a [`Fold`] made as the request opens ([`Plane::open`]), fed every record the plane says of
 /// it ([`PlaneOutput::Said`]), looked at once a second while its job runs
-/// (`super::job::doing`) and dropped as its job ends ([`Plane::forget`]).
+/// (`super::job::doing`) and dropped as its job ends ([`Plane::forget`]). The same records,
+/// read once through [`now::Records`], also go to the explorer's task table when the daemon
+/// publishes one ([`Plane::publish_tasks`]): every request's, until each task settles.
 pub struct Folds {
     // alloc: the plane's, an entry a request whose job has not ended
     by: HashMap<RequestId, Live, Global>,
+    /// What reads the plane's records keeps from one to the next.
+    records: now::Records,
+    /// The daemon's tasks for the explorer (`blaze_explore::Tasks`); a daemon with no explorer
+    /// (a simulation's) has none.
+    #[cfg(feature = "native")]
+    tasks: Option<std::sync::Arc<blaze_explore::Tasks>>,
 }
 
 /// One request's fold and when it opened on the plane's clock: a record's `at_ns` is the
@@ -709,16 +717,37 @@ struct Live {
 
 impl Folds {
     fn new() -> Folds {
-        Folds { by: HashMap::new_in(Global) } // alloc: the plane's, once
+        Folds {
+            by: HashMap::new_in(Global), // alloc: the plane's, once
+            records: now::Records::new(),
+            #[cfg(feature = "native")]
+            tasks: None,
+        }
     }
 
-    /// One record of `request`, at `at_ns` of the plane's clock. A request with no fold is one
-    /// whose job ended ([`Plane::forget`]): what the plane still says of it (its cancel's
-    /// moves) is no live view's, and is dropped.
+    /// One record of `request`, at `at_ns` of the plane's clock, to its fold and the explorer's
+    /// task table. A request with no fold is one whose job ended ([`Plane::forget`]): what the
+    /// plane still says of it (its cancel's moves) is no live view's, and its fold has none of
+    /// it; the task table still takes it, so its tasks settle there.
     fn said(&mut self, request: RequestId, at_ns: u64, event: &Event) {
-        let Some(live) = self.by.get_mut(&request) else { return };
-        live.fold.advance_clock(at_ns.saturating_sub(live.began_ns));
-        live.fold.take_event(event);
+        if !matches!(event, Event::Node { .. } | Event::Nodes { .. } | Event::Moved { .. }) {
+            return;
+        }
+        let mut live = self.by.get_mut(&request);
+        if let Some(live) = live.as_deref_mut() {
+            live.fold.advance_clock(at_ns.saturating_sub(live.began_ns));
+        }
+        #[cfg(feature = "native")]
+        let mut table = self.tasks.as_deref().map(blaze_explore::Tasks::lock);
+        self.records.read(event, |record| {
+            if let Some(live) = live.as_deref_mut() {
+                live.fold.take_record(record);
+            }
+            #[cfg(feature = "native")]
+            if let Some(table) = table.as_mut() {
+                table.said(request.0, at_ns, record);
+            }
+        });
     }
 
     /// `request`'s build as of `at` on the plane's clock, with what one look found; `None` when
@@ -1219,6 +1248,13 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// Every request's live model, for a look ([`Folds::look`]).
     pub fn folds(&mut self) -> &mut Folds {
         &mut self.folds
+    }
+
+    /// From now on, every node and move the plane says also goes to `tasks`, the explorer's
+    /// task table (`blaze_explore::Tasks`), read by its sessions' live feeds.
+    #[cfg(feature = "native")]
+    pub fn publish_tasks(&mut self, tasks: std::sync::Arc<blaze_explore::Tasks>) {
+        self.folds.tasks = Some(tasks);
     }
 
     /// The job of `request` ended, or the request was its job's and the job opened another:

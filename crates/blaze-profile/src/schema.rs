@@ -751,6 +751,11 @@ pub const OPEN: Table = Table {
         opt("awaits", Type::Utf8, "what a wait waits for, as in `spans`"),
         opt("owner", Type::U64, "who runs what it waits for, as in `spans`"),
         col("read_ns", Type::I64, "when the threads were read: one value a reading"),
+        opt(
+            "task",
+            Type::U64,
+            "the nearest task among the span and its ancestors: a daemon `task` span's plane request << 32 | node, the id of the explorer's `tasks` row",
+        ),
     ],
 };
 

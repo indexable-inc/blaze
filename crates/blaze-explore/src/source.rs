@@ -8,13 +8,14 @@ use std::sync::Arc;
 
 use blaze_profile::{clock, live, schema};
 use ix_prof::explore::{
-    self, Answer, Explorer, Hello, Kind as Core, Layer, Live, OpError, Rule, Source, StartError,
-    Stop, Tick,
+    self, Answer, CoreWasm, Explorer, Hello, Kind as Core, Layer, Live, OpError, Rule, Source,
+    StartError, Stop, Tick,
 };
 use serde_json::Value;
 
 use crate::{
     ops::{self, Context, History},
+    tasks::{self, Tasks},
     wire,
 };
 
@@ -34,17 +35,47 @@ pub struct Config {
     pub dev_origin: bool,
     /// The daemon's version, as `hello` says it.
     pub daemon: &'static str,
+    /// The daemon's tasks, as the plane's loop keeps them ([`Tasks`]).
+    pub tasks: Arc<Tasks>,
+    /// The explorer core the daemon serves the page, or why it has none ([`core_file`]).
+    pub core: Result<CoreWasm, String>,
+}
+
+/// The name of the explorer core's file, beside the daemon's executable as the release
+/// archive lays it out.
+pub const CORE_FILE: &str = "explore-core.wasm";
+
+/// The command that builds the explorer core, as an error saying it has none names it.
+pub const CORE_BUILD: &str =
+    "blaze build --release -p blaze-explore-core --target wasm32-unknown-unknown";
+
+/// The explorer core beside `exe` ([`CORE_FILE`]), or why there is none: the error names the
+/// path it looked at and the command that builds one.
+pub fn core_file(exe: &std::path::Path) -> Result<CoreWasm, String> {
+    let Some(dir) = exe.parent() else {
+        return Err(format!("the daemon's executable {} has no directory to hold {CORE_FILE}", exe.display()));
+    };
+    let path = dir.join(CORE_FILE);
+    let shown = path.display().to_string();
+    match std::fs::read(&path) {
+        Ok(bytes) => CoreWasm::new(bytes, &shown),
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "no explorer core at {shown}: a release archive has it beside the binary; in a checkout, `{CORE_BUILD}` makes it, then copy target/wasm32-unknown-unknown/release/blaze_explore_core.wasm to {shown}"
+        )),
+        Err(why) => Err(format!("the explorer core {shown} could not be read: {why}")),
+    }
 }
 
 /// Starts the daemon's explorer; it serves until the [`Explorer`] is dropped.
 pub fn start(config: Config) -> Result<Explorer, StartError> {
-    let Config { history, world, dev_origin, daemon } = config;
-    let source = Daemon { cx: Context { history, world }, daemon };
+    let Config { history, world, dev_origin, daemon, tasks, core } = config;
+    let source = Daemon { cx: Context { history, world }, daemon, tasks };
     explore::serve(explore::Config {
         source: Arc::new(source),
         dev_origin,
         name: NAME,
         every: live::EVERY,
+        core,
     })
 }
 
@@ -52,6 +83,7 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
 pub(crate) struct Daemon {
     pub(crate) cx: Context,
     pub(crate) daemon: &'static str,
+    pub(crate) tasks: Arc<Tasks>,
 }
 
 impl Source for Daemon {
@@ -74,7 +106,12 @@ impl Source for Daemon {
 
     fn live(&self) -> Box<dyn Live> {
         // alloc: once a session, its feed
-        Box::new(Feed { feed: live::Feed::new(), frame: live::Frame::default() })
+        Box::new(Feed {
+            feed: live::Feed::new(),
+            frame: live::Frame::default(),
+            // clone: an `Arc` of the tasks, once a session
+            tasks: tasks::Feed::new(Arc::clone(&self.tasks)),
+        })
     }
 
     fn op(&self, name: &str, args: &Value, stop: &Stop) -> Option<Result<Answer, OpError>> {
@@ -82,12 +119,14 @@ impl Source for Daemon {
     }
 }
 
-/// A session's place in the flight recorder's rings and its stream of each table.
+/// A session's place in the flight recorder's rings and its stream of each table, and its
+/// feed of the daemon's tasks.
 struct Feed {
     feed: live::Feed,
     /// The feed's last frame: each tick its buffers trade places with the tick's, so neither
     /// is copied nor made anew.
     frame: live::Frame,
+    tasks: tasks::Feed,
 }
 
 impl Live for Feed {
@@ -117,7 +156,8 @@ impl Live for Feed {
             table.rows = rows;
             std::mem::swap(&mut table.ipc, ipc);
         }
-        Ok(())
+        let downloads = blaze_fetch::downloads::Downloads::process().shown();
+        self.tasks.tick(*at_ns, &downloads, into)
     }
 }
 
@@ -131,13 +171,19 @@ mod tests {
     fn daemon() -> Daemon {
         let history =
             History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: Flush::new(|| Ok(0)) };
-        Daemon { cx: Context { history, world: None }, daemon: "test" }
+        Daemon { cx: Context { history, world: None }, daemon: "test", tasks: Arc::new(Tasks::new()) }
     }
 
     fn op(source: &Daemon, request: &str) -> Option<Result<Answer, OpError>> {
         let args: Value = serde_json::from_str(request).unwrap();
         let name = args["op"].as_str().unwrap().to_owned();
         source.op(&name, &args, &crossbeam_channel::never())
+    }
+
+    #[test]
+    fn a_daemon_with_no_core_beside_it_says_where_it_looked_and_how_to_build_one() {
+        let why = core_file(std::path::Path::new("/nowhere/blaze-engine")).unwrap_err();
+        assert!(why.contains("/nowhere/explore-core.wasm") && why.contains(CORE_BUILD), "{why}");
     }
 
     #[test]
@@ -172,7 +218,13 @@ mod tests {
         let names: Vec<_> = tick.tables.iter().map(|it| (it.name, it.rule)).collect();
         assert_eq!(
             names,
-            [("spans", Rule::Append), ("counters", Rule::Append), ("open", Rule::Replace)]
+            [
+                ("spans", Rule::Append),
+                ("counters", Rule::Append),
+                ("open", Rule::Replace),
+                ("tasks", Rule::Upsert),
+                ("task_edges", Rule::Append),
+            ]
         );
         let rows: usize = tick.tables.iter().map(|it| it.rows).sum();
         assert!(rows > 0, "the plot is in the rings: {tick:?}");

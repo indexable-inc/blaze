@@ -826,7 +826,9 @@ the history writes when it differs from the last one written (an idle daemon wri
 deadlocked one keeps its last). Its columns are `process u32, thread u32, thread_name dict,
 depth u16 (0 outermost), name dict, target dict, start_ns i64`, then what each span is of, as in
 `spans`: `crate dict?, function utf8?, unit utf8?, awaits utf8?, owner u64?`, then `read_ns i64`,
-when the threads were read (one value a reading). So a stuck worker names the query key it is
+when the threads were read (one value a reading), then `task u64?`, the nearest task among the
+span and its ancestors (a daemon `task` span's plane request `<< 32 |` its node, the id of the
+explorer's `tasks` row; added at the end, so the schema's version stays 5). So a stuck worker names the query key it is
 inside, not only the query's kind, and the history of a daemon that died says what it was
 inside at most one flush (5 s) before its end: `blaze slow` reads it for the build the death
 ended, and the CLI a dead daemon hung up on quotes it.

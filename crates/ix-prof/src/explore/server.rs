@@ -58,6 +58,11 @@ pub struct Config {
     pub name: &'static str,
     /// How often each session's live stream ticks, as `hello`'s `live_every_ms` says it.
     pub every: Duration,
+    /// The explorer core this program serves the page (explore-core.md decision 3): `hello`
+    /// names it and the `core` op answers its bytes. `Err` is why there is none (where the
+    /// program looked and how to make one), which `hello` leaves out and `core` answers as
+    /// `no_core`.
+    pub core: Result<CoreWasm, String>,
 }
 
 struct Shared {
@@ -68,6 +73,7 @@ struct Shared {
     every: Duration,
     source: Arc<dyn Source>,
     cert: watch::Sender<Arc<Served>>,
+    core: Result<CoreWasm, String>,
 }
 
 /// A running explorer; dropping it closes every session and stops the server, waiting at most
@@ -188,6 +194,7 @@ pub fn serve(config: Config) -> Result<Explorer, StartError> {
                     every: config.every,
                     source: config.source,
                     cert: watch::Sender::new(Arc::new(served)),
+                    core: config.core,
                 });
                 if ready_to.send(Ok(Arc::clone(&shared))).is_err() {
                     return;
@@ -394,9 +401,14 @@ async fn answer(
     match step {
         Step::Hello { first } => {
             let served = Arc::clone(&shared.cert.borrow());
-            let bytes = session::hello_bytes(&shared.source.hello(), &served, shared.every);
+            let core = shared.core.as_ref().ok();
+            let bytes = session::hello_bytes(&shared.source.hello(), &served, shared.every, core);
             send_bytes(send, &bytes).await;
             first
+        }
+        Step::Core => {
+            send_bytes(send, &session::core_bytes(&shared.core)).await;
+            false
         }
         Step::Refuse(error) => {
             send_bytes(send, &session::error_bytes(&error)).await;

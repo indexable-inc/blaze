@@ -25,6 +25,7 @@ use arrow_array::{
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::StreamDecoder;
 use arrow_schema::DataType;
+use blaze_protocol::now::State;
 
 use crate::{Error, column};
 
@@ -528,6 +529,122 @@ pub fn counter_rows(
             t_ns: need_i64(&t_ns, row)?,
             value: needed(&value, row, value.f64(row)?)?,
             build_id: opt_id(&build_id, row)?,
+        });
+    }
+    Ok(())
+}
+
+/// A task as the source says it (table `tasks`, upserted by process and task, whole rows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    pub process: u64,
+    pub task: u64,
+    /// Its layer's label (the daemon's `NodeKind` name, `download`); `task` when none.
+    pub kind: String,
+    pub name: String,
+    pub state: State,
+    /// How a settled task settled, in the source's word (`built`, `cached`, `failed`).
+    pub outcome: Option<String>,
+    pub error: Option<String>,
+    /// When it began running, or was first said; on hello's clock.
+    pub start_ns: Option<i64>,
+    pub end_ns: Option<i64>,
+    pub progress_done: Option<u64>,
+    pub progress_total: Option<u64>,
+    pub progress_unit: Option<String>,
+    pub waiting_on: Option<u64>,
+    pub krate: Option<String>,
+    pub unit: Option<String>,
+}
+
+/// A task's need (table `task_edges`): `from` cannot finish without `to`, both of `process`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeRow {
+    pub process: u64,
+    pub from: u64,
+    pub to: u64,
+}
+
+/// A task's state from its word: one of [`State::word`]'s, or `settled`, which is the
+/// `outcome`'s (`failed`, `cancelled`, else done).
+fn state_of(word: &str, outcome: Option<&str>) -> Option<State> {
+    match word {
+        "settled" => Some(match outcome {
+            Some("failed") => State::Failed,
+            Some("cancelled") => State::Cancelled,
+            _ => State::Done,
+        }),
+        _ => State::from_word(word),
+    }
+}
+
+/// The rows of a batch of table `tasks`, appended to `into`.
+pub fn task_rows(batch: &RecordBatch, message: &str, into: &mut Vec<TaskRow>) -> Result<(), Error> {
+    let t = Columns { batch, message };
+    let process = t.need(&["process"], Want::Id)?;
+    let task = t.need(&["task"], Want::Id)?;
+    let kind = t.get(&["kind"], Want::Text)?;
+    let name = t.need(&["name"], Want::Text)?;
+    let state = t.need(&["state"], Want::Text)?;
+    let outcome = t.get(&["outcome"], Want::Text)?;
+    let error = t.get(&["error"], Want::Text)?;
+    let start_ns = t.get(&["start_ns"], Want::I64)?;
+    let end_ns = t.get(&["end_ns"], Want::I64)?;
+    let progress_done = t.get(&["progress_done"], Want::Id)?;
+    let progress_total = t.get(&["progress_total"], Want::Id)?;
+    let progress_unit = t.get(&["progress_unit"], Want::Text)?;
+    let waiting_on = t.get(&["waiting_on", "waiting_on_task"], Want::Id)?;
+    let krate = t.get(&["crate"], Want::Text)?;
+    let unit = t.get(&["unit"], Want::Text)?;
+    // alloc: a frame's rows, into the caller's list
+    into.reserve(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let outcome = opt_text(&outcome, row)?;
+        let word = needed(&state, row, state.text(row)?)?;
+        let Some(state_now) = state_of(word, outcome.as_deref()) else {
+            return Err(state.wrong(
+                row,
+                // alloc: an error's text
+                format!(
+                    "`{word}`, not a task's state (waiting, ready, running, done, failed, cancelled, settled)"
+                ),
+            ));
+        };
+        into.push(TaskRow {
+            process: need_id(&process, row)?,
+            task: need_id(&task, row)?,
+            // alloc: a row's text, kept in the live state
+            kind: opt_text(&kind, row)?.unwrap_or_else(|| "task".to_owned()),
+            name: need_text(&name, row)?,
+            state: state_now,
+            outcome,
+            error: opt_text(&error, row)?,
+            start_ns: opt_i64(&start_ns, row)?,
+            end_ns: opt_i64(&end_ns, row)?,
+            progress_done: opt_id(&progress_done, row)?,
+            progress_total: opt_id(&progress_total, row)?,
+            progress_unit: opt_text(&progress_unit, row)?,
+            waiting_on: opt_id(&waiting_on, row)?,
+            krate: opt_text(&krate, row)?,
+            unit: opt_text(&unit, row)?,
+        });
+    }
+    Ok(())
+}
+
+/// The rows of a batch of table `task_edges`, appended to `into`.
+pub fn edge_rows(batch: &RecordBatch, message: &str, into: &mut Vec<EdgeRow>) -> Result<(), Error> {
+    let t = Columns { batch, message };
+    let process = t.need(&["process"], Want::Id)?;
+    let from = t.need(&["from", "task"], Want::Id)?;
+    let to = t.need(&["to", "needs"], Want::Id)?;
+    // alloc: a frame's rows, into the caller's list
+    into.reserve(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        into.push(EdgeRow {
+            process: need_id(&process, row)?,
+            from: need_id(&from, row)?,
+            to: need_id(&to, row)?,
         });
     }
     Ok(())

@@ -50,6 +50,9 @@ pub struct Counter<'d> {
 /// A download as it is now: what it is, where from (redacted), and its line.
 #[derive(Clone, Debug)]
 pub struct Shown {
+    /// Its id in this process, never reused while the process lives ([`Downloads::begin`]
+    /// counts them from 0): the explorer's task id of it.
+    pub id: u64,
     pub what: String,
     pub url: String,
     pub line: Line,
@@ -102,7 +105,7 @@ impl Downloads {
                 let mut meter = entry.meter.lock();
                 meter.advance_clock(now);
                 let line = meter.line();
-                (*id, Shown { what: entry.what.clone(), url: entry.url.clone(), line })
+                (*id, Shown { id: *id, what: entry.what.clone(), url: entry.url.clone(), line })
             })
             .collect(); // alloc: a status's list, a handful
         all.sort_by_key(|(id, _)| *id);

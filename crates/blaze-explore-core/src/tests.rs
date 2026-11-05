@@ -1,12 +1,13 @@
 //! The core read against the daemon's own producers: blaze-profile's `batches::open` and
-//! `live::Encoder` make the tables' IPC, blaze-explore's `frame` makes the heads.
+//! `live::Encoder` make the tables' IPC, blaze-explore's `tasks::Feed` the tasks', ix-prof's
+//! `explore::frame` makes the heads.
 
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
-use blaze_explore::frame;
+use ix_prof::explore::{Tick, frame};
 use blaze_profile::{
     batches::{self, Process},
     flight::{OpenSpan, ThreadNow},
@@ -130,7 +131,7 @@ fn a_live_stream_across_three_frames_follows_deltas_and_the_reset_at_end() {
     assert_eq!(session.stats().frames, 3);
     assert_eq!(session.streams()[0], 2, "the reset began a second stream");
 
-    let now = view::running_now(&session, 12 * S + S / 2).unwrap();
+    let now = view::running_now(&mut session, 12 * S + S / 2).unwrap();
     assert_eq!((now.workers, now.busy_count, now.idle), (2, 1, 1), "{now:?}");
     assert_eq!(now.headline, "1 of 2 busy · 1 idle");
     assert_eq!(now.idle_line, "1 idle worker");
@@ -141,10 +142,13 @@ fn a_live_stream_across_three_frames_follows_deltas_and_the_reset_at_end() {
     assert_eq!(busy.stack.len(), 2);
     assert_eq!(busy.stack[1].krate.as_deref(), Some("serde v1.0.219 (lib)"));
     assert!(now.internal.is_empty());
+    assert_eq!(now.phase, "running", "no tasks: busy and idle from the open spans alone");
+    assert_eq!(now.tally.total, 0);
+    assert!(now.blockers.is_empty() && now.downloads.is_empty());
 
     // A frame with no rows: the open set emptied.
     session.feed_live_frame(&live_frame("open", 0, 13 * S, &[])[wire::HEAD..]).unwrap();
-    let now = view::running_now(&session, 13 * S).unwrap();
+    let now = view::running_now(&mut session, 13 * S).unwrap();
     assert_eq!((now.workers, now.busy_count, now.idle), (2, 0, 2), "{now:?}");
 }
 
@@ -188,9 +192,9 @@ fn ids_past_two_to_the_53_survive_to_the_view() {
     session.feed_hello(&hello((2 * S) as u64)).unwrap();
     session.feed_live_frame(&live_frame("open", 1, 3 * S, &ipc)[wire::HEAD..]).unwrap();
     let mut out = Vec::new();
-    view::render(&session, Which::RunningNow, 3 * S, &mut out).unwrap();
+    view::render(&mut session, Which::RunningNow, 3 * S, &mut out).unwrap();
     let now: RunningNow = cbor::from_slice(&out).unwrap();
-    assert_eq!(now, view::running_now(&session, 3 * S).unwrap());
+    assert_eq!(now, view::running_now(&mut session, 3 * S).unwrap());
     assert_eq!(now.busy.len(), 1, "{now:?}");
     let row = &now.busy[0];
     assert_eq!(row.thread, "9007199254740993");
@@ -199,7 +203,7 @@ fn ids_past_two_to_the_53_survive_to_the_view() {
     assert_eq!(row.stack[0].span.as_deref(), Some("18446744073709551615"));
     // The same bytes render the same CBOR.
     let mut again = Vec::new();
-    view::render(&session, Which::RunningNow, 3 * S, &mut again).unwrap();
+    view::render(&mut session, Which::RunningNow, 3 * S, &mut again).unwrap();
     assert_eq!(out, again);
 }
 
@@ -275,4 +279,52 @@ fn a_live_header_error_names_the_table_and_field() {
         refused,
         "live frame for table `open`, field `at_ns`: holds \"soon\", not a signed 64-bit integer"
     );
+}
+
+#[test]
+fn the_daemons_tasks_fold_through_the_one_model_into_running_now() {
+    use blaze_explore::tasks::{Feed, Tasks, task_id};
+    use blaze_protocol::{
+        events::NodeState,
+        now::{Record, State},
+    };
+    let tasks = Arc::new(Tasks::new());
+    // The plane's clock is the profile's.
+    tasks.clock(0, 0);
+    {
+        let mut table = tasks.lock();
+        let at = S as u64;
+        table.said(7, at, Record::Task { id: 1, kind: "codegen", name: "serde lib", deps: &[] });
+        table.said(7, at, Record::Task { id: 2, kind: "link", name: "app bin", deps: &[1] });
+        let running = Record::Moved { id: 1, state: State::Running, node: &NodeState::Running };
+        table.said(7, 2 * at, running);
+    }
+    let mut feed = Feed::new(Arc::clone(&tasks));
+    let mut tick = Tick::default();
+    tick.clear(3 * S);
+    feed.tick(3 * S, &[], &mut tick).unwrap();
+    let names: Vec<_> = tick.tables.iter().map(|it| (it.name, it.rows)).collect();
+    assert_eq!(names, [("tasks", 2), ("task_edges", 1)]);
+
+    let mut session = Session::new();
+    session.feed_hello(&hello(0)).unwrap();
+    for table in &tick.tables {
+        let frame = live_frame(table.name, table.rows, 3 * S, &table.ipc);
+        session.feed_live_frame(&frame[wire::HEAD..]).unwrap();
+    }
+    let now = view::running_now(&mut session, 4 * S).unwrap();
+    assert_eq!(now.phase, "compiling", "{now:?}");
+    assert_eq!((now.tally.total, now.tally.running, now.tally.waiting), (2, 1, 1));
+    assert_eq!(now.blockers.len(), 1, "{now:?}");
+    let blocker = &now.blockers[0];
+    assert_eq!(blocker.task.name, "serde lib");
+    assert_eq!(blocker.task.task, Some(task_id(7, 1).to_string()), "ids as decimal strings");
+    assert_eq!((blocker.holds, blocker.chain), (1, 1));
+    assert_eq!(blocker.for_ms, 2_000, "running since its start_ns, not since the page saw it");
+
+    // A second tick sends only what changed: nothing.
+    let mut again = Tick::default();
+    again.clear(5 * S);
+    feed.tick(5 * S, &[], &mut again).unwrap();
+    assert!(again.tables.iter().all(|it| it.rows == 0 && it.ipc.is_empty()), "{again:?}");
 }

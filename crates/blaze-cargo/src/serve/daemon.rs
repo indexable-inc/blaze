@@ -1401,6 +1401,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut plane = Plane::new(plane_config, history, runner)
             .map_err(|error| format!("the plane: {error}"))?;
         plane.number_from(observe.first_build());
+        // The explorer's task table: every node and move the plane says, on the profile's clock.
+        #[cfg(feature = "native")]
+        {
+            plane.publish_tasks(observe.tasks());
+            observe.clock_tasks(driver.now());
+        }
         // The first turn of the machine's memory ledger, before any request: until one, the
         // plane would grant up to its ceiling whatever the other daemons hold.
         #[cfg_attr(not(all(unix, feature = "native")), allow(unused_mut))]
@@ -2161,6 +2167,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.jobs.under_way() == 0 {
             return;
         }
+        #[cfg(feature = "native")]
+        self.observe.clock_tasks(now);
         // alloc: a look, once a second while a build runs
         let mut running = Vec::new();
         let plane = &self.plane;
