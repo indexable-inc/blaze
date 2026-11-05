@@ -703,7 +703,7 @@ impl Provided {
             libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
         };
         if got < 0 {
-            return Err(pbuf_refused(&reg, check, io::Error::last_os_error()));
+            return Err(pbuf_refused(&reg, check, &io::Error::last_os_error()));
         }
         let mut provided = Provided { ring, buffers, tail: 0, published: 0 };
         for bid in 0..RECV_BUFFERS {
@@ -858,7 +858,7 @@ impl ReservedCheck {
 
 /// Why `IORING_REGISTER_PBUF_RING` of `reg` failed with `error`: what was asked, and which of
 /// io_register_pbuf_ring's requirements the answer stands for.
-fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: io::Error) -> io::Error {
+fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Error {
     let kernel = crate::cgroup::kernel();
     let inverted = match check {
         ReservedCheck::Upstream => "",
@@ -886,8 +886,8 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: io::Error) -> io::Err
         // alloc: the error of a setup that failed.
         format!(
             "io_uring a ring of provided buffers (IORING_REGISTER_PBUF_RING of {} entries at \
-             {:#x}, group {}, flags {:#x}, reserved words {:?}{inverted}): {error}: {why}",
-            reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv,
+             {:#x}, group {}, flags {:#x}, reserved words {}, {}, {}{inverted}): {error}: {why}",
+            reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv[0], reg.resv[1], reg.resv[2],
         ),
     )
 }
