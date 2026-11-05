@@ -184,13 +184,13 @@ $releases/channels/$CHANNEL"
     fi
     step "release $tag from $releases ($CHANNEL)"
 
-    if ! fetch "$releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>"$tmp/error"; then
+    if ! fetch "$releases/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>"$tmp/error"; then
         if [ -n "$VERSION" ]; then
             fail "there is no blaze release $VERSION." "Releases: https://github.com/$REPO/releases"
         fi
         fail "the list of blaze's releases could not be read; is the network up?" \
             "$(cat "$tmp/error")
-$releases/download/$tag/SHA256SUMS"
+$releases/$tag/SHA256SUMS"
     fi
 
     # The .tar.xz, a third of the size, where the release has one and this tar reads xz (bsdtar
@@ -211,10 +211,10 @@ $releases/download/$tag/SHA256SUMS"
     if [ -z "$VERSION" ] && [ "$CHANNEL" = canary ]; then shown="$shown (canary)"; fi
     say "Installing $shown for $machine..."
     step "downloading $asset"
-    fetch "$releases/download/$tag/$asset" "$tmp/$asset" 2>"$tmp/error" ||
+    fetch "$releases/$tag/$asset" "$tmp/$asset" 2>"$tmp/error" ||
         fail "the download of blaze stopped before it finished; running this again retries it." \
             "$(cat "$tmp/error")
-$releases/download/$tag/$asset"
+$releases/$tag/$asset"
     got=$(sha256 "$tmp/$asset")
     [ "$got" = "$want" ] ||
         fail "the download is not the file the release published, so it was not installed. Running this again downloads it again." \
