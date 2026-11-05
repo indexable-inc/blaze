@@ -260,6 +260,9 @@ pub struct SessionInfo {
     pub mode: String,
     /// A chat's model, as its agent said.
     pub model: Option<String>,
+    /// A chat's reasoning effort, as its launch chose or its agent said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// It ended before this daemon started (set by `list`).
     #[serde(default)]
     pub past: bool,

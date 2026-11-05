@@ -188,6 +188,8 @@ pub struct ChatMode;
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct AgentModel {
     pub s: ScriptString,
+    /// The reasoning effort it runs with (the daemon's `effort`; empty when unknown).
+    pub effort: ScriptString,
 }
 
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
@@ -911,8 +913,9 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
             }
         }
         let model = s["model"].as_str().unwrap_or("");
-        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
-            e.set(AgentModel { s: model.into() });
+        let effort = s["effort"].as_str().unwrap_or("");
+        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model || m.effort.as_str() != effort) {
+            e.set(AgentModel { s: model.into(), effort: effort.into() });
         }
         let past = s["past"].as_bool().unwrap_or(false);
         if e.has(Past::id()) != past {

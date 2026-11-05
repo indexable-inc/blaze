@@ -183,6 +183,7 @@ impl Session {
             busy: self.busy.load(Ordering::Relaxed),
             mode: if self.chat.is_some() { "chat" } else { "tui" }.to_owned(),
             model: self.chat.as_ref().map(|c| c.model()),
+            effort: self.chat.as_ref().map(|c| c.effort()).filter(|e| !e.is_empty()),
             past: false,
         }
     }
@@ -432,7 +433,7 @@ impl Daemon {
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
-            "claude" => Box::new(chat::claude::Claude::default()),
+            "claude" => Box::new(chat::claude::Claude::new(launch.effort.clone())),
             "codex" => Box::new(chat::codex::Codex::new(&cwd)),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
@@ -579,20 +580,23 @@ impl Daemon {
                 a => args.push(a.to_owned()),
             }
         }
-        let adapter: Box<dyn chat::Adapter> = match s.kind.as_str() {
-            "claude" => {
-                args.extend(["--resume".to_owned(), session.clone()]);
-                Box::new(chat::claude::Claude::default())
-            }
-            "codex" => Box::new(chat::codex::Codex::resume(&s.cwd, &session)),
+        match s.kind.as_str() {
+            "claude" => args.extend(["--resume".to_owned(), session.clone()]),
+            "codex" => {}
             other => anyhow::bail!("{other} has no chat adapter to resume with"),
-        };
+        }
         if let Some(n) = &s.name {
             db::check_name(n)?;
         }
         let launch = profiles::launch(
             &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
         )?;
+        // Claude's adapter says the effort its launch passed, so it is made after the launch.
+        let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
+            Box::new(chat::claude::Claude::new(launch.effort.clone()))
+        } else {
+            Box::new(chat::codex::Codex::resume(&s.cwd, &session))
+        };
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
         db::session_start(&db::SessionRow {

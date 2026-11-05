@@ -113,6 +113,8 @@ pub struct Transcript {
     pub busy: bool,
     pub agent: String,
     pub model: String,
+    /// The reasoning effort it runs with; empty when its `session` event did not say.
+    pub effort: String,
     /// The agent's own id for the conversation (Claude's session id, Codex's thread id): what resumes it. Empty when the
     /// log never said (a chat recorded before `session` events carried it).
     pub session_id: String,
@@ -132,8 +134,8 @@ pub struct Transcript {
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.items, self.busy, &self.agent, &self.model, &self.session_id, &self.title, &self.details, &self.at)
-            == (&o.items, o.busy, &o.agent, &o.model, &o.session_id, &o.title, &o.details, &o.at)
+        (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
+            == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
     }
 }
 
@@ -204,9 +206,10 @@ impl Transcript {
     pub fn apply(&mut self, e: &Event) {
         self.rev = self.rev.wrapping_add(1);
         match &e.body {
-            Body::Session { agent, model, session_id } => {
+            Body::Session { agent, model, session_id, effort } => {
                 self.agent.clone_from(agent);
                 self.model.clone_from(model);
+                self.effort = effort.clone().unwrap_or_default();
                 if let Some(id) = session_id.as_ref().filter(|id| !id.is_empty()) {
                     self.session_id.clone_from(id);
                 }

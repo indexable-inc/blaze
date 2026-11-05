@@ -8,6 +8,7 @@ hn {
   prefab ChatPane : hn.Pane {
     list : ui.Scroll {
       Cursor: {shape: Text}
+      ClipFade: {len: $chat_fade_len}
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
@@ -15,7 +16,10 @@ hn {
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
       }
     }
+    // The foot is opaque, in the card's own ground: the transcript ends at its top (thinning out under it), and nothing
+    // drawn behind the pane shows under the input or its status line.
     foot : ui.Column {
+      Fill: $tone_term_ground
       Flex: {axis: Column, gap: 6, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: 4, b: 12}
