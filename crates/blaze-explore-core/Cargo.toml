@@ -1,0 +1,41 @@
+[package]
+name = "blaze-explore-core"
+description = "The explorer's core, for the page in wasm32 and for the host: the daemon's wire (hello, answers, the live frames), each live table's Arrow IPC stream kept across frames, the live state (open span chains, busy and idle workers, recent spans, counters) and Running now's view models in deterministic CBOR, behind a small C ABI over linear memory"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+# `cdylib`: the module the page loads (`blaze build -p blaze-explore-core --target
+# wasm32-unknown-unknown`); `rlib`: the host's tests and any Rust reader.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Each live table's IPC stream (`StreamDecoder`) and the answers' (`StreamReader`), zstd bodies
+# through vendor/zstd-sys (libzstd-rs-sys on wasm).
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+# The view models' deterministic CBOR (`cbor::to_vec`), and later `now::Fold`.
+blaze-protocol.workspace = true
+blaze-serde.workspace = true
+serde.workspace = true
+# The daemon's headers are JSON today (blaze-explore's `frame::head`).
+serde_json.workspace = true
+
+[dev-dependencies]
+# The daemon's own producers: the live tables' batches and their long-lived IPC streams
+# (blaze-profile's `batches::open` and `live::Encoder`) and the frames' heads (blaze-explore's
+# `frame`), so the tests decode exactly the bytes the daemon writes.
+blaze-explore.workspace = true
+blaze-profile.workspace = true
+
+[lints]
+workspace = true
