@@ -106,6 +106,7 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
+    // A Command key bound to an Edit selector (cmd+c, cmd+x, cmd+v) runs what the window's responder would (see `press`).
     // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
     // when it is open, the Archive's search when it has the keyboard).
     let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| {
@@ -292,8 +293,22 @@ fn press(app: &mut App, spec: &str) {
             mods: c.mods(),
             action: crate::term::KeyAction::Press,
             composing: false,
-        });
-        crate::app::Outcome::Done
+        })
     };
     eprintln!("harness-native: shot key {spec}: {out:?}");
+    // A selector goes up the responder chain to the view (src/window.rs): this app plays the view's part, with
+    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline); what a copy or cut would put on it is logged.
+    if let crate::app::Outcome::Selector(sel) = out {
+        let clip = std::env::var("HARNESS_NATIVE_SHOT_CLIP").unwrap_or_default().replace("\\n", "\n");
+        let took = match sel.as_str() {
+            "copy:" => app.copy(),
+            "cut:" => app.cut(),
+            "paste:" => {
+                app.paste(&clip);
+                None
+            }
+            _ => None,
+        };
+        eprintln!("harness-native: shot {sel} pasteboard {took:?}");
+    }
 }

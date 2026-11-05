@@ -429,21 +429,35 @@ define_class!(
         #[unsafe(method(copy:))]
         fn copy(&self, _sender: Option<&AnyObject>) {
             if let Some(text) = with(|st| st.app.copy()).flatten() {
-                let pb = NSPasteboard::generalPasteboard();
-                pb.clearContents();
-                // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
-                pb.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+                pasteboard_put(&text);
             }
+            wake();
         }
 
+        #[unsafe(method(cut:))]
+        fn cut(&self, _sender: Option<&AnyObject>) {
+            if let Some(text) = with(|st| st.app.cut()).flatten() {
+                pasteboard_put(&text);
+            }
+            wake();
+        }
+
+        /// Files on the pasteboard (a Finder copy, which carries their names as a string too) paste as their paths, else
+        /// its string pastes.
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
-            // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
-            let text = NSPasteboard::generalPasteboard().stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string());
-            if let Some(text) = text {
-                with(|st| st.app.paste(&text));
-                wake();
+            let pb = NSPasteboard::generalPasteboard();
+            let paths = pasteboard_paths(&pb);
+            if paths.is_empty() {
+                // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
+                let text = pb.stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string());
+                if let Some(text) = text {
+                    with(|st| st.app.paste(&text));
+                }
+            } else {
+                with(|st| st.app.paste_paths(&paths));
             }
+            wake();
         }
 
         /// A right click (or control-click) on a tree row: what can be done to its object.
@@ -636,7 +650,10 @@ impl HarnessView {
             action,
             composing: false,
         };
-        with(|st| st.app.key(&k));
+        // A Command key that reached keyDown (no key equivalent took it) can still be bound to a selector (`copy:`).
+        if let Some(crate::app::Outcome::Selector(sel)) = with(|st| st.app.key(&k)) {
+            send_selector(self.mtm(), &sel);
+        }
         wake();
     }
 
@@ -1386,6 +1403,29 @@ fn main_menu(
         bar.addItem(&submenu(mtm, title, &items));
     }
     bar
+}
+
+/// Put `text` on the general pasteboard as its one string.
+fn pasteboard_put(text: &str) {
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
+    pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+}
+
+/// The paths of the files on pasteboard `pb` (each item's file URL; Finder's are file reference URLs, resolved to paths).
+fn pasteboard_paths(pb: &NSPasteboard) -> Vec<String> {
+    let Some(items) = pb.pasteboardItems() else { return Vec::new() };
+    let mut out = Vec::new(); // alloc: a paste's few paths
+    for item in &items {
+        // SAFETY: NSPasteboardTypeFileURL is a valid static pasteboard type.
+        let Some(url) = item.stringForType(unsafe { objc2_app_kit::NSPasteboardTypeFileURL }) else { continue };
+        let path = objc2_foundation::NSURL::URLWithString(&url).and_then(|u| u.filePathURL()).and_then(|u| u.path());
+        if let Some(p) = path {
+            out.push(p.to_string());
+        }
+    }
+    out
 }
 
 /// Send AppKit action `sel` (`copy:`) up the responder chain from the key window's first responder to the app.

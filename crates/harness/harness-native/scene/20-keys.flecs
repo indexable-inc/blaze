@@ -62,6 +62,9 @@ act {
     MenuItem: {bar: "File", title: "New Shell"} }
   Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
 
+  // The Edit menu's: sent up the responder chain to the view (src/window.rs), which runs the app's cut, copy, paste.
+  Cut { Selector: {sel: "cut:"}
+    MenuItem: {bar: "Edit", title: "Cut"} }
   Copy { Selector: {sel: "copy:"}
     MenuItem: {bar: "Edit", title: "Copy"} }
   Paste { Selector: {sel: "paste:"}
@@ -158,7 +161,6 @@ act {
   ChatWordErase : act.Edit { EditOp: {op: "word_erase"} }
   ChatWordDelete : act.Edit { EditOp: {op: "word_delete"} }
   ChatLineErase : act.Edit { EditOp: {op: "line_erase"} }
-  ChatCut : act.Edit { EditOp: {op: "cut"} }
 }
 
 // ---- bindings ----
@@ -181,6 +183,8 @@ key {
   archive { Keybind: {key: "w", cmd: 1}
     (Does, act.Archive) }
 
+  cut { Keybind: {key: "x", cmd: 1}
+    (Does, act.Cut) }
   copy { Keybind: {key: "c", cmd: 1}
     (Does, act.Copy) }
   paste { Keybind: {key: "v", cmd: 1}
@@ -394,5 +398,4 @@ key {
   chat_word_erase { Keybind: {key: "backspace", opt: 1}; (Does, act.ChatWordErase); (When, ctx.Chat) }
   chat_word_delete { Keybind: {key: "delete", opt: 1}; (Does, act.ChatWordDelete); (When, ctx.Chat) }
   chat_line_erase { Keybind: {key: "backspace", cmd: 1}; (Does, act.ChatLineErase); (When, ctx.Chat) }
-  chat_cut { Keybind: {key: "x", cmd: 1}; (Does, act.ChatCut); (When, ctx.Chat) }
 }
