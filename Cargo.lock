@@ -1887,6 +1887,7 @@ dependencies = [
  "blaze-report",
  "blaze-v2-proof",
  "blaze-vfs",
+ "expect-test",
  "hashbrown 0.17.1",
  "ratatui",
  "serde_json",
