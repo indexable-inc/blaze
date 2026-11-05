@@ -1,11 +1,11 @@
 //! Claude's adapter: `claude -p` over stream-json (`--input-format stream-json --output-format stream-json --verbose
 //! --include-partial-messages`) read into the event model of `chat/mod.rs`. The only place Claude's shapes are known.
 //!
-//! What Claude writes, per turn: `system/init` (model), then for each assistant message `stream_event`s
+//! What Claude writes, per turn: `system/init` (model, session_id: what `--resume` takes), then for each assistant message `stream_event`s
 //! (`message_start` with its id; per content block `content_block_start` at an index, `content_block_delta`s of
 //! `text_delta` / `thinking_delta` / `input_json_delta`, `content_block_stop`), and one whole `assistant` line per block
 //! in index order (it may come before its block's stop); `user` lines carry tool results; `result` ends the turn
-//! (`subtype` success or error_*, `duration_ms`, `total_cost_usd`, `usage`, `result`, `terminal_reason`). An interrupt
+//! (`subtype` success or error_*, `duration_ms`, `total_cost_usd` (since the process started), `usage`, `result`, `terminal_reason`). An interrupt
 //! (`control_request` subtype interrupt) is answered by a `control_response`, the partial block whole, a `user` line
 //! "[Request interrupted by user]" and a `result` with terminal_reason `aborted_streaming`.
 use serde_json::{Value, json};
@@ -28,6 +28,9 @@ pub struct Claude {
     last_text: String,
     interrupted: bool,
     requests: u64,
+    /// What this process had cost by the last turn's end: Claude's `total_cost_usd` counts from the process's start, a
+    /// `turn_end`'s `cost_usd` is the turn's own.
+    cost_before: f64,
 }
 
 impl Claude {
@@ -140,13 +143,18 @@ impl Claude {
             "error".to_owned()
         };
         let text = v["result"].as_str().map_or_else(|| std::mem::take(&mut self.last_text), str::to_owned);
+        let cost = v["total_cost_usd"].as_f64().map(|total| {
+            let turn = ((total - self.cost_before) * 1e9).round() / 1e9;
+            self.cost_before = total;
+            turn
+        });
         let mut out = Vec::new();
         if stop == "error" {
             let why = v["errors"].as_array().and_then(|e| e.first()).and_then(Value::as_str).unwrap_or("the turn failed");
             out.push(json!({"ev": "error", "text": why}));
         }
         out.push(json!({
-            "ev": "turn_end", "ok": ok, "stop": stop, "duration_ms": v["duration_ms"], "cost_usd": v["total_cost_usd"],
+            "ev": "turn_end", "ok": ok, "stop": stop, "duration_ms": v["duration_ms"], "cost_usd": cost,
             "usage": v["usage"], "text": text,
         }));
         out.push(json!({"ev": "busy", "busy": false}));
@@ -179,7 +187,7 @@ impl super::Adapter for Claude {
         };
         match v["type"].as_str().unwrap_or("") {
             "system" if v["subtype"] == "init" => {
-                vec![json!({"ev": "session", "agent": "claude", "model": v["model"]})]
+                vec![json!({"ev": "session", "agent": "claude", "model": v["model"], "session_id": v["session_id"]})]
             }
             "stream_event" => self.partial(&v["event"]),
             "assistant" => self.assistant(&v),

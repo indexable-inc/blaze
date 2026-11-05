@@ -886,8 +886,9 @@ impl App {
         let pv = View::of(w.entity_from_id(pane));
         let mut states = self.chat.borrow_mut();
         let st = states.entry(sid).or_default();
-        // Its own stream of events: attach (again a second after a try while it runs, once when it ended). A stream the
-        // link holds from before the session was known to be a chat is a terminal's: dropped for ours.
+        // Its own stream of events: attach (again a second after a try while it runs, once when it ended). The stream
+        // outlives the agent (a resume's events come on it), and a past chat's is its log replayed by the daemon. A stream
+        // the link holds from before the session was known to be a chat is a terminal's: dropped for ours.
         let attached = self.link.attached(sid);
         if attached && !st.ours {
             self.link.detach(sid);
@@ -1020,7 +1021,7 @@ impl App {
                 m.text(&model);
             }
             let state = if self.status_of(e) != "running" {
-                "ended"
+                "ended \u{00B7} a message resumes it"
             } else if t.busy {
                 "Working\u{2026}  esc to interrupt"
             } else {

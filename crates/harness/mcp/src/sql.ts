@@ -4,13 +4,17 @@
 //   objects   every object: PTY sessions (s7: claude|codex|cursor|shell), runs (r12: proc), stages (r12.0: stage), REPL cells (repl)
 //   sessions, runs, stages   objects filtered by kind
 //   streams   (object, stream, path, bytes, compacted_ms, archive_path): one raw append-only file per object stream
-//   lines     (object, kind, stream, line_no, ts_ms, text): every stream line; also named `events`
+//   lines     (object, kind, stream, line_no, ts_ms, text): every line stream's line; also named `events`
 //   messages  (object, role, kind, tool, text, ts_ms): agent conversations parsed from their transcripts
+//   chat      one row per event of every chat session's log (harness/src/chat/mod.rs has the event model)
+//   chats     one row per chat session
 //
 // `lines` = archive/objects/*.parquet for compacted objects, plus the raw files of everything not yet
 // compacted (running runs and sessions), tailed incrementally into memory before each query. Both use
 // one line rule (split on \n, lossy UTF-8; same as archive.rs), so a query answers the same before
-// and after the daemon compacts or restarts.
+// and after the daemon compacts or restarts. A chat's log is not a line stream: it is never compacted,
+// stays one NDJSON file (objects/<id>/chat) for good, and `chat` reads those files directly, live or
+// long finished alike, numbering lines as the daemon does (harness-chat's `lines`).
 import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from "@duckdb/node-api";
 import { existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { table, type Table } from "./table.ts";
@@ -46,7 +50,7 @@ async function connect(): Promise<DuckDBConnection> {
 
 /** Read new complete lines of every uncompacted stream into live_lines; partial last lines into live_tail. */
 async function syncLive(c: DuckDBConnection) {
-  const r = await c.runAndReadAll("select object, stream, path from h.streams where compacted_ms is null and stream != 'messages'");
+  const r = await c.runAndReadAll("select object, stream, path from h.streams where compacted_ms is null and stream not in ('messages', 'chat')");
   const want = new Map(r.getRowObjectsJS().map((x) => [String(x.path), { object: String(x.object), stream: String(x.stream) }]));
   for (const [path, t] of tails) {
     if (want.has(path)) continue;
@@ -91,7 +95,7 @@ async function syncLive(c: DuckDBConnection) {
   const archive = `${HOME()}/archive/objects`;
   const any = existsSync(archive) && !new Bun.Glob("*.parquet").scanSync(archive).next().done;
   const parquet = any
-    ? `select object, stream, line_no, ts_ms, text from read_parquet(${lit(archive + "/*.parquet")}) where object not in (select object from live_objs)`
+    ? `select object, stream, line_no, ts_ms, text from read_parquet(${lit(archive + "/*.parquet")}) where object not in (select object from live_objs) and stream != 'chat'`
     : "select null::varchar object, null::varchar stream, null::bigint line_no, null::bigint ts_ms, null::varchar text where false";
   await c.run(`create or replace view lines as
     select l.object, o.kind, l.stream, l.line_no, l.ts_ms, l.text from (
@@ -105,6 +109,56 @@ async function syncLive(c: DuckDBConnection) {
     ? `select * from read_json([${msgs.map((m) => lit(`${HOME()}/objects/${m}`)).join(", ")}], format = 'newline_delimited', ignore_errors = true,
         columns = {object: 'VARCHAR', role: 'VARCHAR', kind: 'VARCHAR', tool: 'VARCHAR', text: 'VARCHAR', ts_ms: 'BIGINT'})`
     : "select null::varchar object, null::varchar role, null::varchar kind, null::varchar tool, null::varchar text, null::bigint ts_ms where false"}`);
+  await chatViews(c);
+}
+
+/** Every chat log's lines: (session, n, line), n numbered from 1 over the file's `\n`-split pieces, blanks left out. */
+function chatLines(): string {
+  const objects = `${HOME()}/objects`;
+  const any = existsSync(objects) && !new Bun.Glob("*/chat").scanSync(objects).next().done;
+  if (!any) return "select null::varchar session, null::bigint n, null::varchar line where false";
+  return `select session, n, line from (
+      select session, generate_subscripts(ls, 1)::bigint n, unnest(ls) line
+      from (select regexp_extract(filename, '/objects/([^/]+)/chat$', 1) session, string_split(content, chr(10)) ls
+            from read_text(${lit(objects + "/*/chat")}))
+    ) where trim(line) != ''`;
+}
+
+/** The `chat` and `chats` views over every chat log (see the header). */
+async function chatViews(c: DuckDBConnection) {
+  await c.run(`create or replace view chat as
+    with l as (select session, n, line, json_valid(line) valid from (${chatLines()})),
+    e as (select session, n, valid, case when valid then line::json end j from l)
+    select session, n, j->>'ev' ev, (j->>'ts')::bigint ts_ms,
+      j->>'ev' in ('block_start', 'delta', 'tool_start', 'tool_delta') partial,
+      j->>'block' block,
+      case when j->>'ev' in ('block', 'block_start') then j->>'kind' end kind,
+      case when j->>'ev' = 'user' then 'user'
+           when j->>'ev' in ('block', 'block_start', 'delta', 'tool_start', 'tool_delta', 'tool_call') then 'assistant'
+           when j->>'ev' in ('tool_result', 'tool_detail') then 'tool'
+           else 'system' end role,
+      coalesce(j->>'text', j->>'json') text,
+      coalesce(j->>'name', max(case when j->>'ev' in ('tool_start', 'tool_call') then j->>'name' end) over (partition by session, j->>'block')) tool,
+      j->'input' input, (j->>'error')::boolean error,
+      j->>'cell' cell, j->>'status' status, (j->>'ms')::bigint ms, j->'effects' effects, j->'value' value, j->'ui' ui,
+      (j->>'ok')::boolean ok, j->>'stop' stop, (j->>'duration_ms')::bigint duration_ms, (j->>'cost_usd')::double cost_usd, j->'usage' usage,
+      j->>'agent' agent, j->>'model' model, j->>'session_id' session_id, (j->>'busy')::boolean busy,
+      valid, j json
+    from e`);
+  await c.run(`create or replace view chats as
+    select o.id, o.kind agent, o.name, o.parent, o.cwd, o.status, o.created_ms started_ms, o.ended_ms,
+      max(c.ts_ms) last_ms,
+      arg_max(c.model, c.n) filter (where c.ev = 'session') model,
+      arg_max(c.session_id, c.n) filter (where c.ev = 'session' and c.session_id is not null) agent_session,
+      count(*) filter (where c.ev = 'turn_end') turns,
+      count(*) filter (where c.ev = 'user') messages,
+      list_filter(string_split(arg_min(c.text, c.n) filter (where c.ev = 'user'), chr(10)), lambda x: trim(x) != '')[1] title,
+      arg_min(c.text, c.n) filter (where c.ev = 'user') first_message,
+      sum(c.cost_usd) cost_usd,
+      count(*) filter (where not c.valid) bad_lines
+    from objects o left join chat c on c.session = o.id
+    where o.meta->>'mode' = 'chat'
+    group by all`);
 }
 
 const plain = (v: unknown): unknown =>

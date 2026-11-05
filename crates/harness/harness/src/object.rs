@@ -147,8 +147,8 @@ pub fn info(d: &Daemon, id: &str) -> Result<Value> {
                 let exit = *s.exit.lock().unwrap();
                 json!({
                     "id": id, "kind": s.kind, "name": s.name, "parent": s.parent.map(|p| format!("s{p}")), "cwd": s.cwd,
-                    "status": if exit.is_some() { "exited" } else { "running" }, "exit_code": exit, "signal": null,
-                    "created_ms": s.created_ms, "title": i["title"], "pid": s.pid, "cols": i["cols"], "rows": i["rows"],
+                    "status": i["status"], "exit_code": exit, "signal": null,
+                    "created_ms": s.created_ms, "title": i["title"], "pid": s.pid(), "cols": i["cols"], "rows": i["rows"],
                 })
             }
             Err(_) => known(&id)?,
@@ -230,7 +230,7 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
             "kill" => handle(Req::Kill { id: n }),
             "forget" => handle(Req::Forget { id: n }),
             "signal" => {
-                let pid = d.get(n)?.pid.ok_or_else(|| anyhow!("{id} has no pid"))?;
+                let pid = d.get(n)?.pid().ok_or_else(|| anyhow!("{id} has no pid"))?;
                 unsafe { libc::kill(pid as i32, sig_num(&args["sig"])?) };
                 Ok(json!({ "ok": true }))
             }
