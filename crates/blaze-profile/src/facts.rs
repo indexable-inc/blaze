@@ -140,20 +140,31 @@ pub struct ProvenanceRow {
     pub what: Option<&'static str>,
 }
 
-/// A row of the schema's `key_parts` table: one part of the key of a thing a build computed
-/// again (`blaze_kernel::Part`), or the key alone when it exposes no parts.
+/// What the schema's `key_parts` table holds of one thing a build computed again: a row each
+/// part of its key (`blaze_kernel::Part`), or one with no part when the key exposes none. Kept a
+/// miss at a time, its item and key once rather than once a part, and made rows only as a
+/// flush's batch is ([`key_parts`]): a cold `blaze test --workspace` computed 1.79M dev
+/// templates, 12.7M parts, each part row with its own copy of its item and key, 9 to 15 GiB of
+/// the daemon's heap at the build's end (#1726).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyPartRow {
+pub struct KeyedMiss {
     pub build_id: u64,
     pub step: &'static str,
     pub item: String,
     /// The whole key, hex.
     pub key: String,
-    pub part: Option<String>,
+    /// Its key's parts, each a row.
+    pub parts: Vec<KeyPart>,
+    pub beyond: Option<&'static str>,
+}
+
+/// One part of a [`KeyedMiss`]'s key: a `key_parts` row's own columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPart {
+    pub name: String,
     /// The part's hash, hex.
     pub hash: Option<String>,
     pub names: Option<String>,
-    pub beyond: Option<&'static str>,
 }
 
 /// A row of the schema's `misses` table: one thing a build computed again, and why.
@@ -416,19 +427,27 @@ pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
 }
 
 /// The `key_parts` rows of `rows`.
-pub fn key_parts(rows: &[KeyPartRow]) -> Result<RecordBatch, ArrowError> {
-    let text =
-        |of: fn(&KeyPartRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+pub fn key_parts(misses: &[KeyedMiss]) -> Result<RecordBatch, ArrowError> {
+    // Each miss's rows: its parts, or one with none when its key exposes none.
+    let rows = || {
+        misses.iter().flat_map(|miss| {
+            let none = miss.parts.is_empty().then_some(None);
+            none.into_iter().chain(miss.parts.iter().map(Some)).map(move |part| (miss, part))
+        })
+    };
+    let text = |of: fn(Option<&KeyPart>) -> Option<&str>| {
+        column(StringArray::from_iter(rows().map(|(_, part)| of(part))))
+    };
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        dict(rows.iter().map(|it| Some(it.step))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.item.as_str()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.key.as_str()))),
-        text(|it| it.part.as_deref()),
-        text(|it| it.hash.as_deref()),
-        text(|it| it.names.as_deref()),
-        text(|it| it.beyond),
+        column(UInt64Array::from_iter_values(rows().map(|(miss, _)| miss.build_id))),
+        dict(rows().map(|(miss, _)| Some(miss.step))),
+        column(StringArray::from_iter_values(rows().map(|(miss, _)| miss.item.as_str()))),
+        column(StringArray::from_iter_values(rows().map(|(miss, _)| miss.key.as_str()))),
+        text(|part| part.map(|it| it.name.as_str())),
+        text(|part| part.and_then(|it| it.hash.as_deref())),
+        text(|part| part.and_then(|it| it.names.as_deref())),
+        column(StringArray::from_iter(rows().map(|(miss, _)| miss.beyond))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::KEY_PARTS), columns)
 }
@@ -519,16 +538,17 @@ impl ProvenanceRow {
     }
 }
 
-impl KeyPartRow {
-    /// The bytes of text this row puts in its batch's string columns.
+impl KeyedMiss {
+    /// The bytes of text its rows put in their batch's string columns.
     pub fn text_bytes(&self) -> usize {
-        self.step.len()
-            + self.item.len()
-            + self.key.len()
-            + text_len(self.part.as_deref())
-            + text_len(self.hash.as_deref())
-            + text_len(self.names.as_deref())
-            + text_len(self.beyond)
+        let rows = self.parts.len().max(1);
+        let each = self.step.len() + self.item.len() + self.key.len() + text_len(self.beyond);
+        let parts: usize = self
+            .parts
+            .iter()
+            .map(|it| it.name.len() + text_len(it.hash.as_deref()) + text_len(it.names.as_deref()))
+            .sum();
+        rows * each + parts
     }
 }
 
@@ -582,21 +602,19 @@ mod tests {
 
     #[test]
     fn a_flush_of_more_text_than_one_batch_holds_is_split_and_keeps_every_row() {
-        let row = KeyPartRow {
+        let row = KeyedMiss {
             build_id: 7,
             step: "codegen",
             item: "x".repeat(1000),
             key: "ab".into(),
-            part: None,
-            hash: None,
-            names: None,
+            parts: Vec::new(),
             beyond: None,
         };
         let most = 10 * row.text_bytes();
         let rows = vec![row; 25];
-        let batches = in_batches(&rows, KeyPartRow::text_bytes, most, key_parts).unwrap();
+        let batches = in_batches(&rows, KeyedMiss::text_bytes, most, key_parts).unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(), [10, 10, 5]);
-        assert_eq!(in_batches(&[], KeyPartRow::text_bytes, most, key_parts).unwrap().len(), 1);
+        assert_eq!(in_batches(&[], KeyedMiss::text_bytes, most, key_parts).unwrap().len(), 1);
     }
 
     #[test]
@@ -666,20 +684,43 @@ mod tests {
         assert!(batch.column(at("cause")).is_null(1) && batch.column(at("cause_key")).is_null(1));
         assert_eq!(batch.column(at("what")).as_string::<i32>().value(1), "the proc macro's output");
 
-        let parts = key_parts(&[KeyPartRow {
-            build_id: 5,
-            step: "unit",
-            item: "app v0.1.0 (lib)".into(),
-            key: "ab".into(),
-            part: Some("env CC".into()),
-            hash: Some("cd".into()),
+        let part = |name: &str, hash: &str| KeyPart {
+            name: name.into(),
+            hash: Some(hash.into()),
             names: None,
-            beyond: Some("its process variables"),
-        }])
+        };
+        let parts = key_parts(&[
+            KeyedMiss {
+                build_id: 5,
+                step: "unit",
+                item: "app v0.1.0 (lib)".into(),
+                key: "ab".into(),
+                parts: vec![part("env CC", "cd"), part("env LD", "ef")],
+                beyond: Some("its process variables"),
+            },
+            KeyedMiss {
+                build_id: 5,
+                step: "unit",
+                item: "lib v0.1.0 (lib)".into(),
+                key: "01".into(),
+                parts: Vec::new(),
+                beyond: None,
+            },
+        ])
         .unwrap();
         assert_eq!(
             parts.column(schema::KEY_PARTS.column("hash").unwrap()).as_string::<i32>().value(0),
             "cd"
         );
+        // A row a part, and one with no part for the key that exposes none, each with its
+        // miss's item.
+        let text = |name: &str| parts.column(schema::KEY_PARTS.column(name).unwrap()).as_string::<i32>();
+        assert_eq!(parts.num_rows(), 3);
+        assert_eq!(text("part").value(1), "env LD");
+        assert_eq!(text("item").value(1), "app v0.1.0 (lib)");
+        assert!(text("part").is_null(2) && text("hash").is_null(2));
+        assert_eq!(text("item").value(2), "lib v0.1.0 (lib)");
+        assert_eq!(text("beyond").value(1), "its process variables");
+        assert!(text("beyond").is_null(2));
     }
 }
