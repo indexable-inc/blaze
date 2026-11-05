@@ -207,11 +207,11 @@ export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.
 export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 // With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
 // ground are set at runtime from each appearance's theme background and foreground: tone_term_ground (hn.Main),
-// tone_term_ink and tone_term_muted (hn.TitleBar), tone_plate (Plate), tone_card (hn.Palette.card) and tone_side_tint
-// (hn.SideClip). The values here are the built-in theme's, kept for an appearance the config does not theme.
+// tone_term_ink and tone_term_muted (the words on it: the title bar's, the chat's), tone_plate (Plate), tone_card (the
+// palette's and the picker's cards) and tone_side_tint (hn.SideClip); every Fill copied from one follows it. The values here are the built-in theme's, kept for an appearance the config does not theme.
 // The terminal's ground (the built-in theme's bg, #121214): the main card and the title bar over it, in both appearances.
 export mut tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
-// Ink over the terminal's ground (always dark): the title bar's words.
+// Ink over the terminal's ground (the built-in theme's is dark): the title bar's and the chat's words.
 export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
 export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
