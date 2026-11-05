@@ -101,6 +101,10 @@ fn claude(ctx: &Ctx) -> Launch {
         // Show the real cursor at the input instead of hiding it (?25l) and painting an inverse block. Claude takes
         // that from its `tengu_native_cursor` flag, which DISABLE_TELEMETRY / NONESSENTIAL_TRAFFIC leave at false.
         ("CLAUDE_CODE_NATIVE_CURSOR", "1"),
+        // The fullscreen renderer: the alt screen with Claude's own virtualized scrollback, so the input bar stays put
+        // and the wheel (sent as mouse reports, src/app/panes.rs wheel) scrolls the conversation, not the terminal's
+        // history. Same as the `tui: "fullscreen"` setting, which --setting-sources "" would drop.
+        ("CLAUDE_CODE_NO_FLICKER", "1"),
     ] {
         env.insert(k.into(), v.into());
     }
