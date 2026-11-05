@@ -19,6 +19,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod genui;
+
 /// cod-chevron-right, cod-chevron-down.
 const CLOSED: &str = "\u{EAB6}";
 const OPENED: &str = "\u{EAB4}";
@@ -257,6 +259,8 @@ enum Row {
     Results { v: Arc<Value>, cap: usize },
     /// Text a cell printed or returned: a command's output, a string, an error's stack.
     Output { text: String, error: bool },
+    /// What a cell draws (its Svelte markup's tree, [`genui`]).
+    Ui { v: Arc<Value> },
     /// "Show code" under an opened card.
     CodeToggle { block: String, open: bool },
     Thinking { block: String, open: bool, text: String, live: bool },
@@ -286,6 +290,7 @@ impl Row {
             Row::Results { .. } => "hn.ChatResults",
             Row::Output { error: true, .. } => "hn.ChatOutputError",
             Row::Output { .. } => "hn.ChatOutput",
+            Row::Ui { .. } => "hn.ChatUi",
             Row::CodeToggle { .. } => "hn.ChatCodeToggle",
             Row::Thinking { open: true, .. } => "hn.ChatThinkingOpen",
             Row::Thinking { .. } => "hn.ChatThinking",
@@ -550,6 +555,7 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
                 "record" => format!("{n} field{}", if n == 1 { "" } else { "s" }),
                 "scalar" => cell_text(&v["v"]),
                 "text" => first_line(v["v"].as_str().unwrap_or("")),
+                _ if !d.ui.is_null() => "Drew a view".into(),
                 _ => "Done".into(),
             };
             (kind_icon(""), words, String::new(), false)
@@ -585,7 +591,14 @@ fn card_rows(block: &str, d: &Detail, open: &HashSet<String>, out: &mut Vec<Row>
     let (icon, words, detail, error) = headline(d);
     let state = d.ms.filter(|_| d.status != "running").map(secs).unwrap_or_default();
     out.push(Row::Card { block: block.to_owned(), icon, words, detail, state, error, open: is_open });
+    // What it draws shows under its head, folded or open, in place of its value.
+    if !d.ui.is_null() {
+        out.push(Row::Ui { v: d.ui.clone() });
+    }
     if !is_open {
+        if !d.ui.is_null() {
+            return;
+        }
         let main = if d.value.is_null() { d.effects.iter().rev().map(|e| &e.value).find(|v| !v.is_null()) } else { Some(&d.value) };
         // A cell whose whole value is its head ("42") shows nothing more.
         if let Some(main) = main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar")) {
@@ -722,9 +735,13 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Card { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
         Row::Output { text, .. } => vec![(&["card", "text"], text.clone(), false)],
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } | Row::Table(_) | Row::Results { .. } => {
-            Vec::new()
-        }
+        Row::Tool { .. }
+        | Row::Thinking { .. }
+        | Row::Grid { .. }
+        | Row::CodeToggle { .. }
+        | Row::Table(_)
+        | Row::Results { .. }
+        | Row::Ui { .. } => Vec::new(),
     }
 }
 
@@ -768,7 +785,14 @@ impl Row {
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
             Row::Output { text, .. } => format!("```\n{text}\n```"),
             Row::Table(t) => t.markdown(),
-            Row::Results { .. } | Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => {
+            Row::Results { .. }
+            | Row::Tool { .. }
+            | Row::Thinking { .. }
+            | Row::Card { .. }
+            | Row::Step { .. }
+            | Row::Grid { .. }
+            | Row::CodeToggle { .. }
+            | Row::Ui { .. } => {
                 return None;
             }
         })
@@ -1563,6 +1587,18 @@ struct RowCtx<'k> {
     open: Option<usize>,
 }
 
+impl RowCtx<'static> {
+    /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
+    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None };
+}
+
+impl RowCtx<'_> {
+    /// What a press on a table row in this row sends (the row's number after it); None outside the transcript.
+    fn row_action(&self) -> Option<String> {
+        (!self.key.is_empty()).then(|| format!("chat:row:{}:{}", self.sid, self.key))
+    }
+}
+
 /// A table's measure: words (in a style, inline markdown or not) to their one-line width in points.
 type Measure<'m> = dyn FnMut(&str, &TextStyle, bool) -> f32 + 'm;
 
@@ -1656,12 +1692,13 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Grid { v, cap } => fill_grid(row, v, *cap, ctx, measure),
         Row::Table(t) => {
             if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
-                let action = format!("chat:row:{}:{}", ctx.sid, ctx.key);
-                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: Some(&action), open: ctx.open };
+                let action = ctx.row_action();
+                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: action.as_deref(), open: ctx.open };
                 view::table(grid, t, opts, measure);
             }
         }
         Row::Results { v, cap } => fill_results(row, v, *cap),
+        Row::Ui { v } => genui::fill(row, v, measure),
         Row::Output { text: s, .. } => {
             if let Some(t) = row.part("card").and_then(|c| c.part("text")) {
                 t.text(s);
@@ -1696,17 +1733,6 @@ fn grid_table(v: &Value) -> view::table::Table {
         columns.push(Column { name: "#".into(), align: Align::End });
     }
     columns.extend(cols.iter().map(|(name, _)| Column { name: (*name).to_owned(), align: Align::Auto }));
-    let url = |s: &str| (s.starts_with("https://") || s.starts_with("http://")) && !s.contains(char::is_whitespace);
-    let cell = |x: &Value, ty: &str| match x {
-        Value::Null => Cell::new(Kind::Dim, "null"),
-        Value::Bool(b) => Cell::new(Kind::Bool, b.to_string()),
-        Value::Number(n) => Cell::new(Kind::Number, n.to_string()),
-        Value::String(s) if url(s) => Cell::new(Kind::Url, s.as_str()),
-        Value::String(s) if ty == "number" => Cell::new(Kind::Number, s.as_str()),
-        Value::String(s) if ty == "nested" || ty == "date" || codeish(s) => Cell::new(Kind::Code, s.as_str()),
-        Value::String(s) => Cell::new(Kind::Text, s.as_str()),
-        x => Cell::new(Kind::Code, x.to_string()),
-    };
     let rows = rows
         .iter()
         .enumerate()
@@ -1717,7 +1743,7 @@ fn grid_table(v: &Value) -> view::table::Table {
             }
             for (c, (_, ty)) in cols.iter().enumerate() {
                 let x = &row[c];
-                out.push(if kind == "record" && c == 0 { Cell::new(Kind::Dim, cell_text(x)) } else { cell(x, ty) });
+                out.push(if kind == "record" && c == 0 { Cell::new(Kind::Dim, cell_text(x)) } else { value_cell(x, ty) });
             }
             out
         })
@@ -1731,6 +1757,24 @@ fn row_table(r: &Row) -> Option<view::table::Table> {
         Row::Table(t) => Some((**t).clone()),
         Row::Grid { v, .. } => Some(grid_table(v)),
         _ => None,
+    }
+}
+
+/// A JSON value as a typed table cell, `ty` its column's type (mcp/src/shown.ts; "" when none): a null dim, a bool a
+/// mark, a number or a number column's string at the end, a web link its host, a date, nested value or code-ish string in
+/// the code face, else words.
+fn value_cell(x: &Value, ty: &str) -> view::table::Cell {
+    use view::table::{Cell, Kind};
+    let url = |s: &str| (s.starts_with("https://") || s.starts_with("http://")) && !s.contains(char::is_whitespace);
+    match x {
+        Value::Null => Cell::new(Kind::Dim, "null"),
+        Value::Bool(b) => Cell::new(Kind::Bool, b.to_string()),
+        Value::Number(n) => Cell::new(Kind::Number, n.to_string()),
+        Value::String(s) if url(s) => Cell::new(Kind::Url, s.as_str()),
+        Value::String(s) if ty == "number" => Cell::new(Kind::Number, s.as_str()),
+        Value::String(s) if ty == "nested" || ty == "date" || codeish(s) => Cell::new(Kind::Code, s.as_str()),
+        Value::String(s) => Cell::new(Kind::Text, s.as_str()),
+        x => Cell::new(Kind::Code, x.to_string()),
     }
 }
 
@@ -1770,9 +1814,9 @@ fn fill_grid(row: View<'_>, v: &Value, cap: usize, ctx: &RowCtx<'_>, measure: &m
     let total = v["total"].as_u64().map_or(data.rows.len(), |t| t as usize);
     let shown = data.rows.len().min(cap);
     if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
-        let action = format!("chat:row:{}:{}", ctx.sid, ctx.key);
-        let action = (kind != "record").then_some(action.as_str());
-        view::table(grid, &data, view::table::Opts { look: "hn.ChatTable", shown, action, open: ctx.open }, measure);
+        let action = ctx.row_action().filter(|_| kind != "record");
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: action.as_deref(), open: ctx.open };
+        view::table(grid, &data, opts, measure);
     }
     if let Some(f) = row.part("foot") {
         let unit = if kind == "record" { "fields" } else if kind == "list" { "items" } else { "rows" };

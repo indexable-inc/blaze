@@ -20,7 +20,7 @@
 //! | `tool_delta` | `block`, `json` | more of its arguments' JSON text *(partial)* |
 //! | `tool_call` | `block`, `name`, `input` | the call, whole (replaces its partials) |
 //! | `tool_result` | `block`, `text`, `error` | what the call returned |
-//! | `tool_detail` | `block`, `cell`, `status`, `ms`, `code`, `effects`, `effects_dropped`, `value`, `logs` | what a harness REPL cell the call ran did, whole each time (see below) |
+//! | `tool_detail` | `block`, `cell`, `status`, `ms`, `code`, `effects`, `effects_dropped`, `value`, `ui`, `logs` | what a harness REPL cell the call ran did, whole each time (see below) |
 //! | `note` | `text` | something the agent said that is not the assistant's words (an interrupt) |
 //! | `error` | `text` | the agent reported an error |
 //! | `turn_end` | `ok`, `stop` (`end_turn` \| `interrupted` \| `error` \| ...), `duration_ms`, `cost_usd`, `usage`, `text` | the turn is over; `text` its last assistant words |
@@ -41,6 +41,10 @@
 //! - `value`: the cell's result as the app shows it (`mcp/src/shown.ts`), null while it runs or when it is one of its
 //!   steps' values: `{t: table | record | list, cols: [{name, type}], rows: [[cell]], total}`, `{t: scalar, type, v}`,
 //!   `{t: text, v, total}`, `{t: error, message, stack}`. A step's `value` has the same shape.
+//! - `ui`: what the cell draws, when its value was Svelte 5 markup (`mcp/src/ui/`), else null: a tree `{type, props,
+//!   children}` or a list of them, `type` one of the app's elements (Column, Row, Text, Markdown, Code, Table, Badge, Stat,
+//!   Card, Divider, Spacer; harness-native `app/chat/genui.rs` draws them). The cell's `$state` changing posts the cell
+//!   again with the new tree, so a `tool_detail` can follow its cell's end.
 //!
 //! # Storage and attach
 //!
@@ -366,7 +370,7 @@ pub fn tool_detail(block: &str, task: &Value) -> Value {
         "ev": "tool_detail", "block": block,
         "cell": format!("{}.{}", task["repl"].as_str().unwrap_or("repl"), task["id"].as_str().unwrap_or("t?")),
         "status": task["status"], "ms": ms, "code": task["code"], "effects": task["effects"],
-        "effects_dropped": task["effects_dropped"], "value": task["value"], "logs": task["logs"],
+        "effects_dropped": task["effects_dropped"], "value": task["value"], "ui": task["ui"], "logs": task["logs"],
     })
 }
 

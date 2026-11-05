@@ -87,6 +87,13 @@ pub struct Matched {
     pub gy: f32,
     pub gw: f32,
     pub gh: f32,
+    /// The room (`Viewport`, view points) it last chased in, and the clock time that room came in (`rescaled` once it
+    /// has changed): a frame whose room differs (the UI zoomed, the window resized) lands the frame on its node, and so
+    /// does every later layout pass of that same frame, so a zoom is a uniform scale and never a slide.
+    pub room_w: f32,
+    pub room_h: f32,
+    pub room_at: f32,
+    pub rescaled: bool,
 }
 
 /// Where a node is drawn this frame when that is not its `Laid` (a `MatchedGeometry` mid-slide), window points. Its

@@ -165,7 +165,11 @@ pub fn install(world: WorldRef<'_>) {
     // Each root's inputs when it was last solved: a root whose inputs are the same keeps the places it has. Layout runs more
     // than once a frame (the host lays its views out again once it has synced them), and most roots are still.
     let mut solved: HashMap<u64, u64> = HashMap::new();
-    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).each_iter(move |it, row, _| {
+    // In its own phase, after everything that sizes nodes. It writes every node's Laid (and LazyRange; its Hidden tags go
+    // in the same merge) through the stage; `writes` makes flecs merge them before the systems after it in the same pass
+    // (hits, matched geometry, the draw pass), so none of them reads the last pass's places. Without it (and with flecs
+    // ordering a phase by recycled entity ids) a zoom drew a frame of the old layout and the selection pill chased it.
+    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Layout).writes(Laid::id()).writes(LazyRange::id()).each_iter(move |it, row, _| {
         let e = it.entity(row);
         let placed = e.has(Placed::id());
         if !placed && e.parent().is_some_and(|p| p.has(Node::id())) {

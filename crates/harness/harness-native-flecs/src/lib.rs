@@ -29,7 +29,7 @@ pub use reflect::HOST_OWNED;
 pub use script::{Prop, ScriptBuilder, ScriptEntityView};
 pub use shared::{Json, Shared};
 pub use string::ScriptString;
-pub use system::{Event, ObserverBuilder, SystemBuilder, TableIter};
+pub use system::{Event, ObserverBuilder, Phase, SystemBuilder, TableIter};
 pub use world::{ComponentView, World, WorldRef};
 pub mod migrate;
 
@@ -49,7 +49,7 @@ pub mod __private {
 pub mod prelude {
     pub use crate::flecs;
     pub use crate::{
-        Component, ComponentId, Entity, EntityView, Get, IntoId, Layout, Prop, Query, QueryBuilder, ScriptEntityView, ScriptString, Shared, TableIter, World, WorldRef,
+        Component, ComponentId, Entity, EntityView, Get, IntoId, Layout, Phase, Prop, Query, QueryBuilder, ScriptEntityView, ScriptString, Shared, TableIter, World, WorldRef,
     };
 }
 

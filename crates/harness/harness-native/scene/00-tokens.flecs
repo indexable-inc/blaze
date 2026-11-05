@@ -254,6 +254,11 @@ export const chat_row_estimate = 44
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
 export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
+// A cell's own UI in the chat (scene/widgets/genui.flecs, src/app/chat/genui.rs): the space between its elements, and
+// a Stat's value, set large.
+export const gen_gap = 8
+export const size_gen_stat = 22
+export const line_gen_stat = 28
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
 // `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and
