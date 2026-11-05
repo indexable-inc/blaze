@@ -1,11 +1,21 @@
 //! AArch64 branches past their 128 MiB reach (`crate::thunk`): a caller and its callee with a
 //! 200 MiB function between them link, each `bl` landing on a thunk that jumps to its target,
 //! in a release image (direct calls) and a dev image with a jump table (calls to slot stubs,
-//! past the patch room too), and in an incremental link's new code.
+//! past the patch room too), and in an incremental link's new code; and a `bl` from a native
+//! object's `.init`, which ELF lays out after the code and its islands.
 
 use blaze_codegen::{Arch, CompiledFunction, RelocKind, Relocation, Target};
 
-use super::{Change, Disk, Image, Linked, TO, function, key, name, output};
+use object::write::{Object as Builder, Relocation as Reloc, Symbol as Def, SymbolSection};
+use object::{
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
+    SymbolScope, elf,
+};
+
+use super::{
+    Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name, output,
+    section_of,
+};
 use crate::Output;
 use crate::symbols::SymKey;
 
@@ -139,4 +149,72 @@ fn an_image_with_islands_is_the_same_whatever_order_its_functions_came_in() {
     };
     let (first, second) = (link(vec![&one, &big, &three]), link(vec![&three, &big, &one]));
     assert!(first.file(TO).same(second.file(TO)));
+}
+
+/// `mov x0, #42`: what `call_weak_fn` starts with, to tell it from the other code.
+const MOV_42: u32 = 0xd280_0540;
+
+/// An AArch64 object shaped as glibc's `crti.o`: `.init` calls the local `call_weak_fn`, at
+/// the start of its own `.text`, which is 200 MiB long.
+fn crti() -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+    let text = b.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    let mut code = vec![0u8; 200 * MIB];
+    code[..4].copy_from_slice(&MOV_42.to_le_bytes());
+    code[4..8].copy_from_slice(&RET);
+    b.append_section_data(text, &code, 16);
+    let weak = b.add_symbol(Def {
+        name: b"call_weak_fn".to_vec(),
+        value: 0,
+        size: 8,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Compilation,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let init = b.add_section(Vec::new(), b".init".to_vec(), SectionKind::Text);
+    b.append_section_data(init, &[[0, 0, 0, 0x94], RET].concat(), 4);
+    let call = Reloc {
+        offset: 0,
+        symbol: weak,
+        addend: 0,
+        flags: RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 },
+    };
+    b.add_relocation(init, call).unwrap();
+    b.write().unwrap()
+}
+
+#[test]
+fn a_bl_from_init_past_its_reach_goes_through_a_thunk() {
+    let object: std::sync::Arc<[u8]> = crti().into();
+    let start = CompiledFunction { arch: Arch::Aarch64, ..function(1, &RET, Vec::new()) };
+    for incremental in [false, true] {
+        let mut image = Image::new(name(TO), a64(incremental)).unwrap();
+        let mut disk = Disk::default();
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            natives: vec![Native {
+                id: id(60),
+                name: "crti.o",
+                bytes: &object,
+                kind: NativeKind::Object,
+                order: 0,
+            }],
+            ..Change::default()
+        };
+        disk.link(&mut image, change)
+            .unwrap_or_else(|it| panic!("incremental {incremental}: {it}"));
+        let linked = Linked::of(disk.file(TO));
+        let (init, _) = section_of(&linked, ".init");
+        let via = bl(&linked, init);
+        assert!(
+            via.abs_diff(init) < 1 << 27,
+            "incremental {incremental}: the `bl` at {init:#x} reaches {via:#x}"
+        );
+        let to = thunk(&linked, via);
+        assert_eq!(linked.u32_at(to), MOV_42, "incremental {incremental}: `call_weak_fn`");
+        assert!(to.abs_diff(init) > 1 << 27, "incremental {incremental}: out of a `bl`'s reach");
+    }
 }

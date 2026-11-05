@@ -830,11 +830,22 @@ impl<'a> Stage<'a> {
             });
         }
         // AArch64 code is cut into segments, each followed by its island of thunks (`thunk`).
+        // The other executable classes' pieces (ELF's `.init` and `.fini`, an executable named
+        // section, the stubs) are placed outside the segments: their far branches take the
+        // islands' thunks too, so the planner reads them.
         if self.output.arch == blaze_codegen::Arch::Aarch64 && !self.plan.indexed_code {
-            if let Some(ids) =
-                self.new.find_class(&Class::Text).and_then(|it| groups.get_mut(it.0 as usize))
-            {
-                self.islands(ids);
+            if let Some(text) = self.new.find_class(&Class::Text) {
+                let mut outside: FrameVec<'a, PieceId> = Vec::new_in(self.arena);
+                for (at, ids) in groups.iter().enumerate() {
+                    if at != text.0 as usize
+                        && self.writer.prot(self.new.class(ClassId(at as u16))).exec
+                    {
+                        outside.extend_from_slice(ids);
+                    }
+                }
+                if let Some(ids) = groups.get_mut(text.0 as usize) {
+                    self.islands(ids, outside);
+                }
             }
         }
         if let Some(iat) = iat {

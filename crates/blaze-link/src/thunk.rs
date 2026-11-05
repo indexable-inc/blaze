@@ -15,7 +15,9 @@
 //!   the callers before it reach (a function over 128 MiB gets an island on each side). Island
 //!   `k` is right after segment `k`. The cut reads only the pieces' sizes, so a segment's index
 //!   is the same in every placement round. A far branch takes the island after its segment, or
-//!   the one before it when only that one is in reach.
+//!   the one before it when only that one is in reach. A branch from a piece of another
+//!   executable class, laid out outside the segments (ELF's `.init` and `.fini`, after the
+//!   code), takes the island nearest it in reach: the last one, for `.init` after the code.
 //! - An incremental link puts the thunks its written code needs in the patch region, after the
 //!   code it places: one island for the stage, a new index ([`State::islands`]). A thunk of any
 //!   island already in reach is used instead.
@@ -139,11 +141,20 @@ struct Need {
     addend: i32,
 }
 
+/// What [`Stage::plan_thunk`] reads and fills in a full link's placement round.
+struct Planning<'p, 'a> {
+    /// Each island's first and end address as placed.
+    spans: &'p [(u64, u64)],
+    needs: &'p mut FrameVec<'a, Need>,
+    used: &'p mut FrameVec<'a, PieceId>,
+}
+
 impl<'a> Stage<'a> {
     /// A full link's code class laid out as segments and their islands ([module docs](self)):
     /// `ids` (sorted) with each thunk moved after its segment, and what [`Stage::thunks`] reads
-    /// recorded. Only an AArch64 image's [`Class::Text`].
-    pub(crate) fn islands(&mut self, ids: &mut Vec<PieceId>) {
+    /// recorded, with `outside`, the pieces of the image's other executable classes. Only an
+    /// AArch64 image's [`Class::Text`].
+    pub(crate) fn islands(&mut self, ids: &mut Vec<PieceId>, outside: FrameVec<'a, PieceId>) {
         let arena = self.arena;
         let mut code: FrameVec<'a, PieceId> = Vec::with_capacity_in(ids.len(), arena);
         let mut thunks: FrameVec<'a, (u32, PieceId)> = Vec::new_in(arena);
@@ -177,7 +188,7 @@ impl<'a> Stage<'a> {
         // A thunk of an island this layout has no segment for: an earlier link's, which the
         // first round drops ([`Stage::thunks`]).
         ids.extend(thunks[next..].iter().map(|it| it.1));
-        self.text = Some(crate::stage::Text { code, ends, thunks });
+        self.text = Some(crate::stage::Text { code, ends, thunks, outside });
     }
 
     /// Makes the thunks the placed image's far branches need ([module docs](self)), and in a
@@ -251,37 +262,37 @@ impl<'a> Stage<'a> {
                 spans.push((low, high));
                 start = *end;
             }
+            let mut planning = Planning { spans: &spans, needs: &mut needs, used: &mut used };
             let mut start = 0;
             for (segment, end) in text.ends.iter().enumerate() {
+                // The island after its segment, else the one before it.
+                let segment = segment as u32;
+                let islands = [Some(segment), segment.checked_sub(1)];
                 for id in &text.code[start..*end] {
                     let piece = self.new.piece(*id).expect("live");
                     for fixup in piece.fixups().iter().filter(|it| extends(it.apply)) {
                         let p = piece.addr + fixup.at;
-                        let Some(target) = self.far(&resolver, fixup, p) else { continue };
-                        let addend = self.thunk_addend(piece.sym, target, fixup)?;
-                        let islands = [Some(segment as u32), (segment as u32).checked_sub(1)];
-                        let reused = islands.iter().flatten().find_map(|island| {
-                            let sym = self.symbols.find(SymKey::Thunk(target, *island, addend))?;
-                            let (id, _) = self.new.home(sym)?;
-                            let piece = self.new.piece(id)?;
-                            (piece.placed() && reaches(p, piece.addr, REACH - MARGIN)).then_some(id)
-                        });
-                        if let Some(id) = reused {
-                            used.push(id);
-                            continue;
-                        }
-                        let fits = |(low, high): (u64, u64)| {
-                            reaches(p, low, REACH - MARGIN)
-                                && reaches(p, high + LEN, REACH - MARGIN)
-                        };
-                        let island =
-                            islands.into_iter().flatten().find(|it| fits(spans[*it as usize]));
-                        // None in reach: the writer names the branch ([`through`]).
-                        let Some(island) = island else { continue };
-                        needs.push(Need { target, island, addend });
+                        let islands = islands.iter().flatten().copied();
+                        self.plan_thunk(&resolver, &mut planning, piece.sym, fixup, p, islands)?;
                     }
                 }
                 start = *end;
+            }
+            // A piece outside the segments: the islands nearest it first, whichever side.
+            let mut order: FrameVec<'a, u32> = Vec::with_capacity_in(spans.len(), arena);
+            for id in text.outside.iter() {
+                let piece = self.new.piece(*id).expect("live");
+                for fixup in piece.fixups().iter().filter(|it| extends(it.apply)) {
+                    let p = piece.addr + fixup.at;
+                    order.clear();
+                    order.extend(0..spans.len() as u32);
+                    order.sort_by_key(|it| {
+                        let (low, high) = spans[*it as usize];
+                        (low.saturating_sub(p).max(p.saturating_sub(high)), *it)
+                    });
+                    let islands = order.iter().copied();
+                    self.plan_thunk(&resolver, &mut planning, piece.sym, fixup, p, islands)?;
+                }
             }
             self.new.islands = self.new.islands.max(text.ends.len() as u32);
         }
@@ -309,6 +320,41 @@ impl<'a> Stage<'a> {
             }
         }
         Ok(changed)
+    }
+
+    /// Plans the thunk a full link's branch at `p` takes when it is far: one of `islands`'
+    /// (in the order tried) already placed in reach is used, else the first island whose
+    /// thunks are all in reach gets one. None in reach: the writer names the branch
+    /// ([`through`]).
+    fn plan_thunk(
+        &self,
+        resolver: &Resolver<'_>,
+        planning: &mut Planning<'_, 'a>,
+        caller: Sym,
+        fixup: &Fixup,
+        p: u64,
+        islands: impl Iterator<Item = u32> + Clone,
+    ) -> Result<(), LinkError> {
+        let Some(target) = self.far(resolver, fixup, p) else { return Ok(()) };
+        let addend = self.thunk_addend(caller, target, fixup)?;
+        let reused = islands.clone().find_map(|island| {
+            let sym = self.symbols.find(SymKey::Thunk(target, island, addend))?;
+            let (id, _) = self.new.home(sym)?;
+            let piece = self.new.piece(id)?;
+            (piece.placed() && reaches(p, piece.addr, REACH - MARGIN)).then_some(id)
+        });
+        if let Some(id) = reused {
+            planning.used.push(id);
+            return Ok(());
+        }
+        let fits = |(low, high): (u64, u64)| {
+            reaches(p, low, REACH - MARGIN) && reaches(p, high + LEN, REACH - MARGIN)
+        };
+        let mut islands = islands;
+        if let Some(island) = islands.find(|it| fits(planning.spans[*it as usize])) {
+            planning.needs.push(Need { target, island, addend });
+        }
+        Ok(())
     }
 
     fn patch_thunks(&mut self, regions: &[Region]) -> Result<bool, LinkError> {
