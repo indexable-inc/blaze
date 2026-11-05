@@ -191,9 +191,9 @@ fn work_out(
             }
             // alloc: an error, once
             Ok((Ok((proof, _)), _)) => {
-                return Err(refused(job, compile, format!("it walked {}", proof.steps)));
+                return Err(refused(job, compile, &format!("it walked {}", proof.steps)));
             }
-            Ok((Err(out), _)) => return Err(refused(job, compile, format!("it {out}"))), // alloc: an error, once
+            Ok((Err(out), _)) => return Err(refused(job, compile, &format!("it {out}"))), // alloc: an error, once
             Err(out) => {
                 let what = format!(
                     "did not end: the query engine under it {out}, past the {ENGINE_FUEL} rows a proof may bring up to \
@@ -239,7 +239,7 @@ fn work_out(
 
 /// The error of the purity proof of the script compiled by unit `compile`, which walked more
 /// instances than [`PROOF_STEPS`]: `how` says how far it got.
-fn refused(job: &Job, compile: usize, how: String) -> ApiError {
+fn refused(job: &Job, compile: usize, how: &str) -> ApiError {
     // alloc: an error, once
     let what = format!(
         "walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 15): {how}"
