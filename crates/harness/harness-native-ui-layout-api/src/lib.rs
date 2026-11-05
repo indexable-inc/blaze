@@ -243,6 +243,16 @@ pub struct Lazy {
     pub overscan: u32,
 }
 
+/// A virtualized stack of rows of any height (a chat's transcript): only the rows in view, and `overscan` points more
+/// either side, exist; the rows above and below them are spacers as tall as those rows were measured (`estimate` points
+/// each before they ever were). Kept by `harness_native_ui_view::lazy_stack`; put it in a `ui.Scroll`. Layout lays it out as
+/// a plain column.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct LazyStack {
+    pub estimate: f32,
+    pub overscan: f32,
+}
+
 /// Which of its `Lazy` container's rows a child is.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LazyIndex {
@@ -311,6 +321,7 @@ hyperion_api_layouts::api_layouts! {
     "GridColumns" => alias GridColumns,
     "Lazy" => alias Lazy,
     "LazyIndex" => alias LazyIndex,
+    "LazyStack" => alias LazyStack,
     "LazyRange" => alias LazyRange,
     "Background" => alias Background,
     "Overlay" => alias Overlay,
@@ -362,6 +373,7 @@ pub fn register(world: &World) {
     world.component::<GridColumns>().writable();
     world.component::<Lazy>().writable();
     world.component::<LazyIndex>().writable();
+    world.component::<LazyStack>().writable();
     world.component::<LazyRange>();
     // Aliased, as `Node` is: inside the `ui` scope the bare `Overlay` would otherwise find the prefab `ui.Overlay`.
     world.component::<Background>().writable().aliased();

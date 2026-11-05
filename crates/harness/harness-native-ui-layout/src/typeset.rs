@@ -5,7 +5,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Intrinsic, Padding};
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_node_api::Laid;
-use harness_native_ui_text_api::{OneLine, Text, Truncate, TruncateMode};
+use harness_native_ui_text_api::{MarkdownText, OneLine, Text, Truncate, TruncateMode};
 
 /// The host's typesetter, seen from layout: how wide a string runs on one line and how tall it is wrapped at a width. `node`
 /// is the entity the text is on, for a typesetter that keeps its shaping per node.
@@ -63,6 +63,8 @@ pub struct Wanted {
     pub truncate: Option<TruncateMode>,
     /// `truncate.is_some()`: one line tall at any width (the host cuts it with an ellipsis when it draws).
     pub one_line: bool,
+    /// Its words are inline markdown (`MarkdownText`): the host sets them without their markers.
+    pub markdown: bool,
 }
 
 impl Wanted {
@@ -91,6 +93,7 @@ pub fn wanted(world: WorldRef<'_>) -> Vec<Wanted> {
             now: *now,
             truncate: e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail)),
             one_line: e.has(OneLine::id()) || e.has(Truncate::id()),
+            markdown: e.has(MarkdownText::id()),
         });
     });
     out

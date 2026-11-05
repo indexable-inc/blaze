@@ -336,8 +336,9 @@ impl Link {
         self.streams.lock().unwrap().contains_key(&id)
     }
 
-    /// Attach to `id` at `cols` x `rows`: its stream's bytes come as `Msg::Data`.
-    pub fn attach(&self, id: u64, cols: u16, rows: u16) {
+    /// Attach to `id` at `cols` x `rows`: its stream's bytes come as `Msg::Data` (a chat session's events as JSON lines, with
+    /// `events`).
+    pub fn attach(&self, id: u64, cols: u16, rows: u16, events: bool) {
         if self.attached(id) {
             return;
         }
@@ -345,7 +346,7 @@ impl Link {
         if write_frame(
             &mut s,
             T_JSON,
-            json!({"op": "attach", "id": id, "cols": cols, "rows": rows}).to_string().as_bytes(),
+            json!({"op": "attach", "id": id, "cols": cols, "rows": rows, "events": events}).to_string().as_bytes(),
         )
         .is_err()
         {
@@ -421,7 +422,30 @@ impl Link {
         }
     }
 
-    /// A new object of `kind` in `cwd`; `then` gets its id.
+    /// A message from the person into chat session `id` (the daemon writes it to the agent as a user turn).
+    pub fn chat_send(&self, id: u64, text: &str) {
+        let (text, poke) = (text.to_owned(), self.poke.clone());
+        std::thread::spawn(move || {
+            match request(&json!({"op": "send", "id": id, "text": text})) {
+                Ok(v) if v.get("error").is_some() => eprintln!("harness-native: send {id}: {v}"),
+                Ok(_) => {}
+                Err(e) => eprintln!("harness-native: send {id}: {e}"),
+            }
+            let _ = poke.send(());
+        });
+    }
+
+    /// Interrupt chat session `id`'s turn in flight.
+    pub fn chat_interrupt(&self, id: u64) {
+        std::thread::spawn(move || {
+            if let Err(e) = request(&json!({"op": "rpc", "id": format!("s{id}"), "method": "interrupt"})) {
+                eprintln!("harness-native: interrupt {id}: {e}");
+            }
+        });
+    }
+
+    /// A new object of `kind` in `cwd`; `then` gets its id. `claude-tui` is Claude in its terminal UI (a PTY); plain
+    /// `claude` is a chat session.
     pub fn spawn(
         &self,
         kind: &str,
@@ -432,8 +456,12 @@ impl Link {
     ) {
         let (kind, poke) = (kind.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
+            let (k, mode) = match kind.as_str() {
+                "claude-tui" => ("claude", Some("tui")),
+                k => (k, None),
+            };
             match request(
-                &json!({"op": "spawn", "kind": kind, "cwd": cwd, "cols": cols, "rows": rows}),
+                &json!({"op": "spawn", "kind": k, "cwd": cwd, "cols": cols, "rows": rows, "mode": mode}),
             ) {
                 Ok(v) => match v["id"].as_u64() {
                     Some(id) => {

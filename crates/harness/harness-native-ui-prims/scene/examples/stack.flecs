@@ -1,0 +1,24 @@
+// ui.LazyStack in a ui.Scroll: 2 000 rows of different heights (the gallery fills them with
+// harness_native_ui_view::lazy_stack); and a ui.TextArea holding three wrapped lines with a selection.
+
+@tree ChildOf
+ex {
+  prefab StackDemo : ex.Card {
+    label : ui.Label { Text: {s: "LAZY STACK, ROWS OF ANY HEIGHT"} }
+    status : ui.Words, Muted { Text: {s: ""} }
+    scroll : ui.Scroll {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 132, min: 0, max: 0}}
+      rows : ui.LazyStack {
+        LazyStack: {estimate: 22, overscan: 60}
+      }
+    }
+    area : ui.TextArea {
+      text : ui.Words {
+        Text: {s: "A text area wraps its words at its width and grows with them, a few lines tall at most, then scrolls."}
+        TextEdit: {caret: 24, anchor: 2, mark_lo: 0, mark_hi: 0, focused: true,
+          caret_dark: $tone_accent.dark, caret_light: $tone_accent.light,
+          select_dark: $tone_text_select.dark, select_light: $tone_text_select.light}
+      }
+    }
+  }
+}

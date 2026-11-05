@@ -25,6 +25,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("95-ex-truncate", include_str!("../scene/examples/truncate.flecs")),
     ("96-ex-compose", include_str!("../scene/examples/compose.flecs")),
     ("97-ex-motion", include_str!("../scene/examples/motion.flecs")),
+    ("98-ex-stack", include_str!("../scene/examples/stack.flecs")),
     ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
 ];
 

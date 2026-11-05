@@ -54,9 +54,11 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
     });
     // Wall time from load, the same clock the shot's HARNESS_NATIVE_SHOT_SECS counts.
     let start = Instant::now();
+    let mut heights = view::Heights::default();
     w.system_named::<&mut GalleryStep>("GalleryDrive").each_iter(move |it, _, step| {
         let w = it.world();
         lazy_rows(w);
+        stack_rows(w, &mut heights);
         let time = start.elapsed().as_secs_f32();
         label_chips(w);
         if time >= 1.0 && !step.changed {
@@ -86,6 +88,32 @@ fn lazy_rows(w: WorldRef<'_>) {
 }
 
 /// The inserted chips' words, once their parts exist (a chip made in a system is instantiated when the system ends).
+/// The lazy stack's rows: every third one wraps to a few lines, so rows are of different heights.
+fn stack_rows(w: WorldRef<'_>, heights: &mut view::Heights) {
+    let Some(rows) = at(w, "cards::stack::scroll::rows") else { return };
+    let room = at(w, "cards::stack::scroll")
+        .and_then(|s| s.try_cloned::<&harness_native_ui_node_api::Laid>())
+        .map_or(132.0, |l| l.h);
+    let mut live = 0;
+    let s = view::lazy_stack(
+        View::of(rows),
+        heights,
+        0.0,
+        room,
+        2_000,
+        |i| format!("r{i}"),
+        |_| "ui.Words",
+        |v, i, _| {
+            live += 1;
+            let long = if i % 3 == 0 { " that runs on and on until it wraps onto a second line and maybe a third" } else { "" };
+            v.text(&format!("Row {i}{long}"));
+        },
+    );
+    if let Some(status) = at(w, "cards::stack::status") {
+        View::of(status).text(&format!("{live} of 2 000 exist, {:.0} points in all", s.content));
+    }
+}
+
 fn label_chips(w: WorldRef<'_>) {
     let Some(chips) = at(w, "cards::transition::chips") else { return };
     for (name, words) in
