@@ -2431,6 +2431,13 @@ impl Driver for Uring {
                     Ok(None)
                 }
                 Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
+                // No io_uring op reads a file's page-cache residency: an open and one
+                // `cachestat` a range here on the driver's thread, as a seal is set, each a
+                // call of microseconds that never waits on the disk.
+                Effect::Residency { file, ranges, .. } => {
+                    under(&self.root, &file, |path| crate::fs::residency(path, &ranges))
+                        .map(|pages| Some(Done::Resident(pages)))
+                }
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
                     .and_then(|listener| {
@@ -2632,6 +2639,31 @@ mod tests {
         for it in [ours, theirs] {
             std::fs::remove_dir_all(it).unwrap();
         }
+    }
+
+    /// cachestat through the driver: a file written and read back is in the page cache, so
+    /// its range reports cached pages; a range of no bytes is no pages.
+    #[test]
+    fn a_file_written_and_read_reports_cached_pages() {
+        let root = dir("uring-residency");
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = vec![7u8; 64 << 10];
+        std::fs::write(root.join("pack"), &bytes).unwrap();
+        assert_eq!(std::fs::read(root.join("pack")).unwrap(), bytes);
+        let file = FileName::new("pack").unwrap();
+        let ranges =
+            vec![crate::Extent { at: 0, len: 64 << 10 }, crate::Extent { at: 100, len: 0 }];
+        let mut effects = vec![Effect::Residency { file, ranges, tag: Tag(1) }];
+        let mut seen = Vec::new();
+        run_until_idle(&mut Uring::new(&root).unwrap(), &mut effects, |done, _| {
+            seen.push(done.done)
+        });
+        let [Done::Resident(pages)] = &seen[..] else { panic!("{seen:?}") };
+        assert_eq!(pages.len(), 2, "{pages:?}");
+        assert!(pages[0].cached > 0, "{pages:?}");
+        assert!(pages[0].pages >= pages[0].cached, "{pages:?}");
+        assert_eq!(pages[1], crate::Pages::default());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A file cut, then its directory removed by another process (`blaze clean` of a build

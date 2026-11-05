@@ -1063,6 +1063,18 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Removed)
         }),
         Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
+        #[cfg(target_os = "linux")]
+        Effect::Residency { file, ranges, .. } => {
+            Ok(Done::Resident(at(root, &file, |path| fs::residency(path, &ranges))?))
+        }
+        // One path a system: macOS, Windows and WASI have no call that reads the system's
+        // page cache of a file (`crate::RESIDENCY`).
+        #[cfg(not(target_os = "linux"))]
+        Effect::Residency { file, .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            // alloc: an error path.
+            format!("{file} {}", crate::RESIDENCY_ON_LINUX),
+        )),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
         }

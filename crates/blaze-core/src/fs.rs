@@ -265,6 +265,64 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(named)
 }
 
+/// [`crate::Effect::Residency`]: `path` opened to read, then one `cachestat` a range of
+/// `ranges`, each counted in pages of the system's size. A kernel without the call
+/// (`CONFIG_CACHESTAT_SYSCALL=n`) and a file system with no page cache to read (hugetlbfs) are
+/// errors naming `path` and why, as is every other failure: nothing guesses a range's pages.
+#[cfg(target_os = "linux")]
+pub(crate) fn residency(path: &Path, ranges: &[crate::Extent]) -> io::Result<Vec<crate::Pages>> {
+    use std::os::fd::AsFd as _;
+    let file = File::open(path)
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    let page = crate::raw::page_size();
+    ranges
+        .iter()
+        .map(|range| {
+            if range.len == 0 {
+                return Ok(crate::Pages::default());
+            }
+            let stat = crate::raw::cachestat(file.as_fd(), range.at, range.len)
+                .map_err(|error| cachestat_failed(path, range, error))?;
+            let last = range.at.saturating_add(range.len - 1);
+            Ok(crate::Pages {
+                pages: last / page - range.at / page + 1,
+                cached: stat.nr_cache,
+                recently_evicted: stat.nr_recently_evicted,
+            })
+        })
+        // alloc: the completion's counts, one a range.
+        .collect()
+}
+
+/// The error of a `cachestat` of `range` of `path` that failed with `error`, naming both and,
+/// where the code says it, why.
+#[cfg(target_os = "linux")]
+fn cachestat_failed(path: &Path, range: &crate::Extent, error: io::Error) -> io::Error {
+    let why = match error.raw_os_error() {
+        Some(libc::ENOSYS) => {
+            "this kernel was built without CONFIG_CACHESTAT_SYSCALL, and blaze reads the page \
+             cache's residency of the store's packs with cachestat alone (docs/kernel.md)"
+        }
+        Some(libc::EOPNOTSUPP) => {
+            "its file system (hugetlbfs) keeps no page cache cachestat can read; keep the \
+             store on another"
+        }
+        _ => "",
+    };
+    // alloc: an error path.
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{}: cachestat of {} bytes at {}: {error}{}{why}",
+            path.display(),
+            range.len,
+            range.at,
+            if why.is_empty() { "" } else { ": " },
+        ),
+    )
+}
+
 #[cfg(unix)]
 fn not_sealed(path: &Path, kind: &str) -> io::Error {
     // alloc: an error path.

@@ -65,7 +65,12 @@ pub const FEATURES: &[Feature] = &[
         used_for: "store writes that should not fill the page cache",
     },
     Feature { name: "mseal", since: v(6, 10), used_for: "sealing the loader's code mappings" },
-    Feature { name: "cachestat", since: v(6, 5), used_for: "the store's choice of warm entries" },
+    Feature {
+        name: "cachestat",
+        since: v(6, 5),
+        used_for: "the store's settle, which keeps a record warm while its pages are in the page \
+                   cache and moves unread ones out of it colder first",
+    },
 ];
 
 /// The kernel is older than [`FLOOR`], or says a release blaze cannot read.

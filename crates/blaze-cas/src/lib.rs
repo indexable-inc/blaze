@@ -58,7 +58,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
+use blaze_core::{Completion, Done, Effect, Extent, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -155,6 +155,14 @@ const FAILURES_MOST: u32 = 8;
 
 /// The packs of one store; a record's place in memory is its tier, pack and offset in 64 bits.
 const PACKS_MOST: usize = 1 << 16;
+
+// A settle sorts its demotions by kind, then known or not resident (bit 95), then pack and
+// offset (`Store::settle`): a pack's number stays below that bit.
+const _: () = assert!(PACKS_MOST <= 1 << 31);
+
+/// The most records one settle asks the page cache about ([`Effect::Residency`]): at most this
+/// many `cachestat` calls of the driver's, each of microseconds, a settle.
+const RESIDENCY_MOST: usize = 1 << 14;
 
 /// What a value was made from, hashed.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -699,6 +707,8 @@ pub struct Store {
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
+    /// What the page cache holds of the own packs' records, as settles last asked.
+    residency: Residency,
     /// The encodings of each schema whose values it keeps in columns.
     columns: Arc<Encodings>,
     /// The other writers of its directory's shared one ([`Store::open_shared`]).
@@ -841,6 +851,46 @@ enum Lost {
     /// than the record moved: the delta holds a key only where `prev` does (`Own::claim`).
     Apart { batch: u64, key: Key, from: Seg, to: Loc, place: Place, content: ContentId },
 }
+
+/// What the page cache holds of the own packs' records ([`Effect::Residency`]), which a settle
+/// reads alongside the read flags: a record whose every page is cached is warm whatever its
+/// flags say. A settle asks of the records it may move and uses what the last whole round
+/// answered; it never waits for one (a round still out is not asked again, and its answers are
+/// used once they are all in). Asked only where the system can say it
+/// ([`blaze_core::RESIDENCY`]): elsewhere every record's is unknown, and the flags alone decide.
+struct Residency {
+    /// Whether settles ask.
+    asks: bool,
+    /// By pack and offset, whether every page of the record there was cached, as the last
+    /// whole round said.
+    known: HashMap<(u32, u64), bool, Global>, // alloc: the store's own table, for its life
+    /// The answers of the round out so far, which become `known` once it is all in.
+    answering: HashMap<(u32, u64), bool, Global>, // alloc: the store's own table, for its life
+    /// The round out, or the last.
+    round: u64,
+    /// Its effects not yet answered.
+    waiting: usize,
+}
+
+impl Residency {
+    fn new() -> Residency {
+        Residency {
+            asks: blaze_core::RESIDENCY,
+            known: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            answering: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            round: 0,
+            waiting: 0,
+        }
+    }
+
+    /// Whether the record at `loc` was resident, where the last round said.
+    fn of(&self, loc: &Loc) -> Option<bool> {
+        self.known.get(&(loc.pack, loc.offset)).copied()
+    }
+}
+
+/// Records a settle moves: each key, where its record is and its row.
+type Moves = Vec<(Key, Loc, Row)>;
 
 /// What one [`Store::settle`] did.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -994,6 +1044,14 @@ enum Op {
     Fetch {
         key: Key,
         admit: Admit,
+    },
+    /// The page-cache residency of the records at `offsets` of own pack `pack`, of the
+    /// settles' round `round` ([`Residency`]).
+    Residency {
+        round: u64,
+        file: FileName,
+        pack: u32,
+        offsets: Vec<u64>,
     },
     /// The shared directory listed, for the other writers' stores in it.
     Peers,
@@ -1385,6 +1443,7 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
+            residency: Residency::new(),
             columns,
             peers,
             staging,
@@ -1616,7 +1675,14 @@ impl Store {
     /// colder: a value of a schema it was given encodings for ([`Store::encode_columns`]) goes
     /// from hot to warm columns (or straight to cold where warm saves too little) and from warm
     /// to cold columns; any other goes from raw or LZ4 to zstd. A record read in two periods
-    /// running moves hot. The daemon
+    /// running moves hot.
+    ///
+    /// Where the system says what is in the page cache ([`blaze_core::RESIDENCY`]), a settle
+    /// also asks it of the records it may move ([`Effect::Residency`]) and the next uses the
+    /// answers: a record whose pages are all cached stays where it is however long it went
+    /// unread, and comes hot when it was read in one of the two periods; of a kind, the
+    /// records known to be out of the cache go colder first. It never waits for an answer.
+    /// The daemon
     /// calls it when idle, never on the way of a get or a put, and it moves a bounded number of
     /// bytes a call.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
@@ -1634,9 +1700,15 @@ impl Store {
         // What short cold records took of `spent`, and whether some were left for the next.
         let (mut spent_short, mut more_short) = (0u64, false);
         let encodings = Arc::clone(&self.columns);
-        let (mut demote, mut promote) = self.tier_moves();
+        let (mut demote, mut promote, asks) = self.tier_moves();
+        let residency = &self.residency;
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
-            (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
+            // Of a kind, the records known to be out of the page cache first, then those whose
+            // residency is unknown.
+            let unknown = residency.of(loc).is_none();
+            (u128::from(loc.kind.code()) << 96)
+                | (u128::from(unknown) << 95)
+                | radix::pack_64(u64::from(loc.pack), loc.offset)
         });
         radix::sort_by_key(&mut promote, |(_, loc, _)| {
             radix::pack_64(u64::from(loc.pack), loc.offset)
@@ -1790,19 +1862,102 @@ impl Store {
         own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
         own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
         self.periods = self.periods.saturating_add(1);
+        self.ask_residency(asks, effects);
         self.start_commit(effects);
         settled
     }
 
+    /// Asks the page cache of the records at `asks` (own pack, offset, span), one
+    /// [`Effect::Residency`] a pack, by pack and offset and at most [`RESIDENCY_MOST`], unless
+    /// a round is still out or this store does not ask. A pack this settle retired is left out.
+    fn ask_residency(&mut self, mut asks: Vec<(u32, u64, u64)>, effects: &mut Vec<Effect>) {
+        if !self.residency.asks || self.residency.waiting > 0 {
+            return;
+        }
+        let own = &self.tiers[0];
+        asks.retain(|&(pack, _, _)| {
+            own.packs.get(pack as usize).is_some_and(|it| !it.removed && !it.retiring)
+        });
+        if asks.is_empty() {
+            return;
+        }
+        radix::sort_by_key(&mut asks, |&(pack, at, _)| radix::pack_64(u64::from(pack), at));
+        asks.truncate(RESIDENCY_MOST);
+        self.residency.round += 1;
+        self.residency.answering.clear();
+        let round = self.residency.round;
+        for group in asks.chunk_by(|a, b| a.0 == b.0) {
+            let pack = group[0].0;
+            // clone: the effect and the op each own the name; once per pack a settle (idle)
+            let file = self.tiers[0].packs[pack as usize].file.clone();
+            // alloc: once per pack a settle (idle), the ranges the effect carries
+            let ranges = group.iter().map(|&(_, at, len)| Extent { at, len }).collect();
+            // alloc: once per pack a settle (idle), the offsets its answer is kept by
+            let offsets = group.iter().map(|&(_, at, _)| at).collect();
+            // clone: a name's refcount, for the effect
+            let named = file.clone();
+            let tag = self.tags.ask(Op::Residency { round, file, pack, offsets });
+            effects.push(Effect::Residency { file: named, ranges, tag });
+            self.residency.waiting += 1;
+        }
+    }
+
+    /// Takes the answer of an [`Effect::Residency`] of `file` (own pack `pack`) for the
+    /// records at `offsets`, of round `round`. One that failed leaves those records' residency
+    /// unknown, named in the problems: nothing is guessed of them.
+    fn residency_answered(
+        &mut self,
+        round: u64,
+        file: FileName,
+        pack: u32,
+        offsets: &[u64],
+        done: Done,
+    ) {
+        let current = round == self.residency.round;
+        match done {
+            Done::Resident(pages) if pages.len() == offsets.len() => {
+                if current {
+                    for (&at, pages) in offsets.iter().zip(&pages) {
+                        self.residency.answering.insert((pack, at), pages.resident());
+                    }
+                }
+            }
+            // alloc: a problem reported
+            Done::Resident(pages) => self.problems.push(format!(
+                "{file}: the page-cache residency of {} records came back as {} counts, so \
+                 settles move them by their reads alone until it is asked again",
+                offsets.len(),
+                pages.len()
+            )),
+            // alloc: a problem reported
+            done => self.problems.push(format!(
+                "{file}: the page-cache residency of {} records is unknown, so settles move \
+                 them by their reads alone until it is asked again: {}",
+                offsets.len(),
+                describe(&done)
+            )),
+        }
+        if current {
+            self.residency.waiting -= 1;
+            if self.residency.waiting == 0 {
+                std::mem::swap(&mut self.residency.known, &mut self.residency.answering);
+                self.residency.answering.clear();
+            }
+        }
+    }
+
     /// The own tier's records in its packs to move cold and to move hot, as of the period
-    /// ending now. A record still in a segment is new, and stays.
-    fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
+    /// ending now, and those to ask the page cache about (pack, offset, span) for the next. A
+    /// record still in a segment is new, and stays.
+    fn tier_moves(&self) -> (Moves, Moves, Vec<(u32, u64, u64)>) {
         let own = &self.tiers[0];
         // alloc: once a settle (idle, never on the way of a get or a put); empty unless a slot is not whole
         let mut bad = Vec::new();
         let rows = self.look().rows(0, &mut bad);
         // alloc: once a settle (idle), the records it moves, sorted after
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
+        // alloc: once a settle (idle), the records it asks the page cache about
+        let mut asks = Vec::new();
         // By kind code: whether a short record of the kind is listed. A cold kind's is, to be
         // moved colder once the kind has a dictionary and, before, to be sampled while its
         // training wants samples (after a reopen, the only way its records already kept are).
@@ -1822,24 +1977,40 @@ impl Store {
             }
             let flag = |flag| found.at.get(flag);
             let (read, before) = (flag(Flag::Read), flag(Flag::ReadBefore));
+            // Whether its flags would move it colder once it is old enough, or hotter with
+            // one more period of reading or with its pages cached.
+            let colder = matches!(loc.form, Form::Raw | Form::Lz4 | Form::Warm)
+                && !read
+                && !before
+                && !flag(Flag::Tried);
+            let hotter =
+                matches!(loc.form, Form::Zstd | Form::Warm | Form::ColdColumns) && !short;
+            if self.residency.asks
+                && (colder || (hotter && (read || before)))
+                && let Some(span) = disk::span_of(loc.stored)
+            {
+                asks.push((loc.pack, loc.offset, span));
+            }
+            let resident = self.residency.of(&loc) == Some(true);
             match loc.form {
                 Form::Raw | Form::Lz4 | Form::Warm
                     if self.periods >= 2
-                        && !read
-                        && !before
+                        && colder
                         && !flag(Flag::New)
                         && !flag(Flag::NewBefore)
-                        && !flag(Flag::Tried) =>
+                        && !resident =>
                 {
                     demote.push((key, loc, found.at.row()));
                 }
-                Form::Zstd | Form::Warm | Form::ColdColumns if read && before && !short => {
+                Form::Zstd | Form::Warm | Form::ColdColumns
+                    if hotter && ((read && before) || ((read || before) && resident)) =>
+                {
                     promote.push((key, loc, found.at.row()));
                 }
                 _ => {}
             }
         }
-        (demote, promote)
+        (demote, promote, asks)
     }
 
     /// Sets a flag of an own record by its row: rows hold while the store swaps no table, as
@@ -3008,6 +3179,9 @@ impl Store {
                         describe(&done)
                     ));
                 }
+            }
+            Op::Residency { round, file, pack, offsets } => {
+                self.residency_answered(round, file, pack, &offsets, done)
             }
             Op::Peers => self.peers_listed(done, effects),
             Op::Announce => self.announced(&done, effects),

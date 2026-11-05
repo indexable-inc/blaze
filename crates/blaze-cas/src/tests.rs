@@ -3244,6 +3244,49 @@ fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// The store's use of cachestat (docs/kernel.md): two records of one pack with the same read
+/// flags, both unread since they were put. The one whose pages the simulated page cache holds
+/// stays warm; the one it does not goes cold. Each settle asks the cache
+/// (`Effect::Residency`) and the next uses the answers. The control is the same run with
+/// nothing cached: both go cold, so the cache, not the flags, kept the first.
+#[test]
+fn a_record_in_the_page_cache_stays_warm_and_one_out_of_it_goes_cold() {
+    let run = |cached: bool| {
+        let mut sim = Sim::new(34, quiet());
+        let mut store = open(&mut sim, "store");
+        store.residency.asks = true;
+        store.put(key(1), Kind::Code, &text(1, 16 << 10)).unwrap();
+        store.put(key(2), Kind::Code, &text(2, 16 << 10)).unwrap();
+        flush(&mut sim, &mut store);
+        let (warm, cold) = (store.loc_of(&key(1)), store.loc_of(&key(2)));
+        assert_eq!(warm.pack, cold.pack, "one pack: only their ranges tell them apart");
+        let pack = store.tiers[0].packs[warm.pack as usize].file.clone();
+        if cached {
+            sim.cache(&pack, warm.offset, disk::span_of(warm.stored).unwrap());
+        }
+        let (mut asked, mut settled) = (0, Settled::default());
+        for _ in 0..3 {
+            let mut effects = Vec::new();
+            settled = store.settle(&mut effects);
+            asked += effects
+                .iter()
+                .filter(|it| matches!(it, Effect::Residency { file, .. } if *file == pack))
+                .count();
+            drive(&mut sim, &mut store, &mut effects);
+        }
+        assert!(asked >= 2, "{asked}: the settles ask of the pack their records are in");
+        assert_eq!(store.problems(), &[] as &[String]);
+        (settled, form_of(&store, &key(1)), form_of(&store, &key(2)))
+    };
+    let (settled, first, second) = run(true);
+    assert_eq!(settled.demoted, 1, "{settled:?}");
+    assert_eq!(first, Form::Raw, "its pages are cached: it stays warm");
+    assert_eq!(second, Form::Zstd, "unread and out of the cache: it goes cold");
+    let (settled, first, second) = run(false);
+    assert_eq!(settled.demoted, 2, "{settled:?}");
+    assert_eq!((first, second), (Form::Zstd, Form::Zstd), "nothing cached: both go cold");
+}
+
 #[test]
 fn a_value_that_does_not_compress_is_tried_once() {
     let mut sim = Sim::new(32, quiet());

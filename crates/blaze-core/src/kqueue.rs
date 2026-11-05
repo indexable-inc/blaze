@@ -482,6 +482,12 @@ impl Kqueue {
                 }
                 Ok(())
             }
+            // No call of this system's reads its page cache of a file (`crate::RESIDENCY`).
+            Effect::Residency { file, .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                // alloc: an error path.
+                format!("{file} {}", crate::RESIDENCY_ON_LINUX),
+            )),
             // A lock never waits, so it is taken here rather than on the threads.
             Effect::Lock { file, mode, tag } => {
                 let done = self.locks.lock(&self.root, &file, mode, tag)?;

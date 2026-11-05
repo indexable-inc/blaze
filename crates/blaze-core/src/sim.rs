@@ -21,6 +21,9 @@
 //! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], and [`Sim::fill`] (a disk
 //! out of room: what does not fit fails with ENOSPC, an append keeping the part that fits).
 //!
+//! The page cache is the test's: [`Sim::cache`] and [`Sim::evict`] say which pages of a file it
+//! holds or let go of, [`Effect::Residency`] counts them, and a crash empties it.
+//!
 //! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
 //! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
 //! slabs named by the asker's tag, and the ends of connections in a [`Slab`] whose handle bits
@@ -34,7 +37,7 @@
 
 mod journal;
 
-use std::{mem, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, mem, path::PathBuf, time::Duration};
 
 use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
@@ -43,10 +46,13 @@ use std::alloc::Global;
 pub use self::journal::Journal;
 use crate::{
     Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
-    LockMode, Meta, RECV_MOST, Tag,
+    LockMode, Meta, Pages, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
+
+/// The size of a page of the simulated page cache ([`Effect::Residency`], [`Sim::cache`]).
+pub const PAGE: u64 = 4096;
 
 /// What a simulated program does when spawned: how it ends, and how long it runs.
 #[derive(Clone, Debug)]
@@ -137,12 +143,24 @@ struct SimFile {
     mode: u32,
     /// A symbolic link, its bytes its target.
     link: bool,
+    /// Its pages in the simulated page cache, by number ([`PAGE`] bytes each): `true` held,
+    /// `false` let go of lately. Only the test puts a page there or takes it out
+    /// ([`Sim::cache`], [`Sim::evict`]); a crash empties it, and a file made anew (a write, a
+    /// clone) starts with none. Ordered, so [`Effect::Residency`] counts a range's pages
+    /// without a lookup a page.
+    cache: BTreeMap<u64, bool>,
 }
 
 impl Default for SimFile {
     fn default() -> SimFile {
         // alloc: none, two empty vectors.
-        SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644, link: false }
+        SimFile {
+            durable: Vec::new(),
+            ops: Vec::new(),
+            mode: 0o644,
+            link: false,
+            cache: BTreeMap::new(),
+        }
     }
 }
 
@@ -519,6 +537,7 @@ impl Sim {
         let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (_, file) in files {
+            file.cache.clear();
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
             let torn = file.ops.get(kept).and_then(|op| op.torn(&mut self.rng));
             file.sync(kept);
@@ -826,6 +845,57 @@ impl Sim {
         let first = given.chain(moded).min_by_key(|&(file, rank, _)| (file, rank));
         // clone: the refusal names the file
         Done::Private(first.map(|(file, _, access)| (file.clone(), access)))
+    }
+
+    /// The pages of `file` that `len` bytes from `at` touch put in the simulated page cache, as
+    /// a read by another process would: [`Effect::Residency`] counts them cached. For a test
+    /// of what a store keeps warm. A file not there has no pages to hold.
+    pub fn cache(&mut self, file: &FileName, at: u64, len: u64) {
+        self.set_pages(file, at, len, true);
+    }
+
+    /// The pages of `file` that `len` bytes from `at` touch let go of by the simulated page
+    /// cache, as memory pressure would: [`Effect::Residency`] counts them recently evicted.
+    pub fn evict(&mut self, file: &FileName, at: u64, len: u64) {
+        self.set_pages(file, at, len, false);
+    }
+
+    fn set_pages(&mut self, file: &FileName, at: u64, len: u64, held: bool) {
+        let Some(sim) = self.files.get_mut(file) else { return };
+        if len == 0 {
+            return;
+        }
+        for page in at / PAGE..=at.saturating_add(len - 1) / PAGE {
+            sim.cache.insert(page, held);
+        }
+    }
+
+    /// [`Effect::Residency`] on the simulated disk: each range's pages, and of them those the
+    /// test put in the cache or let go of.
+    fn residency(&self, file: &FileName, ranges: &[crate::Extent]) -> Done {
+        let Some(sim) = self.files.get(file) else {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("{file}: no such file")));
+        };
+        let pages = ranges
+            .iter()
+            .map(|range| {
+                if range.len == 0 {
+                    return Pages::default();
+                }
+                let first = range.at / PAGE;
+                let last = range.at.saturating_add(range.len - 1) / PAGE;
+                let held = sim.cache.range(first..=last).filter(|(_, held)| **held).count();
+                let evicted = sim.cache.range(first..=last).filter(|(_, held)| !**held).count();
+                Pages {
+                    pages: last - first + 1,
+                    cached: held as u64,
+                    recently_evicted: evicted as u64,
+                }
+            })
+            // alloc: the counts, which the completion carries.
+            .collect();
+        Done::Resident(pages)
     }
 
     /// The file removed by something outside the state machine.
@@ -1350,6 +1420,7 @@ impl Sim {
                 // alloc: the mapping, which the completion carries.
                 Done::Mapped(crate::Mapping::copy(&self.contents(&file)))
             }
+            Effect::Residency { file, ranges, .. } => self.residency(&file, &ranges),
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
                 Some((_, spawning)) => Done::Exited(Box::new(spawning.exit)),

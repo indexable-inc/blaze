@@ -917,6 +917,12 @@ impl Iocp {
                 self.to_threads(Work::File(effect));
                 Ok(())
             }
+            // No call of this system's reads its page cache of a file (`crate::RESIDENCY`).
+            Effect::Residency { file, .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                // alloc: an error path.
+                format!("{file} {}", crate::RESIDENCY_ON_LINUX),
+            )),
             Effect::Timer { after, tag } => {
                 // A timer past what a tick count can say is due in some 584 years: never, here.
                 let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
