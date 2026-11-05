@@ -14,6 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+# A proxy's `Proxy-Authorization: Basic` credentials.
+base64.workspace = true
 # The SHA-256 of a pinned certificate (h3's `serverCertificateHashes` check).
 blaze-sha256.workspace = true
 # quinn-proto's datagram buffers.
@@ -28,6 +30,8 @@ httparse.workspace = true
 rustls.workspace = true
 # QUIC under h3: quinn-proto's sans-IO endpoint and connections, on rustls with ring.
 quinn-proto.workspace = true
+# A proxy address's user and password, percent-decoded.
+percent-encoding.workspace = true
 # The machine's roots (`roots::native`), read once as a client is made; not the core's.
 rustls-native-certs.workspace = true
 # Addresses and where their redirects lead.
