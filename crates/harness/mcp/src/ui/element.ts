@@ -6,7 +6,8 @@
  * types), and every check says the cell line it is about when it is known. Nothing here depends on Svelte. Copied from den's repl/src/ui/element.ts and cut to
  * the elements the harness app draws.
  */
-import { fileProblem } from './media.ts';
+import { fileProblem, mediaProblem } from './media.ts';
+import { ID_RULE, aspectOf, shaderWire, texturesProblem, uniformsOf } from './shader.ts';
 
 /** The element names the app draws (genui.rs `ELEMENTS`, one `hn.Gen<Name>` prefab each in scene/widgets/genui.flecs). */
 export const ELEMENT_NAMES = [
@@ -27,6 +28,8 @@ export const ELEMENT_NAMES = [
   'Icon', 'Image', 'Chip', 'Tile', 'FileRef',
   // The agent as the app shows it: Kip, the voxel mascot, live in a mood or a short run of them.
   'Kip',
+  // Moving pictures: a video file or URL with its controls, and the agent's own Slang fragment shader (shader.ts), on the GPU.
+  'Video', 'Shader',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
@@ -34,7 +37,7 @@ const known = new Set<string>(ELEMENT_NAMES);
 export const isKnownElement = (name: string): name is ElementName => known.has(name);
 
 /** Den's elements the harness app does not draw (yet): naming one is this error, never a blank or a ReferenceError. */
-export const NOT_DRAWN: ReadonlySet<string> = new Set(['Browser', 'Shader', 'Video']);
+export const NOT_DRAWN: ReadonlySet<string> = new Set(['Browser']);
 export const notDrawnError = (name: string, where?: string): TypeError =>
   new TypeError(`<${name}> is not drawn by the harness app${where ? ` (${where})` : ''}: the elements are ${ELEMENT_NAMES.join(', ')}`);
 
@@ -73,10 +76,11 @@ export const PROPS: Record<ElementName, readonly string[]> = {
   Polyline: ['points', 'closed', ...SHAPE_PROPS],
   // The controls take exactly what the app reads of them (CONTROLS below says what goes on the wire), so no tip.
   Button: ['label', 'tone', 'disabled', 'onclick', 'children'],
-  Toggle: ['value', 'label', 'disabled', 'onchange'],
-  Checkbox: ['checked', 'label', 'disabled', 'onchange'],
-  Slider: ['value', 'min', 'max', 'step', 'label', 'disabled', 'onchange'],
-  NumberField: ['value', 'min', 'max', 'step', 'label', 'disabled', 'onchange'],
+  // `id` is what a Shader's '@id' uniform names: it reads the control's live value.
+  Toggle: ['value', 'label', 'disabled', 'id', 'onchange'],
+  Checkbox: ['checked', 'label', 'disabled', 'id', 'onchange'],
+  Slider: ['value', 'min', 'max', 'step', 'label', 'disabled', 'id', 'onchange'],
+  NumberField: ['value', 'min', 'max', 'step', 'label', 'disabled', 'id', 'onchange'],
   Input: ['value', 'placeholder', 'label', 'disabled', 'onchange', 'onsubmit'],
   TextArea: ['value', 'placeholder', 'lines', 'disabled', 'onchange', 'onsubmit'],
   Select: ['options', 'selected', 'placeholder', 'disabled', 'onchange'],
@@ -101,12 +105,17 @@ export const PROPS: Record<ElementName, readonly string[]> = {
   Loading: ['label', 'children'],
   Skeleton: ['lines'],
   Icon: ['name'],
-  Image: ['src', 'width', 'height', 'fit', 'alt'],
+  Image: ['src', 'width', 'height', 'fit', 'alt', 'id'],
   Chip: ['label', 'selected', 'value', 'onclick', 'children'],
   Tile: ['gap', 'pad', 'value', 'onclick', 'children'],
   FileRef: ['path', 'line'],
   Kip: ['mood', 'size'],
+  Video: ['src', 'poster', 'autoplay', 'loop', 'muted', 'controls', 'width', 'height', 'aspect', 'fit', 'id', 'paused', 'currentTime', 'ontimeupdate', 'onended', 'onplay', 'onpause'],
+  // `sourceLine` is compile.ts's (the cell line the source between the tags starts on), for the lines of a compile error.
+  Shader: ['source', 'src', 'width', 'height', 'aspect', 'uniforms', 'textures', 'animate', 'id', 'sourceLine', 'children'],
 };
+/** Props the kernel sets itself, never listed as what an element takes. */
+const INTERNAL: ReadonlySet<string> = new Set(['sourceLine']);
 /** The props only a Text inside a Canvas reads. */
 export const CANVAS_TEXT_PROPS: ReadonlySet<string> = new Set(['x', 'y', 'anchor', 'size', 'fill']);
 
@@ -208,14 +217,16 @@ export function tableError(columns: unknown, rows: unknown, where?: string): Typ
 }
 
 /**
- * What a bindable element is: `<Slider bind:value={v}>` is the value the person sets, `<Choice bind:selected={s}>` the one they pick.
- * Its change event writes the prop back (svelte.ts `hostSource`), then the cell's own `onchange` runs, so a binding follows the person
- * and a plain `value={x}` still shows what is written. Copied from den's repl/src/ui/element.ts, cut to the app's controls.
+ * What a bindable element is: `<Slider bind:value={v}>` is the value the person sets, `<Choice bind:selected={s}>` the one they pick,
+ * `<Video bind:currentTime={t} bind:paused={p}>` where its playhead is and whether it plays. Its events write the props back (svelte.ts
+ * `hostSource`), then the cell's own handler runs, so a binding follows the person and a plain `value={x}` still shows what is
+ * written. The first is the element's binding as an error names it. Copied from den's repl/src/ui/element.ts, cut to the app's elements.
  */
-export const BINDABLE: Partial<Record<string, string>> = {
-  Input: 'value', Slider: 'value', Toggle: 'value', NumberField: 'value', TextArea: 'value', Checkbox: 'checked',
-  Choice: 'selected', Radio: 'selected', Select: 'selected',
-  Split: 'ratio', Tabs: 'selected', Disclosure: 'open', Popover: 'open', Menu: 'open', Dialog: 'open', Sheet: 'open',
+export const BINDABLE: Partial<Record<string, readonly string[]>> = {
+  Input: ['value'], Slider: ['value'], Toggle: ['value'], NumberField: ['value'], TextArea: ['value'], Checkbox: ['checked'],
+  Choice: ['selected'], Radio: ['selected'], Select: ['selected'],
+  Split: ['ratio'], Tabs: ['selected'], Disclosure: ['open'], Popover: ['open'], Menu: ['open'], Dialog: ['open'], Sheet: ['open'],
+  Video: ['currentTime', 'paused'],
 };
 
 /**
@@ -228,8 +239,8 @@ export const BIND_ALIAS: Partial<Record<string, Readonly<Record<string, string>>
   Radio: { value: 'selected', group: 'selected' }, Tabs: { value: 'selected' },
 };
 
-/** An event that writes a binding back, and what it writes when not the event's value. */
-export interface WriteBack { event: string; value?: unknown }
+/** An event that writes a binding back (`prop`, the element's first binding when not said), and what it writes when not the event's value. */
+export interface WriteBack { event: string; prop?: string; value?: unknown }
 /**
  * The events that write a binding back when it is not `change` alone: a fold or a float is opened and shut by `toggle`, a Menu also shuts
  * when a row is picked, and closing a Dialog or a Sheet is `open = false`. Copied from den's repl/src/ui/element.ts (Menu added).
@@ -237,6 +248,8 @@ export interface WriteBack { event: string; value?: unknown }
 export const BOUND_BY: Partial<Record<string, readonly WriteBack[]>> = {
   Disclosure: [{ event: 'toggle' }], Popover: [{ event: 'toggle' }], Menu: [{ event: 'toggle' }, { event: 'select', value: false }],
   Dialog: [{ event: 'close', value: false }], Sheet: [{ event: 'close', value: false }],
+  // A Video's playhead follows its timeupdate; it plays and pauses by the person's press.
+  Video: [{ event: 'timeupdate', prop: 'currentTime' }, { event: 'play', prop: 'paused', value: false }, { event: 'pause', prop: 'paused', value: true }],
 };
 
 /**
@@ -246,25 +259,27 @@ export const BOUND_BY: Partial<Record<string, readonly WriteBack[]>> = {
  */
 export function bindError(element: string, name: string, where?: string): TypeError | undefined {
   const bound = BINDABLE[element];
-  if (name === 'this' || name === bound || BIND_ALIAS[element]?.[name] === bound) return undefined;
-  if (bound) return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: a ${element}'s binding is bind:${bound}={...}`);
-  const takers = Object.entries(BINDABLE).map(([el, prop]) => `${el} (bind:${prop})`).join(', ');
+  const alias = BIND_ALIAS[element]?.[name];
+  if (name === 'this' || bound?.includes(name) || (alias !== undefined && bound?.includes(alias))) return undefined;
+  if (bound) return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: ${bound.length === 1 ? `a ${element}'s binding is bind:${bound[0]}={...}` : `a ${element}'s bindings are ${bound.map(prop => `bind:${prop}={...}`).join(' and ')}`}`);
+  const takers = Object.entries(BINDABLE).map(([el, props]) => `${el} (${props!.map(prop => `bind:${prop}`).join(', ')})`).join(', ');
   return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: only ${takers} take a binding; pass ${name}={...} and an on-handler instead`);
 }
 
 /** The props whose value children text becomes: `<Text>hi</Text>` is `{text: 'hi'}`. */
 export const TEXT_PROP: Partial<Record<string, string>> = {
   Text: 'text', Badge: 'text', Code: 'text', Markdown: 'text', Button: 'label', Chip: 'label', Loading: 'label', Toast: 'text',
+  Shader: 'source',
 };
-/** The elements whose children are only their words (`<Chip>Open</Chip>`): another element between their tags is an error. */
-export const WORDS_ONLY: ReadonlySet<string> = new Set(['Button', 'Chip', 'Loading', 'Toast']);
+/** The elements whose children are only their words (`<Chip>Open</Chip>`, a Shader's source): another element between their tags is an error. */
+export const WORDS_ONLY: ReadonlySet<string> = new Set(['Button', 'Chip', 'Loading', 'Toast', 'Shader']);
 
 export const article = (word: string): string => /^[AEIOU]/.test(word) ? 'an' : 'a';
 const squash = (name: string) => name.toLowerCase().replace(/[-_:]/g, '');
 
 /** What an element takes, as an error says it: `a Code takes text, lang (its text is also its children)`. */
 export function takes(element: ElementName): string {
-  const props = PROPS[element].filter(name => name !== 'children' && name !== 'tip');
+  const props = PROPS[element].filter(name => name !== 'children' && name !== 'tip' && !INTERNAL.has(name));
   const list = props.length ? `takes ${props.join(', ')}` : 'takes only tip';
   const kids = !PROPS[element].includes('children') ? '' : TEXT_PROP[element] ? ` (its ${TEXT_PROP[element]} is also its children)` : ' (and children)';
   return `${article(element)} ${element} ${list}${kids}`;
@@ -387,6 +402,12 @@ export function itemsOf(value: unknown): WireItem[] | string {
 }
 const items: Rule = v => { const r = itemsOf(v); return typeof r === 'string' ? r : undefined; };
 const file: Rule = v => fileProblem(v);
+/** A Video's source: a file, or an http(s) URL it streams. */
+const media: Rule = v => mediaProblem(v);
+const id: Rule = ID_RULE;
+const aspect: Rule = v => aspectOf(v) !== undefined ? undefined : `a width over a height: "16:9", "16/9" or a number (16 / 9), from 0.01 to 100`;
+const uniforms: Rule = v => { const u = uniformsOf(v); return typeof u === 'string' ? u : undefined; };
+const textures: Rule = v => texturesProblem(v);
 
 /** The problem with a Select's, Choice's or Radio's `options`, or the options as the app reads them. */
 export function optionsOf(value: unknown): WireOption[] | string {
@@ -434,10 +455,10 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
     points: v => { const n = numbers(v); return n && n.length % 2 === 0 && n.every(Number.isFinite) ? undefined : `points as x,y pairs: [[0, 0], [10, 5]], [0, 0, 10, 5] or "0,0 10,5"`; },
   },
   Button: { label, tone: v => v === '' ? undefined : oneOf(BUTTON_TONES)(v), disabled: flag },
-  Toggle: { value: flag, label, disabled: flag },
-  Checkbox: { checked: flag, label, disabled: flag },
-  Slider: { value: number, min: number, max: number, step: positive, label, disabled: flag },
-  NumberField: { value: number, min: number, max: number, step: positive, label, disabled: flag },
+  Toggle: { value: flag, label, disabled: flag, id },
+  Checkbox: { checked: flag, label, disabled: flag, id },
+  Slider: { value: number, min: number, max: number, step: positive, label, disabled: flag, id },
+  NumberField: { value: number, min: number, max: number, step: positive, label, disabled: flag, id },
   Input: { value: text, placeholder: label, label, disabled: flag },
   TextArea: { value: text, placeholder: label, lines, disabled: flag },
   Select: { options, placeholder: label, disabled: flag },
@@ -458,12 +479,20 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
   Loading: { label },
   Skeleton: { lines: whole(1, MAX_SKELETON, 'lines') },
   Icon: { name: label },
-  Image: { src: file, width: positive, height: positive, fit: oneOf(IMAGE_FITS), alt: label },
+  Image: { src: file, width: positive, height: positive, fit: oneOf(IMAGE_FITS), alt: label, id },
   Chip: { label, selected: flag },
   FileRef: { path: file, line: whole(1, Number.MAX_SAFE_INTEGER, 'a line') },
   Kip: {
     mood: v => { const m = kipMoodOf(v); return typeof m === 'string' ? m : undefined; },
     size: numeral(n => n >= KIP_SIZE.min && n <= KIP_SIZE.max, `points from ${KIP_SIZE.min} to ${KIP_SIZE.max} (how tall Kip stands)`),
+  },
+  Video: {
+    src: media, poster: file, autoplay: flag, loop: flag, muted: flag, controls: flag, width: positive, height: positive, aspect,
+    fit: oneOf(IMAGE_FITS), id, paused: flag, currentTime: numeral(n => n >= 0, 'seconds, 0 or more'),
+  },
+  Shader: {
+    source: v => typeof v === 'string' ? undefined : 'Slang source (a string): float4 main(ShaderInput in) { ... }', src: file,
+    width: positive, height: positive, aspect, uniforms, textures, animate: flag, id, sourceLine: whole(1, Number.MAX_SAFE_INTEGER, 'a line'),
   },
 };
 
@@ -471,7 +500,7 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
 export const WIRED: ReadonlySet<string> = new Set([
   'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio',
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split', 'Tabs', 'Accordion', 'Disclosure', 'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
-  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'Kip',
+  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'Kip', 'Video', 'Shader',
 ]);
 
 /** Two values the same as JSON says them (a tab's value against the selected one). */
@@ -507,11 +536,11 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
     }
     case 'Toggle':
       out.value = props.value === true;
-      put('label', 'disabled', 'onChange');
+      put('label', 'disabled', 'id', 'onChange');
       break;
     case 'Checkbox':
       out.checked = props.checked === true;
-      put('label', 'disabled', 'onChange');
+      put('label', 'disabled', 'id', 'onChange');
       break;
     case 'Slider': {
       const min = num('min') ?? 0;
@@ -521,7 +550,7 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.min = min;
       out.max = max;
       if (given('step')) out.step = num('step');
-      put('label', 'disabled', 'onChange');
+      put('label', 'disabled', 'id', 'onChange');
       break;
     }
     case 'NumberField': {
@@ -532,7 +561,7 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       if (min !== undefined) out.min = min;
       if (max !== undefined) out.max = max;
       out.step = num('step') ?? 1;
-      put('label', 'disabled', 'onChange');
+      put('label', 'disabled', 'id', 'onChange');
       break;
     }
     case 'Input':
@@ -655,6 +684,7 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       put('width', 'height');
       out.fit = given('fit') ? props.fit : 'contain';
       if (given('alt')) out.alt = String(props.alt);
+      put('id');
       break;
     case 'Chip': {
       // Words between its tags are not checked as they are set, so the cap is checked here, as a Button's is.
@@ -685,6 +715,25 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.size = num('size') ?? KIP_SIZE.given;
       break;
     }
+    case 'Video':
+      // src and poster are absolute paths (or src an http(s) URL) by now: tree.ts resolves them, and they must be there.
+      if (!given('src')) throw fail('has no src', 'src="~/Movies/clip.mp4" (a file on disk, relative ones from the working directory) or an http(s) URL');
+      out.src = props.src;
+      put('poster');
+      out.autoplay = yes('autoplay', false);
+      out.loop = yes('loop', false);
+      out.muted = yes('muted', true);
+      out.controls = yes('controls', true);
+      put('width', 'height');
+      if (given('aspect')) out.aspect = aspectOf(props.aspect);
+      out.fit = given('fit') ? props.fit : 'contain';
+      put('id');
+      if (given('paused')) out.paused = props.paused === true;
+      if (given('currentTime')) out.currentTime = num('currentTime');
+      put('onTimeUpdate', 'onEnded', 'onPlay', 'onPause');
+      break;
+    case 'Shader':
+      return shaderWire(props, where);
     default:
       throw new Error(`elementWire: <${element}> is not one of the elements sent exactly (WIRED)`);
   }
@@ -851,8 +900,10 @@ export interface Attachment {
 /** The last handler id handed out, across every tree: a tree that replaces another never answers the old one's ids. */
 let handlerSeq = 0;
 
+/** The events of more than one word, as the wire spells them (camel case: `ontimeupdate` is `onTimeUpdate`). */
+const EVENT_WORDS: Readonly<Record<string, string>> = { timeupdate: 'TimeUpdate' };
 /** The prop the app knows an event by: `onclick={...}` (Svelte's `click` event) is `onClick` on the wire. */
-export const wireName = (type: string): string => `on${type.slice(0, 1).toUpperCase()}${type.slice(1)}`;
+export const wireName = (type: string): string => `on${EVENT_WORDS[type] ?? `${type.slice(0, 1).toUpperCase()}${type.slice(1)}`}`;
 
 export type Kind = 'element' | 'text' | 'comment' | 'fragment';
 

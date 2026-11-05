@@ -1529,6 +1529,8 @@ impl App {
             ..Draw::default()
         };
         self.emit(&mut d, scale, upload);
+        // The cells' Shaders and Videos: what Media should render and play, now that the paint says which are visible.
+        self.step_media(&mut d, dt, scale);
         if self.paint.get_mut().end_frame() {
             self.poke();
         }
@@ -1722,6 +1724,9 @@ impl App {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
                 self.genui_action(ev);
+            } else if let Some(m) = a.strip_prefix("media:") {
+                // A press on a cell's Shader or Video (chat/genui/surface.rs): play, mute, resume.
+                self.media_action(m);
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (the browser), or a file (a cell's FileRef) in the app its kind opens in, at its line.
                 crate::open::open(target);

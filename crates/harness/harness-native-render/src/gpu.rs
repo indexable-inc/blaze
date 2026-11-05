@@ -6,7 +6,8 @@
 //! shader elements and 3D scenes are gone; den's mascot, Kip, is back (kip.rs). Per-frame CPU-written buffers are rings of [`FRAMES`]
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
-use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst};
+use crate::media::Media;
+use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst, SurfaceInst};
 use block2::RcBlock;
 use bytemuck::Pod;
 use dispatch2::{DispatchData, DispatchRetained, DispatchSemaphore, DispatchTime};
@@ -15,8 +16,10 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
 use objc2_quartz_core::CAMetalDrawable as _;
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 /// The one pixel format of the layer and every pipeline's colour attachment. Half floats: sRGB-encoded colour.
 pub const PIXEL_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
@@ -58,6 +61,7 @@ pub struct Renderer {
     path: Pso,
     sprite: Pso,
     image: Pso,
+    surface: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     /// Kip's pictures and pipelines (kip.rs, shaders/mascot.slang).
     kips: crate::kip::Mascots,
@@ -65,12 +69,14 @@ pub struct Renderer {
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
     curves: Buf,
     bands: Buf,
-    rings: [Option<Ring>; 7],
+    rings: [Option<Ring>; 8],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
     /// The last finished command buffer's GPU time (GPUEndTime - GPUStartTime), milliseconds as f32 bits: two reads in
     /// the completion handler the frame already has. F3's overlay (src/app/stats.rs) reads it.
     gpu_ms: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Shaders' and videos' live pictures (media/), shared with the host, which reads their status and states.
+    media: Rc<RefCell<Media>>,
 }
 
 fn s(x: &str) -> Retained<NSString> {
@@ -140,6 +146,7 @@ impl Renderer {
         };
         let curves = fixed(bytemuck::cast_slice(&marks.curves));
         let bands = fixed(bytemuck::cast_slice(&marks.bands));
+        let media = Rc::new(RefCell::new(Media::new(&dev)));
         Self {
             panel: pipeline(&dev, &lib, "panel_vs", "panel_fs"),
             glyph: pipeline(&dev, &lib, "glyph_vs", "glyph_fs"),
@@ -148,17 +155,25 @@ impl Renderer {
             sprite: pipeline(&dev, &lib, "sprite_vs", "sprite_fs"),
             image: pipeline(&dev, &lib, "image_vs", "image_fs"),
             kips: crate::kip::Mascots::new(&dev),
+            surface: pipeline(&dev, &lib, "surface_vs", "surface_fs"),
             dev,
             queue,
             sampler,
             atlas,
             curves,
             bands,
-            rings: [None, None, None, None, None, None, None],
+            rings: [None, None, None, None, None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
             gpu_ms: std::sync::Arc::default(),
+            media,
         }
+    }
+
+    /// The live pictures Surface nodes show: the host reads shader status and video state from it (and, in the offscreen
+    /// shot, pumps and settles it). Borrowed mutably only inside [`Self::render`].
+    pub fn media(&self) -> Rc<RefCell<Media>> {
+        self.media.clone()
     }
 
     /// Where the last frame's GPU time lands (milliseconds as f32 bits).
@@ -271,6 +286,24 @@ impl Renderer {
         let ib = self.ring(4, ring_slot, &draw.images);
         let ab = self.ring(5, ring_slot, &draw.paths);
         let eb = self.ring(6, ring_slot, &draw.edges);
+        // Media steps first (renders sent, frames pulled), then each Surface samples its latest finished picture.
+        let media_rc = self.media.clone();
+        let mut media = media_rc.borrow_mut();
+        media.prepare(&draw.media);
+        let (frames_done, serial) = media.frame_token();
+        let surfaces: Vec<SurfaceInst> = draw
+            .surfaces
+            .iter()
+            .zip(&draw.surface_keys)
+            .map(|(inst, key)| {
+                let mut inst = *inst;
+                if let Some((_, size)) = media.texture(*key) {
+                    inst.uv = cover_uv(inst.rect, inst.shape[3] != 0.0, size);
+                }
+                inst
+            })
+            .collect();
+        let fb_surf = self.ring(7, ring_slot, &surfaces);
         // A texture per picture, filled now: small, and alive until the command buffer that reads it is done with it.
         let texs: Vec<Tex> = draw
             .images
@@ -281,6 +314,8 @@ impl Renderer {
         // Kips whose pose changed render their pictures first, in a command buffer committed before the frame's.
         self.kips.prepare(&self.queue, &draw.kips);
         let Some(cmd) = self.queue.commandBuffer() else {
+            // Nothing of this frame reaches the GPU: what it marked sampled is free.
+            frames_done.fetch_max(serial, std::sync::atomic::Ordering::Release);
             self.sem.signal();
             return;
         };
@@ -338,6 +373,22 @@ impl Renderer {
                     SegKind::Image => {
                         (&self.image, "image_vs", "image_fs", &ib, std::mem::size_of::<ImageInst>())
                     }
+                    SegKind::Surface => (
+                        &self.surface,
+                        "surface_vs",
+                        "surface_fs",
+                        &fb_surf,
+                        std::mem::size_of::<SurfaceInst>(),
+                    ),
+                };
+                // A Surface with nothing finished to show yet (a shader building or on its first render, a video before
+                // its first frame) draws nothing.
+                let live = match sg.kind {
+                    SegKind::Surface => match media.texture(draw.surface_keys[sg.first as usize]) {
+                        Some((t, _)) => Some(&**t),
+                        None => continue,
+                    },
+                    _ => None,
                 };
                 enc.setRenderPipelineState(pso);
                 // SAFETY: the pointers are valid for the lengths given; setBytes copies them. Buffers, textures and the
@@ -389,6 +440,15 @@ impl Renderer {
                                 slot(fs, "tex"),
                             );
                         }
+                        SegKind::Surface => {
+                            enc.setFragmentBuffer_offset_atIndex(
+                                Some(buf),
+                                sg.first as usize * stride,
+                                slot(fs, "insts"),
+                            );
+                            enc.setFragmentTexture_atIndex(live, slot(fs, "tex"));
+                            enc.setFragmentSamplerState_atIndex(Some(&self.sampler), slot(fs, "smp"));
+                        }
                         SegKind::Glyph => {
                             enc.setFragmentTexture_atIndex(Some(&self.atlas), slot(fs, "atlas"));
                             enc.setFragmentSamplerState_atIndex(
@@ -420,12 +480,15 @@ impl Renderer {
         if let Some(d) = &drawable {
             cmd.presentDrawable(ProtocolObject::from_ref(&**d));
         }
+        drop(media);
         let (sem, gpu_ms) = (self.sem.clone(), self.gpu_ms.clone());
         let done = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal hands the completed command buffer, alive for the handler.
             let cb = unsafe { cb.as_ref() };
             let ms = ((cb.GPUEndTime() - cb.GPUStartTime()) * 1000.0) as f32;
             gpu_ms.store(ms.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            // Media may now write over or let go what this frame sampled.
+            frames_done.fetch_max(serial, std::sync::atomic::Ordering::Release);
             sem.signal();
         });
         // SAFETY: Metal copies the block.
@@ -454,6 +517,26 @@ impl Renderer {
             )
         };
         v.into_iter().map(|h| (half_to_f32(h).clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+    }
+}
+
+/// The part of a `size` texture a Surface shows over `rect` (points): with `cover`, the middle of it at the box's aspect
+/// (cropped, never stretched); without, all of it.
+fn cover_uv(rect: [f32; 4], cover: bool, size: [u32; 2]) -> [f32; 4] {
+    let (bw, bh) = (rect[2].max(1e-3), rect[3].max(1e-3));
+    let (tw, th) = (size[0].max(1) as f32, size[1].max(1) as f32);
+    if !cover {
+        return [0.0, 0.0, 1.0, 1.0];
+    }
+    let (box_aspect, tex_aspect) = (bw / bh, tw / th);
+    if tex_aspect > box_aspect {
+        // Wider than the box: crop left and right.
+        let k = box_aspect / tex_aspect;
+        [0.5 - k / 2.0, 0.0, 0.5 + k / 2.0, 1.0]
+    } else {
+        // Taller: crop top and bottom.
+        let k = tex_aspect / box_aspect;
+        [0.0, 0.5 - k / 2.0, 1.0, 0.5 + k / 2.0]
     }
 }
 

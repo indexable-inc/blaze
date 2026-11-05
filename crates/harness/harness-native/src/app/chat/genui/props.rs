@@ -5,7 +5,7 @@
 use super::*;
 
 /// The tier-3 elements and the props each takes on the wire.
-const PROPS: [(&str, &[&str]); 23] = [
+const PROPS: [(&str, &[&str]); 25] = [
     ("Grid", &["columns", "fit", "gap", "pad"]),
     ("Stack", &[]),
     ("Layer", &["anchor", "x", "y", "z"]),
@@ -24,17 +24,25 @@ const PROPS: [(&str, &[&str]); 23] = [
     ("Loading", &["label"]),
     ("Skeleton", &["lines"]),
     ("Icon", &["name"]),
-    ("Image", &["src", "width", "height", "fit", "alt"]),
+    ("Image", &["src", "width", "height", "fit", "alt", "id"]),
     ("Chip", &["label", "selected", "value", "onClick"]),
     ("Tile", &["gap", "pad", "value", "onClick"]),
     ("FileRef", &["path", "line"]),
     ("Kip", &["mood", "size"]),
+    ("Shader", &["msl", "key", "uniforms", "textures", "width", "height", "aspect", "animate", "pointer", "id"]),
+    (
+        "Video",
+        &[
+            "src", "poster", "autoplay", "loop", "muted", "controls", "width", "height", "aspect", "fit", "id", "paused", "currentTime",
+            "onTimeUpdate", "onEnded", "onPlay", "onPause",
+        ],
+    ),
 ];
 
-pub(super) const TIER3: [&str; 23] = {
-    let mut out = [""; 23];
+pub(super) const TIER3: [&str; 25] = {
+    let mut out = [""; 25];
     let mut i = 0;
-    while i < 23 {
+    while i < 25 {
         out[i] = PROPS[i].0;
         i += 1;
     }
@@ -54,7 +62,7 @@ const MAX_LINES: f64 = 20.0;
 const TONES: [&str; 7] = ["ink", "muted", "strong", "error", "accent", "success", "warning"];
 
 /// The elements that hold nothing.
-const LEAVES: [&str; 9] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef", "Kip"];
+const LEAVES: [&str; 11] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef", "Kip", "Shader", "Video"];
 
 /// A Kip's mood words (the kernel's `KIP_MOODS`; harness-native-kip act.rs plays them), what joins them, the most it plays in
 /// turn, and how tall it stands (points).
@@ -234,7 +242,49 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
                 Value::String(f) if matches!(f.as_str(), "contain" | "cover") => {}
                 _ => return bad("fit", "contain or cover"),
             }
-            at_least("width", 0.0, true).or_else(|| at_least("height", 0.0, true)).or_else(|| text("alt", false))
+            at_least("width", 0.0, true).or_else(|| at_least("height", 0.0, true)).or_else(|| text("alt", false)).or_else(|| text("id", false))
+        }
+        // The kernel compiled the source and resolved the files; what is checked here is the wire's shape
+        // (surface::wire), a box that can be drawn, and its flags.
+        "Shader" => surface::wire(node)
+            .err()
+            .or_else(|| at_least("width", 0.0, true))
+            .or_else(|| at_least("height", 0.0, true))
+            .or_else(|| at_least("aspect", 0.0, true))
+            .or_else(|| flag("animate"))
+            .or_else(|| flag("pointer"))
+            .or_else(|| text("id", false)),
+        "Video" => {
+            let src = match &p["src"] {
+                Value::String(s) if !s.is_empty() => s,
+                _ => return bad("src", "a video file's absolute path or an http(s) URL (it is required)"),
+            };
+            if !(src.starts_with('/') || src.starts_with("http://") || src.starts_with("https://")) {
+                return Some(format!("<Video> src \u{201C}{src}\u{201D} is not an absolute path or an http(s) URL"));
+            }
+            match &p["poster"] {
+                Value::Null => {}
+                Value::String(s) if !s.starts_with('/') => return Some(format!("<Video> poster \u{201C}{s}\u{201D} is not an absolute path")),
+                Value::String(s) => {
+                    if let Err(e) = media::photo_size(s) {
+                        return Some(format!("<Video> poster: {e}"));
+                    }
+                }
+                _ => return bad("poster", "an image file's absolute path"),
+            }
+            match &p["fit"] {
+                Value::Null => {}
+                Value::String(f) if matches!(f.as_str(), "contain" | "cover") => {}
+                _ => return bad("fit", "contain or cover"),
+            }
+            ["autoplay", "loop", "muted", "controls", "paused"]
+                .into_iter()
+                .find_map(|f| flag(f))
+                .or_else(|| at_least("width", 0.0, true))
+                .or_else(|| at_least("height", 0.0, true))
+                .or_else(|| at_least("aspect", 0.0, true))
+                .or_else(|| at_least("currentTime", 0.0, false))
+                .or_else(|| text("id", false))
         }
         "Chip" => text("label", true).or_else(|| flag("selected")),
         "Tile" => at_least("gap", 0.0, false).or_else(|| at_least("pad", 0.0, false)),

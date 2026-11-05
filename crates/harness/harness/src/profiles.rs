@@ -51,7 +51,13 @@ Tabs (tabs, bind:selected; pick the body with {#if}), Disclosure (title) in an A
 and Sheet (bind:open on each) and Toast; status and pictures: Progress, Loading, Skeleton, Icon, Image (src: a file \
 path), Chip, Tile (onclick) and FileRef (path); Kip, the app's mascot, in a mood (mood: wave happy celebrate \
 thinking working oops sleepy idle, a few in turn as \"thinking then celebrate\"; size 20 to 160) for a greeting or an \
-outcome, sparingly. To ask the person and wait for the answer, await ask(text, {options, \
+outcome, sparingly. Video plays a file or http(s) URL (muted, with controls; autoplay loop, \
+bind:currentTime, bind:paused): <Video id=\"clip\" src=\"~/Movies/a.mp4\" autoplay loop />. Shader runs a Slang \
+fragment shader every frame, `float4 main(ShaderInput in)` between its tags (in.uv, in.pixel, in.resolution, in.time, \
+in.pointer, in.hovered, in.u.<uniform>; texture(name, uv)); uniforms and textures take values or '@id' of an element \
+in the cell (a Slider's live value, a Video's frames): <Shader aspect=\"16:9\" textures={{ clip: '@clip' }} \
+uniforms={{ gain: '@gain' }}>float4 main(ShaderInput in) { return texture(clip, in.uv) * in.u.gain; }</Shader>. \
+To ask the person and wait for the answer, await ask(text, {options, \
 default}). An element or prop not listed is an error naming it and its line.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {

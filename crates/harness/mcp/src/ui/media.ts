@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,4 +63,28 @@ export function resolveFile(value: unknown, what: string, cwd: string = process.
   const found = pathOf(value, cwd);
   if ('path' in found) return found.path;
   throw new TypeError(`${what} is ${found.is}, not a file on disk: ${found.fix}`);
+}
+
+/** An http(s) URL as written: only a Video's `src` and a Shader's video texture take one (AVPlayer streams it). */
+export const isWebUrl = (value: unknown): value is string => typeof value === 'string' && /^https?:\/\/\S+$/i.test(value.trim());
+
+/** Why `value` names no file and no http(s) URL a Video plays, said as what it should be; undefined when it names one. */
+export function mediaProblem(value: unknown, cwd: string = process.cwd()): string | undefined {
+  if (isWebUrl(value)) return undefined;
+  const problem = fileProblem(value, cwd);
+  return problem && `${problem.replace(/^a file on disk/, 'a file on disk or an http(s) URL').replace(FETCH, 'only an http(s) URL plays as it is; fetch any other to a file first')}`;
+}
+
+/**
+ * The absolute path of a file that must be there now (a Video's, a poster, a texture, a Shader's `.slang`), or, when `web` allows
+ * it, an http(s) URL as written; throws the TypeError naming `what` and the path it looked for.
+ */
+export function resolveMedia(value: unknown, what: string, web = false, cwd: string = process.cwd()): string {
+  if (web && isWebUrl(value)) return value.trim();
+  const path = resolveFile(value, what, cwd);
+  if (!existsSync(path)) {
+    const from = typeof value === 'string' && !value.startsWith('/') && !value.startsWith('file:') ? ` (${JSON.stringify(value)} from ${value.startsWith('~') ? 'the home directory' : cwd})` : '';
+    throw new TypeError(`${what} names ${path}${from}, which is not there`);
+  }
+  return path;
 }

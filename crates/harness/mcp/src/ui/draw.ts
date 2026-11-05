@@ -170,7 +170,7 @@ const INSTEAD: Readonly<Record<string, string>> = {
   h5: 'Text bold', h6: 'Text bold', hr: 'Divider', br: 'a new Text', pre: 'Code', code: 'Code', table: 'Table', tr: 'Table rows={...}',
   td: 'Table rows={...}', th: 'Table columns={...}', ul: 'Column of Text', ol: 'Column of Text', li: 'Text', img: 'Image src="/path/to/picture.png"',
   details: 'Disclosure title="..."', summary: 'Disclosure title="..."', dialog: 'Dialog', progress: 'Progress', a: 'FileRef path="..." (a file) or Button',
-  video: 'nothing: Video is not drawn by the harness app',
+  video: 'Video src="/path/to/clip.mp4"', canvas: 'Canvas (shapes) or Shader (a Slang fragment shader)',
   button: 'Button', input: 'Input (words), Slider or NumberField (a number), Checkbox or Toggle (on or off)', textarea: 'TextArea', select: 'Select', form: 'Column', foreignObject: 'no HTML inside a drawing: words in an <svg> are <text x y>',
   tspan: 'one <text> per run of words', defs: 'nothing: no gradients or patterns, colour is an ink', linearGradient: 'an ink: no gradients',
   radialGradient: 'an ink: no gradients', clipPath: 'nothing yet: no clipping', mask: 'nothing yet: no masks', use: 'the shape written again',

@@ -16,14 +16,14 @@ use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, S
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
+    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::GlyphsIn;
 
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::select;
-use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst};
+use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SurfaceInst};
 use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, SUBPX, Style, TypeLook};
 
 /// The atlas uploader a frame is drawn with: `(x, y, w, h, bytes)` into the glyph atlas.
@@ -67,6 +67,7 @@ pub struct Emitted {
     pub panels: usize,
     pub glyphs: usize,
     pub images: usize,
+    pub surfaces: usize,
     pub lines: usize,
     pub paths: usize,
 }
@@ -420,6 +421,7 @@ impl Painter {
             panels: d.panels.len(),
             glyphs: d.glyphs.len(),
             images: d.images.len(),
+            surfaces: d.surfaces.len(),
             lines: d.lines.len(),
             paths: d.paths.len(),
         };
@@ -733,6 +735,15 @@ impl Painter {
                     m.rect[3] * k,
                 ];
             }
+            for m in &mut d.surfaces[at.surfaces..] {
+                m.rect = [
+                    ox + (m.rect[0] - ox) * k,
+                    oy + (m.rect[1] - oy) * k,
+                    m.rect[2] * k,
+                    m.rect[3] * k,
+                ];
+                m.shape[0] *= k;
+            }
         }
         // The clip it sits in, both ways: a scroll cuts its content at its top and foot and at its sides (a table that
         // scrolls sideways). A far edge of 0 reads as none in the shader, so a clip with nothing left in it keeps a sliver.
@@ -749,6 +760,10 @@ impl Painter {
                 glyph.clipx[..2].copy_from_slice(&across);
             }
             for m in &mut d.images[at.images..] {
+                m.clip[..2].copy_from_slice(&band);
+                m.clipx[..2].copy_from_slice(&across);
+            }
+            for m in &mut d.surfaces[at.surfaces..] {
                 m.clip[..2].copy_from_slice(&band);
                 m.clipx[..2].copy_from_slice(&across);
             }
@@ -870,6 +885,23 @@ impl Painter {
         dark: bool,
         sc: f32,
     ) -> Result<(), String> {
+        // A live picture from Media (a Shader's or a Video's frames): drawn by key; the renderer binds Media's latest
+        // finished frame for it and skips the draw while there is none.
+        if let Some(sf) = e.try_cloned::<&Surface>() {
+            let mut shape = e.try_cloned::<&Shape>().unwrap_or_default();
+            if shape.n <= 0.0 {
+                shape.n = 4.0;
+            }
+            let inst = SurfaceInst {
+                rect,
+                shape: [shape.radius.max(0.0), shape.n, alpha, f32::from(u8::from(sf.cover != 0))],
+                clip: [0.0; 4],
+                clipx: [0.0; 4],
+                uv: [0.0, 0.0, 1.0, 1.0],
+            };
+            d.surface(inst, sf.key);
+            return Ok(());
+        }
         let path = e.path();
         let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
         if let Some(k) = e.try_cloned::<&Kip>() {

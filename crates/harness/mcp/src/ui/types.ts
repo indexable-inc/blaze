@@ -104,13 +104,13 @@ export interface PolylineProps extends ShapeProps { points: string | number[] | 
 /** A press. Its label is `label`, or the words between its tags (`<Button>Save</Button>`); its plate is plain unless `tone` says. */
 export interface ButtonProps { label?: string; tone?: 'accent' | 'error' | 'success' | 'warning' | 'muted'; disabled?: boolean; onclick?: Handle<null> }
 /** A switch, on or off. Binds `value`. */
-export interface ToggleProps { value?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
+export interface ToggleProps { id?: string; value?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
 /** A box ticked or not. Binds `checked`. */
-export interface CheckboxProps { checked?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
+export interface CheckboxProps { id?: string; checked?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
 /** A number dragged from `min` (0) to `max` (100), snapped to `step`. Binds `value` (`min` when not said). */
-export interface SliderProps { value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
+export interface SliderProps { id?: string; value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
 /** A number typed or stepped by `step` (1) within `min` and `max`. Binds `value` (`min`, else 0, when not said). */
-export interface NumberFieldProps { value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
+export interface NumberFieldProps { id?: string; value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
 /** One line of words; `onchange` hears them while typing (at most every 150 ms) and on leaving, `onsubmit` on Enter. Binds `value`. */
 export interface InputProps { value?: string; placeholder?: string; label?: string; disabled?: boolean; onchange?: Handle<string>; onsubmit?: Handle<string> }
 /** Words over `lines` (3) lines; `onsubmit` on Cmd+Enter. Binds `value`. */
@@ -170,7 +170,7 @@ export interface IconProps { name: string }
 /** A file on disk (a path, relative ones from the working directory, `~/` the home directory, or a `{path}`), as the app is given it: an absolute path. */
 export type FileSource = string | URL | Blob | { path: string };
 /** A picture from a file (no http or data: URLs). Natural size, at most the column wide and 360 tall, unless `width`/`height` say; `fit` (contain) in a box of both. */
-export interface ImageProps { src: FileSource; width?: number; height?: number; fit?: 'contain' | 'cover'; alt?: string }
+export interface ImageProps { src: FileSource; id?: string; width?: number; height?: number; fit?: 'contain' | 'cover'; alt?: string }
 /** A pill, brighter when `selected`. A press sends `value`, or `!selected` when it has none. Its label is also its children. */
 export interface ChipProps { label?: string; selected?: boolean; value?: unknown; onclick?: Handle }
 /** Its children in a column, pressed as a whole (it lights under the pointer); a press sends `value`. Gap 8, pad 12. */
@@ -187,6 +187,30 @@ export interface KipProps {
   /** How tall Kip stands, in points: 20 to 160, 64 when not given. */
   size?: number;
 }
+/** A width over a height: a number, `"16:9"` or `"16/9"`. */
+export type Aspect = number | string;
+/**
+ * A video from a file or an http(s) URL, played by the app with `controls` (true: play/pause, a scrub bar, mute) shown on hover
+ * and while paused. Muted unless `muted={false}`. `paused` and `currentTime` are commands (both bind); `ontimeupdate` gets the
+ * seconds about 4 times a second while playing. Its `id` is what a Shader's '@id' names (its frames as a texture, its time as a
+ * uniform).
+ */
+export interface VideoProps {
+  src: FileSource; poster?: FileSource; autoplay?: boolean; loop?: boolean; muted?: boolean; controls?: boolean;
+  width?: number; height?: number; aspect?: Aspect; fit?: 'contain' | 'cover'; id?: string; paused?: boolean; currentTime?: number;
+  ontimeupdate?: Handle<number>; onended?: Handle<null>; onplay?: Handle<null>; onpause?: Handle<null>;
+}
+/** A uniform's value: a number, a flag (1/0), 2 to 4 numbers, a colour `#rgb`..`#rrggbbaa`, or '@id' of a Slider, NumberField, Toggle, Checkbox or Video. */
+export type UniformValue = number | boolean | readonly number[] | string;
+/**
+ * A Slang fragment shader, `float4 main(ShaderInput in)` (or Shadertoy's `mainImage`), compiled by the kernel and drawn by the
+ * app every frame: its source between its tags, as `source`, or a `.slang` file as `src`. `uniforms` are read as `in.u.<name>`;
+ * `textures` (an image or video file, an http(s) URL, or '@id' of a Video, Image or Shader) with `texture(name, uv)`.
+ */
+export interface ShaderProps {
+  source?: string; src?: FileSource; width?: number; height?: number; aspect?: Aspect;
+  uniforms?: Readonly<Record<string, UniformValue>>; textures?: Readonly<Record<string, FileSource>>; animate?: boolean; id?: string;
+}
 
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
@@ -198,7 +222,7 @@ export interface ElementProps {
   Grid: GridProps; Stack: StackProps; Layer: LayerProps; Wrap: WrapProps; Scroll: ScrollProps; Split: SplitProps; Tabs: TabsProps;
   Accordion: AccordionProps; Disclosure: DisclosureProps; Popover: PopoverProps; Menu: MenuProps; Dialog: DialogProps; Sheet: SheetProps;
   Toast: ToastProps; Progress: ProgressProps; Loading: LoadingProps; Skeleton: SkeletonProps; Icon: IconProps; Image: ImageProps;
-  Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps; Kip: KipProps;
+  Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps; Kip: KipProps; Video: VideoProps; Shader: ShaderProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */

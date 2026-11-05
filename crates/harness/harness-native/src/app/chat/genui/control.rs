@@ -25,8 +25,9 @@ const SLIDE_EVERY: f32 = 0.050;
 const CHECK: &str = "\u{EAB2}";
 const CHEVRON: &str = "\u{EAB4}";
 
-/// The controls that keep state while they are used: with tier 3's Split (its rule dragged as a slider's knob is) and
-/// Toast (a press hides it here as well as sending onDismiss).
+/// The controls that keep state while they are used: with tier 3's Split (its rule dragged as a slider's knob is),
+/// Toast (a press hides it here as well as sending onDismiss) and a Video's scrub rail (dragged as a slider's; it seeks
+/// the player here and sends nothing of its own: genui/surface.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Input,
@@ -36,6 +37,7 @@ enum Kind {
     Select,
     Split,
     Toast,
+    Scrub,
 }
 
 impl Kind {
@@ -48,6 +50,7 @@ impl Kind {
             Kind::Select => "select",
             Kind::Split => "split",
             Kind::Toast => "toast",
+            Kind::Scrub => "scrub",
         }
     }
 
@@ -60,13 +63,14 @@ impl Kind {
             "select" => Kind::Select,
             "split" => Kind::Split,
             "toast" => Kind::Toast,
+            "scrub" => Kind::Scrub,
             _ => return None,
         })
     }
 
-    /// Dragged: a slider's knob, a split's rule.
+    /// Dragged: a slider's knob, a split's rule, a video's scrub rail.
     fn drags(self) -> bool {
-        matches!(self, Kind::Slider | Kind::Split)
+        matches!(self, Kind::Slider | Kind::Split | Kind::Scrub)
     }
 
     fn typed(self) -> bool {
@@ -158,6 +162,25 @@ pub struct Live {
     /// Each split dragged here, by its element's entity: where it was let go, over the ratio the tree said then. It holds
     /// until the tree says another ratio (its onChange's echo, or the cell's own change).
     splits: BTreeMap<u64, Kept>,
+    /// The cells' Shaders and Videos, and the host's Media they are drawn by (genui/surface.rs).
+    pub(super) surf: super::surface::Surfaces,
+}
+
+/// The value of the slider (or split, or scrub rail) of entity `node` while it is dragged: where the pointer has it, not
+/// where the tree last said. What an `@id` uniform reads at frame rate (genui/surface.rs).
+pub(super) fn slide_value(live: &Live, node: u64) -> Option<f64> {
+    live.slide.as_ref().filter(|s| s.spec.node == node).map(|s| s.value)
+}
+
+/// The video whose scrub rail is being dragged, and where to (seconds).
+pub(super) fn scrubbing(live: &Live) -> Option<(u64, f64)> {
+    live.slide.as_ref().filter(|s| s.spec.k == Kind::Scrub).map(|s| (s.spec.node, s.value))
+}
+
+/// The Action of video `node`'s scrub rail in cell `cell`: dragged as a slider over 0 to `duration` seconds, to a
+/// millisecond; it seeks the player and sends nothing itself (its timeupdate does: genui/surface.rs).
+pub(super) fn scrub_action(cell: &str, node: u64, duration: f64) -> String {
+    Spec { cell: cell.to_owned(), node, k: Kind::Scrub, change: None, submit: None, min: 0.0, max: duration.max(0.001), step: 0.001 }.action()
 }
 
 /// A split's ratio as dragged (`at`) while the tree still says `from`.
@@ -854,13 +877,19 @@ impl App {
                         }
                         flush(&self.link, Out::new(&spec, spec.change.as_ref(), Value::Null).into_iter().collect());
                     }
-                    Kind::Slider | Kind::Split => {
+                    Kind::Slider | Kind::Split | Kind::Scrub => {
                         let at = self.drag_at(&spec);
                         let mut live = self.genui.borrow_mut();
                         let sent = live.slide.take().filter(|s| s.spec.node == spec.node).and_then(|s| s.sent);
                         // A split keeps where it was let go.
                         if let (Some(v), Some(k)) = (at, live.splits.get_mut(&spec.node)) {
                             k.at = v;
+                        }
+                        // A video seeks to where it was let go.
+                        if spec.k == Kind::Scrub
+                            && let Some(v) = at
+                        {
+                            live.surf.scrubbed(spec.node, v);
                         }
                         drop(live);
                         if let Some(v) = at.filter(|v| sent != Some(*v)) {
@@ -878,8 +907,10 @@ impl App {
     /// Where the pointer puts dragged control `spec`'s value: a slider's ([`Self::slider_at`]) or a split's ratio (the
     /// rule's middle along the split, less the rule: 0.05 to 0.95, to a thousandth).
     fn drag_at(&self, spec: &Spec) -> Option<f64> {
-        if spec.k != Kind::Split {
-            return self.slider_at(spec);
+        match spec.k {
+            Kind::Split => {}
+            Kind::Scrub => return self.scrub_at(spec),
+            _ => return self.slider_at(spec),
         }
         let e = self.world.world_ref().entity_from_id(spec.node);
         if !e.is_alive() {
@@ -900,7 +931,21 @@ impl App {
         if !e.is_alive() {
             return None;
         }
-        let rail = View::of(e).part("body")?.part("rail")?;
+        self.rail_at(View::of(e).part("body")?.part("rail")?, spec)
+    }
+
+    /// Where the pointer puts video `spec`'s playhead: along its bar's rail, as a slider's.
+    fn scrub_at(&self, spec: &Spec) -> Option<f64> {
+        let w = self.world.world_ref();
+        let e = w.entity_from_id(spec.node);
+        if !e.is_alive() {
+            return None;
+        }
+        self.rail_at(View::of(e).part("bar")?.part("plate")?.part("rail")?, spec)
+    }
+
+    /// Where the pointer puts `spec`'s value along `rail` (the knob's middle within it), snapped and bounded.
+    fn rail_at(&self, rail: View<'_>, spec: &Spec) -> Option<f64> {
         let l = rail.entity().try_cloned::<&Laid>()?;
         let knob = rail.part("knob").and_then(|k| k.entity().try_cloned::<&Laid>()).map_or(16.0, |k| k.w);
         let frac = f64::from(((self.pointer.x - l.x - knob * 0.5) / (l.w - knob).max(1.0)).clamp(0.0, 1.0));
