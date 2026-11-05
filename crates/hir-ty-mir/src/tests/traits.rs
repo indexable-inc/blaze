@@ -1460,7 +1460,7 @@ fn foo<const C: u8, T>() -> (impl FnOnce(&str, T), impl Trait<u8>) {
 }
 "#,
         &expect![[r#"
-            134..165 '{     ...(C)) }': (impl FnOnce(&'?0.0 str, T), impl Trait<u8>)
+            134..165 '{     ...(C)) }': (impl FnOnce(&'?0.0 str, T), Bar<u8>)
             140..163 '(|inpu...ar(C))': (impl FnOnce(&'?0.0 str, T), Bar<u8>)
             141..154 '|input, t| {}': impl FnOnce(&'?0.0 str, T)
             142..147 'input': &'? str
@@ -3367,7 +3367,7 @@ fn foo() {
             246..247 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>
             281..310 'Box { ... {}) }': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>
             294..308 '&mut (|ps| {})': &'? mut impl FnOnce(&'?0.0 Option<i32>)
-            300..307 '|ps| {}': impl FnOnce(&'?0.0 Option<i32>)
+            299..308 '(|ps| {})': impl FnOnce(&'?0.0 Option<i32>)
             301..303 'ps': &'? Option<i32>
             305..307 '{}': ()
             316..317 'f': Box<dyn FnOnce(&'?0.0 Option<i32>) + 'static>

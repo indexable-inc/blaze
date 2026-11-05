@@ -262,7 +262,7 @@ const fn run(n: u32) -> u32 {
     }
     sum
 }
-const WARM: u32 = run(5);
+const WARM: u32 = run(5) + 10 + 20;
 const TEN: u32 = run(10);
 const TWENTY: u32 = run(20);
 "#;
@@ -278,6 +278,9 @@ const TWENTY: u32 = run(20);
             .1
             .allocations
         };
+        // WARM also interns the literals `10` and `20`: a scalar constant's bytes go into a
+        // process-wide table the first time any thread lowers them, so without this TWENTY (or
+        // TEN, after another test) would pay for its literal's row and the table page under it.
         eval("WARM");
         // The two constants' bodies and runs are the same but for the count: each round of
         // the loop and each call of its arithmetic allocates nothing.
