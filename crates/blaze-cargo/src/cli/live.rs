@@ -275,7 +275,7 @@ pub fn drive<A: Api>(
         terminal,
         form,
         board,
-        view: testing.then(|| TestView::new(paint)),
+        view: testing.then(|| TestView::new(paint).under_board()),
         paint,
         said: Vec::new(), // alloc: one a command
         held: Vec::new(), // alloc: one a command
@@ -700,10 +700,15 @@ impl Screen {
             false => self.terminal.size()?.width,
         };
         let lines = self.take_above(width);
-        let summary = match &self.view {
-            Some(view) => view.summary(width),
-            None => Vec::new(), // alloc: none
-        };
+        // The board's summary first (the build's time, its slowest tasks, what failed), then
+        // the tests'.
+        let mut said = String::new(); // alloc: once, at the end
+        self.board.summary(&mut said);
+        // alloc: once, at the end
+        let mut summary: Vec<Line<'static>> = said.lines().map(|it| Line::from(it.to_owned())).collect();
+        if let Some(view) = &self.view {
+            summary.extend(view.summary(width));
+        }
         if self.broken {
             plain(&lines);
             plain(&summary);

@@ -88,8 +88,10 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Lock`]. 40: [`Status::uptime_ms`], for `blaze status --json`. 41:
 /// [`Response::Doing`] (what a build waits on and what each unit under way does, about once a
 /// second), [`Status::builds`] and [`Status::downloads`]. 42: [`Doing::now`] and
-/// [`Building::now`], the build's live model (`blaze_protocol::now::Now`).
-pub const SCHEMA: u32 = 42;
+/// [`Building::now`], the build's live model (`blaze_protocol::now::Now`). 43: `Now` gains
+/// its running tasks, longest first (`running`), the tasks settled in the last 30 s
+/// (`recent`), the failed tasks (`failures`) and the proc-macro expansion lane (`expanding`).
+pub const SCHEMA: u32 = 43;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.

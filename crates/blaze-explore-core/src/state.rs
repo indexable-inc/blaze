@@ -147,8 +147,6 @@ pub struct Session {
     pub(crate) threads: BTreeMap<ThreadKey, Thread>,
     /// The live tasks and their fold.
     pub(crate) tasks: Tasks,
-    /// Spans closed since the last [`Session::look`]: progress, to the fold.
-    closed: u64,
     /// Closed spans, newest last.
     pub(crate) recent: VecDeque<SpanRow>,
     pub(crate) counters_now: BTreeMap<(u64, String), CounterRow>,
@@ -223,7 +221,6 @@ impl Session {
             edge_rows: Vec::new(),
             threads: BTreeMap::new(),
             tasks: Tasks::default(),
-            closed: 0,
             recent: VecDeque::new(),
             counters_now: BTreeMap::new(),
             at_ns: None,
@@ -522,7 +519,6 @@ impl Session {
             let end = row.start_ns.saturating_add(row.dur_ns);
             self.last_close_ns = Some(self.last_close_ns.map_or(end, |it| it.max(end)));
             let key = ThreadKey { process: row.process, thread: row.thread };
-            self.closed = self.closed.saturating_add(1);
             if let Some(thread) = self.threads.get_mut(&key) {
                 thread.closed += 1;
                 thread.seen_ns = thread.seen_ns.max(at_ns);
@@ -665,8 +661,7 @@ impl Session {
             .map(|(_, row)| row.value.max(0.0) as u64)
             .fold(0u64, u64::saturating_add);
         let memory = Memory { held, ..Memory::default() };
-        let closed = std::mem::take(&mut self.closed);
-        Ok(self.tasks.look(now, workers, &threads, closed, &memory))
+        Ok(self.tasks.look(now, workers, &threads, &memory))
     }
 
     /// What is running at `now_ns`, the page's reading of the daemon's clock (hello's `clock`):

@@ -6,11 +6,13 @@
 //! boxed, and the compiler's own lines), and [`TestView::summary`] last, so what stays in the
 //! scrollback is the failures and the summary, never the live region.
 //!
-//! The region, at most a dozen lines:
+//! Under the build's board ([`TestView::under_board`], how `blaze test` draws it) the header,
+//! the build row and the held row go, the board says them, and the gauge waits for a total.
+//! Alone, the region, at most a dozen lines:
 //!
 //! ```text
 //!  ⠹ blaze test  compiling and testing                                         12.4s
-//!  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────  ✔ 405  ✘ 2  ⊘ 5  412/730+  ~6s left
+//!  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───  ✔ 405 passed  ✘ 2 failed  ⊘ 5 ignored  412 of 730+ tests run  ~6s left
 //!  build  ▰▰▰▰▰▰▰▱▱▱  38/52  hir-ty lib 9.1s · blaze-cargo lib test 4.2s
 //!  bins   ✔ 4  ◷ 2  ⋯ 3   blaze-cargo lib · hir-ty lib
 //!  ⠹ hir_ty::tests::traits::big_one                          hir-ty lib    4.21s
@@ -266,6 +268,9 @@ pub struct TestView {
     unbuilt: Vec<(String, String, String)>,
     /// What the build is doing, as it last said; `None` before it said and once it ended.
     doing: Option<Doing>,
+    /// Drawn under the build's board ([`crate::board::Board`]), which says the header, the
+    /// build's progress and what holds it: the region is then only the tests' own rows.
+    under_board: bool,
     /// Lines made to print above the region and not yet taken, each a block of styled lines
     /// to wrap to the width it is taken at.
     above: Vec<Above>,
@@ -303,8 +308,16 @@ impl TestView {
             stopping: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
             doing: None,
+            under_board: false,
             above: Vec::new(),   // alloc: drained at every draw
         }
+    }
+
+    /// The view drawn under the build's board: no header, build row or held row of its own,
+    /// which the board says, and no gauge before a test has a total.
+    pub fn under_board(mut self) -> TestView {
+        self.under_board = true;
+        self
     }
 
     /// Time passes with nothing said: the spinners and times move.
@@ -518,11 +531,17 @@ impl TestView {
         }
         let width = area.width as usize;
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(area.height as usize); // alloc: one a draw
-        rows.push(self.header(width));
-        rows.push(self.gauge(width));
-        rows.push(self.build_row(width));
-        if let Some(row) = self.held_row() {
-            rows.push(row);
+        if !self.under_board {
+            rows.push(self.header(width));
+        }
+        if !self.under_board || self.total().0 > 0 {
+            rows.push(self.gauge(width));
+        }
+        if !self.under_board {
+            rows.push(self.build_row(width));
+            if let Some(row) = self.held_row() {
+                rows.push(row);
+            }
         }
         if !self.binaries.is_empty() || self.build != Build::Running {
             rows.push(self.binaries_row(width));
@@ -591,21 +610,22 @@ impl TestView {
         let (total, more) = self.total();
         let mut counts = vec![
             Span::raw("  "),
-            Span::styled(format!("✔ {}", self.passed), self.style(Color::Green)), // alloc: a row
+            Span::styled(format!("✔ {} passed", self.passed), self.style(Color::Green)), // alloc: a row
         ];
         if self.failed > 0 {
             counts.push(Span::raw("  "));
             counts.push(Span::styled(
-                format!("✘ {}", self.failed),
+                format!("✘ {} failed", self.failed),
                 self.style(Color::Red).add_modifier(Modifier::BOLD),
             )); // alloc: a row
         }
         if self.ignored > 0 {
             counts.push(Span::raw("  "));
-            counts.push(Span::styled(format!("⊘ {}", self.ignored), self.style(Color::Yellow))); // alloc: a row
+            counts.push(Span::styled(format!("⊘ {} ignored", self.ignored), self.style(Color::Yellow))); // alloc: a row
         }
+        // `+`: more executables are still to say how many tests they hold.
         let plus = if more { "+" } else { "" };
-        counts.push(Span::styled(format!("  {}/{total}{plus}", self.done()), self.dim())); // alloc: a row
+        counts.push(Span::styled(format!("  {} of {total}{plus} tests run", self.done()), self.dim())); // alloc: a row
         if let Some(eta) = self.eta() {
             counts.push(Span::styled(format!("  ~{} left", duration(eta)), self.dim())); // alloc: a row
         }

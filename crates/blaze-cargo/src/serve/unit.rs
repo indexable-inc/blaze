@@ -45,7 +45,7 @@ mod pack;
 mod perf;
 mod reach;
 mod reads;
-mod release;
+pub(super) mod release;
 mod run;
 mod say;
 mod script;
