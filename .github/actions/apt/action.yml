@@ -21,9 +21,13 @@ runs:
     - shell: bash
       run: |
         mkdir -p ~/apt-archives/partial
+        # The ix runner image's sources are snapshot.ubuntu.com, which answers 500, 502 and 503
+        # in bursts (the x86-64 cross job's packages, 2026-11-05): apt retries each fetch, with
+        # its own backoff, rather than failing the job on the first.
+        retries="-o Acquire::Retries=5"
         # The ix runner image ships no package lists, which a hosted image has.
-        if [ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages' -print -quit)" ]; then sudo apt-get update -qq; fi
-        sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true ${{ inputs.packages }}
+        if [ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages' -print -quit)" ]; then sudo apt-get update -qq $retries; fi
+        sudo apt-get install -y $retries -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true ${{ inputs.packages }}
         sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
     - if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v6
