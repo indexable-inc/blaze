@@ -296,6 +296,7 @@ pub(crate) fn make(
                 display_name: Some(CrateDisplayName::from_canonical_name(CONST_AST_NAME)),
                 potential_cfg_options: None,
                 built_for: crates::built_for(unit.built_for()),
+                build_script_runs: Box::new([]),
             };
             let mut cfg = CfgOptions::default();
             for it in target::target_cfg(cx.triple, &CfgArgs::default())
@@ -357,6 +358,7 @@ pub(crate) fn make(
         display_name: Some(CrateDisplayName::from_canonical_name(stem)),
         potential_cfg_options: None,
         built_for: crates::built_for(unit.built_for()),
+        build_script_runs: crates::build_script_runs(units, unit, |at| cx.lowerings[at].class),
     };
     let env: Env = plan_of.env.iter().cloned().collect();
     let krate = Crate::create(db, data, extra, cx.workspace, cfg, env, cx.durability);

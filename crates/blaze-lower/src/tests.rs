@@ -527,6 +527,71 @@ fn units_apart_in_their_runs_opt_level_are_two_crates_each_of_its_own_run() {
     blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
 }
 
+/// Two runs of `a`'s build script for one platform and features that are two run classes but
+/// carry no [`crates::RUN_PROFILE`] atom: they differ in a variable other than `OUT_DIR`,
+/// `OPT_LEVEL` and `DEBUG`, so each is its own run family. Their readers are alike in all their
+/// key covers but the runs they read (their `OUT_DIR`s are machine paths, which keys leave out),
+/// so each crate carries its runs' classes' portable unit identities, and those keep the keys
+/// apart (#1610).
+#[test]
+fn readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities() {
+    const OUT_OTHER: &str = "/w/target/release/build/a-override/out";
+    let mut units = units();
+    units.plans[RUN].unit_id = "release-run".to_owned(); // alloc: test input
+    units.plans[RUN].env = vec![("PROFILE".to_owned(), "release".to_owned())]; // alloc: test input
+    let run = units.graph.units.len();
+    units.graph.units.push(units.graph.units[RUN].clone()); // clone: the other run of the script
+    let mut run_plan = units.plans[RUN].clone(); // clone: the run has its own output directory
+    run_plan.unit_id = "build-override-run".to_owned(); // alloc: stable run identity under test
+    run_plan.env = vec![("PROFILE".to_owned(), "debug".to_owned())]; // alloc: test input
+    run_plan.out_dir = Some(OUT_OTHER.to_owned()); // alloc: test input
+    units.plans.push(run_plan);
+
+    let lib = units.graph.units.len();
+    let mut other_lib = units.graph.units[LIB].clone(); // clone: a library reading the other run
+    other_lib.profile.opt_level = "0".to_owned(); // alloc: test profile
+    other_lib.dependencies.iter_mut().find(|dep| dep.index == RUN).unwrap().index = run;
+    units.graph.units.push(other_lib);
+    let mut lib_plan = units.plans[LIB].clone(); // clone: the second crate reads the second run
+    for (name, value) in &mut lib_plan.env {
+        if name == "OUT_DIR" {
+            *value = OUT_OTHER.to_owned(); // alloc: test input
+        }
+    }
+    units.plans.push(lib_plan);
+    units.graph.roots.push(lib);
+    let mut built = lowered(&units).unwrap();
+    let first = krate(&built, LIB);
+    let second = krate(&built, lib);
+    let db = built.lowered.db();
+    assert_ne!(first, second);
+    assert!(!has_run_profile(db, first) && !has_run_profile(db, second), "two run families");
+    assert_ne!(blaze_items::key::crate_key(db, first), blaze_items::key::crate_key(db, second));
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+    assert_eq!(&*first.extra_data(db).build_script_runs, ["release-run"]);
+    assert_eq!(&*second.extra_data(db).build_script_runs, ["build-override-run"]);
+
+    // Taking away the run identity brings back the clash and its diagnostic names the runs.
+    let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
+    same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
+    second.set_extra_data(built.lowered.served_db(), same);
+    let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
+    assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
+}
+
+/// Twin runs of one run class are read by one crate, which names the class's run alone.
+#[test]
+fn readers_of_one_run_class_name_the_class_run() {
+    let mut units = units();
+    units.plans[RUN].unit_id = "class-run".to_owned(); // alloc: test input
+    let (run, lib, _) = twins(&mut units, "/w/target/release/build/a-2/out", &[]);
+    units.plans[run].unit_id = "twin-run".to_owned(); // alloc: test input
+    let built = lowered(&units).unwrap();
+    let db = built.lowered.db();
+    assert_eq!(krate(&built, lib), krate(&built, LIB));
+    assert_eq!(&*krate(&built, LIB).extra_data(db).build_script_runs, ["class-run"]);
+}
+
 #[test]
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();
