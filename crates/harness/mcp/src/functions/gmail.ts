@@ -5,11 +5,19 @@
 //   bv  "bulk view": a search; the request is the query plus paging, the reply the matching threads with a
 //       summary of their messages.
 //   fd  "fetch details": whole threads, every message with headers, its HTML body and attachment parts.
+//   s   "sync": every change. A request is a list of thread operations [opNum, [threadId, fields]]; the fields used:
+//       3  create a thread: [[subject, null, ts, threadId, [message]]] (a new draft)
+//       7  change labels: [add, remove, messageIds] (archive = remove ^i, trash = add ^k, read = remove ^u)
+//       10 discard draft messages: [messageIds]
+//       14 save a message: [message, null, 1]; with the draft labels (^r, ^r_bt) it is a draft, with the outgoing set
+//          (^pfg, ^f_bt, ^f_btns, ^f_cl, ^a) Gmail sends it. Ids are the client's own: thread-a:r<int64>, msg-a:r<int64>.
+//       The reply lists [opNum, status] per operation; status 0 is applied.
 // Those requests need headers the client computes (an XSRF token, a client-info blob, a storage flag). We don't
 // rebuild them: a script installed before the page loads records the X-* headers Gmail's own XHRs send to /sync/,
 // and our requests reuse them from inside the page. The values stay in the page; nothing here reads, logs or returns
 // them. Label names come from the boot data the page hands to `_GM_setData` (key hqyl8), recorded the same way.
-// Attachments download from the legacy `/mail/u/<n>/?view=att` URL the fd reply names.
+// Attachments download from the legacy `/mail/u/<n>/?view=att` URL the fd reply names, and upload to /_/upload (a
+// resumable upload whose reply is a blob token the message names).
 //
 // The array positions below were read off live traffic (2026-11-05); when Gmail moves them, the error names the
 // endpoint and what was missing.
@@ -18,6 +26,7 @@ import { join } from "node:path";
 import { browser, type Page } from "../cdp.ts";
 import { table, type Table } from "../table.ts";
 import { effect, oneLine } from "../effects.ts";
+import { canConfirm, confirm } from "../host.ts";
 
 const ACCOUNT = 0;
 const ORIGIN = "https://mail.google.com";
@@ -168,7 +177,7 @@ async function openPage(): Promise<Page> {
 
 let counter = 0;
 /** POST a JSON body to /sync/u/0/i/<op> from inside the Gmail page, with the headers Gmail's own client sent. */
-async function sync(op: "bv" | "fd", body: unknown, retried = false): Promise<unknown[]> {
+async function sync(op: "bv" | "fd" | "s", body: unknown, retried = false): Promise<unknown[]> {
   const p = await gmailPage();
   const url = `${SYNC}/${op}?hl=en&c=${++counter}&rt=r&pt=ji`;
   const r = await p.evaluate(async ({ url, body }) => {
@@ -336,7 +345,7 @@ export function bodyText(html: string): { text: string; quotedRemoved: boolean }
               links.pop();
               if (skip || cut) return;
               const label = decode(out.slice(mark).join("")).trim();
-              if (/^https?:/i.test(href) && href.length <= 300 && label && label !== href) out.push(` <${decode(href)}>`);
+              if (/^https?:/i.test(href) && href.length <= 120 && label && label !== href) out.push(` <${decode(href)}>`);
             });
           }
         },
@@ -518,4 +527,409 @@ function attachment(threadId: string, msgId: string, partId: string, opts: { dir
   }, (f) => ({ detail: f }));
 }
 
-export const gmail = { search, messages, read, labels, attachment };
+// ---------------------------------------------------------------- writing
+
+/** One address ("a@b" or "Name <a@b>") or several (an array, or comma separated). */
+type Addrs = string | string[];
+
+/** A message to send or keep as a draft. */
+export type GmailOutgoing = {
+  to: Addrs;
+  cc?: Addrs;
+  bcc?: Addrs;
+  subject: string;
+  /** Plain text; it becomes the HTML body (escaped, line breaks kept) unless `html` is given. */
+  body?: string;
+  html?: string;
+  /** Paths of files to attach (25 MB in all at most, Gmail's limit). */
+  attachments?: string[];
+  /** Reply in this message's thread: a message (a row from gmail.messages(), or read(...).messages[i]). */
+  replyTo?: MessageRef;
+};
+
+/** A draft gmail.draft saved: send it with gmail.send(draft), discard it with gmail.deleteDraft(draft). */
+export type GmailDraft = { id: string; threadId: string; subject: string; to: string[]; cc: string[]; bcc: string[]; attachments: string[] };
+
+/** A message: its row ({ id, threadId }), or a bare "msg-f:…" id (found when it starts its thread). */
+type MessageRef = string | { id: string; threadId?: string };
+/** What label changes act on: a thread id or row (every message in it), or a message row (that one). */
+type Target = string | { id: string; threadId?: string };
+
+// The labels Gmail's client gives a draft, and the set that makes a save a send (from its own label builder:
+// ^pfg "pending send", ^f_bt/^f_btns/^f_cl sent bookkeeping, ^a; the draft labels removed).
+const DRAFT_LABELS = ["^all", "^r", "^r_bt"];
+const SEND_LABELS = ["^all", "^pfg", "^f_bt", "^f_btns", "^f_cl", "^a"];
+const MAX_ATTACH = 25 * 1024 * 1024;
+
+const rand64 = () => BigInt.asIntN(64, crypto.getRandomValues(new BigUint64Array(1))[0]!).toString();
+const hex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+const addrList = (v: Addrs | undefined): string[] =>
+  (v === undefined ? [] : Array.isArray(v) ? v : [v]).flatMap((x) => x.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/)).map((x) => x.trim()).filter(Boolean);
+
+/** "Name <a@b>" or "a@b" as Gmail's address entry [1, email, name?]. */
+function addrEntry(s: string): A {
+  const m = /^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/.exec(s);
+  const email = (m ? m[2] : s).trim();
+  const name = m?.[1]?.trim();
+  if (!/^[^\s@<>,"]+@[^\s@<>,"]+\.[^\s@<>,"]+$/.test(email)) throw new GmailError(`gmail: ${JSON.stringify(s)} is not an email address`);
+  return name ? [1, email, name] : [1, email];
+}
+
+const escapeHtml = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const textHtml = (t: string) => `<div dir="ltr">${escapeHtml(t).replace(/\r?\n/g, "<br>")}</div>`;
+
+type Me = { email: string; name: string };
+let meCache: Me | undefined;
+/** The signed-in account: its address (GLOBALS[10]) and display name (the account button's label). */
+async function me(): Promise<Me> {
+  if (meCache) return meCache;
+  const p = await gmailPage();
+  const r = await p.evaluate(() => {
+    const email = (window as unknown as { GLOBALS?: unknown[] }).GLOBALS?.[10];
+    return { email: typeof email === "string" ? email : "", label: document.querySelector("a[aria-label^='Google Account:']")?.getAttribute("aria-label") ?? "" };
+  });
+  if (!r.email) throw new GmailError("Gmail's page has no account address at GLOBALS[10]; the web client changed");
+  return (meCache = { email: r.email, name: /^Google Account:\s*(.*?)\s*\(/.exec(r.label)?.[1] ?? "" });
+}
+
+/** A message as the web client's own draft saves lay it out (78 slots; the positions used are the ones it fills). */
+export function messageArray(o: { id: string; from: Me; to: A[]; cc: A[]; bcc: A[]; subject: string; html: string; labels: string[]; attachments: A[]; session: string; ts: number }): A {
+  const m: A = Array(78).fill(null);
+  m[0] = o.id;
+  m[1] = [1, o.from.email, o.from.name || null, null, null, null, null, null, null, o.from.email];
+  m[2] = o.to;
+  m[3] = o.cc.length ? o.cc : null;
+  m[4] = o.bcc.length ? o.bcc : null;
+  m[6] = o.ts;
+  m[7] = o.subject;
+  m[8] = [null, [[0, o.html]], null, null, null, null, 1];
+  m[10] = o.labels;
+  m[11] = o.attachments.length ? o.attachments : null;
+  m[17] = o.ts;
+  m[41] = 0;
+  m[42] = [0, 0, 0, null, 0];
+  const s = `s:${o.session}|#${o.id}|0`; // the compose session the message belongs to
+  m[51] = s;
+  m[76] = [null, null, null, null, null, null, s];
+  m[77] = [];
+  return m;
+}
+
+type Op = { thread: string; field: number; payload: unknown };
+/** A /i/s request: each operation is field `field` (1-based) of a thread's change. */
+export function syncRequest(ops: Op[], now = Date.now()): unknown {
+  return [null, [ops.map((o, i) => {
+    const f: A = Array(o.field).fill(null);
+    f[o.field - 1] = o.payload;
+    return [i + 1, [o.thread, f]];
+  })], [1, null, null, null, [null, 0], null, 1], [null, 1, now, 0, 1], 2];
+}
+
+/** Apply thread operations; every one must come back with status 0. */
+async function mutate(what: string, ops: Op[]): Promise<void> {
+  const r = await sync("s", syncRequest(ops));
+  const results = arr(arr(r[0])[0]).map(arr);
+  ops.forEach((o, i) => {
+    const res = results.find((x) => x[0] === i + 1);
+    if (!res) throw new GmailError(`Gmail endpoint POST ${SYNC}/s: no result for ${what} on ${o.thread} (operation ${i + 1}); the reply format changed`);
+    if (res[1] !== 0) throw new GmailError(`Gmail endpoint POST ${SYNC}/s refused ${what} on ${o.thread}: status ${JSON.stringify(res[1])}`);
+  });
+}
+
+/** Protobuf for an upload's start request: 1 message id, 3 0, 4 0, 7 and 8 the account, 11 0. */
+function uploadStartBody(msgId: string, email: string): string {
+  const out: number[] = [];
+  const varint = (n: number) => { while (n > 0x7f) { out.push((n & 0x7f) | 0x80); n >>>= 7; } out.push(n); };
+  const string = (field: number, s: string) => { const b = new TextEncoder().encode(s); varint((field << 3) | 2); varint(b.length); out.push(...b); };
+  const zero = (field: number) => { varint(field << 3); varint(0); };
+  string(1, msgId); zero(3); zero(4); string(7, email); string(8, email); zero(11);
+  return Buffer.from(out).toString("base64");
+}
+
+type Upload = { path: string; name: string; mime: string; bytes: Uint8Array };
+async function readAttachments(paths: string[]): Promise<Upload[]> {
+  const out: Upload[] = [];
+  for (const path of paths) {
+    const f = Bun.file(path);
+    if (!(await f.exists())) throw new GmailError(`gmail: attachment ${path} does not exist`);
+    out.push({ path, name: path.split("/").pop() || path, mime: f.type.split(";")[0] || "application/octet-stream", bytes: new Uint8Array(await f.arrayBuffer()) });
+  }
+  const total = out.reduce((n, u) => n + u.bytes.length, 0);
+  if (total > MAX_ATTACH) throw new GmailError(`gmail: attachments total ${(total / 1048576).toFixed(1)} MB; Gmail takes at most 25 MB (${out.map((u) => u.name).join(", ")})`);
+  return out;
+}
+
+/** Upload one file for message `msgId` (Gmail's resumable /_/upload) and return its attachment entry. */
+async function upload(u: Upload, msgId: string, my: Me): Promise<A> {
+  const p = await gmailPage();
+  const r = await p.evaluate(async ({ start, name, mime, b64 }) => {
+    const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const s = await fetch("/_/upload?authuser=0&dcp=asu-n", {
+      method: "POST", credentials: "include", body: start,
+      headers: { "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-File-Name": name,
+        "X-Goog-Upload-Header-Content-Type": mime, "X-Goog-Upload-Header-Content-Length": String(bin.length), "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    });
+    const url = s.headers.get("x-goog-upload-url");
+    if (s.status !== 200 || !url) return { step: "start", status: s.status, token: "" };
+    const f = await fetch(url, { method: "POST", credentials: "include", body: bin, headers: { "X-Goog-Upload-Command": "upload, finalize", "X-Goog-Upload-Offset": "0", "X-Goog-Upload-File-Name": name, "Content-Type": mime } });
+    return { step: "upload", status: f.status, token: f.status === 200 ? (await f.text()).trim() : "" };
+  }, { start: uploadStartBody(msgId, my.email), name: /^[\x20-\x7e]*$/.test(u.name) ? u.name : encodeURIComponent(u.name), mime: u.mime, b64: Buffer.from(u.bytes).toString("base64") });
+  if (!r.token) throw new GmailError(`Gmail endpoint POST /_/upload (${r.step}) returned HTTP ${r.status} for attachment ${u.path}${r.status === 200 ? " without an upload URL or token; the upload scheme changed" : ""}`);
+  return [u.mime, u.name, u.bytes.length, null, `f_${Math.random().toString(36).slice(2, 10)}`, null, 0, [], null, r.token];
+}
+
+/** A message with what a reply or forward needs: its thread, its decoded fields and its HTML body. */
+async function original(ref: MessageRef, what: string): Promise<{ thread: GmailThreadDetail; message: GmailMessage; html: string }> {
+  const id = typeof ref === "string" ? ref : ref.id;
+  const threadId = typeof ref === "string" ? undefined : ref.threadId;
+  if (!id.startsWith("msg-")) throw new GmailError(`gmail.${what}: ${JSON.stringify(id)} is not a message id ("msg-f:…"); pass a row from gmail.messages() or read(...).messages`);
+  // A thread is named after its first message, so a bare id finds its thread only when it is the first one.
+  const tid = threadId ?? id.replace(/^msg-/, "thread-");
+  const raw = await sync("fd", [[[tid, 1, null, null, 1]], 2]);
+  const t = arr(raw[1]).map(arr).find((x) => x[0] === tid);
+  const m = arr(t?.[2]).map(arr).find((x) => x[0] === id);
+  if (!t || !m) throw new GmailError(`gmail.${what}: ${id} is not in thread ${tid}${threadId ? "" : "; pass the message's row (with threadId) from gmail.messages() or read(...).messages"}`);
+  const thread = await decodeThread(t, await userLabels());
+  const html = arr(arr(arr(m[1])[5])[1]).map((part) => str(arr(arr(part)[2])[1])).join("\n");
+  return { thread, message: thread.messages.find((x) => x.id === id)!, html };
+}
+
+const emailOf = (s: string) => (/<([^>]+)>\s*$/.exec(s)?.[1] ?? s).trim().toLowerCase();
+const when = (d: Date) => d.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+const quoteBlock = (m: GmailMessage, html: string) =>
+  `<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">On ${escapeHtml(when(m.date))}, ${escapeHtml(m.from)} &lt;${escapeHtml(m.fromEmail)}&gt; wrote:<br></div>` +
+  `<blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">${html || textHtml(m.text)}</blockquote></div>`;
+
+/** Everything a save or send needs, checked before anything is written. */
+type Prepared = {
+  thread: string; id: string; newThread: boolean; from: Me;
+  to: string[]; cc: string[]; bcc: string[]; subject: string; html: string; preview: string;
+  uploads: Upload[]; inReplyTo?: GmailMessage; attached: A[];
+};
+
+async function prepare(o: GmailOutgoing, what: string): Promise<Prepared> {
+  const to = addrList(o.to), cc = addrList(o.cc), bcc = addrList(o.bcc);
+  if (!to.length && !cc.length && !bcc.length) throw new GmailError(`gmail.${what}: no recipients (to, cc and bcc are all empty)`);
+  [...to, ...cc, ...bcc].forEach(addrEntry);
+  if (typeof o.subject !== "string") throw new GmailError(`gmail.${what}: subject must be a string`);
+  if (o.body === undefined && o.html === undefined) throw new GmailError(`gmail.${what}: give a body (plain text) or html`);
+  const [from, uploads] = await Promise.all([me(), readAttachments(o.attachments ?? [])]);
+  let html = o.html ?? textHtml(o.body ?? "");
+  let thread = `thread-a:r${rand64()}`, newThread = true, inReplyTo: GmailMessage | undefined;
+  if (o.replyTo !== undefined) {
+    const orig = await original(o.replyTo, what);
+    inReplyTo = orig.message;
+    thread = orig.thread.id;
+    newThread = false;
+    html += quoteBlock(orig.message, orig.html);
+  }
+  const preview = o.body ?? bodyText(o.html ?? "").text;
+  return { thread, id: `msg-a:r${rand64()}`, newThread, from, to, cc, bcc, subject: o.subject, html, preview, uploads, inReplyTo, attached: [] };
+}
+
+function message(p: Prepared, labels: string[]): A {
+  return messageArray({ id: p.id, from: p.from, to: p.to.map(addrEntry), cc: p.cc.map(addrEntry), bcc: p.bcc.map(addrEntry), subject: p.subject, html: p.html, labels, attachments: p.attached, session: hex(8), ts: Date.now() });
+}
+
+/** Upload the attachments and save `p` as a draft (a new thread, or a new message in the replied-to thread). */
+async function saveDraft(p: Prepared): Promise<void> {
+  if (p.uploads.length && !p.attached.length) p.attached = await Promise.all(p.uploads.map((u) => upload(u, p.id, p.from)));
+  const m = message(p, DRAFT_LABELS);
+  await mutate("saving a draft", [p.newThread
+    ? { thread: p.thread, field: 3, payload: [[p.subject, null, m[6], p.thread, [m]]] }
+    : { thread: p.thread, field: 14, payload: [m, null, 1] }]);
+  p.newThread = false;
+}
+
+// Drafts this process saved, so send(draft) can send them as they are and deleteDraft needs no confirmation.
+const ours = new Map<string, Prepared>();
+
+const draftOf = (p: Prepared): GmailDraft => ({ id: p.id, threadId: p.thread, subject: p.subject, to: p.to, cc: p.cc, bcc: p.bcc, attachments: p.uploads.map((u) => u.name) });
+
+/** Ask the person; refuse unless they accept. Nothing has been written when this throws. */
+async function approve(what: string, text: string, nothing: string): Promise<void> {
+  if (!canConfirm())
+    throw new GmailError(`gmail.${what} refused: it needs the person's OK and this session has no way to ask (the MCP client offers no confirmation prompt); ${nothing}`);
+  if (!(await confirm(text))) throw new GmailError(`gmail.${what}: the person declined; ${nothing}`);
+}
+
+function sendPrompt(p: Prepared): string {
+  const lines = [`Send this email from ${p.from.email}?`, `To: ${p.to.join(", ") || "(none)"}`];
+  if (p.cc.length) lines.push(`Cc: ${p.cc.join(", ")}`);
+  if (p.bcc.length) lines.push(`Bcc: ${p.bcc.join(", ")}`);
+  lines.push(`Subject: ${p.subject || "(no subject)"}`);
+  if (p.inReplyTo) lines.push(`In reply to: ${p.inReplyTo.from} · ${oneLine(p.inReplyTo.subject, 60)}`);
+  if (p.uploads.length) lines.push(`Attachments: ${p.uploads.map((u) => `${u.name} (${Math.max(1, Math.round(u.bytes.length / 1024))} KB)`).join(", ")}`);
+  const body = p.preview.trim();
+  lines.push("", body.length > 600 ? `${body.slice(0, 600)}…` : body || "(empty body)");
+  return lines.join("\n");
+}
+
+/** Send: confirm with the person, then save and send. */
+async function sendPrepared(p: Prepared, what: string): Promise<GmailDraft & { sent: true }> {
+  await approve(what, sendPrompt(p), "nothing was sent");
+  if (p.newThread) await saveDraft(p);
+  else if (p.uploads.length && !p.attached.length) p.attached = await Promise.all(p.uploads.map((u) => upload(u, p.id, p.from)));
+  try {
+    await mutate("sending", [{ thread: p.thread, field: 14, payload: [message(p, SEND_LABELS), null, 1] }]);
+  } catch (e) {
+    throw new GmailError(`${(e as Error).message}; the message stays as draft ${p.id} in ${p.thread}`);
+  }
+  ours.delete(p.id);
+  return { ...draftOf(p), sent: true };
+}
+
+const sendTarget = (p: Prepared) => `${p.to.concat(p.cc, p.bcc).join(", ")} · ${p.subject}`;
+
+/** Send an email, or a draft gmail.draft saved. Always asks the person first (recipients, subject, body preview)
+ *  and refuses when they decline or can't be asked. With replyTo it goes into that message's thread. */
+function send(o: GmailOutgoing | GmailDraft): Promise<GmailDraft & { sent: true }> {
+  return effect("net", "Sending an email", "Sent an email", "id" in o && "threadId" in o ? o.id : addrList((o as GmailOutgoing).to).join(", "), async () => {
+    if ("id" in o && "threadId" in o) {
+      const p = ours.get(o.id);
+      if (!p) throw new GmailError(`gmail.send: draft ${o.id} was not saved by gmail.draft in this session, so its full content isn't known here; open it in Gmail to send it, or send a new one with gmail.send({ to, subject, body })`);
+      return sendPrepared(p, "send");
+    }
+    return sendPrepared(await prepare(o, "send"), "send");
+  }, (r) => ({ detail: `${r.to.concat(r.cc, r.bcc).join(", ")} · ${oneLine(r.subject, 50)}` }));
+}
+
+/** Save a draft (no confirmation; nothing leaves the account). Review it in Gmail, then gmail.send(draft) or deleteDraft. */
+function draft(o: GmailOutgoing): Promise<GmailDraft> {
+  return effect("write", "Saving a Gmail draft", "Saved a Gmail draft", addrList(o.to).join(", "), async () => {
+    const p = await prepare(o, "draft");
+    await saveDraft(p);
+    ours.set(p.id, p);
+    return draftOf(p);
+  }, (d) => ({ detail: `${d.subject} → ${d.to.join(", ")}` }));
+}
+
+/** Discard a draft: one gmail.draft saved (no confirmation), or any other (asks the person). */
+function deleteDraft(d: GmailDraft | { id: string; threadId: string }): Promise<void> {
+  return effect("delete", "Discarding a Gmail draft", "Discarded a Gmail draft", d.id, async () => {
+    if (!ours.has(d.id)) {
+      const [t] = await fetchThreads([d.threadId]);
+      const s = arr(arr(t[1])[1]).map(arr).find((x) => x[0] === d.id);
+      if (!s) throw new GmailError(`gmail.deleteDraft: ${d.id} is not in ${d.threadId}`);
+      if (!arr(s[3]).includes("^r")) throw new GmailError(`gmail.deleteDraft: ${d.id} is not a draft; it refuses to discard a sent or received message`);
+      await approve("deleteDraft", `Discard the Gmail draft "${str(arr(arr(t[1])[0])[1]) || d.id}"?`, "the draft was kept");
+    }
+    await mutate("discarding a draft", [{ thread: d.threadId, field: 10, payload: [d.id] }]);
+    ours.delete(d.id);
+  });
+}
+
+/** Reply to a message (in its thread, quoting it). To the sender, or with { all: true } also everyone it went to.
+ *  Asks the person first, like send. */
+function reply(to: MessageRef, body: string, opts: { all?: boolean; html?: string; attachments?: string[]; cc?: Addrs; bcc?: Addrs } = {}): Promise<GmailDraft & { sent: true }> {
+  return effect("net", "Replying to an email", "Replied to an email", typeof to === "string" ? to : to.id, async () => {
+    const my = await me();
+    const { message: m } = await original(to, "reply");
+    const self = my.email.toLowerCase();
+    const fromMe = m.fromEmail.toLowerCase() === self;
+    const primary = fromMe ? m.to : [m.from && m.from !== m.fromEmail ? `${m.from} <${m.fromEmail}>` : m.fromEmail];
+    const seen = new Set<string>([self]);
+    const keep = (xs: string[]) => xs.filter((x) => { const e = emailOf(x); if (!e || seen.has(e)) return false; seen.add(e); return true; });
+    const toList = keep(primary);
+    const ccList = keep([...(opts.all ? [...(fromMe ? [] : m.to), ...m.cc] : []), ...addrList(opts.cc)]);
+    const p = await prepare({
+      to: toList.length ? toList : [my.email], cc: ccList, bcc: opts.bcc, subject: /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`,
+      body, html: opts.html, attachments: opts.attachments, replyTo: to,
+    }, "reply");
+    return sendPrepared(p, "reply");
+  }, (r) => ({ detail: `${r.to.concat(r.cc).join(", ")} · ${oneLine(r.subject, 50)}` }));
+}
+
+/** Forward a message (its body and attachments) with an optional note on top. Asks the person first, like send. */
+function forward(msg: MessageRef, to: Addrs, note = "", opts: { cc?: Addrs; bcc?: Addrs } = {}): Promise<GmailDraft & { sent: true }> {
+  return effect("net", "Forwarding an email", "Forwarded an email", typeof msg === "string" ? msg : msg.id, async () => {
+    const { thread, message: m, html } = await original(msg, "forward");
+    const files = await Promise.all(m.attachments.map((a) => attachment(thread.id, m.id, a.partId, { dir: join(HOME(), "gmail", "forward", m.id.replace(/[^\w.-]/g, "_")) })));
+    const head = [`---------- Forwarded message ---------`, `From: ${m.from} <${m.fromEmail}>`, `Date: ${when(m.date)}`, `Subject: ${m.subject}`, `To: ${m.to.join(", ")}`, ...(m.cc.length ? [`Cc: ${m.cc.join(", ")}`] : [])];
+    const p = await prepare({
+      to, cc: opts.cc, bcc: opts.bcc, subject: /^fwd?:/i.test(m.subject) ? m.subject : `Fwd: ${m.subject}`, attachments: files,
+      html: `${note ? textHtml(note) : ""}<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">${head.map(escapeHtml).join("<br>")}<br></div><br><br>${html || textHtml(m.text)}</div>`,
+    }, "forward");
+    p.preview = `${note}\n\n${head.join("\n")}\n\n${oneLine(m.text, 300)}`.trim();
+    return sendPrepared(p, "forward");
+  }, (r) => ({ detail: `${r.to.join(", ")} · ${oneLine(r.subject, 50)}` }));
+}
+
+// ---------------------------------------------------------------- label changes
+
+/** Threads and the messages in them that `targets` name, with each thread's subject for the confirmation. */
+async function resolveTargets(targets: Target | Target[], what: string): Promise<{ thread: string; subject: string; msgs: string[] }[]> {
+  const list = (Array.isArray(targets) ? targets : [targets]).map((t) => {
+    const id = typeof t === "string" ? t : t.id;
+    const thread = typeof t === "string" ? t : t.threadId ?? t.id;
+    if (!thread.startsWith("thread-")) throw new GmailError(`gmail.${what}(${JSON.stringify(id)}): needs a thread id or a row from gmail.search() / gmail.messages()`);
+    return { thread, msg: id.startsWith("msg-") ? id : undefined };
+  });
+  if (!list.length) throw new GmailError(`gmail.${what}: no threads or messages given`);
+  const raw = await fetchThreads([...new Set(list.map((t) => t.thread))]);
+  const out = new Map<string, { thread: string; subject: string; msgs: Set<string> }>();
+  for (const { thread, msg } of list) {
+    const t = raw.find((x) => x[0] === thread)!;
+    const ids = arr(arr(t[1])[1]).map((s) => str(arr(s)[0]));
+    if (msg && !ids.includes(msg)) throw new GmailError(`gmail.${what}: ${msg} is not in ${thread}`);
+    const e = out.get(thread) ?? { thread, subject: str(arr(arr(t[1])[0])[1]), msgs: new Set<string>() };
+    for (const id of msg ? [msg] : ids) e.msgs.add(id);
+    out.set(thread, e);
+  }
+  return [...out.values()].map((e) => ({ ...e, msgs: [...e.msgs] }));
+}
+
+/** A label name (Inbox, Starred, a user label) or id (^i, Label_12) to its id. */
+async function labelId(name: string): Promise<string> {
+  if (name.startsWith("^")) return name;
+  const sys = Object.entries(SYSTEM_LABELS).find(([, [n]]) => n.toLowerCase() === name.toLowerCase());
+  if (sys) return sys[0];
+  const users = await userLabels();
+  if (users.has(name)) return name;
+  const user = [...users].find(([, n]) => n.toLowerCase() === name.toLowerCase());
+  if (user) return user[0];
+  throw new GmailError(`gmail.label: no label named ${JSON.stringify(name)} (labels: ${[...users.values()].join(", ") || "none of the account's own"}; system: ${Object.values(SYSTEM_LABELS).map(([n]) => n).join(", ")})`);
+}
+
+async function relabel(what: string, verb: string, targets: Target | Target[], add: string[], remove: string[], ask: boolean): Promise<{ threads: number; messages: number }> {
+  const ts = await resolveTargets(targets, what);
+  const messagesN = ts.reduce((n, t) => n + t.msgs.length, 0);
+  if (ask) {
+    const shown = ts.slice(0, 8).map((t) => `- ${oneLine(t.subject || t.thread, 70)}${t.msgs.length > 1 ? ` (${t.msgs.length} messages)` : ""}`);
+    await approve(what, [`${verb} ${plural(ts.length, "Gmail thread")} (${plural(messagesN, "message")})?`, ...shown, ...(ts.length > 8 ? [`… and ${ts.length - 8} more`] : [])].join("\n"), "nothing was changed");
+  }
+  await mutate(what, ts.map((t) => ({ thread: t.thread, field: 7, payload: [add, remove, t.msgs] })));
+  return { threads: ts.length, messages: messagesN };
+}
+
+const change = (r: { threads: number; messages: number }) => ({ detail: `${plural(r.threads, "thread")}, ${plural(r.messages, "message")}` });
+const targetName = (t: Target | Target[]) => (Array.isArray(t) ? t : [t]).map((x) => (typeof x === "string" ? x : x.id)).join(" ");
+
+/** Archive (take out of the Inbox). Asks the person first. */
+function archive(targets: Target | Target[]) {
+  return effect("write", "Archiving Gmail threads", "Archived Gmail threads", targetName(targets), () => relabel("archive", "Archive", targets, [], ["^i"], true), change);
+}
+
+/** Move to Trash. Asks the person first. */
+function trash(targets: Target | Target[]) {
+  return effect("delete", "Trashing Gmail threads", "Trashed Gmail threads", targetName(targets), () => relabel("trash", "Move to Trash", targets, ["^k"], ["^i"], true), change);
+}
+
+/** Add and remove labels by name ("Starred", "Important", "Inbox", a user label) or id. Asks the person first. */
+function label(targets: Target | Target[], change_: { add?: string[]; remove?: string[] }) {
+  return effect("write", "Relabelling Gmail threads", "Relabelled Gmail threads", targetName(targets), async () => {
+    const [add, remove] = await Promise.all([Promise.all((change_.add ?? []).map(labelId)), Promise.all((change_.remove ?? []).map(labelId))]);
+    if (!add.length && !remove.length) throw new GmailError("gmail.label: nothing to change (give add or remove)");
+    const verb = [add.length ? `Add ${(change_.add ?? []).join(", ")}` : "", remove.length ? `${add.length ? "remove" : "Remove"} ${(change_.remove ?? []).join(", ")}` : ""].filter(Boolean).join(" and ");
+    return relabel("label", `${verb} on`, targets, add, remove, true);
+  }, change);
+}
+
+/** Mark read (or unread with read: false). No confirmation: it only changes the account's own read state. */
+function markRead(targets: Target | Target[], read = true) {
+  return effect("write", read ? "Marking Gmail read" : "Marking Gmail unread", read ? "Marked Gmail read" : "Marked Gmail unread", targetName(targets),
+    () => relabel("markRead", "", targets, read ? [] : ["^u"], read ? ["^u"] : [], false), change);
+}
+
+export const gmail = { search, messages, read, labels, attachment, send, draft, deleteDraft, reply, forward, archive, trash, label, markRead };
