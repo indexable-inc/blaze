@@ -57,6 +57,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
         // clone: on the error path, for an error hir found
         None => (base.clone(), written_name(node.value)),
     };
+    let display = name;
+    let name = name.strip_prefix("r#").unwrap_or(name);
     let source = PathSource::of(node.value, in_node.is_some(), name);
     let scope = cx.vsema.scope(syntax);
     let module = scope.as_ref().map(|it| it.module());
@@ -64,9 +66,36 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     let mut diag = if name == "self" {
         // clone: on the error path, for an error hir found
         self_value(cx, syntax, d.node.file_id, source, span.clone())
+    } else if let Some((descr, defined, real)) =
+        scope.as_ref().and_then(|it| as_type(cx, it, source, name))
+    {
+        // alloc: the error's text, for an error hir found
+        let message =
+            format!("expected {}, found {descr} `{display}` in this scope", source.expected());
+
+        let mut diag = Diag::error(Some("E0423"), message, span.clone()); // clone: on the error path, for an error hir found
+        if let Some(defined) = defined {
+            // alloc: the error's label, for an error hir found
+            let label = match real {
+                // The name is an alias (`use m::Real as Alias`): the span is `Real`'s.
+                Some(real) => format!("`{real}` (imported as `{display}`) defined here"),
+                None => format!("`{display}` defined here"),
+            };
+            diag.span_label(defined, label);
+        }
+        // rustc still suggests a similar value in scope (`suggest_typo`) ...
+        if let Some(scope) = scope.as_ref() {
+            typo(cx, &mut diag, Names::Scope(scope), source, name, &span, &[]);
+        }
+        // ... and the value of that name to import (`report_with_use_injections`).
+        if let Some(module) = module {
+            let found = imports(cx, module, source, name, None);
+            show_imports(cx, &mut diag, module, found, true);
+        }
+        diag
     } else {
         // alloc: the error's text, for an error hir found
-        let message = format!("cannot find {} `{name}` in this scope", source.expected());
+        let message = format!("cannot find {} `{display}` in this scope", source.expected());
         // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some(source.code()), message, span.clone());
         let suggested = scope.as_ref().is_some_and(|scope| {
@@ -89,6 +118,39 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     code_fact(cx, &mut diag, InFile::new(d.node.file_id, d.node.value.0.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Resolve)]
+}
+
+fn as_type<'db>(
+    cx: &Cx<'_, 'db>,
+    scope: &hir::SemanticsScope<'db>,
+    source: PathSource,
+    name: &str,
+) -> Option<(&'static str, Option<Span>, Option<String>)> {
+    if !matches!(source, PathSource::Value | PathSource::Callee(_)) {
+        return None;
+    }
+
+    let mut found = None;
+    scope.process_all_names(&mut |it, def| {
+        if found.is_some() || it.symbol().as_str() != name {
+            return;
+        }
+        if let Some(descr) = scope_descr(cx, Ns::Type, &def)
+            && !matches!(descr, "self type" | "macro" | "attribute macro" | "derive macro")
+        {
+            // The item's own name, when the scope reaches it under another (an alias).
+            // alloc: the error's text, for an error hir found
+            let real = match &def {
+                hir::ScopeDef::ModuleDef(it) => it
+                    .name(cx.db)
+                    .filter(|real| real.symbol().as_str() != name)
+                    .map(|real| real.display_no_db(cx.edition).to_string()),
+                _ => None,
+            };
+            found = Some((descr, scope_span(cx, Ns::Type, &def).0, real));
+        }
+    });
+    found
 }
 
 /// The name a path expression or pattern is written with.
@@ -444,6 +506,10 @@ pub(crate) fn typo<'db>(
         return false;
     };
     let (def, is_local) = scope_span(cx, ns, &def);
+    // The name as it is written in this edition (`r#match`), for every text shown or inserted;
+    // `found` stays the stored symbol, which the `_` check below compares.
+    // alloc: the error's text, for an error hir found
+    let shown = found.display_no_db(cx.edition).to_string();
     let found = found.symbol().as_str();
     if let Some(def) = &def
         && def.file == span.file
@@ -455,7 +521,7 @@ pub(crate) fn typo<'db>(
     let mut labelled = false;
     if !is_local && let Some(def) = &def {
         // alloc: the error's text, for an error hir found
-        diag.span_label(def.clone(), format!("similarly named {descr} `{found}` defined here"));
+        diag.span_label(def.clone(), format!("similarly named {descr} `{shown}` defined here"));
         labelled = true;
     }
     let snippet = cx.snippet(span);
@@ -480,7 +546,7 @@ pub(crate) fn typo<'db>(
                 span.clone(),
                 // alloc: the error's text, for an error hir found
                 format!("a {descr} with a similar name exists"),
-                found,
+                shown,
                 Applicability::MaybeIncorrect,
             );
         }
