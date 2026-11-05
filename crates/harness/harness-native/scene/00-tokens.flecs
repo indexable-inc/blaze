@@ -66,6 +66,25 @@ export const tree_glide_zeta = 1
 export const tree_reveal_margin = 8
 export const tree_fade_len = 22
 export const sidebar_zeta = 1
+// Dragging the sidebar's edge (den's feel, src/resize.rs): its width stays between side_min and side_max; dragged left
+// past half of side_min by side_latch more it latches closed (folding away on the sidebar spring), and dragged back
+// out past half of side_min by side_latch it latches open again, so it never flickers at the boundary. Past side_max
+// it stretches at most side_give, half of it side_soft points past, and the whole window rubber-bands right by that
+// much, springing back on the window_back spring when let go. Touching side_max pulses once, again only after a
+// side_rearm retreat. A press within side_grab of the edge grabs it; folded, a press within side_reach of the window's
+// left edge does (wider, clear of AppKit's own window-resize band). side_keep is the least the main card keeps beside
+// it, lowering side_max in a narrow window.
+export const side_min = 180
+export const side_max = 480
+export const side_latch = 8
+export const side_give = 24
+export const side_soft = 48
+export const side_rearm = 8
+export const side_grab = 5
+export const side_reach = 10
+export const side_keep = 320
+export const window_back_omega = 24
+export const window_back_zeta = 1
 // Overlay scrollers (prims.flecs ui.Scroller, on every ui.Scroll; macOS's overlay NSScroller): the knob scroller_thin
 // across at rest and scroller_wide over its track while the pointer is within scroller_grab of the edge, scroller_inset
 // off the edge, never shorter than scroller_min (but shortened under a rubber band). It shows as the content scrolls,
