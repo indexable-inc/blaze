@@ -330,7 +330,7 @@ impl Fanotify {
                     format!(
                         "fanotify_init: {error}: Linux 5.9 or later reports a change's directory \
                          and name (FAN_REPORT_DFID_NAME), and this is Linux {}",
-                        crate::cgroup::kernel()
+                        crate::kernel::release()
                     ),
                 ),
                 _ => named(&error, "fanotify_init"),

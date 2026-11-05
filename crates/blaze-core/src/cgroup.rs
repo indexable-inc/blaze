@@ -127,7 +127,7 @@ impl Cgroup {
         })
     }
 
-    /// The most it held: memory.peak (Linux 5.19+); an error naming the kernel if missing.
+    /// The most it held: memory.peak; an error naming the directory if missing.
     pub(crate) fn peak(&self) -> io::Result<u64> {
         self.file("memory.peak", |path| {
             let mut bytes = [0u8; 32];
@@ -151,9 +151,11 @@ impl Cgroup {
                     io::ErrorKind::Unsupported,
                     // alloc: an error's message, made as it fails.
                     format!(
-                        "{} is missing: Linux 5.19 or later keeps it, and this is Linux {}",
+                        "{} is missing: every kernel blaze runs on (Linux 7.2 or later, \
+                         docs/kernel.md) keeps it in a cgroup v2 directory whose memory \
+                         controller is on, so this one is not (Linux {})",
                         path.display(),
-                        kernel()
+                        crate::kernel::release()
                     ),
                 )),
                 // alloc: an error's message, made as it fails.
@@ -180,15 +182,18 @@ impl Cgroup {
                 return Err(not_enabled());
             }
             // Asked of it once the process has exited; refused now rather than after the run.
-            // A kernel that keeps it (5.19) also has `cgroup.kill` (5.14), which its end needs.
+            // Every kernel blaze runs on has it and `cgroup.kill`, which its end needs: missing,
+            // the directory is not a cgroup v2 one with the memory controller.
             if !self.file("memory.peak", Path::exists) {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     // alloc: an error's message, made as it fails.
                     format!(
-                        "{} has no memory.peak: Linux 5.19 or later keeps it, and this is Linux {}",
+                        "{} has no memory.peak: Linux 7.2 (blaze's floor) keeps it wherever the \
+                         memory controller is on, so this is not a cgroup v2 directory with it \
+                         (Linux {})",
                         self.dir().display(),
-                        kernel()
+                        crate::kernel::release()
                     ),
                 ));
             }
@@ -441,18 +446,6 @@ fn listed(list: &str, name: &str) -> bool {
 /// Whether any swap is on (more than the header line of /proc/swaps).
 fn swap_in_use() -> io::Result<bool> {
     Ok(read(Path::new("/proc/swaps"))?.lines().skip(1).any(|line| !line.trim().is_empty()))
-}
-
-/// The kernel's release, as `uname -r` says it.
-pub(crate) fn kernel() -> String {
-    let Ok(name) = crate::raw::uname() else {
-        return "of an unknown release".into();
-    };
-    let release: Vec<u8> =
-        // alloc: only for an error's message.
-        name.release.iter().take_while(|&&it| it != 0).map(|&it| it as u8).collect();
-    // alloc: only for an error's message.
-    String::from_utf8_lossy(&release).into_owned()
 }
 
 fn read(path: &Path) -> io::Result<String> {

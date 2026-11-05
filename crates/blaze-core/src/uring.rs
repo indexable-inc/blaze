@@ -20,9 +20,9 @@
 //! through an eventfd it reads.
 //!
 //! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter`,
-//! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Linux 6.0 or
-//! later: each feature's absence is an error naming it and the kernel that has it. Before 6.1
-//! `statx` says no alignment for writes that bypass the cache, so none does.
+//! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Every kernel
+//! blaze runs on is Linux 7.2 or later (`crate::kernel::check`, docs/kernel.md), so each
+//! feature is used with no probe; a refusal is an error naming what was asked.
 //!
 //! A request in flight is a slot of columns ([`ops`]): 32 bytes a completion reads, the buffer
 //! it lends the kernel, and what only its submission and end read; its handle is the
@@ -148,7 +148,6 @@ const REGISTER_FILES2: libc::c_uint = 13;
 const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
 const REGISTER_BUFFERS2: libc::c_uint = 15;
 const REGISTER_PBUF_RING: libc::c_uint = 22;
-const UNREGISTER_PBUF_RING: libc::c_uint = 23;
 const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
 const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
@@ -174,7 +173,7 @@ const INBOX: usize = 4 << 20;
 /// notification, of ~1 µs together; below ~10 KiB the copy is the cheaper (the kernel's
 /// `msg_zerocopy.rst`). A Unix socket has no zero-copy sends, so its sends always copy.
 const ZERO_COPY_LEAST: usize = 32 << 10;
-/// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
+/// `statx`'s mask bit of the alignment a write that bypasses the cache needs.
 const STATX_DIOALIGN: u32 = 0x2000;
 /// What a [`Stamp`] is made of, as `statx`'s mask asks for it (`linux/stat.h`; `libc` has these
 /// only for some C libraries).
@@ -421,15 +420,13 @@ fn stamp_of_error(res: i32) -> Stamp {
     }
 }
 
-/// `io_uring_register(2)` of `opcode` with `arg`, or an error naming what was asked and the
-/// kernel that has it, where this one refuses it as unknown.
+/// `io_uring_register(2)` of `opcode` with `arg`, or an error naming what was asked.
 fn register<T>(
     ring: RawFd,
     opcode: libc::c_uint,
     arg: *const T,
     nr: libc::c_uint,
     what: &str,
-    since: &str,
 ) -> io::Result<i64> {
     // SAFETY: `arg` points at what `opcode` reads (and the memory it names), alive for the call.
     let got = unsafe { libc::syscall(libc::SYS_io_uring_register, ring, opcode, arg, nr) };
@@ -442,9 +439,9 @@ fn register<T>(
             io::ErrorKind::Unsupported,
             // alloc: the error of a setup that failed.
             format!(
-                "io_uring {what}: {error}: Linux {since} or later has it, and this kernel \
-                 (Linux {}) refuses it, by lacking it or by refusing what it was given",
-                crate::cgroup::kernel()
+                "io_uring {what}: {error}: every kernel blaze runs on (Linux 7.2 or later, \
+                 docs/kernel.md) has it, so this one (Linux {}) refuses what it was given",
+                crate::kernel::release()
             ),
         ),
         // alloc: the error of a setup that failed.
@@ -511,7 +508,6 @@ impl Table {
             &raw const sparse,
             nr,
             "a sparse table of registered files",
-            "5.19",
         )?;
         let ours = size / 2;
         let range = FileIndexRange { off: ours, len: size - ours, resv: 0 };
@@ -521,7 +517,6 @@ impl Table {
             &raw const range,
             0,
             "a range of the file table for direct accepts",
-            "6.0",
         )?;
         // alloc: setup, once per driver: room for every slot, so a drop never grows it.
         let closing = RefCell::new(Vec::with_capacity(size as usize));
@@ -552,7 +547,6 @@ impl Table {
             &raw const update,
             nr,
             "updating the file table",
-            "5.13",
         )
         .map(|_| ())
     }
@@ -648,7 +642,7 @@ impl Registered {
             tags: 0,
         };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
-        register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
+        register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers").map_err(|error| {
             match error.raw_os_error() {
                 Some(libc::ENOMEM) => io::Error::new(
                     error.kind(),
@@ -688,13 +682,12 @@ impl Provided {
     fn new(fd: RawFd) -> io::Result<Provided> {
         let ring = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>())?;
         let buffers = anonymous(RECV_BUFFERS as usize * RECV_BUFFER)?;
-        let check = ReservedCheck::of(fd)?;
         let reg = BufReg {
             ring_addr: ring.at as u64,
             ring_entries: RECV_BUFFERS.into(),
             bgid: RECV_GROUP,
             flags: 0,
-            resv: check.reserved(),
+            resv: [0; 3],
         };
         // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring it
         // names is `ring`, mapped for `RECV_BUFFERS` entries, which `Provided` keeps mapped
@@ -703,7 +696,7 @@ impl Provided {
             libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
         };
         if got < 0 {
-            return Err(pbuf_refused(&reg, check, &io::Error::last_os_error()));
+            return Err(pbuf_refused(&reg, &io::Error::last_os_error()));
         }
         let mut provided = Provided { ring, buffers, tail: 0, published: 0 };
         for bid in 0..RECV_BUFFERS {
@@ -782,95 +775,15 @@ impl Provided {
 }
 
 const _: () = assert!(RECV_BUFFERS.is_power_of_two());
-/// How this kernel checks the reserved words of a provided buffer ring's registration
-/// (`io_uring_buf_reg.resv`).
-///
-/// Upstream Linux, from 5.19 on, refuses a registration whose reserved words are not zero.
-/// Ubuntu's linux-azure 6.8 from 6.8.0-1063.71 (through 6.8.0-1070.78 at least, the kernel of
-/// GitHub's hosted ubuntu-22.04 runners, x86-64 and AArch64, in November 2026) backported
-/// upstream's `if (!mem_is_zero(reg.resv, sizeof(reg.resv))) return -EINVAL;` as
-/// `if (!memchr_inv(reg.resv, 0, sizeof(reg.resv))) return -EINVAL;`. `memchr_inv` answers
-/// NULL when every byte is zero, so that kernel refuses exactly the registrations upstream
-/// takes, in io_register_pbuf_ring and io_unregister_pbuf_ring alike (io_uring/kbuf.c), and
-/// takes only one whose reserved words are not zero, which it reads nowhere else.
-///
-/// The check is asked of the kernel before the registration, with no side effect: an
-/// unregister of a group the ring does not have gets past a right check to the group's lookup
-/// (ENOENT) and stops at an inverted one (EINVAL). It must run before the ring has any group,
-/// as [`Provided::new`] runs it: upstream 6.8 answers EINVAL for an unregister of a group of
-/// its array of the first 64 once that array is made. Each kernel then gets the one
-/// registration it takes; there is no second attempt and no other kind of receive.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ReservedCheck {
-    Upstream,
-    Inverted,
-}
-
-impl ReservedCheck {
-    fn of(fd: RawFd) -> io::Result<ReservedCheck> {
-        let reg =
-            BufReg { ring_addr: 0, ring_entries: 0, bgid: RECV_GROUP, flags: 0, resv: [0; 3] };
-        // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring has no
-        // group, so nothing is unregistered.
-        let got = unsafe {
-            libc::syscall(libc::SYS_io_uring_register, fd, UNREGISTER_PBUF_RING, &raw const reg, 1)
-        };
-        let errno = match got {
-            0.. => None,
-            _ => io::Error::last_os_error().raw_os_error(),
-        };
-        ReservedCheck::answered(errno).ok_or_else(|| {
-            let answer = match errno {
-                Some(errno) => io::Error::from_raw_os_error(errno).to_string(), // alloc: an error.
-                None => "success, unregistering a group that is not there".to_owned(), // alloc: an error.
-            };
-            io::Error::other(
-                // alloc: the error of a setup that failed.
-                format!(
-                    "io_uring a ring of provided buffers: asking this kernel (Linux {}) how it \
-                     checks the reserved words of IORING_REGISTER_PBUF_RING, by unregistering \
-                     group {RECV_GROUP}, which the ring does not have, answered {answer}, where a \
-                     kernel answers ENOENT (upstream's check) or EINVAL (the inverted check of \
-                     Ubuntu's linux-azure 6.8.0-1063 and later)",
-                    crate::cgroup::kernel(),
-                ),
-            )
-        })
-    }
-
-    /// The check the unregister probe's answer (its errno, `None` for a success) shows, if it
-    /// shows one.
-    fn answered(errno: Option<i32>) -> Option<ReservedCheck> {
-        match errno {
-            Some(libc::ENOENT) => Some(ReservedCheck::Upstream),
-            Some(libc::EINVAL) => Some(ReservedCheck::Inverted),
-            _ => None,
-        }
-    }
-
-    /// The reserved words this kernel takes.
-    fn reserved(self) -> [u64; 3] {
-        match self {
-            ReservedCheck::Upstream => [0; 3],
-            ReservedCheck::Inverted => [1, 0, 0],
-        }
-    }
-}
-
 /// Why `IORING_REGISTER_PBUF_RING` of `reg` failed with `error`: what was asked, and which of
 /// io_register_pbuf_ring's requirements the answer stands for.
-fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Error {
-    let kernel = crate::cgroup::kernel();
-    let inverted = match check {
-        ReservedCheck::Upstream => "",
-        ReservedCheck::Inverted => ", as this kernel's inverted check takes them",
-    };
+fn pbuf_refused(reg: &BufReg, error: &io::Error) -> io::Error {
+    let kernel = crate::kernel::release();
     let why = match error.raw_os_error() {
         // alloc: the error of a setup that failed.
         Some(libc::EINVAL) => format!(
             "every requirement io_register_pbuf_ring states is met (a power of two of entries \
-             under 65536, a page-aligned ring, no flags, reserved words as this kernel checks \
-             them), and this kernel (Linux {kernel}) refuses it all the same: its io_uring/kbuf.c \
+             under 65536, a page-aligned ring, no flags, zero reserved words), and this kernel (Linux {kernel}) refuses it all the same: its io_uring/kbuf.c \
              says for what"
         ),
         // alloc: the error of a setup that failed.
@@ -887,7 +800,7 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Er
         // alloc: the error of a setup that failed.
         format!(
             "io_uring a ring of provided buffers (IORING_REGISTER_PBUF_RING of {} entries at \
-             {:#x}, group {}, flags {:#x}, reserved words {}, {}, {}{inverted}): {error}: {why}",
+             {:#x}, group {}, flags {:#x}, reserved words {}, {}, {}): {error}: {why}",
             reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv[0], reg.resv[1], reg.resv[2],
         ),
     )
@@ -1029,24 +942,27 @@ impl Ring {
                 libc::ENOSYS | libc::EINVAL => io::ErrorKind::Unsupported,
                 _ => error.kind(),
             };
-            let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel());
+            let why = setup_refused(errno, &error, disabled, &crate::kernel::release());
             return Err(io::Error::new(kind, why));
         }
         // SAFETY: the call returned a file descriptor of its own.
         let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
+        // Every kernel blaze runs on (Linux 7.2 or later) says each of these; one that does not
+        // is not the io_uring blaze was written for, whatever its release says.
         let wanted = [
-            (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP", "5.4"),
-            (FEAT_NODROP, "IORING_FEAT_NODROP", "5.5"),
-            (FEAT_SQPOLL_NONFIXED, "IORING_FEAT_SQPOLL_NONFIXED", "5.11"),
-            (FEAT_EXT_ARG, "IORING_FEAT_EXT_ARG", "5.11"),
+            (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP"),
+            (FEAT_NODROP, "IORING_FEAT_NODROP"),
+            (FEAT_SQPOLL_NONFIXED, "IORING_FEAT_SQPOLL_NONFIXED"),
+            (FEAT_EXT_ARG, "IORING_FEAT_EXT_ARG"),
         ];
-        if let Some((_, name, since)) = wanted.iter().find(|(bit, ..)| params.features & bit == 0) {
+        if let Some((_, name)) = wanted.iter().find(|(bit, _)| params.features & bit == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 // alloc: the error of a setup that failed.
                 format!(
-                    "io_uring without {name}: Linux {since} or later has it, and this is Linux {}",
-                    crate::cgroup::kernel()
+                    "io_uring without {name}: every Linux 7.2 or later has it, and this one \
+                     (Linux {}) does not say it does",
+                    crate::kernel::release()
                 ),
             ));
         }
@@ -1253,8 +1169,9 @@ impl Ring {
 }
 
 /// What blaze says when `io_uring_setup` fails with `errno`: what failed, the likely cause and
-/// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled` (absent before Linux 6.6),
-/// `kernel` the running kernel's release. On Linux the build runs on io_uring and on nothing
+/// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled`, `kernel` the running
+/// kernel's release, which is at blaze's floor (Linux 7.2, `crate::kernel::check`), so a
+/// refusal is the kernel's configuration or a filter, never its age. On Linux the build runs on io_uring and on nothing
 /// else, so this is where it stops.
 fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
     let name = match errno {
@@ -1294,22 +1211,20 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         (libc::EPERM | libc::EACCES, _) => write!(out, "{seccomp}. Fix: {allow}"),
         (libc::ENOSYS, _) => write!(
             out,
-            "this kernel (Linux {kernel}) has no io_uring: older than 5.1 or built without \
-             CONFIG_IO_URING; or {seccomp}, answering ENOSYS. \
-             Fix: run on Linux 6.0 or later built with io_uring, or {allow}"
+            "this kernel (Linux {kernel}) was built without CONFIG_IO_URING; or {seccomp}, \
+             answering ENOSYS. Fix: boot a kernel built with CONFIG_IO_URING=y, or {allow}"
         ),
         (libc::EINVAL, _) => write!(
             out,
-            "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
-             IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have. \
-             Fix: run on Linux 6.0 or later"
+            "this kernel (Linux {kernel}) refuses the ring's setup flags \
+             (IORING_SETUP_SQPOLL with IORING_SETUP_SINGLE_ISSUER), which every Linux 7.2 \
+             takes, so its io_uring is patched or restricted. \
+             Fix: boot an unpatched Linux 7.2 or later (docs/kernel.md)"
         ),
         (libc::ENOMEM, _) => write!(
             out,
-            "the locked-memory limit (RLIMIT_MEMLOCK), which kernels before 5.12 charge a ring \
-             to, is too small, or the machine is out of memory. \
-             Fix: raise the limit (ulimit -l unlimited, or LimitMEMLOCK= for a systemd unit), or run \
-             on Linux 6.0 or later"
+            "the machine or this cgroup is out of memory for the ring. \
+             Fix: free memory or raise the cgroup's memory.max"
         ),
         (libc::EMFILE | libc::ENFILE, _) => write!(
             out,
@@ -1319,8 +1234,7 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         _ => write!(
             out,
             "an answer io_uring_setup is not known to give on Linux {kernel}. \
-             Fix: check that the kernel is Linux 6.0 or later, that kernel.io_uring_disabled is 0, \
-             and {allow}"
+             Fix: check that kernel.io_uring_disabled is 0 and {allow}"
         ),
     };
     out.push('.');
@@ -2498,8 +2412,9 @@ impl Driver for Uring {
                     );
                     None
                 }),
-                // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
-                // and `ftruncate` of the name here, as a mode is set. Never through a kept
+                // One open and `ftruncate` of the name here, as a mode is set: the ring's
+                // `IORING_OP_FTRUNCATE` cuts a descriptor, which would need an open linked
+                // before it (docs/kernel.md lists it as next). Never through a kept
                 // descriptor, which may be of a file no longer at the name (a build directory
                 // removed by `blaze clean` and made again): the cut would go to the removed file
                 // and the writes after it, which open the name, find nothing there. A file kept
@@ -4676,41 +4591,6 @@ mod tests {
         assert!(took < Duration::from_secs(2), "a 50 ms poll under signals every 5 ms took {took:?}");
     }
 
-    /// The reserved-word check `ReservedCheck::of` reads is the one this kernel applies: a
-    /// ring registers with the words it chose and is refused (EINVAL) with the other choice,
-    /// upstream's zeroes on an inverted kernel (Ubuntu's linux-azure 6.8.0-1063 and later)
-    /// and a set word on any other.
-    #[test]
-    fn the_reserved_check_is_the_kernels() {
-        let ring = Ring::new(ENTRIES, COMPLETIONS).unwrap();
-        let fd = ring.fd.as_raw_fd();
-        let check = ReservedCheck::of(fd).unwrap();
-        let other = match check {
-            ReservedCheck::Upstream => ReservedCheck::Inverted,
-            ReservedCheck::Inverted => ReservedCheck::Upstream,
-        };
-        let map = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>()).unwrap();
-        let reg = |bgid: u16, check: ReservedCheck| BufReg {
-            ring_addr: map.at as u64,
-            ring_entries: RECV_BUFFERS.into(),
-            bgid,
-            flags: 0,
-            resv: check.reserved(),
-        };
-        let call = |reg: BufReg| {
-            // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring
-            // it names is `map`, mapped for `RECV_BUFFERS` entries and kept past the ring.
-            let got = unsafe {
-                libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
-            };
-            if got < 0 { io::Error::last_os_error().raw_os_error() } else { None }
-        };
-        let kernel = crate::cgroup::kernel();
-        assert_eq!(call(reg(1, other)), Some(libc::EINVAL), "{other:?} on Linux {kernel}");
-        assert_eq!(call(reg(1, check)), None, "{check:?} on Linux {kernel}");
-        drop(ring);
-    }
-
     /// The provided buffers a pass of completions gives back are shown to the kernel together,
     /// with one store of the ring's tail after the pass, not one per buffer; between, the
     /// kernel's tail is as it was.
@@ -4850,7 +4730,7 @@ mod tests {
     fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
         let error = io::Error::from_raw_os_error(libc::EPERM);
         assert_eq!(
-            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0"),
+            super::setup_refused(libc::EPERM, &error, Some(0), "7.2.11"),
             "blaze runs its build on io_uring on Linux and cannot start without it: \
              io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
              Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
@@ -4863,7 +4743,7 @@ mod tests {
     #[test]
     fn each_refusal_names_its_errno_cause_and_fix() {
         let says = |errno: i32, disabled: Option<u8>| {
-            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "5.0.0")
+            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "7.2.11")
         };
         let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
             (
@@ -4887,9 +4767,9 @@ mod tests {
                 "seccomp",
                 "io_uring_setup, io_uring_enter and io_uring_register",
             ),
-            (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
-            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
-            (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
+            (libc::ENOSYS, None, "with ENOSYS", "CONFIG_IO_URING", "CONFIG_IO_URING=y"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "unpatched Linux 7.2"),
+            (libc::ENOMEM, None, "with ENOMEM", "out of memory", "memory.max"),
             (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
         ];
         for (errno, disabled, failed, cause, fix) in cases {

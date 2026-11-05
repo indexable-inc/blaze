@@ -59,6 +59,8 @@ mod handoff;
 #[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
 pub mod iocp;
 mod journal;
+/// The Linux kernel blaze runs on and the floor it refuses to start below (docs/kernel.md).
+pub mod kernel;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, reason = "the kqueue driver: kevent and the records it reads")]
 pub mod kqueue;

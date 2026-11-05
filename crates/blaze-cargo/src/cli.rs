@@ -145,6 +145,15 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     if !trampoline && let Err(code) = cores() {
         return ended(code);
     }
+    // The client and `blaze serve` both stop here on a kernel below blaze's floor (Linux 7.2,
+    // docs/kernel.md), before anything uses a feature it lacks: a typed refusal naming the
+    // kernel, the floor, the features and the fix, never a slower path. A trampoline is a test
+    // the daemon launched, on the kernel the daemon already checked.
+    #[cfg(target_os = "linux")]
+    if !trampoline && let Err(too_old) = blaze_core::kernel::check() {
+        eprint!("{}", say::error(&too_old.to_string(), auto_color()));
+        return ended(Exit::Failed.code());
+    }
     // The client and `blaze serve` both record into the flight recorder from here on: the
     // daemon writes its history, and the client sends its rows there as its request ends
     // (`client_rows`), which `BLAZE_PROFILE` then exports as the build's trace.
