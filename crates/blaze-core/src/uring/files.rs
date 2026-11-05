@@ -14,8 +14,14 @@
 //! Where an open (or a link, or a clone's target) finds a directory missing and the effect
 //! makes it, the request makes each directory of its path in turn (`IORING_OP_MKDIRAT`, an
 //! existing one answering `EEXIST`), as `create_dir_all` does, then asks its chain again; a
-//! second `ENOENT` fails it. The kernel reads every name, and writes every `statx`, in the
-//! request's arena of [`ops::Paths`], which never moves and is never read as a slice.
+//! second `ENOENT` fails it. The kernel reads every name and `struct open_how`, and writes
+//! every `statx`, in the request's arena of [`ops::Paths`], which never moves and is never
+//! read as a slice.
+//!
+//! A read of a file no request keeps ([`Effect::Map`], and [`Effect::ReadAll`] and
+//! [`Effect::Read`] of a file not kept) opens with `IORING_OP_OPENAT2` and `OPENAT2_REGULAR`
+//! (Linux 7.2): a directory, FIFO, socket or device fails with `EFTYPE`, refused as
+//! [`crate::READ_OF_NO_FILE`], never opened, blocked on or read.
 
 use std::{
     ffi::CStr,
@@ -101,6 +107,26 @@ fn open(path: *const u8, flags: i32, mode: u32, slot: u32, link: u8, user_data: 
     }
 }
 
+/// The open of `path` for a read of a file no request keeps ([`Kind::Map`], [`Kind::Load`]),
+/// to a descriptor of the driver's own: `IORING_OP_OPENAT2` with `how`, the request's copy of
+/// [`crate::raw::READ_REGULAR`] in its arena (`O_RDONLY | O_CLOEXEC | OPENAT2_REGULAR`), so
+/// only a regular file opens and anything else fails with `EFTYPE` before it opens
+/// (`Uring::regular_failed`). Every asker of these reads reads a regular file (a pack, an
+/// index, a journal, the daemon's image, a source file), so none asks otherwise.
+fn open_regular(path: *const u8, how: *const u8, link: u8, user_data: u64) -> Sqe {
+    Sqe {
+        opcode: OP_OPENAT2,
+        flags: link,
+        fd: libc::AT_FDCWD,
+        addr: path as u64,
+        // `addr2`: the `struct open_how`, and its size.
+        off: how as u64,
+        len: crate::raw::READ_REGULAR.len() as u32,
+        user_data,
+        ..Sqe::default()
+    }
+}
+
 /// `opcode` on the file in `slot`.
 fn on_slot(opcode: u8, slot: u32, link: u8, user_data: u64) -> Sqe {
     Sqe { opcode, flags: SQE_FIXED_FILE | link, fd: slot as i32, user_data, ..Sqe::default() }
@@ -167,6 +193,14 @@ fn push_c(into: &mut RegionVec<u8>, bytes: &[u8]) -> io::Result<u32> {
     let at = into.len() as u32;
     put(into, bytes)?;
     put(into, &[0])?;
+    Ok(at)
+}
+
+/// [`crate::raw::READ_REGULAR`], the `struct open_how` of [`open_regular`], at the end of
+/// `into`, for the kernel to read; where it starts.
+fn push_how(into: &mut RegionVec<u8>) -> io::Result<u32> {
+    let at = into.len() as u32;
+    put(into, &crate::raw::READ_REGULAR)?;
     Ok(at)
 }
 
@@ -291,6 +325,18 @@ impl Uring {
         Step::Ends(Some(Done::Failed(IoError(format!("{what} {name}: {}", error(res))))))
     }
 
+    /// The request `id` ([`Kind::Map`], [`Kind::Load`]) whose [`open_regular`] failed with
+    /// `res`: a name that is no regular file refused with [`crate::READ_OF_NO_FILE`], as the
+    /// threads driver refuses it; any other error as the open's.
+    fn regular_failed(&self, id: Id, res: i32) -> Step {
+        if res != -crate::raw::EFTYPE {
+            return self.failed_on(id, "opening", 0, res);
+        }
+        let name = self.name_of(id, 0).to_string_lossy();
+        // alloc: an error path.
+        Step::Ends(Some(Done::Failed(IoError(format!("{name} {}", crate::READ_OF_NO_FILE)))))
+    }
+
     /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: a `statx` first where
     /// the write may bypass the page cache, then the open into a slot linked to the write.
     pub(super) fn write_at(
@@ -413,9 +459,10 @@ impl Uring {
     ) -> io::Result<()> {
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_c(names, path.as_os_str().as_bytes())?;
-            if kind == Kind::Stat {
-                at[4] = push_zeros(names, STATX_SIZE)?;
-            }
+            at[4] = match kind {
+                Kind::Stat => push_zeros(names, STATX_SIZE)?,
+                _ => push_how(names)?,
+            };
             Ok(())
         };
         let mut hot = Hot::new(tag, kind, 0);
@@ -447,6 +494,7 @@ impl Uring {
         };
         let push = |path: &Path, names: &mut RegionVec<u8>, starts: &mut [u32; 5]| {
             starts[0] = push_c(names, path.as_os_str().as_bytes())?;
+            starts[4] = push_how(names)?;
             Ok(())
         };
         self.named(hot, buf, Cold { at, ..Cold::EMPTY }, push, file)?;
@@ -497,7 +545,7 @@ impl Uring {
                 return Step::Ends(Some(Done::Read(ops::NO_BYTES)));
             }
             if res < 0 {
-                return self.failed_on(id, "opening", 0, res);
+                return self.regular_failed(id, res);
             }
             // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
             let fd = unsafe { OwnedFd::from_raw_fd(res) };
@@ -859,7 +907,7 @@ impl Uring {
                 2
             }
             (Kind::Map, _) => {
-                sqes[0] = open(name(0), libc::O_RDONLY, 0, NO_SLOT, 0, ud(0));
+                sqes[0] = open_regular(name(0), name(4), 0, ud(0));
                 1
             }
             (Kind::Stat, _) => {
@@ -872,7 +920,7 @@ impl Uring {
             (Kind::Load, phase) => {
                 let spread = if self.loading >= SPREAD_LEAST { SQE_ASYNC } else { 0 };
                 sqes[0] = match phase {
-                    OPENING => open(name(0), libc::O_RDONLY, 0, NO_SLOT, spread, ud(0)),
+                    OPENING => open_regular(name(0), name(4), spread, ud(0)),
                     _ => {
                         let (addr, len) = spare_of(buf, buf.capacity());
                         let (fd, off) = (raw(&cold.fds[0]), cold.at + buf.len() as u64);
@@ -1276,7 +1324,7 @@ impl Uring {
 
     fn mapped(&mut self, id: Id, res: i32) -> Step {
         if res < 0 {
-            return self.failed_on(id, "opening", 0, res);
+            return self.regular_failed(id, res);
         }
         // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
         let file = File::from(unsafe { OwnedFd::from_raw_fd(res) });

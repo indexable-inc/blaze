@@ -92,6 +92,7 @@ const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
 const OP_RECV: u8 = 27;
+const OP_OPENAT2: u8 = 28;
 const OP_SHUTDOWN: u8 = 34;
 const OP_RENAMEAT: u8 = 35;
 const OP_UNLINKAT: u8 = 36;
@@ -4431,6 +4432,67 @@ mod tests {
         assert_eq!((driver.table.free.borrow().len(), driver.slots_held), (free, 0));
         assert_eq!(driver.paths.held(), [0, 0]);
         drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A read of a file no request keeps (`ReadAll`, `Read`, `Map`) of a directory or a FIFO
+    /// is refused as no regular file (`openat2` `OPENAT2_REGULAR`, `EFTYPE`), naming it,
+    /// without blocking on the FIFO, which no one opens to write; a regular file beside them
+    /// reads and maps. The ring and the threads driver say it the same.
+    #[test]
+    fn a_read_of_no_regular_file_is_refused_naming_it() {
+        fn reads(driver: &mut impl Driver) -> BTreeMap<u64, Done> {
+            let name = |it: &str| FileName::new(it).unwrap();
+            let mut effects = Vec::new();
+            for (n, file) in ["dir", "fifo"].into_iter().enumerate() {
+                let tag = |k: u64| Tag(10 * n as u64 + k);
+                effects.push(Effect::ReadAll { file: name(file), tag: tag(1) });
+                effects.push(Effect::Read { file: name(file), at: 0, len: 4, tag: tag(2) });
+                effects.push(Effect::Map { file: name(file), tag: tag(3) });
+            }
+            effects.push(Effect::ReadAll { file: name("plain"), tag: Tag(31) });
+            effects.push(Effect::Map { file: name("plain"), tag: Tag(32) });
+            let mut seen = BTreeMap::new();
+            run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+            seen
+        }
+        fn check(root: &Path, seen: &BTreeMap<u64, Done>) {
+            for (n, file) in ["dir", "fifo"].into_iter().enumerate() {
+                let wanted = format!("{} {}", root.join(file).display(), crate::READ_OF_NO_FILE);
+                for k in 1..=3 {
+                    let tag = 10 * n as u64 + k;
+                    match &seen[&tag] {
+                        Done::Failed(IoError(why)) => assert_eq!(why, &wanted, "{tag}"),
+                        other => panic!("{tag}: {other:?}, wanted {wanted}"),
+                    }
+                }
+            }
+            assert_eq!(seen[&31], Done::Read(b"plain".to_vec()));
+            match &seen[&32] {
+                Done::Mapped(mapping) => assert_eq!(mapping.bytes(), b"plain"),
+                other => panic!("32: {other:?}"),
+            }
+        }
+        fn tree(name: &str) -> PathBuf {
+            use std::os::unix::ffi::OsStringExt as _;
+            let root = dir(name);
+            std::fs::create_dir_all(root.join("dir")).unwrap();
+            std::fs::write(root.join("plain"), b"plain").unwrap();
+            let fifo = std::ffi::CString::new(root.join("fifo").into_os_string().into_vec())
+                .unwrap();
+            // SAFETY: `fifo` is a NUL-terminated path, borrowed for the call.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo {fifo:?}");
+            root
+        }
+        let root = tree("uring-no-regular");
+        let mut ring = Uring::new(&root).unwrap();
+        check(&root, &reads(&mut ring));
+        assert_eq!((ring.loading, ring.load_waiting.len()), (0, 0));
+        assert_eq!(ring.paths.held(), [0, 0]);
+        drop(ring);
+        std::fs::remove_dir_all(root).unwrap();
+        let root = tree("uring-no-regular-threads");
+        check(&root, &reads(&mut Threads::new(&root, 2)));
         std::fs::remove_dir_all(root).unwrap();
     }
 

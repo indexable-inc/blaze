@@ -11,7 +11,7 @@ kernel, the floor, the features that need it and the fix:
 
     error: blaze needs Linux 7.3 or later, and this is Linux 6.8.0-1070-azure (rule
     kernel-floor, docs/kernel.md). It uses, with no slower path:
-      - openat2 OPENAT2_REGULAR (Linux 7.2): store and cache reads that open only a regular file
+      - openat2 OPENAT2_REGULAR (Linux 7.2): store, cache, journal and source reads that open only a regular file
       - ...
     Fix: boot Linux 7.3 or later: your distribution's newer kernel package (a mainline build,
     Ubuntu's HWE kernel, Fedora's or Arch's current kernel), or run blaze in an ix VM (`ix new`),
@@ -68,7 +68,7 @@ not built), **next** (an opportunity found, unowned).
 | `MADV_POPULATE_WRITE`, `MADV_COLLAPSE` (advice) | 5.14, 6.1 | populating and collapsing the daemon's arenas | blaze-mem | in use |
 | `close_range` | 5.9 | the test fork server's descriptor cleanup | blaze-usercode | in use |
 | `statx` `STATX_MNT_ID` | 5.8 | ix-prof's FUSE check | ix-prof | in use |
-| `openat2` `OPENAT2_REGULAR` | 7.2 | store and cache reads open only a regular file (`EFTYPE` otherwise) | blaze-core | in use (this lane) |
+| `openat2` `OPENAT2_REGULAR` | 7.2 | every read of a file no request keeps (`Effect::ReadAll`, `Read`, `Map`: store packs and indexes, journals, the daemon's image, source files) opens only a regular file; a directory, FIFO, socket or device is refused with `EFTYPE`, named (`READ_OF_NO_FILE`). io_uring's `IORING_OP_OPENAT2` (`uring/files.rs`), the threads driver's `openat2` (`raw::openat2_read_regular`) | blaze-core | in use |
 | file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path learns of a write the file system lost | blaze-core, blaze-cas | in use (this lane) |
 | `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon stay out of the page cache, on a file system that takes it | blaze-core | in use (this lane) |
 | `mseal` | 6.10 | sealing the loader's code mappings that are never changed | blaze-live | in use (this lane) |
