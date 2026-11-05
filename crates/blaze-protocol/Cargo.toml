@@ -19,13 +19,13 @@ doctest = false
 reference = []
 
 [dependencies]
+blaze-hash.workspace = true
 blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-fuzz.workspace = true
-blaze-hash.workspace = true
 blaze-ids.workspace = true
 hegeltest.workspace = true
 serde_json.workspace = true

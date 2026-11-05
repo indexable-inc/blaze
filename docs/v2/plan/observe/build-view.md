@@ -45,7 +45,7 @@ blaze's but blaze-serde). It holds the wire types and the fold:
 ```rust
 pub struct Now {            // one build, as of `at_ms` after it began
     pub at_ms: u64,
-    pub phase: Phase,       // Starting | Fetching | Resolving | Planning | Compiling | Linking | Testing | Finishing
+    pub phase: Phase,       // Starting | Fetching | Resolving | Planning | Compiling | Linking | Testing | Finishing | Running
     pub stage: String,      // what the daemon says the stage waits on: `waits for its pinned native inputs, 1 of 1 layouts left`
     pub tally: Tally,       // tasks waiting, ready, running, done, failed, total
     pub workers: u32,       // the pool's workers; idle = workers - busy.len()
@@ -57,15 +57,24 @@ pub struct Now {            // one build, as of `at_ms` after it began
 }
 pub struct Span { pub name: String, pub item: Option<String>, pub krate: Option<String>, pub awaits: Option<String>, pub for_ms: u64 }
 pub struct Busy { pub thread: String, pub task: Option<Task>, pub span: Span }
-pub struct Task { pub id: u32, pub kind: NodeKind, pub name: String }
+pub struct Task { pub id: u64, pub kind: String, pub name: String } // kind: the layer's label, a build's `NodeKind::name()`
 pub struct Blocker { pub task: Task, pub running: bool, pub for_ms: u64, pub span: Option<Span>, pub holds: u32, pub chain: u32, pub behind: Vec<String> }
+
+// The fold's input, generic so the explorer's wasm32 page folds any program's feed:
+pub struct TaskRecord { pub id: u64, pub kind: String, pub name: String, pub deps: Vec<u64> }
+pub enum State { Waiting, Ready, Running, Done, Failed, Cancelled } // From<&NodeState>
+pub struct Worker { pub thread: String, pub task: Option<u64>, pub open: Vec<Span> }
 ```
 
-`Fold` is the sans-IO core (`#![blaze::sans_io]`): it takes the plane's records
-(`Event::Node`, `Event::Nodes`, `Event::Moved`) as they come and the clock as `advance_clock`,
-and `look(&mut self, workers, downloads, stage) -> Now` builds the model from what it holds and
-the look's inputs (each worker thread's open spans with their plane node, the downloads' meters,
-the stage's words). It owns no thread, socket or clock.
+`Fold` is the sans-IO core (`#![blaze::sans_io]`): `take(&TaskRecord)` adds or updates a task,
+`moved(id, State)` moves one, and `take_event(&Event)` is the one place the plane's records
+(`Event::Node`, `Event::Nodes`, `Event::Moved`) become those (ids widened to `u64`, the kind
+`NodeKind::name()`). The clock comes as `advance_clock`, and `look(&mut self, &Look) -> Now`
+builds the model from what it holds and the look's inputs (each worker thread's open spans with
+its task's id, the downloads' meters, the stage's words). It keeps tasks in slots in arrival
+order with an id-to-slot map that is asked, never walked, so no output depends on its order, and
+at most `MOST_TASKS` (2^22) of them. It owns no thread, socket or clock, and builds for
+`wasm32-unknown-unknown`.
 
 - **Busy and idle.** A worker is busy when its thread is inside a span; its task is the plane node
   its `task` span carries (`OpenSpan::node`, lane fetch-progress), never matched by name.
@@ -77,9 +86,11 @@ the stage's words). It owns no thread, socket or clock.
   then age. In Andrew's build the one blocker is `codegen core` (running, 4 min 30 s, in
   `copy_prop` of `core::ptr::is_freeze`), holding 82 and a chain of 41; the build scripts the
   old line listed appear under it as held, not as running.
-- **Phase.** Fetching while a download is in flight and no task runs; Resolving and Planning from
-  the stage; then Compiling, Linking or Testing by the kinds of the running tasks (a test run
-  over a link over a compile).
+- **Phase.** Running when no task has a build's kind (one of `NodeKind::ALL`'s names): a program
+  that is not a build, whose tasks run with no phase. Otherwise Fetching while a download is in
+  flight and no task runs; Resolving and Planning from the stage; then Compiling, Linking or
+  Testing by the kinds of the running tasks (a test run over a link over a compile), the kinds
+  told by name.
 - **Memory.** The look carries what admission reads (`blaze_graph::admission::Pressure`:
   the footprint, the limit, the subsystem past its fair share) and how many ready tasks the
   plane holds back for memory; the fold keeps the build's peak and counts its releases.
@@ -101,7 +112,8 @@ Readers, all of the same `Now`:
 The model compiles to wasm32 (coordinator's decision, 2026-11-05): `blaze_protocol::now` is
 sans-IO, depends on nothing but serde and blaze-serde, and a `wasm32-unknown-unknown` check of
 blaze-protocol is part of its proof. Its name and place are `blaze_protocol::now` (`Now`,
-`Fold`, `Look`, `Worker`); the explorer lane builds its wasm reader on these names.
+`Fold`, `Look`, `Worker`, `TaskRecord`, `State`); the explorer lane builds its wasm reader on
+these names, feeding any program's live feed through `take` and `moved`.
 
 `blaze debug live` (`blaze_profile::live::Top`) stays the raw view of every thread; the build's
 view is per build.
