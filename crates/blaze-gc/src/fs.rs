@@ -1501,7 +1501,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         // What the errno was, said as such: EINVAL is also a rename into its own subtree, so it
         // alone does not say the file system lacks no-replace renames (review round 6, N2).
         match error.raw_os_error() {
-            Some(errno @ (libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)) => Err(io::Error::new(
+            Some(errno @ (libc::EINVAL | libc::ENOTSUP)) => Err(io::Error::new(
                 error.kind(),
                 format!(
                     "renaming {} to {} without replacing failed with errno {errno} ({error}); {}",
@@ -1510,7 +1510,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
                     match errno {
                         libc::EINVAL =>
                             "the file system may not support it, or the rename is invalid",
-                        _ => "the file system or kernel does not support it",
+                        _ => "the file system does not support it",
                     }
                 ),
             )),

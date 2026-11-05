@@ -12,8 +12,8 @@
 //! (a memo column per tracked function and struct) stay a few base pages each, and a table that
 //! grows past 2 MiB is made of 2 MiB pages from there. Under [`Pages::Transparent`] the first
 //! 2 MiB, made of base pages while the region was small, is collapsed into a huge page when the
-//! region outgrows it (`MADV_COLLAPSE`, Linux 6.1; advice, so an older kernel leaves it to
-//! khugepaged). Under [`Pages::Reserved`] the first 2 MiB stays base pages, so a small region
+//! region outgrows it (`MADV_COLLAPSE`; advice, so where the kernel cannot collapse it then,
+//! short of free huge pages or with transparent huge pages off, khugepaged may later). Under [`Pages::Reserved`] the first 2 MiB stays base pages, so a small region
 //! takes nothing from the pool.
 //!
 //! macOS has no huge pages for anonymous memory on Apple silicon: XNU takes superpages
@@ -80,7 +80,7 @@ pub fn chosen() -> io::Result<Pages> {
     let pages = choose(std::env::var_os(VAR).as_deref())?;
     // Before the choice is published: a reservation that sees it sees the process policy set.
     // Two threads choosing at once both set the same flag.
-    THP.store(crate::os::opt_out_unadvised(pages) as u8, Ordering::Relaxed);
+    THP.store(crate::os::opt_out_unadvised(pages)? as u8, Ordering::Relaxed);
     CHOSEN.store(pages as u8, Ordering::Relaxed);
     Ok(pages)
 }
@@ -96,14 +96,14 @@ pub enum Thp {
     /// Not chosen yet ([`chosen`] not called).
     #[default]
     Unset = 0,
-    /// Huge pages only where advised, as under the host setting `madvise` (Linux 6.18's
-    /// `PR_THP_DISABLE_EXCEPT_ADVISED`): the pages chosen are [`Pages::Transparent`].
+    /// Huge pages only where advised, as under the host setting `madvise`
+    /// (`PR_THP_DISABLE_EXCEPT_ADVISED`): the pages chosen are [`Pages::Transparent`].
     AdvisedOnly = 1,
     /// No transparent huge pages in the process: the pages chosen are base or hugetlb ones.
     Off = 2,
-    /// The kernel refused the setting (older than 6.18 for [`Thp::AdvisedOnly`]): unadvised
-    /// memory follows the host setting; our regions are still advised one by one.
-    Unavailable = 3,
+    // 3 was `Unavailable`, a kernel that refused the setting: a refusal is now an error of
+    // [`chosen`]. The value is only ever in this process (`THP`), never persisted; the number
+    // stays unused so the others keep theirs.
     /// Not Linux: no transparent huge pages to opt out of.
     NotLinux = 4,
 }
@@ -113,7 +113,6 @@ impl Thp {
         match byte {
             1 => Thp::AdvisedOnly,
             2 => Thp::Off,
-            3 => Thp::Unavailable,
             4 => Thp::NotLinux,
             _ => Thp::Unset,
         }
@@ -126,7 +125,6 @@ impl std::fmt::Display for Thp {
             Thp::Unset => "unset",
             Thp::AdvisedOnly => "advised only",
             Thp::Off => "off",
-            Thp::Unavailable => "host setting (kernel refused the opt-out)",
             Thp::NotLinux => "none (not Linux)",
         })
     }

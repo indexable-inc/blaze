@@ -35,7 +35,7 @@ const PERF_RECORD_SAMPLE: u32 = 9;
 /// Call chain entries at or above this mark a context (kernel, user), not an address.
 const PERF_CONTEXT_MAX: u64 = -4095i64 as u64;
 
-/// `struct perf_event_attr` to `sample_max_stack`: `PERF_ATTR_SIZE_VER5`, Linux 4.8 on.
+/// `struct perf_event_attr` to `sample_max_stack`: `PERF_ATTR_SIZE_VER5`.
 #[repr(C)]
 #[derive(Default)]
 struct Attr {

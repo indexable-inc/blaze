@@ -1,7 +1,7 @@
 //! Watching a tree with fanotify: one mark of each file system the watched directory spans
 //! (`FAN_MARK_FILESYSTEM`), so nothing is added as directories appear, and events that name
 //! the directory a change was in by a file handle and the file by its name
-//! (`FAN_REPORT_DFID_NAME`, Linux 5.9). A handle is opened again (`open_by_handle_at`) to
+//! (`FAN_REPORT_DFID_NAME`, in every kernel blaze runs on). A handle is opened again (`open_by_handle_at`) to
 //! learn where its directory is now; a directory gone since is named where it was last seen.
 //!
 //! Needs `CAP_SYS_ADMIN` (the mark) and `CAP_DAC_READ_SEARCH` (opening handles):
@@ -324,12 +324,27 @@ impl Fanotify {
             let error = io::Error::last_os_error();
             return Err(match error.raw_os_error() {
                 Some(libc::EPERM) => error,
+                // Every kernel blaze runs on (`crate::kernel::FLOOR`) has these flags, so a
+                // refusal of them is the kernel's or a filter's, named with what was asked.
                 Some(libc::EINVAL) => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    // alloc: the error of a watch that failed.
+                    format!(
+                        "fanotify_init: {error}: Linux {} refused the flags \
+                         FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_REPORT_DFID_NAME{} (flags {flags:#x}, \
+                         event flags O_RDONLY | O_CLOEXEC); every kernel blaze runs on has them, \
+                         so something other than the release refused them (a patched kernel or \
+                         a seccomp filter)",
+                        crate::kernel::release(),
+                        if nonblocking { " | FAN_NONBLOCK" } else { "" },
+                    ),
+                ),
+                Some(libc::ENOSYS) => io::Error::new(
                     io::ErrorKind::Unsupported,
                     // alloc: the error of a watch that failed.
                     format!(
-                        "fanotify_init: {error}: Linux 5.9 or later reports a change's directory \
-                         and name (FAN_REPORT_DFID_NAME), and this is Linux {}",
+                        "fanotify_init: {error}: this kernel ({}) is built without fanotify \
+                         (CONFIG_FANOTIFY=n), or a seccomp filter refuses fanotify_init",
                         crate::kernel::release()
                     ),
                 ),

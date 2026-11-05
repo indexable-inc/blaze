@@ -658,8 +658,18 @@ fn run_in(
     let mut watch = Watch { around, network: also.network, processes: HashMap::new_in(Global) };
     let supervised = listener.is_some();
     if let Some(listener) = listener {
-        supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
+        let supervising = supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
         drop(listener);
+        if let Err(why) = supervising {
+            // Not supervised, the sandbox does not run on: it is ended, and reaped, here.
+            raw::kill(first, libc::SIGKILL);
+            let mut status = 0;
+            while raw::wait(first, &mut status, 0) < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {}
+            super::pass_signals_to(0);
+            return Err(why);
+        }
     }
     let mut status = 0;
     while raw::wait(first, &mut status, 0) < 0 {
@@ -964,16 +974,18 @@ mod landlock {
     const MAKE_FIFO: u64 = 1 << 10;
     const MAKE_BLOCK: u64 = 1 << 11;
     const MAKE_SYM: u64 = 1 << 12;
-    /// ABI 2 on.
     const REFER: u64 = 1 << 13;
-    /// ABI 3 on.
     const TRUNCATE: u64 = 1 << 14;
-    /// ABI 4 on.
     const BIND_TCP: u64 = 1 << 0;
     const CONNECT_TCP: u64 = 1 << 1;
-    /// ABI 6 on.
     const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     const SCOPE_SIGNAL: u64 = 1 << 1;
+
+    /// The Landlock ABI every kernel blaze runs on has where Landlock is on: Linux 6.15 brought
+    /// ABI 7, and blaze refuses a kernel below `blaze_core::kernel::FLOOR` (7.2). Everything
+    /// [`restrict`] asks for (`REFER` from ABI 2, `TRUNCATE` from 3, TCP from 4, scopes from 6)
+    /// is in it, so it is asked for unconditionally.
+    const MIN_ABI: i64 = 7;
 
     /// The devices of `/dev` a program writes as it would anywhere, without writing the machine.
     const DEVICES: &[&str] = &["null", "zero", "full", "tty", "random", "urandom", "pts"];
@@ -991,16 +1003,28 @@ mod landlock {
         parent_fd: i32,
     }
 
-    /// The version of Landlock this kernel has, or why it has none.
+    /// The version of Landlock this kernel has, or why it has none blaze can use: Landlock
+    /// left out of the kernel (`CONFIG_SECURITY_LANDLOCK=n`), turned off (`lsm=`), or an ABI
+    /// below [`MIN_ABI`], which only a patched kernel gives at blaze's floor.
     pub(super) fn abi() -> Result<i64, String> {
         let abi = super::raw::landlock_abi();
-        if abi >= 1 {
+        if abi >= MIN_ABI {
             return Ok(abi);
+        }
+        if abi >= 1 {
+            // alloc: the error, once, and no sandbox is made.
+            return Err(format!(
+                "this kernel's Landlock is ABI {abi}, and blaze's sandbox needs ABI {MIN_ABI} \
+                 (every Linux 7.2 or later with Landlock on has it, so this kernel is patched)"
+            ));
         }
         let error = std::io::Error::last_os_error();
         Err(match error.raw_os_error() {
             // alloc: the error, once, and no sandbox is made.
-            Some(libc::ENOSYS) => "this kernel has no Landlock (Linux 5.13 on has it)".to_owned(),
+            Some(libc::ENOSYS) => format!(
+                "landlock_create_ruleset: {error}: this kernel is built without Landlock \
+                 (CONFIG_SECURITY_LANDLOCK=n), or a seccomp filter refuses its system calls"
+            ),
             // alloc: as above.
             Some(libc::EOPNOTSUPP) => "this kernel has Landlock turned off (`lsm=`)".to_owned(),
             // alloc: as above.
@@ -1009,12 +1033,12 @@ mod landlock {
     }
 
     /// Restricts this process and what it runs: no write but below `writable` and to
-    /// [`DEVICES`], and, where the kernel has them, no TCP `bind` or `connect` but with the
-    /// `network`, no abstract Unix socket and no signal outside.
+    /// [`DEVICES`], no TCP `bind` or `connect` but with the `network`, no abstract Unix socket
+    /// and no signal outside.
     pub(super) fn restrict(writable: &[PathBuf], network: bool) -> Result<(), String> {
-        let abi = abi()?;
-        let mut file = WRITE_FILE;
-        let mut dir = WRITE_FILE
+        abi()?;
+        let file = WRITE_FILE | TRUNCATE;
+        let dir = WRITE_FILE
             | REMOVE_DIR
             | REMOVE_FILE
             | MAKE_CHAR
@@ -1023,26 +1047,15 @@ mod landlock {
             | MAKE_SOCK
             | MAKE_FIFO
             | MAKE_BLOCK
-            | MAKE_SYM;
-        if abi >= 2 {
-            dir |= REFER;
-        }
-        if abi >= 3 {
-            file |= TRUNCATE;
-            dir |= TRUNCATE;
-        }
+            | MAKE_SYM
+            | REFER
+            | TRUNCATE;
         let attr = RulesetAttr {
             handled_access_fs: dir,
-            handled_access_net: if abi >= 4 && !network { BIND_TCP | CONNECT_TCP } else { 0 },
-            scoped: if abi >= 6 { SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL } else { 0 },
+            handled_access_net: if network { 0 } else { BIND_TCP | CONNECT_TCP },
+            scoped: SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL,
         };
-        // The structure as long as this version knows it.
-        let size: usize = match abi {
-            1..=3 => 8,
-            4 | 5 => 16,
-            _ => 24,
-        };
-        let Some(ruleset) = super::raw::landlock_ruleset(&attr, size) else {
+        let Some(ruleset) = super::raw::landlock_ruleset(&attr) else {
             return Err(super::os("a Landlock ruleset"));
         };
         let add = |path: &Path, required: bool| -> Result<(), String> {
@@ -2091,15 +2104,25 @@ fn supervise(
     first: libc::pid_t,
     recorder: &mut Recorder,
     watch: &mut Watch,
-) {
+) -> Result<(), String> {
     // The kernel wakes the supervisor on the CPU of the thread it holds and switches to it
-    // there, as gVisor has it, rather than waking it as any other waiter. A kernel before 6.6
-    // has no such flag and refuses it: the calls are answered the same, each a wake-up later.
-    raw::set_notif_flags(listener, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP);
+    // there, as gVisor has it, rather than waking it as any other waiter. Every kernel blaze
+    // runs on has the flag, so a refusal is an error.
+    if raw::set_notif_flags(listener, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP) < 0 {
+        return Err(os(
+            "the sandbox's supervisor setting SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP on its seccomp \
+             listener (ioctl SECCOMP_IOCTL_NOTIF_SET_FLAGS)",
+        ));
+    }
     let mut scratch = Scratch::default();
-    let pidfd = raw::pidfd_open(first);
-    // `poll` passes over a negative descriptor, whose `revents` stays 0: no pidfd.
-    let ended_fd = pidfd.as_ref().map_or(-1, |it| it.as_raw_fd());
+    let Some(pidfd) = raw::pidfd_open(first) else {
+        let error = std::io::Error::last_os_error();
+        // alloc: the error, once, and the sandbox stops.
+        return Err(format!(
+            "the sandbox's supervisor opening its first process {first} (pidfd_open): {error}"
+        ));
+    };
+    let ended_fd = pidfd.as_raw_fd();
     let mut fds = [
         libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: ended_fd, events: libc::POLLIN, revents: 0 },
@@ -2122,6 +2145,7 @@ fn supervise(
         }
     }
     drop(pidfd);
+    Ok(())
 }
 
 /// What the supervisor keeps beside the record.
@@ -3205,7 +3229,7 @@ for it in "$OUT"/*; do :; done
     /// Landlock, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
     fn a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing() {
-        if let Err(why) = super::landlock::abi() {
+        if let Some(why) = landlock_off() {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
@@ -3340,7 +3364,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
     /// it, when the writer does not close it within blaze-core's waits.
     #[test]
     fn a_program_still_open_for_writing_runs_once_it_is_closed() {
-        if let Err(why) = super::landlock::abi() {
+        if let Some(why) = landlock_off() {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
@@ -3392,6 +3416,15 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         let spec = Spec { cwd: "/out".into(), env, record, view: Some(view), ..Spec::default() };
         let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
         alone::run(&spec, Some(&program))
+    }
+
+    /// Why this kernel has no Landlock at all (left out or turned off), which skips a test of
+    /// the confined sandbox; a kernel whose Landlock is too old is not skipped, and fails.
+    fn landlock_off() -> Option<String> {
+        if super::raw::landlock_abi() >= 1 {
+            return None;
+        }
+        super::landlock::abi().err()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -3605,7 +3638,7 @@ true
     /// Skipped where the kernel has no Landlock, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
     fn a_confined_sandbox_writes_a_file_given_and_refuses_a_pipe_or_a_linked_file() {
-        if let Err(why) = super::landlock::abi() {
+        if let Some(why) = landlock_off() {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");

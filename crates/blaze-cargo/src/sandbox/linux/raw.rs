@@ -323,14 +323,20 @@ pub(super) fn landlock_abi() -> c_long {
     }
 }
 
-/// A Landlock ruleset of the first `size` bytes of `attr` (what this kernel's ABI knows), or
-/// `None` with `errno` set.
-pub(super) fn landlock_ruleset(attr: &RulesetAttr, size: usize) -> Option<OwnedFd> {
-    assert!(size <= size_of::<RulesetAttr>(), "a ruleset attribute of {size} bytes");
-    // SAFETY: `attr` is a `struct landlock_ruleset_attr` (`repr(C)`, checked above) borrowed
-    // for the call, which reads its first `size` bytes, no more than it has (asserted).
-    let fd =
-        unsafe { libc::syscall(landlock::CREATE_RULESET, attr as *const RulesetAttr, size, 0) };
+/// A Landlock ruleset of the whole of `attr` (24 bytes, `handled_access_fs`,
+/// `handled_access_net` and `scoped`: every kernel blaze runs on knows all three), or `None`
+/// with `errno` set.
+pub(super) fn landlock_ruleset(attr: &RulesetAttr) -> Option<OwnedFd> {
+    // SAFETY: `attr` is a `struct landlock_ruleset_attr` (`repr(C)`, 24 bytes, checked above)
+    // borrowed for the call, which reads `size_of::<RulesetAttr>()` bytes of it, all it has.
+    let fd = unsafe {
+        libc::syscall(
+            landlock::CREATE_RULESET,
+            attr as *const RulesetAttr,
+            size_of::<RulesetAttr>(),
+            0,
+        )
+    };
     if fd < 0 {
         return None;
     }

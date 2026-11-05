@@ -396,7 +396,8 @@ mod unix {
         }
         if stx.stx_mask & libc::STATX_MNT_ID == 0 {
             return Err(format!(
-                "{shown} is on FUSE, and this kernel does not report a descriptor's mount (statx STATX_MNT_ID, Linux 5.8): refused (ix-prof trusts a FUSE mount only once it has checked who mounted it; use a directory on a local disk)"
+                "{shown} is on FUSE, and statx of it returned a mask ({:#x}) without the STATX_MNT_ID it asked for, so the kernel did not say which mount it is on: refused (ix-prof trusts a FUSE mount only once it has checked who mounted it; use a directory on a local disk)",
+                stx.stx_mask
             ));
         }
         let table = std::fs::read_to_string("/proc/self/mountinfo") // alloc: once per FUSE directory opened

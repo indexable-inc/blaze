@@ -317,18 +317,8 @@ mod unix {
         pub struct Kept(Vec<(u32, u32)>);
 
         impl Kept {
-            /// What is open now, which every test's child keeps; an error on a kernel without
-            /// `close_range` (before 5.9).
+            /// What is open now, which every test's child keeps.
             pub fn now() -> Result<Kept, String> {
-                // SAFETY: `close_range` takes integers and touches no memory of ours; the range
-                // of the one descriptor `u32::MAX`, never open, closes nothing and only asks
-                // whether the kernel has the call.
-                let asked = unsafe {
-                    syscall(CLOSE_RANGE, u32::MAX as ::core::ffi::c_long, u32::MAX as ::core::ffi::c_long, 0 as ::core::ffi::c_long)
-                };
-                if asked != 0 {
-                    return Err(format!("close_range: {} (blaze's fork server needs Linux 5.9 or later)", std::io::Error::last_os_error())); // alloc: error path
-                }
                 let mut open: Vec<u32> = Vec::new(); // alloc: setup, once per server
                 let listing = std::fs::read_dir("/proc/self/fd").map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
                 for entry in listing {
@@ -347,8 +337,9 @@ mod unix {
             }
 
             /// In the test's child: its output on 1 and 2, and every descriptor of the server's
-            /// closed. `_servers` is what the other platforms close one by one.
-            pub fn into_child(&self, theirs: Int, _servers: impl Iterator<Item = Int>) {
+            /// closed, or the `close_range` that was refused. `_servers` is what the other
+            /// platforms close one by one.
+            pub fn into_child(&self, theirs: Int, _servers: impl Iterator<Item = Int>) -> Result<(), String> {
                 // SAFETY: `theirs` is open until the closes below; 1 and 2 become copies of it,
                 // and stay, being below 3.
                 unsafe { dup2(theirs, 1) };
@@ -358,8 +349,12 @@ mod unix {
                     // SAFETY: in the test's child, which leaves by `_exit` and never uses the
                     // server's owners again (`start`), so no descriptor is closed twice or used
                     // after its close; `theirs` is in a gap, closed here after its copies.
-                    unsafe { syscall(CLOSE_RANGE, first as ::core::ffi::c_long, last as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
+                    let closed = unsafe { syscall(CLOSE_RANGE, first as ::core::ffi::c_long, last as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
+                    if closed != 0 {
+                        return Err(format!("close_range({}, {}, 0) of the server's descriptors in a test's child: {}", first, last, std::io::Error::last_os_error())); // alloc: error path
+                    }
                 }
+                Ok(())
             }
         }
     }
@@ -383,7 +378,7 @@ mod unix {
 
             /// In the test's child: every descriptor of `servers` closed, and its output on 1
             /// and 2.
-            pub fn into_child(&self, theirs: Int, servers: impl Iterator<Item = Int>) {
+            pub fn into_child(&self, theirs: Int, servers: impl Iterator<Item = Int>) -> Result<(), String> {
                 for fd in servers {
                     // SAFETY: in the test's child, which leaves by `_exit` and never uses the
                     // server's owners again (`start`), so no descriptor is closed twice or used
@@ -398,6 +393,7 @@ mod unix {
                     // SAFETY: as above, `theirs` is not used in the child after this; 1 and 2 stay.
                     unsafe { close(theirs) };
                 }
+                Ok(())
             }
         }
     }
@@ -718,7 +714,12 @@ mod unix {
                     .iter()
                     .flat_map(|child| ::core::iter::once(child.output.as_raw_fd()).chain(child.exit.as_ref().map(|it| it.as_raw_fd()))),
             );
-            kept.into_child(theirs.as_raw_fd(), servers);
+            if let Err(why) = kept.into_child(theirs.as_raw_fd(), servers) {
+                eprintln!("blaze's fork server: {}", why);
+                // SAFETY: `_exit` ends the process at once and returns to nothing, as below; the
+                // test never runs with the server's descriptors open.
+                unsafe { _exit(101) }
+            }
             let armed = region.arm();
             if armed != 0 {
                 eprintln!("blaze's fork server: the runtime did not arm the execution record ({}); what this test executed is not known", armed);

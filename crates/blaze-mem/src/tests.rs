@@ -345,11 +345,6 @@ fn unadvised_memory_follows_the_process_opt_out_on_linux() {
     let thp = huge::thp();
     assert_ne!(thp, huge::Thp::Unset, "choosing the pages sets the process policy");
     assert_eq!(crate::tag::snapshot().thp, thp, "the profile says the policy");
-    if thp == huge::Thp::Unavailable {
-        // A kernel before 6.18 under the default transparent setting: only our regions are
-        // opted out, which the tests above hold.
-        return;
-    }
     let bytes = 64 << 20;
     // SAFETY: a fresh anonymous mapping, unmapped below.
     let base = unsafe {

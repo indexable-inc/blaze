@@ -181,36 +181,47 @@ pub(crate) unsafe fn keep_base_pages(_ptr: NonNull<u8>, _bytes: usize) {}
 /// global allocator's when it is not on huge pages, thread stacks, libc's own mappings),
 /// given the pages its huge regions are made of ([`crate::huge::Thp`]).
 ///
-/// - `Pages::Transparent`: only advised memory gets them, as under the
-///   host setting `madvise` (`PR_SET_THP_DISABLE` with `PR_THP_DISABLE_EXCEPT_ADVISED`, Linux
-///   6.18). An older kernel refuses the flag; then every region of ours is still advised one
-///   by one ([`advise_pages`]) and the rest follows the host, which [`Thp::Unavailable`]
-///   says in the memory profile.
+/// - `Pages::Transparent`: only advised memory gets them, as under the host setting `madvise`
+///   (`PR_SET_THP_DISABLE` with `PR_THP_DISABLE_EXCEPT_ADVISED`).
 /// - `Pages::Base` and `Pages::Reserved` (hugetlb, which this does not touch): none at all
-///   (`PR_SET_THP_DISABLE`, Linux 3.15).
+///   (`PR_SET_THP_DISABLE`).
+///
+/// Every kernel blaze runs on has both, so a refusal is an error naming the `prctl`, its
+/// flags and the errno (a seccomp filter that refuses `prctl`, a patched kernel), never a
+/// quiet fall back to the host setting.
 ///
 /// Linux keeps the setting across `fork` and `execve`, so a child process (rustc, the linker)
 /// runs under it too.
-///
-/// [`Thp::Unavailable`]: crate::huge::Thp::Unavailable
 #[cfg(target_os = "linux")]
-pub(crate) fn opt_out_unadvised(pages: crate::huge::Pages) -> crate::huge::Thp {
+pub(crate) fn opt_out_unadvised(pages: crate::huge::Pages) -> io::Result<crate::huge::Thp> {
     use crate::huge::{Pages, Thp};
-    /// `prctl.h`'s `PR_THP_DISABLE_EXCEPT_ADVISED` (Linux 6.18).
+    /// `prctl.h`'s `PR_THP_DISABLE_EXCEPT_ADVISED`.
     const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 1 << 1;
-    let (flags, then) = match pages {
-        Pages::Transparent => (PR_THP_DISABLE_EXCEPT_ADVISED, Thp::AdvisedOnly),
-        Pages::Base | Pages::Reserved => (0, Thp::Off),
+    let (flags, then, named) = match pages {
+        Pages::Transparent => {
+            (PR_THP_DISABLE_EXCEPT_ADVISED, Thp::AdvisedOnly, "PR_THP_DISABLE_EXCEPT_ADVISED")
+        }
+        Pages::Base | Pages::Reserved => (0, Thp::Off, "0"),
     };
     let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
     // SAFETY: sets one flag of this process's memory descriptor; reads and writes no memory.
     let set = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, on, flags, unused, unused) };
-    if set == 0 { then } else { Thp::Unavailable }
+    if set != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            // alloc: the error, once, and no huge region is reserved.
+            format!(
+                "prctl(PR_SET_THP_DISABLE, 1, {named}) for the {pages:?} pages chosen: {error}"
+            ),
+        ));
+    }
+    Ok(then)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn opt_out_unadvised(_pages: crate::huge::Pages) -> crate::huge::Thp {
-    crate::huge::Thp::NotLinux
+pub(crate) fn opt_out_unadvised(_pages: crate::huge::Pages) -> io::Result<crate::huge::Thp> {
+    Ok(crate::huge::Thp::NotLinux)
 }
 
 #[cfg(windows)]
@@ -583,7 +594,7 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
 /// Makes `[ptr, ptr + bytes)` readable and writable on 2 MiB pages of the reserved hugetlb
 /// pool, every page made now, preferred on NUMA node `node` when given. Errs, with the range
 /// given back to the reservation, when the pool has too few free pages: populating is what
-/// takes them, so no later touch can fault for want of one (`MADV_POPULATE_WRITE`, Linux 5.14).
+/// takes them, so no later touch can fault for want of one (`MADV_POPULATE_WRITE`).
 ///
 /// The range is also `MADV_DONTFORK`: a child made by `fork` gets no copy of it, so a write
 /// after a fork never needs a page of the pool for copy-on-write. A child reaches none of the
@@ -656,7 +667,9 @@ pub(crate) unsafe fn commit_reserved(
 fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
     let hint = match why.raw_os_error() {
         Some(libc::EINVAL) if step.starts_with("making") => {
-            "populating needs Linux 5.14 (`MADV_POPULATE_WRITE`)"
+            "`MADV_POPULATE_WRITE` refused this private anonymous MAP_HUGETLB mapping as a kind \
+             it cannot populate (it refuses VM_PFNMAP and VM_IO mappings, and a range not wholly \
+             mapped)"
         }
         Some(libc::ENOMEM | libc::EFAULT) => {
             "the pool has too few free 2 MiB pages: reserve more (`sysctl vm.nr_hugepages`)"
@@ -680,8 +693,9 @@ pub(crate) unsafe fn commit_reserved(
 }
 
 /// Asks Linux to make `[ptr, ptr + bytes)`, committed and partly touched while it was made of
-/// base pages, one huge page now, its contents kept (`MADV_COLLAPSE`, Linux 6.1). Advice: an
-/// older kernel or a refusal leaves base pages, which khugepaged may collapse later.
+/// base pages, one huge page now, its contents kept (`MADV_COLLAPSE`). Advice: a refusal (no
+/// free huge page now, `EAGAIN` or `ENOMEM`, or transparent huge pages off) leaves base pages,
+/// which khugepaged may collapse later.
 ///
 /// # Safety
 ///
