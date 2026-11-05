@@ -48,6 +48,9 @@ struct State {
     link: Retained<CAMetalDisplayLink>,
     window: Retained<NSWindow>,
     last: Option<f64>,
+    /// The view's size in points and its backing scale at the last frame drawn (what a step out of sight lays out for).
+    points: (f32, f32),
+    backing: f32,
     title: String,
     /// The traffic lights' opacity as last set (they fade with the sidebar's fold).
     lights: f32,
@@ -98,9 +101,56 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 fn wake() {
+    if UNSEEN.load(Ordering::SeqCst) {
+        if ASLEEP.swap(false, Ordering::SeqCst) {
+            step_unseen_soon();
+        }
+        return;
+    }
     ASLEEP.store(false, Ordering::SeqCst);
     with(|st| st.link.setPaused(false));
 }
+
+/// The window is out of sight (covered by others, miniaturized, on another Space, the screen locked or asleep): the
+/// display link stops calling, so no frame would take the daemon's messages, and they would pile up in the mailbox for
+/// as long as it stays hidden (terminal output, chat events). Out of sight the link is paused and each wake steps the
+/// app without drawing ([`step_unseen`]) instead, so the world, terminals and transcripts stay current and nothing
+/// waits longer than [`UNSEEN_STEP`].
+static UNSEEN: AtomicBool = AtomicBool::new(false);
+
+/// How long a wake out of sight waits before its step, so a burst of messages is one step.
+const UNSEEN_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn step_unseen_soon() {
+    let when = dispatch2::DispatchTime::try_from(UNSEEN_STEP).expect("a short delay");
+    let _ = DispatchQueue::main().after(when, step_unseen);
+}
+
+/// One step of the app with nothing drawn, out of sight: it takes the daemon's messages as a frame would. Then asleep
+/// (the next message wakes it), or another step when messages came during this one.
+fn step_unseen() {
+    if !UNSEEN.load(Ordering::SeqCst) {
+        // Back in sight since this was asked for: frames take the messages.
+        wake();
+        return;
+    }
+    let seen = POSTED.load(Ordering::SeqCst);
+    let stepped = with(|st| {
+        st.link.setPaused(true);
+        let now = objc2_quartz_core::CACurrentMediaTime();
+        let dt = st.last.map_or(1.0 / 120.0, |l| (now - l).clamp(0.0, 0.1)) as f32;
+        st.last = Some(now);
+        let renderer = &st.renderer;
+        let _ = st.app.frame(st.points, st.backing, dt, &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b));
+    })
+    .is_some();
+    ASLEEP.store(true, Ordering::SeqCst);
+    // A message posted during the step, or a step that could not run (the state was in use): step again.
+    if (!stepped || POSTED.load(Ordering::SeqCst) != seen) && ASLEEP.swap(false, Ordering::SeqCst) {
+        step_unseen_soon();
+    }
+}
+
 
 /// The display link is paused (the app went idle): the next daemon message must wake it. While it runs, each frame
 /// drains the daemon's messages itself, so the daemon's threads leave the main thread alone.
@@ -114,6 +164,10 @@ fn wake_from_any_thread() -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
         POSTED.fetch_add(1, Ordering::SeqCst);
         if !ASLEEP.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if UNSEEN.load(Ordering::SeqCst) {
+            step_unseen_soon();
             return;
         }
         // Only unpause: the frame drains the message and draws on if it changed anything (`daemon`), else sleeps again.
@@ -432,6 +486,28 @@ define_class!(
             self.sync_chrome();
         }
 
+        /// The window came into sight or went out of it ([`UNSEEN`]).
+        #[unsafe(method(windowOcclusionChanged:))]
+        fn occlusion_changed(&self, _note: &NSNotification) {
+            let Some(visible) = with(|st| {
+                st.window.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible)
+            }) else {
+                return;
+            };
+            if visible == !UNSEEN.load(Ordering::SeqCst) {
+                return;
+            }
+            if visible {
+                UNSEEN.store(false, Ordering::SeqCst);
+                with(|st| st.app.poke());
+                wake();
+            } else {
+                UNSEEN.store(true, Ordering::SeqCst);
+                ASLEEP.store(false, Ordering::SeqCst);
+                step_unseen();
+            }
+        }
+
         #[unsafe(method(windowDidResignKey:))]
         fn did_resign_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -671,6 +747,7 @@ impl HarnessView {
         with(|st| {
             let dt = st.last.map_or(1.0 / 120.0, |l| (t - l).clamp(0.0, 0.1)) as f32;
             st.last = Some(t);
+            (st.points, st.backing) = ((points.width as f32, points.height as f32), backing as f32);
             let renderer = &st.renderer;
             let draw = st.app.frame(
                 (points.width as f32, points.height as f32),
@@ -1045,6 +1122,8 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             link,
             window: window.clone(),
             last: None,
+            points: (1.0, 1.0),
+            backing: 1.0,
             title: String::new(),
             lights: 1.0,
             tip: String::new(),
@@ -1090,6 +1169,12 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             &view,
             sel!(windowDidResignKey:),
             Some(objc2_app_kit::NSWindowDidResignKeyNotification),
+            Some(&window),
+        );
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(windowOcclusionChanged:),
+            Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
             Some(&window),
         );
         // AppKit lays the title bar (and the traffic lights) out again after these.

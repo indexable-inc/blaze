@@ -23,13 +23,15 @@
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
-//! The daemon link (a thread in the app) sends [`Msg`]s; the `DaemonInbox` system applies them to the world each frame.
+//! The daemon link (a thread in the app) posts [`Msg`]s to a [`Mailbox`]; the `DaemonInbox` system applies them to the
+//! world each frame.
 pub use harness_chat as chat;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use harness_native_api::APP;
 use harness_native_flecs::prelude::*;
@@ -294,6 +296,60 @@ pub enum Msg {
     RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
 }
 
+/// Where the daemon link's threads post [`Msg`]s for the `DaemonInbox` system to take, in the order posted, except that
+/// a [`Msg::List`] or [`Msg::Runs`] is the whole tree as the daemon tells it: a new one replaces the one still waiting
+/// (in its place), since applying the older first would change nothing the newer does not. So however long nothing
+/// takes (a window the display link stopped drawing), at most one of each waits, not one per change the daemon
+/// announced (up to 20 a second, each a copy of every session and the last 100 runs).
+#[derive(Clone, Default)]
+pub struct Mailbox(Arc<Mutex<Waiting>>);
+
+#[derive(Default)]
+struct Waiting {
+    msgs: VecDeque<Msg>,
+    /// Where in `msgs` the waiting `List` and `Runs` are.
+    list: Option<usize>,
+    runs: Option<usize>,
+}
+
+impl Mailbox {
+    pub fn send(&self, msg: Msg) {
+        let mut w = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = match msg {
+            Msg::List(_) => w.list,
+            Msg::Runs(_) => w.runs,
+            _ => None,
+        };
+        if let Some(i) = slot {
+            w.msgs[i] = msg;
+            return;
+        }
+        let i = w.msgs.len();
+        match msg {
+            Msg::List(_) => w.list = Some(i),
+            Msg::Runs(_) => w.runs = Some(i),
+            _ => {}
+        }
+        w.msgs.push_back(msg);
+    }
+
+    /// Every message waiting, oldest first.
+    pub fn take(&self) -> VecDeque<Msg> {
+        let mut w = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (w.list, w.runs) = (None, None);
+        std::mem::take(&mut w.msgs)
+    }
+
+    /// How many messages wait.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).msgs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
     Up,
@@ -378,9 +434,9 @@ pub fn nz(n: u16) -> std::num::NonZeroU16 {
 /// The local device: the one daemon on this machine.
 pub const LOCAL: &str = "devices::local";
 
-/// Make the local device and install the inbox: each frame it drains `rx` into the world. Returns the terminal parsers:
+/// Make the local device and install the inbox: each frame it drains `mail` into the world. Returns the terminal parsers:
 /// the sessions' (by session id) and the runs' and stages' (by entity id), and the chat sessions' transcripts.
-pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> (Terms, Terms, Chats) {
+pub fn install(world: WorldRef<'_>, host: &str, sock: &str, mail: Mailbox) -> (Terms, Terms, Chats) {
     let dev = world.entity_named(LOCAL);
     dev.set(Device { host: host.into(), sock: sock.into() });
     dev.add((Link::id(), Connecting::id()));
@@ -407,7 +463,7 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
                 apply(w, dev, idx, &parsers, Msg::Data { id, bytes });
             }
         };
-        for msg in rx.try_iter() {
+        for msg in mail.take() {
             match msg {
                 Msg::Data { id, bytes } => {
                     match &mut data {
@@ -1085,3 +1141,4 @@ pub fn kind_name(e: EntityView<'_>) -> &'static str {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     [(*w.component_id::<Claude>(), "claude"), (*w.component_id::<Codex>(), "codex"), (*w.component_id::<CursorAgent>(), "cursor"), (*w.component_id::<Shell>(), "shell"), (*w.component_id::<Stage>(), "stage")].into_iter().find(|(id, _)| *id == k).map_or("proc", |(_, n)| n)
 }
+

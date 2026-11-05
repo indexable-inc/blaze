@@ -7,7 +7,7 @@
 //!   daemon's change feed (`watch`) says something changed, or every [`POLL`] against an older daemon without one.
 //! - Each attached object has a thread reading its stream (`attach`: a JSON ok, the snapshot, then live bytes and the
 //!   exit) into [`Msg::Data`] and [`Msg::Exit`]; its write half takes the keyboard (`T_DATA`) and resizes (`T_RESIZE`).
-use harness_native_model::{LinkState, Msg};
+use harness_native_model::{LinkState, Mailbox, Msg};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -194,7 +194,7 @@ fn follow(
 /// [`Msg`]s.
 #[derive(Clone)]
 pub struct Link {
-    tx: Sender<Msg>,
+    tx: Mailbox,
     wake: Wake,
     /// The write half of each attach stream, by session id.
     streams: Arc<Mutex<HashMap<u64, (u64, UnixStream)>>>,
@@ -212,7 +212,7 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn start(tx: Sender<Msg>, wake: Wake) -> Self {
+    pub fn start(tx: Mailbox, wake: Wake) -> Self {
         let (poke, poked) = std::sync::mpsc::channel::<()>();
         let link = Self {
             tx: tx.clone(),
@@ -248,11 +248,11 @@ impl Link {
                                 pid.store(p as u32, Ordering::Relaxed);
                             }
                             let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
-                            let _ = tx.send(Msg::List(sessions));
+                            tx.send(Msg::List(sessions));
                             // The recent shell runs, beside the sessions they ran in.
                             match request(&json!({"op": "runs", "limit": RUNS})) {
                                 Ok(v) if v.get("error").is_none() => {
-                                    let _ = tx.send(Msg::Runs(
+                                    tx.send(Msg::Runs(
                                         v["runs"].as_array().cloned().unwrap_or_default(),
                                     ));
                                 }
@@ -263,7 +263,7 @@ impl Link {
                         }
                         Err(_) => {
                             if up != Some(LinkState::Connecting) {
-                                let _ = tx.send(Msg::Link(LinkState::Connecting));
+                                tx.send(Msg::Link(LinkState::Connecting));
                                 wake();
                             }
                             match ensure_daemon() {
@@ -276,7 +276,7 @@ impl Link {
                         }
                     };
                     if up != Some(state) {
-                        let _ = tx.send(Msg::Link(state));
+                        tx.send(Msg::Link(state));
                         up = Some(state);
                     }
                     wake();
@@ -375,14 +375,14 @@ impl Link {
                     match t {
                         T_DATA => {
                             counted.fetch_add(body.len() as u64, Ordering::Relaxed);
-                            let _ = tx.send(Msg::Data { id, bytes: body });
+                            tx.send(Msg::Data { id, bytes: body });
                         }
                         T_EXIT => {
                             let code = serde_json::from_slice::<Value>(&body)
                                 .ok()
                                 .and_then(|v| v["code"].as_i64())
                                 .unwrap_or(0);
-                            let _ = tx.send(Msg::Exit { id, code: code as i32 });
+                            tx.send(Msg::Exit { id, code: code as i32 });
                         }
                         _ => {}
                     }
@@ -392,7 +392,7 @@ impl Link {
                 if map.get(&id).is_some_and(|(g, _)| *g == generation) {
                     map.remove(&id);
                     drop(map);
-                    let _ = tx.send(Msg::Detached { id });
+                    tx.send(Msg::Detached { id });
                     wake();
                 }
             })
@@ -495,7 +495,7 @@ impl Link {
                 let send = |err: bool, data: &str| {
                     if !data.is_empty() {
                         counted.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let _ = tx.send(Msg::RunData {
+                        tx.send(Msg::RunData {
                             run,
                             stage,
                             err,
@@ -517,7 +517,7 @@ impl Link {
                         follow(run, stage, "err", &current, |v| {
                             let data = v["data"].as_str().unwrap_or("");
                             if !data.is_empty() {
-                                let _ = tx.send(Msg::RunData {
+                                tx.send(Msg::RunData {
                                     run,
                                     stage,
                                     err: true,
@@ -557,7 +557,7 @@ impl Link {
                 }
             };
             let full = runs.len() >= PAGE;
-            let _ = tx.send(Msg::RunsPage { runs, full });
+            tx.send(Msg::RunsPage { runs, full });
             wake();
         });
     }
@@ -568,7 +568,7 @@ impl Link {
         let (tx, wake, q) = (self.tx.clone(), self.wake.clone(), q.to_owned());
         std::thread::spawn(move || match request(&json!({"op": "runs", "limit": PAGE, "q": q})) {
             Ok(v) if v.get("error").is_none() => {
-                let _ = tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
+                tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
                 wake();
             }
             Ok(v) => eprintln!("harness-native: runs matching {q:?}: {v}"),
