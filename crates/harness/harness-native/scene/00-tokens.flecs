@@ -295,8 +295,26 @@ export const result_snippet_h = 36
 
 // The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
 // well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
-export const chat_w = 720
+// chat_w is the reading column (the words, the bubble's trailing edge, the input): centred, chat_pad clear of the pane's
+// edges either side when the pane is narrower.
+export const chat_w = 672
 export const chat_pad = 24
+// Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
+// person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
+// its answer).
+export const chat_gap_block = 10
+export const chat_gap_turn = 28
+export const chat_gap_reply = 14
+export const chat_block_half = $chat_gap_block / 2
+// The person's bubble: its words' inset (even to the eye: the line's own leading adds to the vertical), its line, and the
+// least room it leaves at the leading edge.
+export const chat_bubble_pad_x = 12
+export const chat_bubble_pad_y = 7
+export const line_chat_bubble = 20
+export const chat_bubble_lead = 48
+// The input's words' inset on its plate; the status line under it keeps the same inset.
+export const chat_input_pad_x = 14
+export const chat_input_pad_y = 10
 export const size_chat = 14
 export const line_chat = 21
 export const size_chat_h1 = 19
