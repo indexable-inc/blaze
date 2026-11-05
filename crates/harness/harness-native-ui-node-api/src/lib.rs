@@ -72,6 +72,14 @@ pub struct Hidden;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Clip;
 
+/// On a `Clip` node that scrolls: its children thin out over `len` points at an edge with more of them scrolled beyond it,
+/// and cut hard at an edge they end at, so what goes under a neighbour (the chat's composer) fades instead of stopping
+/// on a line.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClipFade {
+    pub len: f32,
+}
+
 /// Which stack a root node is drawn and hit-tested in, bottom first.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -97,6 +105,7 @@ hyperion_api_layouts::api_layouts! {
     "Offscreen" => alias Offscreen,
     "Laid" => alias Laid,
     "Clip" => alias Clip,
+    "ClipFade" => alias ClipFade,
     "Hidden" => alias Hidden,
     "Layer" => alias Layer,
     Level,
@@ -134,6 +143,7 @@ pub fn register(world: &World) {
     world.component::<Offscreen>().writable();
     world.component::<Laid>().writable();
     world.component::<Clip>().writable();
+    world.component::<ClipFade>().writable();
     world.component::<Hidden>();
     world.component::<Layer>().writable();
 }

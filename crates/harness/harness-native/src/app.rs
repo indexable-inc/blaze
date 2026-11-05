@@ -1792,8 +1792,8 @@ impl App {
                 }
             }
             if p.clipped && !scroller_part {
-                // Cut to the tree's band: soft at an edge with more of the tree beyond it (not its scroller).
-                if let Some(fade) = self.tree_fade(&p) {
+                // Cut to its band: soft at an edge with more beyond it (the tree's, else its clip's ClipFade; not a scroller).
+                if let Some(fade) = self.tree_fade(&p).or_else(|| (p.fade != [0.0; 2]).then_some(p.fade)) {
                     for panel in &mut d.panels[np..] {
                         panel.clip[2..].copy_from_slice(&fade);
                     }

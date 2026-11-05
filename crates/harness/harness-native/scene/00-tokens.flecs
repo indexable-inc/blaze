@@ -312,6 +312,8 @@ export const result_snippet_h = 36
 // edges either side when the pane is narrower.
 export const chat_w = 672
 export const chat_pad = 24
+// How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
+export const chat_fade_len = 28
 // Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
 // person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
 // its answer).

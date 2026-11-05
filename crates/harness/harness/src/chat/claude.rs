@@ -32,9 +32,18 @@ pub struct Claude {
     /// What this process had cost by the last turn's end: Claude's `total_cost_usd` counts from the process's start, a
     /// `turn_end`'s `cost_usd` is the turn's own.
     cost_before: f64,
+    /// The effort its launch passed as `--effort` (profiles.rs): Claude's init does not say it, so its `session` event
+    /// carries this.
+    effort: Option<String>,
 }
 
 impl Claude {
+    /// An adapter for a claude launched with `effort` ([`crate::profiles::Launch::effort`]).
+    #[must_use]
+    pub fn new(effort: Option<String>) -> Self {
+        Self { effort, ..Self::default() }
+    }
+
     fn partial(&mut self, e: &Value) -> Vec<Body> {
         match e["type"].as_str().unwrap_or("") {
             "message_start" => {
@@ -203,6 +212,7 @@ impl super::Adapter for Claude {
                 agent: "claude".to_owned(),
                 model: v["model"].as_str().unwrap_or("").to_owned(),
                 session_id: v["session_id"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
+                effort: self.effort.clone(),
             }],
             "stream_event" => self.partial(&v["event"]),
             "assistant" => self.assistant(&v),

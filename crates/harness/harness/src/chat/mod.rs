@@ -338,6 +338,11 @@ impl Chat {
         self.store.lock().transcript.model.clone()
     }
 
+    /// The reasoning effort its agent runs with; empty when its `session` event did not say.
+    pub fn effort(&self) -> String {
+        self.store.lock().transcript.effort.clone()
+    }
+
     /// The agent's own id for this conversation (what resumes it), when its log said one.
     pub fn session_id(&self) -> Option<String> {
         Some(self.store.lock().transcript.session_id.clone()).filter(|s| !s.is_empty())

@@ -1053,13 +1053,18 @@ impl App {
         }
         if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
             let o = w.entity_from_id(e);
-            let model = if t.model.is_empty() {
-                o.try_cloned::<&model::AgentModel>().map(|m| m.s.as_str().to_owned()).unwrap_or_default()
+            // The model and the effort it runs with ("claude-opus-5-5 · high"): the transcript's when its `session`
+            // event said them, else the daemon's listing; the model alone when the effort is unknown.
+            let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
+            let (model, effort) = if t.model.is_empty() {
+                (listed.s.as_str().to_owned(), listed.effort.as_str().to_owned())
             } else {
-                t.model.clone()
+                let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
+                (t.model.clone(), effort.to_owned())
             };
+            let shown = if model.is_empty() || effort.is_empty() { model } else { format!("{model} \u{00B7} {effort}") };
             if let Some(m) = status.part("model") {
-                m.text(&model);
+                m.text(&shown);
             }
             let state = if self.status_of(e) != "running" {
                 "ended \u{00B7} a message resumes it"
