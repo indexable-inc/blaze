@@ -16,7 +16,7 @@ use harness_native_ui_layout_api::{
 };
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
-    Animate, CopyFlash, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Pose, Reveal, Shown, ShownWhen, SizeTween, Target,
+    Animate, CopyFlash, Drawn, FillTween, FromEdge, Leaving, Flip, Matched, MatchedGeometry, Motion, PadTween, Pose, Posed, Posing, Reveal, Shown, ShownWhen, SizeTween, Target,
     Transition, TransitionKind,
 };
 use harness_native_ui_node_api::{Hidden, Laid};
@@ -332,6 +332,63 @@ pub fn install(world: WorldRef<'_>) {
             still |= going;
         }
         if still {
+            moving(&w);
+        }
+    });
+
+    // Poses on springs: a Posed node's Posing chases its Posed, on the Posed's own tune (else the node's Motion, else the
+    // `ui.spring.pose` token; with none it lands), still until its `hold` (an entrance's delay). A node with no Posing yet
+    // lands on its Posed. At rest nothing is written, so the frame goes idle.
+    world.system_named::<&Posed>("Posing").each_iter(|it, row, p| {
+        let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
+        let Some(mut s) = e.try_cloned::<&Posing>() else {
+            e.set(Posing::at(*p, 0.0));
+            return;
+        };
+        let pairs = |s: &Posing| [(s.x, p.x), (s.y, p.y), (s.scale, p.scale), (s.opacity, p.opacity), (s.share, p.share)];
+        if pairs(&s).iter().all(|(sp, to)| sp.x == *to && sp.v == 0.0) {
+            return;
+        }
+        let now = w.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+        if now < s.hold {
+            moving(&w);
+            return;
+        }
+        let tune = if p.omega > 0.0 { Some(Tune { omega: p.omega, zeta: if p.zeta > 0.0 { p.zeta } else { 1.0 } }) } else { tune_of(w, e, "pose") };
+        let Some(tune) = tune else {
+            e.set(Posing::at(*p, s.hold));
+            return;
+        };
+        let mut going = false;
+        for (sp, to) in [(&mut s.x, p.x), (&mut s.y, p.y), (&mut s.scale, p.scale), (&mut s.opacity, p.opacity), (&mut s.share, p.share)] {
+            if settle(sp, to, tune, dt) {
+                going = true;
+            } else {
+                *sp = Spring::at(to);
+            }
+        }
+        e.set(s);
+        if going {
+            moving(&w);
+        }
+    });
+
+    // FLIP: after layout, a Flip node whose place in its parent moved has its Posing pushed back by the move, so it is
+    // drawn where it was this pass and springs to where it is (the Posing system, next frame on). The draw pass reads it.
+    world.system_named::<(&Laid, &mut Flip)>("Flip").phase(Phase::AfterLayout).reads(Laid::id()).writes(Posing::id()).each_iter(|it, row, (l, f)| {
+        let (e, w) = (it.entity(row), it.world());
+        let p = e.parent().and_then(|p| p.try_cloned::<&Laid>()).unwrap_or_default();
+        let (x, y) = (l.x - p.x, l.y - p.y);
+        let (dx, dy) = (f.x - x, f.y - y);
+        let seen = f.seen;
+        *f = Flip { x, y, seen: true };
+        if !seen || (dx.abs() < 0.01 && dy.abs() < 0.01) {
+            return;
+        }
+        if let Some(mut s) = e.try_cloned::<&Posing>() {
+            s.x.x += dx;
+            s.y.x += dy;
+            e.set(s);
             moving(&w);
         }
     });

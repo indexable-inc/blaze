@@ -26,6 +26,7 @@ mod genui;
 mod pick;
 
 pub(super) use genui::Live as GenLive;
+pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
 
 /// A thought's line's icon (cod-lightbulb).
 const THOUGHT: &str = "\u{EA61}";
@@ -1183,7 +1184,9 @@ impl App {
         let Some(ui) = v.part("ui") else { return };
         let mut paint = self.paint.borrow_mut();
         let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
-        genui::fill(ui, tree, "gallery.0", Some(&self.genui), true, &mut measure);
+        // HARNESS_NATIVE_GENUI_CELLS: the cells a CellRef in the tree shows (checked as the shot starts).
+        let cells = crate::gallery::genui_cells().ok().flatten();
+        genui::fill_in(ui, tree, "gallery.0", cells, Some(&self.genui), true, &mut measure);
     }
 
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
@@ -1271,7 +1274,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy };
+                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1465,6 +1468,7 @@ impl App {
         self.step_genui();
         // A press off the picker's open menu closes it.
         self.step_chat_pick();
+        self.step_genui_common();
     }
 
     /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
@@ -1917,7 +1921,8 @@ impl App {
     /// its transcript it starts a selection there; a drag extends either. A press on a cell's field is the field's
     /// ([`Self::genui_pointer_down`]). Whether a chat took it.
     pub(super) fn chat_pointer_down(&mut self, clicks: isize) -> bool {
-        if self.genui_pointer_down(clicks) {
+        let took = self.genui_common_down();
+        if self.genui_pointer_down(clicks) || took {
             return true;
         }
         let Some((p, _, sid)) = self.focused_chat() else { return false };
@@ -1967,7 +1972,7 @@ impl App {
     /// The pointer moved with a chat's press held: its selection follows (the press's own span kept whole), a cell's
     /// field's as well ([`Self::genui_pointer_drag`]). Whether a chat is being dragged in.
     pub(super) fn chat_pointer_drag(&mut self) -> bool {
-        if self.genui_pointer_drag() {
+        if self.genui_common_drag() || self.genui_pointer_drag() {
             return true;
         }
         let held = self.chat.borrow().iter().find_map(|(sid, st)| st.drag.map(|d| (*sid, d)));
@@ -2001,7 +2006,7 @@ impl App {
     /// The press let go: a drag ends (a cell's field's too), and a transcript selection that covers nothing goes. Whether
     /// a chat was dragged in.
     pub(super) fn chat_pointer_up(&mut self) -> bool {
-        let mut any = self.genui_pointer_up();
+        let mut any = self.genui_common_up() | self.genui_pointer_up();
         for st in self.chat.borrow_mut().values_mut() {
             if st.drag.take().is_some() {
                 any = true;
@@ -2073,11 +2078,13 @@ struct RowCtx<'k> {
     ui: Option<&'k std::cell::RefCell<GenLive>>,
     /// Its agent is at work: a cell's UI new to the transcript plays (genui's `playing`).
     playing: bool,
+    /// The transcript's cells by tool call, for a cell's UI that shows another (a CellRef).
+    cells: Option<&'k HashMap<String, Detail>>,
 }
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false };
+    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false, cells: None };
 }
 
 impl RowCtx<'_> {
@@ -2171,13 +2178,13 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Table(t) => {
             if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
                 let action = ctx.row_action();
-                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: action.as_deref(), open: ctx.open };
+                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: action.as_deref(), open: ctx.open, ..view::table::Opts::default() };
                 view::table(grid, t, opts, measure);
             }
         }
         Row::Results { v, cap } => fill_results(row, v, *cap),
         Row::Ui { v, cell, block, code } => {
-            genui::fill(row, v, cell, ctx.ui, ctx.playing, measure);
+            genui::fill_in(row, v, cell, ctx.cells, ctx.ui, ctx.playing, measure);
             // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
             if let Some(b) = row.part("code_at").and_then(|z| z.part("code")) {
                 b.action(&format!("chat:open:{}", code_key(block)));
@@ -2301,7 +2308,7 @@ fn fill_grid(row: View<'_>, v: &Value, cap: usize, ctx: &RowCtx<'_>, measure: &m
     let shown = data.rows.len().min(cap);
     if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
         let action = ctx.row_action().filter(|_| kind != "record");
-        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: action.as_deref(), open: ctx.open };
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: action.as_deref(), open: ctx.open, ..view::table::Opts::default() };
         view::table(grid, &data, opts, measure);
     }
     if let Some(f) = row.part("foot") {

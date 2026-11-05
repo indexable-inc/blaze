@@ -20,6 +20,23 @@ pub struct Breath {
     pub up: bool,
 }
 
+/// What waits a moment before it shows (den's PendingLook): unseen for `delay` seconds after it first shows, then faded in
+/// on the spring of the same prefab's `Motion` (a cell's Loading and Skeleton, scene/widgets/genui.flecs hn.GenPending),
+/// so a wait that ends at once never flickers.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShowAfter {
+    pub delay: f32,
+}
+
+/// A band sweeping along a span (den ui/progress.rs's shimmer): across in `period` seconds, eased so it lingers at each end,
+/// `share` of the span long, its alpha falling to `low` of full as an end of the span cuts it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sweep {
+    pub period: f32,
+    pub share: f32,
+    pub low: f32,
+}
+
 /// A part shown only while row `row` is hovered (its opacity the row's hover spring), or always when `keep`. Row 0: the
 /// part's nearest ancestor with a row's hover look (what a scene template writes: it cannot name its instance's id).
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -66,6 +83,8 @@ pub fn register(world: &World) {
     world.component::<Breath>().writable();
     world.component::<HoverShow>().writable();
     world.component::<Disclose>().writable();
+    world.component::<ShowAfter>().writable();
+    world.component::<Sweep>().writable();
 }
 
 /// The theme's `role` (`hn.Theme.<role>`, scene/10-harness.flecs). The scene is compiled in, so a role it lacks is a bug.

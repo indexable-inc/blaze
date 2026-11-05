@@ -763,6 +763,10 @@ impl App {
         if b == Button::Left && self.chat_pointer_down(clicks) {
             return;
         }
+        // A right press in a cell's context menu's region opens it at the pointer.
+        if b == Button::Right && self.genui_context() {
+            return;
+        }
         let Some(t) = self.term_at() else { return };
         let Some((vr, col)) = self.pointer_cell(t, false) else { return };
         if self.reporting(t, m) {
@@ -980,6 +984,10 @@ impl App {
     /// send up the responder chain), else typing for whatever has the keyboard.
     pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
         self.poke_why("key");
+        // An element of a cell's UI that has the keys hears them first (genui/common.rs).
+        if self.genui_common_key(k) {
+            return super::Outcome::None;
+        }
         if k.action != KeyAction::Release
             && let Some(c) = crate::keys::Chord::of(k.code, k.unshifted, k.mods)
         {

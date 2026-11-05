@@ -210,7 +210,7 @@ fn inputs(items: &[Item], room: [f32; 2], given: Option<Laid>, anchor: Option<(L
     let mut h = mix(0xcbf2_9ce4_8422_2325, room.map(|v| u64::from(v.to_bits())));
     h = mix(h, given.map(rect).into_iter().flatten());
     if let Some((a, side)) = anchor {
-        h = mix(h, rect(a).into_iter().chain([side.edge as u64, u64::from(side.dx.to_bits()), u64::from(side.dy.to_bits())]));
+        h = mix(h, rect(a).into_iter().chain([side.edge as u64, u64::from(side.dx.to_bits()), u64::from(side.dy.to_bits()), side.align as u64]));
     }
     for it in items {
         let sizing = |s: Sizing| [s.kind as u64, u64::from(s.value.to_bits()), u64::from(s.min.to_bits()), u64::from(s.max.to_bits())];
@@ -292,7 +292,7 @@ pub fn install(world: WorldRef<'_>) {
         }
         if let Some((anchor, side)) = side {
             let size = [items[root].out.w, items[root].out.h];
-            let at = anchored(anchor, size, side.edge, [side.dx, side.dy], room);
+            let at = anchored(anchor, size, side, room);
             shift(&mut items, root, at[0], at[1]);
         }
         // A stand-in moves its node with the flow; the node keeps its own size (its own root lays its children out in it).

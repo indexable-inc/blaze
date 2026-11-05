@@ -24,7 +24,7 @@
 //! exist yet and says which are in view (`range`); a Row aligned on `FirstBaseline`/`LastBaseline` lines up its text;
 //! `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's `SafeAreaInset` (a
 //! second pass, once the first has said where the node is).
-use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, SizeKind, Sizing};
+use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, Side, SizeKind, Sizing};
 use harness_native_ui_node_api::Laid;
 
 /// Whether a child is in its parent's flow or laid over the parent's whole frame, behind or in front.
@@ -723,10 +723,18 @@ fn place(items: &mut [Item], i: usize, view: [f32; 4]) {
     } else {
         match flex.axis {
             FlexAxis::Z => {
+                // Across by `align`, down by `justify` (SwiftUI's two-way `ZStack(alignment:)`); a child's AlignSelf places
+                // it both ways.
+                let down = match flex.justify {
+                    Justify::Center => Align::Center,
+                    Justify::End => Align::End,
+                    Justify::Start | Justify::SpaceBetween => Align::Start,
+                };
                 for &c in &kids {
-                    let (cw, ch, al, g) = (items[c].out.w, items[c].out.h, items[c].align_self.unwrap_or(flex.align), items[c].guide);
-                    items[c].out.x = ox + across(al, iw, cw) - g[0];
-                    items[c].out.y = oy + across(al, ih, ch) - g[1];
+                    let (cw, ch, g) = (items[c].out.w, items[c].out.h, items[c].guide);
+                    let (ax, ay) = items[c].align_self.map_or((flex.align, down), |a| (a, a));
+                    items[c].out.x = ox + across(ax, iw, cw) - g[0];
+                    items[c].out.y = oy + across(ay, ih, ch) - g[1];
                 }
             }
             FlexAxis::Row if flex.wrap => {
@@ -892,15 +900,23 @@ fn lazy_place(items: &mut [Item], i: usize, kids: &[usize], [ox, oy, iw, ih]: [f
     }
 }
 
-/// Where an anchored overlay of `size` goes against `anchor`, flipped to the opposite side when it overflows and then
-/// clamped inside `room`.
+/// Where an anchored overlay of `size` goes against `anchor` on `side` (its edge, nudge and alignment along the edge),
+/// flipped to the opposite side when it overflows and then clamped inside `room`.
 #[must_use]
-pub fn anchored(anchor: Laid, size: [f32; 2], edge: Opens, nudge: [f32; 2], room: [f32; 2]) -> [f32; 2] {
+pub fn anchored(anchor: Laid, size: [f32; 2], side: Side, room: [f32; 2]) -> [f32; 2] {
+    let (edge, nudge) = (side.edge, [side.dx, side.dy]);
+    // Along the edge: from the anchor's start, by how much the overlay's start sits past it.
+    let along = |room: f32, len: f32| match side.align {
+        Align::Center => (room - len) / 2.0,
+        Align::End => room - len,
+        _ => 0.0,
+    };
+    let (ax, ay) = (anchor.x + along(anchor.w, size[0]), anchor.y + along(anchor.h, size[1]));
     let at = |e: Opens| match e {
-        Opens::Bottom => [anchor.x + nudge[0], anchor.y + anchor.h + nudge[1]],
-        Opens::Top => [anchor.x + nudge[0], anchor.y - size[1] - nudge[1]],
-        Opens::Right => [anchor.x + anchor.w + nudge[0], anchor.y + nudge[1]],
-        Opens::Left => [anchor.x - size[0] - nudge[0], anchor.y + nudge[1]],
+        Opens::Bottom => [ax + nudge[0], anchor.y + anchor.h + nudge[1]],
+        Opens::Top => [ax + nudge[0], anchor.y - size[1] - nudge[1]],
+        Opens::Right => [anchor.x + anchor.w + nudge[0], ay + nudge[1]],
+        Opens::Left => [anchor.x - size[0] - nudge[0], ay + nudge[1]],
     };
     let fits = |p: [f32; 2]| p[0] >= 0.0 && p[1] >= 0.0 && p[0] + size[0] <= room[0] && p[1] + size[1] <= room[1];
     let flipped = match edge {

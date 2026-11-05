@@ -1,4 +1,4 @@
-import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, elementWire, holdsError, placeError, wholeChartError, wireValue } from './element.ts';
+import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, commonWire, elementWire, holdsError, placeError, taskOf, wholeChartError, wireValue, written } from './element.ts';
 import type { ElementName } from './element.ts';
 import { resolveFile, resolveMedia } from './media.ts';
 import { resolveRefs } from './shader.ts';
@@ -23,7 +23,7 @@ export interface UiNode { type: string; props: Record<string, unknown>; children
  * `there` ones must be there now (a Video's, a poster, a Shader's `.slang`), `web` ones may also be an http(s) URL (a Video's src).
  */
 const FILE_PROPS: Partial<Record<string, Readonly<Record<string, 'drawn' | 'there' | 'web'>>>> = {
-  Image: { src: 'drawn' }, FileRef: { path: 'drawn' }, Video: { src: 'web', poster: 'there' }, Shader: { src: 'there' },
+  Image: { src: 'drawn' }, FileRef: { path: 'drawn' }, File: { path: 'drawn' }, Video: { src: 'web', poster: 'there' }, Shader: { src: 'there' },
 };
 
 /** A file prop's value as its absolute path (or URL), by how FILE_PROPS takes it; `what` names it for the error. */
@@ -36,6 +36,8 @@ function textureFiles(value: unknown): unknown {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
   return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, typeof item === 'string' && item.startsWith('@') ? item : resolveMedia(item, `<Shader textures.${name}>`, true)]));
 }
+/** What a File given a path cannot also say: it is then the FileRef chip of that file, which shows none of them. */
+const NOT_ON_A_CHIP = ['size', 'modified', 'value'];
 
 /** At most one render per this long. */
 export const RENDER_MS = 16;
@@ -47,6 +49,11 @@ export interface TreeOptions {
   fail(what: string, error: unknown): void;
   /** Runs `fn` as the cell that started the tree did (its task, for its logs). */
   enter?<T>(fn: () => T): T;
+  /**
+   * The tool call id of the cell `task` (`t3`) of this lane, for a CellRef to show it by; or why it cannot be shown (this lane never
+   * ran it, it is the cell itself). A tree without it shows no other cell.
+   */
+  cell?(task: string): string | { refused: string };
 }
 
 /** A prop value as JSON: no functions, undefined or non-finite numbers; dates and bigints as text, typed arrays as arrays. */
@@ -270,6 +277,9 @@ export class UiTree implements Attachment {
       } else if (node.type === 'Shader' && name === 'textures' && value !== undefined && value !== null) {
         try { props[name] = textureFiles(value); }
         catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      } else if (node.type === 'File' && name === 'modified' && value instanceof Date) {
+        // A time as its milliseconds, which elementWire says as a File shows it (JSON would make it ISO words).
+        props[name] = value.getTime();
       } else {
         const kept = plain(value);
         if (kept !== undefined) props[name] = kept;
@@ -291,32 +301,56 @@ export class UiTree implements Attachment {
       const error = wholeChartError(props, node.at);
       if (error) throw placed(error, node.at);
     }
-    // A drawing and what it holds go as the app reads them (draw.ts), the paint a group says passed on to its shapes.
+    // A drawing and what it holds go as the app reads them (draw.ts), the paint a group says passed on to its shapes; an SVG tag's
+    // handlers go as the Canvas element's, and a Canvas element's common props as the rest's.
     if (node.type === 'Canvas' || DRAWING.has(node.type) || (node.type === 'Text' && paint)) {
       let drawn: ReturnType<typeof drawWire>;
-      try { drawn = drawWire(node.type, node.from, props, paint ?? {}, node.at); }
-      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      try {
+        drawn = drawWire(node.type, node.from, props, paint ?? {}, node.at);
+        for (const [name, id] of node.ids) drawn.props[name] = id;
+        if (!node.from) commonWire(node.type, props, drawn.props, node.at);
+      } catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
       return { type: node.type, props: drawn.props, children: leaf ? [] : this.children(node, drawn.paint) };
     }
     for (const [name, value] of Object.entries(props)) props[name] = wireValue(node.type, name, value);
+    let type = node.type;
+    // A File that names a path is that file's chip, sent as the FileRef it is.
+    if (type === 'File' && props.path !== undefined) {
+      const also = NOT_ON_A_CHIP.find(name => props[name] !== undefined);
+      if (also) throw placed(new TypeError(`<File path=... ${also}=...> is a file chip${node.at ? ` (${node.at})` : ''}: a File given a path is the FileRef chip of that file, which shows no ${also}; say name, kind, size and modified without a path for a row of a listing`), node.at);
+      type = 'FileRef';
+    }
+    // A CellRef names a cell of this lane by its task; the app finds it by the tool call that ran it.
+    if (type === 'CellRef') {
+      const where = node.at ? ` (${node.at})` : '';
+      const task = taskOf(props.task);
+      if (task === undefined) throw placed(new TypeError(`<CellRef${props.task === undefined ? '' : ` ${written('task', props.task)}`}> names no cell${where}: say task="t3" or task={3}, the id a cell's reply gives it`), node.at);
+      const found = this.options.cell?.(task) ?? { refused: 'is not shown here: this UI shows no other cell' };
+      if (typeof found !== 'string') throw placed(new TypeError(`<CellRef task="${task}"> ${found.refused}${where}`), node.at);
+      props.task = task;
+      props.call = found;
+    }
     // A control, and every element of tier 3, goes as exactly what the app reads of it (element.ts `elementWire`). One that holds only
     // its words (a Button's label) or nothing has no children on the wire; the rest hold what `holdsError` lets them, where `placeError` does.
-    if (WIRED.has(node.type)) {
+    // Then the props every element takes (element.ts `commonWire`), which elementWire leaves out.
+    if (WIRED.has(type)) {
       const where = node.at ? ` (${node.at})` : '';
-      const leaf = WORDS_ONLY.has(node.type) || !PROPS[node.type as ElementName].includes('children');
+      const leaf = WORDS_ONLY.has(type) || !PROPS[type as ElementName].includes('children');
       const inner = kids.find(child => child.isElement);
-      const holds = node.type === 'Shader' ? 'only its Slang source' : `only its words, <${node.type}>${node.type === 'Button' ? 'Save' : 'Open'}</${node.type}>`;
-      if (leaf && inner) throw placed(new TypeError(`<${node.type}> holds ${inner.type}${where}: ${WORDS_ONLY.has(node.type) ? `${article(node.type)} ${node.type} holds ${holds}` : `${article(node.type)} ${node.type} holds nothing`}`), node.at);
+      const holds = type === 'Shader' ? 'only its Slang source' : `only its words, <${type}>${type === 'Button' ? 'Save' : 'Open'}</${type}>`;
+      if (leaf && inner) throw placed(new TypeError(`<${node.type}> holds ${inner.type}${where}: ${WORDS_ONLY.has(type) ? `${article(type)} ${type} holds ${holds}` : `${article(node.type)} ${node.type} holds nothing`}`), node.at);
       try {
-        const error = placeError(node.type, node.parent?.type, node.at);
+        const error = placeError(type, node.parent?.type, node.at);
         if (error) throw error;
         const children = leaf ? [] : this.children(node);
-        const holds = holdsError(node.type, children.map(child => child.type), node.at);
+        const holds = holdsError(type, children.map(child => child.type), node.at);
         if (holds) throw holds;
-        return { type: node.type, props: elementWire(node.type, props, node.at), children };
+        return { type, props: commonWire(type, props, elementWire(type, props, node.at), node.at), children };
       } catch (error) { throw error instanceof Error && !error.stack?.includes('repl-cell.js') ? placed(error, node.at) : error; }
     }
-    return { type: node.type, props, children: leaf ? [] : this.children(node) };
+    try { commonWire(type, props, props, node.at); }
+    catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+    return { type, props, children: leaf ? [] : this.children(node) };
   }
 }
 

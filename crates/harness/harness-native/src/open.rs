@@ -4,14 +4,16 @@
 //! says which app it was.
 
 /// What a press on an `open:` action opens: `open:<url>`, `open:<path>`, or `open:<line>:<path>` (a path is absolute, so
-/// the line before it is unambiguous).
-pub fn open(target: &str) {
+/// the line before it is unambiguous). `reveal` (an Option-press) shows a file in the Finder instead of opening it.
+pub fn open(target: &str, reveal: bool) {
     let (path, line) = match target.split_once(':') {
         Some((n, rest)) if rest.starts_with('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (rest, n.parse::<u32>().ok()),
         _ => (target, None),
     };
     let cmd = if path.starts_with("https://") || path.starts_with("http://") {
         Some(Launch::Open(vec![path.to_owned()]))
+    } else if path.starts_with('/') && reveal {
+        Some(Launch::Open(vec!["-R".to_owned(), path.to_owned()]))
     } else if path.starts_with('/') {
         Some(file(path, line))
     } else {

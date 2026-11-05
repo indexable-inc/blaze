@@ -15,16 +15,11 @@ import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
 import { shown } from "./shown.ts";
 import { stripCell } from "./ui/compile.ts";
 import { count, dispatch, installUi, isElement, show, uiError } from "./ui/index.ts";
-import { parse } from "./check/shape.ts";
-import { snapshot } from "./hibernate.ts";
-import { ResultHistory } from "./results.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
 export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
 const cap = (s: string, n = 64 << 10) => (s.length > n ? s.slice(0, n) + `… [${s.length - n} more chars]` : s);
 const POST_MS = 100;
-/** This package's sources: frames in them are the harness's, not the cell's. */
-const SRC = new URL(".", import.meta.url).pathname;
 const posting = new WeakMap<Task, { chain: Promise<unknown>; timer?: Timer }>();
 
 /** The cell's state as harnessd gets it. */
@@ -128,108 +123,57 @@ export function rewrite(js: string): { body: string; names: string[] } {
   return { body, names };
 }
 
-/** A value that shows itself as a cell's result (den's `Symbol.for('repl.render')`): its method's string is what the model reads. */
-export const RENDER = Symbol.for("repl.render");
-
-/** How a cell's value reads to the model: a string as it is (a file read should not come back quoted), a value that renders itself so, anything else as NUON. */
-export function render(value: unknown): string {
-  if (typeof value === "string") return value === "" ? "''" : value;
-  if (value && (typeof value === "object" || typeof value === "function")) {
-    let renderer: unknown;
-    try { renderer = Reflect.get(value, RENDER); } catch { renderer = undefined; }
-    if (typeof renderer === "function") return String(renderer.call(value));
-  }
-  return nuon(value, { maxRows: 100 });
-}
-
-/** `repl` in a cell: earlier results, and where this lane is. */
-export interface ReplApi {
-  /** The value the cell whose reply said `t3` returned (`'t3'` or `3`); the last 50 of this lane's cells are held. */
-  result(task: string | number): unknown;
-  /** The lane this cell runs in (`main` unless the call named one). */
-  readonly lane: string;
-  /** The working directory now. */
-  readonly cwd: string;
-}
-
 export class Repl {
   /** Persistent bindings; seeded with the exposed functions. */
   readonly scope: Record<string, unknown>;
-  /** The names cells bound, in the order they were first bound: what a snapshot saves (hibernate.ts). */
-  readonly bound = new Set<string>();
-  readonly results = new ResultHistory();
-  /** The globals a cell starts with, as the checker declares them (globals.ts `CellGlobals`). */
-  readonly globalNames: string[];
 
-  constructor(globals: Record<string, unknown>, lane = "main") {
-    const results = this.results;
-    const api: ReplApi = { result: (task) => results.get(task), lane, get cwd() { return process.cwd(); } };
+  constructor(globals: Record<string, unknown>) {
     // __import: a cell's `import` (node:fs comes back with its reads and writes recorded as steps, effects.ts).
-    this.scope = { ...globals, parse, repl: api, __import: async (spec: string) => (await fsFor(spec)) ?? import(spec) };
-    // `$_`: the latest result that was not undefined; a cell that assigns it makes its own binding.
-    Object.defineProperty(this.scope, "$_", { get: () => results.last, set: (v) => Object.defineProperty(this.scope, "$_", { value: v, writable: true, enumerable: true, configurable: true }), enumerable: true, configurable: true });
+    this.scope = { ...globals, __import: async (spec: string) => (await fsFor(spec)) ?? import(spec) };
     installUi(this.scope);
-    this.globalNames = Object.keys(this.scope).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n) && !n.startsWith("__"));
     installCapture();
     installEffects();
     watchTasks(post);
   }
 
-  /** Start a cell as task `id` and return it at once; cells run concurrently, each with its own console capture.
+  /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture.
    *  `call` is the agent's id for the tool call running it, when known. */
-  run(code: string, call: string | null = null, id?: string): Task {
-    const t = newTask(code, call, id);
+  run(code: string, timeoutMs?: number, call: string | null = null): Task {
+    const t = newTask(code, call);
     post(t);
-    inTask(t, () => this.#run(t, code)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t, true); });
+    inTask(t, () => this.#run(t, code, timeoutMs)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t, true); });
     return t;
   }
 
-  /** The bindings that survive a copy, and the names of those that do not (hibernate.ts). */
-  snapshot() { return snapshot([...this.bound].map((n) => [n, () => this.scope[n]] as [string, () => unknown])); }
-
-  /** Bind saved values, as the cells that made them did. */
-  restore(values: Map<string, unknown>) {
-    for (const [n, v] of values) { this.scope[n] = v; this.bound.add(n); }
-  }
-
-  async #run(t: Task, code: string): Promise<{ ok: boolean; value: unknown; result: string }> {
-    let names: string[] = [];
-    let before: unknown[] = [];
+  async #run(t: Task, code: string, timeoutMs?: number): Promise<{ ok: boolean; value: unknown; result: string }> {
     try {
       // TypeScript with its types erased, or a cell of Svelte markup compiled (ui/compile.ts); the compiler's warnings go to the
       // cell's logs, which the agent reads.
       const js = stripCell(code, (w) => t.logs.push(`[svelte] ${w}`));
-      const rewritten = rewrite(js);
-      names = rewritten.names;
-      before = names.map((n) => this.scope[n]);
+      const { body, names } = rewrite(js);
       for (const n of names) if (!(n in this.scope)) this.scope[n] = undefined;
       // Sloppy-mode `with` routes bare identifiers to the persistent scope, falling back to globals.
-      const fn = new AsyncFunction("__scope", `with (__scope) { return await (async () => {\n${rewritten.body}\n})(); }`);
-      const value = await fn(this.scope);
-      this.#bind(t, names);
+      const fn = new AsyncFunction("__scope", `with (__scope) { return await (async () => {\n${body}\n})(); }`);
+      let timer: Timer | undefined;
+      const value = await (timeoutMs === undefined ? fn(this.scope) : Promise.race([
+        fn(this.scope),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`cell timed out after ${timeoutMs}ms`)), timeoutMs); }),
+      ]).finally(() => clearTimeout(timer)));
       // A cell whose value is a component draws it (the person sees it under the cell); the agent is told it did.
       if (isElement(value)) {
         show(t, value);
         return { ok: true, value: undefined, result: `UI shown (${count(t.ui)} elements)` };
       }
-      this.results.add(t.id, value);
-      if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${render(value)}`}` };
-      // undefined says nothing when the cell printed something (den's rule); alone it says the cell ran.
-      return { ok: true, value, result: value === undefined ? (t.logs.length ? "" : "undefined") : render(value) };
+      if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${typeof value === "string" ? value : nuon(value, { maxRows: 100 })}`}` };
+      return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
-      // A name the cell reached before it threw is bound; one it never reached keeps what it was.
-      this.#bind(t, names.filter((n, i) => this.scope[n] !== before[i]));
       // An error that came through the cell's UI is said at the cell's line, without Svelte's frames or the kernel's (ui/index.ts).
       const ui = uiError(e);
       if (ui !== undefined) return { ok: false, value: e, result: ui };
-      // Drop the harness's own frames (the cell's wrapper, parse, the functions): what is left is the error and the frames of code the cell imported.
+      // Drop the harness frames below the cell.
       const stack = e instanceof Error ? (e.stack ?? e.message).split("\n") : [String(e)];
-      return { ok: false, value: e, result: stack.filter((l) => !/^\s+at /.test(l) || !l.includes(SRC)).join("\n") };
+      const cut = stack.findIndex((l) => l.includes("at #run "));
+      return { ok: false, value: e, result: (cut > 0 ? stack.slice(0, cut) : stack).join("\n") };
     }
-  }
-
-  #bind(t: Task, names: string[]) {
-    t.bound = names;
-    for (const n of names) this.bound.add(n);
   }
 }
