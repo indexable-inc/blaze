@@ -9,6 +9,7 @@ use super::*;
 use crate::read::Found;
 
 mod model_check;
+mod place_race;
 
 fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
