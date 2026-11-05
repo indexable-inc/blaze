@@ -1,33 +1,23 @@
-//! The explorer's daemon side: the HTTP/3 WebTransport server `blaze explore` starts in the
-//! daemon, which https://ix.dev/explore connects to on 127.0.0.1 (docs/v2/plan/lanes/observe/
-//! explore.md; the wire is /tmp/blaze-lanes/explore-wire.md until it moves to docs/).
+//! The explorer's daemon side: the daemon as a source of ix-prof's explorer
+//! (`ix_prof::explore`, the HTTP/3 WebTransport server https://ix.dev/explore connects to on
+//! 127.0.0.1; docs/v2/plan/observe/explore-generic.md). `blaze explore` starts it in the
+//! daemon. This crate is the `blaze` layer alone: the transport, the certificate, the link, the
+//! token, `hello` and the live stream's framing are ix-prof's.
 //!
-//! - [`link`]: the token, the origins accepted and the link the user opens, which carries the
-//!   port, the token and the certificate's hash in its fragment (never sent to ix.dev).
-//! - [`cert`]: the self-signed ECDSA P-256 certificate the page pins by hash, valid 13 days
-//!   (WebTransport's `serverCertificateHashes` takes at most 14), and when it is made anew.
-//! - [`wire`]: what the page asks (one JSON object a bidirectional stream) and the typed errors.
-//! - [`frame`]: what the daemon answers: a header padded so the Arrow IPC stream after it starts
-//!   8-aligned, then one IPC stream, then FIN; and the live stream's frames.
+//! - [`wire`]: the `blaze` layer's ops as the page asks them, and its kinds of error.
 //! - [`tiles`]: the spans of a range per (process, thread, depth, pixel-wide bucket).
-//! - `ops`: the answer to each op, with no transport in it; [`server`]: the transport, the
-//!   sessions and the live stream.
-//!
-//! The server runs on a thread of its own with a one-thread tokio runtime: the daemon's workers
-//! never wait on a page, and the work of an answer (DuckDB, Arrow encoding) runs on tokio's
-//! blocking pool, so a slow query never holds up the live stream or another query.
+//! - `ops`: the answer to each op, with no transport in it.
+//! - `source`: the daemon's `ix_prof::explore::Source` over the history, the build world and
+//!   blaze-profile's flight recorder, and [`start`].
 
-#![feature(random)]
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
 
-pub mod cert;
-pub mod frame;
-pub mod link;
 mod ops;
-pub mod server;
+mod source;
 pub mod tiles;
 pub mod wire;
 
+pub use ix_prof::explore::{Explorer, StartError};
 pub use ops::{Flush, History};
-pub use server::{Config, Explorer, StartError, start};
+pub use source::{Config, LAYERS, NAME, start};

@@ -3,7 +3,7 @@
     uv run --frozen python .github/scripts/explore_page.py '{}'
     uv run --frozen python .github/scripts/explore_page.py '{"page": "https://ix.dev/explore/schemas.json"}'
 
-The page lives in indexable-inc/ix (packages/web/src/lib/explore/client.ts, `SCHEMAS`) and
+The page lives in indexable-inc/ix (packages/web/src/lib/explore/schema.ts, `SCHEMAS`) and
 deploys from ix's main; the daemon's `hello` sends blaze-profile's `schema::VERSION`
 (crates/blaze-profile/src/schema.rs). A page that does not read the daemon's version refuses
 the session, so a blaze whose version the deployed page lacks must not land or be released:
@@ -27,7 +27,7 @@ from typed_input import parse
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_RS = ROOT / "crates/blaze-profile/src/schema.rs"
-PAGE_SOURCE = "indexable-inc/ix packages/web/src/lib/explore/client.ts (SCHEMAS)"
+PAGE_SOURCE = "indexable-inc/ix packages/web/src/lib/explore/schema.ts (SCHEMAS)"
 
 
 @dataclass(frozen=True)
