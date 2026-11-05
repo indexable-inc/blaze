@@ -48,8 +48,8 @@ from typed_input import fail, parse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from storelib import SCRUBBED, artifact, blaze_toolchain_of  # noqa: E402
-from storelib import Failed as Refused  # noqa: E402
+from storelib import SCRUBBED, artifact, blaze_toolchain_of
+from storelib import Failed as Refused
 
 SCRIPT = "norustc/setup.py"
 REPO = "https://github.com/indexable-inc/blaze"

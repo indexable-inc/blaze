@@ -17,7 +17,9 @@
 //! never queued is one asked for while its job answers another's question ([`answering`]): the
 //! thread of that other expansion waits for the answer, so making it wait for a thread could
 //! leave every thread of the cap waiting on the queue. Such a nested expansion gets a thread
-//! past the cap, which ends with it.
+//! past the cap, which ends with it, up to a [`ceiling`] of [`NESTING`] times the cap: past
+//! that, the expansion is refused with an error naming the counts (bounded-progress), never a
+//! thread more, so no chain of expansions can take the process to its thread limit.
 
 use std::{
     cell::Cell,
@@ -222,6 +224,17 @@ pub(crate) fn cap() -> usize {
     2 * blaze_graph::exec::shared().workers().max(1)
 }
 
+/// How many times [`cap`] the expansion threads alive may reach with nested expansions: each
+/// level of expansions asked for while answering another's question takes at most a cap's
+/// worth more, and no real crate nests this deep.
+const NESTING: usize = 8;
+
+/// The most expansion threads alive at once, nested ones included: past it a nested expansion
+/// is refused ([`submit`]).
+pub(crate) fn ceiling() -> usize {
+    NESTING * cap()
+}
+
 thread_local! {
     /// How many expansions' questions the job on this thread is answering now: carried with
     /// the job across its waits ([`blaze_query::carry`]), so an expansion its answer asks for
@@ -276,7 +289,8 @@ impl Drop for Answering {
 }
 
 /// Gives `job` to an idle expansion thread, or to a new one while fewer than [`cap`] are alive
-/// (or always, for a `nested` one), else queues it for the first thread to end its expansion.
+/// (or, for a `nested` one, fewer than [`ceiling`]), else queues it for the first thread to end
+/// its expansion. A nested one past the ceiling is refused, naming the counts.
 fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
     let cap = cap();
     let mut threads = wait::lock(&THREADS, THREADS_NAME);
@@ -293,6 +307,17 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
     if !nested && threads.started >= cap {
         threads.queued.push_back(job);
         return Ok(());
+    }
+    let ceiling = ceiling();
+    if threads.started >= ceiling {
+        let started = threads.started;
+        drop(threads);
+        // alloc: error path
+        return Err(Stop(format!(
+            "refused a nested wasm expansion: {started} expansion threads are alive, the ceiling \
+             of {ceiling} ({NESTING} levels of nesting times the cap of {cap}, twice the \
+             workers) is reached (bounded-progress: no expansion takes a thread past it)"
+        )));
     }
     threads.started += 1;
     drop(threads);
@@ -343,7 +368,11 @@ mod tests {
 
     use parking_lot::{Condvar, Mutex};
 
-    use super::{cap, submit};
+    use super::{cap, ceiling, submit};
+
+    /// Held by each test: they share the process's expansion threads, and one holding the
+    /// ceiling would refuse another's nested expansion.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// A gate the test's expansions wait at until it opens, and how many of them run now, ran
     /// at most at once, and are done.
@@ -394,6 +423,7 @@ mod tests {
     /// crates or programs a build expands, and the rest wait for a thread, not for each other.
     #[test]
     fn expansions_past_the_cap_wait_for_a_thread_and_all_run() {
+        let _serial = SERIAL.lock();
         let cap = cap();
         let gate = Arc::new(Gate::default());
         let count = 3 * cap;
@@ -415,6 +445,7 @@ mod tests {
     /// so queueing it could leave the cap waiting on itself.
     #[test]
     fn a_nested_expansion_runs_while_the_cap_is_busy() {
+        let _serial = SERIAL.lock();
         let cap = cap();
         let gate = Arc::new(Gate::default());
         for _ in 0..cap {
@@ -433,5 +464,27 @@ mod tests {
         gate.open();
         assert!(ran, "the nested expansion ran while the cap's threads were busy");
         assert!(gate.reaches(Duration::from_secs(60), |it| it.done.load(Ordering::Acquire) == cap));
+    }
+
+    /// Nested expansions take threads past the cap only up to the ceiling: one more is refused
+    /// with an error naming the counts, and the threads alive never pass it.
+    #[test]
+    fn nested_expansions_stop_at_the_ceiling() {
+        let _serial = SERIAL.lock();
+        let ceiling = ceiling();
+        let gate = Arc::new(Gate::default());
+        let mut handed = 0;
+        let refused = loop {
+            match submit(true, gate.job()) {
+                Ok(()) => handed += 1,
+                Err(stop) => break stop,
+            }
+            assert!(handed <= ceiling, "{handed} nested expansions got threads, past {ceiling}");
+        };
+        assert!(refused.0.contains("ceiling"), "the refusal names the ceiling: {}", refused.0);
+        gate.open();
+        let all =
+            gate.reaches(Duration::from_secs(60), |it| it.done.load(Ordering::Acquire) == handed);
+        assert!(all, "{} of {handed} nested expansions ran", gate.done.load(Ordering::Acquire));
     }
 }

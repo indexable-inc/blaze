@@ -461,6 +461,7 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         Response::Status(Status {
             pid: 4242,
+            uptime_ms: 40,
             bugs: Vec::new(),
             views: 1,
             requests: vec![1, 2],
@@ -473,6 +474,7 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         Response::Status(Status {
             pid: 1,
+            uptime_ms: u64::MAX,
             bugs: vec![blaze_api::Bug {
                 at: "crates/hir-ty/src/next_solver/interner.rs:1:1".to_owned(),
                 kind: "AdtDef".to_owned(),
