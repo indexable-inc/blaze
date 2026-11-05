@@ -989,7 +989,7 @@ impl Row {
                 };
                 items.iter().map(|r| format!("- {}", line(r))).collect::<Vec<_>>().join("\n")
             }
-            Row::Ui { v } => genui::plain(v),
+            Row::Ui { v, .. } => genui::plain(v),
             Row::Tool { .. }
             | Row::Thinking { .. }
             | Row::Card { .. }

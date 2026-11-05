@@ -916,16 +916,6 @@ impl App {
             "send" if k == Kind::Area => _ = self.genui_draft(|d| d.insert("\n")),
             "newline" => {}
             "send" | "submit" => self.genui_submit(),
-            "cut" => {
-                let mut cut = String::new();
-                self.genui_draft(|d| {
-                    cut = d.selected().to_owned();
-                    d.insert("");
-                });
-                if !cut.is_empty() {
-                    pasteboard_set(&cut);
-                }
-            }
             "interrupt" => {
                 // Let go of the keys; the next step sends the words.
                 self.world.lookup(APP).remove((Focused::id(), flecs::Wildcard::ID));
