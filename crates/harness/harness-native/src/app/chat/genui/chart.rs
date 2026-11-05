@@ -575,11 +575,15 @@ fn pie(v: View<'_>, node: &Value, kind: &str, slices: Vec<(String, f64)>, unit: 
             disc.set(want);
         }
         let center = if donut {
+            // The total alone, big, its unit (or the caption) under it: the hole is only so wide.
             let big = match prop(node, "center") {
-                Value::Null => with_unit(total, if unit == "%" { "" } else { unit.as_ref() }),
+                Value::Null if unit == "%" => with_unit(total, unit),
+                Value::Null => short(total),
                 c => c.as_str().map_or_else(|| c.to_string(), str::to_owned),
             };
-            Some((big, words(node, "caption")))
+            let caption = words(node, "caption");
+            let caption = if caption.is_empty() && unit != "%" { unit.to_string() } else { caption };
+            Some((big, caption))
         } else {
             None
         };

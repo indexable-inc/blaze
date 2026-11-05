@@ -888,6 +888,21 @@ fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
 }
 
 impl App {
+    /// The genui gallery (`HARNESS_NATIVE_GALLERY=genui`, src/gallery.rs): fill its `hn.ChatUi` with `tree`, a cell's
+    /// tree as the kernel sends it, measured by this app's typesetter and drawn in its ground's scheme, as a chat card's is.
+    pub(crate) fn fill_genui_gallery(&self, root: u64, tree: &Value) {
+        let w = self.world.world_ref();
+        let v = View::of(w.entity_from_id(root));
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        if v.entity().try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme) {
+            v.entity().set(scheme);
+        }
+        let Some(ui) = v.part("ui") else { return };
+        let mut paint = self.paint.borrow_mut();
+        let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+        genui::fill(ui, tree, &mut measure);
+    }
+
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
     pub(super) fn term_ground_dark(&self) -> bool {
         let w = self.world.world_ref();

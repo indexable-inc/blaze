@@ -124,6 +124,7 @@ hn {
   // A drawing (Canvas, or SVG markup): its box, and each shape (genui/canvas.rs) laid over all of it, its path data in
   // the canvas's user units through its view box. A shape behind the rest (a chart's gridlines) is a GenShapeBack.
   prefab GenCanvas : ui.Node {
+    Clip
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 160, min: 0, max: 0}}
   }
   prefab GenShape : ui.Node {
@@ -242,6 +243,21 @@ hn {
     caption : ui.Line {
       Fill: $tone_term_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // The generative-UI gallery's page (src/gallery.rs, HARNESS_NATIVE_GALLERY=genui): one cell's UI on the terminal's
+  // ground, as wide as a transcript.
+  prefab GenGallery : ui.Column {
+    // Scrolls, so a cell taller than the window keeps its natural height (a column that does not shrinks Fit children).
+    Clip
+    ScrollState: {x: 0, y: 0}
+    Fill: $tone_term_ground
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Padding: {l: 40, r: 40, t: 24, b: 24}
+    ui : hn.ChatUi {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 760}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
   }
 
