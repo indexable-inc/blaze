@@ -32,6 +32,7 @@
 //! `Fn::call` among them). Only a call whose types name no parameter of the generic body is
 //! looked at: the facts are of concrete object types.
 
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
@@ -60,7 +61,11 @@ use crate::mir::{
     OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets,
     Terminator, TerminatorKind, transform::Ctx,
 };
-use crate::{db::HirDatabase as _, infer::PointerCast, mir::location::track_caller};
+use crate::{
+    db::HirDatabase as _,
+    infer::PointerCast,
+    mir::{home, location::track_caller},
+};
 
 use super::{Result, block_index};
 
@@ -260,6 +265,11 @@ fn site_digest(object: &Object, found: &[Found]) -> [u8; 32] {
 /// Why a direct call may not name a target's method.
 #[derive(Clone, Copy, Debug)]
 enum Unseen {
+    /// The type names a crate the body's crate does not load (a closure of a downstream
+    /// crate's, behind an upstream `dyn Fn`): the direct callee, an instance of that type,
+    /// would be worked out in the body's crate, which sees neither that crate's types nor its
+    /// impls (`home::unloaded_crate`).
+    Unloaded(Crate),
     /// The body's crate finds no method for it: its impl is in a crate the body's does not
     /// depend on (impls are looked up in the crates a crate loads), or the lookup fails so.
     NoMethod(NoImplMethod),
@@ -273,8 +283,14 @@ enum Unseen {
 }
 
 impl Unseen {
-    fn describe(self) -> String {
+    fn describe(self, db: &Db) -> String {
         match self {
+            // alloc: a reason, once a call kept
+            Unseen::Unloaded(krate) => format!(
+                "its type names the crate {}, which the body's crate does not load, so the direct callee would be \
+                 resolved where that crate's types and impls are not seen",
+                krate.named(db)
+            ),
             // alloc: a reason, once a call kept
             Unseen::NoMethod(why) => {
                 format!("it finds no method ({}): an impl in a crate it does not depend on is not seen there", why.describe())
@@ -357,7 +373,7 @@ fn plan<'db>(
                 ctx.krate().named(ctx.db),
                 object.name,
                 unseen.ty.as_ref(),
-                why.describe()
+                why.describe(ctx.db)
             )),
             // A compare of each, and the `dyn` call past them: a vtable is one object per
             // content in a staged image, but not in a lazy run, nor where two origins'
@@ -426,8 +442,9 @@ fn seen<'t, 'db>(
 
 /// Whether a direct call in the body's crate may name `site`'s method for `ty`, as the code
 /// generator resolves it there: the crate finds the method (the impl's, or the trait's own
-/// where the lookup rightly leaves it to later), the method reports the location a `dyn` call
-/// does, and no impl the crate does not see may specialize it.
+/// where the lookup rightly leaves it to later), the type names only crates the body's crate
+/// loads, the method reports the location a `dyn` call does, and no impl the crate does not
+/// see may specialize it.
 fn sees<'db>(ctx: &Ctx<'_, 'db>, site: &Site<'db>, ty: Ty<'db>) -> std::result::Result<(), Unseen> {
     let mut args: Vec<GenericArg<'db>> = site.args.iter().collect(); // alloc: a call's generic arguments
     args[0] = ty.into();
@@ -439,6 +456,11 @@ fn sees<'db>(ctx: &Ctx<'_, 'db>, site: &Site<'db>, ty: Ty<'db>) -> std::result::
         GenericArgs::new_from_slice(&args),
     )
     .map_err(Unseen::NoMethod)?;
+    // A method found for a type of a crate the body's does not load is a blanket impl's or the
+    // compiler's (a closure's `Fn*`), whose body is still the type's to resolve.
+    if let Some(krate) = home::unloaded_crate(ctx.db, ctx.krate(), ty) {
+        return Err(Unseen::Unloaded(krate));
+    }
     // A builtin derive's method: the compiler's, never `#[track_caller]` nor specialized.
     let Either::Left(func) = method else { return Ok(()) };
     let declared = AttrFlags::query(ctx.db, site.method.into()).contains(AttrFlags::TRACK_CALLER);

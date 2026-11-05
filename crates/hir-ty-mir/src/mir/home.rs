@@ -62,6 +62,10 @@
 //! - `dyn` calls and function pointers add nothing to what an instance names (a walk follows
 //!   them where the vtable or pointer is made), so a downstream impl behind a `dyn` of an
 //!   upstream trait changes the instance that makes the vtable, which names the type.
+//!   `Devirtualize` keeps this: it makes a `dyn` call direct only for a type whose crates the
+//!   body's crate loads ([`unloaded_crate`]). A direct call of a downstream type from an
+//!   upstream body would be an instance no crate that loads its crates stands for, so it
+//!   would stay in the upstream asker, which sees neither the type's crate nor its impls.
 //! - The callees of `I` are asked from `H`, and [`stands_for`] chains: `H'` for `H` and `H` for
 //!   `S` give `H'` for `S` (inclusion, equalities, and the crates between are covered by one
 //!   check or the other).
@@ -155,6 +159,22 @@ pub fn home(db: &Db, asker: Crate, code: Option<Crate>, args: GenericArgs<'_>) -
         crates.iter().all(|other| loaded.contains(other))
     })?;
     home_over(db, asker, lowest)
+}
+
+/// The first crate `ty` names (each ADT's, foreign type's, function's, closure's, coroutine's
+/// and object trait's, as [`home`] reads an instance's arguments) that `krate` does not load
+/// ([`loaded_crates`]), if any. A body of `krate` that names such a type resolves what it does
+/// with it where that crate's types and impls are not seen: the module's argument holds only
+/// for a body that names crates its own loads, which every body Rust writes does and a
+/// rewrite (`Devirtualize`'s direct call) must keep.
+pub fn unloaded_crate(db: &Db, krate: Crate, ty: Ty<'_>) -> Option<Crate> {
+    let loaded = loaded_crates(db, krate);
+    frame::task(Tag::Mir, |frame| {
+        let mut named =
+            Named { db, crates: SmallVec::new(), seen: HashSet::new_in(frame), open: false };
+        ty.visit_with(&mut named);
+        named.crates.into_iter().find(|it| !loaded.contains(it))
+    })
 }
 
 /// Whether an instance with `args` is generic: an argument is not a lifetime. The one
