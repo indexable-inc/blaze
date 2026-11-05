@@ -36,7 +36,7 @@ pub struct PanelInst {
     /// track of the edge colour shape.z thick and over it an arc of the fill clockwise from twelve for the share fx2.z,
     /// 4 caret: edge_d the sweep's start rect, edge_l the bar at rest, fx2.z the move time, shape.y the sweep's seconds,
     /// shape.z the seconds it stays solid after it moved, fx.y the blink's cycle in seconds (the scene's CaretLook),
-    /// 5 copy light: a band across the row at fx2.z of the way, fx2.w the square-corner mask, 6 image,
+    /// 5 copy light (select.rs): a band of the fill across the row at fx2.z of the way, fx2.w the square-corner mask, 6 image,
     /// 8 chevron, 9 stopwatch: begun at fx2.z (frame time), lasting lens.x seconds, 10 the light on an icon button's glass:
     /// a soft highlight of the fill at lens.xy from the rect's middle, lens.z across, and the rim facing it, 11 invisible
     /// ink, 12 an agent's art (ui/agentgrid.rs): the fill its ink over the edge as its ground, lens its clock, calm,
@@ -44,7 +44,8 @@ pub struct PanelInst {
     /// and which work (lanes + 8 x mask), 13 an agent's art from the art cache, drawn as a `SegKind::Art`: fx3 its uv rect
     /// there, lens.x its brightness, the fill its ink over the edge).
     pub fx: [f32; 4],
-    /// shadow dy, opacity, kind parameter (a liquid glass panel's frost), 0.
+    /// shadow dy, opacity, kind parameter (a liquid glass panel's frost), the square-corner mask (1 top-left, 2 top-right,
+    /// 4 bottom-right, 8 bottom-left: a selection's rows joined into one shape).
     pub fx2: [f32; 4],
     /// Liquid glass on a glass panel: bevel (points, 0 for none), magnify, dispersion, rim light.
     pub lens: [f32; 4],

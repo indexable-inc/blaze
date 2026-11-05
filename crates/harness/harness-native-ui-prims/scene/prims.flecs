@@ -269,8 +269,7 @@ ui {
       Cursor: {shape: Text}
       TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light,
-        select_dark: $tone_text_select.dark, select_light: $tone_text_select.light}
+        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
     }
   }
 
@@ -426,7 +425,18 @@ ui {
 
 @tree ChildOf
 ui {
+  // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
+  // here, and a Cmd+C pulses it with CopyLook on the `copy` spring below.
+  prefab selection {
+    Fill: $plate_selection
+    Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
+    CopyLook: {grow: $copy_grow, light: $copy_light, sweep: $copy_sweep, stagger: $copy_stagger, row_in: $copy_row_in}
+  }
   spring {
+    // A copy's pulse (CopyFlash): critically damped, kicked from rest, back at rest in about half a second.
+    prefab copy {
+      Motion: {omega: $copy_omega, zeta: $copy_zeta}
+    }
     // The springs the generic motion falls back on when a node has no Motion of its own.
     prefab transition {
       Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
