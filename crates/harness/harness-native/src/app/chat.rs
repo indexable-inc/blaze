@@ -256,7 +256,6 @@ enum Row {
     Thinking { block: String, open: bool, text: String, live: bool },
     Note(String),
     Error(String),
-    Foot(String),
 }
 
 impl Row {
@@ -284,7 +283,6 @@ impl Row {
             Row::Thinking { .. } => "hn.ChatThinking",
             Row::Note(_) => "hn.ChatNote",
             Row::Error(_) => "hn.ChatError",
-            Row::Foot(_) => "hn.ChatFoot",
         }
     }
 }
@@ -594,23 +592,8 @@ fn rows(t: &Transcript, open: &HashSet<String>) -> Vec<(String, Row)> {
             }
             Item::Note { text } => part.push(Row::Note(text.clone())),
             Item::Error { text } => part.push(Row::Error(text.clone())),
-            Item::TurnEnd { stop, duration_ms, cost_usd, .. } => {
-                let mut bits = Vec::new();
-                if let Some(ms) = duration_ms {
-                    bits.push(if *ms >= 60_000 {
-                        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
-                    } else {
-                        format!("{:.1}s", *ms as f64 / 1000.0)
-                    });
-                }
-                if let Some(c) = cost_usd.filter(|c| *c > 0.0) {
-                    bits.push(if c < 0.01 { format!("${c:.4}") } else { format!("${c:.2}") });
-                }
-                if stop == "interrupted" {
-                    bits.push("interrupted".into());
-                }
-                part.push(Row::Foot(bits.join(" \u{00B7} ")));
-            }
+            // A turn ends quietly: no time or cost under it (an interruption shows as its own note).
+            Item::TurnEnd { .. } => {}
         }
         for (k, r) in part.into_iter().enumerate() {
             out.push((format!("i{n}.{k}"), r));
@@ -675,7 +658,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
             (&["body", "result"], tool_result(result).to_owned(), false),
         ],
         Row::Thinking { open: true, text, .. } => vec![(&["text"], text.trim().to_owned(), false)],
-        Row::Note(s) | Row::Error(s) | Row::Foot(s) => vec![(&["text"], s.clone(), false)],
+        Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Card { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
         Row::Output { text, .. } => vec![(&["card", "text"], text.clone(), false)],
@@ -708,7 +691,7 @@ impl Row {
     /// The row as markdown, for a copy that takes it whole (None: its words as shown).
     fn markdown(&self) -> Option<String> {
         Some(match self {
-            Row::User(s) | Row::Prose(s) | Row::Note(s) | Row::Error(s) | Row::Foot(s) => s.clone(),
+            Row::User(s) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
             Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
             Row::ListItem { depth, mark, text } => {
                 let mark = match mark.as_str() {
@@ -1452,7 +1435,7 @@ fn fill_row(row: View<'_>, r: &Row) {
                 t.text(s);
             }
         }
-        Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) | Row::Foot(s) => text("text", s),
+        Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) => text("text", s),
         Row::ListItem { depth, mark, text: s } => {
             text("mark", mark);
             text("text", s);

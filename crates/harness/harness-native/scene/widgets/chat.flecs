@@ -392,14 +392,4 @@ hn {
       TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
     }
   }
-
-  // A turn's quiet foot: how long it took and what it cost.
-  prefab ChatFoot : ui.Row {
-    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: 2, b: 12}
-    text : ui.Line, Faint {
-      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-    }
-  }
 }
