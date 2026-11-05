@@ -127,7 +127,7 @@ pub(super) fn emit(
 ) -> Result<Code, Unhandled> {
     let pointees = std::mem::take(&mut recorder.pointees);
     let alone = Alone { func, named, pointees: &pointees, weights };
-    let emitted = compiled(recorder, Members::Alone(alone), optimization, imports);
+    let emitted = compiled(recorder, &Members::Alone(alone), optimization, imports);
     recorder.pointees = pointees;
     emitted?.members.pop().ok_or(Unhandled::Shape("an object without the function"))?
 }
@@ -154,7 +154,7 @@ pub(super) fn emit_unit(
     optimization: Optimization,
     imports: &[Import],
 ) -> Result<Unit, Unhandled> {
-    compiled(recorder, Members::Unit(members), optimization, imports)
+    compiled(recorder, &Members::Unit(members), optimization, imports)
 }
 
 /// The function of a module of one, which is named [`OWN`] and has nothing else call it.
@@ -172,20 +172,20 @@ enum Members<'a> {
 
 fn compiled(
     recorder: &mut Wants,
-    members: Members<'_>,
+    members: &Members<'_>,
     optimization: Optimization,
     imports: &[Import],
 ) -> Result<Unit, Unhandled> {
     let tally = Tally::global();
     let target = recorder.target;
-    let alone = match &members {
+    let alone = match members {
         Members::Alone(alone) => Some(alone),
         Members::Unit(_) => None,
     };
     let weights = alone.and_then(|it| it.weights);
     // A member's request, none for a function alone.
     let (requested, defined): (SmallVec<[Option<SymbolName>; 1]>, SmallVec<[Defined<'_>; 1]>) =
-        match &members {
+        match members {
             Members::Alone(it) => {
                 let defined = Defined {
                     name: "",

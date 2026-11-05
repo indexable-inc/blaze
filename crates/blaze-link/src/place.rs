@@ -118,6 +118,7 @@ const RECORD_RULE: &str = "a call frame record's 32-bit PC-relative address (`DW
 const PERSONALITY_RULE: &str = "a CIE's personality (`DW_EH_PE_indirect|pcrel|sdata4`, as LLVM writes it) reaches its GOT cell within ±2 GiB";
 
 /// The two ends of a reach past its limit, and the limit: what [`out_of_reach`] says.
+#[derive(Clone, Copy)]
 struct Reach {
     from: u64,
     to: u64,

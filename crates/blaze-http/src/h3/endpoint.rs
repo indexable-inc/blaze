@@ -318,8 +318,8 @@ impl Endpoint {
         client: Option<ClientConfig>,
     ) -> Result<Endpoint, Error> {
         let serving = server.as_ref().map(|it| it.transport);
-        let server = server.as_ref().map(config::server).transpose()?;
-        let client = client.as_ref().map(config::client).transpose()?;
+        let server = server.map(|it| config::server(&it)).transpose()?;
+        let client = client.map(|it| config::client(&it)).transpose()?;
         // alloc: one per endpoint.
         let quic =
             quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), server, true, None);

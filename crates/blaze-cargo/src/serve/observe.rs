@@ -693,7 +693,7 @@ fn keep(
             Ok(ToHistory::Client { to, rows }) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
-                let flushed = history.client_rows(rows).and_then(|()| history.flush(Some(build)));
+                let flushed = history.client_rows(&rows).and_then(|()| history.flush(Some(build)));
                 let written = flushed.as_ref().map(|_| ()).map_err(ToString::to_string);
                 _ = told.send(Told::ClientWritten { to, written });
                 (flushed, false)

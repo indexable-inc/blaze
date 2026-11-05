@@ -1512,7 +1512,7 @@ impl History {
     /// with them (the `builds` view keeps that one). A build not ended yet gets them as it
     /// ends. A batch that does not fit is the error, naming the build and table; nothing of
     /// that client is noted then.
-    pub fn client_rows(&mut self, client: ClientRows) -> Result<(), HistoryError> {
+    pub fn client_rows(&mut self, client: &ClientRows) -> Result<(), HistoryError> {
         let build = client.build;
         let spans = client_batches(build, &schema::SPANS, &client.spans)?;
         let events = client_batches(build, &schema::EVENTS, &client.events)?;
@@ -2767,7 +2767,7 @@ mod tests {
         let mut bytes = Vec::new();
         crate::live::encode(&spans, &mut bytes).unwrap();
         history
-            .client_rows(ClientRows {
+            .client_rows(&ClientRows {
                 build: 81,
                 started_ns: 500,
                 ended_ns: 90_000,
@@ -2795,7 +2795,7 @@ mod tests {
         )
         .unwrap();
         let refused =
-            history.client_rows(ClientRows { build: 81, spans: other, ..ClientRows::default() });
+            history.client_rows(&ClientRows { build: 81, spans: other, ..ClientRows::default() });
         assert!(
             matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })),
             "{refused:?}"

@@ -108,11 +108,11 @@ pub(super) fn read<S: Borrow<Signature>>(
 /// [`sanitize::COVERAGE`].
 pub(super) fn read_covered<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, S),
+    function: &(&str, S),
     recorder: &mut Wants,
 ) -> Result<(Code, Covered), Unhandled> {
     let instrumented = Instrumented { covered: true, profiled: false };
-    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    let mut read = read_all(object, std::slice::from_ref(function), recorder, instrumented)?;
     let (code, covered, _) =
         read.pop().ok_or(Unhandled::Shape("an object without the function"))??;
     Ok((code, covered))
@@ -124,12 +124,12 @@ pub(super) fn read_covered<S: Borrow<Signature>>(
 /// of [`pgo::COUNTER_RELOCS`].
 pub(super) fn read_profiled<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, S),
+    function: &(&str, S),
     recorder: &mut Wants,
     covered: bool,
 ) -> Result<(Code, Covered, u32), Unhandled> {
     let instrumented = Instrumented { covered, profiled: true };
-    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    let mut read = read_all(object, std::slice::from_ref(function), recorder, instrumented)?;
     read.pop().ok_or(Unhandled::Shape("an object without the function"))?
 }
 
