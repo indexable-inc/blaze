@@ -328,8 +328,9 @@ impl Region {
             // first and the pages it adds prefaulted after, by the one thread whose publish
             // moved it: a grower that lost the race, and every thread that touches the new
             // pages meanwhile, goes on (a touch before the prefault faults its page in, which
-            // the prefault then leaves alone). No `MADV_COLLAPSE` either: the reservation was
-            // advised huge pages whole, so the first touch of each 2 MiB already makes one.
+            // the prefault then leaves alone). Past its first 2 MiB a huge region is advised
+            // huge pages already, so each 2 MiB's first touch makes one; its first 2 MiB, base
+            // pages while small, is advised and collapsed once, as it grows past them.
             if let Some(before) = self.publish(target) {
                 let start = crate::align::align_down(before, self.granule);
                 // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
@@ -337,6 +338,12 @@ impl Region {
                 unsafe { os::commit(self.at(start), target - start) }.map_err(|os| {
                     MemError::Commit { tag: self.tag, bytes: target - start, os }
                 })?;
+                let unit = huge_unit();
+                if self.pages == Pages::Transparent && before < unit && target > unit {
+                    // SAFETY: `[base, base + unit)` is huge-aligned (the reservation's base is)
+                    // and committed (`target > unit`), inside the reservation.
+                    unsafe { os::promote_first(self.base, unit) };
+                }
             }
             return Ok(());
         }

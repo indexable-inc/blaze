@@ -156,7 +156,15 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
         let _ = timed(Kind::Munmap, || unsafe { libc::munmap(aligned.wrapping_add(bytes).cast(), tail) });
     }
     #[cfg(target_os = "linux")]
-    advise_pages(aligned, bytes, huge);
+    {
+        advise_pages(aligned, bytes, huge);
+        if huge && prot != libc::PROT_NONE && bytes > crate::HUGE_PAGE {
+            // A writable reservation advised huge pages whole would make its first touch a
+            // 2 MiB page, so a small huge region would cost a huge page: its first huge page's
+            // worth stays base pages until it grows past it ([`promote_first`]).
+            advise_pages(aligned, crate::HUGE_PAGE, false);
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     let _ = huge;
     NonNull::new(aligned).ok_or_else(|| io::Error::other("mmap returned null"))
@@ -758,6 +766,23 @@ pub(crate) unsafe fn collapse(ptr: NonNull<u8>, bytes: usize) {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) unsafe fn collapse(_ptr: NonNull<u8>, _bytes: usize) {}
+
+/// A writable huge reservation ([`reserve`] on Linux) that grew past its first huge page:
+/// its first 2 MiB, kept on base pages while it was all the region used, advised huge pages
+/// like the rest and collapsed into one (two calls in a region's life, at that crossing).
+///
+/// # Safety
+///
+/// As for [`collapse`]: `ptr` is the reservation's base and `bytes` one huge page, committed.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn promote_first(ptr: NonNull<u8>, bytes: usize) {
+    advise_pages(ptr.as_ptr(), bytes, true);
+    // SAFETY: as the caller says, committed memory of ours.
+    unsafe { collapse(ptr, bytes) };
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) unsafe fn promote_first(_ptr: NonNull<u8>, _bytes: usize) {}
 
 /// Gives `[ptr, ptr + bytes)` back to the kernel, still reserved, reading zeros when it is
 /// committed again. On Linux the range stays readable and writable and its pages are dropped
