@@ -11,7 +11,7 @@ hn {
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
-        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w + 2 * $chat_pad}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
       }
     }
@@ -28,13 +28,13 @@ hn {
         Action: {name: "chat:focus"}
         Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: 14, r: 14, t: 10, b: 10}
+        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: $chat_input_pad_y, b: $chat_input_pad_y}
         area : ui.TextArea {}
       }
       status : ui.Row {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: 6, r: 6, t: 0, b: 0}
+        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: 0, b: 0}
         model : ui.Line, Faint {
           TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
         }
@@ -51,15 +51,16 @@ hn {
   prefab ChatUser : ui.Row {
     Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 48, r: 0, t: 14, b: 10}
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
     bubble : ui.Bubble {
       Fill: $tone_chat_bubble
+      Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
       Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
         Fill: $tone_term_ink
-        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+        TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
   }
@@ -68,7 +69,7 @@ hn {
   prefab ChatProse : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: 4, b: 6}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
       Fill: $tone_term_ink
       MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
@@ -116,7 +117,7 @@ hn {
   prefab ChatQuote : ui.Row {
     Flex: {axis: Row, gap: 12, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 2, r: 0, t: 4, b: 6}
+    Padding: {l: 2, r: 0, t: $chat_block_half, b: $chat_block_half}
     bar : hn.Seam {}
     text : ui.Words {
       Fill: $tone_term_muted
@@ -444,7 +445,7 @@ hn {
   prefab ChatError : ui.Row {
     Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: 4, b: 6}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
       Fill: $tone_failed
       TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}

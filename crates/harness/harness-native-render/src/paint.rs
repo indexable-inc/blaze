@@ -546,10 +546,22 @@ impl Painter {
                 if let Some(m) = md {
                     // Code spans on a chip, a plate per line they cover.
                     let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
-                    let shape = Shape { radius: 3.0, n: 4.0, border: 0.0, feather: 0.0 };
-                    for &(lo, hi) in shown_md.as_ref().map_or(&[][..], |m| m.code.as_slice()) {
-                        for r in spans_of(&lay, lo, hi) {
-                            let rect = [laid.x + r[0] - 3.0, laid.y + r[1] + 1.0, r[2] + 6.0, r[3] - 2.0];
+                    let shape = Shape { radius: crate::markdown::CHIP_RADIUS, n: 4.0, border: 0.0, feather: 0.0 };
+                    let size = set_of(&style).size;
+                    let inset = size * crate::markdown::CHIP_INSET_EM;
+                    let (units, code): (Vec<u16>, &[(usize, usize)]) = shown_md
+                        .as_ref()
+                        .map_or((Vec::new(), &[][..]), |m| (m.text.encode_utf16().collect(), m.code.as_slice()));
+                    for &(lo, hi) in code {
+                        // The span's carets are half the room the typesetter left (chip_room) outside its glyphs; the
+                        // plate reaches `inset` past the glyphs either side, into that room.
+                        let (before, after) = crate::markdown::chip_room(&units, lo, hi, size);
+                        let rects = spans_of(&lay, lo, hi);
+                        let last = rects.len().saturating_sub(1);
+                        for (k, r) in rects.into_iter().enumerate() {
+                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
+                            let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
                         }
                     }
