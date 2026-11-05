@@ -359,6 +359,61 @@ mod unix {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// `struct cachestat` of `linux/mman.h`: what `cachestat` says of a range, in pages.
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug)]
+    pub(crate) struct CacheStat {
+        pub(crate) nr_cache: u64,
+        pub(crate) nr_dirty: u64,
+        pub(crate) nr_writeback: u64,
+        pub(crate) nr_evicted: u64,
+        pub(crate) nr_recently_evicted: u64,
+    }
+
+    /// One `cachestat` (Linux 6.5) of `len` bytes of `fd` from `at`, no flags: how many of the
+    /// pages they touch the page cache holds. `len` 0 would mean to the file's end; a caller
+    /// asks for at least a byte.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cachestat(fd: BorrowedFd<'_>, at: u64, len: u64) -> io::Result<CacheStat> {
+        /// `__NR_cachestat`: 451 in the one table x86-64 and AArch64 share from 6.5. The libc
+        /// crate (0.2.191) has no `SYS_cachestat` for either, so it is written here.
+        const SYS_CACHESTAT: libc::c_long = 451;
+        /// `struct cachestat_range` of `linux/mman.h`.
+        #[repr(C)]
+        struct Range {
+            off: u64,
+            len: u64,
+        }
+        debug_assert!(len > 0, "a cachestat of no bytes reads to the file's end");
+        let range = Range { off: at, len };
+        let mut stat = CacheStat::default();
+        // SAFETY: `fd` is borrowed open for the call; `range` and `stat` are live locals of the
+        // kernel's own layouts (`repr(C)`, five and two `u64`s), the one read and the other
+        // written whole on success, neither kept after the call; flags are 0, the only value.
+        let done = unsafe {
+            libc::syscall(
+                SYS_CACHESTAT,
+                fd.as_raw_fd(),
+                &raw const range,
+                &raw mut stat,
+                0 as libc::c_uint,
+            )
+        };
+        match done {
+            0 => Ok(stat),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// The size of a page of the page cache, in bytes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn page_size() -> u64 {
+        // SAFETY: no pointers; `_SC_PAGESIZE` is always answered.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(size).expect("sysconf(_SC_PAGESIZE) answers a positive size")
+    }
+
     /// The running kernel's `uname`.
     #[cfg(target_os = "linux")]
     pub(crate) fn uname() -> io::Result<libc::utsname> {

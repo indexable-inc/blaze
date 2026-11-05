@@ -69,7 +69,12 @@ pub const FEATURES: &[Feature] = &[
         since: v(6, 10),
         used_for: "sealing the code memory's arena a dev run's start hook lays",
     },
-    Feature { name: "cachestat", since: v(6, 5), used_for: "the store's choice of warm entries" },
+    Feature {
+        name: "cachestat",
+        since: v(6, 5),
+        used_for: "the store's settle, which keeps a record warm while its pages are in the page \
+                   cache and moves unread ones out of it colder first",
+    },
 ];
 
 /// The kernel is older than [`FLOOR`], or says a release blaze cannot read.

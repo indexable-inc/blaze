@@ -72,7 +72,7 @@ not built), **next** (an opportunity found, unowned).
 | file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path learns of a write the file system lost | blaze-core, blaze-cas | in use (this lane) |
 | `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon stay out of the page cache, on a file system that takes it | blaze-core | in use (this lane) |
 | `mseal` | 6.10 | the dev run's start hook seals the code memory's arena it lays: never unmapped, remapped or made writable after (`seal` in `library/blaze_inproc_rt/src/sys/linux.rs`). The executable's code segments stay unsealed, since blaze-live windows exec named sections there (`map_twice` in `crates/blaze-live/src/slots/linux.rs`) | blaze_inproc_rt | in use |
-| `cachestat` | 6.5 | which store entries are warm (resident in the page cache) | blaze-cas | in use (this lane) |
+| `cachestat` | 6.5 | the store's settle asks the page-cache residency of the pack records it may move (`Effect::Residency`, one call a record on the driver's thread; no io_uring op): a record whose pages are all cached stays warm, and an unread one out of the cache goes colder first. A kernel without `CONFIG_CACHESTAT_SYSCALL` fails it, named. Linux only (`blaze_core::RESIDENCY`): macOS and Windows have no call that reads the system's cache of a file, so their settles go by read flags alone | blaze-core, blaze-cas | in use |
 
 ### Planned (owned elsewhere, not built here)
 

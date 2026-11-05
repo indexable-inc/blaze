@@ -500,6 +500,18 @@ pub enum Effect {
         after: Duration,
         tag: Tag,
     },
+    /// How much of each of `ranges` of `file` is in the page cache: completes with
+    /// [`Done::Resident`], one [`Pages`] a range, in their order. Linux only: one `cachestat`
+    /// (Linux 6.5) a range, on the driver's thread (io_uring has no op for it). Every other
+    /// driver fails it with [`RESIDENCY_ON_LINUX`] after the name, and an asker asks it only
+    /// where [`RESIDENCY`] says the system has it. A kernel built without
+    /// `CONFIG_CACHESTAT_SYSCALL`, and a file system with no page cache to read (hugetlbfs),
+    /// fail it naming the file and why: nothing guesses. A range of no bytes is no pages.
+    Residency {
+        file: FileName,
+        ranges: Vec<Extent>,
+        tag: Tag,
+    },
     /// The whole file mapped read-only into memory, shared with every other mapping of it
     /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
     ///
@@ -597,6 +609,7 @@ impl Effect {
             | Effect::Flush { tag, .. }
             | Effect::Timer { tag, .. }
             | Effect::Map { tag, .. }
+            | Effect::Residency { tag, .. }
             | Effect::Spawn { tag, .. }
             | Effect::Kill { tag }
             | Effect::Listen { tag, .. }
@@ -606,6 +619,41 @@ impl Effect {
             | Effect::Send { tag, .. }
             | Effect::Hangup { tag, .. } => *tag,
         }
+    }
+}
+
+/// Whether this system says what of a file is in its page cache ([`Effect::Residency`]): Linux,
+/// through `cachestat`. macOS's `mincore` reads only a mapping of this process's, and Windows
+/// has no call that reads the system's cache of a file, so neither has the effect.
+pub const RESIDENCY: bool = cfg!(target_os = "linux");
+
+/// What a driver without [`Effect::Residency`] fails it with, after the file's name.
+pub const RESIDENCY_ON_LINUX: &str = "has no page-cache residency here: blaze reads it with \
+     Linux's cachestat alone, and asks for it only on Linux (`blaze_core::RESIDENCY`)";
+
+/// `len` bytes of a file from `at`: a range of [`Effect::Residency`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Extent {
+    pub at: u64,
+    pub len: u64,
+}
+
+/// How much of one [`Extent`] is in the page cache, in pages of the system's size.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub struct Pages {
+    /// The pages the range touches: its first byte's through its last's.
+    pub pages: u64,
+    /// Of those, the pages the cache holds.
+    pub cached: u64,
+    /// Of those, the pages the cache let go of lately (the kernel's `nr_recently_evicted`):
+    /// read before, and pushed out by others since.
+    pub recently_evicted: u64,
+}
+
+impl Pages {
+    /// Every page the range touches is in the cache: a read of it costs no IO.
+    pub fn resident(&self) -> bool {
+        self.pages > 0 && self.cached >= self.pages
     }
 }
 
@@ -871,6 +919,8 @@ pub enum Done {
     Flushed,
     Fired,
     Mapped(Mapping),
+    /// Of an [`Effect::Residency`]: one a range, in their order.
+    Resident(Vec<Pages>),
     Exited(Box<Exit>),
     Accepted {
         conn: Conn,
