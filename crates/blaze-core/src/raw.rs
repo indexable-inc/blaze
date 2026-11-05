@@ -83,6 +83,8 @@ mod unix {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 
+    /// Linux waits for a child on its wait ring (`blaze_core::wait::reap`).
+    #[cfg(not(target_os = "linux"))]
     /// One `wait4` of `pid`, blocking until it exits: its status and what it used. `EINTR` is
     /// the caller's to retry.
     pub(crate) fn wait4(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
@@ -98,6 +100,8 @@ mod unix {
         }
     }
 
+    /// Linux waits for a child on its wait ring (`blaze_core::wait::exited`).
+    #[cfg(not(target_os = "linux"))]
     /// One `waitid(WEXITED | WNOWAIT)` of `pid`: returns once it has exited, leaving it
     /// unreaped. `EINTR` is the caller's to retry.
     pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {

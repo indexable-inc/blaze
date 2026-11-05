@@ -91,7 +91,10 @@ pub struct WaitError {
 enum Why {
     Io(io::Error),
     /// This many calls in a row returned not ready with the clock still at `at`.
-    Stuck { calls: u32, at: Duration },
+    Stuck {
+        calls: u32,
+        at: Duration,
+    },
 }
 
 impl WaitError {

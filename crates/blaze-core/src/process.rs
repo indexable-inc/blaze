@@ -472,6 +472,20 @@ fn cpu(it: libc::timeval) -> Duration {
 /// child [`start`] made: it leaves [`unreaped`]'s list here, reaped, or found reaped already
 /// (`ECHILD`, which names the second reap as the error it is).
 pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
+    // On Linux a `wait4(WNOHANG)`, and where the child still runs, its exit waited for on the
+    // thread's wait ring (`IORING_OP_WAITID`, leaving it unreaped) before that reap.
+    #[cfg(target_os = "linux")]
+    let reaped = {
+        let clock = crate::wait::Monotonic::new();
+        match crate::wait::reap("a child's exit, to reap it", pid, None, &clock) {
+            Ok(crate::wait::Waited::Ready(reaped)) => Ok(reaped),
+            Ok(crate::wait::Waited::Deadline) => {
+                unreachable!("a reap with no deadline ended at one")
+            }
+            Err(error) => Err(io::Error::from(error)),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let reaped = loop {
         match crate::raw::wait4(pid) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -497,6 +511,16 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> 
 
 /// Waits until `pid` has exited without reaping it, so its pid is not another's until it is.
 pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
+    // On Linux `IORING_OP_WAITID` on the thread's wait ring.
+    #[cfg(target_os = "linux")]
+    {
+        let clock = crate::wait::Monotonic::new();
+        match crate::wait::exited("a child's exit", pid, None, &clock) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     loop {
         match crate::raw::wait_exited(pid) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

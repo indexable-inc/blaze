@@ -10,6 +10,8 @@
 
 use std::io;
 
+use crate::wait::Clock as _;
+
 /// The first wait: about what the process holding the file takes to reach its exec.
 pub const FIRST_NS: u64 = 50_000;
 /// The longest single wait.
@@ -29,9 +31,9 @@ pub const fn next(tried: u32, waited: u64) -> Option<u64> {
     Some(if wait < left { wait } else { left })
 }
 
-/// Waits out one wait of the schedule, `ns` from [`next`]: the one sleep of blaze's spawns, a
-/// driver's timer, on a thread no job runs on (a driver's, or the launcher's before its exec).
-/// A syscall alone, so the launcher may call it between its fork and its exec.
+/// Waits out one wait of the schedule, `ns` from [`next`]: the sleep of blaze's sandbox
+/// launcher before its exec, which stays off io_uring (its seccomp filter refuses it to what it
+/// launches) and may make nothing between its fork and its exec. A syscall alone.
 #[allow(
     clippy::disallowed_methods,
     reason = "the schedule's timer: no event says the writer's copy is closed"
@@ -41,7 +43,8 @@ pub fn wait(ns: u64) {
 }
 
 /// `start` made again for as long as its exec fails with `ETXTBSY`, waiting as [`next`]
-/// says. In the parent, never in a child: each try is a new child, whose descriptors are
+/// says, each wait a [`crate::wait::sleep_until`] (a ring timeout on Linux). In the parent,
+/// never in a child: each try is a new child, whose descriptors are
 /// copied from the parent's as they are then. A Linux child that retried its own `execve`
 /// would keep the copy of the writer's descriptor it was made with, and never run. The
 /// calling thread waits, as it waits for the spawn anyway: at most [`MOST_NS`] in all,
@@ -68,7 +71,16 @@ pub fn while_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> 
                 ),
             ));
         };
-        wait(ns);
+        // A driver's thread or a spawn's caller, never the launcher (which follows the
+        // schedule with [`wait`]): the deadline wait, a ring timeout on Linux.
+        let clock = crate::wait::Monotonic::new();
+        let until = crate::wait::Deadline::after(clock.now(), std::time::Duration::from_nanos(ns));
+        crate::wait::sleep_until(
+            "an exec's file to be let go by its writer (ETXTBSY)",
+            until,
+            &clock,
+        )
+        .map_err(io::Error::from)?;
         tried += 1;
         waited += ns;
     }

@@ -162,6 +162,20 @@ Steps, each its own PR:
    outside `blaze_core::wait`, the macOS park takes `os_sync_wait_on_address_with_deadline`,
    Windows `WaitOnAddress`, and the Windows sampler follows.
 
+   Landed (2026-11-05, branch `ring-waits`): a per-thread wait ring in
+   `blaze-core/src/wait/ring.rs` (`SINGLE_ISSUER | DEFER_TASKRUN`, a registered wait region
+   holding the absolute deadline and the signal mask); `wait::Parker` (core
+   `wait/parking.rs`) on `IORING_OP_FUTEX_WAIT`/`WAKE` for the pool's idle park and wakes;
+   `wait::exited`/`wait::reap` (core `wait/reaping.rs`) on `IORING_OP_WAITID` with `WNOWAIT`
+   then `wait4(WNOHANG)` for `process::reap`, `wait_exited` (and so the Threads errand) and
+   blaze-cargo's `wait_exited`; `wait::pollable` (ring `POLL_ADD`) for `ended_within` and
+   `cgroup.events`; `wait::sleep_until` as a ring `TIMEOUT` for the cgroup and `ETXTBSY`
+   retries. The DST covers the park (planted `ParkPlant::CheckThenStore`, a lost wakeup) and
+   the reap (planted `ReapPlant::ReapInWait`, a reaped child never reported).
+   Still to do: the uring driver's pidfd `POLL_ADD` onto `OP_WAITID`, the pool's stopper and
+   `block_until` client parks, `fiber.rs`'s idle, the SQE-embedded timeout, the bans above,
+   the macOS and Windows parks and the Windows sampler.
+
 ## How it is proven
 
 A DST (`dst-not-review`), `crates/blaze-core/src/wait/tests.rs`: Hegel draws a sequence of

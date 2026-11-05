@@ -17,7 +17,8 @@
 //! workers search at once, and a job wakes a parked worker (of its group first) only when none
 //! searches; a searcher that finds work and was the last wakes another for the rest (Go's and
 //! Tokio's rules), so a burst of work wakes no stampede and none is left unseen. A parked worker
-//! sleeps on its own thread's futex (`thread::park`), not a shared condvar.
+//! sleeps on its own futex word (a [`blaze_core::wait::Parker`]: `IORING_OP_FUTEX_WAIT` on its
+//! thread's io_uring on Linux), not a shared condvar; nothing signals it.
 //!
 //! On a machine of fast and slow groups, a job on its request's critical path
 //! ([`Pool::submit_critical`]) goes to its `near` group if that is fast, else to the least loaded
@@ -644,12 +645,31 @@ struct Slot {
     sleeping: AtomicBool,
     group: u32,
     thread: OnceLock<Thread>,
+    /// What its worker parks on when idle: a futex wait on its thread's io_uring on Linux
+    /// (rule deadline-waits), woken by [`Shared::wake`] and [`Shared::unpark_workers`].
+    parker: blaze_core::wait::Parker,
     /// How many jobs ended on this worker (ran to their end, not parked): written by its
     /// worker alone, summed by [`Pool::ended`].
     ended: AtomicU64,
     /// Whether its worker runs a job's code now, from a fiber's resume to its yield or end:
     /// written by its worker alone, counted by [`Pool::working`].
     inside: AtomicBool,
+}
+
+impl Slot {
+    /// Its worker parks for up to `wait` (no limit for `None`), until a wake: on its own
+    /// [`blaze_core::wait::Parker`], whose deadline is absolute, so an interruption waits only
+    /// for what is left. The caller's span names the wait (`Driving::Idle`).
+    #[cfg(not(blaze_check))]
+    fn park_for(&self, wait: Option<std::time::Duration>) {
+        use blaze_core::wait::{Clock as _, Deadline, Monotonic};
+        let clock = Monotonic::new();
+        let deadline = wait.map(|it| Deadline::after(clock.now(), it));
+        let what = "a job for an idle worker, or its pool's next due wait";
+        if let Err(error) = self.parker.park(what, deadline, &clock) {
+            panic!("an idle worker of group {} could not park: {error}", self.group);
+        }
+    }
 }
 
 /// How many workers search and how many sleep, in one word so a submit reads both at once.
@@ -907,6 +927,7 @@ impl Pool {
                 sleeping: AtomicBool::new(false),
                 group: cpu.group,
                 thread: OnceLock::new(),
+                parker: blaze_core::wait::Parker::new(),
                 ended: AtomicU64::new(0),
                 inside: AtomicBool::new(false),
             })
@@ -1823,6 +1844,7 @@ fn take(next: &AtomicPtr<Header>) -> Option<Job> {
 impl Shared {
     fn unpark_workers(&self) {
         for slot in &self.slots {
+            slot.parker.unpark();
             if let Some(thread) = slot.thread.get() {
                 thread.unpark();
             }
@@ -1911,6 +1933,9 @@ impl Shared {
                 {
                     group.sleepers.fetch_sub(1, Ordering::SeqCst);
                     self.idle.0.fetch_add(SEARCHING.wrapping_sub(SLEEPING), Ordering::SeqCst);
+                    #[cfg(not(blaze_check))]
+                    slot.parker.unpark();
+                    #[cfg(blaze_check)]
                     if let Some(thread) = slot.thread.get() {
                         thread.unpark();
                     }
@@ -2227,14 +2252,12 @@ impl Local {
                 {
                     // The last to sleep with jobs parked: none of them wakes unless a job ends a
                     // wait, so after a while with none, the scheduler checks for a stall.
-                    thread::park_timeout(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER)));
+                    slot.park_for(Some(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER))));
                     if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
                         _ = crate::sched::check_stall(&shared.sched);
                     }
-                } else if let Some(due) = due {
-                    thread::park_timeout(due);
                 } else {
-                    thread::park();
+                    slot.park_for(due);
                 }
                 drop(parked);
                 crate::sched::idle(&shared.sched, false);
@@ -4741,6 +4764,7 @@ mod model {
                 sleeping: AtomicBool::new(false),
                 group: 0,
                 thread: OnceLock::new(),
+                parker: blaze_core::wait::Parker::new(),
                 ended: AtomicU64::new(0),
                 inside: AtomicBool::new(false),
             })

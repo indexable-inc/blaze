@@ -1,8 +1,9 @@
-//! Linux's waits: `io_uring_enter` for the io_uring driver and `clock_nanosleep` for a sleep.
+//! Linux's waits: `io_uring_enter` for the io_uring driver, and a sleep on the thread's wait
+//! ring (`wait/ring.rs`).
 
-use std::{convert::Infallible, io, os::fd::RawFd, ptr};
+use std::{io, os::fd::RawFd, ptr};
 
-use super::{Clock, Deadline, Once, WaitError, Waited, unix::timespec, until};
+use super::{Clock, Deadline, Once, WaitError, Waited, until};
 
 /// `IORING_ENTER_GETEVENTS`: wait for `min_complete` completions.
 const ENTER_GETEVENTS: u32 = 1 << 0;
@@ -28,7 +29,7 @@ struct GeteventsArg {
 /// The size of the kernel's own sigset, `_NSIG / 8`: 64 signals on every architecture blaze
 /// runs on (x86_64, aarch64, riscv64). `libc::sigset_t` is glibc's 128 bytes, which the kernel
 /// refuses (EINVAL).
-const KERNEL_SIGSET: u32 = 8;
+pub(super) const KERNEL_SIGSET: u32 = 8;
 
 const fn bit(signal: libc::c_int) -> u64 {
     1 << (signal - 1)
@@ -39,7 +40,7 @@ const fn bit(signal: libc::c_int) -> u64 {
 /// thread that does not block it and only a stop interrupts the driver's wait; the
 /// synchronous fault signals are never blocked, as a fault while blocked kills the process.
 /// SIGKILL and SIGSTOP the kernel never blocks.
-const WAITING_MASK: u64 = !(bit(libc::SIGINT)
+pub(super) const WAITING_MASK: u64 = !(bit(libc::SIGINT)
     | bit(libc::SIGTERM)
     | bit(libc::SIGHUP)
     | bit(libc::SIGQUIT)
@@ -110,52 +111,15 @@ pub(crate) fn uring_enter(
     })
 }
 
-/// Sleeps until `deadline` on `clock`. Each call is a `clock_nanosleep` to an absolute time
-/// on `CLOCK_MONOTONIC`, what is left on `clock` from the kernel's now, so a signal that ends
-/// it early sleeps again for only what is left.
+/// Sleeps until `deadline` on `clock`: a ring timeout (`IORING_OP_TIMEOUT` to an absolute
+/// `CLOCK_MONOTONIC` time) on this thread's wait ring, its deadline in the ring's registered
+/// wait region, so a signal that ends the wait early waits again for only what is left.
 pub fn sleep_until(
     what: &'static str,
     deadline: Deadline,
     clock: &impl Clock,
 ) -> Result<(), WaitError> {
-    let waited = until(what, clock, Some(deadline), |left| -> io::Result<Once<Infallible>> {
-        let left = timespec(left.unwrap_or_default());
-        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: a timespec for the kernel to write.
-        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let nsec = now.tv_nsec + left.tv_nsec;
-        let at = libc::timespec {
-            tv_sec: now
-                .tv_sec
-                .saturating_add(left.tv_sec)
-                .saturating_add(nsec / 1_000_000_000),
-            tv_nsec: nsec % 1_000_000_000,
-        };
-        match nanosleep_until(&at) {
-            0 => Ok(Once::TimedOut),
-            libc::EINTR => Ok(Once::Interrupted),
-            error => Err(io::Error::from_raw_os_error(error)),
-        }
-    })?;
-    match waited {
-        Waited::Ready(never) => match never {},
-        Waited::Deadline => Ok(()),
-    }
-}
-
-/// One `clock_nanosleep` to `at` on `CLOCK_MONOTONIC`: 0, or the error number it returns.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one sleep of `wait::sleep_until`, to an absolute time from its deadline"
-)]
-fn nanosleep_until(at: &libc::timespec) -> libc::c_int {
-    // SAFETY: a valid timespec that outlives the call, and no remainder asked for (an absolute
-    // sleep writes none).
-    unsafe {
-        libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, at, ptr::null_mut())
-    }
+    super::ring::sleep_until(what, deadline, clock)
 }
 
 #[cfg(test)]
