@@ -527,8 +527,8 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux x86-64 and macOS, `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from cold: nothing pushes its store); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix) and macOS, `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from cold on macOS, as nothing pushes its store, and from main's last green run's snapshot on ix); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
+| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64 (hosted), AArch64 (ix) and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` or `linux arm64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
@@ -600,29 +600,58 @@ moves in when it is next changed. `harness/imports.py` runs in the workspace's P
 
 ### ix runners
 
-The repository variable `BLAZE_IX_RUNNERS` moves the slow Linux jobs to ix's GitHub Actions
-runners ([ix.dev/docs/runners](https://ix.dev/docs/runners)). Set to `true`, the gate's build and
-unit tests run on Linux AArch64 (`linux arm64 / build`, `linux arm64 / tests`) in place of Linux
-x86-64, and main's `linux arm64` jobs and `lint-baselines` move with them, each on
-`[self-hosted, ix, arm64, ix-cpu-64, blaze-<job>]`: 64 vCPUs, and memory that grows on demand up
-to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB. A cold build of blaze needs about 28 GB
-and on a hosted runner swapped for over an hour; the run of #1654 was shut down in it.
+Every Linux job that can runs on indexable's own GitHub Actions runners, ix's
+([ix.dev/docs/runners](https://ix.dev/docs/runners)), with no switch to turn it off. ix serves
+Linux AArch64 alone today: its runner plane refuses a job for an architecture it has no node for
+(an `x64` job then waits a day), so the jobs that move are AArch64 ones, and a job that ran on
+hosted x86-64 only because that was the default runner moves to AArch64.
+
+- The gate's build and unit tests run on Linux AArch64 (`linux arm64 / build`,
+  `linux arm64 / tests`), and so do `lint-baselines` and the Linux half of `workspace-check`,
+  each on `[ix, arm64, ix-cpu-64, blaze-<job>]`: 64 vCPUs, and memory that grows on demand up
+  to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB. A cold build of blaze needs about
+  28 GB and on a hosted runner swapped for over an hour; the run of #1654 was shut down in it.
+- Every job of `blaze-platform.yaml` for `linux-arm64` (the train's and `focused.yaml`'s
+  harnesses, smoke, the larger projects, the profile gate) runs on ix: 64 vCPUs for the build,
+  the unit tests and the projects, 16 for the rest, each with a label of its own.
+- The small jobs (`changes`, `scripts`, `actionlint`, `ci`, the train's verdict and release,
+  canary and release cuts, the profile trend, the bench workflows' matrix jobs, ...) run on
+  `[ix, arm64]`, ix's default size.
 
 Every ix runner is a fork of the snapshot of the last green job on main with the same labels, its
-disk included: the checkout, `target/`, the toolchain, the pinned LLVM and blaze's store, which
-`.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` there (ix's scrub deletes
-`_work/_temp` before a snapshot) and bounds at 200G. The pull from the remote then fetches only
-what main pushed since. A pull request's fork never becomes a snapshot. No swap is made on ix:
-its scrub refuses to snapshot a machine with swap on.
+disk included: the checkout, `target/`, the toolchain, the pinned LLVM, `/nix/store` and blaze's
+store, which `.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` on a self-hosted
+runner (ix's scrub deletes `_work/_temp` before a snapshot) and bounds at 200G. The pull from the
+remote then fetches only what main pushed since. No swap is made on ix: its scrub refuses to
+snapshot a machine with swap on. The image is Ubuntu 24.04 with build-essential, git, gh, jq,
+python3 and Nix, and lacks some of what a hosted image has: `.github/actions/toolchain` installs
+rustup when there is none, `.github/actions/nix` uses the image's Nix in place of Determinate's
+installer, and an `apt-get install` first fetches the package lists the image does not ship.
 
-ix serves AArch64 alone today (its runner plane refuses an `x64` job), so with the variable on,
-Linux x86-64's build and unit tests run only on main's push (and the train), on hosted runners,
-and `workspace-check` stays on hosted runners on both platforms. A second variable,
-`BLAZE_IX_X64_RUNNERS`, moves `linux x64 / build` and `linux x64 / tests` to
-`[self-hosted, ix, x64, ix-cpu-64, blaze-<job>]` (64 vCPUs, ix's x86-64 cap, and the same 256 GiB
-memory), for once ix serves x86-64. Unset, every job runs on hosted runners: a job whose labels
-no runner serves waits a day for one, so each variable goes on only once the ix-runners GitHub
-App serves this repository on that architecture and its ix account can pay.
+A run off main never becomes a snapshot, and before every snapshot ix's scrub removes what a job
+could leave for the next (processes, the job's credentials, git credentials and logins, `/tmp`),
+since a fork's pull request restores the same snapshots. A pull request from a fork runs only
+once a maintainer approves it: the repository's fork pull request policy is
+`all_external_contributors`, and no workflow uses `pull_request_target`.
+
+What stays on GitHub's hosted runners, and why:
+
+- Linux x86-64: `linux x64` (main's push and the train), install.yaml's archive and no-Rust
+  jobs, nix-live's `x86_64-linux` build, downstream.yaml, rival.yaml (its numbers are of the
+  hosted x86-64 runner it names) and toolchain-bump's x86-64 answers, until ix serves x86-64.
+- Builds of what users run: release.yaml, llvm.yaml's and pgo.yaml's builds run on the oldest
+  hosted Ubuntu (22.04) so that the binaries ask for an old glibc (`build_release.py` refuses one
+  newer than RHEL 9's); the ix image's glibc is 2.39.
+- install.yaml's installs, which test a first install on a clean machine, which a snapshot
+  holding earlier runs is not.
+- Jobs that hold a long-lived secret besides the store's write token and signing key (the bot
+  token, Cloudflare's, crates.io's): fmt, site, the bench and live-latency history commits,
+  promote.yaml's smoke and metadata, release.yaml, yank's metadata, pgo's pin and
+  toolchain-bump's branch and pull request. They gain nothing from a warm machine, and on a
+  hosted runner nothing they leave can reach a later job.
+- Timings compared against a baseline from a hosted runner: promote.yaml's apps.
+- macOS and Windows, which ix does not serve. The bench workflows' measurements run on the
+  machines `BENCH_RUNNERS` registers.
 
 ### Named harnesses, and the projects downstream
 

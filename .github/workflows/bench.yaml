@@ -36,7 +36,7 @@ defaults:
 jobs:
   tango:
     name: tango
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-64, blaze-tango]
     # Two builds by blaze from main's build store, which runs longer than an hour when cold.
     timeout-minutes: 240
     steps:

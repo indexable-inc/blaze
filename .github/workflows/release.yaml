@@ -67,10 +67,11 @@ jobs:
   build:
     name: ${{ matrix.target }}
     needs: notes
-    # Linux AArch64 on a 64-vCPU ix runner (memory on demand up to 256 GiB) when BLAZE_IX_RUNNERS
-    # is on, as blaze.yaml's builds: a cold build of blaze by blaze ran out of a hosted runner's
-    # 16 GB and swap (#1654). The others on hosted runners, until ix serves their kind.
-    runs-on: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && vars.BLAZE_IX_RUNNERS == 'true' && fromJSON('["self-hosted", "ix", "arm64", "ix-cpu-64", "blaze-release"]') || matrix.os }}
+    # On GitHub's hosted runners, Linux too: the binaries are built on the oldest hosted Ubuntu so
+    # that they ask for an old glibc (build_release.py refuses one newer than RHEL 9's), and the
+    # ix runner image is Ubuntu 24.04, whose glibc 2.39 headers bind C code to newer symbols
+    # (docs/harness.md "ix runners").
+    runs-on: ${{ matrix.os }}
     # A store blaze's release has not compiled into, which a release's always is: about 97
     # minutes on hosted Linux x86-64 and longer on macOS's 7 GB runner (blaze-platform.yaml's
     # build), under the hosted runner's 6-hour cap.
@@ -87,8 +88,6 @@ jobs:
       # `cargo binstall` and install.sh find the archive and its binaries by this name
       # ([package.metadata.binstall] in crates/blaze-engine/Cargo.toml).
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
-      # .github/actions/blaze keeps the store under $HOME on ix and makes no swap there.
-      BLAZE_CI_IX: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && vars.BLAZE_IX_RUNNERS == 'true' }}
     steps:
       - uses: actions/checkout@v7
       # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version

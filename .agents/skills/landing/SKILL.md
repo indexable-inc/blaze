@@ -34,8 +34,8 @@ See [docs/contributing.md#credit](../../../docs/contributing.md#credit).
 
 From [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change):
 `land.py` pushes the branch, opens "Merge <branch>: what the branch does" and turns on auto-merge.
-The merge gate is the build and unit tests on Linux x86-64 and the released blaze's
-`blaze check --workspace` on Linux x86-64 and macOS, with astlog's rules and the lint baselines.
+The merge gate is the build and unit tests on Linux AArch64 (ix runners) and the released blaze's
+`blaze check --workspace` on Linux AArch64 and macOS, with astlog's rules and the lint baselines.
 There is no merge queue; the release train on main catches changes that break together. The wait
 runs in its own process, logging to `.git/land/pr-N.log` in the main checkout; `land.py --wait`
 follows it again. A branch that conflicts gets `git merge origin/main` first. For anything the

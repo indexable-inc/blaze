@@ -45,16 +45,14 @@ env:
 jobs:
   unit-graphs:
     name: nix unit graphs are current
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - uses: ./.github/actions/nix
         with:
-          use-flakehub: false
-          use-gha-cache: true
+          cache: true
       - run: python3 tools/nix/unit_graph.py
       - name: tools/nix/units is what unit_graph.py writes
         run: |
@@ -112,7 +110,7 @@ jobs:
   demo:
     name: demo/life and blaze-live (linux)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live-demo]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

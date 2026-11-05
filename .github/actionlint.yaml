@@ -1,4 +1,11 @@
 # actionlint's configuration (blaze.yaml's `workflows` job runs it). Each ignore says why.
+# ix's runner labels (docs/harness.md "ix runners"): `ix`, a size `ix-cpu-N`, and a label of the
+# job's own (`blaze-<job>`) that gives it a snapshot lineage of its own.
+self-hosted-runner:
+  labels:
+    - ix
+    - ix-cpu-*
+    - blaze-*
 paths:
   .github/workflows/release.yaml:
     ignore:

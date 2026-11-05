@@ -5,16 +5,16 @@
 # `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
 # so nothing is cross-compiled or emulated.
 #
-# With `ix-cpu`, the build and the unit tests run on ix's GitHub Actions runners
-# (https://ix.dev/docs/runners) in place of `os`: a VM of that many vCPUs whose memory grows on
-# demand up to 256 GiB, forked from a snapshot of the last green job on main with the same labels,
-# its disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has
-# its own label set (`blaze-build`, `blaze-tests`), so each forks its own job's snapshot; main's
-# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. `ix-arch` is the
-# runner's architecture label: ix's runner plane picks the machine by it (`arm64`, or `x64`,
-# whose cap is 64 vCPUs) and refuses one it does not serve, and ix serves AArch64 alone today,
-# so `x64` goes on only with BLAZE_IX_X64_RUNNERS (blaze.yaml). Memory has no label: every ix
-# runner's grows on demand to the platform's 256 GiB.
+# Linux AArch64 (`linux-arm64`) runs every job on ix's GitHub Actions runners
+# (https://ix.dev/docs/runners, docs/harness.md "ix runners"): a VM whose memory grows on demand
+# up to 256 GiB, forked from a snapshot of the last green job on main with the same labels, its
+# disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has a
+# label of its own (`blaze-build`, `blaze-tests`, ...), so each forks its own job's snapshot;
+# main's runs make the snapshots and the pull requests' runs fork them. The build, the unit
+# tests and the larger projects take 64 vCPUs and the other jobs 16, where a hosted runner has 4.
+# The other platforms run on `os`, GitHub's hosted runners: ix serves no x86-64 runner today
+# (its runner plane refuses an `x64` job it has no node for, and the job waits a day), and no
+# macOS or Windows.
 name: blaze platform
 on:
   workflow_call:
@@ -24,17 +24,9 @@ on:
         type: string
         required: true
       os:
-        description: the hosted runner
+        description: the hosted runner, for every platform but linux-arm64 (which runs on ix)
         type: string
         required: true
-      ix-cpu:
-        description: "vCPUs of the ix runner the build and the unit tests run on (8, 16, 32, 64 or 128), or empty for `os`"
-        type: string
-        default: ""
-      ix-arch:
-        description: "the ix runner's architecture label, `arm64` or `x64`, which has to be the platform's"
-        type: string
-        default: arm64
       tier:
         description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
@@ -70,9 +62,6 @@ env:
   BLAZE_SANDBOX: ${{ startsWith(inputs.os, 'windows') && 'off' || '' }}
   # Git Bash on Windows has `python` and no `python3`.
   PYTHON: ${{ startsWith(inputs.os, 'windows') && 'python' || 'python3' }}
-  # The build and the unit tests on an ix runner (.github/actions/blaze keeps the store under
-  # $HOME there, for the snapshot, and makes no swap).
-  BLAZE_CI_IX: ${{ inputs.ix-cpu != '' }}
   # blaze builds and tests blaze (AGENTS.md rule blaze-builds-blaze): the latest release is the
   # compiler and its store the one cache, pulled from the shared remote main's runs push to
   # (.github/actions/blaze). On Windows the build and the tests stop with an error: release.yaml
@@ -93,7 +82,7 @@ jobs:
     # (harness/unittests.py), and hands over what it compiled, so only the crates built with
     # `cfg(test)` are compiled here.
     needs: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-tests"]') || inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
@@ -153,10 +142,10 @@ jobs:
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
       # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
-      # ix's image may carry no package lists, which a hosted image has.
+      # The ix runner image ships no package lists, which a hosted image has.
       - if: env.BLAZE == 'true' && runner.os == 'Linux'
         run: |
-          if [ "$BLAZE_CI_IX" = true ]; then sudo apt-get update -qq > /dev/null; fi
+          if [ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages' -print -quit)" ]; then sudo apt-get update -qq > /dev/null; fi
           sudo apt-get install -y -qq gdb > /dev/null
       - if: env.BLAZE == 'true'
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
@@ -177,7 +166,7 @@ jobs:
 
   build:
     name: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-build"]') || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
     # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
@@ -314,17 +303,17 @@ jobs:
     name: profile gate
     needs: build
     if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-profile-gate"]') || inputs.os }}
     timeout-minutes: 30
     permissions:
       contents: read
     env:
       # The class of machine the self-build ran on: a summary compares only with its own class's.
-      RUNNER_CLASS: ${{ inputs.ix-cpu != '' && format('ix-{0}-{1}', inputs.ix-arch, inputs.ix-cpu) || inputs.os }}
+      RUNNER_CLASS: ${{ inputs.platform == 'linux-arm64' && 'ix-arm64-64' || inputs.os }}
     steps:
       - uses: actions/checkout@v7
       # The pinned DuckDB (flake.nix), which `blaze debug gate` runs: blaze never links one.
-      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: ./.github/actions/nix
       - id: duckdb
         run: echo "path=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
@@ -372,7 +361,7 @@ jobs:
     name: harness (${{ matrix.part }})
     if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-harness"]') || inputs.os }}
     # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
     timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
@@ -452,7 +441,7 @@ jobs:
     # merge, and promote.yaml runs the whole corpus on every release before it is stable.
     if: inputs.smoke && inputs.tier != 'gate'
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-smoke"]') || inputs.os }}
     timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
     steps:
       - uses: actions/checkout@v7
@@ -479,7 +468,7 @@ jobs:
     name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-blaze-cli"]') || inputs.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -516,14 +505,14 @@ jobs:
             /tmp/blaze-cargo-*/home-*/*/*/log
           if-no-files-found: ignore
 
-  # The larger projects as they are published, natively on AArch64: what the programs print and
-  # what every test says has to be what cargo gives. The ten after these take more than a hosted
-  # runner's three hours, and it was shut down loading rust-analyzer.
+  # The larger projects as they are published, natively on AArch64 (on ix, 64 vCPUs): what the
+  # programs print and what every test says has to be what cargo gives. The ten after these took
+  # more than a hosted runner's three hours, and it was shut down loading rust-analyzer.
   projects:
     name: projects (${{ matrix.projects }})
     if: inputs.projects
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-projects"]') || inputs.os }}
     timeout-minutes: 120
     # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
     # axum's example-testing crashes in the test binary the daemon builds. nushell's cold build

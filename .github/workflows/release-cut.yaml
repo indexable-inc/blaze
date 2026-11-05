@@ -24,7 +24,7 @@ jobs:
   release:
     name: release
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     permissions:
       contents: write

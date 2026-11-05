@@ -60,8 +60,9 @@ runs:
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
-        if [ "$BLAZE_CI_IX" = true ]; then
-          # On an ix runner (blaze-platform.yaml's `ix-cpu`) the machine is a fork of the
+        if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+          # On an ix runner (the only self-hosted runners that run this action; docs/harness.md
+          # "ix runners") the machine is a fork of the
           # snapshot of its label set's last green job on main, its disk included, so a store
           # under $HOME starts with what that job had and the pull below fetches only what is
           # newer. Not under $RUNNER_TEMP: ix's scrub deletes _work/_temp before the snapshot.
@@ -115,7 +116,7 @@ runs:
     # its memory grows on demand up to 256 GiB, and ix's scrub refuses to snapshot a machine
     # with swap on, so a job that turned it on would never become its label set's seed.
     - name: swap
-      if: runner.os == 'Linux' && env.BLAZE_CI_IX != 'true'
+      if: runner.os == 'Linux' && runner.environment == 'github-hosted'
       shell: bash
       run: |
         # On the disk with the most room: /mnt on x86-64, the root on AArch64, which has no /mnt.

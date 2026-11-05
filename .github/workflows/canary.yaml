@@ -43,7 +43,7 @@ jobs:
   cut:
     name: cut
     if: github.repository == 'indexable-inc/blaze'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     # canary.py waits at most 90 minutes for main's build.
     timeout-minutes: 100
     permissions:

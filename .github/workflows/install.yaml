@@ -42,7 +42,7 @@ env:
 jobs:
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7

@@ -82,7 +82,7 @@ jobs:
     name: train
     needs: [linux-x64, linux-arm64, macos, windows]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     steps:
       - env:
@@ -98,7 +98,7 @@ jobs:
     name: release
     needs: train
     if: needs.train.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     permissions:
       contents: write
@@ -116,7 +116,7 @@ jobs:
     name: train issue
     needs: [train, release]
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     permissions:
       issues: write

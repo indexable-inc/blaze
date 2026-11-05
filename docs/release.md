@@ -8,8 +8,7 @@ blaze has two release channels, made of the same releases:
 
 - **canary** (opt-in): every release, as soon as it is built. A release is cut from a commit of
   main as soon as main's merge gate has built it on Linux (the job `linux x64 / build`, or
-  `linux arm64 / build`, which runs on an ix runner with room for the build when the repository
-  variable `BLAZE_IX_RUNNERS` is on; #1654), without waiting for the unit tests or the other platforms. It is published as a GitHub
+  `linux arm64 / build`, which runs on an ix runner with room for the build; #1654), without waiting for the unit tests or the other platforms. It is published as a GitHub
   *prerelease*.
 - **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
   commit passed main's whole merge gate: its whole run green, with the unit tests on Linux

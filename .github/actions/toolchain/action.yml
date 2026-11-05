@@ -1,5 +1,5 @@
 # Rust (the nightly in harness/toolchain) and the LLVM 23 blaze pins
-# (crates/hir-ty-codegen/llvm.json), on any of the hosted runners CI uses. `llvm: build` is Nix
+# (crates/hir-ty-codegen/llvm.json), on any of the runners CI uses (hosted, and ix's). `llvm: build` is Nix
 # with the flake's dev shell fetched: a build of blaze, which links LLVM, runs in it
 # (`nix develop --command cargo build ...`), linked statically against that LLVM with the dev
 # shell's C toolchain and libc. `llvm: run` puts the pinned LLVM's tools the harnesses read with
@@ -23,6 +23,16 @@ runs:
     - name: Rust (the nightly in harness/toolchain)
       shell: bash
       run: |
+        # A hosted image has rustup; the ix runner image has none (its seed keeps ~/.cargo and
+        # ~/.rustup once a job on main has put them there). rustup-init from rustup's own
+        # server, with no toolchain: the pinned one is installed below.
+        if ! command -v rustup > /dev/null; then
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
         tc=$(cat harness/toolchain)
         # No rust-src: blaze compiles the standard library only from its own library/
         # (docs/toolchain.md) and reads no toolchain's rust-src.
@@ -43,7 +53,7 @@ runs:
         fi
 
     - if: runner.os != 'Windows' && inputs.llvm != 'none'
-      uses: DeterminateSystems/nix-installer-action@v23
+      uses: ./.github/actions/nix
     - name: LLVM 23 (Nix)
       if: runner.os != 'Windows' && inputs.llvm != 'none'
       shell: bash

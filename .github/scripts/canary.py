@@ -55,8 +55,8 @@ LOOK_BACK = 40
 # The merge gate, and the jobs of its run on a push to main of which a canary needs one to have
 # passed: blaze built by blaze on Linux. Either says main builds; x86-64's is on a hosted
 # runner, whose 16 GB the build outgrows into swap until the runner is shut down (#1654), and
-# AArch64's is on a 64-vCPU ix runner, whose memory grows to 256 GiB, when the repository
-# variable BLAZE_IX_RUNNERS is on (blaze.yaml). With only x86-64's counted, no canary was cut
+# AArch64's is on a 64-vCPU ix runner, whose memory grows to 256 GiB (blaze.yaml). With only
+# x86-64's counted, no canary was cut
 # from 2026-11-01 on: every build of main since was shut down or refused.
 GATE = ".github/workflows/blaze.yaml"
 BUILDS = ("linux x64 / build", "linux arm64 / build")

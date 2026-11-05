@@ -1,0 +1,30 @@
+# Nix with flakes, on any runner CI uses. An ix runner's image has it already (a nix-daemon under
+# systemd, flakes on, cache.ix.dev and cache.nixos.org as substituters), and its /nix/store lives
+# on in the snapshot its job's label set forks, so nothing is installed or cached there. A
+# GitHub-hosted runner has none: Determinate's installer puts it there, and with `cache` the
+# Actions cache keeps what it builds.
+name: nix
+description: Nix with flakes (the ix image's, or installed on a hosted runner)
+inputs:
+  cache:
+    description: keep what Nix builds in the Actions cache, on a hosted runner (magic-nix-cache)
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - id: have
+      shell: bash
+      run: |
+        if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+          nix --version || { echo "::error::this self-hosted runner has no nix on PATH; the ix runner image has one (ix nix/base-images/ubuntu)"; exit 1; }
+          echo "install=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "install=true" >> "$GITHUB_OUTPUT"
+        fi
+    - if: steps.have.outputs.install == 'true'
+      uses: DeterminateSystems/nix-installer-action@v23
+    - if: steps.have.outputs.install == 'true' && inputs.cache == 'true'
+      uses: DeterminateSystems/magic-nix-cache-action@v15
+      with:
+        use-flakehub: false
+        use-gha-cache: true
