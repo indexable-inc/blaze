@@ -16,10 +16,10 @@ export const size_code = 11.5
 export const weight_row = 500
 export const weight_label = 600
 
-// Rows: a session 28 tall, a run 24, the fold 22; children indented 16 a level; icons 14 in a 16 box.
-export const row_h = 28
-export const run_h = 24
-export const more_h = 22
+// Rows: a session 24 tall, a run 20, the fold 20 (packed: the tree has no gap between rows); children indented 16 a level; icons 14 in a 16 box.
+export const row_h = 24
+export const run_h = 20
+export const more_h = 20
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
