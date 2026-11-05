@@ -29,7 +29,10 @@ pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 
 const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
 description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
-process and task tables). Use it for everything. To run another agent, use agents.spawn in ts (never a built-in \
+process and task tables). Use it for everything. Each cell is type-checked before it runs: a type error refuses it, \
+naming the line, so fix the type rather than cast, and check outside data with parse<T>(value). Cells in a `lane` share \
+its bindings; lanes run in parallel; cancel stops a lane and clears its bindings; plain-data bindings survive a restart \
+of the chat. To run another agent, use agents.spawn in ts (never a built-in \
 sub-agent or collaboration tool), so it appears in the harness tree. \
 Each task has a typed call that returns data and that the person sees as what it did: read a file with await \
 Bun.file(p).text(); find text with await rg('fn main', {path, type: 'rust', context: 2}); files by name with await \
@@ -72,6 +75,8 @@ fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     env.insert("HARNESS_SOCK".into(), ctx.sock.display().to_string());
     env.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
     env.insert("HOME".into(), std::env::var("HOME").unwrap_or_default());
+    // Where the REPL saves each lane's bindings (`repl/s<session>/`), so a resumed chat gets them back.
+    env.insert("HARNESS_HOME".into(), paths::home().display().to_string());
     env
 }
 
