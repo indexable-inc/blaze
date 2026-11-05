@@ -164,8 +164,7 @@ fn ssa_locals<'f, 'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &'f Frame
         }
     }
     for (local, decl) in body.locals.iter() {
-        if borrowed.contains(local_index(local))
-            && !crate::drop::is_freeze(&ctx.infcx, decl.ty.as_ref(), ctx.env)
+        if borrowed.contains(local_index(local)) && !ctx.is_freeze(decl.ty.as_ref())
         {
             assignments[local_index(local)] = Assignments::Many;
         }

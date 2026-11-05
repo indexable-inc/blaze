@@ -122,10 +122,34 @@ pub(super) fn optimize<'db>(
     if !optimizing && !options.ub_checks {
         return Ok(body);
     }
+    // One span a body optimized, named for it as it starts: a pass that runs for minutes
+    // shows in `blaze debug live` as the function it is on and, below it, the pass (copy
+    // propagation's walk of `MInst` ran 493 s under a span that said only `codegen describe`).
+    let span = tracing::info_span!(target: "blaze", "mir optimize", function = tracing::field::Empty);
+    if !span.is_disabled() {
+        span.record("function", owner_path(db, body.owner).as_str());
+    }
+    let _entered = span.enter();
     frame::task(Tag::Mir, |outer| {
         passes(&Ctx::new(db, body.owner, outer), &mut body, options, caller, optimizing, None)
     })?;
     Ok(body)
+}
+
+/// `owner` by its path, as a span names it.
+fn owner_path(db: &Db, owner: crate::InferBodyId<'_>) -> String {
+    // alloc: a span's name of the body, once a body optimized
+    let mut path = String::new();
+    match owner {
+        crate::InferBodyId::DefWithBodyId(def) => {
+            hir_def::span_names::write_body_path(db, def, &mut path)
+        }
+        crate::InferBodyId::AnonConstId(_) => {
+            use std::fmt::Write as _;
+            _ = write!(path, "{owner:?}");
+        }
+    }
+    path
 }
 
 /// The pipeline over `body`, of `caller` where it is a function's: `within` is the copy
@@ -143,6 +167,9 @@ fn passes<'db>(
     // next can read.
     macro_rules! run {
         ($pass:literal, |$frame:ident| $run:expr) => {{
+            // Each pass a span of its own under the body's (`mir optimize`), so a slow one
+            // names itself.
+            let _pass = tracing::info_span!(target: "blaze", concat!("mir ", $pass)).entered();
             frame::task(Tag::Mir, |$frame| -> Result<'db, ()> {
                 $run;
                 #[cfg(debug_assertions)]
