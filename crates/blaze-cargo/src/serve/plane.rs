@@ -694,7 +694,12 @@ struct Admitting {
 
 /// What a unit's phase of a kind with no ratio measured yet is predicted to hold per KiB of
 /// its source: 1 MiB, a thousand bytes for each byte of source. Never more than the kind's own
-/// peak ([`Plane::push_sized`]), so a guess too high costs no more than the kind floor did.
+/// peak once a task of the kind was measured ([`Plane::push_sized`]), so a guess too high costs
+/// no more than the kind floor did; before that, the guess stands (under a budget, at most the
+/// budget, [`admitted`]). Capping it then by the history's prediction for a kind never seen,
+/// [`SIZED_FLOOR`], granted every unit of a cold daemon's first build 64 MiB, whatever its
+/// size: hir-def's front end held 2.39 GiB on its grant of 64 MiB, and a cold `blaze test
+/// --workspace` reached 169 GiB on a 127 GiB Mac (#1726).
 pub const PER_SOURCE_KIB: u64 = 1 << 20;
 
 /// The least a sized unit's phase is predicted to hold, however small its source: the
@@ -1004,15 +1009,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// What a unit of `source` bytes of source is predicted to hold in a task of `kind`: its
     /// KiB times the kind's bytes per KiB, at least [`SIZED_FLOOR`], at most the kind's peak
-    /// (or the floor, where that is less).
+    /// (or the floor, where that is less) once a task of the kind was measured.
     fn sized(&self, kind: TaskKind, source: u64) -> u64 {
         let per_kib = self.per_kib(kind).unwrap_or(PER_SOURCE_KIB);
-        let kind_peak = self.predict.predict(kind, None).peak;
-        source
-            .div_ceil(1024)
-            .saturating_mul(per_kib)
-            .max(SIZED_FLOOR)
-            .min(kind_peak.max(SIZED_FLOOR))
+        let guess = source.div_ceil(1024).saturating_mul(per_kib).max(SIZED_FLOOR);
+        match self.predict.measured(kind, None) {
+            true => guess.min(self.predict.predict(kind, None).peak.max(SIZED_FLOOR)),
+            // No task of the kind measured: its "peak" is the default for a kind never seen,
+            // no measure of anything, so the unit's own size says what it may hold.
+            false => guess,
+        }
     }
 
     /// The bytes a sized node of `kind` held per KiB of its source lately, once one ended:
@@ -2035,6 +2041,33 @@ mod tests {
         let why = settled[2].2.as_deref().unwrap_or_default();
         assert!(why.contains("measured big needs 2.00 GB of memory"), "{why}");
         assert!(why.contains("2.00 GB is what this unit's own last runs held at most"), "{why}");
+    }
+
+    /// A cold daemon has measured no task of any kind: a unit is predicted by its own size, not
+    /// capped at the default for a kind never seen. #1726: every unit of a cold workspace build
+    /// was granted 64 MiB, hir-def's front end held 2.39 GiB on it, and the daemon went past its
+    /// limit.
+    #[test]
+    fn a_cold_daemon_predicts_a_unit_by_its_size_not_the_unseen_kinds_default() {
+        let mib = 1u64 << 20;
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let history = blaze_history::History::new(blaze_history::Config::default());
+        // No task runs: the batch's type only names one.
+        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        // 4 MiB of source at PER_SOURCE_KIB: 4 GiB, though the kind was never seen.
+        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 4096 * mib);
+        // A small unit stays at the floor.
+        assert_eq!(plane.sized(kinds::COMPILE, 4 << 10), SIZED_FLOOR);
+
+        // Once the kind is measured, its peak caps the guess again.
+        let mut history = blaze_history::History::new(blaze_history::Config::default());
+        history.observe(kinds::COMPILE, None, 1_000, 512 * mib);
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let plane: Plane<Idle, _> =
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 512 * mib);
     }
 
     /// Runs `plane` until each of `ids` settled, saying which did well.

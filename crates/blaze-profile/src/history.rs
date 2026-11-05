@@ -122,7 +122,7 @@ use crate::{
     clock, crash,
     errors::{self, ErrorRow},
     facts::{
-        self, CrateDepRow, KeyPartRow, LinkRow, MissRow, ProcessRow, ProvenanceRow, QueryCountRow,
+        self, CrateDepRow, KeyedMiss, LinkRow, MissRow, ProcessRow, ProvenanceRow, QueryCountRow,
         TestRunRow,
     },
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
@@ -789,7 +789,7 @@ pub struct History {
     /// as it ends. At most [`RECENT_BUILDS`], oldest dropped.
     pending_clients: VecDeque<(u64, (i64, i64))>,
     /// The parts of the keys of what builds computed again, since the last flush.
-    key_parts: Vec<KeyPartRow>,
+    key_parts: Vec<KeyedMiss>,
     /// The query engine's run log at each build's end, since the last flush.
     provenance: Vec<ProvenanceRow>,
     /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
@@ -1146,7 +1146,7 @@ impl History {
 
     /// Notes the parts of the key of each thing a build computed again, for the next flush to
     /// write.
-    pub fn keyed(&mut self, rows: impl IntoIterator<Item = KeyPartRow>) {
+    pub fn keyed(&mut self, rows: impl IntoIterator<Item = KeyedMiss>) {
         self.key_parts.extend(rows);
     }
 
@@ -1365,7 +1365,7 @@ impl History {
         let key_parts =
             facts::in_batches(
                 &self.key_parts,
-                KeyPartRow::text_bytes,
+                KeyedMiss::text_bytes,
                 facts::BATCH_TEXT_BYTES,
                 facts::key_parts,
             )
