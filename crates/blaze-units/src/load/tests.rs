@@ -689,7 +689,10 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     let first = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "pub fn f() {}\n")];
     let first = ready(fixture.plan(fixture.open(&ask(&first))));
     let b = "[package]\nname = \"b\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
-    let second = [("ws/Cargo.toml", b), ("ws/src/main.rs", "fn main() {}\n")];
+    // A library too: a binary brings the dev runtime into its std (`DEV_RUNTIME`), another set
+    // of crates and so another std; what this checks is that the workspace and its target
+    // directory are not among std's inputs.
+    let second = [("ws/Cargo.toml", b), ("ws/src/lib.rs", "pub fn g() {}\n")];
     let env = [("CARGO_TARGET_DIR", "/home/u/elsewhere"), ("TERM", "dumb")];
     let second = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&second) })));
     assert_eq!(second.target_dir, "/home/u/elsewhere");
