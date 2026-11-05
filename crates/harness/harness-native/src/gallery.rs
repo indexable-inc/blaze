@@ -160,6 +160,7 @@ fn stack_rows(w: WorldRef<'_>, heights: &mut view::Heights) {
         2_000,
         |i| format!("r{i}"),
         |_| "ui.Words",
+        |_| false,
         |v, i, _| {
             live += 1;
             let long = if i % 3 == 0 { " that runs on and on until it wraps onto a second line and maybe a third" } else { "" };

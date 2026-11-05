@@ -61,7 +61,6 @@ pub fn install(world: WorldRef<'_>) {
     // pointer's resolve after every hit is in.
     world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).phase(Phase::AfterLayout).each_entity(move |e, (_, laid)| {
         let (mut depth, mut root) = (0u32, e);
-        let mut clip: Option<Laid> = None;
         let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
         // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer; one
         // layout left out (Hidden: a ViewThatFits variant, a scroller's part while it is hidden) takes none either.
@@ -78,16 +77,8 @@ pub fn install(world: WorldRef<'_>) {
             if cursor.is_none() {
                 cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
             }
-            if p.has(Clip::id()) && let Some(c) = p.try_cloned::<&Laid>() {
-                clip = Some(match clip {
-                    None => c,
-                    Some(a) => {
-                        let (x, y) = (a.x.max(c.x), a.y.max(c.y));
-                        Laid { x, y, w: ((a.x + a.w).min(c.x + c.w) - x).max(0.0), h: ((a.y + a.h).min(c.y + c.h) - y).max(0.0) }
-                    }
-                });
-            }
         }
+        let clip = cut(e);
         if leaving || root.has(Offscreen::id()) || root.has(Hosted::id()) {
             return;
         }
@@ -230,20 +221,39 @@ fn scroller(e: EntityView<'_>, w: WorldRef<'_>, c: Scroller, s: ScrollState, l: 
     }
 }
 
-/// `l` cut to every `Clip` around `e`: where the pointer can reach it.
-fn clipped(e: EntityView<'_>, l: Laid) -> Laid {
-    let mut r = l;
-    let mut at = e.parent();
-    while let Some(n) = at.filter(|n| n.has(Node::id())) {
-        if n.has(Clip::id())
-            && let Some(c) = n.try_cloned::<&Laid>()
-        {
-            let (x, y) = (r.x.max(c.x), r.y.max(c.y));
-            r = Laid { x, y, w: ((r.x + r.w).min(c.x + c.w) - x).max(0.0), h: ((r.y + r.h).min(c.y + c.h) - y).max(0.0) };
+/// `a` within `b`.
+fn within(a: Laid, b: Laid) -> Laid {
+    let (x, y) = (a.x.max(b.x), a.y.max(b.y));
+    Laid { x, y, w: ((a.x + a.w).min(b.x + b.w) - x).max(0.0), h: ((a.y + a.h).min(b.y + b.h) - y).max(0.0) }
+}
+
+/// Where the clips around `e` let the pointer reach it (their rects intersected), as the draw pass cuts it: from its root
+/// down, every `Clip` ancestor cuts it, except that a node a `Layer` lifts above its tree's level (a float) starts again
+/// uncut, so a popover opened in a scroll is hit where it draws. None: nothing cuts it.
+fn cut(e: EntityView<'_>) -> Option<Laid> {
+    reach(e).1
+}
+
+/// The level node `e` is drawn at and the clip that cuts it ([`cut`]).
+fn reach(e: EntityView<'_>) -> (Level, Option<Laid>) {
+    let own = e.try_cloned::<&Layer>().map(|l| l.level);
+    let Some(p) = e.parent().filter(|p| p.has(Node::id())) else { return (own.unwrap_or_default(), None) };
+    let (level, above) = reach(p);
+    match own {
+        Some(l) if l > level => (l, None),
+        _ => {
+            let mine = match (p.has(Clip::id()), p.try_cloned::<&Laid>()) {
+                (true, Some(c)) => Some(above.map_or(c, |a| within(a, c))),
+                _ => above,
+            };
+            (level, mine)
         }
-        at = n.parent();
     }
-    r
+}
+
+/// `l` cut to every `Clip` around `e` ([`cut`]): where the pointer can reach it.
+fn clipped(e: EntityView<'_>, l: Laid) -> Laid {
+    cut(e).map_or(l, |c| within(l, c))
 }
 
 /// Resolve the pointer's shape from `over` (the topmost hit's) and the press that may hold one, into `PointerShape` when it

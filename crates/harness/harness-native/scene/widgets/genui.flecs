@@ -77,10 +77,11 @@ hn {
     Padding: {l: 0, r: 0, t: 0, b: 0}
   }
 
-  // A short word on a chip, in a tone.
+  // A short word on a chip, in a tone. Its ground is opaque and edged, so it reads over any picture as on the page.
   prefab GenBadge : ui.Row {
-    Fill: $tone_code_chip
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    Fill: $tone_gen_badge
+    Edge: {dark: $tone_gen_badge_edge.dark, light: $tone_gen_badge_edge.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 7, r: 7, t: 1, b: 2}
@@ -627,7 +628,8 @@ hn {
   // ---- Tier 3: layout, folding, floating, status, pictures (genui/layout.rs, genui/float.rs, genui/media.rs), after
   // den's 33-genui-prims.flecs. What floats (a popover's or a menu's plate, a dialog's scrim, a toast) is a Placed node in
   // its element's tree with a Layer of its own: laid out apart from the flow (against its trigger, or over the pane the
-  // transcript scrolls in), drawn and hit over everything at the Base level, cut by the pane's clip.
+  // transcript scrolls in), drawn and hit over everything at the Base level and cut by no clip around it (a Scroll, a
+  // Split's pane, the transcript): lifted, it escapes them.
 
   // A grid of `columns` equal columns, its children row by row (a row of cells; the last row's empty ones keep the
   // width), or as many columns at least `fit` points wide as fit (GenGridFit). `gap` apart both ways.

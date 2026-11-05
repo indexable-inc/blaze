@@ -1,9 +1,10 @@
-//! Tier 3's floating elements (after den's genui.rs and 33-genui-prims.flecs), drawn over the transcript and cut to its
-//! pane. A Popover's or a Menu's trigger stays in the flow; open, its plate is a `Placed` child opened against the trigger
-//! on its placement's side (layout flips it and keeps it on screen), in the Overlay stack. A Dialog, a Sheet and a Toast
-//! are `Placed` themselves, given the pane's place while they show: a scrim over it with the plate on it, or the toast's
-//! plate at its foot. Each open float is noted in [`Live`]'s floats with what closes it, so a press elsewhere (a popover,
-//! a menu) and Escape (genui/control.rs) send that.
+//! Tier 3's floating elements (after den's genui.rs and 33-genui-prims.flecs), drawn over the transcript in the Overlay
+//! layer, where no Scroll, Split pane or transcript around them cuts them (a lifted node escapes its ancestors' clips).
+//! A Popover's or a Menu's trigger stays in the flow; open, its plate is a `Placed` child opened against the trigger on
+//! its placement's side (layout flips it and keeps it on screen). A Dialog, a Sheet and a Toast are `Placed` themselves,
+//! given the pane's place while they show: a scrim over it with the plate on it, or the toast's plate at its foot. Each
+//! open float is noted in [`Live`]'s floats with what closes it, so a press elsewhere (a popover, a menu) and Escape
+//! (genui/control.rs) send that. A modal's transcript row is kept while the modal is open, in view or not (chat.rs).
 use super::*;
 use control::{Float, Toast, arm, handler, inert, sends};
 use harness_native_ui_layout_api::{Opens, Side, Viewport};
@@ -18,6 +19,28 @@ pub(super) fn pane_of(row: View<'_>) -> Laid {
         Some(p) => p.try_cloned::<&Laid>().unwrap_or_default(),
         None => world.try_get::<&Viewport>(|v| Laid { x: 0.0, y: 0.0, w: v.w, h: v.h }).unwrap_or_default(),
     }
+}
+
+/// Whether any of node `e` shows through the clips around it, as laid out last frame (the draw pass's clips: up to a node
+/// lifted into a higher Layer, which nothing around it cuts). Not laid out yet counts as shown.
+fn in_view(e: EntityView<'_>) -> bool {
+    let Some(mut r) = e.try_cloned::<&Laid>() else { return true };
+    let mut at = Some(e);
+    while let Some(n) = at.filter(|n| n.has(harness_native_ui_node_api::Node::id())) {
+        if n.try_cloned::<&harness_native_ui_node_api::Layer>().is_some_and(|l| l.level > harness_native_ui_node_api::Level::Base) {
+            break;
+        }
+        let p = n.parent();
+        if let Some(c) = p.filter(|p| p.has(Clip::id())).and_then(|p| p.try_cloned::<&Laid>()) {
+            let (x, y) = (r.x.max(c.x), r.y.max(c.y));
+            r = Laid { x, y, w: (r.x + r.w).min(c.x + c.w) - x, h: (r.y + r.h).min(c.y + c.h) - y };
+            if r.w <= 0.0 || r.h <= 0.0 {
+                return false;
+            }
+        }
+        at = p;
+    }
+    true
 }
 
 /// Draw floating element `node` (of `kind`) on `v`, with its children `kids`.
@@ -40,10 +63,13 @@ fn over_pane(v: View<'_>, pane: Laid, shown: bool) {
 
 fn popover(v: View<'_>, node: &Value, menu: bool, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let cell = b.cell;
-    let open = prop(node, "open") == &Value::Bool(true);
     let toggle = handler(node, "onToggle");
+    // Open, its plate floats while its trigger is in view: one scrolled out of its Scroll (or the transcript) leaves no
+    // plate hanging over what is there now; it comes back with the trigger, still open.
+    let open = prop(node, "open") == &Value::Bool(true);
+    let shows = open && v.part("trigger").is_none_or(|t| in_view(t.entity()));
     let plate = if menu { "hn.GenMenuPlate" } else { "hn.GenFloat" };
-    let parts: &[(&str, &str)] = if open { &[("trigger", "hn.GenTrigger"), ("float", plate)] } else { &[("trigger", "hn.GenTrigger")] };
+    let parts: &[(&str, &str)] = if shows { &[("trigger", "hn.GenTrigger"), ("float", plate)] } else { &[("trigger", "hn.GenTrigger")] };
     view::for_each_of(v, parts.iter().map(|(k, p)| (*k, *p, ())), |_, (), _| {});
     let Some(trigger) = v.part("trigger") else { return };
     let events: Vec<(String, Value)> = toggle.iter().map(|h| (h.clone(), Value::Bool(!open))).collect();

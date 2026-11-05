@@ -163,6 +163,21 @@ impl Draft {
         }
     }
 
+    /// A press at byte `i` by `unit`: what it selects ([`Self::span`]) is the selection, the caret at its end. The span,
+    /// for a drag from it to keep whole ([`Self::drag_to`]).
+    fn press(&mut self, i: usize, unit: Unit) -> (usize, usize) {
+        let span = self.span(i, unit);
+        (self.anchor, self.caret, self.goal) = (span.0, span.1, None);
+        span
+    }
+
+    /// A press that selected `held` dragged to byte `i`: the selection runs from `held`'s far end to the far end of what
+    /// `unit` takes at `i`, so the pressed word or line stays whole whichever way the drag goes.
+    fn drag_to(&mut self, i: usize, unit: Unit, held: (usize, usize)) {
+        let s = self.span(i, unit);
+        (self.anchor, self.caret) = if s.0 < held.0 { (held.1, s.0) } else { (held.0, s.1) };
+    }
+
     /// The words shown (the marked text in at the caret) and the TextEdit's units: caret, anchor, marked range (UTF-16).
     fn shown(&self) -> (String, [u32; 4]) {
         let u = |s: &str| s.encode_utf16().count() as u32;
@@ -1051,6 +1066,37 @@ fn words_layout(paint: &mut Painter, e: EntityView<'_>) -> Option<(Rc<Layout>, L
     Some((paint.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md), laid))
 }
 
+/// Where editable words node `e` shows its caret (window points, x, y, width, height), for the input method's candidate
+/// window: at the start of its marked text, else at its caret (its `TextEdit`), on its layout ([`words_layout`]), a line
+/// tall. None while it is not laid out or edits nothing.
+fn words_caret(paint: &mut Painter, e: EntityView<'_>) -> Option<[f32; 4]> {
+    let (lay, l) = words_layout(paint, e)?;
+    let te = e.try_cloned::<&TextEdit>()?;
+    let at = if te.mark_hi > te.mark_lo { te.mark_lo } else { te.caret } as usize;
+    let (x, top, h) = match lay.lines.is_empty() {
+        true => (0.0, 0.0, l.h),
+        false => {
+            let (x, li) = lay.caret(at);
+            (x, lay.lines[li].top, lay.lines[li].height)
+        }
+    };
+    Some([l.x + x, l.y + top, 2.0, h])
+}
+
+/// The scroll along one axis that keeps place `at` (points from the content's start) in a view `view` long over content
+/// `len` long, moved from `from` as little as it can: kept while `at` shows, else just far enough to show it at the near
+/// edge, and never past the content's end (so it comes back as the content shrinks).
+fn keep_in_view(from: f32, at: f32, view: f32, len: f32) -> f32 {
+    let to = if at < from {
+        at
+    } else if at > from + view {
+        at - view
+    } else {
+        from
+    };
+    to.clamp(0.0, (len - view).max(0.0))
+}
+
 /// Chat pane `p`'s input words.
 fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
     View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")
@@ -1195,6 +1241,8 @@ impl App {
                 rows.len(),
                 |i| rows[i].0.as_str(),
                 |i| rows[i].1.prefab(),
+                // A cell with a dialog or a sheet open keeps its row out of view: a modal stays up until it is dismissed.
+                |i| matches!(&rows[i].1, Row::Ui { v, .. } if genui::holds_modal(v)),
                 fresh_rows,
             );
             st.content = s.content + pad.t + pad.b;
@@ -1710,23 +1758,18 @@ impl App {
         along_lines(&mut states.entry(sid).or_default().draft, &lay, m)
     }
 
-    /// Where the focused chat's caret is (window points), for the input method's candidate window: the start of the
-    /// marked text, else the caret, on the input's layout.
+    /// Where the focused chat's caret is (window points, zoomed), for the input method's candidate window: the start of
+    /// the marked text, else the caret ([`words_caret`]): a cell's field's while it has the keys, else the input's.
     pub(super) fn chat_caret_rect(&mut self) -> Option<Option<[f32; 4]>> {
-        let (p, ..) = self.focused_chat()?;
-        let Some((lay, l, ..)) = self.input_layout() else { return Some(None) };
-        let w = self.world.world_ref();
-        let Some(te) = input_text(w, p).and_then(|t| t.entity().try_cloned::<&TextEdit>()) else { return Some(None) };
-        let at = if te.mark_hi > te.mark_lo { te.mark_lo } else { te.caret } as usize;
-        let (x, top, h) = match lay.lines.is_empty() {
-            true => (0.0, 0.0, l.h),
-            false => {
-                let (x, li) = lay.caret(at);
-                (x, lay.lines[li].top, lay.lines[li].height)
-            }
-        };
         let z = self.zoom();
-        Some(Some([(l.x + x) * z, (l.y + top) * z, 2.0 * z, h * z]))
+        let zoomed = |r: Option<[f32; 4]>| r.map(|r| r.map(|v| v * z));
+        if let Some(r) = self.genui_caret() {
+            return Some(zoomed(r));
+        }
+        let (p, ..) = self.focused_chat()?;
+        let w = self.world.world_ref();
+        let Some(t) = input_text(w, p) else { return Some(None) };
+        Some(zoomed(words_caret(&mut self.paint.borrow_mut(), t.entity())))
     }
 
     /// The byte of the focused chat's draft nearest window point `(x, y)` on its input.
@@ -1794,15 +1837,15 @@ impl App {
     }
 
     /// A left press: in the focused chat's input it places the caret (a double press a word, a triple its line), in
-    /// its transcript it starts a selection there; a drag extends either. Whether a chat took it.
+    /// its transcript it starts a selection there; a drag extends either. A press on a cell's field is the field's
+    /// ([`Self::genui_pointer_down`]). Whether a chat took it.
     pub(super) fn chat_pointer_down(&mut self, clicks: isize) -> bool {
+        if self.genui_pointer_down(clicks) {
+            return true;
+        }
         let Some((p, _, sid)) = self.focused_chat() else { return false };
         let (x, y) = (self.pointer.x, self.pointer.y);
-        let unit = match clicks {
-            ..=1 => Unit::Cell,
-            2 => Unit::Word,
-            _ => Unit::Line,
-        };
+        let unit = Unit::of_clicks(clicks);
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
@@ -1822,8 +1865,7 @@ impl App {
             let st = states.entry(sid).or_default();
             (st.sel, st.reading) = (None, false);
             if let Some(i) = at.filter(|_| st.draft.marked.is_none()) {
-                let span = st.draft.span(i, unit);
-                (st.draft.anchor, st.draft.caret, st.draft.goal) = (span.0, span.1, None);
+                let span = st.draft.press(i, unit);
                 st.drag = Some(Drag::Input { unit, span });
             }
         } else if in_list {
@@ -1845,9 +1887,12 @@ impl App {
         true
     }
 
-    /// The pointer moved with a chat's press held: its selection follows (the press's own span kept whole). Whether a
-    /// chat is being dragged in.
+    /// The pointer moved with a chat's press held: its selection follows (the press's own span kept whole), a cell's
+    /// field's as well ([`Self::genui_pointer_drag`]). Whether a chat is being dragged in.
     pub(super) fn chat_pointer_drag(&mut self) -> bool {
+        if self.genui_pointer_drag() {
+            return true;
+        }
         let held = self.chat.borrow().iter().find_map(|(sid, st)| st.drag.map(|d| (*sid, d)));
         let Some((sid, drag)) = held else { return false };
         let Some((p, ..)) = self.focused_chat().filter(|c| c.2 == sid) else {
@@ -1858,12 +1903,9 @@ impl App {
         };
         let (x, y) = (self.pointer.x, self.pointer.y);
         match drag {
-            Drag::Input { unit, span: (a0, a1) } => {
+            Drag::Input { unit, span } => {
                 if let Some(i) = self.input_index(x, y) {
-                    let mut states = self.chat.borrow_mut();
-                    let d = &mut states.entry(sid).or_default().draft;
-                    let s = d.span(i, unit);
-                    (d.anchor, d.caret) = if s.0 < a0 { (a1, s.0) } else { (a0, s.1) };
+                    self.chat.borrow_mut().entry(sid).or_default().draft.drag_to(i, unit, span);
                 }
             }
             Drag::List { unit, span: (a0, a1) } => {
@@ -1879,9 +1921,10 @@ impl App {
         true
     }
 
-    /// The press let go: a drag ends, and a transcript selection that covers nothing goes. Whether a chat was dragged in.
+    /// The press let go: a drag ends (a cell's field's too), and a transcript selection that covers nothing goes. Whether
+    /// a chat was dragged in.
     pub(super) fn chat_pointer_up(&mut self) -> bool {
-        let mut any = false;
+        let mut any = self.genui_pointer_up();
         for st in self.chat.borrow_mut().values_mut() {
             if st.drag.take().is_some() {
                 any = true;

@@ -6,6 +6,7 @@ mod haptic;
 mod keys;
 mod link;
 mod look;
+mod open;
 mod pane;
 mod prefs;
 mod resize;

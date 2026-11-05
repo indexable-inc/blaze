@@ -346,11 +346,14 @@ pub struct Stacked {
 /// `i` named `key(i)` and made from `prefab(i)`; `top` is how far its content is scrolled and `room` how tall its view is.
 /// Rows are measured from their last layout into `heights`; rows never laid out count the `LazyStack`'s estimate. The rows
 /// above and below the ones that exist are two spacers (`_top`, `_foot`) as tall as they are, so the stack is as long as
-/// all its rows. The stack's `Flex.gap` must be 0 (rows carry their own padding).
+/// all its rows. The stack's `Flex.gap` must be 0 (rows carry their own padding). A row out of view that `keep` holds (one
+/// with a modal open over the pane) stays an entity, parked out of the flow (`Placed`, laid below the view, so the clip
+/// around the stack hides it) and still updated, so what it floats over the pane stays up; in view again, it rejoins the
+/// flow as the same entity.
 #[allow(clippy::too_many_arguments)]
 pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
     parent: View<'a>, heights: &mut Heights, top: f32, room: f32, count: usize, key: impl Fn(usize) -> K,
-    prefab: impl Fn(usize) -> &'p str, mut update: impl FnMut(View<'a>, usize, bool),
+    prefab: impl Fn(usize) -> &'p str, keep: impl Fn(usize) -> bool, mut update: impl FnMut(View<'a>, usize, bool),
 ) -> Stacked {
     use harness_native_ui_layout_api::{LazyStack, Size, SizeKind, Sizing};
     use harness_native_ui_node_api::Laid;
@@ -377,7 +380,7 @@ pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
     let mut shift = 0.0;
     e.each_child(|c| {
         let name = c.name().to_string();
-        if name.starts_with('_') || !c.has(Node::id()) {
+        if name.starts_with('_') || !c.has(Node::id()) || c.has(Placed::id()) {
             return;
         }
         let Some(l) = c.try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { return };
@@ -402,17 +405,39 @@ pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
     enum Slot {
         Gap(f32),
         Row(usize),
+        Parked(usize),
     }
+    // Parked rows lie past the stack's end by more than the view is tall: below the view whatever the scroll.
+    let at = e.try_cloned::<&Laid>().unwrap_or_default();
+    let parked_y = at.y + at.h + room + spec.overscan;
+    let parked = (0..first).chain(last..count).filter(|&i| keep(i));
     let rows = std::iter::once(("_top".to_owned(), "ui.Node", Slot::Gap(tops[first])))
         .chain((first..last).map(|i| (keys[i].clone(), prefab(i), Slot::Row(i))))
-        .chain(std::iter::once(("_foot".to_owned(), "ui.Node", Slot::Gap(total - tops[last]))));
+        .chain(std::iter::once(("_foot".to_owned(), "ui.Node", Slot::Gap(total - tops[last]))))
+        .chain(parked.map(|i| (keys[i].clone(), prefab(i), Slot::Parked(i))));
     for_each_of(parent, rows, |row, slot, new| match slot {
         Slot::Gap(h) => {
             if row.0.try_cloned::<&Size>().is_none_or(|s| (s.h.value - h).abs() > 0.01) {
                 row.0.set(gap(h));
             }
         }
-        Slot::Row(i) => update(row, i, new),
+        Slot::Row(i) => {
+            if row.0.has(Placed::id()) {
+                row.0.remove(Placed::id());
+            }
+            update(row, i, new);
+        }
+        Slot::Parked(i) => {
+            if !row.0.has(Placed::id()) {
+                row.0.add(Placed::id());
+            }
+            let h = heights.h.get(&keys[i]).copied().unwrap_or(spec.estimate);
+            let want = Laid { x: at.x, y: parked_y, w: at.w, h };
+            if row.0.try_cloned::<&Laid>() != Some(want) {
+                row.0.set(want);
+            }
+            update(row, i, new);
+        }
     });
     Stacked { content: total, shift }
 }

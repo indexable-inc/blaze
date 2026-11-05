@@ -428,6 +428,10 @@ export const tone_gen_bone: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.07
 export const tone_gen_chip_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.14}}
 export const tone_gen_chip_on: Fill = {dark: {0.263, 0.263, 0.278, 1}, light: {0.847, 0.847, 0.863, 1}}
 export const tone_gen_chip_on_edge: Fill = {dark: {1, 1, 1, 0.34}, light: {0, 0, 0, 0.30}}
+// A badge's ground is opaque and edged, so its ink reads over a picture as on the plain ground (a Layer over an Image):
+// the code chip's wash as it shows on the terminal's ground, without letting what is under it through.
+export const tone_gen_badge: Fill = {dark: {0.196, 0.196, 0.212, 1}, light: {0.937, 0.937, 0.945, 1}}
+export const tone_gen_badge_edge: Fill = {dark: {1, 1, 1, 0.14}, light: {0, 0, 0, 0.12}}
 // File kinds as the IntelliJ New UI colours them (den's scene/15-filetypes.flecs): an Icon's or a FileRef's kind.
 export const tone_file_rust: Fill = {dark: {0.878, 0.38, 0.298, 1}, light: {0.784, 0.263, 0.184, 1}}
 export const tone_file_typescript: Fill = {dark: {0.298, 0.604, 0.91, 1}, light: {0.165, 0.435, 0.753, 1}}
