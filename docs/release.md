@@ -123,9 +123,9 @@ puts them itself, which is how a release made outside release.yaml gets there:
     gh release download v0.YYYYMMDD.N -R indexable-inc/blaze -D out
     python3 -I .github/scripts/r2.py '{"kind": "release", "tag": "v0.YYYYMMDD.N", "dir": "out", "run": true}'
 
-R2 holds every release from v0.20261105.1 on, v0.20261027.0 (stable on 2026-11-05) and LLVM
-23.1.4 at e152d9fa2bc2. A pin to an
-older release fails until it is put there the same way.
+R2 holds every release from v0.20261105.1 on (.1 and .4, the pin on 2026-11-05), v0.20261027.0
+(stable on 2026-11-05) and LLVM 23.1.4 at e152d9fa2bc2. A pin to an older release fails until it
+is put there the same way.
 
 ## Yanking a release
 
