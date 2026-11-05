@@ -145,6 +145,13 @@ refused ([cargo.md](cargo.md#pinning-a-release-of-blaze)). PGO is off for now (#
 the release is built with `"pgo": "off"`, by the stage-0 blaze `.github/blaze-version` names
 (`.github/scripts/build_release.py`; blaze builds blaze, never cargo or rustc).
 
+`release.yaml` has a row for Windows too (x86-64 MSVC, on `windows-2025`): `build_release.py`
+links its C runtime statically, names the Windows SDK's libraries, ships `.exe`s and refuses one
+whose import or delay-load directory names LLVM or the Visual C++ runtime. The row stops at its
+first step, naming why, without holding up the others (#1389): blaze builds blaze, and no release
+of blaze for Windows exists yet to build it with (`install.sh` refuses Windows); after that,
+blaze-link has to link a static C runtime, which it refuses today.
+
 The sums come from the same release as the archives, so they show an archive arrived whole and
 unchanged, not that blaze's release workflow made it: whoever can replace a release's assets can
 replace its sums too. The plan for that, in order:
@@ -166,7 +173,9 @@ the workflow's own token publishes starts no `release:` workflow). One gate runs
 newer canary's run replaces one still waiting, so the gate always takes the newest canary when it
 is free, and a canary it never took stays a canary. It runs, against the
 published archives, installed with `install.sh --version <v>` as a user installs them, on macOS
-(Apple silicon) and Linux (x86-64 and ARM64):
+(Apple silicon) and Linux (x86-64 and ARM64); the Windows archive is unpacked by hand, since
+`install.sh` refuses Windows, and has to report its version and build and run `blaze new`
+(`windows-archive`):
 
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
   `Hello, world!` (v2's blaze has no `new` command, so a v2 release fails this check until it

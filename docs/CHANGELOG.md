@@ -35,6 +35,7 @@ since the release before and the title of each change merged since.
   the crates, search, compile time, the build's steps and what an edit rebuilt. Its model is a
   Flecs world of the workspace, its crates, modules and functions, which Flecs's REST answers
   queries of, read only, under the same token (docs/web.md).
+- release.yaml has a Windows x86-64 (MSVC) row for `blaze-v<version>-x86_64-pc-windows-msvc.tar.gz`, built with the static C runtime and refused when one of its programs imports LLVM or the Visual C++ runtime, and promotion unpacks and tries that archive when a release has it. The row stops, saying why, until a release of blaze for Windows exists to build it with (#1389).
 
 ### Changed
 

@@ -31,6 +31,16 @@ The binaries are refused when one loads libLLVM, or on Linux a C++ runtime (a ma
 downloads them has neither), and on Linux when one asks for a glibc newer than `GLIBC` (RHEL 9's;
 the release builds on the oldest hosted Ubuntu; install.sh says the same floor).
 
+On Windows (x86-64 MSVC) the build links the C runtime statically (`-C target-feature=+crt-static`),
+as the pinned LLVM is built (/MT), and names the x64 libraries of the newest Windows SDK installed
+(`-L native=...`), which the link is not otherwise shown; both go in `CARGO_ENCODED_RUSTFLAGS`,
+since the SDK's path has spaces. The binaries are `.exe`s, and one is refused when its PE32+
+import or delay-load directory names LLVM or the Visual C++ runtime (vcruntime, msvcp, concrt),
+which a machine that downloads it may not have. Two things stand before a Windows release today:
+no release of blaze for Windows exists to be the stage 0 (release.yaml's Windows row says so and
+stops), and blaze-link refuses `+crt-static` ("a static C runtime is not implemented",
+crates/blaze-link/src/args/rustflags.rs), so a build here stops with that error until it links one.
+
 Every step is bounded, and a failure stops the script naming the step, the command, its exit
 status and the tail of what it printed; nothing is skipped or done another way.
 """
@@ -43,6 +53,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import sys
 import tomllib
 import urllib.request
@@ -63,13 +74,22 @@ LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
 # The libraries no shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
-NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
+# On Windows, LLVM's DLLs and the Visual C++ runtime's (the C runtime is linked in: +crt-static).
+NOT_LOADED = {
+    "linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"),
+    "darwin": re.compile(r"libLLVM"),
+    "windows": re.compile(r"(?i)^(llvm|vcruntime|msvcp|concrt)"),
+}
+WINDOWS = "x86_64-pc-windows-msvc"
+# Where the Windows SDK keeps the libraries of each of its versions.
+WINDOWS_SDK = Path("C:/Program Files (x86)/Windows Kits/10/Lib")
 # Flags from the environment would change what ships without the recipe saying so.
 FOREIGN_FLAGS = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
 HOSTS = {
     ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
     ("darwin", "arm64"): "aarch64-apple-darwin",
+    ("win32", "AMD64"): WINDOWS,
 }
 TAIL_LINES = 80
 
@@ -190,14 +210,28 @@ def sha256(path: Path) -> str:
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def binaries() -> list[str]:
-    """The binaries blaze-engine builds: its `[[bin]]`s and, unless `autobins` is off, the files of
-    `src/bin`. What ships is all of them."""
+def binaries(target: str) -> list[str]:
+    """The files of the binaries blaze-engine builds for `target`: its `[[bin]]`s and, unless
+    `autobins` is off, the files of `src/bin`, each an `.exe` on Windows. What ships is all of them."""
     manifest = tomllib.loads((ENGINE / "Cargo.toml").read_text())
     names = [b["name"] for b in manifest.get("bin", [])]
     if manifest.get("package", {}).get("autobins", True):
         names += [p.stem for p in sorted((ENGINE / "src" / "bin").glob("*.rs")) if p.stem not in names]
-    return sorted(names)
+    suffix = ".exe" if target == WINDOWS else ""
+    return sorted(f"{name}{suffix}" for name in names)
+
+
+def windows_sdk() -> Path:
+    """The x64 libraries of the newest Windows SDK installed."""
+    found = sorted(
+        WINDOWS_SDK.glob("*/um/x64"), key=lambda p: [int(n) for n in re.findall(r"\d+", p.parts[-3])]
+    )
+    if not found:
+        raise Failed(
+            f"windows sdk: no Windows SDK in {WINDOWS_SDK}: blaze links against its libraries. Visual "
+            "Studio's installer adds it (the Windows 10 or 11 SDK)"
+        )
+    return found[-1]
 
 
 async def pinned_profile(build: Build) -> Path:
@@ -266,8 +300,14 @@ def build_env(build: Build, target_dir: Path, profile: Path | None) -> dict[str,
     env = {k: v for k, v in os.environ.items() if k not in FOREIGN_FLAGS}
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["CARGO_INCREMENTAL"] = "0"
+    flags: list[str] = []
+    if build.target == WINDOWS:
+        flags += ["-C", "target-feature=+crt-static", "-L", f"native={windows_sdk()}"]
     if profile is not None:
-        env["CARGO_ENCODED_RUSTFLAGS"] = f"-Cprofile-use={profile}"
+        flags.append(f"-Cprofile-use={profile}")
+    if flags:
+        # One flag per \x1f-separated field: the SDK's path has spaces.
+        env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     return env
 
 
@@ -277,12 +317,56 @@ def glibc_asked(data: bytes) -> tuple[int, int] | None:
     return max(found, default=None)
 
 
+def pe_imports(binary: Path, data: bytes) -> list[str] | None:
+    """The DLLs a PE32+ executable imports, the delay-loaded ones included, or None for a file that
+    is not one."""
+    if data[:2] != b"MZ":
+        return None
+    (pe,) = struct.unpack_from("<I", data, 0x3C)
+    if data[pe : pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, pe + 24)[0] != 0x20B:
+        return None
+    (count,) = struct.unpack_from("<H", data, pe + 6)
+    (optional_size,) = struct.unpack_from("<H", data, pe + 20)
+    optional = pe + 24
+    # Each section's address, size in memory and offset in the file.
+    sections: list[tuple[int, int, int]] = []
+    for index in range(count):
+        size, address, _, raw = struct.unpack_from("<IIII", data, optional + optional_size + 40 * index + 8)
+        sections.append((address, size, raw))
+
+    def offset(rva: int) -> int:
+        for address, size, raw in sections:
+            if address <= rva < address + size:
+                return rva - address + raw
+        raise Failed(f"check {binary.name}: {binary} has an address {rva:#x} in no section")
+
+    dlls: list[str] = []
+    # The import directory (entry 1: 20-byte descriptors, the name's address at 12) and the
+    # delay-load one (entry 13: 32-byte descriptors, the name's at 4), each ended by zeros.
+    for entry, size, at in ((1, 20, 12), (13, 32, 4)):
+        (rva,) = struct.unpack_from("<I", data, optional + 112 + 8 * entry)
+        if not rva:
+            continue
+        descriptor = offset(rva)
+        while any(data[descriptor : descriptor + size]):
+            start = offset(struct.unpack_from("<I", data, descriptor + at)[0])
+            dlls.append(data[start : data.index(b"\0", start)].decode())
+            descriptor += size
+    return dlls
+
+
 async def check_binary(build: Build, binary: Path) -> list[str]:
     """What is wrong with one shipped binary: a library it loads that a user's machine lacks, or a
     glibc newer than the floor."""
     data = binary.read_bytes()
     wrong: list[str] = []
-    if data[:4] == b"\x7fELF":
+    if build.target == WINDOWS:
+        dlls = pe_imports(binary, data)
+        if dlls is None:
+            wrong.append(f"{binary.name} is not a 64-bit Windows executable (PE32+)")
+        else:
+            wrong += [f"{binary.name} imports {dll}" for dll in dlls if NOT_LOADED["windows"].search(dll)]
+    elif data[:4] == b"\x7fELF":
         shown = (
             await run(f"check {binary.name}", ["readelf", "-d", str(binary)], secs=build.check_secs)
         ).stdout
@@ -341,7 +425,7 @@ async def main_async(build: Build) -> None:
     out = Path(build.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     shipped: list[Path] = []
-    for name in binaries():
+    for name in binaries(build.target):
         path = built / name
         if not path.is_file():
             raise Failed(f"build: `{' '.join(cmd)}` ended well and made no {path}")
@@ -353,17 +437,19 @@ async def main_async(build: Build) -> None:
     if wrong:
         raise Failed(
             f"check: a shipped binary would not run on a user's machine: {'; '.join(wrong)} (LLVM and, on "
-            "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs)"
+            "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs; on Windows the C "
+            "runtime too: +crt-static)"
         )
     how = f"with the profile {profile.name}" if profile else "without PGO"
+    if build.target == WINDOWS:
+        loads = " or Visual C++ runtime"
+    elif sys.platform == "darwin":
+        loads = ""
+    else:
+        loads = f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} or older"
     print(
         f"build_release: {', '.join(p.name for p in shipped)} in {out}, the `{PROFILE}` profile {how}, built by "
-        f"{said.stdout.strip()}; each loads no libLLVM"
-        + (
-            ""
-            if sys.platform == "darwin"
-            else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} or older"
-        ),
+        f"{said.stdout.strip()}; each loads no libLLVM{loads}",
         flush=True,
     )
 
