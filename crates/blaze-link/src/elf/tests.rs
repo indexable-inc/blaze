@@ -470,10 +470,10 @@ fn an_executable_reads_back() {
     assert_eq!(header.e_machine(endian), elf::EM_X86_64);
     assert_eq!(header.e_entry(endian), text + 32);
 
-    // Segments: four loads, R, RX, relro, RW, each on a page, covering every region.
+    // Segments: four loads, R, relro, RX, RW, each on a page, covering every region.
     let phdrs = file.elf_program_headers();
     let loads: Vec<_> = phdrs.iter().filter(|it| it.p_type(endian) == elf::PT_LOAD).collect();
-    assert_eq!(loads.iter().map(|it| it.p_flags(endian).0).collect::<Vec<_>>(), [4, 5, 6, 6]);
+    assert_eq!(loads.iter().map(|it| it.p_flags(endian).0).collect::<Vec<_>>(), [4, 6, 5, 6]);
     for load in &loads {
         assert_eq!(load.p_offset(endian), load.p_vaddr(endian));
         assert_eq!(load.p_vaddr(endian) % 0x1000, 0);
@@ -701,7 +701,7 @@ fn relro_is_protected_whole_and_only_where_its_load_maps_on_every_page_size() {
         .position(|it| it.p_vaddr(endian) == start)
         .expect("relro starts its own PT_LOAD");
     let load = loads[at];
-    assert!(at + 1 < loads.len(), "writable data follows relro");
+    assert!(at + 1 < loads.len(), "the code follows relro");
     assert!(end <= loads[at + 1].p_vaddr(endian), "relro ends before the next PT_LOAD");
     for page in [0x1000u64, 0x4000, 0x10000] {
         let down = |it: u64| it / page * page;
@@ -2143,7 +2143,7 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
 
     // The segments.
     let loads = loads(&bytes);
-    assert_eq!(loads.iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6, 0, 0, 0]);
+    assert_eq!(loads.iter().map(|it| it.0).collect::<Vec<_>>(), [4, 6, 5, 6, 0, 0, 0]);
     let code: Vec<_> = loads.iter().filter(|it| it.0 & elf::PF_X.0 != 0).collect();
     assert_eq!(code.len(), 1);
     for &&(flags, offset, vaddr, filesz, memsz) in &code {
@@ -2227,7 +2227,7 @@ fn an_image_without_a_dev_run_keeps_its_layout() {
     image.rebase = vec![preinit];
     image.entry = Some(text);
     let bytes = image.link();
-    assert_eq!(loads(&bytes).iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6]);
+    assert_eq!(loads(&bytes).iter().map(|it| it.0).collect::<Vec<_>>(), [4, 6, 5, 6]);
     let entries = dynamic_entries(&bytes);
     let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     assert_eq!(
