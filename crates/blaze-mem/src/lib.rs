@@ -59,6 +59,7 @@ pub mod revision;
 pub mod scratch;
 mod stack;
 pub mod swiss;
+pub mod syscalls;
 mod sync;
 pub mod tag;
 pub mod text;

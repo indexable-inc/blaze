@@ -461,8 +461,11 @@ mod tests {
     /// the growers write every place as they go, which keeps the growth going for a
     /// millisecond or so rather than the few microseconds the commits alone take. A length
     /// published before its pages are committed lets a reader touch the newest place while
-    /// its page is still inaccessible, which faults: planted once (`Dense::grow` storing the
-    /// asked-for length before `region.ensure`), this test died of the fault on the first run.
+    /// its page is still inaccessible, which faults on macOS and Windows: planted once
+    /// (`Dense::grow` storing the asked-for length before `region.ensure`), this test died of
+    /// the fault on the first run. On Linux a reservation is readable and writable whole
+    /// (blaze-mem's `os::reserve`), so there such a place reads zero and the test checks only
+    /// the values.
     /// The readers must also see the length move under them: a run where the growth never
     /// raced a reader proves nothing, so it fails, saying so.
     #[test]

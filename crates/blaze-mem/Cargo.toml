@@ -45,3 +45,10 @@ harness = false
 
 [lints]
 workspace = true
+
+# Every thread's cold-build memory traffic at once (a shared node column, a row heap, frame
+# tasks with spans): wall, CPU, faults and every virtual-memory call, with its slowest. An
+# example, not a bench: the 0.20261105.4 release refuses every `harness = false` bench target
+# ("the root of `kept` (bench test for the host) can't have a module appended").
+[[example]]
+name = "mm"
