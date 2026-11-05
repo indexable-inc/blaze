@@ -86,9 +86,11 @@ of them (`batches.rs`, `logs.rs`, `time.rs`, `hot/read.rs`) is unchanged, and th
 is byte for byte what it was. No schema bump. The explorer's reader range and #1769's release
 gate are untouched.
 
-**The core is sans-IO.** `flight/names.rs` is marked `#![blaze::sans_io]`. `Local` hands back the
-rows to write through a callback, and `Streams` takes rows in. The driver is `flight.rs`
-(`Ring::put`, `take`).
+**The core is sans-IO.** `flight/names.rs` is marked `#![blaze::sans_io]`. `Local` writes rows
+through the driver's `Out` (`intern`, and `row_syms`, which turns all of one row's tokens into its
+syms in one call, so no generation begins between two of them), and `Streams` takes rows in
+through a `Source`, which says the first index it read and the head, so a reader knows which rows
+it missed. The driver is `flight.rs` (`Ring::put`, `take`).
 
 **The postmortem reads names from the rows.** A dead process's definitions are in its mapped
 rings, so the 16 shard name logs, their handoff queue and `handed_off` go. One log remains, for
@@ -99,8 +101,10 @@ goes to 4, so an older file is refused, never misread.
 
 `flight::Names`, `Shared`, `Shard`, `INTERN_TRIES`, `NameCounts::{raced, handed_off}`,
 `postmortem::{NameLog, handed_off, HANDED_OFF}` and the `ProfileNamesRaced` and
-`ProfileNamesHandedOff` plots. `.clippy.toml` bans `blaze_profile::flight::postmortem::handed_off`
-and `papaya` maps in `blaze-profile`'s flight recorder, pointing at `flight::names`.
+`ProfileNamesHandedOff` plots. `ProfileNamesLinked` counts links; `NameCounts` is now `given`,
+`linked` and `lost`. `.clippy.toml` bans the removed `flight::Names`, `flight::Shared` and
+`postmortem::handed_off`, each pointing at `flight::names` (a clippy ban cannot be scoped to one
+module, so papaya is not banned in the recorder by path).
 
 ## Cost budget
 
@@ -122,5 +126,13 @@ and `papaya` maps in `blaze-profile`'s flight recorder, pointing at `flight::nam
 - **Round trip**: spans and events with dynamic names recorded on several threads, one span
   closed on another thread, read and written as the spans and events parquet, read back as the
   same strings.
-- **Bench** (`benches/flight_names.rs`): N threads opening spans with a `Debug` field, distinct
-  and repeated values, before (#1805's papaya table) and after.
+- **Bench** (`crates/blaze-bench/benches/flight_names.rs`): N threads opening spans with a
+  `Debug` field, distinct and repeated values, before (#1805's papaya table) and after.
+
+## Trade-offs kept
+
+- A live reader resolves a row's name with one hash of its text per name per row (no per-name
+  cache in `LiveNamer`).
+- Two `Name`s are equal when their tokens are, or failing that their texts: the same text given
+  on two threads is two tokens.
+- A token kept long (more than `RETAIN` generations of its ring) reads as forgotten.
