@@ -8,8 +8,12 @@
 // (two statements on one line need a `;` between them). Loaded after 00-tokens (it uses the tones, radii and sizes).
 //
 // Layout (harness-native-ui-layout) reads Flex, Size, Padding, Aspect and Intrinsic and writes Laid; draw reads the looks (Fill,
-// Edge, Shape, Lift, Frost, TextStyle) and the content (Text, Icon, Picture); input reads Pressable, Focusable and
-// Editable. `OrderedChildren` makes a container's children keep the order they are declared in.
+// Edge, Shape, Lift, Frost, TextStyle) and the content (Text, Icon, Picture); input reads Pressable, Focusable,
+// Editable and Cursor. `OrderedChildren` makes a container's children keep the order they are declared in.
+//
+// `Cursor: {shape}` is the system pointer over a node and what is inside it, macOS's way: Text (the I-beam) on whatever
+// takes typing or selection (ui.Field, a text area), Arrow on controls (buttons, rows, chips), Hand only on a real link. A
+// Cursor makes its node a hit target; a hit node that says none (nor its ancestors) shows the arrow.
 //
 // A Size axis is {kind: Fit | Grow | Fixed | Percent, value, min, max}: Fit is its content; Grow shares the room left by
 // `value` as weight (0 counts as 1); Fixed is `value` points; Percent is `value` (0 to 1) of the parent's inner size;
@@ -90,7 +94,7 @@ ui {
   prefab Button : ui.Row, Wash {
     Pressable
     Action: {name: ""}
-    Cursor: {shape: Hand}
+    Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
     Padding: {l: 12, r: 12, t: 6, b: 6}
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
@@ -103,7 +107,7 @@ ui {
   prefab IconButton : ui.Row, Wash {
     Pressable
     Action: {name: ""}
-    Cursor: {shape: Hand}
+    Cursor: {shape: Arrow}
     AlignSelf: {align: Start}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}

@@ -44,6 +44,8 @@ hn {
     prop rtt: string = ""
     prop pid: string = ""
     prop rss: string = ""
+    // The system pointer's shape and why (src/app/pointer.rs).
+    prop pointer: string = ""
     (IsA, ui.Column)
     Overlay
     Flex: {axis: Column, gap: 0, align: End, justify: Start, wrap: false}
@@ -58,7 +60,7 @@ hn {
         Fill: $tone_stats_ink
         TextStyle: {size: $size_stats, line: $line_stats, role: 9, bold: 0}
         const head = "fps   {fps:>5.0} now  {frames:>5.0} in 1s\ncpu   {cpu:>5.2} ms  p50 {cpu50:>5.2}  p99 {cpu99:>5.2}\ngpu   {gpu:>5.2} ms  p50 {gpu50:>5.2}  p99 {gpu99:>5.2}\nstate {state}  ({asked:.0} of {frames:.0} frames asked for in 1s)\nwhy   {why}\necs  {ents:.0} entities  {nodes:.0} nodes  {laid:.0} laid\ndraw  {panels:.0} panels  {glyphs:.0} glyphs  {sprites:.0} sprites\natlas {atlas:.1}% full  glyph hit {glyph_hit}  shape hit {shape_hit}"
-        const tail = "link  {link}  rtt {rtt}  harnessd {pid}\nmem   rss {rss}"
+        const tail = "link  {link}  rtt {rtt}  harnessd {pid}\nmem   rss {rss}\nptr   {pointer}"
         if $cols > 0 {
           Text: {s: "{head}\nterm  {term} {cols:.0}x{rows:.0}  cell {cw:.0}x{ch:.0}px  sb {sb:.0}\npty   {pty_rate}/s  ({pty_total} total)\n{tail}"}
         } else {

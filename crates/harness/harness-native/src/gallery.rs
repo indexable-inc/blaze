@@ -2,7 +2,8 @@
 //! drawn instead of the app's view, in the same App and Renderer. Every other root node is made `Offscreen`; the window's
 //! title-bar strip is the gallery root's `SafeAreaInset`; a system keeps the lazy example's rows to the ones in view and,
 //! one second in, moves the selection pill, inserts and removes chips, removes a list row and retargets the animated bar, so a shot shortly
-//! after (`HARNESS_NATIVE_SHOT_SECS`) catches them mid-spring.
+//! after (`HARNESS_NATIVE_SHOT_SECS`) catches them mid-spring. `HARNESS_NATIVE_GALLERY=prims` draws the primitives gallery
+//! instead (scene/gallery.flecs in the prims crate: one of every primitive, a button, a toggle and a field among them).
 use std::time::Instant;
 
 use harness_native_flecs::prelude::*;
@@ -25,11 +26,17 @@ fn at<'a>(w: WorldRef<'a>, path: &str) -> Option<EntityView<'a>> {
     w.try_lookup(&format!("{ROOT}::{path}"))
 }
 
-/// Load the examples and make them the only thing drawn; `strip` is the title-bar strip (points) to inset.
-pub fn load(app: &App, strip: f32) -> Result<(), String> {
+/// Load the examples (or, `prims`, the primitives gallery) and make them the only thing drawn; `strip` is the title-bar strip
+/// (points) to inset.
+pub fn load(app: &App, strip: f32, prims: bool) -> Result<(), String> {
     let world = &app.world;
     world.component::<GalleryStep>();
-    for (name, src) in harness_native_ui_prims::EXAMPLES {
+    let (scenes, root): (&[(&str, &str)], &str) = if prims {
+        (core::slice::from_ref(&harness_native_ui_prims::GALLERY), "gallery")
+    } else {
+        (harness_native_ui_prims::EXAMPLES, ROOT)
+    };
+    for (name, src) in scenes {
         let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
         let err = e.try_get::<&flecs::Script>(|s| {
             // SAFETY: `error` is null or a NUL-terminated string owned by the EcsScript component, alive for this call.
@@ -42,7 +49,7 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
         }
     }
     let w = world.world_ref();
-    let root = w.try_lookup(ROOT).ok_or("the gallery scene has no swiftui_gallery")?;
+    let root = w.try_lookup(root).ok_or_else(|| format!("the gallery scene has no {root}"))?;
     root.set(SafeAreaInset { l: 0.0, r: 0.0, t: strip, b: 0.0 });
     root.set(GalleryStep::default());
     let root_id = *root.id();

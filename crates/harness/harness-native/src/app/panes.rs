@@ -522,6 +522,30 @@ impl App {
         }
     }
 
+    /// The pointer's shape a terminal's drag holds (src/app/pointer.rs): a selection, the I-beam; a press reported to its
+    /// program, the arrow.
+    pub(super) fn term_drag_pointer(&self) -> Option<(Pointer, &'static str)> {
+        if self.term_with(|a, t| a.get::<TermSelection>(t).selecting).is_some() {
+            Some((Pointer::Text, "drag: terminal selection"))
+        } else if self.term_with(|a, t| a.get::<TermMouse>(t).report.is_some()).is_some() {
+            Some((Pointer::Arrow, "drag: reported to the program"))
+        } else {
+            None
+        }
+    }
+
+    /// The pointer's shape over a terminal's grid (src/app/pointer.rs), where `pointer_down` takes a press: the I-beam, or
+    /// the arrow while a press there goes to the program (it turned a mouse mode on and Shift is not held).
+    pub(super) fn term_zone_pointer(&self) -> Option<(Pointer, &'static str)> {
+        let t = self.term_at()?;
+        self.pointer_cell(t, false)?;
+        Some(if self.reporting(t, self.mods) {
+            (Pointer::Arrow, "terminal, mouse reported to the program")
+        } else {
+            (Pointer::Text, "terminal")
+        })
+    }
+
     /// The terminal holding a mouse report or a drag, if any.
     fn term_with(&self, f: impl Fn(&Self, u64) -> bool) -> Option<u64> {
         self.terminals().into_iter().find(|&t| f(self, t))
@@ -530,6 +554,7 @@ impl App {
     /// The pointer moved to `(x, y)` (window points).
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         if self.resizing {
             if let Some(side) = self.sidebar() {
                 let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
@@ -572,22 +597,13 @@ impl App {
     /// A button went down at `(x, y)`: the `clicks`th in a row.
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         self.poke();
         self.press = (clicks, m);
         // On the sidebar's right edge: drag it wider or narrower.
-        if b == Button::Left
-            && self.palette.is_none()
-            && self.side_open
-            && let Some(l) =
-                self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0)
-        {
-            if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB
-                && self.pointer.y >= l.y
-                && self.pointer.y <= l.y + l.h
-            {
-                self.resizing = true;
-                return;
-            }
+        if b == Button::Left && self.on_side_edge() {
+            self.resizing = true;
+            return;
         }
         if b == Button::Left {
             self.pointer.down = true;
@@ -628,9 +644,13 @@ impl App {
 
     pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
         self.set_pointer(x, y);
+        self.mods = m;
         if self.resizing {
             self.resizing = false;
-            if let Some(v) = self.side_w {
+            // Kept for the next launch, but not from an offscreen shot's drag (`persist` off).
+            if self.persist
+                && let Some(v) = self.side_w
+            {
                 crate::prefs::set("sidebar_width", serde_json::json!(v));
             }
             self.poke();

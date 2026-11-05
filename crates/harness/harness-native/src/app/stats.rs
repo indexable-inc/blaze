@@ -376,6 +376,7 @@ impl App {
         let rtt = self.link.rtt_ms().map_or("-".into(), |r| format!("{r:.2} ms"));
         let pid = self.link.daemon_pid().map_or("-".into(), |p| p.to_string());
         let rss = rss_bytes().map_or("-".into(), |b| mb(b as f64));
+        let pointer = self.pointer_line();
         let top = f64::from(self.chrome.strip / self.zoom());
         let f = |v: f32| Prop::Float(f64::from(v));
         let n = |v: usize| Prop::Float(v as f64);
@@ -415,6 +416,7 @@ impl App {
                 ("rtt", Prop::Str(&rtt)),
                 ("pid", Prop::Str(&pid)),
                 ("rss", Prop::Str(&rss)),
+                ("pointer", Prop::Str(&pointer)),
             ],
         );
         self.stats.prev = Prev { glyph, shape, pty };

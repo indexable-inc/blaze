@@ -12,11 +12,12 @@ use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, 
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
+    NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
     NSVisualEffectView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
+use harness_native_ui_input_api::Pointer;
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
 use objc2_foundation::{
@@ -55,6 +56,11 @@ struct State {
     calm: bool,
     /// The keys' load the menu bar was made from (made again when the user's keys.flecs changes).
     menu_gen: u64,
+    /// The system pointer's shape as this app last set it (None: AppKit or another window has it since).
+    cursor: Option<Pointer>,
+    /// The pointer is over the view in the key window (between mouseEntered/mouseMoved and mouseExited or resigning key): only
+    /// then does the app set the system pointer, so it never takes it from the window's resize edges or another window.
+    inside: bool,
 }
 
 thread_local! {
@@ -308,12 +314,45 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            with(|st| st.inside = true);
+            self.pointer_move(event);
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, event: &NSEvent) {
+            with(|st| st.inside = true);
             self.pointer_move(event);
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
+            with(|st| st.inside = false);
+            // A drag that leaves the view goes on (mouseDragged keeps coming): the pointer is where those put it.
+            if NSEvent::pressedMouseButtons() != 0 {
+                return;
+            }
             with(|st| st.app.pointer_move(-1.0e4, -1.0e4, KeyMods::default()));
+            wake();
+        }
+
+        /// AppKit asks for the pointer's shape (the pointer came into the view, the window became key, a live resize
+        /// ended): set the one last resolved now, and move the app's pointer here so the next frame resolves it afresh.
+        #[unsafe(method(cursorUpdate:))]
+        fn cursor_update(&self, event: &NSEvent) {
+            with(|st| {
+                st.inside = true;
+                st.cursor = None;
+            });
+            self.pointer_move(event);
+            with(|st| apply_cursor(st));
+        }
+
+        /// Shift (or another modifier) went down or up with no pointer event: Shift over a terminal whose program reports
+        /// the mouse selects instead, so the pointer's shape may change.
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, event: &NSEvent) {
+            let m = mods_of(event.modifierFlags());
+            with(|st| st.app.set_mods(m));
             wake();
         }
 
@@ -396,6 +435,9 @@ define_class!(
         #[unsafe(method(windowDidResignKey:))]
         fn did_resign_key(&self, _note: &NSNotification) {
             with(|st| {
+                // The tracking area sleeps until the window is key again (its cursorUpdate: then gives the pointer back).
+                st.inside = false;
+                st.cursor = None;
                 st.app.focused = false;
                 st.app.poke();
             });
@@ -650,6 +692,7 @@ impl HarnessView {
                 st.title.clone_from(&st.app.title);
                 st.window.setTitle(&NSString::from_str(&st.title));
             }
+            apply_cursor(st);
             let tip = st.app.tooltip();
             if tip != st.tip {
                 st.tip = tip;
@@ -772,6 +815,36 @@ mod framelog {
             );
             let _ = w.flush();
         }
+    }
+}
+
+/// Set the system pointer to the app's resolved shape when it differs from the one last set, while the pointer is over
+/// the view in the key window or a drag that began there goes on (AppKit keeps a drag's pointer, even outside the view).
+fn apply_cursor(st: &mut State) {
+    let want = st.app.shape();
+    if st.cursor == Some(want) || !(st.inside || NSEvent::pressedMouseButtons() != 0) {
+        return;
+    }
+    st.cursor = Some(want);
+    ns_cursor(want).set();
+}
+
+/// The NSCursor macOS shows for `p`: columnResizeCursor and its one-way forms for a divider (NSSplitView's, macOS 15),
+/// not the deprecated resizeLeftRightCursor.
+fn ns_cursor(p: Pointer) -> Retained<NSCursor> {
+    use objc2_app_kit::{NSHorizontalDirections, NSVerticalDirections};
+    match p {
+        Pointer::Arrow => NSCursor::arrowCursor(),
+        Pointer::Text => NSCursor::IBeamCursor(),
+        Pointer::VerticalText => NSCursor::IBeamCursorForVerticalLayout(),
+        Pointer::Hand => NSCursor::pointingHandCursor(),
+        Pointer::OpenHand => NSCursor::openHandCursor(),
+        Pointer::Grabbing => NSCursor::closedHandCursor(),
+        Pointer::ResizeLeftRight => NSCursor::columnResizeCursorInDirections(NSHorizontalDirections::All),
+        Pointer::ResizeLeft => NSCursor::columnResizeCursorInDirections(NSHorizontalDirections::Left),
+        Pointer::ResizeRight => NSCursor::columnResizeCursorInDirections(NSHorizontalDirections::Right),
+        Pointer::ResizeUpDown => NSCursor::rowResizeCursorInDirections(NSVerticalDirections::All),
+        Pointer::NotAllowed => NSCursor::operationNotAllowedCursor(),
     }
 }
 
@@ -915,8 +988,11 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     layer.setContentsGravity(unsafe { kCAGravityTopLeft });
     view.setLayer(Some(&layer));
     view.setWantsLayer(true);
+    // CursorUpdate: AppKit sends `cursorUpdate:` when the pointer comes into the view or the window becomes key, so the
+    // pointer's shape is set again after AppKit has shown its own (a resize edge, the title bar, another window).
     let options = NSTrackingAreaOptions::MouseEnteredAndExited
         | NSTrackingAreaOptions::MouseMoved
+        | NSTrackingAreaOptions::CursorUpdate
         | NSTrackingAreaOptions::ActiveInKeyWindow
         | NSTrackingAreaOptions::InVisibleRect;
     // SAFETY: the view owns the area and outlives it; no user info.
@@ -974,6 +1050,8 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             tip: String::new(),
             calm: false,
             menu_gen,
+            cursor: None,
+            inside: false,
         })
     });
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.

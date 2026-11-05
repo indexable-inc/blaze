@@ -5,8 +5,8 @@ use harness_native_flecs::prelude::*;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Hoverable;
 
-/// The system pointer's shape, as macOS names them (window.rs and window_linux.rs map each to the platform's). There is
-/// no wait cursor: den never blocks.
+/// The system pointer's shape, as macOS names them (harness-native's window.rs maps each to an NSCursor). There is no wait
+/// cursor: the app never blocks. macOS conventions, not the web's: controls (buttons, rows, chips) keep the arrow.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Pointer {
@@ -16,7 +16,8 @@ pub enum Pointer {
     Text,
     /// Over text set in vertical lines.
     VerticalText,
-    /// Over what a press opens or does: a link, a button, a chip, a sidebar row.
+    /// Over a real link (words that open a URL or a file). Never on buttons, rows or chips: native macOS keeps the arrow
+    /// over controls.
     Hand,
     /// A press on what can be carried (a tab, a sidebar row, a panel's head) that has nearly moved far enough to pick
     /// it up.
@@ -25,14 +26,20 @@ pub enum Pointer {
     Grabbing,
     /// Over a draggable edge between things side by side (the sidebar's, a divider), or dragging it.
     ResizeLeftRight,
+    /// A draggable edge at its rightmost: it only goes left (NSSplitView's divider at its limit).
+    ResizeLeft,
+    /// A draggable edge at its leftmost: it only goes right.
+    ResizeRight,
     /// Over a draggable edge between things one above the other, or dragging it.
     ResizeUpDown,
     /// A carry over a place that will not take it: letting go there does nothing.
     NotAllowed,
 }
 
-/// The pointer's shape over a hit target (`Cursor: {shape: Hand}`). Every Hoverable and every control prefab says one
-/// (ui/cursor.rs holds the scene and the world to it); the topmost target under the pointer decides.
+/// The pointer's shape over a node and everything inside it (`Cursor: {shape: Text}`), said on the primitives and prefabs
+/// in script (prims.flecs: `ui.Field` is Text, `ui.Button` Arrow) so views inherit it. A Cursor makes its node a hit target
+/// (Flecs adds Hoverable with it). The input pass (harness-native-ui-input) resolves the topmost hit node's Cursor, or its
+/// nearest ancestor's, into [`PointerShape`]; a node that says none is the arrow.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     pub shape: Pointer,
@@ -40,7 +47,18 @@ pub struct Cursor {
 
 impl Cursor {
     pub const ARROW: Self = Self { shape: Pointer::Arrow };
-    pub const HAND: Self = Self { shape: Pointer::Hand };
+    pub const TEXT: Self = Self { shape: Pointer::Text };
+}
+
+/// The pointer's shape as the scene asks for it, singleton, written by the input pass when it changes: the topmost hit node's
+/// `Cursor` (or its nearest ancestor's; the arrow when none says one), held from a press until its release so a drag keeps
+/// the shape it began with. `node` is false where no hit node is under the pointer (or was pressed): the host's own zones
+/// (a terminal grid, a draggable edge) decide there, and it composes the final shape (harness-native's
+/// `App::pointer_shape`).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PointerShape {
+    pub shape: Pointer,
+    pub node: bool,
 }
 
 /// (Hovered, e) on the app: what the pointer is on.
@@ -114,6 +132,7 @@ hyperion_api_layouts::api_layouts! {
     "Focusable" => alias Focusable,
     "Hoverable" => alias Hoverable,
     "Cursor" => alias Cursor,
+    "PointerShape" => alias PointerShape,
     "Hovered" => alias Hovered,
     Pointer,
 }
@@ -123,7 +142,9 @@ pub fn register(world: &World) {
     world.component::<Hoverable>().writable();
     world.component::<Focusable>().writable();
     world.component::<Pressable>().with(Hoverable::id()).with(Focusable::id()).writable();
-    world.component::<Cursor>().writable();
+    // A node that says how the pointer looks over it takes the pointer: the input pass hit-tests it.
+    world.component::<Cursor>().with(Hoverable::id()).writable();
+    world.component::<PointerShape>().writable();
     world.component::<Hovered>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Pressed>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Focused>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
@@ -135,4 +156,5 @@ pub fn register(world: &World) {
     world.component::<PointerState>().writable();
     // The pointer is a singleton the input pass runs on: present from the start, the host writes it from window events.
     world.set(PointerState::default());
+    world.set(PointerShape::default());
 }

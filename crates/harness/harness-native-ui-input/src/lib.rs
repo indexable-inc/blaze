@@ -5,13 +5,21 @@
 //! systems can observe the `Action`. With no hoverable node in the world the pass does nothing (the chrome that is not yet
 //! nodes keeps its own `Hovered`). The host ends the frame with [`end_frame`].
 //!
-//! The only state is the per-frame hit list shared by the two systems, rebuilt every frame; everything else is in the world.
+//! The same step resolves the pointer's shape: the topmost hit's `Cursor`, or its nearest ancestor's (the arrow when none
+//! says one), held from a press until its release, into the `PointerShape` singleton when it changes. The host puts its own
+//! zones and drags over it and sets the system pointer (harness-native's `App::pointer_shape` and window.rs).
+//!
+//! The state is the per-frame hit list shared by the two systems, rebuilt every frame, and the shape a press holds;
+//! everything else is in the world.
+use core::cell::Cell;
 use core::cell::RefCell;
 use std::rc::Rc;
 
 use harness_native_flecs::prelude::*;
 use harness_native_api::APP;
-use harness_native_ui_input_api::{Activated, Focusable, Focused, Hoverable, Hovered, PointerState, Pressable, Pressed};
+use harness_native_ui_input_api::{
+    Activated, Cursor, Focusable, Focused, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
+};
 use harness_native_ui_node_api::{Clip, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
 
 struct Hit {
@@ -23,6 +31,17 @@ struct Hit {
     key: (Level, f32, u32, u64),
     pressable: bool,
     focusable: bool,
+    /// Its `Cursor`, or its nearest ancestor's.
+    cursor: Option<Pointer>,
+}
+
+/// What the topmost hit under the pointer is: its id, whether it is Pressable and Focusable, and its pointer shape.
+#[derive(Clone, Copy)]
+struct Top {
+    id: u64,
+    pressable: bool,
+    focusable: bool,
+    cursor: Pointer,
 }
 
 /// Create the input systems in the module scope; deleting that scope removes them before unloading.
@@ -32,9 +51,13 @@ pub fn install(world: WorldRef<'_>) {
     world.system_named::<(&Node, &Laid)>("UiHits").with(Hoverable::id()).each_entity(move |e, (_, laid)| {
         let (mut depth, mut root) = (0u32, e);
         let mut clip: Option<Laid> = None;
+        let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
+            if cursor.is_none() {
+                cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
+            }
             if p.has(Clip::id()) && let Some(c) = p.try_cloned::<&Laid>() {
                 clip = Some(match clip {
                     None => c,
@@ -57,23 +80,47 @@ pub fn install(world: WorldRef<'_>) {
             key: (level, z, depth, *e.id()),
             pressable: e.has(Pressable::id()),
             focusable: e.has(Focusable::id()),
+            cursor,
         });
     });
     let app = *world.lookup(APP).id();
+    // The shape a press holds until its release (None: the press was on no node), while the button is down.
+    let held: Cell<Option<Option<Pointer>>> = Cell::new(None);
     world.system_named::<&PointerState>("UiPointer").each_iter(move |it, _, p| {
         let mut hits = hits.borrow_mut();
-        if hits.is_empty() {
-            return;
-        }
         hits.sort_by(|a, b| a.key.0.cmp(&b.key.0).then(a.key.1.total_cmp(&b.key.1)).then(a.key.2.cmp(&b.key.2)).then(a.key.3.cmp(&b.key.3)));
-        let top = hits.iter().rev().find(|h| h.laid.contains(p.x, p.y) && h.clip.is_none_or(|c| c.contains(p.x, p.y))).map(|h| (h.id, h.pressable, h.focusable));
+        let top = hits
+            .iter()
+            .rev()
+            .find(|h| h.laid.contains(p.x, p.y) && h.clip.is_none_or(|c| c.contains(p.x, p.y)))
+            .map(|h| Top { id: h.id, pressable: h.pressable, focusable: h.focusable, cursor: h.cursor.unwrap_or_default() });
+        let any = !hits.is_empty();
         hits.clear();
-        apply(it.world().entity_from_id(app), top, *p);
+        let w = it.world();
+        shape(w, &held, top.map(|t| t.cursor), *p);
+        if any {
+            apply(w.entity_from_id(app), top, *p);
+        }
     });
 }
 
-fn apply(app: EntityView<'_>, top: Option<(u64, bool, bool)>, p: PointerState) {
-    let now = top.map(|t| t.0);
+/// Resolve the pointer's shape from `over` (the topmost hit's) and the press that may hold one, into `PointerShape` when it
+/// changes.
+fn shape(w: WorldRef<'_>, held: &Cell<Option<Option<Pointer>>>, over: Option<Pointer>, p: PointerState) {
+    if p.went_down && p.down {
+        held.set(Some(over));
+    } else if !p.down {
+        held.set(None);
+    }
+    let now = held.get().unwrap_or(over);
+    let want = PointerShape { shape: now.unwrap_or_default(), node: now.is_some() };
+    if w.try_get::<&PointerShape>(|s| *s) != Some(want) {
+        w.set(want);
+    }
+}
+
+fn apply(app: EntityView<'_>, top: Option<Top>, p: PointerState) {
+    let now = top.map(|t| t.id);
     let was = app.target(Hovered::id(), 0).map(|e| *e.id());
     // What the chrome that is not yet nodes has under the pointer is its own: only a node's hover is taken off here.
     let was_node = app.target(Hovered::id(), 0).is_some_and(|e| e.has(Node::id()));
@@ -102,8 +149,8 @@ fn apply(app: EntityView<'_>, top: Option<(u64, bool, bool)>, p: PointerState) {
 }
 
 /// The button went down over `top`: it is Pressed if Pressable, and focus goes to it or nowhere. The node pressed, if any.
-fn press(app: EntityView<'_>, top: Option<(u64, bool, bool)>) -> Option<u64> {
-    let Some((id, pressable, focusable)) = top else {
+fn press(app: EntityView<'_>, top: Option<Top>) -> Option<u64> {
+    let Some(Top { id, pressable, focusable, .. }) = top else {
         app.remove((Focused::id(), flecs::Wildcard::ID));
         return None;
     };

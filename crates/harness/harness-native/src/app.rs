@@ -17,7 +17,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_model::{self as model, Msg};
 use harness_native_render::paint::{Painter, panel_from};
 use harness_native_ui_draw_api::{Paint, PaintKind};
-use harness_native_ui_input_api::{Action, Activated, Hovered, PointerState, Pressed};
+use harness_native_ui_input_api::{Action, Activated, Hovered, Pointer, PointerState, Pressed};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing, Viewport};
 use harness_native_ui_look_api::{Fill, Rgba, Shape};
 use harness_native_ui_node_api::{Laid, Level};
@@ -30,6 +30,7 @@ mod archive;
 mod fold;
 mod keys;
 mod panes;
+mod pointer;
 mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
@@ -154,6 +155,11 @@ pub struct App {
     zoom: usize,
     ids: Ids,
     pointer: PointerState,
+    /// The modifier keys as the last pointer event or modifier change left them (Shift over a terminal that reports the
+    /// mouse selects instead, so the pointer turns back to the I-beam).
+    mods: KeyMods,
+    /// The system pointer's shape as last resolved, and why (src/app/pointer.rs; window.rs sets NSCursor when it changes).
+    shape: (Pointer, &'static str),
     time: f32,
     /// Frames to draw before the window may stop: anything that changed asks for a few, so layout settles.
     pending: u32,
@@ -392,6 +398,8 @@ impl App {
             zoom: 4,
             ids,
             pointer: PointerState::default(),
+            mods: KeyMods::default(),
+            shape: (Pointer::Arrow, "none"),
             time: 0.0,
             pending: 4,
             palette: None,
@@ -1355,6 +1363,7 @@ impl App {
             self.poke_why("animation");
         }
         self.sync_terms();
+        self.resolve_pointer();
         let mut d = Draw {
             frame: Frame {
                 view: [view.0, view.1],

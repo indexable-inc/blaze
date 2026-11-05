@@ -19,9 +19,10 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
     app.set_gpu_clock(renderer.gpu_clock());
-    // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset).
-    if std::env::var_os("HARNESS_NATIVE_GALLERY").is_some() {
-        crate::gallery::load(&app, 32.0)?;
+    // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
+    // `prims`: the primitives gallery.
+    if let Ok(g) = std::env::var("HARNESS_NATIVE_GALLERY") {
+        crate::gallery::load(&app, 32.0, g == "prims")?;
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
@@ -70,7 +71,8 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     let secs =
         std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
-    // Pointer input (window points): clicks `x,y;x,y` one every 0.4 s from 1 s in, and a drag `x0,y0,x1,y1` at 0.8 s.
+    // Pointer input (window points): clicks `x,y;x,y` one every 0.4 s from 1 s in, and a drag `x0,y0,x1,y1` at 0.8 s (or at
+    // `x0,y0,x1,y1,t` seconds): pressed, moved in 8 steps, a frame drawn mid-drag, then let go.
     let nums =
         |s: &str| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>();
     let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK")
@@ -81,12 +83,20 @@ pub fn run(path: &str) -> Result<(), String> {
         .enumerate()
         .map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1]))
         .collect();
-    let mut drag =
-        std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
+    let mut drag = std::env::var("HARNESS_NATIVE_SHOT_DRAG")
+        .ok()
+        .map(|s| nums(&s))
+        .filter(|v| v.len() == 4 || v.len() == 5);
     let mut up_next = false;
     // HARNESS_NATIVE_SHOT_HOVER `x,y,t`: the pointer moves to (x, y) at t seconds (a hover mid-spring for a shot just after).
-    let mut hover =
-        std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
+    // Several as `x,y,t;x,y,t`, each logged with the pointer's shape it resolves to a frame later (src/app/pointer.rs).
+    let mut hovers: Vec<Vec<f32>> = std::env::var("HARNESS_NATIVE_SHOT_HOVER")
+        .unwrap_or_default()
+        .split(';')
+        .map(nums)
+        .filter(|v| v.len() == 3)
+        .collect();
+    let mut hovered: Option<(f32, f32)> = None;
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
@@ -122,8 +132,14 @@ pub fn run(path: &str) -> Result<(), String> {
     loop {
         let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
         frames += 1;
-        if let Some(h) = hover.take_if(|h| t >= h[2]) {
+        // The last hover's shape, resolved by the frame after it moved.
+        if let Some((x, y)) = hovered.take() {
+            eprintln!("harness-native: hover {x},{y} pointer {}", app.pointer_line());
+        }
+        if hovers.first().is_some_and(|h| t >= h[2]) {
+            let h = hovers.remove(0);
             app.pointer_move(h[0], h[1], crate::app::KeyMods::default());
+            hovered = Some((h[0], h[1]));
         }
         if let Some((v, n)) = wheel.as_mut().filter(|(v, _)| t >= v[3]) {
             if *n == 0 {
@@ -153,7 +169,7 @@ pub fn run(path: &str) -> Result<(), String> {
         if up_next {
             app.pointer_up(at.0, at.1, left, none);
             up_next = false;
-        } else if let Some(d) = drag.take_if(|_| t >= 0.8) {
+        } else if let Some(d) = drag.take_if(|d| t >= d.get(4).copied().unwrap_or(0.8)) {
             app.pointer_down(d[0], d[1], left, 1, none);
             for k in 1..=8 {
                 let f = k as f32 / 8.0;
