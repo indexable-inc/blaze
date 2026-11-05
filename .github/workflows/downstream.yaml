@@ -48,7 +48,7 @@ jobs:
   # Validate the build against the trusted dispatch commit before consuming its artifact.
   blaze:
     name: blaze
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 5
     outputs:
       run-id: ${{ steps.build.outputs.run-id }}
@@ -78,7 +78,7 @@ jobs:
   test:
     name: ${{ inputs.suite }}
     needs: blaze
-    runs-on: [ix, arm64, ix-cpu-32, blaze-downstream]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-32, blaze-downstream]
     timeout-minutes: 300
     defaults:
       run:
@@ -152,7 +152,7 @@ jobs:
     name: uv copy-on-write (Btrfs)
     needs: [blaze, test]
     if: ${{ !cancelled() && inputs.suite == 'uv' }}
-    runs-on: [ix, arm64, ix-cpu-16, blaze-downstream-uv-cow]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-16, blaze-downstream-uv-cow]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

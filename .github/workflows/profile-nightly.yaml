@@ -26,7 +26,7 @@ concurrency:
 jobs:
   trend:
     name: profile trend, ${{ matrix.platform }}
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 30
     strategy:
       fail-fast: false

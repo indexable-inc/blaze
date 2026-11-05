@@ -149,7 +149,7 @@ jobs:
   verdict:
     name: verdict
     if: ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'toolchain/bump' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.train != ''))
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     # It waits for the train of the main commit the bump is on (toolchain/base), started beside
     # the bump's: about as long as the bump's took.
     timeout-minutes: 150

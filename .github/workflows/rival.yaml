@@ -35,7 +35,7 @@ env:
 jobs:
   build:
     name: build both blazes
-    runs-on: [ix, arm64, ix-cpu-64, blaze-rival-build]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-64, blaze-rival-build]
     # A cold build of ours by blaze, then Astral's (on a 64-vCPU AArch64 ix runner).
     timeout-minutes: 300
     outputs:
@@ -100,7 +100,7 @@ jobs:
   measure:
     name: rival (${{ matrix.project }})
     needs: build
-    runs-on: [ix, arm64, ix-cpu-16, blaze-rival-measure]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-16, blaze-rival-measure]
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -152,7 +152,7 @@ jobs:
     name: rival report
     needs: measure
     if: always()
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     steps:
       - uses: actions/checkout@v7
         with:

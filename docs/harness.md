@@ -635,6 +635,15 @@ and runs nothing.
   history commits, promote.yaml's and yank's metadata, release.yaml's notes-free jobs (crates,
   publish, metadata), pgo's pin and toolchain-bump's branch and pull request.
 
+Every warm (not cold) job asks for `ix-trusted` in place of `ix` on main's `push`, `schedule`
+and `workflow_dispatch` runs, and for `ix` everywhere else:
+`"${{ (github.event_name == 'push' || ...) && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}"`.
+ix restores trusted (pre-scrub) memory only into a runner registered as `ix-trusted` without `ix`,
+so GitHub can never hand a pull request's job to it; before this, a PR job could land on a
+trusted runner and fail with "IX job admission Denied: untrusted assignment cannot execute with
+inherited trusted memory" (ix's docs/design/ci-on-ix.md, "Trusted memory"). Both labels fork one
+seed, so pull requests still start warm from main's clean snapshot.
+
 Every warm ix runner is a fork of the snapshot of the last green job on main with the same
 labels, its disk included: the checkout, `target/`, the toolchain, the pinned LLVM, `/nix/store`
 and blaze's store, which `.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` on a
