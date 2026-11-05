@@ -1,0 +1,41 @@
+{
+  "block": "t1",
+  "cell": "r.t1",
+  "code": "await glob('src/*')",
+  "effects": [
+    {
+      "detail": "",
+      "doing": "",
+      "done": "Found 3",
+      "kind": "search",
+      "status": "ok",
+      "target": "",
+      "value": null
+    }
+  ],
+  "effects_dropped": 0,
+  "ev": "tool_detail",
+  "logs": "",
+  "ms": 4,
+  "status": "done",
+  "ts": 7,
+  "ui": null,
+  "value": {
+    "cols": [
+      {
+        "name": "path",
+        "type": "string"
+      }
+    ],
+    "rows": [
+      [
+        "a"
+      ],
+      [
+        "b"
+      ]
+    ],
+    "t": "table",
+    "total": 2
+  }
+}
