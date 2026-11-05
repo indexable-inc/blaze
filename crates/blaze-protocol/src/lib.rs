@@ -17,6 +17,7 @@ pub mod bytes;
 pub mod cbor;
 pub mod events;
 pub mod follow;
+pub mod now;
 
 #[doc(hidden)]
 pub use serde as __serde;
