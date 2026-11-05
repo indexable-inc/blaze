@@ -6440,7 +6440,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 drop_args.store(),
                 self.param_env.store(),
             )
-            .map_err(|it| MirEvalError::MirLowerError(drop_impl, it))?;
+            .map_err(|it| {
+                // The error stack holds the frames that called, not the one running, so the
+                // drop is named here with where it was made.
+                MirEvalError::InFunction(
+                    // alloc: error path
+                    Box::new(MirEvalError::MirLowerError(drop_impl, it)),
+                    vec![(Either::Left(drop_impl), span, locals.body.owner)], // alloc: error path
+                )
+            })?;
             let this = self.pointer_value(addr, None)?;
             return self.exec_looked_up_function(
                 body,
