@@ -1,6 +1,6 @@
 //! Chat mode: an agent session driven over its structured protocol instead of its TUI in a PTY, so the native app draws
 //! the conversation itself (harness-native's chat pane) and agents talk to it without typing into a terminal. The agent's
-//! own protocol stays in its adapter ([`claude`]: stream-json; [`codex`]: the slot for `codex app-server`); everything
+//! own protocol stays in its adapter ([`claude`]: stream-json; [`codex`]: `codex app-server`'s JSON-RPC); everything
 //! here, and everything a client reads, is the one agent-neutral event model below.
 //!
 //! # The event model
@@ -51,7 +51,9 @@
 //!   history, then each event live, then T_EXIT. The history leaves out the partials of every block that came whole
 //!   since, so a reattach is the finished conversation plus what is still streaming. Without `events` (the terminal
 //!   client) the same events come as plain text.
-//! - `send` writes the adapter's user line and records a `user` event; `interrupt` writes the adapter's interrupt.
+//! - `send` writes the adapter's user lines and records a `user` event; `interrupt` writes the adapter's interrupt. An
+//!   adapter may also write lines of its own: a handshake as the child starts ([`Adapter::start`]) and answers to what
+//!   the child asks or queued messages once it can take them ([`Adapter::replies`], drained after every line read).
 //! - Busy (the sidebar's breathing dot) is a turn in flight, from a `user` until its `turn_end`. The title is the first
 //!   user message's first line.
 //! - The `messages` stream (what `Obj.reply()` reads) is written here from the events, `turn_end` on each turn's end;
@@ -73,19 +75,63 @@ use tokio::sync::broadcast;
 /// How many lines of the conversation `screen` returns (its tail).
 const SCREEN_LINES: usize = 200;
 
-/// An agent's protocol: how its output lines become events, and the lines that send a message and stop a turn.
+/// An agent's protocol: how its output lines become events, and the lines that start it, send a message, stop a turn
+/// and answer what it asks.
 pub trait Adapter: Send {
+    /// The lines to write as the child starts, before any message (a handshake).
+    fn start(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// The events one line of the agent's output stands for (none for what the model has no place for).
     fn events(&mut self, line: &str) -> Vec<Value>;
-    /// The line that sends the user's `text`.
-    fn user(&mut self, text: &str) -> String;
-    /// The line that stops the turn in flight.
-    fn interrupt(&mut self) -> String;
+    /// The lines to write now that [`Adapter::events`] read a line: answers to the child's requests, messages it can
+    /// take now. Drained.
+    fn replies(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The lines that send the user's `text` (none while the adapter holds it until the agent can take it).
+    fn user(&mut self, text: &str) -> Vec<String>;
+    /// The lines that stop the turn in flight (none when there is nothing to stop yet).
+    fn interrupt(&mut self) -> Vec<String>;
 }
 
 /// Whether event `ev` is a partial a whole block replaces.
 fn partial(ev: &str) -> bool {
     matches!(ev, "block_start" | "delta" | "tool_start" | "tool_delta")
+}
+
+/// Whether event `ev` is a block that came whole (it replaces its partials).
+fn whole(ev: &str) -> bool {
+    matches!(ev, "block" | "tool_call")
+}
+
+/// A chat's history from its record (`objects/sN/chat`) as a reattach to it live gives it: every event but the partials
+/// of each block that came whole since, and every block's `tool_detail` but its latest. For a chat that ended before this
+/// daemon started.
+pub fn history_of(path: &Path) -> std::io::Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut partials: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut details: HashMap<String, usize> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let ev: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let kind = ev["ev"].as_str().unwrap_or("");
+        if let Some(b) = ev["block"].as_str() {
+            if partial(kind) {
+                partials.entry(b.to_owned()).or_default().push(out.len());
+            } else if kind == "tool_detail" {
+                if let Some(i) = details.insert(b.to_owned(), out.len()) {
+                    out[i] = None;
+                }
+            } else if whole(kind) {
+                for i in partials.remove(b).unwrap_or_default() {
+                    out[i] = None;
+                }
+            }
+        }
+        out.push(Some(line.to_owned()));
+    }
+    Ok(out.into_iter().flatten().collect())
 }
 
 /// The history a reattach replays.
@@ -151,35 +197,42 @@ impl Chat {
         self.model.lock().unwrap().clone()
     }
 
-    /// A line the agent wrote: kept in `raw`, and its events recorded. Whether the busy state changed.
-    pub fn agent_line(&self, line: &str, tx: &broadcast::Sender<Ev>) -> bool {
+    /// The lines to write to the child as it starts.
+    pub fn start_lines(&self) -> Vec<String> {
+        self.store.lock().unwrap().adapter.start()
+    }
+
+    /// A line the agent wrote: kept in `raw`, and its events recorded. Whether the busy state changed, and the lines to
+    /// write back to the agent.
+    pub fn agent_line(&self, line: &str, tx: &broadcast::Sender<Ev>) -> (bool, Vec<String>) {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            return false;
+            return (false, Vec::new());
         }
-        let evs = {
+        let (evs, replies) = {
             let mut st = self.store.lock().unwrap();
             if let Err(e) = st.raw.write_all(format!("{line}\n").as_bytes()) {
                 eprintln!("{} raw: {e}", self.oid);
             }
-            st.adapter.events(line)
+            let evs = st.adapter.events(line);
+            (evs, st.adapter.replies())
         };
         let mut flipped = false;
         for ev in evs {
             flipped |= self.record(ev, tx);
         }
-        flipped
+        (flipped, replies)
     }
 
-    /// The line that sends `text` to the agent, after recording its `user` event (and the turn starting).
-    pub fn user_line(&self, text: &str, tx: &broadcast::Sender<Ev>) -> String {
+    /// The lines that send `text` to the agent, after recording its `user` event (and the turn starting).
+    pub fn user_lines(&self, text: &str, tx: &broadcast::Sender<Ev>) -> Vec<String> {
         self.record(json!({"ev": "user", "text": text}), tx);
         self.record(json!({"ev": "busy", "busy": true}), tx);
         self.store.lock().unwrap().adapter.user(text)
     }
 
-    /// The line that stops the turn in flight.
-    pub fn interrupt_line(&self) -> String {
+    /// The lines that stop the turn in flight.
+    pub fn interrupt_lines(&self) -> Vec<String> {
         self.store.lock().unwrap().adapter.interrupt()
     }
 
@@ -210,7 +263,7 @@ impl Chat {
                 if let Some(i) = st.details.insert(b.clone(), at) {
                     st.replay[i] = None;
                 }
-            } else if matches!(kind.as_str(), "block" | "tool_call") {
+            } else if whole(&kind) {
                 for i in st.partials.remove(b).unwrap_or_default() {
                     st.replay[i] = None;
                 }
@@ -380,5 +433,64 @@ impl portable_pty::ChildKiller for PidKiller {
 
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
         Box::new(*self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Quiet;
+    impl Adapter for Quiet {
+        fn events(&mut self, _: &str) -> Vec<Value> {
+            Vec::new()
+        }
+        fn user(&mut self, _: &str) -> String {
+            String::new()
+        }
+        fn interrupt(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// An ended chat's history read back from its record is the history a live reattach gave, line for line: the
+    /// partials of every block that came whole left out, a block still streaming kept.
+    #[test]
+    fn a_record_replays_as_the_live_history() {
+        let dir = std::env::temp_dir().join(format!("harness-chat-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let open = |n: &str| std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(n)).unwrap();
+        let chat = Chat {
+            oid: "s1".into(),
+            store: Mutex::new(Store {
+                raw: open("raw"),
+                events: open("chat"),
+                messages: open("messages"),
+                replay: Vec::new(),
+                partials: HashMap::new(),
+                tools: HashMap::new(),
+                adapter: Box::new(Quiet),
+            }),
+            title: Mutex::new(String::new()),
+            model: Mutex::new(String::new()),
+            busy: AtomicBool::new(false),
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        for ev in [
+            json!({"ev": "user", "text": "hi"}),
+            json!({"ev": "block_start", "block": "b1", "kind": "text"}),
+            json!({"ev": "delta", "block": "b1", "text": "hel"}),
+            json!({"ev": "tool_start", "block": "t1", "name": "Bash"}),
+            json!({"ev": "block", "block": "b1", "kind": "text", "text": "hello"}),
+            json!({"ev": "tool_delta", "block": "t1", "json": "{"}),
+        ] {
+            chat.record(ev, &tx);
+        }
+        let (live, _) = chat.history_and_subscribe(&tx);
+        let live: Vec<String> = live.iter().map(|l| l.to_string()).collect();
+        let read = history_of(&dir.join("chat")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(read, live);
+        assert_eq!(read.len(), 4, "{read:?}");
     }
 }

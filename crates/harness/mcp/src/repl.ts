@@ -4,8 +4,8 @@
 //
 // Each cell is posted to harnessd as it runs (`repl_task`): indexed as a `repl` object, and, when the agent said which
 // tool call ran it (`call`), drawn by the app as that call's card. A post is the cell's whole state: its code, status,
-// logs, steps (effects.ts) and, once done, its value as the app shows it (shown.ts). Posts while it runs are coalesced
-// to one per POST_MS and go out in order; the last one is its end.
+// logs, steps (effects.ts) and, once done, its value as the app shows it (shown.ts). Its first post goes at once, later
+// ones while it runs are coalesced to one per POST_MS; all go out in order, and the last one is its end.
 import * as acorn from "acorn";
 import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
@@ -34,16 +34,17 @@ export function body(t: Task) {
   };
 }
 
-/** Index a cell in harnessd (best effort; the REPL works without the daemon): now when it ended, else within POST_MS. */
+/** Index a cell in harnessd (best effort; the REPL works without the daemon): now when it starts or ends, else within POST_MS. */
 function post(t: Task) {
   if (!daemonPresent()) return;
+  const first = !posting.has(t);
   const p = posting.get(t) ?? posting.set(t, { chain: Promise.resolve() }).get(t)!;
   const send = () => {
     p.timer = undefined;
     // In order: each post waits for the one before it, and reads the task when it goes.
     p.chain = p.chain.then(() => req(body(t))).catch(() => {});
   };
-  if (t.status !== "running") {
+  if (first || t.status !== "running") {
     clearTimeout(p.timer);
     send();
   } else if (!p.timer) {

@@ -189,13 +189,15 @@ impl super::Adapter for Claude {
         }
     }
 
-    fn user(&mut self, text: &str) -> String {
-        json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).to_string()
+    fn user(&mut self, text: &str) -> Vec<String> {
+        vec![json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).to_string()]
     }
 
-    fn interrupt(&mut self) -> String {
+    fn interrupt(&mut self) -> Vec<String> {
         self.requests += 1;
-        json!({"type": "control_request", "request_id": format!("harness-{}", self.requests), "request": {"subtype": "interrupt"}})
-            .to_string()
+        vec![
+            json!({"type": "control_request", "request_id": format!("harness-{}", self.requests), "request": {"subtype": "interrupt"}})
+                .to_string(),
+        ]
     }
 }

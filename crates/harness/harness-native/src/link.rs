@@ -444,8 +444,8 @@ impl Link {
         });
     }
 
-    /// A new object of `kind` in `cwd`; `then` gets its id. `claude-tui` is Claude in its terminal UI (a PTY); plain
-    /// `claude` is a chat session.
+    /// A new object of `kind` in `cwd`; `then` gets its id. `claude-tui` and `codex-tui` are the agent in its terminal
+    /// UI (a PTY); plain `claude` and `codex` are chat sessions.
     pub fn spawn(
         &self,
         kind: &str,
@@ -457,8 +457,7 @@ impl Link {
         let (kind, poke) = (kind.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
             let (k, mode) = match kind.as_str() {
-                "claude-tui" => ("claude", Some("tui")),
-                k => (k, None),
+                k => k.strip_suffix("-tui").map_or((k, None), |k| (k, Some("tui"))),
             };
             match request(
                 &json!({"op": "spawn", "kind": k, "cwd": cwd, "cols": cols, "rows": rows, "mode": mode}),

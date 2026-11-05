@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 
 const dir = mkdtempSync(`${tmpdir()}/effects-smoke-`);
 process.env.HARNESS_SOCK = `${dir}/harnessd.sock`;
+process.env.HARNESS_HOME = dir; // never the live ~/.harness
 type Post = { id: string; call: string | null; status: string; effects: { kind: string; doing: string; done: string; status: string; detail: string; value: { t: string } | null }[]; value: { t: string; cols?: { name: string; type: string }[]; total?: number } | null };
 const posts: Post[] = [];
 Bun.listen({

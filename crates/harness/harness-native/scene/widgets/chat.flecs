@@ -7,6 +7,7 @@ hn {
   // The pane: the transcript scrolling over the card's ground, a column as wide as reads well; the input under it.
   prefab ChatPane : hn.Pane {
     list : ui.Scroll {
+      Cursor: {shape: Text}
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
@@ -45,17 +46,18 @@ hn {
     }
   }
 
-  // What the person sent: their words on a soft plate at the trailing edge.
+  // What the person sent: their words in a bubble at the trailing edge, as wide as they are up to $chat_bubble_max_w,
+  // wrapping past it (and past the row's room in a narrow pane).
   prefab ChatUser : ui.Row {
     Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 48, r: 0, t: 14, b: 10}
-    bubble : ui.Column {
+    bubble : ui.Bubble {
       Fill: $tone_chat_bubble
       Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      Padding: {l: 14, r: 14, t: 8, b: 8}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
+        Cursor: {shape: Text}
         Fill: $tone_term_ink
         TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
       }

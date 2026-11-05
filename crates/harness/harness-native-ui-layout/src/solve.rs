@@ -5,6 +5,20 @@
 //! then height, then `place` writes positions. A leaf's content size is its `Intrinsic` (a component the host's
 //! typesetter writes, `typeset`).
 //!
+//! Widths are proposals, SwiftUI's model: a parent proposes the room it has and each child picks its own width within it.
+//! Along a row the children share the room (`distribute`: Fit at its ideal, Grow by weight, a deficit shrunk off the
+//! lowest priority down to each floor); across a column (and in a Z stack) a child that does not stretch takes the less of
+//! its ideal width and the room (`across_size`), so a Fit box around words (a chat bubble, a chip, a card) is as wide as
+//! its words up to the room and no wider, and its words wrap at what it has inside. `Size.w.max` is SwiftUI's
+//! `.frame(maxWidth:)`, `Size.w.min` the floor a proposal stops at, `FixedSize` is `.fixedSize()` (its ideal whatever is
+//! proposed). Before 2026-11-04 a non-stretched child across a column took its ideal width whatever the room, so a long
+//! line in a Fit column ran out past its parent (and its plate) on one line.
+//!
+//! Heights follow widths: a text leaf is as tall as its lines wrapped at the width the width pass gave it. The solver cannot
+//! shape text (the layout module is hot-swapped and has no typesetter), so the host measures each `Text` at its last laid
+//! width (`typeset`: `Intrinsic.at`), and the frame alternates typeset and layout until no height moves. Widths never
+//! depend on heights (but for `Aspect`), so a layout whose widths moved settles one round later, inside the same frame.
+//!
 //! On top of flex, SwiftUI's layout vocabulary: `Background`/`Overlay` children take their parent's frame out of the flow;
 //! a `Grid` sizes columns by their widest cell; `GridColumns` makes adaptive columns; `Lazy` stands for rows that do not
 //! exist yet and says which are in view (`range`); a Row aligned on `FirstBaseline`/`LastBaseline` lines up its text;
@@ -414,7 +428,10 @@ fn lines(items: &[Item], i: usize) -> Vec<Vec<usize>> {
 }
 
 /// The size a child gets across its parent (or in a slot `inner` long): its own Fixed or Percent, all of it when it
-/// grows or is stretched, else its natural size.
+/// grows or is stretched, else its natural size. Across a width (`a` 0) the room is a proposal (SwiftUI's): a Fit child
+/// takes the less of its ideal width and the room, down to its floor, unless it is `FixedSize` (see the module doc). A
+/// scroll keeps its content's natural length along its main axis only, so this holds across it too. Heights across are
+/// left alone (a node is as tall as its content at its width; the parent clips).
 fn across_size(ch: &Item, a: usize, inner: f32, align: Align, stretch_fit: bool, grow: bool) -> f32 {
     let s = ch.size[a];
     let align = ch.align_self.unwrap_or(align);
@@ -423,6 +440,7 @@ fn across_size(ch: &Item, a: usize, inner: f32, align: Align, stretch_fit: bool,
         SizeKind::Percent => s.clamp(s.value * inner),
         SizeKind::Grow if grow && !ch.fixed[a] => s.clamp(inner),
         SizeKind::Fit if align == Align::Stretch && (stretch_fit || ch.align_self == Some(Align::Stretch)) && !ch.fixed[a] => s.clamp(inner),
+        SizeKind::Fit if a == 0 && !ch.fixed[0] => ch.nat[0].min(inner.max(ch.floor[0])),
         _ => ch.nat[a],
     }
 }
@@ -1000,6 +1018,41 @@ mod tests {
         solve(&mut items, 0, [120.0, 50.0]);
         assert_eq!(items[1].out.w, 90.0);
         assert_eq!(items[2].out.w, 120.0 - 8.0 - 90.0);
+    }
+
+    /// A chat bubble: a trailing-justified row 300 wide holding a Fit column (padding 14 a side, at most 240) around words
+    /// whose one line runs 500. The column takes the less of the room and its max, and its words get its inner width to
+    /// wrap at, whatever the column's align; short words keep their own width and the bubble hugs them.
+    #[test]
+    fn a_fit_box_around_words_wraps_at_the_room_it_is_proposed() {
+        let bubble = |words: f32| {
+            let col = Item {
+                flex: Flex { axis: FlexAxis::Column, align: Align::Start, ..Flex::default() },
+                pad: [14.0, 14.0, 8.0, 8.0],
+                ..item([Sizing { max: 240.0, ..Sizing::FIT }, Sizing::FIT], vec![2])
+            };
+            let row = Item { flex: Flex { axis: FlexAxis::Row, justify: Justify::End, ..Flex::default() }, ..item([Sizing::fixed(300.0), Sizing::FIT], vec![1]) };
+            vec![row, col, text(words, 20.0, 15.0, 15.0)]
+        };
+        let mut items = bubble(500.0);
+        solve(&mut items, 0, [300.0, 100.0]);
+        assert_eq!(items[1].out.w, 240.0);
+        assert_eq!(items[1].out.x, 60.0);
+        assert_eq!(items[2].out.w, 240.0 - 28.0);
+        // No max: the room is the cap.
+        items[1].size[0].max = 0.0;
+        solve(&mut items, 0, [300.0, 100.0]);
+        assert_eq!(items[1].out.w, 300.0);
+        assert_eq!(items[2].out.w, 300.0 - 28.0);
+        // FixedSize opts out: the words keep their one line.
+        items[2].fixed = [true, false];
+        solve(&mut items, 0, [300.0, 100.0]);
+        assert_eq!(items[2].out.w, 500.0);
+        let mut items = bubble(80.0);
+        solve(&mut items, 0, [300.0, 100.0]);
+        assert_eq!(items[1].out.w, 108.0);
+        assert_eq!(items[1].out.x, 300.0 - 108.0);
+        assert_eq!(items[2].out.w, 80.0);
     }
 
     /// Rows 20 long with 4 between (a stride of 24): the view 100..200 of the content shows rows 4 (ending 116) to 8

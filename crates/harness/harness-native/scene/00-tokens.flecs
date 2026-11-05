@@ -133,6 +133,9 @@ export const line_keycap = 13
 
 export const radius_control = 6
 export const radius_card = 12
+// ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
+export const radius_bubble = 12
+export const bubble_max_w = 480
 
 // Vibrant labels: primary, secondary, tertiary, quaternary.
 export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
@@ -241,8 +244,33 @@ export const size_chat_h2 = 16.5
 export const size_chat_h3 = 14.5
 export const line_chat_code = 17
 export const chat_bubble_radius = 12
+// The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
+export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
 export const chat_row_estimate = 44
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
 export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
+
+// Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
+// `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and
+// `function.macro`); a capture none names keeps the words' own ink. These are for an appearance the Ghostty config does
+// not theme; with a theme, src/app/ghostty.rs (CODE_ANSI) sets each from the theme's ANSI colour, so code reads as it
+// would in the terminal.
+@tree ChildOf
+code_ink {
+  keyword { Fill: {dark: {0.776, 0.471, 0.867, 1}, light: {0.812, 0.133, 0.180, 1}} }
+  function { Fill: {dark: {0.380, 0.686, 0.937, 1}, light: {0.510, 0.314, 0.875, 1}} }
+  type { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  constructor { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  attribute { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  string { Fill: {dark: {0.596, 0.765, 0.475, 1}, light: {0.039, 0.188, 0.412, 1}} }
+  escape { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  number { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  constant { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  property { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.020, 0.314, 0.682, 1}} }
+  label { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.584, 0.220, 0.000, 1}} }
+  operator { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.812, 0.133, 0.180, 1}} }
+  comment { Fill: {dark: {0.498, 0.518, 0.557, 1}, light: {0.431, 0.467, 0.506, 1}} }
+  variable { builtin { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.812, 0.133, 0.180, 1}} } }
+}

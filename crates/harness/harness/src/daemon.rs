@@ -135,19 +135,27 @@ impl Session {
         }
     }
 
-    /// A chat session's message: its user line to the agent (Err: not a chat session).
+    /// A chat session's message: its user lines to the agent (Err: not a chat session).
     pub fn chat_send(&self, text: &str) -> Result<()> {
         let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
-        let line = c.user_line(text, &self.tx);
+        let lines = c.user_lines(text, &self.tx);
         self.busy.store(true, Ordering::Relaxed);
         changed();
-        self.write(format!("{line}\n").as_bytes())
+        self.write_lines(&lines)
     }
 
     /// Stop a chat session's turn in flight.
     pub fn chat_interrupt(&self) -> Result<()> {
         let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
-        self.write(format!("{}\n", c.interrupt_line()).as_bytes())
+        self.write_lines(&c.interrupt_lines())
+    }
+
+    /// Protocol lines to a chat child's stdin, each with its newline.
+    fn write_lines(&self, lines: &[String]) -> Result<()> {
+        for l in lines {
+            self.write(format!("{l}\n").as_bytes())?;
+        }
+        Ok(())
     }
 
     pub fn kill(&self) {
@@ -182,7 +190,7 @@ pub enum Req {
         name: Option<String>,
         cols: Option<u16>,
         rows: Option<u16>,
-        /// `chat` (Claude's default) or `tui` (a PTY).
+        /// `chat` (Claude's and Codex's default) or `tui` (a PTY).
         mode: Option<String>,
     },
     /// `events`: a chat session's events as NDJSON (chat/mod.rs) instead of the conversation as text.
@@ -268,9 +276,10 @@ impl Daemon {
         // A known Claude session id ties this object to its transcript (the messages stream).
         let mut args = args.to_vec();
         let mut meta = json!({ "session": id, "cwd": cwd, "created_ms": created_ms });
-        // Claude runs as a chat (stream-json, drawn by the app) unless `--tui` asks for its terminal UI.
+        // Claude and Codex run as a chat (stream-json, app-server; drawn by the app) unless `--tui` asks for their
+        // terminal UI.
         let tui = args.iter().position(|a| a == "--tui").map(|i| args.remove(i)).is_some();
-        let chat = kind == "claude" && !tui;
+        let chat = matches!(kind, "claude" | "codex") && !tui;
         if chat {
             meta["mode"] = json!("chat");
         }
@@ -280,11 +289,10 @@ impl Daemon {
             args.splice(0..0, ["--session-id".to_string(), uuid.clone()]);
             meta["claude_session"] = json!(uuid);
         }
-        let mut launch = profiles::launch(
-            kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt: if chat { None } else { prompt } },
+        let launch = profiles::launch(
+            kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt: if chat { None } else { prompt }, chat },
         )?;
         if chat {
-            launch.args.splice(0..0, chat::claude::ARGS.iter().map(|a| a.to_string()));
             return self.spawn_chat(id, kind, launch, parent, cwd, prompt, name, env, meta, created_ms);
         }
         let mut cmd = CommandBuilder::new(&launch.program);
@@ -384,13 +392,18 @@ impl Daemon {
     }
 
     /// A chat session (chat/mod.rs): `launch` run with stdin and stdout piped, each line it writes recorded through
-    /// Claude's adapter; `prompt`, if any, sent as its first message.
+    /// its kind's adapter (chat/claude.rs, chat/codex.rs); `prompt`, if any, sent as its first message.
     #[allow(clippy::too_many_arguments)]
     fn spawn_chat(
         self: &Arc<Self>, id: u64, kind: &str, launch: profiles::Launch, parent: Option<u64>, cwd: String,
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         use std::io::BufRead;
+        let adapter: Box<dyn chat::Adapter> = match kind {
+            "claude" => Box::new(chat::claude::Claude::default()),
+            "codex" => Box::new(chat::codex::Codex::new(&cwd)),
+            other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
+        };
         let oid = format!("s{id}");
         let dir = db::object_dir(&oid);
         std::fs::create_dir_all(&dir)?;
@@ -417,7 +430,7 @@ impl Daemon {
         db::session_start(&db::SessionRow {
             id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "chat",
         });
-        let c = Arc::new(chat::Chat::open(&oid, &dir, Box::new(chat::claude::Claude::default()))?);
+        let c = Arc::new(chat::Chat::open(&oid, &dir, adapter)?);
         let (tx, _) = broadcast::channel(16384);
         let session = Arc::new(Session {
             id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Some(pid),
@@ -438,9 +451,13 @@ impl Daemon {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                if c.agent_line(&line, &s.tx) {
+                let (flipped, replies) = c.agent_line(&line, &s.tx);
+                if flipped {
                     s.busy.store(c.busy.load(Ordering::Relaxed), Ordering::Relaxed);
                     changed();
+                }
+                if let Err(e) = s.write_lines(&replies) {
+                    eprintln!("chat session {id}: writing to the agent: {e}");
                 }
             }
         })?;
@@ -462,6 +479,7 @@ impl Daemon {
             db::session_end(s.id, code, status, ended);
             archive::compact_bg(format!("s{}", s.id));
         })?;
+        session.write_lines(&session.chat.as_ref().map(|c| c.start_lines()).unwrap_or_default())?;
         if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
             session.chat_send(p)?;
         }
@@ -623,6 +641,11 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             let s = match d.get(id) {
                 Ok(s) => s,
                 Err(e) => {
+                    // A chat that ended before this daemon started: its history from its record, then its exit.
+                    if let Some(info) = db::session(id).filter(|s| s["mode"] == "chat") {
+                        proto::write_json(&mut w, &json!({ "ok": true, "info": info })).await?;
+                        return attach_ended_chat(id, &info, events, w).await;
+                    }
                     proto::write_json(&mut w, &json!({ "error": e.to_string() })).await?;
                     continue;
                 }
@@ -737,30 +760,9 @@ async fn attach_chat(
     let (history, mut rx) = c.history_and_subscribe(&s.tx);
     let exited = *s.exit.lock().unwrap();
     let sid = s.id;
-    let render = move |lines: &[u8]| -> Vec<u8> {
-        if events {
-            return lines.to_vec();
-        }
-        let mut out = String::new();
-        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
-        }
-        out.replace('\n', "\r\n").into_bytes()
-    };
+    let render = chat_render(events);
     let mut out = tokio::spawn(async move {
-        // The history in frames of whole lines, about 256 KB each.
-        let mut buf = Vec::new();
-        for l in &history {
-            buf.extend_from_slice(l.as_bytes());
-            buf.push(b'\n');
-            if buf.len() >= 256 * 1024 {
-                proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
-                buf.clear();
-            }
-        }
-        if !buf.is_empty() {
-            proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
-        }
+        send_history(&mut w, &history, &render).await?;
         if let Some(code) = exited {
             proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
             return Ok::<_, anyhow::Error>(());
@@ -799,6 +801,53 @@ async fn attach_chat(
     out.abort();
     s.attached.fetch_sub(1, Ordering::Relaxed);
     res
+}
+
+/// How a chat attach sends event lines: as they are (`events`, the app), or as the conversation's text (the terminal
+/// client).
+fn chat_render(events: bool) -> impl Fn(&[u8]) -> Vec<u8> + Send + 'static {
+    move |lines: &[u8]| -> Vec<u8> {
+        if events {
+            return lines.to_vec();
+        }
+        let mut out = String::new();
+        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
+        }
+        out.replace('\n', "\r\n").into_bytes()
+    }
+}
+
+/// A chat's history to an attach, in T_DATA frames of whole lines, about 256 KB each.
+async fn send_history(
+    w: &mut tokio::net::unix::OwnedWriteHalf, history: &[impl AsRef<str>], render: impl Fn(&[u8]) -> Vec<u8>,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    for l in history {
+        buf.extend_from_slice(l.as_ref().as_bytes());
+        buf.push(b'\n');
+        if buf.len() >= 256 * 1024 {
+            proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+    }
+    Ok(())
+}
+
+/// An attach to a chat that ended before this daemon started (`info` its index row): its history from its record,
+/// then its exit.
+async fn attach_ended_chat(id: u64, info: &Value, events: bool, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let path = db::object_dir(&format!("s{id}")).join("chat");
+    let read = path.clone();
+    let history = tokio::task::spawn_blocking(move || chat::history_of(&read))
+        .await?
+        .with_context(|| format!("attach s{id}: reading its chat record {}", path.display()))?;
+    send_history(&mut w, &history, chat_render(events)).await?;
+    proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": info["exit"] }).to_string().as_bytes()).await?;
+    Ok(())
 }
 
 /// Random RFC 4122 v4 UUID (for Claude's --session-id).

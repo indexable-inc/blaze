@@ -4,6 +4,7 @@
 //! replaces what they grew. A `tool_detail` (what a harness REPL cell a tool call ran did: its steps and value) is kept by
 //! its call's block beside the items, whole each time, whichever comes first. Nothing here knows which agent wrote it.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -34,7 +35,8 @@ pub struct ToolResult {
 
 /// What a harness REPL cell a tool call ran did (`tool_detail`, harness/src/chat/mod.rs): its steps outside the REPL and
 /// its value. Values (`value`, a step's `value`) stay JSON in the kernel's shape (mcp/src/shown.ts): `{t: table | record |
-/// list, cols, rows, total}`, `{t: scalar, type, v}`, `{t: text, v, total}`, `{t: error, message, stack}`, or null.
+/// list, cols, rows, total}`, `{t: scalar, type, v}`, `{t: text, v, total}`, `{t: error, message, stack}`, or null; shared,
+/// so a row that draws one holds it without a copy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Detail {
     /// `running`, `done` or `error`.
@@ -44,7 +46,7 @@ pub struct Detail {
     pub effects: Vec<Effect>,
     /// Steps past the kernel's cap, not kept.
     pub dropped: u64,
-    pub value: Value,
+    pub value: Arc<Value>,
     pub logs: String,
 }
 
@@ -61,7 +63,7 @@ pub struct Effect {
     pub status: String,
     pub ms: Option<u64>,
     pub detail: String,
-    pub value: Value,
+    pub value: Arc<Value>,
 }
 
 impl Detail {
@@ -79,7 +81,7 @@ impl Detail {
                 status: s(e, "status"),
                 ms: e["ms"].as_u64(),
                 detail: s(e, "detail"),
-                value: e["value"].clone(),
+                value: Arc::new(e["value"].clone()),
             })
             .collect();
         Self {
@@ -88,7 +90,7 @@ impl Detail {
             code: s(v, "code"),
             effects,
             dropped: v["effects_dropped"].as_u64().unwrap_or(0),
-            value: v["value"].clone(),
+            value: Arc::new(v["value"].clone()),
             logs: s(v, "logs"),
         }
     }

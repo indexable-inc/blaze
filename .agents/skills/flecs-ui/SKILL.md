@@ -37,9 +37,10 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | --- | --- |
 | HStack / VStack / ZStack | `ui.Row`, `ui.Column`, `ui.ZStack` (`Flex: {axis, gap, align, justify, wrap}`) |
 | Spacer, Divider | `ui.Spacer`, `ui.Divider` (`hn.Seam` for the 1pt vertical hairline) |
-| .frame / .padding | `Size: {w, h}`, each axis `{kind: Fixed/Grow/Fit/Percent, value, min, max}`; `Padding: {l, r, t, b}` |
+| .frame / .padding | `Size: {w, h}`, each axis `{kind: Fixed/Grow/Fit/Percent, value, min, max}`; `Padding: {l, r, t, b}`. Widths are proposals (SwiftUI's): a Fit node takes the less of its ideal width and the room, `max` is `.frame(maxWidth:)`, `FixedSize` is `.fixedSize()`; text wraps at what it gets (solve.rs's module doc) |
 | Grid / LazyVGrid | `ui.Grid` + `ui.GridRow`/`ui.GridColumn`; `ui.AdaptiveGrid` with `GridColumns: {min, max}` |
 | Long lists | `ui.LazyColumn`/`ui.LazyGrid` (`Lazy: {count, row, overscan}`) in a `ui.Scroll`: only visible rows exist (the Archive) |
+| Words in a hugging plate (chat bubble, callout) | `ui.Bubble` (a Fit `ui.Box` capped by `Size.w.max`; its words wrap past it) |
 | Text | `ui.Words` (wraps) / `ui.Line` / `ui.Lead` + `TextStyle`; `ui.LineMiddle`/`ui.LineHead` or `Truncate: {mode: Head/Middle/Tail}`; one line in rows, never wrap |
 | Who truncates first | `ui.Lead` (`ShrinkFirst`), `LayoutPriority {value}`, `FixedSize {h, v}` (name truncates before badge) |
 | Alignment | `Align: FirstBaseline/LastBaseline`, `AlignSelf`, `AlignmentGuide {dx, dy}` |
@@ -137,6 +138,11 @@ existing action is entities only; a new action also needs a handler under its na
 
 ## Verify (no focus-taking, ever)
 
+- First, after any `.flecs` change: `CARGO_TARGET_DIR=target cargo test -p harness-native scenes_load` (from
+  `crates/harness/`). It builds the world headless (no window, Metal or daemon), loads every scene script (tokens, prims,
+  the harness scene and its widgets, keys, the prims gallery and every example) and fails with flecs's error and line. A
+  scene that does not load (a prefab named like a component it sets, an entity named by a script keyword such as `new`,
+  an unknown token) otherwise only shows at launch, as an empty window. Run it before every push.
 - Offscreen: `HARNESS_NATIVE_SHOT=out.png HARNESS_NATIVE_SHOT_SECS=2` (default 2.5; + `HARNESS_NATIVE_SHOT_HOVER=x,y,t`
   in window points, `HARNESS_NATIVE_SHOT_KEY=k,t`, `HARNESS_NATIVE_SHOT_SEQ=t0,t1` for frame sequences,
   `HARNESS_NATIVE_SIDEBAR=0`, `HARNESS_NATIVE_APPEARANCE=light`); see `harness-native/src/shot.rs` for the rest.
