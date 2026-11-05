@@ -28,7 +28,7 @@ pub struct DevTemplate;
 /// What a dev template is of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TemplateOf {
-    /// What the driver keeps the instance's code as: `placed(stored(key, built_in), refs)`.
+    /// What the driver keeps the instance's code as: `placed(stored(key, built_in), refs, own)`.
     pub stored: InstanceKey,
     pub settings: Settings,
 }

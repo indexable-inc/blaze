@@ -212,7 +212,7 @@ impl FnSource {
 }
 
 /// An LLVM-optimized function as the release driver keeps it: under
-/// `blaze_codegen::driver::release_template_key(instance, built_in, refs, imports, imported_units, imported_refs, imported_built_in)`,
+/// `blaze_codegen::driver::release_template_key(instance, own, built_in, refs, imports, imported_units, imported_refs, imported_built_in)`,
 /// the driver's own function for it.
 #[derive(Clone, Copy, Debug)]
 pub struct FunctionMade<'a> {
@@ -293,7 +293,7 @@ pub enum ImagePart {
 /// A function compiled alone, with no import decisions, by Cranelift or copy-and-patch (a
 /// whole build's, a lazy build's first compiles, a lazy build's tier-up (`Later::tier_up`) to
 /// Cranelift), as the driver keeps it: under
-/// `blaze_codegen::driver::dev_template_key(instance, built_in, refs, toolchain)`, the driver's
+/// `blaze_codegen::driver::dev_template_key(instance, own, built_in, refs, toolchain)`, the driver's
 /// own function for it.
 /// It has no import decisions: those are release code's.
 #[derive(Clone, Copy, Debug)]
@@ -304,7 +304,8 @@ pub struct DevFunctionMade<'a> {
     /// The bodies its code builds in, in the driver's order: strictly ascending by instance key.
     pub built_in: &'a [FnSource],
     /// What its code references, in its relocations' order: the key covers each one's kind
-    /// (`blaze_codegen::driver::placed`), as the driver's does.
+    /// and which one is the function itself (`blaze_codegen::driver::placed`), as the
+    /// driver's does.
     pub refs: &'a [Target],
 }
 
@@ -545,6 +546,7 @@ impl Rule {
         let (_, key) = with_keys(made.built_in, |built_in| {
             blaze_codegen::driver::release_template_key(
                 &made.function.template_instance(),
+                made.function.instance.key(),
                 built_in,
                 made.refs,
                 made.imports,
@@ -655,6 +657,7 @@ impl Rule {
         let key = with_keys(made.built_in, |built_in| {
             blaze_codegen::driver::dev_template_key(
                 &made.function.template_instance(),
+                made.function.instance.key(),
                 built_in,
                 made.refs,
                 &spec.toolchain.id,
@@ -1388,8 +1391,9 @@ mod tests {
         // references laid out, of its placed stored key.
         let stored =
             blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
-        let placed = blaze_codegen::driver::placed(stored, &refs);
-        let (_, places) = blaze_codegen::backend::release_refs(&refs, &imported_refs);
+        let (all, places) = blaze_codegen::backend::release_refs(&refs, &imported_refs);
+        let own = blaze_codegen::template::own_place(function.instance.key(), &all);
+        let placed = blaze_codegen::driver::placed(stored, &refs, own);
         assert_eq!(places, [0, 1, 0, 2], "the import's call of the same callee is one place");
         let laid = blaze_codegen::backend::laid_out(placed, &places);
         let inlined_keys = [inlined[0].instance.key()];
@@ -1500,7 +1504,8 @@ mod tests {
                 function.instance.key(),
                 &[built_in[0].instance.key()],
             );
-            let placed = blaze_codegen::driver::placed(stored, &refs);
+            let own = blaze_codegen::template::own_place(function.instance.key(), &refs);
+            let placed = blaze_codegen::driver::placed(stored, &refs, own);
             let key = blaze_codegen::kernel::template(&placed, &settings, &dev.toolchain.id);
             assert_eq!((public.key(), public.kind()), (key, Kind::Code));
             let direct = [

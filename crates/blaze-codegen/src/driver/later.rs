@@ -46,7 +46,7 @@ use crate::{
     plan::{Mode, Origin},
     query::keys,
     settings::Spec,
-    template::Template,
+    template::{Template, own_place},
 };
 
 /// A function of a lazy build, as its walk reached it: what `blaze_lazy::plan::Plan` is made
@@ -221,6 +221,7 @@ fn compiled<B: Prepare>(
     let (key, item) = (unit.instance.key(), unit.item);
     let at = dev_template_key(
         &template_instance(node, unit),
+        unit.instance.key(),
         &node.built_in,
         &node.refs,
         &spec.toolchain.id,
@@ -289,8 +290,8 @@ fn claimed<B: Prepare>(
     spec: &Spec,
     check: impl Fn() -> Result<(), CodegenError>,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
-    let (key, at) =
-        (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
+    let key = unit.instance.key();
+    let at = placed(stored(key, &node.built_in), &node.refs, own_place(key, &node.refs));
     let flights = memo.flights();
     let mut plan = flight::Plan::new(1);
     // alloc: what other builds' waits for this compile name it by, once per later compile
@@ -349,6 +350,7 @@ fn claimed<B: Prepare>(
             key,
             dev_template_key(
                 &template_instance(node, unit),
+                unit.instance.key(),
                 &node.built_in,
                 &node.refs,
                 &spec.toolchain.id,
@@ -520,6 +522,7 @@ impl<I, S> Later<I, S> {
         let tiered = unit.instance.key();
         let at = dev_template_key(
             &template_instance(node, &unit),
+            unit.instance.key(),
             &node.built_in,
             &node.refs,
             &spec.toolchain.id,

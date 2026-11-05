@@ -288,9 +288,22 @@ impl Shape {
         hasher.id(&self.0);
         Shape(hasher.finish())
     }
+
+    /// This shape as compiled to a template of a function whose place `at` is itself
+    /// ([`crate::template::own_place`]), else itself. The IR takes that place like any other,
+    /// but its template holds a [`crate::template::Ref::Own`] there, so a function that calls
+    /// itself and one with the same IR that calls another instance at that place compile to two
+    /// templates: one memo entry would give one of them the other's call (rule 20).
+    pub fn own_place(self, at: Option<u32>) -> Shape {
+        let Some(at) = at else { return self };
+        let mut hasher = blaze_ids::Hasher::new(OWN_PLACE_SHAPE_DOMAIN);
+        hasher.id(&self.0).update(&at.to_le_bytes());
+        Shape(hasher.finish())
+    }
 }
 
 pub const RELATIVE_SHAPE_DOMAIN: &str = "blaze v2 relative shape 1";
+pub const OWN_PLACE_SHAPE_DOMAIN: &str = "blaze v2 own place shape 1";
 
 /// What a compile gives.
 #[derive(PartialEq, Eq, Debug)]

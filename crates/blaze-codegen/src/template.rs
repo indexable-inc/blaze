@@ -525,6 +525,23 @@ fn place(refs: &Refs, target: &Target) -> Result<u32, TemplateError> {
     found.map(|it| it as u32).ok_or_else(|| TemplateError::NotReferenced(target.clone()))
 }
 
+/// The place among `refs` that a template of `own`'s code holds as [`Ref::Own`], never as a
+/// [`Ref::Place`]: `Target::Direct(own)`, the function calling or addressing itself, which
+/// [`template_relocs`] takes for a jump into its own code. Every other place is a
+/// [`Ref::Place`]. Which instance fills a place is the build's walk's (`refs`), never the
+/// template code's, which holds no name (docs/v2/plan/design/name-free-identity.md), nor the
+/// IR's, which takes each reference by its place: two functions of one template code can have
+/// one place resolved to the function itself and the other's to another instance (one
+/// non-generic body in a library and in its `--test` crate, `hir-ty-mir`'s `unwind::is_panic`,
+/// its recursive call at place 5), and their templates differ there. So every key a template is
+/// kept or shared under holds this place (`driver::placed`, the memo's
+/// [`crate::backend::Shape::own_place`]), rule 20. `refs` lists each target once, so there is
+/// at most one.
+pub fn own_place(own: InstanceKey, refs: &Refs) -> Option<u32> {
+    let at = refs.iter().position(|it| matches!(it, Target::Direct(key) if *key == own))?;
+    Some(u32::try_from(at).expect("an instance refers to fewer than 2^32 things"))
+}
+
 /// `target` by its place among `refs`, else, for an outside symbol, among `externs`.
 fn reference(refs: &Refs, externs: &[String], target: &Target) -> Result<Ref, TemplateError> {
     match place(refs, target) {
@@ -590,6 +607,8 @@ fn template_relocs(
             Target::Counter(key) => return Err(TemplateError::Counter(own.map(|_| *key))),
             Target::ProfileCounters if own.is_some() => Ref::ProfileCounters,
             Target::ProfileCounters => return Err(TemplateError::ProfileCounters),
+            // Before any place, so a listed call of itself is its own too: what [`own_place`]
+            // names for the keys.
             Target::Direct(key) if own == Some(*key) => Ref::Own,
             other => reference(refs, externs, other)?,
         })
@@ -1532,6 +1551,51 @@ mod tests {
             named.instantiate(ItemKey(ContentId([3; 32])), ContentId([4; 32]), &[]).unwrap_err(),
             TemplateError::Own
         );
+    }
+
+    /// One code calling the instance at its place 0: a call of itself is its own
+    /// ([`Ref::Own`]), a call of another instance there a [`Ref::Place`]. The template code
+    /// and the IR's shape take the place alike whatever fills it, so the two templates differ
+    /// in what [`own_place`] says alone, which is what their keys must hold (`hir-ty-mir`'s
+    /// `unwind::is_panic` in its library and its `--test` crate, rule 20). Two functions that
+    /// each call themselves keep one template, as name-free sharing wants.
+    #[test]
+    fn a_call_of_itself_is_told_apart_from_a_call_at_its_place() {
+        let calling = |own: InstanceKey, callee: InstanceKey| {
+            let refs = vec![Target::Direct(callee)];
+            let function = CompiledFunction {
+                key: own,
+                arch: Arch::X86_64,
+                align: 16,
+                code: vec![0xe8, 0, 0, 0, 0, 0xc3],
+                relocs: vec![call(1, refs[0].clone())].into(),
+                data: Vec::new(),
+                inlined: Vec::new(),
+                side: None,
+                unwind: None,
+                lines: Vec::new(),
+                coverage: None,
+                profile: None,
+            };
+            (function, refs)
+        };
+        let template = |(function, refs): &(CompiledFunction, Vec<Target>)| {
+            (Template::of(function, refs, &[]).unwrap(), own_place(function.key, refs))
+        };
+        let (itself, other_itself) = (calling(key(1), key(1)), calling(key(2), key(2)));
+        let another = calling(key(3), key(1));
+        let (t_itself, at_itself) = template(&itself);
+        let (t_other_itself, at_other_itself) = template(&other_itself);
+        let (t_another, at_another) = template(&another);
+        assert_eq!(t_itself.relocs.targets(), [Ref::Own]);
+        assert_eq!(t_another.relocs.targets(), [Ref::Place(0)]);
+        assert_ne!(t_itself, t_another, "one code, two templates");
+        assert_ne!(at_itself, at_another, "told apart by the place of itself");
+        assert_eq!((at_itself, at_another), (Some(0), None));
+        assert_eq!(t_itself, t_other_itself, "two that call themselves share one template");
+        assert_eq!(at_itself, at_other_itself);
+        assert_eq!(t_itself.instantiate(key(2), &other_itself.1).unwrap(), other_itself.0);
+        assert_eq!(t_another.instantiate(key(3), &another.1).unwrap(), another.0);
     }
 
     /// A function whose code, data and lines name its own span tables at `own` and one table of

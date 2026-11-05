@@ -47,7 +47,7 @@ use crate::{
     query::keys,
     settings::Spec,
     summary::{Imports, Summary},
-    template::{OwnAnchors, StaticTemplate, Template, TemplateError},
+    template::{OwnAnchors, StaticTemplate, Template, TemplateError, own_place},
 };
 
 /// The store as a build reads it.
@@ -352,25 +352,33 @@ pub fn stored(key: InstanceKey, built_in: &[InstanceKey]) -> InstanceKey {
     InstanceKey(hasher.finish())
 }
 
-pub const PLACED_DOMAIN: &str = "blaze v2 placed 1";
+pub const PLACED_DOMAIN: &str = "blaze v2 placed 2";
 
-/// What a unit's code is kept under: [`stored`] and the kind of each of its references, by
-/// place. A template is made against the places of its references, and two bodies of one key
-/// can have other places (a fact of the arguments the key leaves out adds a call), so how many
-/// there are and what each is are keyed; which callee or symbol is at a place is not, as a
-/// template takes any.
-pub fn placed(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
+/// What a unit's code is kept under: [`stored`], the kind of each of its references, by
+/// place, and which place is the function itself (`own`, [`crate::template::own_place`] of
+/// the references its template is made against). A template is made against the places of its
+/// references, and two bodies of one key can have other places (a fact of the arguments the
+/// key leaves out adds a call), so how many there are and what each is are keyed; which callee
+/// or symbol is at a place is not, as a template takes any, but for the function itself, which
+/// its template holds as its own and never as a place (rule 20).
+pub fn placed(stored: InstanceKey, refs: &[Target], own: Option<u32>) -> InstanceKey {
     let mut hasher = Hasher::new(PLACED_DOMAIN);
     hasher.id(&stored.0).update(&(refs.len() as u64).to_le_bytes());
     for target in refs {
         hasher.update(&[place_kind(target)]);
     }
+    match own {
+        Some(at) => hasher.update(&[1]).update(&at.to_le_bytes()),
+        None => hasher.update(&[0]),
+    };
     InstanceKey(hasher.finish())
 }
 
-/// The store key of the dev template of `instance`, whose code builds in `built_in` (in the
-/// driver's order) and references `refs`, compiled by the codegen of `toolchain`
-/// (`Spec::toolchain.id`): `kernel::template(placed(stored(..), refs), ..)`. The one place the
+/// The store key of the dev template of `instance` (its template instance: its code is its
+/// template code), compiled as `own` (the instance key its function is compiled under), whose
+/// code builds in `built_in` (in the driver's order) and references `refs`, compiled by the
+/// codegen of `toolchain` (`Spec::toolchain.id`):
+/// `kernel::template(placed(stored(..), refs, own_place(own, refs)), ..)`. The one place the
 /// driver and `blaze_global`'s public dev function rule make it, so the two cannot differ.
 /// Every function compiled alone, with no imports, is kept under it, whatever its backend: a
 /// whole build's Cranelift and stencil code (all but [`crate::Backend::is_release`]'s), a lazy
@@ -379,23 +387,29 @@ pub fn placed(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
 /// whole live build's tier-up (`Build::tier_up`).
 pub fn dev_template_key(
     instance: &Instance,
+    own: InstanceKey,
     built_in: &[InstanceKey],
     refs: &[Target],
     toolchain: &ContentId,
 ) -> Key {
-    kernel::template(&placed(stored(instance.key(), built_in), refs), &instance.settings, toolchain)
+    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, refs));
+    kernel::template(&placed, &instance.settings, toolchain)
 }
 
-/// The references and the store key of the release compile of `instance`, whose code builds
-/// in `built_in` (in the driver's order) and references `refs`, importing `imports` with
+/// The references and the store key of the release compile of `instance` (its template
+/// instance), compiled as `own` (the instance key its function is compiled under), whose code
+/// builds in `built_in` (in the driver's order) and references `refs`, importing `imports` with
 /// `imported_units`, `imported_refs` and `imported_built_in` (each imported function's
 /// instance key as its export is compiled, at its own settings, its references and the
 /// bodies its export builds in, in [`Imports::imported`]'s order):
-/// `keys::release(imports.blob_key(with_imported(laid_out(placed(stored(..), refs), places), ..)))`,
-/// the places of [`release_refs`]. The one place the driver and `blaze_global`'s public
-/// function rule make it, so the two cannot differ.
+/// `keys::release(imports.blob_key(with_imported(laid_out(placed(stored(..), refs, own_place(own, all)), places), ..)))`,
+/// `all` and `places` those of [`release_refs`]: its template is made against `all`, so the
+/// place of the function itself is among them, an import's call of it too. The one place the
+/// driver and `blaze_global`'s public function rule make it, so the two cannot differ.
+#[allow(clippy::too_many_arguments)]
 pub fn release_template_key(
     instance: &Instance,
+    own: InstanceKey,
     built_in: &[InstanceKey],
     refs: &[Target],
     imports: &Imports,
@@ -404,7 +418,8 @@ pub fn release_template_key(
     imported_built_in: &[&[InstanceKey]],
 ) -> (Vec<Target>, Key) {
     let (all, places) = release_refs(refs, imported_refs);
-    let laid = laid_out(placed(stored(instance.key(), built_in), refs), &places);
+    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, &all));
+    let laid = laid_out(placed, &places);
     let key = keys::release(&imports.blob_key(with_imported(
         laid,
         imported_units,
@@ -438,7 +453,7 @@ pub fn with_imported(
     }
     for ((unit, refs), built_in) in imported_units.iter().zip(imported_refs).zip(imported_built_in)
     {
-        hasher.id(&placed(stored(*unit, built_in), refs).0);
+        hasher.id(&placed(stored(*unit, built_in), refs, own_place(*unit, refs)).0);
     }
     InstanceKey(hasher.finish())
 }
@@ -502,7 +517,8 @@ fn group_flight(group: &Group) -> InstanceKey {
 impl<I, S> FnNode<I, S> {
     /// What its code is kept under.
     fn stored(&self) -> InstanceKey {
-        placed(stored(self.unit.instance.key(), &self.built_in), &self.refs)
+        let own = own_place(self.unit.instance.key(), &self.refs);
+        placed(stored(self.unit.instance.key(), &self.built_in), &self.refs, own)
     }
 
     /// What its dev compile flies under ([`crate::flight`]): [`Self::stored`] and whether its
@@ -528,6 +544,7 @@ impl<I, S> FnNode<I, S> {
     fn template_key(&self) -> Key {
         dev_template_key(
             &self.template_instance(),
+            self.unit.instance.key(),
             &self.built_in,
             &self.refs,
             &self.spec.toolchain.id,
@@ -565,7 +582,14 @@ impl<I, S> FnNode<I, S> {
             Part::new("its codegen settings", Some(instance.settings.0)),
             Part::new(
                 "the kinds of its references",
-                Some(placed(InstanceKey(ContentId::default()), &self.refs).0),
+                Some(
+                    placed(
+                        InstanceKey(ContentId::default()),
+                        &self.refs,
+                        own_place(self.unit.instance.key(), &self.refs),
+                    )
+                    .0,
+                ),
             ),
         ];
         // alloc: once a miss
@@ -790,7 +814,8 @@ fn release_kept<B: Prepare>(
 
 impl<B: Prepare> Job<'_, B> {
     fn stored(&self) -> InstanceKey {
-        placed(stored(self.unit.instance.key(), &self.node.built_in), &self.node.refs)
+        let own = own_place(self.unit.instance.key(), &self.node.refs);
+        placed(stored(self.unit.instance.key(), &self.node.built_in), &self.node.refs, own)
     }
 
     /// What its summary is kept and flown under: [`Self::stored`] and its callees.
@@ -831,7 +856,8 @@ fn prepare_node<B: Prepare>(
     node: &Node<B>,
 ) -> Result<(Shape, B::Prepared), CodegenError> {
     let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
-    Ok((shape.relative(node.described.anchors.is_some()), made))
+    let own = own_place(unit.instance.key(), &node.refs);
+    Ok((shape.relative(node.described.anchors.is_some()).own_place(own), made))
 }
 
 /// `why`, the refusal of the function called `name`, with its message naming it where it does
@@ -3510,6 +3536,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 imports.imported.iter().map(|it| by_name[it].unit.instance.key()).collect();
             let (refs, blob_key) = release_template_key(
                 &Instance { code: job.node.described.template_code, ..job.unit.instance },
+                job.unit.instance.key(),
                 &job.node.built_in,
                 &job.node.refs,
                 &imports,
