@@ -262,6 +262,42 @@ pub const SEAL_THROUGH_A_LINK: &str = "is a symbolic link: a seal is never set t
 /// file: a FIFO, a socket, a device or a directory.
 pub const SEAL_OF_NO_FILE: &str = "is no regular file: only a regular file is sealed";
 
+/// What a failed [`Effect::WatchFsErrors`] says first when the file system's errors cannot be
+/// watched here, before why: no `CAP_SYS_ADMIN`, a file system that reports none, a system
+/// with no such events. Every driver says it the same, so an asker can tell this fact about
+/// the file system from a watch that broke.
+pub const FS_ERRORS_UNAVAILABLE: &str = "fs error events unavailable";
+
+/// [`FS_ERRORS_UNAVAILABLE`], then why: the message of a watch of a file system's errors that
+/// cannot be made here.
+pub(crate) fn fs_errors_unavailable(why: impl fmt::Display) -> String {
+    // alloc: an error's message.
+    format!("{FS_ERRORS_UNAVAILABLE}: {why}")
+}
+
+/// Why a driver of a system with no events for a file system's IO errors refuses
+/// [`Effect::WatchFsErrors`]: only Linux reports them (7.0's fserror, as fanotify
+/// `FAN_FS_ERROR`), so there fsync's errors alone say what is durable.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn no_fs_errors(driver: &str) -> String {
+    fs_errors_unavailable(format_args!(
+        "{driver} has no events for a file system's IO errors (Linux's fanotify FAN_FS_ERROR \
+         is the one blaze watches); fsync's errors alone say what is durable"
+    ))
+}
+
+/// An IO error a file system reported ([`Effect::WatchFsErrors`]): fanotify's
+/// `FAN_EVENT_INFO_TYPE_ERROR` record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FsError {
+    /// The first error since the last event was read, an errno (`EIO`, ...); 0 for an error
+    /// the event could not name: a queue that overflowed, or a record that was not whole.
+    pub error: i32,
+    /// How many errors the file system counted since the last event was read, the first
+    /// among them.
+    pub count: u32,
+}
+
 /// The most bytes one [`Effect::Recv`] appends, whatever its `most`: a receive reserves its
 /// room before the bytes come, so an asker of a long frame grows its buffer by this much a
 /// receive, not by the frame's length at once.
@@ -460,6 +496,34 @@ pub enum Effect {
     Unwatch {
         tag: Tag,
     },
+    /// A standing watch of the file system that holds `dir` for the IO errors it reports: on
+    /// Linux, 7.0's file IO error reporting (`fserror`), delivered as fanotify `FAN_FS_ERROR`
+    /// through a `FAN_MARK_FILESYSTEM` mark. Completes with [`Done::FsErrorsWatched`] once the
+    /// mark is placed, then with [`Done::FsError`] each time the file system reports that it
+    /// failed a write (the kernel keeps the first error and counts the later ones until the
+    /// event is read), until an [`Effect::Unwatch`] of the same tag ends it with
+    /// [`Done::Unwatched`] or a [`Done::Failed`] does. An asker that hears one treats every
+    /// write of that file system since its last successful sync as lost, though the sync said
+    /// it was done: the event is the signal for an error a file's own fsync may not carry (a
+    /// metadata or log write, a file system shut down, an error reported to another
+    /// descriptor). There is no per-file query: fsync's error (errseq) stays the per-file
+    /// signal, and this one is added to it.
+    ///
+    /// Where the errors cannot be watched (the mark needs `CAP_SYS_ADMIN`; a file system that
+    /// reports none; a system with no such events) it fails at once with a message that starts
+    /// with [`FS_ERRORS_UNAVAILABLE`] and says why: a fact about the file system that the asker
+    /// records and states, never a watch quietly not made.
+    ///
+    /// A driver tells each event ahead of every completion it reaps with it or after it, so an
+    /// asker hears of a write lost before it is told of a sync that covered it. The watch
+    /// itself is not counted in [`Driver::in_flight`] (it waits on the file system failing,
+    /// which may never come, so a loop that runs until nothing is in flight is not held by
+    /// it); each completion it makes is counted until it is told. A watch asked under a tag
+    /// that has one already replaces it.
+    WatchFsErrors {
+        dir: FileName,
+        tag: Tag,
+    },
     /// Each file's [`Stamp`], in order, as one batch the driver runs as many at once as it
     /// can (io_uring: `IORING_OP_STATX`, thousands in flight). A symlink is stamped itself, not
     /// followed; a name that is not there is [`Stamp::GONE`]. Completes with
@@ -582,6 +646,7 @@ impl Effect {
             | Effect::Watch { tag, .. }
             | Effect::Journal { tag, .. }
             | Effect::Unwatch { tag }
+            | Effect::WatchFsErrors { tag, .. }
             | Effect::Stamp { tag, .. }
             | Effect::Entries { tag, .. }
             | Effect::Flush { tag, .. }
@@ -857,6 +922,11 @@ pub enum Done {
     /// Of an [`Effect::Entries`]: each name under the root, sorted.
     Entries(Vec<(FileName, Stamp)>),
     Unwatched,
+    /// Of an [`Effect::WatchFsErrors`]: the file system's errors are watched from now on.
+    FsErrorsWatched,
+    /// Of an [`Effect::WatchFsErrors`]: the file system reported an IO error. Every write of
+    /// it since its last successful sync may be lost.
+    FsError(FsError),
     /// Of an [`Effect::Flush`]: the watch's changes queued when it was asked are all told.
     Flushed,
     Fired,

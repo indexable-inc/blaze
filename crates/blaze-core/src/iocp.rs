@@ -982,6 +982,9 @@ impl Iocp {
                     "flushing the watch {watch:?}: nothing is watched as it"
                 )))
             }
+            Effect::WatchFsErrors { .. } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, crate::no_fs_errors("Windows")))
+            }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),

@@ -8,6 +8,7 @@ use blaze_core::{
 use super::*;
 use crate::read::Found;
 
+mod fs_errors;
 mod model_check;
 mod place_race;
 

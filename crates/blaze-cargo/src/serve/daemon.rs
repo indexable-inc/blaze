@@ -117,6 +117,7 @@ fn ends_alone(effect: &Effect) -> bool {
             Effect::Watch { .. }
                 | Effect::Journal { .. }
                 | Effect::Unwatch { .. }
+                | Effect::WatchFsErrors { .. }
                 | Effect::Listen { .. }
                 | Effect::Unlisten { .. }
                 | Effect::Kill { .. }

@@ -477,6 +477,31 @@ impl fmt::Display for Broken {
     }
 }
 
+/// Whether a store hears of the writes its file system lost ([`Store::fs_errors`]), through
+/// [`Effect::WatchFsErrors`] (Linux 7.0's file IO error reporting, docs/kernel.md).
+///
+/// When it does, an error the file system reports while a commit is in flight fails that
+/// commit, though each of its syncs said done: every write since the last commit is taken as
+/// lost and committed again from the packs' memory, as a failed sync is, and errors in a row
+/// break the store as failed IO does ([`FAILURES_MOST`]), naming the error. A commit is
+/// reported durable only once a commit with no error reported during it has written its head.
+///
+/// When it does not (the daemon lacks `CAP_SYS_ADMIN`, which the mark needs; the file system
+/// reports no errors; the system has no such events) the store says so here and in its log
+/// at open, and fsync's errors alone are its durability signal, as they were before the
+/// events existed. That is a fact about the file system, stated, not a path taken instead:
+/// the store never claims a watch it does not have.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FsErrors {
+    /// Asked for as the store opened; not yet answered.
+    Asked,
+    /// Watched: a lost write is committed again.
+    Watched,
+    /// Not watched, and why: the driver's message, which starts with
+    /// [`blaze_core::FS_ERRORS_UNAVAILABLE`] for a file system whose errors cannot be watched.
+    Unavailable(String),
+}
+
 /// Which of a store's directories a value [`Reader::get_from`] found is kept in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Origin {
@@ -714,6 +739,12 @@ pub struct Store {
     /// value at the same path can lose to.
     #[cfg(test)]
     plant_clear_then_clone: bool,
+    /// Whether it hears of the writes its file system lost.
+    fs_errors: FsErrors,
+    /// A planted bug for the fs-error DST (`tests::fs_errors`): an error the file system
+    /// reports is heard and ignored, so a commit whose writes it lost is reported durable.
+    #[cfg(test)]
+    plant_ignore_fs_errors: bool,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -999,6 +1030,8 @@ enum Op {
     Peers,
     /// Its own empty head written, so the other writers find a store in its directory.
     Announce,
+    /// Its watch of the file system's errors ([`FsErrors`]): in its table while it watches.
+    FsErrors,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1392,6 +1425,9 @@ impl Store {
             move_probed: None,
             #[cfg(test)]
             plant_clear_then_clone: false,
+            fs_errors: FsErrors::Asked,
+            #[cfg(test)]
+            plant_ignore_fs_errors: false,
         }
     }
 
@@ -1411,6 +1447,81 @@ impl Store {
             let file = self.tiers[tier].file(HEAD_FILE);
             let tag = self.tags.ask(Op::Head { tier });
             effects.push(Effect::ReadAll { file, tag });
+        }
+    }
+
+    /// Asks to hear of the writes the file system of its directory loses, once the directory
+    /// is there: the mark is of a file system, through a directory of it.
+    fn ask_fs_errors(&mut self, effects: &mut Vec<Effect>) {
+        let tag = self.tags.ask(Op::FsErrors);
+        // clone: setup, once per open
+        effects.push(Effect::WatchFsErrors { dir: self.private_dir().clone(), tag });
+    }
+
+    /// Whether it hears of the writes its file system loses, and if not why ([`FsErrors`]).
+    pub fn fs_errors(&self) -> &FsErrors {
+        &self.fs_errors
+    }
+
+    /// An answer of its watch of the file system's errors, under `tag`.
+    fn fs_errors_done(&mut self, tag: Tag, done: Done) {
+        match done {
+            Done::FsErrorsWatched => {
+                self.fs_errors = FsErrors::Watched;
+                self.tags.ops.insert(tag, Op::FsErrors);
+            }
+            Done::FsError(error) => {
+                self.tags.ops.insert(tag, Op::FsErrors);
+                // alloc: the error of a commit that fails, once an error is reported
+                self.lost_writes(format!(
+                    "its file system reported a write it lost (errno {}, {} errors counted \
+                     since the last report) while the store's writes were not all synced",
+                    error.error, error.count
+                ));
+            }
+            Done::Unwatched => {}
+            done => {
+                let why = describe(&done);
+                let watched = self.fs_errors == FsErrors::Watched;
+                let why = match why.starts_with(blaze_core::FS_ERRORS_UNAVAILABLE) {
+                    true => why,
+                    false => {
+                        let unavailable = blaze_core::FS_ERRORS_UNAVAILABLE;
+                        // alloc: a state's message, once
+                        format!("{unavailable}: the watch ended: {why}")
+                    }
+                };
+                tracing::info!(target: "blaze", store = %self.config.dir, "{why}");
+                // alloc: a state's message, once
+                self.fs_errors = FsErrors::Unavailable(why.clone());
+                // A watch that ended after it was placed may have lost an error with it: what
+                // is not yet synced is taken as lost.
+                if watched {
+                    self.lost_writes(why);
+                }
+            }
+        }
+    }
+
+    /// The file system lost a write, as `what` says: a commit in flight is failed, so it is
+    /// written again from memory once its steps are in; with none in flight every write of the
+    /// store was synced before it, which is a problem reported, not a loss.
+    fn lost_writes(&mut self, what: String) {
+        #[cfg(test)]
+        if self.plant_ignore_fs_errors {
+            return;
+        }
+        match self.commit.as_mut() {
+            Some(commit) => {
+                if commit.failed.is_none() {
+                    // clone: the error of a commit that fails
+                    commit.failed = Some(Broken { file: self.private_dir().clone(), what });
+                }
+            }
+            // alloc: a problem reported
+            None => self.problems.push(format!(
+                "{what}, with no commit in flight: every write of the store was synced before it"
+            )),
         }
     }
 
@@ -2804,6 +2915,7 @@ impl Store {
             Op::Private => match done {
                 Done::Private(None) => {
                     self.failures = 0;
+                    self.ask_fs_errors(effects);
                     self.read_heads(effects);
                     self.ask_placed(effects);
                 }
@@ -3011,6 +3123,7 @@ impl Store {
             }
             Op::Peers => self.peers_listed(done, effects),
             Op::Announce => self.announced(&done, effects),
+            Op::FsErrors => self.fs_errors_done(completion.tag, done),
             op => return self.step(&op, &done, effects),
         }
         self.peers_ask(effects);
@@ -3947,7 +4060,12 @@ impl Store {
             }
             (Op::Sync { .. }, Done::Synced)
             | (Op::WriteExternal { .. } | Op::WriteIndex, Done::Written) => {}
-            (Op::WriteHead, Done::Written) => return self.finish_commit(effects),
+            // A head written after the file system reported an error during the commit names
+            // writes it may have lost: the commit is written again, head and all, before any
+            // of it is reported durable.
+            (Op::WriteHead, Done::Written) if commit.failed.is_none() => {
+                return self.finish_commit(effects);
+            }
             (op, done) => {
                 if commit.failed.is_none() {
                     commit.failed = Some(Broken { file: file_of(op), what: describe(done) });

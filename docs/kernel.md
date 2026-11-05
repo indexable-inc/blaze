@@ -69,7 +69,7 @@ not built), **next** (an opportunity found, unowned).
 | `close_range` | 5.9 | the test fork server's descriptor cleanup | blaze-usercode | in use |
 | `statx` `STATX_MNT_ID` | 5.8 | ix-prof's FUSE check | ix-prof | in use |
 | `openat2` `OPENAT2_REGULAR` | 7.2 | store and cache reads open only a regular file (`EFTYPE` otherwise) | blaze-core | in use (this lane) |
-| file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path learns of a write the file system lost | blaze-core, blaze-cas | in use (this lane) |
+| file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path: on a reported lost write (ext4, XFS, btrfs, f2fs), every store write since the last sync is taken as lost and its commit written again from the packs' memory before any put of it is answered durable (`Effect::WatchFsErrors`; `crates/blaze-core/src/fanotify.rs`, `uring.rs`, `sim.rs`; `FsErrors` in `crates/blaze-cas/src/lib.rs`; DST `crates/blaze-cas/src/tests/fs_errors.rs`). The mark needs `CAP_SYS_ADMIN`: without it, or on a file system that reports none, the store opens anyway in the named state `fs error events unavailable: <reason>` and fsync errors stay the durability signal, as before 7.0 | blaze-core, blaze-cas | in use |
 | `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon stay out of the page cache, on a file system that takes it | blaze-core | in use (this lane) |
 | `mseal` | 6.10 | sealing the loader's code mappings that are never changed | blaze-live | in use (this lane) |
 | `cachestat` | 6.5 | which store entries are warm (resident in the page cache) | blaze-cas | in use (this lane) |

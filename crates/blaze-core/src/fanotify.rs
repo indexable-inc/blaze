@@ -12,6 +12,12 @@
 //! and names are spans of a [`Strings`] column, reused by the next watch once this one ends
 //! ([`Room`]): a watch, its events and its end allocate their completions' payload alone.
 //!
+//! [`FsErrors`] is the other use: a mark of the file system for `FAN_FS_ERROR` alone, which
+//! Linux 7.0's file IO error reporting (`fserror`) delivers when the file system fails a write
+//! (iomap and XFS in 7.0, btrfs's shutdown in 7.1, f2fs in 7.2; ext4 has reported its own
+//! errors since 5.16), each event an error record (`FAN_EVENT_INFO_TYPE_ERROR`) beside a FID
+//! record, for the store's durability path ([`crate::Effect::WatchFsErrors`]).
+//!
 //! Why unsafe: std has no fanotify, `name_to_handle_at`, `open_by_handle_at` or `fstatfs`, so
 //! each is one system call here. The rest has std versions that cost per event: `fs::read_link`
 //! and `fs::canonicalize` return a new `PathBuf` each (an allocation per directory named),
@@ -841,6 +847,194 @@ fn named(error: &io::Error, what: &str) -> io::Error {
     io::Error::new(error.kind(), format!("{what}: {error}"))
 }
 
+const REPORT_FID: u32 = 0x200;
+/// `FAN_FS_ERROR`.
+const FS_ERROR: u64 = 0x8000;
+/// `FAN_EVENT_INFO_TYPE_ERROR`: `{u8 info_type, u8 pad, u16 len, s32 error, u32 error_count}`.
+const INFO_ERROR: u8 = 5;
+const INFO_ERROR_LEN: usize = 12;
+
+/// The file systems that report their IO errors to fanotify, by `statfs`'s `f_type`: a mark
+/// of any other is placed by the kernel but never told anything, so the store says the
+/// file system does not report rather than watch one that cannot speak.
+const REPORTERS: &[(i64, &str)] = &[
+    (0xEF53, "ext4 (its own errors, since Linux 5.16)"),
+    (0x5846_5342, "XFS (iomap's fserror, since Linux 7.0)"),
+    (0x9123_683E, "btrfs (its shutdown, since Linux 7.1)"),
+    (0xF2F5_2010, "f2fs (since Linux 7.2)"),
+];
+
+/// Reads of a watch's descriptor one [`FsErrors::read`] makes at most: the kernel keeps one
+/// error event a file system and counts the rest into it, so two reads find the queue empty.
+const READS_MOST: usize = 16;
+
+/// A watch of the file system that holds a directory for the IO errors it reports
+/// ([`crate::Effect::WatchFsErrors`]): a `FAN_MARK_FILESYSTEM` mark of `FAN_FS_ERROR` on a
+/// nonblocking descriptor that reports file handles (`FAN_REPORT_FID`, which the event type
+/// needs), read by the driver without waiting before it tells a poll's completions.
+pub(crate) struct FsErrors {
+    fd: OwnedFd,
+    /// Room for a read of events, kept for the next.
+    buffer: Vec<u8>,
+}
+
+impl FsErrors {
+    /// Watches the file system of `dir` under `root`, or why not: an error whose message
+    /// starts with [`crate::FS_ERRORS_UNAVAILABLE`] where the errors cannot be watched (no
+    /// `CAP_SYS_ADMIN`, a file system that does not report), else the call that failed.
+    ///
+    /// The unprivileged daemon's case is decided here and in the store (docs/kernel.md, "file
+    /// IO error reporting"): the mark needs `CAP_SYS_ADMIN`, which a daemon run as its user
+    /// lacks, so the refusal (`EPERM`) is the store's stated state ("fs error events
+    /// unavailable: ..."), and fsync's errors stay its durability signal. That is a fact
+    /// about the machine, said where the store's state is read; nothing is done in its place.
+    pub(crate) fn new(root: &Path, dir: &FileName) -> Result<FsErrors, String> {
+        let path = root.join(dir.as_str()); // alloc: once per watch, as a store opens.
+        let shown = path.display();
+        // alloc: once per watch, as a store opens.
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("watching the file system's errors of {shown}: a NUL in it"))?;
+        // SAFETY: all zeros is a valid `statfs`; the call fills it from a NUL-terminated path.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a `statfs` to write.
+        if unsafe { libc::statfs(c.as_ptr(), &mut stat) } != 0 {
+            let error = io::Error::last_os_error();
+            // alloc: an error's message.
+            return Err(format!("watching the file system's errors: statfs of {shown}: {error}"));
+        }
+        #[allow(clippy::unnecessary_cast, reason = "`f_type`'s width is the target's")]
+        let kind = stat.f_type as i64;
+        if !REPORTERS.iter().any(|&(it, _)| it == kind) {
+            // alloc: an error's message.
+            let reporters: Vec<&str> = REPORTERS.iter().map(|(_, it)| *it).collect();
+            return Err(crate::fs_errors_unavailable(format_args!(
+                "the file system of {shown} (statfs type {kind:#x}) reports no IO errors to \
+                 fanotify; those that do: {}",
+                reporters.join(", ")
+            )));
+        }
+        let flags = CLASS_NOTIF | CLOEXEC | NONBLOCK | REPORT_FID;
+        let event_flags = (libc::O_RDONLY | libc::O_CLOEXEC) as libc::c_uint;
+        // SAFETY: no pointers; a descriptor of its own or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, event_flags) };
+        if fd < 0 {
+            return Err(refused(&io::Error::last_os_error(), "fanotify_init", &shown));
+        }
+        // SAFETY: the call returned a descriptor of its own.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+        // SAFETY: a fanotify descriptor and a NUL-terminated path.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_fanotify_mark,
+                fd.as_raw_fd(),
+                MARK_ADD | MARK_FILESYSTEM,
+                FS_ERROR,
+                libc::AT_FDCWD,
+                c.as_ptr(),
+            )
+        };
+        if marked != 0 {
+            return Err(refused(&io::Error::last_os_error(), "fanotify_mark", &shown));
+        }
+        // alloc: once per watch, room for a read of events, kept for its life.
+        Ok(FsErrors { fd, buffer: vec![0; 4096] })
+    }
+
+    /// Every event queued, read now without waiting and handed to `each`, in order.
+    pub(crate) fn read(&mut self, mut each: impl FnMut(crate::FsError)) -> io::Result<()> {
+        for _ in 0..READS_MOST {
+            // SAFETY: an open descriptor and `buffer.len()` bytes to write, which `read`
+            // writes at most.
+            let got = unsafe {
+                libc::read(self.fd.as_raw_fd(), self.buffer.as_mut_ptr().cast(), self.buffer.len())
+            };
+            if got < 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EAGAIN) => return Ok(()),
+                    Some(libc::EINTR) => continue,
+                    _ => return Err(error),
+                }
+            }
+            if got == 0 {
+                return Ok(());
+            }
+            parse_errors(&self.buffer[..got as usize], &mut each);
+        }
+        // The queue holds one event a file system: still more after this many reads is a
+        // kernel that keeps refilling it, which the next poll reads on from.
+        Ok(())
+    }
+}
+
+/// Why `call` refused a watch of the errors of the file system at `path`: a missing privilege
+/// or a kernel or file system that cannot is [`crate::FS_ERRORS_UNAVAILABLE`]; anything else
+/// is the call's error, named.
+fn refused(error: &io::Error, call: &str, path: &std::path::Display<'_>) -> String {
+    match error.raw_os_error() {
+        Some(libc::EPERM) => crate::fs_errors_unavailable(format_args!(
+            "{call} of {path}: {error}: a FAN_MARK_FILESYSTEM mark needs CAP_SYS_ADMIN, which \
+             this process lacks; fsync's errors alone say what is durable"
+        )),
+        Some(libc::EINVAL | libc::EXDEV | libc::ENODEV | libc::EOPNOTSUPP) => {
+            crate::fs_errors_unavailable(format_args!(
+                "{call} of {path}: {error}: Linux {} refused a FAN_FS_ERROR mark of this file \
+                 system (FAN_REPORT_FID needs file handles of it)",
+                crate::kernel::release()
+            ))
+        }
+        // alloc: an error's message.
+        _ => format!("watching the file system's errors: {call} of {path}: {error}"),
+    }
+}
+
+/// Hands each IO error the events in `bytes` say to `each`: one a `FAN_FS_ERROR` event, with
+/// its error record's errno and count; an event or a record that is not whole, or a queue that
+/// overflowed, as an error of errno 0, never passed over, since what it lost may have been an
+/// error. Other events (the mark asks for none) are passed over.
+fn parse_errors(bytes: &[u8], mut each: impl FnMut(crate::FsError)) {
+    let unnamed = crate::FsError { error: 0, count: 1 };
+    let mut at = 0;
+    while at < bytes.len() {
+        if at + METADATA > bytes.len() {
+            return each(unnamed);
+        }
+        let len = u32_at(bytes, at) as usize;
+        let metadata_len = u16_at(bytes, at + 6) as usize;
+        let mask = u64_at(bytes, at + 8);
+        if len < METADATA || metadata_len < METADATA || metadata_len > len || at + len > bytes.len()
+        {
+            return each(unnamed);
+        }
+        let event = &bytes[at..at + len];
+        at += len;
+        if mask & Q_OVERFLOW != 0 {
+            each(unnamed);
+            continue;
+        }
+        if mask & FS_ERROR == 0 {
+            continue;
+        }
+        let mut found = None;
+        let mut info = metadata_len;
+        while info + 4 <= event.len() {
+            let kind = event[info];
+            let info_len = u16_at(event, info + 2) as usize;
+            if info_len < 4 || info + info_len > event.len() {
+                break;
+            }
+            if kind == INFO_ERROR && info_len >= INFO_ERROR_LEN {
+                let error = i32::from_ne_bytes(
+                    event[info + 4..info + 8].try_into().expect("four bytes"),
+                );
+                found = Some(crate::FsError { error, count: u32_at(event, info + 8) });
+            }
+            info += info_len;
+        }
+        each(found.unwrap_or(unnamed));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -883,6 +1077,32 @@ mod tests {
         let mut events = Vec::new();
         let lost = parse(bytes, |mask, record| events.push((mask, record)));
         (events, lost)
+    }
+
+    /// A `FAN_FS_ERROR` event as the kernel lays it out: its error record, then a FID record.
+    fn fs_error_event(error: i32, count: u32) -> Vec<u8> {
+        let mut info = vec![INFO_ERROR, 0];
+        info.extend_from_slice(&(INFO_ERROR_LEN as u16).to_ne_bytes());
+        info.extend_from_slice(&error.to_ne_bytes());
+        info.extend_from_slice(&count.to_ne_bytes());
+        let mut fid = dfid_name([1; 8], 1, &[9; 8], b"");
+        fid[0] = 1; // FAN_EVENT_INFO_TYPE_FID: a handle with no name.
+        info.extend(fid);
+        event(FS_ERROR, &info)
+    }
+
+    #[test]
+    fn an_fs_error_event_says_its_errno_and_count_and_a_broken_one_is_never_passed_over() {
+        let mut errors = Vec::new();
+        let mut bytes = fs_error_event(libc::EIO, 3);
+        bytes.extend(event(Q_OVERFLOW, &[]));
+        parse_errors(&bytes, |it| errors.push(it));
+        let unnamed = crate::FsError { error: 0, count: 1 };
+        assert_eq!(errors, vec![crate::FsError { error: libc::EIO, count: 3 }, unnamed]);
+        errors.clear();
+        let whole = fs_error_event(libc::ENOSPC, 1);
+        parse_errors(&whole[..whole.len() - 3], |it| errors.push(it));
+        assert_eq!(errors, vec![unnamed], "an event cut short is an error, unnamed");
     }
 
     #[test]
