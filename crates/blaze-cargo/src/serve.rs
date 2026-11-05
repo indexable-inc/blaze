@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+pub mod ceiling;
 mod daemon;
 mod fetch;
 mod fetch_url;
@@ -832,6 +833,14 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         memory: args.memory,
     };
     let engine = engine(serving, ready.as_mut())?;
+    // The hard ceiling (docs/memory-budget.md section 7, Hard), set before the daemon restores
+    // its image or takes a request: the kernel's limit where this process may set one, and the
+    // stop's guard's watch, at the budget itself (the machine's 3/4, or `--memory-gb`). In
+    // `blaze serve` alone, whose process is the daemon's own: never the one-shot build's or a
+    // test's, whose process is another's too.
+    if let Some(budget) = &engine.options.budget {
+        ceiling::hold(budget.bytes, &budget.from)?;
+    }
     let mut running = start(engine, "blaze serve", ready.as_mut())?;
     // blaze's update check (docs/install.md, "Updates"), off the loop, for the daemon's life.
     let _updates =

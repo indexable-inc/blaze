@@ -831,8 +831,10 @@ impl fmt::Display for MemoryLine<'_> {
     }
 }
 
-/// Says [`MemoryLine`] in the daemon's log and on its standard error.
-fn log_memory(memory: &blaze_mem::tag::Snapshot) {
+/// Says [`MemoryLine`] in the daemon's log and on its standard error: every
+/// [`MEMORY_LOG_EVERY`], at a stop, and first in the postmortem of a daemon past its memory
+/// ceiling (`serve::stop`).
+pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let resident = crate::raw::memory::footprint(std::process::id());
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

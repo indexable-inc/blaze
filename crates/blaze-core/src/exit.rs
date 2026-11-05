@@ -64,6 +64,11 @@ exits! {
     /// (`serve::stop`): deadlocked, it reaped no child and answered no client, and ends having
     /// written what it was inside and which children it left unreaped.
     LoopStalled = 76, "LOOP_STALLED", "its loop made no progress for the stall bound";
+    /// The daemon's footprint passed its memory ceiling (docs/memory-budget.md section 7, "The
+    /// ceiling, enforced past admission"): its own watch (`serve::stop`) wrote what it held, by
+    /// tag, and what each thread was inside, then ended it rather than let it take the machine
+    /// down.
+    MemoryCeiling = 77, "MEMORY_CEILING", "its footprint passed its memory ceiling";
     /// A build or test failed, or the CLI met an error of its own: cargo's code for both.
     Failed = 101, "FAILED", "a build or test failed, or blaze met an error of its own";
     /// A sandbox launcher could not make the sandbox, so the program it was given did not run:

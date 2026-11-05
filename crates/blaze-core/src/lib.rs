@@ -36,7 +36,7 @@
 
 pub mod busy;
 #[cfg(target_os = "linux")]
-mod cgroup;
+pub mod cgroup;
 #[allow(
     unsafe_code,
     reason = "getpriority and setpriority on the calling process, each one call behind a safe function"
