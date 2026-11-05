@@ -137,6 +137,13 @@ GitHub release, not in a section of docs/CHANGELOG.md.
 main's HEAD the same way (`train_release.py`): a tag through the API and release.yaml on it,
 no commit. Both count every tag, so they never take the same number.
 
+Before it publishes, its `explore-page` job checks that the deployed explorer reads the profile
+schema this tag writes (`.github/scripts/explore_page.py` against `https://ix.dev/explore/schemas.json`;
+the page is indexable-inc/ix's `packages/web/src/lib/explore/schema.ts`). A daemon whose schema the
+page lacks is refused by ix.dev/explore, so a release ahead of the page is not published, and a pull
+request that changes `schema::VERSION` fails blaze.yaml's `scripts` job the same way: the page
+moves first, then blaze.
+
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
 (x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS`; a
 pinned release's fetch checks both, and a release from before `B3SUMS` (dated before 2026-10-31,
