@@ -52,7 +52,7 @@ use hir_ty::{
         InternedOpaqueTyId,
     },
     intrinsic::{Intrinsic, intrinsic_of},
-    method_resolution::loaded_crates,
+    method_resolution::{loaded_crates, lookup_impl_const},
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlockId, LocalId, MirBody, MirLowerError,
         MirSpan, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace,
@@ -60,8 +60,10 @@ use hir_ty::{
     },
     next_solver::{
         AliasConstKind, Allocation, AssocTyId, Binder, BoundRegion, Clause, Const, ConstKind,
-        DbInterner, FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy,
-        Term, TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
+        DbInterner, FnSig, FreeConstAliasId, GenericArg, GenericArgs, ImplTraitIdx,
+        InherentAssocConstId, OpaqueTyIdWrapper, ParamEnv, Pattern, Region, StoredTy, Term, TermId,
+        TraitAssocConstId, TraitRef, Ty, TyKind, TypingMode, ValTree,
+        infer::DbInternerInferExt as _, references_non_lt_error,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
@@ -71,7 +73,7 @@ use rustc_abi::ReprOptions;
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
     ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesClause,
-    PatternKind, RegionKind, TermKind, TypeVisitableExt as _, ValTreeKind,
+    PatternKind, RegionKind, TermKind, TypeFlags, TypeVisitableExt as _, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
@@ -83,7 +85,7 @@ use crate::{
     key::{self, generic_def_item, item_key},
 };
 
-const DOMAIN: &str = "blaze v2 form 3";
+const DOMAIN: &str = "blaze v2 form 4";
 const SPANS_DOMAIN: &str = "blaze v2 form spans 1";
 
 /// Why a form is not of a program rustc accepts.
@@ -2842,7 +2844,9 @@ impl<'db> Cx<'db> {
         match c.number(local) {
             (_, true) => {
                 f.u8(0);
-                self.ty_in(f, c.body.locals[local].ty.as_ref());
+                let ty = c.body.locals[local].ty.as_ref();
+                self.ty_in(f, ty);
+                self.values(f, c, ty.into());
             }
             (number, false) => {
                 f.u8(1);
@@ -2905,6 +2909,7 @@ impl<'db> Cx<'db> {
                 f.u8(2);
                 self.konst(f, konst.as_ref());
                 self.ty_in(f, ty.as_ref());
+                self.values(f, c, konst.as_ref().into());
             }
             OperandKind::Allocation { allocation } => {
                 f.u8(3);
@@ -2983,6 +2988,75 @@ impl<'db> Cx<'db> {
         }
     }
 
+    /// What each constant in `arg` named by a path with no generic parameter left evaluates
+    /// to, in the order its walk meets them, as the code generator's `eval_named_const`
+    /// evaluates it into the compiled body: a trait's constant resolved to its impl's
+    /// (`lookup_impl_const`) in the body's crate, then evaluated.
+    ///
+    /// The constant's own form ([`Cx::konst`]) names the trait's constant and spells its
+    /// arguments by their interface hashes, which hold no name: two types alike but for their
+    /// name (every `impl_intern_key!` id of hir-def) are one spelling, yet each selects its own
+    /// impl and so its own value, which the body holds as data. Without this, the `get` of
+    /// `query_ids!(EnumVariantId, MacroRulesId)` reading `<$ty as Relocate>::KIND` (13 and 0)
+    /// were one code. The value, not the impl, so two bodies that read one value share their
+    /// code whatever type they read it of. A constant left generic is evaluated per instance,
+    /// whose arguments key it (`Instance::args`).
+    fn values(&self, f: &mut Form, c: &Canon<'_, 'db>, arg: GenericArg<'db>) {
+        // A signature form infers no body, and evaluating one would.
+        if f.quiet || self.leak_free || !arg.has_type_flags(TypeFlags::HAS_CONST_ALIAS) {
+            return;
+        }
+        let db = self.db;
+        let krate = c.body.owner.krate(db);
+        let at = f.len_at();
+        let mut count = 0;
+        for it in arg.walk() {
+            let GenericArgKind::Const(konst) = it.kind() else { continue };
+            let ConstKind::Alias(_, alias) = konst.kind() else { continue };
+            let args = alias.args;
+            if args.has_non_region_param()
+                || args.has_infer()
+                || args.has_placeholders()
+                || args.has_escaping_bound_vars()
+                || args.references_error()
+            {
+                continue;
+            }
+            count += 1;
+            let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
+            let (named, value) = match alias.kind {
+                AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+                | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+                | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
+                    let infcx =
+                        DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::Codegen);
+                    let (id, args) = lookup_impl_const(&infcx, env.param_env, id, args);
+                    (Some((id, args)), db.const_eval(id, args, Some(env)).ok())
+                }
+                AliasConstKind::Anon { def_id } => {
+                    (None, db.anon_const_eval(def_id.0, args, Some(env)).ok())
+                }
+                // The code generator refuses one in Self form after type check.
+                AliasConstKind::InherentSelf { .. } => (None, None),
+            };
+            match (value, named) {
+                (Some(value), _) => {
+                    f.u8(0);
+                    self.allocation(f, value);
+                }
+                // One that does not evaluate: the code generator refuses the body, so it is
+                // spelled by the constant it resolves to, which no value can be mistaken for.
+                (None, Some((id, args))) => {
+                    f.u8(1);
+                    f.item(ItemId::Const(id));
+                    self.args(f, args);
+                }
+                (None, None) => f.u8(2),
+            }
+        }
+        f.set_len(at, count);
+    }
+
     fn operands(&self, f: &mut Form, c: &Canon<'_, 'db>, operands: &[Operand]) {
         f.len(operands.len());
         for operand in operands {
@@ -3000,6 +3074,7 @@ impl<'db> Cx<'db> {
                 f.u8(1);
                 self.operand(f, c, operand);
                 self.konst(f, len.as_ref());
+                self.values(f, c, len.as_ref().into());
             }
             Rvalue::Ref(kind, place) => {
                 f.u8(2);

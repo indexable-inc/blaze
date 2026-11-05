@@ -1,6 +1,6 @@
 //! The four hashes and the keys: what an edit changes and what it keeps.
 
-use hir_def::{AdtId, DefWithBodyId, expr_store::Body, hir::Expr};
+use hir_def::{AdtId, DefWithBodyId, ItemContainerId, Lookup, expr_store::Body, hir::Expr};
 use hir_expand::fixture;
 use hir_ty::db::{InternedClosure, InternedClosureId};
 
@@ -437,6 +437,59 @@ fn f() -> &'static str { intrinsics::type_name::<T>() }
 "#,
     );
     assert_ne!(of(&db, "f").code, f.code, "`type_name` spells the name");
+}
+
+/// A body reading `<T as Tr>::K` holds the value `K` has for `T`, which the impl `T` selects
+/// gives: the alias spells `T` by its interface, which two types alike but for their name
+/// share, so two impls one macro writes for two such types (hir-def's `query_ids!` over its
+/// ids, reading `<$ty as Relocate>::KIND`) were one code with two compiled bodies. Bodies
+/// alike that read one value, of one type or of two types alike, still share their code.
+#[test]
+fn a_trait_constant_is_spelled_by_its_value() {
+    let (db, _) = single(
+        r#"
+trait Kind { const KIND: u8; }
+macro_rules! ids {
+    ($($ty:ident = $kind:literal),*) => {$(
+        pub struct $ty(u32);
+        impl Kind for $ty { const KIND: u8 = $kind; }
+    )*};
+}
+ids!(A = 13, B = 0, C = 13);
+trait Get { fn get() -> u8; }
+macro_rules! get {
+    ($($ty:ty),*) => {$(
+        impl Get for $ty { fn get() -> u8 { <$ty as Kind>::KIND } }
+    )*};
+}
+get!(A, B);
+fn a() -> u8 { <A as Kind>::KIND }
+fn a_again() -> u8 { <A as Kind>::KIND }
+fn b() -> u8 { <B as Kind>::KIND }
+fn c() -> u8 { <C as Kind>::KIND }
+"#,
+    );
+    let code = |id: ItemId| {
+        hash::code_hash(&db, id)
+            .unwrap_or_else(|err| panic!("{}", err.describe(&db)))
+            .expect("a body")
+    };
+    let gets: Vec<_> = super::items(&db)
+        .into_iter()
+        .filter(|&id| match id {
+            ItemId::Function(it) => {
+                matches!(it.lookup(&db).container, ItemContainerId::ImplId(_))
+                    && key::path(&db, id).ends_with("::get")
+            }
+            _ => false,
+        })
+        .collect();
+    assert_eq!(gets.len(), 2, "the two `get`s `get!` writes: {gets:?}");
+    assert_ne!(code(gets[0]), code(gets[1]), "`KIND` is 13 for `A` and 0 for `B`");
+    let (a, b, c) = (of(&db, "a").code, of(&db, "b").code, of(&db, "c").code);
+    assert_ne!(a, b, "`A` and `B` are alike but for their name and `KIND`");
+    assert_eq!(of(&db, "a_again").code, a, "one body written twice is one code");
+    assert_eq!(c, a, "one value of two types alike is one code");
 }
 
 #[test]

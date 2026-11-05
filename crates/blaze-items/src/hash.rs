@@ -6,7 +6,10 @@
 //!   refers to by its layout hash and anything else (a trait in a bound) by its interface
 //!   hash: a field's type changing size changes it, transitively.
 //! - **code** (of an item with a body): its interface hash and its body form, each ref by its
-//!   interface hash, so a callee's body edit leaves it as it was.
+//!   interface hash, so a callee's body edit leaves it as it was. A constant the body names
+//!   with no generic parameter left is spelled with the value it evaluates to as well
+//!   (`form::Cx::values`): `<A as Tr>::K` spells `A` by its name-free interface, which tells
+//!   nothing of the impl `A` selects.
 //! - **deep**: the interface and body forms, each ref by its deep hash, for what inlines.
 //! - **signature**: the signature form (the interface form with a marker in place of what a
 //!   body leaks into it), each ref by its signature hash: what a body's identity names an
