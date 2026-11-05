@@ -54,6 +54,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
+    ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -2043,7 +2044,9 @@ mod tests {
         let missing: Vec<&str> = [
             "ui.Table", "ui.TableRow", "ui.TableCell", "ui.TableHead", "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep",
             "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput", "hn.ChatOutputError", "hn.ChatCodeToggle", "hn.ChatCell",
-            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo",
+            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo", "hn.ChatUi", "hn.GenTone.ink",
+            "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
+            "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

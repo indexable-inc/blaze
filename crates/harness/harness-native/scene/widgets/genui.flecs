@@ -1,0 +1,120 @@
+// Generative UI (src/app/chat/genui.rs): what a harness REPL cell draws when its value is Svelte 5 markup (the kernel's
+// mcp/src/ui/), a tree of {type, props, children}, each element an entity made from hn.Gen<type> below and nested by
+// ChildOf. The elements are the kernel's (mcp/src/ui/element.ts ELEMENT_NAMES); a type not here draws hn.GenUnknown, in
+// the failed tone, naming it. Markdown and Code reuse the transcript's own rows (chat.flecs), so a cell's words read
+// like the agent's.
+
+@tree ChildOf
+hn {
+  // The row a cell's UI sits in, under its card's head: its elements down a column, and a quiet note when the tree was
+  // cut at the caps (genui.rs MAX_ELEMENTS, MAX_DEPTH).
+  prefab ChatUi : ui.Column {
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 6, r: 0, t: 4, b: 10}
+    body : ui.Column {
+      Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    note : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // The ink of each tone an element takes (`tone="muted"`): genui.rs copies the Fill of the one named onto the words.
+  // Drawn on the terminal's ground, as the transcript is.
+  prefab GenTone {
+    ink { Fill: $tone_term_ink }
+    muted { Fill: $tone_term_muted }
+    strong { Fill: $tone_term_ink }
+    error { Fill: $tone_failed }
+    accent { Fill: $tone_accent }
+    success { Fill: $tone_running }
+    warning { Fill: $tone_lost }
+  }
+
+  // Children down a column or along a row, $gen_gap apart (`gap`, `pad` in points override). Across a column a child
+  // hugs its content up to the room (words wrap there); cards, tables, code and dividers take the whole width.
+  prefab GenColumn : ui.Column {
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenRow : ui.Row {
+    Flex: {axis: Row, gap: $gen_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // Words in the transcript's face, in a tone (`bold` sets them bold; `strong` is the ink, bold).
+  prefab GenText : ui.Words {
+    Fill: $tone_term_ink
+    TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+  }
+
+  // Markdown, split into the transcript's own rows (hn.ChatProse, hn.ChatH1, hn.ChatItem, hn.ChatCode, ...).
+  prefab GenMarkdown : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // Code on a card, coloured by its `lang` when blaze has the grammar: the transcript's fenced block.
+  prefab GenCode : hn.ChatCode {
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+  }
+
+  // A table of `rows` (records, or lists under `columns`) in a ui.Table on the card's plate, its header the columns,
+  // numbers at the end, nulls dim; a foot says how many rows.
+  prefab GenTable : hn.ChatGrid {
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+  }
+
+  // A short word on a chip, in a tone.
+  prefab GenBadge : ui.Row {
+    Fill: $tone_code_chip
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 7, r: 7, t: 1, b: 2}
+    text : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0, weight: $weight_label}
+    }
+  }
+
+  // A number to read at a glance: its label over it, the value large (in its tone), a note under it.
+  prefab GenStat : ui.Column {
+    Flex: {axis: Column, gap: 1, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 12, t: 0, b: 0}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0, weight: $weight_label}
+    }
+    value : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_stat, line: $line_gen_stat, role: 0, bold: 1}
+    }
+    note : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // Children on the card's plate, a column; a `title` goes first, bold.
+  prefab GenCard : ui.Column {
+    Fill: $tone_chat_card
+    Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+    Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 12, r: 12, t: 10, b: 11}
+  }
+
+  // A hairline across, and room that grows (or `size` points of it).
+  prefab GenDivider : ui.Divider {}
+  prefab GenSpacer : ui.Spacer {}
+
+  // What the app does not draw: its name in the failed tone, never a guess at what was meant.
+  prefab GenUnknown : ui.Words {
+    Fill: $tone_failed
+    TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+  }
+}
