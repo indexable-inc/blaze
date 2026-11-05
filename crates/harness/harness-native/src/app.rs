@@ -55,6 +55,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
+    ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
     ("scene/widgets/stats.flecs", include_str!("../scene/widgets/stats.flecs")),
 ];
@@ -68,7 +69,8 @@ pub use crate::term::Mods as KeyMods;
 /// What a palette entry does.
 #[derive(Clone, Debug)]
 enum Do {
-    New(&'static str),
+    /// Run an action (a new object's act.Spawn), as its keys would.
+    Act(u64),
     Select(u64),
     /// An archived object: opened with the way back to the Archive.
     Archived(u64),
@@ -77,7 +79,30 @@ enum Do {
     Zoom(i32),
 }
 
+/// What the overlay over the window is: the command palette (cmd+K) or the new-object picker (cmd+N). One overlay at a
+/// time; both are a card on the scrim (scene/widgets/palette.flecs), share its keys' actions and take the pointer and the
+/// keyboard from the panes while open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Commands,
+    New,
+}
+
+/// An act.Spawn action: the kind it makes and whose mark shows it (`claude-tui` shows Claude's), its name in the picker
+/// (`title`, empty: not in the picker) and in the palette (`menu`), the keys that run it from anywhere (`hint`) and the
+/// key that picks it in the picker (`cap`).
+struct Pick {
+    act: u64,
+    kind: String,
+    mark: String,
+    title: String,
+    menu: String,
+    hint: String,
+    cap: String,
+}
+
 struct Palette {
+    mode: Mode,
     query: String,
     at: usize,
     /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
@@ -88,7 +113,13 @@ struct Palette {
 
 impl Palette {
     fn new() -> Self {
-        Self { query: String::new(), at: 0, searched: String::new(), changed: 0.0 }
+        Self {
+            mode: Mode::Commands,
+            query: String::new(),
+            at: 0,
+            searched: String::new(),
+            changed: 0.0,
+        }
     }
 }
 
@@ -103,11 +134,10 @@ struct Ids {
     main: u64,
     /// The Archive's row pinned to the sidebar's bottom (pressed, the Archive pane opens).
     archive_row: u64,
-    palette: Option<u64>,
-    /// The title-bar strip's root (`hn.TitleBar`), its label and the muted words after it.
+    /// The overlay on screen and what it is (made again when the mode changes).
+    palette: Option<(u64, Mode)>,
+    /// The title-bar strip's root (`hn.TitleBar`): only the back chevron, no title.
     bar: u64,
-    bar_title: u64,
-    bar_sub: u64,
 }
 
 /// The window's title-bar strip as AppKit lays it out, in points: how tall it is (0 in fullscreen, where it is hidden)
@@ -241,9 +271,9 @@ fn script_error(e: EntityView<'_>) -> Option<String> {
 }
 
 /// A palette entry's glyph: a kind's mark (`look::kind_mark`), or a character in the muted ink.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PalGlyph {
-    Kind(&'static str),
+    Kind(String),
     Char(&'static str),
 }
 
@@ -375,8 +405,6 @@ impl App {
         root.child("hn.Seam");
         let main = root.child("hn.Main");
         let bar = View::root(w, "hn.TitleBar");
-        let bar_title = bar.part("title").map_or(0, View::id);
-        let bar_sub = bar.part("sub").map_or(0, View::id);
         let ids = Ids {
             tree: tree.id(),
             device: device.id(),
@@ -384,8 +412,6 @@ impl App {
             archive_row: archive_row.id(),
             palette: None,
             bar: bar.id(),
-            bar_title,
-            bar_sub,
         };
         let mut paint = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
@@ -819,7 +845,7 @@ impl App {
     fn sync_title(&mut self) {
         let w = self.world.world_ref();
         let sel = self.selected();
-        let (title, sub) = match sel.map(|e| w.entity_from_id(e)) {
+        let (title, _subtitle) = match sel.map(|e| w.entity_from_id(e)) {
             Some(o) => {
                 let e = *o.id();
                 let kind = model::kind_name(o);
@@ -865,19 +891,6 @@ impl App {
         } else {
             "harness".to_owned()
         };
-        // The prefab's ink while the window is key, at half its alpha while it is not.
-        let focused = self.focused;
-        let ink = |part: &str| {
-            let mut f = view::prefab(w, "hn.TitleBar")
-                .and_then(|p| p.lookup_child(part))
-                .and_then(|c| c.try_cloned::<&Fill>())
-                .unwrap_or_default();
-            if !focused {
-                f.dark.a *= 0.5;
-                f.light.a *= 0.5;
-            }
-            f
-        };
         // The back chevron, while the focused pane has somewhere to go back to.
         if let Some(b) = View::of(w.entity_from_id(self.ids.bar)).part("back") {
             let on = self.back_target().is_some();
@@ -888,15 +901,6 @@ impl App {
             {
                 sz.w = Sizing::fixed(box_w);
                 b.set(sz);
-            }
-        }
-        for (id, text, part) in [
-            (self.ids.bar_title, clip_text(&title, 80), "title"),
-            (self.ids.bar_sub, clip_text(&sub, 90), "sub"),
-        ] {
-            if id != 0 {
-                let v = View::of(w.entity_from_id(id)).text(&text);
-                set_if(v, ink(part));
             }
         }
     }
@@ -1098,45 +1102,25 @@ impl App {
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
     fn entries(&self) -> Vec<(String, PalGlyph, String, String, Do)> {
+        if self.picking() {
+            return self
+                .picks()
+                .into_iter()
+                .map(|p| {
+                    (format!("a{}", p.act), PalGlyph::Kind(p.mark), p.title, p.hint, Do::Act(p.act))
+                })
+                .collect();
+        }
         let w = self.world.world_ref();
-        let mut out: Vec<(String, PalGlyph, String, String, Do)> = vec![
-            // Each hint is the binding that runs the same action (scene/20-keys.flecs, or the user's keys.flecs).
-            (
-                "new-claude".into(),
-                PalGlyph::Kind("claude"),
-                "New claude".into(),
-                self.hint("SpawnClaude"),
-                Do::New("claude"),
-            ),
-            (
-                "new-claude-tui".into(),
-                PalGlyph::Kind("claude"),
-                "New claude (terminal)".into(),
-                self.hint("SpawnClaudeTui"),
-                Do::New("claude-tui"),
-            ),
-            (
-                "new-codex".into(),
-                PalGlyph::Kind("codex"),
-                "New codex".into(),
-                self.hint("SpawnCodex"),
-                Do::New("codex"),
-            ),
-            (
-                "new-cursor".into(),
-                PalGlyph::Kind("cursor"),
-                "New cursor".into(),
-                self.hint("SpawnCursor"),
-                Do::New("cursor"),
-            ),
-            (
-                "new-sh".into(),
-                PalGlyph::Kind("shell"),
-                "New sh".into(),
-                self.hint("SpawnShell"),
-                Do::New("shell"),
-            ),
-        ];
+        // A new object of each kind, run as its act.Spawn (as its keys and the picker run it); each hint is the binding
+        // that runs the same action (scene/20-keys.flecs, or the user's keys.flecs).
+        let mut out: Vec<(String, PalGlyph, String, String, Do)> = self
+            .spawns()
+            .into_iter()
+            .map(|p| {
+                (format!("new-{}", p.kind), PalGlyph::Kind(p.mark), p.menu, p.hint, Do::Act(p.act))
+            })
+            .collect();
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
             let name =
@@ -1144,7 +1128,7 @@ impl App {
             let hint = if i < 9 { self.hint(&format!("Select{}", i + 1)) } else { String::new() };
             out.push((
                 format!("obj{e}"),
-                PalGlyph::Kind(model::kind_name(o)),
+                PalGlyph::Kind(model::kind_name(o).into()),
                 name,
                 hint,
                 Do::Select(e),
@@ -1171,7 +1155,7 @@ impl App {
             };
             out.push((
                 format!("arc{e}"),
-                PalGlyph::Kind(model::kind_name(o)),
+                PalGlyph::Kind(model::kind_name(o).into()),
                 name,
                 "archived".into(),
                 Do::Archived(e),
@@ -1196,7 +1180,7 @@ impl App {
                     .unwrap_or_default();
                 out.push((
                     format!("run{e}"),
-                    PalGlyph::Kind("proc"),
+                    PalGlyph::Kind("proc".into()),
                     format!("r{n}  {cmd}"),
                     "run".into(),
                     Do::Select(e),
@@ -1255,64 +1239,179 @@ impl App {
             self.poke();
         }
         let w = self.world.world_ref();
-        match (&self.palette, self.ids.palette) {
-            (None, Some(id)) => {
-                w.entity_from_id(id).destruct();
-                self.ids.palette = None;
-            }
-            (Some(p), _) => {
-                let root = match self.ids.palette {
-                    Some(id) => View::of(w.entity_from_id(id)),
-                    None => {
-                        let v = View::root(w, "hn.Palette");
-                        self.ids.palette = Some(v.id());
-                        v
-                    }
-                };
-                let card = root.part("card");
-                let shown = if p.query.is_empty() {
-                    "Search objects and commands\u{2026}".to_owned()
-                } else {
-                    p.query.clone()
-                };
-                if let Some(t) = card.and_then(|c| c.part("query")).and_then(|q| q.part("text")) {
-                    t.text(&shown);
-                }
-                let entries = self.entries();
-                let at = p.at.min(entries.len().saturating_sub(1));
-                let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
-                if let Some(items) = card.and_then(|c| c.part("items")) {
-                    let rows = entries
-                        .into_iter()
-                        .enumerate()
-                        .take(12)
-                        .map(|(i, (k, g, n, h, _))| (k, (i, g, n, h)));
-                    for_each(items, "hn.PalRow", rows, |row, (i, g, n, h), new| {
-                        if new {
-                            row.set(HoverAmt::default());
-                        }
-                        row.action(&format!("pal:{i}"));
-                        set_if(row, if i == at { chosen } else { clear });
-                        if let Some(p) = row.part("glyph") {
-                            match g {
-                                PalGlyph::Kind(k) => crate::look::kind_mark(w, p.entity(), k),
-                                PalGlyph::Char(c) => {
-                                    crate::look::show_glyph(p.entity(), c);
-                                    set_if(p, tone(w, "muted"));
-                                }
-                            }
-                        }
-                        if let Some(p) = row.part("name") {
-                            p.text(&n);
-                        }
-                        if let Some(p) = row.part("hint") {
-                            p.text(&h);
-                        }
-                    });
-                }
-            }
-            _ => {}
+        let want = self.palette.as_ref().map(|p| (p.mode, p.at, p.query.clone()));
+        // The overlay on screen is no longer wanted (closed, or the other mode opened): it goes out on its springs.
+        if let Some((id, mode)) = self.ids.palette
+            && want.as_ref().is_none_or(|(m, ..)| *m != mode)
+        {
+            leave_overlay(View::of(w.entity_from_id(id)));
+            self.ids.palette = None;
         }
+        let Some((mode, at, query)) = want else { return };
+        let root = match self.ids.palette {
+            Some((id, _)) => View::of(w.entity_from_id(id)),
+            None => {
+                let v = View::root(
+                    w,
+                    match mode {
+                        Mode::Commands => "hn.Palette",
+                        Mode::New => "hn.Picker",
+                    },
+                );
+                self.ids.palette = Some((v.id(), mode));
+                v
+            }
+        };
+        let card = root.part("card");
+        if mode == Mode::New {
+            self.sync_picker(card, at);
+            return;
+        }
+        let shown =
+            if query.is_empty() { "Search objects and commands\u{2026}".to_owned() } else { query };
+        if let Some(t) = card.and_then(|c| c.part("query")).and_then(|q| q.part("text")) {
+            t.text(&shown);
+        }
+        let entries = self.entries();
+        let at = at.min(entries.len().saturating_sub(1));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
+        if let Some(items) = card.and_then(|c| c.part("items")) {
+            let rows = entries
+                .into_iter()
+                .enumerate()
+                .take(12)
+                .map(|(i, (k, g, n, h, _))| (k, (i, g, n, h)));
+            for_each(items, "hn.PalRow", rows, |row, (i, g, n, h), new| {
+                if new {
+                    row.set(HoverAmt::default());
+                }
+                row.action(&format!("pal:{i}"));
+                set_if(row, if i == at { chosen } else { clear });
+                if let Some(p) = row.part("glyph") {
+                    match g {
+                        PalGlyph::Kind(k) => crate::look::kind_mark(w, p.entity(), &k),
+                        PalGlyph::Char(c) => {
+                            crate::look::show_glyph(p.entity(), c);
+                            set_if(p, tone(w, "muted"));
+                        }
+                    }
+                }
+                if let Some(p) = row.part("name") {
+                    p.text(&n);
+                }
+                if let Some(p) = row.part("hint") {
+                    p.text(&h);
+                }
+            });
+        }
+    }
+
+    /// The picker's rows (scene/widgets/picker.flecs `hn.PickRow`), one for each act.Spawn, the highlighted one (`at`)
+    /// holding the pill.
+    fn sync_picker(&self, card: Option<View<'_>>, at: usize) {
+        let Some(items) = card.and_then(|c| c.part("items")) else { return };
+        let picks = self.picks();
+        let at = at.min(picks.len().saturating_sub(1));
+        let rows = picks.iter().enumerate().map(|(i, p)| (format!("a{}", p.act), (i, p)));
+        for_each(items, "hn.PickRow", rows, |row, (i, p), new| {
+            if new {
+                row.set(HoverAmt::default());
+            }
+            row.props(
+                "hn.PickRow",
+                &[
+                    ("obj", Prop::Uint(i as u64)),
+                    ("name", Prop::Str(&p.title)),
+                    ("selected", Prop::Bool(i == at)),
+                    ("kind", Prop::Str(&p.mark)),
+                    ("hint", Prop::Str(&p.hint)),
+                    ("cap", Prop::Str(&p.cap)),
+                ],
+            );
+        });
+    }
+
+    /// The picker's rows: the act.Spawn actions with a title, in their order.
+    fn picks(&self) -> Vec<Pick> {
+        self.spawns().into_iter().filter(|p| !p.title.is_empty()).collect()
+    }
+
+    /// Every act.Spawn action (scene/20-keys.flecs and the user's keys.flecs), in their order.
+    fn spawns(&self) -> Vec<Pick> {
+        let w = self.world.world_ref();
+        let ctx = w.try_lookup(crate::keys::PICKER).map(|e| *e.id());
+        self.keymap
+            .acts
+            .iter()
+            .filter_map(|a| {
+                let k = w.entity_from_id(a.id).try_cloned::<&crate::keys::SpawnKind>()?;
+                let kind = k.kind.as_str().to_owned();
+                let title = k.title.as_str().to_owned();
+                let mark = kind.split('-').next().unwrap_or_default().to_owned();
+                let menu = match &a.menu {
+                    Some((_, t, _)) => t.clone(),
+                    None if !title.is_empty() => format!("New {title}"),
+                    None => format!("New {}", capitalised(&kind)),
+                };
+                let hint =
+                    self.keymap.primary(a.id).map(crate::keys::Chord::hint).unwrap_or_default();
+                let cap = ctx
+                    .and_then(|c| self.keymap.in_context(a.id, c))
+                    .map(crate::keys::Chord::hint)
+                    .unwrap_or_default();
+                Some(Pick { act: a.id, kind, mark, title, menu, hint, cap })
+            })
+            .collect()
+    }
+
+    /// Whether the overlay open is the new-object picker.
+    fn picking(&self) -> bool {
+        self.palette.as_ref().is_some_and(|p| p.mode == Mode::New)
+    }
+
+    /// Open the new-object picker (cmd+N), the kind picked last highlighted (native.json `new_kind`), its pill landing
+    /// there rather than sliding from where it was last drawn.
+    pub fn open_picker(&mut self) {
+        let last = crate::prefs::get("new_kind").and_then(|v| v.as_str().map(str::to_owned));
+        let at = last.and_then(|k| self.picks().iter().position(|p| p.kind == k)).unwrap_or(0);
+        if let Some(m) = self.world.world_ref().try_lookup("ui_matched::hn_picker") {
+            m.destruct();
+        }
+        self.palette = Some(Palette { mode: Mode::New, at, ..Palette::new() });
+        self.poke();
+    }
+
+    /// An object of `kind` is being made by an act.Spawn: from the picker, the choice is kept for its next opening (not
+    /// from an offscreen shot); any overlay open closes.
+    fn spawning(&mut self, kind: &str) {
+        if self.picking() && self.persist {
+            crate::prefs::set("new_kind", serde_json::json!(kind));
+        }
+        self.palette = None;
+    }
+
+    /// Move the overlay's highlight by `by` rows: the palette's stops at its ends, the picker's few rows go round.
+    fn palette_step(&mut self, by: i64) {
+        let n = self.entries().len() as i64;
+        let Some(p) = self.palette.as_mut() else { return };
+        if n == 0 {
+            return;
+        }
+        let at = p.at as i64 + by;
+        p.at = match p.mode {
+            Mode::New => at.rem_euclid(n),
+            Mode::Commands => at.clamp(0, n - 1),
+        } as usize;
+    }
+
+    /// An entry chosen (Return, or a click): it runs, and the overlay closes. A picker row runs its act.Spawn with the
+    /// picker still open, so the action sees where it came from (`spawning`).
+    fn choose(&mut self, d: Do) {
+        if !matches!(d, Do::Act(_)) {
+            self.palette = None;
+        }
+        self.run(d);
+        self.palette = None;
     }
 
     // ---- the frame ----
@@ -1560,8 +1659,7 @@ impl App {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
                 if let Some((.., d)) = self.entries().into_iter().nth(i) {
-                    self.palette = None;
-                    self.run(d);
+                    self.choose(d);
                 }
             }
         }
@@ -1569,7 +1667,9 @@ impl App {
 
     fn run(&mut self, d: Do) {
         match d {
-            Do::New(kind) => self.spawn(kind),
+            Do::Act(id) => {
+                self.run_action(id, None);
+            }
             Do::Select(e) => self.select(Some(e)),
             Do::Archived(e) => self.open_from_archive(e),
             Do::Kill => self.kill(),
@@ -1669,7 +1769,7 @@ impl App {
     /// Text typed into the open palette (a key no binding takes): its query.
     fn palette_type(&mut self, chars: &str) {
         let time = self.time;
-        let Some(p) = self.palette.as_mut() else { return };
+        let Some(p) = self.palette.as_mut().filter(|p| p.mode == Mode::Commands) else { return };
         let typed: String = chars
             .chars()
             .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
@@ -1846,6 +1946,21 @@ fn fmt_dur(ms: u64) -> String {
         60_000..3_600_000 => format!("{}m{:02}s", s / 60, s % 60),
         _ => format!("{}h{:02}m", s / 3600, (s / 60) % 60),
     }
+}
+
+/// An overlay sent away: its scrim fades and its card shrinks back on their Transitions (scene/widgets/palette.flecs),
+/// taking no pointer while they go, and motion deletes them at rest.
+fn leave_overlay(root: View<'_>) {
+    if let Some(card) = root.part("card") {
+        card.add(harness_native_ui_motion_api::Leaving::id());
+    }
+    view::leave(root);
+}
+
+/// `kind` with its first letter upper case (a picker row's title when its act.Spawn names none).
+fn capitalised(kind: &str) -> String {
+    let mut c = kind.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// Whether every character of `q` comes in `s`, in order.
