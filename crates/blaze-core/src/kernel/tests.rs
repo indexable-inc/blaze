@@ -43,6 +43,25 @@ fn no_feature_is_newer_than_the_floor() {
     }
 }
 
+/// ext4, XFS and NFS take `RWF_DONTCACHE`; tmpfs, btrfs, overlayfs, FUSE and an unknown
+/// `f_type` write without it. The refusal names the file, the file system and its release.
+#[test]
+fn dontcache_is_for_ext4_xfs_and_nfs_alone() {
+    // `linux/magic.h`.
+    for (magic, name) in [(0xef53, "ext4"), (0x5846_5342, "XFS"), (0x6969, "NFS")] {
+        assert_eq!(dontcache(magic).map(|it| it.name), Some(name), "{magic:#x}");
+    }
+    for magic in [0x0102_1994, 0x9123_683e, 0x794c_7630, 0x6573_5546, 0xf2f5_2010, 0] {
+        assert_eq!(dontcache(magic), None, "{magic:#x}");
+    }
+    let said = dontcache(0xef53).unwrap().refused(&"/store/placed/ab");
+    assert!(said.starts_with("/store/placed/ab on ext4 refused RWF_DONTCACHE (EOPNOTSUPP)"), "{said}");
+    assert!(said.contains("Linux 6.17"), "{said}");
+    for it in DONTCACHE {
+        assert!(it.since <= FLOOR, "{} takes it from Linux {}", it.name, it.since);
+    }
+}
+
 /// A faked older kernel: the `UNAME26` personality makes `uname` say 2.6.x (as
 /// `setarch --uname-2.6` does). A personality is the calling task's, so set on a thread of
 /// its own it fakes the release for that thread alone; the check run there must refuse it.

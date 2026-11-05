@@ -411,7 +411,7 @@ impl Journal {
             let tickets = std::mem::take(&mut self.open).tickets;
             self.rewriting = bytes.len() as u64;
             // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
-            effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
+            effects.push(Effect::Write { file: self.file.clone(), bytes, cache: blaze_core::Cache::Keep, tag: self.tag(REWRITE) });
             self.flight = Flight::Rewriting(tickets);
             return;
         }

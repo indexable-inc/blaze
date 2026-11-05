@@ -291,6 +291,23 @@ mod unix {
         checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }).map(drop)
     }
 
+    /// `bytes` written at `at` of `fd` with `pwritev2`'s `flags` (`RWF_DONTCACHE`), one
+    /// `iovec`: how many it wrote.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pwritev2(
+        fd: BorrowedFd<'_>,
+        bytes: &[u8],
+        at: u64,
+        flags: libc::c_int,
+    ) -> io::Result<usize> {
+        let at = libc::off_t::try_from(at)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "an offset past off_t"))?;
+        let iov = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
+        // SAFETY: `fd` is borrowed open for the call; `iov` names `bytes`, borrowed across it,
+        // which the kernel only reads and does not keep.
+        checked_size(unsafe { libc::pwritev2(fd.as_raw_fd(), &iov, 1, at, flags) })
+    }
+
     /// A new eventfd, count 0, close-on-exec and nonblocking.
     #[cfg(target_os = "linux")]
     pub(crate) fn eventfd() -> io::Result<OwnedFd> {

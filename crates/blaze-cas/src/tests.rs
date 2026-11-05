@@ -3220,6 +3220,43 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// A commit's write of records a settle moved colder leaves the page cache ([`Cache::Drop`],
+/// `RWF_DONTCACHE` on Linux, docs/kernel.md); a put's write, the head's and a put after it in
+/// the same pack stay in it ([`Cache::Keep`]).
+#[test]
+fn records_moved_colder_are_written_out_of_the_page_cache_and_puts_are_not() {
+    fn packs(sim: &Sim, from: usize) -> Vec<Cache> {
+        let is_pack = |file: &FileName| file.as_str().starts_with("store/pack-");
+        sim.caches()[from..].iter().filter(|(file, _)| is_pack(file)).map(|(_, it)| *it).collect()
+    }
+    let mut sim = Sim::new(30, quiet());
+    let mut store = open(&mut sim, "store");
+    sim.record_caches();
+    for n in 0..10 {
+        store.put(key(n), Kind::Code, &text(n, 8 << 10)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let put = packs(&sim, 0);
+    assert!(!put.is_empty(), "a flush writes its pack");
+    assert!(sim.caches().iter().all(|(_, it)| *it == Cache::Keep), "{:?}", sim.caches());
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(bytes_of(&store, &key(0)).unwrap(), text(0, 8 << 10));
+    let before = sim.caches().len();
+    assert_eq!(settle(&mut sim, &mut store).demoted, 9);
+    let demoted = packs(&sim, before);
+    assert!(!demoted.is_empty(), "the settle's commit writes the records it moved");
+    assert!(demoted.iter().all(|it| *it == Cache::Drop), "{demoted:?}");
+    let others = sim.caches()[before..].iter().filter(|(file, _)| !file.as_str().contains("pack-"));
+    assert!(others.clone().all(|(_, it)| *it == Cache::Keep), "{:?}", others.collect::<Vec<_>>());
+    let before = sim.caches().len();
+    store.put(key(20), Kind::Code, &text(20, 8 << 10)).unwrap();
+    flush(&mut sim, &mut store);
+    let put = packs(&sim, before);
+    assert!(!put.is_empty() && put.iter().all(|it| *it == Cache::Keep), "{put:?}");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), text(1, 8 << 10));
+}
+
 #[test]
 fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     let mut sim = Sim::new(31, quiet());

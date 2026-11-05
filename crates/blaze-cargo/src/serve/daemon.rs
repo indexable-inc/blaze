@@ -1942,7 +1942,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         );
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
-        self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
+        self.effects.push(Effect::Write { file, bytes: stall.trace, cache: blaze_core::Cache::Keep, tag: STALL });
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));
         let mut told = self.spare.said.pop().unwrap_or_default();

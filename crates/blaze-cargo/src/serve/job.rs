@@ -3858,7 +3858,7 @@ impl<S: Steps> Jobs<S> {
                     }
                 };
                 self.begin_placing(id, path);
-                w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
+                w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), cache: blaze_core::Cache::Keep, tag });
             }
             for line in &lock.said {
                 // alloc: a line of the lock write, once per plan that writes one

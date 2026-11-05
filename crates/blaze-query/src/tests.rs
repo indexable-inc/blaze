@@ -294,7 +294,7 @@ fn mapping(bytes: &[u8]) -> Mapping {
 fn written(effects: &mut Vec<Effect>) -> (FileName, Vec<u8>, Tag) {
     assert_eq!(effects.len(), 1, "{effects:?}");
     match effects.pop() {
-        Some(Effect::Write { file, bytes, tag }) => (file, bytes, tag),
+        Some(Effect::Write { file, bytes, tag, .. }) => (file, bytes, tag),
         other => panic!("not a write: {other:?}"),
     }
 }

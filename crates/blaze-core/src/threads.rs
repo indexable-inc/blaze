@@ -1019,12 +1019,12 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::truncate(path, len)?;
             Ok(Done::Truncated)
         }),
-        Effect::Write { file, bytes, .. } => at(root, &file, |path| {
-            fs::write_atomically(path, &bytes)?;
+        Effect::Write { file, bytes, cache, .. } => at(root, &file, |path| {
+            fs::write_atomically(path, &bytes, cache)?;
             Ok(Done::Written)
         }),
-        Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
-            fs::write_at(path, offset, &bytes)?;
+        Effect::WriteAt { file, at: offset, bytes, cache, .. } => at(root, &file, |path| {
+            fs::write_at(path, offset, &bytes, cache)?;
             Ok(Done::Written)
         }),
         Effect::Rename { from, to, .. } => at(root, &from, |from| {

@@ -20,7 +20,7 @@ mod wasi;
 pub(crate) use wasi::{clone, entries, seal, set_mode, set_times, stamps};
 
 #[cfg(any(unix, target_os = "wasi"))]
-use std::{fs::File, io::Write as _};
+use std::fs::File;
 use std::{
     fs::OpenOptions,
     io,
@@ -29,7 +29,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use crate::{FileName, Meta};
+use crate::{Cache, FileName, Meta};
 #[cfg(unix)]
 use crate::{Names, Stamp};
 
@@ -175,15 +175,16 @@ pub(crate) fn open_to_read(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
-/// it, and the directory synced, so the new name survives a crash.
+/// it, and the directory synced, so the new name survives a crash. With [`Cache::Drop`] the
+/// write stays out of the page cache where the file system has a way ([`write_all_at`]).
 #[cfg(any(unix, target_os = "wasi"))]
-pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], cache: Cache) -> io::Result<()> {
     blaze_mem::scratch::with_path(|temporary| {
         temporary_into(path, temporary);
         let written = (|| {
             let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
-            let mut file = making_parent(path, open)?;
-            file.write_all(bytes)?;
+            let file = making_parent(path, open)?;
+            write_all_at(&file, &*temporary, path, 0, bytes, cache)?;
             file.sync_all()
         })();
         if let Err(error) = written {
@@ -217,21 +218,21 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `bytes` written at `at` of the file at `path`, which exists.
-pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8], cache: Cache) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
     // As `uring.rs`'s `O_DIRECT`: a large aligned write stays out of the unified buffer cache;
     // macOS keeps it coherent with cached and mapped pages.
     #[cfg(target_os = "macos")]
-    if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
-        use std::os::fd::AsFd as _;
-        crate::raw::no_cache(file.as_fd())?;
-    }
-    #[cfg(unix)]
-    return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
-    #[cfg(target_os = "wasi")]
-    return std::os::wasi::fs::FileExt::write_all_at(&file, bytes, at);
+    let cache = match bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
+        true => Cache::Drop,
+        false => cache,
+    };
+    #[cfg(any(unix, target_os = "wasi"))]
+    return write_all_at(&file, path, path, at, bytes, cache);
     #[cfg(windows)]
     {
+        // Windows has no write that leaves the cache alone short of unbuffered IO's alignment.
+        let _ = cache;
         let mut done = 0;
         while done < bytes.len() {
             let n =
@@ -243,6 +244,75 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
         }
         Ok(())
     }
+}
+
+/// `bytes` written at `at` of `file`, open at `path` (`named` in an error, the file a
+/// temporary is written for), its pages kept in the cache or not as `cache` says: with
+/// [`Cache::Drop`], on Linux `pwritev2` with `RWF_DONTCACHE` where the file system takes it
+/// ([`crate::kernel::dontcache`], by the `statfs` of `path`; a plain write on any other), its
+/// `EOPNOTSUPP` an error naming the file system ([`crate::kernel::DontCache::refused`]), never a
+/// write again without the flag; on macOS `F_NOCACHE` on `file`; elsewhere a plain write.
+#[cfg(any(unix, target_os = "wasi"))]
+fn write_all_at(
+    file: &File,
+    path: &Path,
+    named: &Path,
+    at: u64,
+    bytes: &[u8],
+    cache: Cache,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if cache == Cache::Drop
+        && let Some(fs) = dontcache_at(path)?
+    {
+        use std::os::fd::AsFd as _;
+        let (mut at, mut rest) = (at, bytes);
+        while !rest.is_empty() {
+            match crate::raw::pwritev2(file.as_fd(), rest, at, libc::RWF_DONTCACHE) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(n) => {
+                    rest = &rest[n..];
+                    at += n as u64;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                    let why = fs.refused(&named.display());
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, why));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if cache == Cache::Drop {
+        use std::os::fd::AsFd as _;
+        crate::raw::no_cache(file.as_fd())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (path, named, cache);
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(file, bytes, at);
+    #[cfg(target_os = "wasi")]
+    return std::os::wasi::fs::FileExt::write_all_at(file, bytes, at);
+}
+
+/// The file system holding `path` where a [`Cache::Drop`] write to it takes `RWF_DONTCACHE`
+/// ([`crate::kernel::dontcache`]); `None` where it is a plain write.
+#[cfg(target_os = "linux")]
+pub(crate) fn dontcache_at(path: &Path) -> io::Result<Option<crate::kernel::DontCache>> {
+    let stat = with_c_path(path, crate::raw::statfs).map_err(|error| {
+        // alloc: an error path.
+        io::Error::new(
+            error.kind(),
+            format!(
+                "statfs of {}, for whether its writes blaze keeps out of the page cache take \
+                 RWF_DONTCACHE: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(crate::kernel::dontcache(stat.f_type as u32))
 }
 
 /// [`crate::Effect::Mode`]: `path`'s permission bits set to `mode`, through a symbolic link
@@ -921,9 +991,9 @@ mod tests {
     #[test]
     fn missing_directories_are_made_where_a_call_needs_them() {
         let root = dir("parents");
-        write_atomically(&root.join("a/b/whole"), b"whole").unwrap();
+        write_atomically(&root.join("a/b/whole"), b"whole", Cache::Keep).unwrap();
         assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"whole");
-        write_atomically(&root.join("a/b/whole"), b"again").unwrap();
+        write_atomically(&root.join("a/b/whole"), b"again", Cache::Keep).unwrap();
         assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"again");
         rename(&root.join("a/b/whole"), &root.join("c/d/moved")).unwrap();
         assert_eq!(std::fs::read(root.join("c/d/moved")).unwrap(), b"again");
@@ -938,7 +1008,8 @@ mod tests {
         });
         std::io::Write::write_all(&mut opened.unwrap(), b"line").unwrap();
         assert_eq!(std::fs::read(root.join("g/h")).unwrap(), b"line");
-        let under_a_file = write_atomically(&root.join("e/linked/under"), b"x").unwrap_err();
+        let under_a_file =
+            write_atomically(&root.join("e/linked/under"), b"x", Cache::Keep).unwrap_err();
         assert_eq!(under_a_file.raw_os_error(), Some(libc::ENOTDIR));
         std::fs::remove_dir_all(root).unwrap();
     }

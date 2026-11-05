@@ -58,7 +58,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Completion, Done, Effect, Extent, FileName, Mapping, Tag};
+use blaze_core::{Cache, Completion, Done, Effect, Extent, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -1205,6 +1205,11 @@ struct Pack {
     committed: u64,
     indexed: u64,
     end: u64,
+    /// Where the last record appended that the build may read back soon ends
+    /// ([`Cache::Keep`]): a commit's write of bytes all past it holds only records a settle
+    /// moved colder, and leaves the page cache ([`Cache::Drop`]). Every record a reopen finds
+    /// is committed, so it opens at 0.
+    kept_end: u64,
     dead: u64,
     removed: bool,
     /// Its live records are copied on; the next head names it removed.
@@ -1790,7 +1795,7 @@ impl Store {
                 if let Some(columns) = encodings_of(&encodings, &bytes) {
                     match colder_columns(columns, loc, &bytes) {
                         Ok(Some((form, payload))) => {
-                            self.replace(key, loc, form, 0, content, &payload);
+                            self.replace(key, loc, form, 0, content, &payload, Cache::Drop);
                             settled.demoted += 1;
                         }
                         Ok(None) => self.set_flag(row, Flag::Tried),
@@ -1817,7 +1822,7 @@ impl Store {
                     continue;
                 }
                 let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
-                self.replace(key, loc, Form::Zstd, dictionary, content, &stored);
+                self.replace(key, loc, Form::Zstd, dictionary, content, &stored, Cache::Drop);
                 settled.demoted += 1;
             }
         }
@@ -1829,8 +1834,10 @@ impl Store {
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
             spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
-                Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
-                None => self.replace(key, loc, Form::Raw, 0, content, &bytes),
+                Some(stored) => {
+                    self.replace(key, loc, Form::Lz4, 0, content, &stored, Cache::Keep)
+                }
+                None => self.replace(key, loc, Form::Raw, 0, content, &bytes, Cache::Keep),
             }
             settled.promoted += 1;
         }
@@ -1846,8 +1853,9 @@ impl Store {
             }
             spent += bytes;
             let unit = Unit(self.tiers[0].packs[at].unit);
+            // A retired pack's live records are as hot as they were: kept.
             for (header, payload) in live {
-                self.rehome(unit, header, &payload);
+                self.rehome(unit, header, &payload, Cache::Keep);
             }
             self.tiers[0].packs[at].retiring = true;
             settled.retired += 1;
@@ -2057,7 +2065,8 @@ impl Store {
         }
     }
 
-    /// Writes another record of `key` in place of the one at `old`, whose bytes are then dead.
+    /// Writes another record of `key` in place of the one at `old`, whose bytes are then dead;
+    /// `cache` is [`Cache::Drop`] for a record moved colder, which the build won't read soon.
     fn replace(
         &mut self,
         key: Key,
@@ -2066,6 +2075,7 @@ impl Store {
         dictionary: u32,
         content: ContentId,
         payload: &[u8],
+        cache: Cache,
     ) {
         let unit = Unit(self.tiers[0].packs[old.pack as usize].unit);
         let header = RecordHeader {
@@ -2077,7 +2087,7 @@ impl Store {
             key,
             content,
         };
-        self.rehome(unit, header, payload);
+        self.rehome(unit, header, payload, cache);
         self.tiers[0].packs[old.pack as usize].dead +=
             disk::span_of(old.stored).expect("`movable` checked `old` against the record it read");
     }
@@ -2086,8 +2096,8 @@ impl Store {
     /// value was durable where it was, so it is as durable now. A record too long for a
     /// segment chunk is refused by `write`, which stops the store: the key stays where it is,
     /// and the settle's `start_commit` fails before any commit removes a pack.
-    fn rehome(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) {
-        let Some((seg, span)) = self.own.write(unit, &header, payload, 0) else { return };
+    fn rehome(&mut self, unit: Unit, header: RecordHeader, payload: &[u8], cache: Cache) {
+        let Some((seg, span)) = self.own.write(unit, &header, payload, 0, cache) else { return };
         self.own.keep(span);
         let spot = Spot::new(header.key, header.content, Place::Segment(seg), Ticket::DURABLE);
         let held = Held::writer(&*self.shared);
@@ -2330,7 +2340,8 @@ impl Store {
                 // process beside `to` and renames it over `to` (`write_atomically`, io_uring's
                 // `push_temporary`), so two writes of the same bytes there both end with them.
                 // clone: the effect and the op each own the name; once per place
-                effects.push(Effect::Write { file: to.clone(), bytes, tag });
+                // A place's file is the build's output, run or read next: kept.
+                effects.push(Effect::Write { file: to.clone(), bytes, cache: Cache::Keep, tag });
                 let op = Op::Place { asked: tag, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(tag, op);
             }
@@ -2694,7 +2705,10 @@ impl Store {
                 let file = self.placed_file(&content);
                 self.files.insert(content, PlacedFile::Writing(waiting));
                 let tag = self.tags.ask(Op::MakeFile { content });
-                effects.push(Effect::Write { file, bytes, tag });
+                // Only cloned from (a clone shares its blocks, not its pages, and where the
+                // file system cannot clone the place is written from the store again), so
+                // nothing reads its pages back: they leave the page cache.
+                effects.push(Effect::Write { file, bytes, cache: Cache::Drop, tag });
             }
             Err(why) => self.refuse_waiting(waiting, &why),
         }
@@ -3234,6 +3248,7 @@ impl Store {
             committed: 0,
             indexed: 0,
             end: PACK_HEADER,
+            kept_end: 0,
             dead: 0,
             removed: false,
             retiring: false,
@@ -3241,7 +3256,15 @@ impl Store {
         own.packs.len() - 1
     }
 
-    fn append_record(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) -> Loc {
+    /// Appends a record to its unit's pack; `cache` says whether the build may read it back
+    /// soon ([`Pack::kept_end`]).
+    fn append_record(
+        &mut self,
+        unit: Unit,
+        header: RecordHeader,
+        payload: &[u8],
+        cache: Cache,
+    ) -> Loc {
         let span = header.span();
         let at = self.writable_pack(unit, span);
         let pack = &mut self.tiers[0].packs[at];
@@ -3250,6 +3273,9 @@ impl Store {
         pack.memory.extend_from_slice(payload);
         pack.memory.resize(pack.memory.len() + (span - RECORD_HEADER - header.stored) as usize, 0);
         pack.end += span;
+        if cache == Cache::Keep {
+            pack.kept_end = pack.end;
+        }
         Loc {
             pack: at as u32,
             kind: header.kind,
@@ -3312,6 +3338,10 @@ impl Store {
         let frame = unsafe { chunk.bytes(at, FRAME) }.expect("a published record is in its chunk");
         let unit = u32::from_le_bytes(*frame.first_chunk().expect("a frame is 16 bytes"));
         let copy = frame[4] == COPY;
+        let cache = match frame[5] {
+            segment::DROP => Cache::Drop,
+            _ => Cache::Keep,
+        };
         // SAFETY: as above, for the header after the frame.
         let header = unsafe { chunk.bytes(at + FRAME, RECORD_HEADER) }
             .map(RecordHeader::decode)
@@ -3366,9 +3396,9 @@ impl Store {
                 memory: Some(payload.to_vec()),
                 committed: false,
             });
-            self.append_record(Unit(unit), RecordHeader { stored: 0, ..header }, &[])
+            self.append_record(Unit(unit), RecordHeader { stored: 0, ..header }, &[], Cache::Keep)
         } else {
-            self.append_record(Unit(unit), header, payload)
+            self.append_record(Unit(unit), header, payload, cache)
         };
         if copy {
             // A copy is written because its key's record was another put's, not yet durable,
@@ -3847,7 +3877,7 @@ impl Store {
                     key: Key(ContentId::of(DICTIONARY_DOMAIN, dictionary)),
                     content: content_of(dictionary),
                 };
-                let loc = self.append_record(Unit::SHARED, header, dictionary);
+                let loc = self.append_record(Unit::SHARED, header, dictionary, Cache::Keep);
                 self.tiers[0].dictionaries.push(Dictionary {
                     kind,
                     pack: loc.pack,
@@ -3997,8 +4027,11 @@ impl Store {
             // clone: the write owns its bytes, and a commit that fails writes them again from these
             let bytes = external.memory.clone().expect("a file not yet written is held");
             let tag = self.tags.ask(Op::WriteExternal { content: *content });
+            // A fresh put's own file, mapped as the commit ends and read by what asked for it:
+            // kept in the page cache.
             // clone: the effect owns its file name; once per file a commit
-            effects.push(Effect::Write { file: external.file.clone(), bytes, tag });
+            let file = external.file.clone();
+            effects.push(Effect::Write { file, bytes, cache: Cache::Keep, tag });
             steps += 1;
         }
         let mut batch = std::mem::take(&mut self.draining);
@@ -4006,7 +4039,8 @@ impl Store {
         self.next_batch += 1;
         let index = index.map(|(slot, bytes)| {
             let tag = self.tags.ask(Op::WriteIndex);
-            effects.push(Effect::Write { file: own.file(&disk::index_file(slot)), bytes, tag });
+            let file = own.file(&disk::index_file(slot));
+            effects.push(Effect::Write { file, bytes, cache: Cache::Keep, tag });
             steps += 1;
             (slot, batch.id)
         });
@@ -4099,13 +4133,21 @@ impl Store {
                         // alloc: the write owns its bytes, and the pack keeps its memory until a mapping covers it; once per pack a commit
                         .to_vec();
                     // `committed` and `to` are block ends (each commit pads its packs), so on a
-                    // driver that can, a long write skips the page cache.
+                    // driver that can, a long write skips the page cache. Bytes that hold only
+                    // records a settle moved colder leave it too: the build won't read them
+                    // soon, though the pack is mapped as the commit ends (a mapping reads
+                    // nothing until a get touches its pages).
+                    let cache = match pack.kept_end > pack.committed {
+                        true => Cache::Keep,
+                        false => Cache::Drop,
+                    };
                     let tag = self.tags.ask(Op::WritePack { pack: at });
                     // clone: the effect owns its file name; once per pack a commit
                     effects.push(Effect::WriteAt {
                         file: pack.file.clone(),
                         at: pack.committed,
                         bytes,
+                        cache,
                         tag,
                     });
                     commit.steps += 1;
@@ -4157,6 +4199,7 @@ impl Store {
             effects.push(Effect::Write {
                 file: own.file(HEAD_FILE),
                 bytes: commit.head.encode(),
+                cache: Cache::Keep,
                 tag,
             });
         }
@@ -4299,6 +4342,7 @@ impl Store {
                 committed: it.committed,
                 indexed: it.indexed,
                 end: it.committed,
+                kept_end: 0,
                 dead: it.dead,
                 removed: it.removed,
                 retiring: false,

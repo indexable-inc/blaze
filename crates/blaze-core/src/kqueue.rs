@@ -1706,7 +1706,7 @@ mod tests {
         let file = name("store/pack");
         let seen = run(
             &mut driver,
-            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), tag: Tag(1) }],
+            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         assert_eq!(seen[&1], Done::Written);
         let seen = run(
@@ -1731,7 +1731,7 @@ mod tests {
         let file = name("vfs/journal");
         fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {
             let mut effects =
-                vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+                vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }];
             let mut seen = Vec::new();
             run_until_idle(driver, &mut effects, |done, effects| {
                 seen.push(match done.done {
@@ -1765,6 +1765,7 @@ mod tests {
                         file: file.clone(),
                         at: 6,
                         bytes: b"!".to_vec(),
+                        cache: crate::Cache::Keep,
                         tag: Tag(16),
                     },
                     16 => Effect::ReadAll { file: file.clone(), tag: Tag(17) },
@@ -1778,6 +1779,7 @@ mod tests {
                         file: name("missing"),
                         at: 0,
                         bytes: vec![1],
+                        cache: crate::Cache::Keep,
                         tag: Tag(22),
                     },
                     _ => return,
@@ -1902,7 +1904,7 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut heard = Vec::new();
@@ -1918,6 +1920,7 @@ mod tests {
                 driver.submit(&mut vec![Effect::Write {
                     file: name("src/deep/lib.rs"),
                     bytes: b"fn f() {}".to_vec(),
+                    cache: crate::Cache::Keep,
                     tag: Tag(100 + n),
                 }]);
             }
@@ -1953,7 +1956,7 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         for round in 0..20u64 {
@@ -2000,7 +2003,7 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         let mut effects = vec![
             Effect::Watch { dir: name("src"), tag: Tag(7) },
@@ -2059,7 +2062,7 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         driver.submit(&mut vec![Effect::Journal {
             dir: name("src"),
@@ -2102,9 +2105,10 @@ mod tests {
                 Effect::Write {
                     file: name("src/lib.rs"),
                     bytes: b"fn f() {}".to_vec(),
+                    cache: crate::Cache::Keep,
                     tag: Tag(1),
                 },
-                Effect::Write { file: name("src/deep/mod.rs"), bytes: Vec::new(), tag: Tag(2) },
+                Effect::Write { file: name("src/deep/mod.rs"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(2) },
             ],
         );
         std::os::unix::fs::symlink("lib.rs", root.join("src/link")).unwrap();
@@ -2290,7 +2294,7 @@ mod tests {
         let file = name("f");
         run(
             &mut driver,
-            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }],
+            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         let (mut effects, mut out) = (Vec::with_capacity(3), Vec::with_capacity(16));
         for round in 0..WARM + ROUNDS {
@@ -2348,7 +2352,7 @@ mod tests {
         let file = name("f");
         run(
             &mut driver,
-            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }],
+            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
         for round in 0..WARM + ROUNDS {
@@ -2408,7 +2412,7 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(64));
         let (src, edited, path) = (name("src"), name("src/edit"), root.join("src/edit"));

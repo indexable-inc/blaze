@@ -277,6 +277,23 @@ pub const SEAL_OF_NO_FILE: &str = "is no regular file: only a regular file is se
 /// receive, not by the frame's length at once.
 pub const RECV_MOST: usize = 64 << 10;
 
+/// Whether the pages a write ([`Effect::Write`], [`Effect::WriteAt`]) makes stay in the page
+/// cache once they reach the disk: a hint from the asker about when it reads them back.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cache {
+    /// Kept, as any write's are: the build reads them back soon (a fresh put, a head, an
+    /// index), or the asker cannot say.
+    Keep,
+    /// Let go once written back: the build won't read them soon (records a settle moved
+    /// colder, a store file only cloned from). On Linux a write with `RWF_DONTCACHE` on a
+    /// file system that takes it ([`kernel::dontcache`]; on any other it is a plain write),
+    /// on macOS `F_NOCACHE` on the file; elsewhere, and for a write that bypasses the cache
+    /// already (`O_DIRECT`), a plain write. A file system blaze lists as taking the flag that
+    /// refuses it fails the write, naming the file, the file system and the release; it is
+    /// never written again without the flag.
+    Drop,
+}
+
 /// IO a state machine asks for.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: tests' logs of what was asked (blaze-vfs's); a driver takes each by value
 pub enum Effect {
@@ -324,6 +341,7 @@ pub enum Effect {
     Write {
         file: FileName,
         bytes: Vec<u8>,
+        cache: Cache,
         tag: Tag,
     },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
@@ -340,6 +358,7 @@ pub enum Effect {
         file: FileName,
         at: u64,
         bytes: Vec<u8>,
+        cache: Cache,
         tag: Tag,
     },
     /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the

@@ -281,6 +281,7 @@ impl Image {
             file: owned(next),
             at,
             bytes,
+            cache: blaze_core::Cache::Keep,
             tag: tags.next(),
         }));
         steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);

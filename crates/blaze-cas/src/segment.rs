@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
 };
 
+use blaze_core::Cache;
 use blaze_ids::ContentId;
 use blaze_mem::{MemError, Region, Tag, scratch};
 use blaze_reclaim::Guard;
@@ -42,8 +43,21 @@ pub(crate) const CHUNK: usize = 1 << 20;
 pub(crate) const CHUNK: usize = 8 << 10;
 
 /// What a record in a segment starts with: its unit (4 bytes), whether it is a copy (1 byte),
-/// zeros to 16.
+/// what its pack's write asks of the page cache (1 byte, [`DROP`]), zeros to 16.
 pub(crate) const FRAME: u64 = 16;
+
+/// A frame's cache byte for a record a settle moved colder ([`Cache::Drop`]): the build won't
+/// read it soon, so the commit's write of a pack holding only such records leaves the page
+/// cache. 0 is [`Cache::Keep`].
+pub(crate) const DROP: u8 = 1;
+
+/// The cache byte of a frame for `cache`.
+pub(crate) fn cache_byte(cache: Cache) -> u8 {
+    match cache {
+        Cache::Keep => 0,
+        Cache::Drop => DROP,
+    }
+}
 
 /// A frame's copy byte for a record no key points at: a chunk of an output another writer has
 /// put and not yet made durable, written again so this writer's put does not wait on that
@@ -656,7 +670,9 @@ impl Own {
     ) -> Result<(), (ContentId, Ticket)> {
         // Refused by its length: the store stops on it, and the put ends having kept nothing,
         // its ticket never durable.
-        let Some((seg, span)) = self.write(unit, &header, payload, 0) else { return Ok(()) };
+        let Some((seg, span)) = self.write(unit, &header, payload, 0, Cache::Keep) else {
+            return Ok(());
+        };
         let tier = &look.view().tiers[0];
         #[cfg(test)]
         if let Some(pause) = &self.pause {
@@ -770,20 +786,22 @@ impl Own {
 
     /// Writes a record no key will point at, kept for its bytes (see [`COPY`]).
     fn write_copy(&mut self, unit: Unit, header: &RecordHeader, payload: &[u8]) {
-        if let Some((_, span)) = self.write(unit, header, payload, COPY) {
+        if let Some((_, span)) = self.write(unit, header, payload, COPY, Cache::Keep) {
             self.at += span;
         }
     }
 
     /// Writes a record at the writer's next bytes, not yet kept: gives its place and length.
     /// `None` for a record whose span with its frame reaches [`MOST_BYTES`]: it writes nothing
-    /// and stops the store on it, naming the record's key ([`Segment::failed`]).
+    /// and stops the store on it, naming the record's key ([`Segment::failed`]). `cache` is
+    /// what the commit's write of its pack asks of the page cache ([`DROP`]).
     pub(crate) fn write(
         &mut self,
         unit: Unit,
         header: &RecordHeader,
         payload: &[u8],
         copy: u8,
+        cache: Cache,
     ) -> Option<(Seg, u64)> {
         assert_eq!(payload.len() as u64, header.stored, "a record's payload is its stored length");
         let span = FRAME + header.span();
@@ -810,6 +828,7 @@ impl Own {
         let mut frame = [0u8; FRAME as usize];
         frame[..4].copy_from_slice(&unit.0.to_le_bytes());
         frame[4] = copy;
+        frame[5] = cache_byte(cache);
         let body = at + FRAME as usize;
         let end = body + RECORD_HEADER as usize + payload.len();
         // SAFETY: this is the segment's one writer (`&mut self`), and `at` is past what it has

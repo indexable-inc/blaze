@@ -843,7 +843,7 @@ impl Iocp {
                 self.put(request);
                 Ok(())
             }
-            Effect::WriteAt { file, at, bytes, tag } => {
+            Effect::WriteAt { file, at, bytes, tag, .. } => {
                 let handle = self.open(&file, files::Access::WriteAt)?;
                 if bytes.is_empty() {
                     self.ready.push(Completion { tag, done: Done::Written });
@@ -2517,8 +2517,8 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
                 Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())))
             }
         },
-        Effect::Write { file, bytes, .. } => {
-            files::write_atomically(joined(at, root, &file), &bytes).map(|()| Done::Written)
+        Effect::Write { file, bytes, cache, .. } => {
+            files::write_atomically(joined(at, root, &file), &bytes, cache).map(|()| Done::Written)
         }
         Effect::Rename { from, to: into, .. } => {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
@@ -3214,7 +3214,7 @@ mod tests {
         let file = name("store/pack");
         let seen = run(
             &mut driver,
-            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), tag: Tag(1) }],
+            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         assert_eq!(seen[&1], Done::Written);
         let seen = run(
@@ -3241,7 +3241,7 @@ mod tests {
         let file = name("vfs/journal");
         fn script(driver: &mut impl Driver, file: &FileName) -> Vec<String> {
             let mut effects =
-                vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+                vec![Effect::Write { file: file.clone(), bytes: b"one".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }];
             let mut seen = Vec::new();
             run_until_idle(driver, &mut effects, |done, effects| {
                 seen.push(match done.done {
@@ -3275,6 +3275,7 @@ mod tests {
                         file: file.clone(),
                         at: 6,
                         bytes: b"!".to_vec(),
+                        cache: crate::Cache::Keep,
                         tag: Tag(16),
                     },
                     16 => Effect::ReadAll { file: file.clone(), tag: Tag(17) },
@@ -3288,6 +3289,7 @@ mod tests {
                         file: name("missing"),
                         at: 0,
                         bytes: vec![1],
+                        cache: crate::Cache::Keep,
                         tag: Tag(22),
                     },
                     _ => return,
@@ -3340,7 +3342,7 @@ mod tests {
         let mut driver = Iocp::new(&root, 1).unwrap();
         run(
             &mut driver,
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }],
         );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut heard = Vec::new();
@@ -3356,6 +3358,7 @@ mod tests {
                 driver.submit(&mut vec![Effect::Write {
                     file: name("src/deep/lib.rs"),
                     bytes: b"fn f() {}".to_vec(),
+                    cache: crate::Cache::Keep,
                     tag: Tag(100 + n),
                 }]);
             }
