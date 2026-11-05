@@ -500,3 +500,80 @@ LL |     let a130 = wrap(a129);
    = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`main`)"#
     );
 }
+
+#[test]
+fn a_by_value_reference_self_does_not_choose_the_output_lifetime() {
+    // A receiver `self` whose `Self` is `&u8` is not `&self`: lifetime elision gives the
+    // returned `&u8` the input's lifetime, not the receiver's, in an impl's method and a
+    // trait's default one alike, so returning `input` past the receiver's local is fine.
+    let source = r#"trait Pick {
+    fn pick(self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(self, input: &u8) -> &u8 { input }
+}
+fn caller(input: &u8) -> &u8 {
+    let receiver = 9;
+    Pick::pick(&receiver, input)
+}
+trait DefaultPick: Sized {
+    fn pick(self, input: &u8) -> &u8 { input }
+}
+impl DefaultPick for &u16 {}
+fn default_caller(input: &u8) -> &u8 {
+    let receiver = 9;
+    DefaultPick::pick(&receiver, input)
+}
+fn main() {}
+"#;
+    assert_eq!(errors(Some("sized, copy"), source), Vec::<String>::new());
+}
+
+#[test]
+fn a_by_value_reference_self_cannot_escape_as_the_input_lifetime() {
+    // The other side of the same rule: the return type has `input`'s lifetime, which the
+    // receiver `&u8` need not outlive.
+    let source = r#"trait Pick {
+    fn pick(self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(self, _input: &u8) -> &u8 {
+        self
+    }
+}
+fn main() {}
+"#;
+    assert_eq!(
+        errors(Some("sized"), source),
+        [format!(" {} lifetime may not live long enough", at(source, "self\n", 0))]
+    );
+}
+
+#[test]
+fn a_borrowed_reference_self_still_chooses_the_output_lifetime() {
+    // `&self` with `Self = &u8` is a reference to `Self`: the return type has the receiver's
+    // lifetime, so returning `input` is refused, and a caller may keep what `keep` returns
+    // past the input's local.
+    let source = r#"trait Pick {
+    fn pick(&self, input: &u8) -> &u8;
+}
+impl Pick for &u8 {
+    fn pick(&self, input: &u8) -> &u8 {
+        input
+    }
+}
+trait Keep {
+    fn keep(&self, _input: &u8) -> &Self { self }
+}
+impl Keep for &u8 {}
+fn caller<'a>(receiver: &'a &'a u8) -> &'a &'a u8 {
+    let input = 9;
+    Keep::keep(receiver, &input)
+}
+fn main() {}
+"#;
+    assert_eq!(
+        errors(Some("sized"), source),
+        [format!(" {} lifetime may not live long enough", at(source, "input\n", 0))]
+    );
+}
