@@ -132,11 +132,33 @@ Steps, each its own PR:
    signal mask, the ban with callers moved, and the DST.
 3. The daemon's start says what it is inside.
 4. The perf sampler with the context log, fiber attribution on both systems, SIGRT deleted.
-5. Later: blocking child waits (`waitpid`, `waitid`, `wait4`) through the driver (pidfd on
-   Linux, `EVFILT_PROC` on macOS) and banned; `wait::park_until` for the pool's idle park
-   (futex `FUTEX_WAIT_BITSET` absolute, `os_sync_wait_on_address_with_deadline`,
-   `WaitOnAddress`); raw `syscall(SYS_futex | SYS_io_uring_enter)` refused by a `blaze::` lint;
-   the Windows sampler.
+5. Every kernel wait through the ring (Linux floor 7.2, the ix VM kernel; no probe, no
+   fallback; what is adopted is recorded in docs/kernel.md):
+   - The deadline wait itself: the SQE-embedded timeout (7.1) in place of `EXT_ARG`'s
+     separate timespec, and a registered wait region (6.13) holding the deadline and the
+     signal mask, so `Ring::enter` passes nothing per call and a retry rewrites only the
+     region's absolute time.
+   - Idle pool threads (`blaze-graph` `Local::park`, `pool.rs:2211`; the older fiber
+     driver's `idle`, `fiber.rs:1455`): each worker parks on its own small ring with
+     `IORING_OP_FUTEX_WAIT` (6.7) on its slot word and one absolute timeout for the next
+     due job or stall check; `Shared::wake` and `unpark_workers` wake it with
+     `IORING_OP_FUTEX_WAKE` (or a plain `FUTEX_WAKE` from a thread with no ring). The pool's
+     timers are then driven by that timeout instead of being seen only at the next wake.
+   - A client thread off a fiber (`pool::block_until`, `pool.rs:2489`) parks the same way.
+   - Child processes: `IORING_OP_WAITID` (6.7) on the driver's ring replaces the blocking
+     `wait4` in `process::reap` (`process.rs:476`) and the `waitid` of the Threads driver's
+     errand thread (`process.rs:499`); `blaze test`'s `wait_exited`
+     (`blaze-cargo/src/raw/process.rs:110`) and `ended_within` move onto a ring of their own.
+   - The driver's own sleeps: the cgroup `rmdir` retry and `wait_empty` poll
+     (`cgroup.rs:246,276`) and the `ETXTBSY` exec retry (`busy.rs:40`) become ring timeouts
+     and a ring `POLL_ADD` on `cgroup.events`, so the driver's thread never sleeps outside
+     its ring.
+   - The stampers' channel (`uring.rs:1503`) stays a futex through the pool's park above.
+   - Out of scope: the sandbox launcher (`sandbox/linux.rs`), whose seccomp filter refuses
+     io_uring to the program it launches; its `waitpid` and `poll` stay on `wait::`.
+   Then `waitpid`/`waitid`/`wait4`/`thread::park*` and raw `syscall(SYS_futex)` are banned
+   outside `blaze_core::wait`, the macOS park takes `os_sync_wait_on_address_with_deadline`,
+   Windows `WaitOnAddress`, and the Windows sampler follows.
 
 ## How it is proven
 
