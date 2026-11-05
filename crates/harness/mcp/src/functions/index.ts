@@ -1,18 +1,31 @@
 // Every function the harness exposes. The MCP `ts` tool puts each one in scope by name.
 import { googleSearch } from "./google.ts";
 import { withHiddenPage } from "../cdp.ts";
-import { table, Table } from "../table.ts";
+import { table, Table, LazyTable, col, lit, tableDocs } from "../table.ts";
+import { gitLog } from "../git-log.ts";
 import { nuon } from "../nuon.ts";
 import { tasks, task, taskValue, wait } from "../tasks.ts";
 import { agents } from "../agents.ts";
 import { sql } from "../sql.ts";
 import { spawn, obj, objects, tree } from "../obj.ts";
+import { rg, ls, glob, du, searchDocs } from "../search.ts";
+import { $ } from "../dollar.ts";
+import { follow, cargo, followDocs } from "../follow.ts";
+import { pmap } from "../pmap.ts";
+import { image } from "../image.ts";
+import { vfs } from "../vfs.ts";
 import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo } from "../proc.ts";
 
-export const functions = { spawn, obj, objects, tree, sql, googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
+export const functions = { rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
 
 /** Shown in the MCP tool description so the model knows what it can call. */
 export const docs: Record<keyof typeof functions, string> = {
+  ...searchDocs,
+  ...followDocs,
+  $: "$`cmd ${arg}`: thenable of { stdout, stderr, exitCode, ok, text(), lines(), json() } — runs a program through sh(); each ${value} is one quoted word (arrays several), $.raw(s) unquoted. Chain before awaiting: .nothrow(), .cwd(dir), .env(vars), .timeout(ms), .stdin(data), .why(reason). A non-zero exit throws with the stderr tail. `await $`git log --oneline -5`.lines()`.",
+  pmap: "pmap(items, (item, i, signal) => ..., { concurrency? = 16 }): Promise<R[]> — map in parallel, results in input order; the first error aborts the rest: `await pmap(await glob('src/**/*.ts'), async p => (await Bun.file(p).text()).split('\\n').length)`.",
+  image: "image(path | svgMarkup, { format?: 'png'|'jpeg'|'pdf', width?, height?, out? }): Promise<{ path, bytes, format }> — convert or resize (rsvg-convert, sips); an SVG with no format stays an SVG.",
+  vfs: "vfs.write(name, text | bytes | Blob | image()): Promise<path> — a file the person asked for (an exported image, a report) goes here, not in the project; show it with render(svelte`<Image src={f} />`, { f }) or <FileRef path={f} />. Also vfs.text/bytes/read(name), list(dir?), move(a, b), delete(name), path(name?).",
   spawn:
     "spawn(kind: 'claude'|'codex'|'cursor'|'shell'|'proc', { name?, prompt?, cmd? (proc), cwd?, env?, args?, parent? = this agent, stdin? }): Promise<Obj> — start a child object, or get the running one holding that name. Obj (every agent, proc, stage is one): fields id ('s7' | 'r12' | 'r12.0'), kind, name, parent, status, exitCode; send(method, args) = RPC; prompt(text); reply(timeoutMs? = 600000): Promise<string> = waits for the turn to finish and returns its last assistant message (claude/codex; the round trip: `const a = await spawn('claude', { name: 'x', prompt: '...' }); await a.reply(); await a.prompt('more'); await a.reply()`); input(bytes); stdin(text), closeStdin() (proc stdin stays open until closed); interrupt() (agents Esc, shell ^C, proc SIGINT); signal(sig); kill(); resize(cols, rows); wait(pred | { status?, match?: string|RegExp, timeoutMs? }) (no arg: until it stops); refresh(). Sync reads: .stdout / .stderr (proc: what its caller sees; a stage: its own) / .pty (escapes stripped) / read(stream, { from?, to?, tail?, new? }) / .messages: Table<{ n, role, kind: text|thinking|tool_call|tool_result|turn_end, tool, text, ts_ms }>. Async: screen(), events({ stream?, since?, tail? }): Table of stored lines, children().",
   obj: "obj(idOrName): Promise<Obj> — handle on any object, live or past: 's7', 'r12', 'r12.0', or a name.",
@@ -25,15 +38,18 @@ export const docs: Record<keyof typeof functions, string> = {
     "googleSearch(query: string, opts?: { limit?: number = 10; hl?: string = 'en' }): Promise<Table<{ title; url; resolved: boolean; site; snippet }>> — Google search in a hidden tab of Dia (CDP :9222). url is the real link when resolved, else Google's /goto link (Google throttles resolving after ~2 per page); site is the displayed breadcrumb.",
   withHiddenPage:
     "withHiddenPage<T>(fn: (page) => Promise<T>): Promise<T> — open a hidden Chrome tab; page has goto(url), evaluate(fn, arg), waitForSelector(sel), url(), send(cdpMethod, params). Closed afterwards.",
-  table:
-    "table(rows): Table<Row> — wrap any array of objects. A Table is a real array (r[0], .map, .length work) plus verbs that return new Tables: select(...cols), drop(...cols), where(fn), derive({ col: r => v }), sortBy(col | cols, { desc }), head(n), tail(n), unique(...cols), column(col), groupBy(...cols).agg(a => ({ n: a.count(), s: a.sum(c), m: a.mean(c), lo: a.min(c), hi: a.max(c), f: a.first(c), l: a.list(c), d: a.distinct(c), sub: a.rows() })), joinOn(other, on, 'inner' | 'left'), explode(listCol), unnest(recordCol), rows(). Cells may hold nested records, lists and Tables.",
+  table: tableDocs.table,
+  col: tableDocs.col,
+  lit: "lit(value) — see col.",
+  gitLog: tableDocs.gitLog,
+  LazyTable: "LazyTable — the class behind table.lazy() and gitLog().",
   Table: "Table — the class behind table(); use for instanceof checks.",
   nuon: "nuon(value, { maxRows? }): string — format any value the way results print: NUON, i.e. JSON with bare strings and keys, and lists of records as [[col, ...]; [v, ...], ...].",
   tasks: "tasks(): Table<{ id; status: running|done|error; code; started; elapsed_ms; logs: count; result: preview }> — every cell run so far.",
   task: "task(id: 't3' | 3): { id; status; code; started; elapsed_ms; logs: string[]; result: string } — snapshot of one cell; logs and result stay after it finishes.",
   taskValue: "taskValue(id): unknown — raw value of a finished cell's last expression (or its thrown error).",
   wait: "wait(id, timeoutMs?): Promise<task snapshot> — wait for a backgrounded cell; on timeout returns it still running.",
-  sh: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, maxBytes? = 8MB per stream kept in memory (oldest lines dropped, line numbers kept), timeoutMs?, local?: true to bypass harnessd }): Proc — the awaitable form of spawn('proc'): start now, return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id: 'p1', run: 'r12' | null, pid, exit_code, signal, stdout, stderr }. Runs through harnessd (bash) when it's up: the command is split at top-level ; && || and |, and the FULL stdout and stderr of EVERY pipeline stage is stored as run r12 stage 0, 1, ... readable later by any agent (`cargo clippy 2>&1 | head -n5` shows you 5 lines, clippy still runs to the end and stage(r, 0) has all of it — so pipe through head/tail/grep freely, nothing is lost). stdout here = last stage of each pipeline; stderr = every stage's. Falls back to a local Bun.spawn (run: null) when the daemon is down. Handle: id, run, pid, status running|exited|killed, kill().",
+  sh: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, why?, maxBytes? = 8MB per stream kept in memory (oldest lines dropped, line numbers kept), timeoutMs?, local?: true to bypass harnessd }): Proc — the awaitable form of spawn('proc'): start now, return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id: 'p1', run: 'r12' | null, pid, exit_code, signal, stdout, stderr }. Runs through harnessd (bash) when it's up: the command is split at top-level ; && || and |, and the FULL stdout and stderr of EVERY pipeline stage is stored as run r12 stage 0, 1, ... readable later by any agent (`cargo clippy 2>&1 | head -n5` shows you 5 lines, clippy still runs to the end and stage(r, 0) has all of it — so pipe through head/tail/grep freely, nothing is lost). stdout here = last stage of each pipeline; stderr = every stage's. Falls back to a local Bun.spawn (run: null) when the daemon is down. Handle: id, run, pid, status running|exited|killed, kill(). For running programs: a command that only reads files or the tree (cat, head, tail, grep, rg, find, ls, stat, wc, sed -n, awk, du, tree, which), even in a pipe, xargs or $(...), is refused with the typed call to use (Bun.file, rg, glob, ls, du) unless { why } says why the shell is needed; filtering a program's output (cargo test 2>&1 | grep FAIL) runs.",
   procs: "procs(): Table<{ id; run; pid; cmd; status; exit_code; started; elapsed_ms; stdout_bytes; stderr_bytes; truncated }> — this REPL's sh() processes, finished included.",
   out: "out(p: 'p1' | 'r12' | pid | Proc, { from?, to?, tail?, new?: true, cursor? = 'default', stage? }): string — stdout lines; from/to are 1-based inclusive line numbers, tail last N; new: only output since the previous read with that cursor (every read moves it to the end). With stage: n | 'final' it returns Promise<string> of that stored stage (same as stage()).",
   err: "err(p, opts?): string — stderr, same options as out() (stage too).",

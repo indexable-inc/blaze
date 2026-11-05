@@ -15,6 +15,10 @@ pub enum Act {
     Write,
     Delete,
     Search,
+    /// A directory listing or file walk (the REPL's ls, glob, du).
+    List,
+    /// A build, lint or test followed to a digest (the REPL's follow, cargo.*).
+    Build,
     Fetch,
     Query,
     Spawn,
@@ -36,6 +40,8 @@ impl Act {
             Act::Delete => format!("deleted {n} {}", s("file", "files")),
             Act::Search if n == 1 => "searched once".to_owned(),
             Act::Search => format!("searched {n} times"),
+            Act::List => format!("listed {n} {}", s("folder", "folders")),
+            Act::Build => format!("ran {n} {}", s("build", "builds")),
             Act::Fetch => format!("fetched {n} {}", s("page", "pages")),
             Act::Query => format!("ran {n} {}", s("query", "queries")),
             Act::Spawn => format!("started {n} {}", s("session", "sessions")),
@@ -45,7 +51,8 @@ impl Act {
     }
 
     /// A harness REPL step's kind (mcp/src/effects.ts).
-    fn of_effect(kind: &str) -> Act {
+    #[must_use]
+    pub fn of_effect(kind: &str) -> Act {
         match kind {
             "exec" => Act::Shell,
             "read" => Act::Read,
@@ -53,6 +60,8 @@ impl Act {
             "delete" => Act::Delete,
             "net" => Act::Fetch,
             "search" => Act::Search,
+            "list" => Act::List,
+            "build" => Act::Build,
             "sql" => Act::Query,
             "spawn" => Act::Spawn,
             _ => Act::Other,
@@ -71,6 +80,21 @@ impl Act {
             _ => Act::Other,
         }
     }
+}
+
+/// Acts in words, counted by kind in the order each kind first came, capitalised: "Read 3 files, searched 2 times".
+#[must_use]
+pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
+    let mut counts: Vec<(Act, usize)> = Vec::new();
+    for a in acts {
+        match counts.iter_mut().find(|(k, _)| *k == a) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((a, 1)),
+        }
+    }
+    let s = counts.iter().map(|(a, n)| a.words(*n)).collect::<Vec<_>>().join(", ");
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// One tool call as the grouping sees it.
@@ -151,16 +175,7 @@ impl Run {
     /// What its calls did, in words, in the order each kind first came: "Read 2 files, ran 1 shell command".
     #[must_use]
     pub fn summary(&self) -> String {
-        let mut counts: Vec<(Act, usize)> = Vec::new();
-        for a in self.calls.iter().flat_map(|(_, c)| &c.acts) {
-            match counts.iter_mut().find(|(k, _)| k == a) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((*a, 1)),
-            }
-        }
-        let s = counts.iter().map(|(a, n)| a.words(*n)).collect::<Vec<_>>().join(", ");
-        let mut c = s.chars();
-        c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+        summary(self.calls.iter().flat_map(|(_, c)| c.acts.iter().copied()))
     }
 
     /// How many of its calls failed.
@@ -359,5 +374,12 @@ mod tests {
         assert_eq!(rs[0].failed(), 1);
         assert!(g.pieces.contains(&Piece::Item(3)), "the view stands alone");
         assert_eq!(rs[1].summary(), "Ran 1 cell, searched once");
+    }
+
+    /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands.
+    #[test]
+    fn typed_calls_sum_up_in_words() {
+        let kinds = ["read", "read", "search", "read", "list", "search", "build"];
+        assert_eq!(summary(kinds.map(Act::of_effect)), "Read 3 files, searched 2 times, listed 1 folder, ran 1 build");
     }
 }
