@@ -47,7 +47,9 @@ jobs:
   unit-graphs:
     name: nix unit graphs are current
     runs-on: [ix, arm64]
-    timeout-minutes: 30
+    # Two minutes on a warm nix store; a cold one builds the dev shell first (unit_graph.py
+    # bounds that at an hour).
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
       # unit_graph.py runs cargo from the flake's dev shell (the pinned toolchain).
