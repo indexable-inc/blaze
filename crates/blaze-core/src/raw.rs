@@ -301,6 +301,64 @@ mod unix {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// `OPENAT2_REGULAR` of `open_how.flags` (Linux 7.2; libc has none yet): the open fails
+    /// with [`EFTYPE`] where the name is no regular file, before it opens, so a FIFO never
+    /// blocks it. With `O_DIRECTORY` or `O_PATH` it is `EINVAL`.
+    #[cfg(target_os = "linux")]
+    pub(crate) const OPENAT2_REGULAR: u64 = 1 << 32;
+
+    /// `EFTYPE`, what [`OPENAT2_REGULAR`] refuses a file that is no regular file with (Linux
+    /// 7.2; libc has none on Linux yet).
+    #[cfg(target_os = "linux")]
+    pub(crate) const EFTYPE: i32 = 134;
+
+    /// The `struct open_how` of every read of a file no request keeps (`Effect::ReadAll`,
+    /// `Effect::Read`, `Effect::Map`), as the kernel reads it: `flags` `O_RDONLY | O_CLOEXEC |
+    /// OPENAT2_REGULAR`, `mode` 0, `resolve` 0, each a native-endian `u64`. The one home of
+    /// those flags: io_uring's `IORING_OP_OPENAT2` copies these bytes into a request's arena,
+    /// and [`openat2_read_regular`] passes them to the system call.
+    #[cfg(target_os = "linux")]
+    pub(crate) static READ_REGULAR: [u8; 24] = {
+        let flags = ((libc::O_RDONLY | libc::O_CLOEXEC) as u64 | OPENAT2_REGULAR).to_ne_bytes();
+        let mut how = [0u8; 24];
+        let mut n = 0;
+        while n < flags.len() {
+            how[n] = flags[n];
+            n += 1;
+        }
+        how
+    };
+
+    /// `struct open_how` is three `u64`s, [`READ_REGULAR`]'s length.
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(size_of::<libc::open_how>() == 24);
+
+    /// One `openat2` of `path` (relative to the working directory) with [`READ_REGULAR`]: a
+    /// new close-on-exec descriptor for reading, or the call's error, [`EFTYPE`] where `path`
+    /// is no regular file. `EINTR` is the caller's: nothing signals the threads that call it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn openat2_read_regular(path: &CStr) -> io::Result<OwnedFd> {
+        // SAFETY: `path` is NUL-terminated and borrowed for the call; `READ_REGULAR` is a
+        // static of `size_of::<open_how>()` bytes (asserted above), the length passed, which
+        // the kernel reads during the call and does not keep.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                READ_REGULAR.as_ptr(),
+                READ_REGULAR.len(),
+            )
+        };
+        let fd = match fd {
+            -1 => return Err(io::Error::last_os_error()),
+            fd => fd as libc::c_int,
+        };
+        // SAFETY: `openat2` succeeded, so `fd` is a new descriptor nothing else owns; owned
+        // once, here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
     /// The running kernel's `uname`.
     #[cfg(target_os = "linux")]
     pub(crate) fn uname() -> io::Result<libc::utsname> {

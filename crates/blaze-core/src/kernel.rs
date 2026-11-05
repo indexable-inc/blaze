@@ -52,7 +52,7 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "openat2 OPENAT2_REGULAR",
         since: v(7, 2),
-        used_for: "store and cache reads that open only a regular file",
+        used_for: "store, cache, journal and source reads that open only a regular file",
     },
     Feature {
         name: "file IO error reporting",

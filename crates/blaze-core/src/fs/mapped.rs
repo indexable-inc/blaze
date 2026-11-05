@@ -35,11 +35,13 @@ use std::{fmt, fs::File, io, ops::Deref, path::Path, ptr::NonNull};
 /// The file mapped read-only and shared, for [`crate::Effect::Map`], as one [`Mapped`] that the
 /// last [`crate::Mapping`] of it unmaps.
 pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
+    // On Linux a regular file alone (`openat2` with `OPENAT2_REGULAR`), as io_uring's map.
+    let file = crate::fs::open_to_read(path)?;
     // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect writes,
     // appends to or truncates it in place; the store and the image replace a file only by
     // renaming another over it. Broken, a reader sees changed bytes (refused by its hash check)
     // or stops at a `SIGBUS` (the module doc).
-    let mapped = unsafe { Mapped::open(path) }?;
+    let mapped = unsafe { Mapped::map(&file) }?;
     Ok(crate::Mapping::file(mapped))
 }
 

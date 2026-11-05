@@ -952,6 +952,18 @@ fn work(shared: &Shared, effect: Effect) -> bool {
     shared.done.push(Told::Done(Completion { tag, done })).is_ok()
 }
 
+/// The whole of the file at `path`, opened with [`fs::open_to_read`]; its buffer the size the
+/// open file has.
+fn read_whole(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = fs::open_to_read(path)?;
+    let size = usize::try_from(file.metadata()?.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
+    // alloc: the read's result, handed to its asker.
+    let mut bytes = Vec::with_capacity(size);
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// `f` of `file` under `root`, joined in the thread's path buffer.
 fn at<R>(
     root: &Path,
@@ -969,7 +981,8 @@ fn at<R>(
 /// keep their file calls on threads. Allocates only what its completion carries.
 pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
     match effect {
-        Effect::ReadAll { file, .. } => match at(root, &file, |path| std::fs::read(path)) {
+        // On Linux a regular file alone ([`fs::open_to_read`]), as io_uring's read.
+        Effect::ReadAll { file, .. } => match at(root, &file, read_whole) {
             Ok(bytes) => Ok(Done::Read(bytes)),
             // alloc: none, an empty read.
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Done::Read(Vec::new())),
@@ -977,7 +990,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         },
         Effect::ReadLink { file, .. } => read_link(root, &file),
         Effect::Read { file, at: from, len, .. } => {
-            let file = at(root, &file, |path| File::open(path))?;
+            let file = at(root, &file, fs::open_to_read)?;
             // alloc: the read's payload.
             let mut bytes = vec![0; len];
             let mut read = 0;

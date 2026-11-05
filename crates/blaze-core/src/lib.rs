@@ -252,6 +252,16 @@ pub const CLONE_THROUGH_A_LINK: &str =
 /// never reported as a file system that cannot share blocks.
 pub const CLONE_OF_NO_FILE: &str = "is no regular file: blaze clones a regular file";
 
+/// What a failed [`Effect::ReadAll`], [`Effect::Read`] or [`Effect::Map`] of a file no request
+/// keeps says after the file's name on Linux when it is no regular file (a directory, a FIFO, a
+/// socket or a device): every such read opens with `openat2` and `OPENAT2_REGULAR` (Linux 7.2,
+/// docs/kernel.md), which refuses it with `EFTYPE` before it opens, so a FIFO never blocks a
+/// read and a device is never read as a file's bytes. The io_uring and threads drivers say it
+/// the same.
+#[cfg(target_os = "linux")]
+pub const READ_OF_NO_FILE: &str =
+    "is not a regular file (openat2 OPENAT2_REGULAR refused it with EFTYPE)";
+
 /// What an [`Effect::Seal`] whose file is a symbolic link (on Windows, a junction too) fails
 /// with, after the name: a seal is never set through a link. Every driver says it the same, so
 /// an asker can tell this refusal (the name is something other than the file it wrote) from a

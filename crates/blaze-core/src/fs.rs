@@ -148,6 +148,32 @@ pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
         })
 }
 
+/// The file at `path` opened for an [`crate::Effect::ReadAll`], [`crate::Effect::Read`] or
+/// [`crate::Effect::Map`] on a thread. On Linux only a regular file opens: one `openat2` with
+/// `OPENAT2_REGULAR` (Linux 7.2, under blaze's floor), which refuses a directory, FIFO, socket
+/// or device with `EFTYPE` before it opens, reported as [`crate::READ_OF_NO_FILE`] after the
+/// path, as the io_uring driver reports it. A missing file stays `NotFound`.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_to_read(path: &Path) -> io::Result<std::fs::File> {
+    with_c_path(path, crate::raw::openat2_read_regular).map(std::fs::File::from).map_err(|error| {
+        match error.raw_os_error() {
+            // alloc: an error path.
+            Some(crate::raw::EFTYPE) => {
+                io::Error::other(format!("{} {}", path.display(), crate::READ_OF_NO_FILE))
+            }
+            _ => error,
+        }
+    })
+}
+
+/// The file at `path` opened for an [`crate::Effect::ReadAll`], [`crate::Effect::Read`] or
+/// [`crate::Effect::Map`] on a thread: macOS, Windows and WASI have no open that refuses a file
+/// that is no regular file, so this is their one open for reading.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn open_to_read(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
 /// it, and the directory synced, so the new name survives a crash.
 #[cfg(any(unix, target_os = "wasi"))]
