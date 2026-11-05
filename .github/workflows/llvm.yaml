@@ -28,8 +28,9 @@ jobs:
   build:
     name: ${{ matrix.target }}
     # Hosted runners, Linux too, for the glibc a release asks for: the oldest hosted Ubuntu, not ix's
-    # 24.04 (docs/harness.md "ix runners"). TODO(sysroot): ix once blaze links against an older
-    # glibc sysroot (docs/v2/plan/toolchain-c.md); it has no --sysroot today.
+    # 24.04 (docs/harness.md "ix runners"). cmake and a C++ compiler, no blaze, so blaze's kernel
+    # floor (docs/kernel.md) does not apply. TODO(sysroot): ix with release.yaml's Ubuntu 22.04
+    # sysroot (.github/scripts/sysroot.py) once cmake is given its CC and CXX words.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 340
     strategy:

@@ -1,0 +1,93 @@
+{
+  "release": "jammy-updates",
+  "glibc": "2.35",
+  "libstdcxx": "11",
+  "targets": [
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "multiarch": "aarch64-linux-gnu",
+      "loader": "ld-linux-aarch64.so.1",
+      "debs": [
+        {
+          "package": "libc6",
+          "version": "2.35-0ubuntu3.15",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.35-0ubuntu3.15_arm64.deb",
+          "sha256": "dd88cc85dcfbac19c0c9b606676b7b1b87f851d75afa5c830fc5ba1293a30833"
+        },
+        {
+          "package": "libc6-dev",
+          "version": "2.35-0ubuntu3.15",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libc6-dev_2.35-0ubuntu3.15_arm64.deb",
+          "sha256": "e1da77e87451ca8f41b2757fe274bca357fd5f7498afe47c05360681d0727bae"
+        },
+        {
+          "package": "linux-libc-dev",
+          "version": "5.15.0-202.212",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/linux-libc-dev_5.15.0-202.212_arm64.deb",
+          "sha256": "4e495110557d627b9fc09ca93eeab3935f627d8563af8a6ee299b9f942923436"
+        },
+        {
+          "package": "libgcc-s1",
+          "version": "12.3.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libgcc-s1_12.3.0-1ubuntu1~22.04.3_arm64.deb",
+          "sha256": "46626e1af6b159061e055f843654ee1f0f1e65fa280331ed47ee76ba1b1f6045"
+        },
+        {
+          "package": "libstdc++6",
+          "version": "12.3.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libstdc++6_12.3.0-1ubuntu1~22.04.3_arm64.deb",
+          "sha256": "59d244119e6129c7e9c0897491c0e210e925d15881b2dedcf8965ceb4fbf1aa3"
+        },
+        {
+          "package": "libstdc++-11-dev",
+          "version": "11.4.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_arm64.deb",
+          "sha256": "e6b5485acb1c0380f388c069188f2f50b0bd72508ed75cc0551493a79d91c348"
+        }
+      ]
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "multiarch": "x86_64-linux-gnu",
+      "loader": "ld-linux-x86-64.so.2",
+      "debs": [
+        {
+          "package": "libc6",
+          "version": "2.35-0ubuntu3.15",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.35-0ubuntu3.15_amd64.deb",
+          "sha256": "79e35256227e16a607c154cdeb8d76ff12d20e31de286ea7fd9ad3b96fe0452d"
+        },
+        {
+          "package": "libc6-dev",
+          "version": "2.35-0ubuntu3.15",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libc6-dev_2.35-0ubuntu3.15_amd64.deb",
+          "sha256": "ce51ae233a9f800a040de2d0cd5983ef86f558c623b342c80942301d7f453f48"
+        },
+        {
+          "package": "linux-libc-dev",
+          "version": "5.15.0-202.212",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/linux-libc-dev_5.15.0-202.212_amd64.deb",
+          "sha256": "3af9a45f616e3676827c31a9b7c43b78ea5c92f37af23d1c09db2a8f5ce294b2"
+        },
+        {
+          "package": "libgcc-s1",
+          "version": "12.3.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libgcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb",
+          "sha256": "d383e642d83263147f7b4b69fb92cf1036e5246c6be3accf10b77f986684589a"
+        },
+        {
+          "package": "libstdc++6",
+          "version": "12.3.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libstdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb",
+          "sha256": "29ef3d289b272704b75141906c8f683db0f2bdb0942061366691333bfb289bdc"
+        },
+        {
+          "package": "libstdc++-11-dev",
+          "version": "11.4.0-1ubuntu1~22.04.3",
+          "url": "https://launchpad.net/ubuntu/+archive/primary/+files/libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+          "sha256": "58e0cd2d1f758e75426eaa47a5e7228d1c86180500ed68d162bcbf7b0a1c5dd0"
+        }
+      ]
+    }
+  ]
+}

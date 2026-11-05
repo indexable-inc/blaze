@@ -10,8 +10,16 @@ One typed input (rule scripts-take-typed-input):
 The build is `blaze build -p blaze-engine --profile dist --locked --target T`, run by `blaze`
 (the stage 0 .github/actions/blaze installs), against the LLVM `LLVM_SYS_231_PREFIX` names (the
 pin crates/hir-ty-codegen/llvm.json, which .github/actions/blaze fetches below /usr/local/lib:
-a build script in blaze's sandbox may name only system directories of libraries). T must be the
-host's: every release target builds on a machine of its own kind, nothing is cross-compiled.
+a build script in blaze's sandbox may name only system directories of libraries). T is the
+host's, with one exception: x86_64-unknown-linux-gnu is cross-compiled on an aarch64 Linux host
+(ix has no x86-64 runners, docs/harness.md "ix runners"), with Ubuntu's x86-64 cross GCC as the
+C driver and the x86-64 archive of the pinned LLVM, whose llvm-config runs under qemu-user; its
+binaries are checked here as every other's, and nothing of them is run. Any other pair is refused.
+
+On Linux the C driver, `CC_<triple with _>`, links against an Ubuntu 22.04 glibc sysroot
+(`--sysroot`, .github/scripts/sysroot.py, which sets it): the ix runners' own glibc is Ubuntu
+24.04's 2.39, and a binary linked against it asks for a newer glibc than users have. A Linux
+build whose C driver names no `--sysroot` is refused before it starts.
 
 `dist` is `release` with `lto = "thin"` and `codegen-units = 1`. blaze's release codegen is one
 LLVM unit per function with ThinLTO's summaries and imports across the whole program
@@ -29,7 +37,8 @@ codegen.rs, `pgo`), so today `pinned` stops with that error and releases ship `"
 
 The binaries are refused when one loads libLLVM, or on Linux a C++ runtime (a machine that
 downloads them has neither), and on Linux when one asks for a glibc newer than `GLIBC` (RHEL 9's;
-the release builds on the oldest hosted Ubuntu; install.sh says the same floor).
+the release links against Ubuntu 22.04's glibc sysroot; install.sh says the same floor), or is an
+ELF of another architecture than the target's.
 
 Every step is bounded, and a failure stops the script naming the step, the command, its exit
 status and the tail of what it printed; nothing is skipped or done another way.
@@ -59,7 +68,8 @@ PINS = ROOT / "tools" / "pgo" / "profiles.json"
 LLVM_PIN = ROOT / "crates" / "hir-ty-codegen" / "llvm.json"
 LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
 # The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and how a
-# binary names the versions it asks for (in its dynamic string table).
+# binary names the versions it asks for (in its dynamic string table). The release links against
+# Ubuntu 22.04's glibc 2.35 (.github/scripts/sysroot.py) and uses nothing newer than 2.34 of it.
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
 # The libraries no shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
@@ -71,12 +81,16 @@ HOSTS = {
     ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
     ("darwin", "arm64"): "aarch64-apple-darwin",
 }
+# The one cross-compiled release target, by the host it is built on (see the top of the file).
+CROSS = {("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu")}
+# An ELF file's `e_machine` for each Linux target.
+ELF_MACHINE = {"x86_64-unknown-linux-gnu": 62, "aarch64-unknown-linux-gnu": 183}
 TAIL_LINES = 80
 
 
 @dataclass(frozen=True)
 class Build:
-    # The Rust target triple, which must be the host's.
+    # The Rust target triple: the host's, or x86_64-unknown-linux-gnu on an aarch64 Linux host.
     target: str
     # Where every binary of blaze-engine is copied; created when missing.
     out: str
@@ -88,8 +102,9 @@ class Build:
     blaze: str = "blaze"
     # The target directory; `target` in the checkout when empty.
     target_dir: str = ""
-    # The bound of the build, in seconds: a cold store of blaze's release builds for about 97
-    # minutes on hosted Linux x86-64 and longer on macOS (blaze-platform.yaml's build job).
+    # The bound of the build, in seconds: a cold store of blaze's release built for about 97
+    # minutes on a hosted Linux x86-64 runner, and longer on macOS's (blaze-platform.yaml's build
+    # job); an ix runner's 64 vCPUs take less.
     build_secs: int = 4 * 3600
     # The bound of `blaze stop` after the build, and of each check of a binary.
     stop_secs: int = 120
@@ -263,6 +278,15 @@ def build_env(build: Build, target_dir: Path, profile: Path | None) -> dict[str,
         )
     if not Path(prefix, "bin").is_dir():
         raise Failed(f"llvm: {LLVM_PREFIX}={prefix} has no bin/: it is not an unpacked LLVM of {LLVM_PIN}")
+    if build.target.endswith("-linux-gnu"):
+        var = "CC_" + build.target.replace("-", "_")
+        driver = os.environ.get(var, "")
+        if not any(word.startswith("--sysroot") for word in driver.split()):
+            raise Failed(
+                f"sysroot: {var} is {driver!r}, which names no --sysroot: linked against the build machine's own "
+                "glibc (Ubuntu 24.04's 2.39 on an ix runner), the binaries would ask for a newer glibc than RHEL 9's; "
+                ".github/scripts/sysroot.py makes Ubuntu 22.04's and sets the C driver to build against it"
+            )
     env = {k: v for k, v in os.environ.items() if k not in FOREIGN_FLAGS}
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["CARGO_INCREMENTAL"] = "0"
@@ -283,6 +307,10 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
     data = binary.read_bytes()
     wrong: list[str] = []
     if data[:4] == b"\x7fELF":
+        machine = int.from_bytes(data[18:20], "little" if data[5] == 1 else "big")
+        want = ELF_MACHINE.get(build.target)
+        if want is not None and machine != want:
+            wrong.append(f"{binary.name} is an ELF for machine {machine}, not {build.target}'s ({want})")
         shown = (
             await run(f"check {binary.name}", ["readelf", "-d", str(binary)], secs=build.check_secs)
         ).stdout
@@ -292,8 +320,8 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
         if asked and asked > GLIBC:
             wrong.append(
                 f"{binary.name} asks for glibc {'.'.join(map(str, asked))}, newer than RHEL 9's "
-                f"{'.'.join(map(str, GLIBC))}, so it does not start there: build on Ubuntu 22.04, as the "
-                "release does"
+                f"{'.'.join(map(str, GLIBC))}, so it does not start there: link against Ubuntu 22.04's "
+                "glibc sysroot (.github/scripts/sysroot.py), as the release does"
             )
     elif data[:4] == b"\xcf\xfa\xed\xfe":
         shown = (
@@ -309,10 +337,12 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
 
 
 async def main_async(build: Build) -> None:
-    if build.target != host():
+    on = host()
+    if build.target != on and (on, build.target) not in CROSS:
         raise Failed(
-            f"target: {build.target} is not this machine's ({host()}); each release target builds on a "
-            "machine of its own kind, and blaze cross-compiles no release"
+            f"target: {build.target} is not this machine's ({on}); a release target builds on a machine of "
+            "its own kind, but for x86_64-unknown-linux-gnu, cross-compiled on aarch64-unknown-linux-gnu: "
+            f"blaze cross-compiles no release from {on} to {build.target}"
         )
     if not shutil.which(build.blaze):
         raise Failed(

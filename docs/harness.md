@@ -613,7 +613,10 @@ answers. Until then `linux x64 (cross-compiled, not run)` (`blaze.yaml`, every t
 cross-compiles `blaze` and `blaze-engine` for `x86_64-unknown-linux-gnu` on an ix AArch64
 runner, with Ubuntu's x86-64 cross gcc and glibc for C and the link, and qemu-user to run the
 x86-64 `llvm-config` the pinned LLVM's build script asks; it checks the binaries are x86-64 ELF
-and runs nothing.
+and runs nothing. release.yaml's x86-64 build is made the same way (below), and runs only
+`blaze --version` under qemu-user. pgo.yaml trains no x86-64 profile (training runs the
+instrumented blaze), so `tools/pgo/profiles.json`'s x86-64 entry stays as last trained, and
+install.yaml's no-Rust containers install only the AArch64 archive.
 
 - The gate's build and unit tests (`linux arm64 / build`, `linux arm64 / tests`),
   `workspace-check` and `lint-baselines` run on `[ix, arm64, ix-cpu-64, blaze-<job>]`: 64
@@ -630,7 +633,8 @@ and runs nothing.
 - Clean-machine jobs and jobs holding a long-lived secret run on **cold** runners,
   `[ix, arm64, ix-mode-cold]`: booted from the base image every time, never snapshotted and
   never a seed, so nothing an earlier job left is there and nothing they leave reaches a later
-  one. The clean machines: install.yaml's installs and promote.yaml's smoke and apps. The
+  one. The clean machines: install.yaml's installs, archive and no-Rust containers,
+release.yaml's builds, pgo.yaml's training, and promote.yaml's smoke and apps. The
   secrets (the bot token, Cloudflare's, crates.io's): fmt, site, the bench and live-latency
   history commits, promote.yaml's and yank's metadata, release.yaml's notes-free jobs (crates,
   publish, metadata), pgo's pin and toolchain-bump's branch and pull request.
@@ -661,16 +665,25 @@ What stays on GitHub's hosted runners, and why:
   aarch64-apple-darwin` once the SDK is in CI). The other macOS jobs run what users run on a
   Mac: release.yaml's, llvm.yaml's and pgo.yaml's darwin builds, install.yaml's and
   promote.yaml's macOS installs and smoke, toolchain-bump's and profile-nightly's macOS entries.
-- **Builds of what users run on Linux**: release.yaml, llvm.yaml's and pgo.yaml's builds and
-  install.yaml's archive (and the no-Rust containers that install it) run on hosted Ubuntu 22.04
-  so that the binaries ask for an old glibc (`build_release.py` refuses one newer than RHEL 9's
-  2.34); the ix image's glibc is 2.39. **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt
-  objects and libc through `$CC_<triple> -print-search-dirs`, and the sysroot archives of
-  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. A driver given one
-  (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
-  but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
-  an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere. Once blaze links against an old glibc
-  sysroot, these move to ix.
+- **llvm.yaml's Linux LLVM builds**: cmake and a C++ compiler, no blaze, on hosted Ubuntu 22.04
+  so that the archives ask for its glibc.
+
+Builds of what users run on Linux are on ix, as every job that runs blaze must be: blaze refuses
+a kernel below Linux 7.2 ([kernel.md](kernel.md)), and GitHub's hosted Ubuntu runners boot 6.8 to
+6.11. release.yaml's Linux builds, pgo.yaml's AArch64 training and install.yaml's archive run on
+cold `[ix, arm64, ix-cpu-64, ix-mode-cold]` runners and link against Ubuntu 22.04's glibc 2.35, not
+the ix image's 2.39 (`build_release.py` refuses a binary that asks for a glibc newer than RHEL 9's
+2.34). `.github/scripts/sysroot.py` lays out that sysroot under `/usr/local/lib/blaze-sysroot/`
+from the debs `.github/scripts/sysroot.json` pins by sha256 (libc6, libc6-dev, linux-libc-dev,
+libgcc-s1, libstdc++6 and libstdc++-11-dev, the GCC 11 libstdc++ hosted 22.04 linked: noble's
+GCC 13 `libstdc++.a` asks for glibc 2.36 and 2.38 symbols). It writes `CC_<triple>`,
+`CXX_<triple>`, `CFLAGS_<triple>` and `CXXFLAGS_<triple>` with `--sysroot` and `-B` words, as
+the image's GCC 13 searches its own directories before a sysroot's, and checks that each crt
+object, libc file and first header the drivers find is the sysroot's. blaze-link takes the ELF
+interpreter from the system path for a libc under the driver's `--sysroot`
+(`crates/blaze-link/src/target.rs`). The x86-64 release build is cross-compiled on the same
+AArch64 runner (the x86-64 cross gcc with its own glibc headers removed, so the sysroot's are
+the ones found) and is not run beyond `blaze --version` under qemu-user.
 - Windows, which ix does not serve.
 - The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.
 
@@ -679,7 +692,8 @@ How far blaze cross-compiles today: `--target` takes one foreign triple; std is 
 signing Mach-O ad hoc (no `codesign`). What a cross build still borrows from the host: a C cross
 compiler as `CC_<triple>` (crt objects, libc, build scripts' `cc`), read when the daemon starts;
 the pinned LLVM's build script runs the target archive's own `llvm-config` (qemu-user for
-x86-64, impossible for a Mach-O one on Linux); and `build_release.py` builds only for the host.
+x86-64, impossible for a Mach-O one on Linux); and `build_release.py` builds for the host and,
+on an AArch64 Linux host, for `x86_64-unknown-linux-gnu`, no other pair.
 For `aarch64-apple-darwin` on Linux it also needs a macOS SDK at `SDKROOT`, a darwin clang as
 `CC_aarch64_apple_darwin` and `otool`, none of which CI has, so no darwin cross job runs.
 

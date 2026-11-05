@@ -43,10 +43,14 @@ env:
 jobs:
   train:
     name: ${{ matrix.target }}
-    # Hosted runners, Linux too, for the glibc a release asks for: the oldest hosted Ubuntu, not ix's
-    # 24.04 (docs/harness.md "ix runners"). TODO(sysroot): ix once blaze links against an older
-    # glibc sysroot (docs/v2/plan/toolchain-c.md); it has no --sysroot today.
-    runs-on: ${{ matrix.os }}
+    # Linux on ix, as every job that runs blaze: blaze refuses a kernel below Linux 7.2
+    # (docs/kernel.md), and GitHub's hosted Ubuntu runners boot 6.8 to 6.11. A profile is trained
+    # on a build like the release's, so it links against the same Ubuntu 22.04 glibc sysroot
+    # (.github/scripts/sysroot.py; the ix image's own glibc is 24.04's 2.39), on a cold runner
+    # as release.yaml's build is. TODO(x86-64): no x86_64-unknown-linux-gnu profile until ix has
+    # x86-64 runners (docs/harness.md "ix runners"): training runs the instrumented blaze, which
+    # an arm64 runner cannot, so its entry in tools/pgo/profiles.json stays as last trained.
+    runs-on: ${{ matrix.runner }}
     # Three builds of blaze (instrumented, with the profile, plain for the baseline), each bounded
     # at two hours by pgo.py, the training and the measuring: the hosted runner's cap.
     timeout-minutes: 360
@@ -54,24 +58,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-15 }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-15, linux: false }
+          - { target: aarch64-unknown-linux-gnu, runner: [ix, arm64, ix-cpu-64, ix-mode-cold], linux: true }
     env:
       # BOLT rewrites ELF alone: pgo.py refuses an ELF target that asks for none and a Mach-O one
       # that asks for it.
-      BOLT: ${{ startsWith(matrix.os, 'macos') && 'none' || 'instrument' }}
+      BOLT: ${{ matrix.linux && 'instrument' || 'none' }}
     steps:
       - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: ${{ matrix.linux && '4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403' || '' }} # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      # Ubuntu 22.04's glibc and the C and C++ drivers' words that build against it, before
+      # blaze's daemon first starts: it reads them when it starts.
+      - if: matrix.linux
+        name: glibc 2.35 sysroot (Ubuntu 22.04)
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-sysroot
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-sysroot
+          jq -n --arg target "${{ matrix.target }}" --arg env "$GITHUB_ENV" \
+            '{target: $target, dir: "/usr/local/lib/blaze-sysroot/\($target)", github_env: $env}' > "$RUNNER_TEMP/sysroot.json"
+          uv run --frozen --no-dev python .github/scripts/sysroot.py "$RUNNER_TEMP/sysroot.json"
       # The builder: the stage 0 .github/blaze-version names, with its own Rust; pgo.py fetches the
       # pinned LLVM itself (llvm-profdata, llvm-bolt among it).
       - uses: ./.github/actions/blaze
         with:
           job: pgo
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: '0.13.5'
-          enable-cache: false
       - name: pgo.py build
         run: |
           jq -n --arg target "${{ matrix.target }}" --arg builder "$(command -v blaze)" \
@@ -111,6 +125,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
           enable-cache: false
       # Each file each <target>.json names, checked by its sha256, uploaded to the release
       # tools/pgo/profiles.json names, and written into it.

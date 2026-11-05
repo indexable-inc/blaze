@@ -248,11 +248,31 @@ fn homebrew_prefix(name: Option<&str>) -> Option<String> {
         .map(|val| val.trim().to_string())
 }
 
-/// blaze: libstdc++.a of the C++ compiler cc-rs would use (`CXX`, else `c++`).
+/// blaze: libstdc++.a of the C++ compiler cc-rs would use for the target: `CXX_<target>` (as
+/// written, then with `_` for `-`), else `CXX`, else `c++`; its first word the program and the
+/// rest its arguments, as cc-rs reads them. A sysroot's driver is words, as in
+/// `g++ --sysroot=<dir> -B<dir>/usr/lib/gcc/<multiarch>/11/` (.github/scripts/sysroot.py), whose
+/// `-B` makes the sysroot's libstdc++.a the one found.
 fn static_libstdcxx() -> PathBuf {
-    println!("cargo:rerun-if-env-changed=CXX");
-    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_owned());
-    let out = Command::new(&cxx)
+    let target = env::var("TARGET").expect("cargo sets TARGET for a build script");
+    let names = [
+        format!("CXX_{target}"),
+        format!("CXX_{}", target.replace('-', "_")),
+        "CXX".to_owned(),
+    ];
+    for name in &names {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let cxx = names
+        .iter()
+        .find_map(|name| env::var(name).ok())
+        .unwrap_or_else(|| "c++".to_owned());
+    let mut words = cxx.split_whitespace();
+    let program = words
+        .next()
+        .unwrap_or_else(|| panic!("the C++ compiler `{cxx}` names no program"));
+    let out = Command::new(program)
+        .args(words)
         .arg("-print-file-name=libstdc++.a")
         .output()
         .unwrap_or_else(|e| panic!("{cxx} -print-file-name=libstdc++.a: {e}"));

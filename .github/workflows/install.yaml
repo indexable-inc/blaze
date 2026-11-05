@@ -128,21 +128,33 @@ jobs:
           if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
           grep -F "blaze has no channel nightly." out.txt
 
-  # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, and with no PGO,
-  # as release.yaml builds it: with a profile older than the crates the build sat silent past
-  # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
-  # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
-  # TODO(sysroot): hosted Ubuntu 22.04 only for its glibc (2.35, near RHEL 9's 2.34). Move to an
-  # ix runner once blaze can link against an older glibc sysroot (docs/v2/plan/toolchain-c.md,
-  # "sysroot"); blaze has no --sysroot today (docs/harness.md "ix runners").
+  # This commit's build, as the release builds it: on ix, as every job that runs blaze (blaze
+  # refuses a kernel below Linux 7.2, docs/kernel.md; GitHub's hosted Ubuntu boots 6.8 to 6.11),
+  # against the release's Ubuntu 22.04 glibc sysroot (.github/scripts/sysroot.py) so that it asks
+  # for the glibc a release asks for, on a cold runner, and with no PGO, as release.yaml builds it:
+  # with a profile older than the crates the build sat silent past every crate for 50 minutes and
+  # more, at random (04:27Z and 07:02Z on 2026-10-28). build_release.py refuses a binary that asks
+  # for a glibc newer than RHEL 9's. AArch64, the ix runners' own (docs/harness.md "ix runners").
   archive:
     name: this commit's build
-    runs-on: ubuntu-22.04
-    # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
+    runs-on: [ix, arm64, ix-cpu-64, ix-mode-cold]
+    # A clean build of blaze by blaze, as a release's.
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      # Before blaze's daemon first starts: it reads the C and C++ drivers' words when it starts.
+      - name: glibc 2.35 sysroot (Ubuntu 22.04)
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-sysroot
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-sysroot
+          jq -n --arg env "$GITHUB_ENV" \
+            '{target: "aarch64-unknown-linux-gnu", dir: "/usr/local/lib/blaze-sysroot/aarch64-unknown-linux-gnu", github_env: $env}' > "$RUNNER_TEMP/sysroot.json"
+          uv run --frozen --no-dev python .github/scripts/sysroot.py "$RUNNER_TEMP/sysroot.json"
       # The release's own recipe, and the recipe is what it checks: the stage 0
       # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
       # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
@@ -150,25 +162,21 @@ jobs:
         with:
           job: install-archive
           llvm: true
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: '0.13.5'
-          enable-cache: false
       - run: |
           uv run --frozen --no-dev python .github/scripts/build_release.py \
-            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+            '{"target": "aarch64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
         timeout-minutes: 300
       - name: archive
         run: |
-          name=blaze-commit-x86_64-unknown-linux-gnu
+          name=blaze-commit-aarch64-unknown-linux-gnu
           mkdir "$name"
           cp shipped/* "$name/"
           "$name/blaze" --version
           tar czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:
-          name: archive
-          path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+          name: archive-aarch64
+          path: blaze-commit-aarch64-unknown-linux-gnu.tar.gz
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log
@@ -179,8 +187,10 @@ jobs:
   no-rust:
     name: no Rust installed, ${{ matrix.system }}
     needs: archive
-    # Hosted, as the archive it installs is x86-64 and built there (TODO(sysroot) above).
-    runs-on: ubuntu-24.04
+    # ix, as the archive it installs is AArch64; each image is multi-arch, so its arm64 one runs.
+    # The container shares the runner's kernel, which is what blaze's floor checks.
+    # TODO(x86-64): the x86-64 archive too once ix has x86-64 runners.
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -203,7 +213,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: archive
+          name: archive-aarch64
       - name: no rustup, cargo or rustc
         run: |
           for tool in rustup cargo rustc; do
@@ -214,7 +224,7 @@ jobs:
         run: |
           set -eu
           began=$(date +%s.%N)
-          BLAZE_ARCHIVE="$PWD/blaze-commit-x86_64-unknown-linux-gnu.tar.gz" sh < site/install.sh
+          BLAZE_ARCHIVE="$PWD/blaze-commit-aarch64-unknown-linux-gnu.tar.gz" sh < site/install.sh
           export PATH="$HOME/.cargo/bin:$PATH"
           mkdir -p "$RUNNER_TEMP/hello/src"
           cd "$RUNNER_TEMP/hello"

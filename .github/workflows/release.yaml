@@ -73,30 +73,65 @@ jobs:
   build:
     name: ${{ matrix.target }}
     needs: notes
-    # On GitHub's hosted runners, Linux too: the binaries are built on the oldest hosted Ubuntu so
-    # that they ask for an old glibc (build_release.py refuses one newer than RHEL 9's), and the
-    # ix runner image is Ubuntu 24.04, whose glibc 2.39 headers bind C code to newer symbols
-    # (docs/harness.md "ix runners"). TODO(sysroot): build Linux on ix against an older glibc
-    # sysroot (docs/v2/plan/toolchain-c.md) once blaze can target one; it has no --sysroot today.
-    runs-on: ${{ matrix.os }}
+    # Linux on ix, as every job that runs blaze: blaze refuses a kernel below Linux 7.2
+    # (docs/kernel.md), and GitHub's hosted Ubuntu runners boot 6.8 to 6.11. The ix image is
+    # Ubuntu 24.04, whose glibc is 2.39, so the build links against Ubuntu 22.04's glibc 2.35
+    # (.github/scripts/sysroot.py), and the binaries ask for no newer glibc than RHEL 9's 2.34
+    # (build_release.py refuses one that does). ix has no x86-64 runners, so x86-64 is
+    # cross-compiled on arm64 and not run, as blaze.yaml's `linux-x64-cross` is (docs/harness.md
+    # "ix runners"). Cold runners: a release's binaries come from a machine no earlier job touched.
+    runs-on: ${{ matrix.runner }}
     # A store blaze's release has not compiled into, which a release's always is: about 97
-    # minutes on hosted Linux x86-64 and longer on macOS's 7 GB runner (blaze-platform.yaml's
-    # build), under the hosted runner's 6-hour cap.
+    # minutes on a hosted Linux x86-64 runner when it built there, and longer on macOS's 7 GB
+    # runner (blaze-platform.yaml's build), under the hosted runner's 6-hour cap.
     timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-15 }
-          # The oldest hosted Ubuntu, so that the binaries ask for an old glibc.
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-15, linux: false, cross: false }
+          - { target: x86_64-unknown-linux-gnu, runner: [ix, arm64, ix-cpu-64, ix-mode-cold], linux: true, cross: true }
+          - { target: aarch64-unknown-linux-gnu, runner: [ix, arm64, ix-cpu-64, ix-mode-cold], linux: true, cross: false }
     env:
       # `cargo binstall` and install.sh find the archive and its binaries by this name
       # ([package.metadata.binstall] in crates/blaze-engine/Cargo.toml).
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
+      # xz for the archive (the ix image may lack it); for x86-64, Ubuntu's x86-64 cross GCC
+      # (the C driver, and the C++ one LLVM's wrappers compile with) and qemu-user, which runs
+      # the x86-64 `llvm-config` llvm-sys's build script asks and the `--version` below.
+      - if: matrix.linux
+        uses: ./.github/actions/apt
+        with:
+          packages: ${{ matrix.cross && 'xz-utils gcc-x86-64-linux-gnu g++-x86-64-linux-gnu qemu-user-static binfmt-support' || 'xz-utils' }}
+      # The cross GCC's own glibc (Ubuntu 24.04's 2.39, in /usr/x86_64-linux-gnu/include and
+      # lib) is searched before any sysroot's, so it goes: the C library is the sysroot's alone.
+      # The runtime (libc6-amd64-cross, libstdc++6-amd64-cross) stays, for qemu-user.
+      - if: matrix.cross
+        name: x86-64 cross GCC without its own glibc headers, qemu-user runs x86-64 programs
+        run: |
+          sudo dpkg --remove --force-depends libc6-dev-amd64-cross linux-libc-dev-amd64-cross
+          sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-x86_64
+          test -e /proc/sys/fs/binfmt_misc/qemu-x86_64 || { echo "::error::binfmt_misc has no qemu-x86_64 entry: the x86-64 llvm-config cannot run"; exit 1; }
+          echo "QEMU_LD_PREFIX=/usr/x86_64-linux-gnu" >> "$GITHUB_ENV"
+      # build_release.py and sysroot.py run in the repository's Python workspace (typed_input).
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: ${{ matrix.linux && '4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403' || '' }} # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      # Ubuntu 22.04's glibc for the target, and the C and C++ drivers' words that build against
+      # it (CC_<triple>, CXX_<triple>, CFLAGS_<triple>, CXXFLAGS_<triple>), before blaze's daemon
+      # first starts: it reads them when it starts.
+      - if: matrix.linux
+        name: glibc 2.35 sysroot (Ubuntu 22.04)
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-sysroot
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-sysroot
+          jq -n --arg target "${{ matrix.target }}" --arg env "$GITHUB_ENV" \
+            '{target: $target, dir: "/usr/local/lib/blaze-sysroot/\($target)", github_env: $env}' > "$RUNNER_TEMP/sysroot.json"
+          uv run --frozen --no-dev python .github/scripts/sysroot.py "$RUNNER_TEMP/sysroot.json"
       # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
       # names, with its own Rust, and the pinned LLVM (LLVM_SYS_231_PREFIX), as blaze-platform.yaml's
       # build job has them; no rustup, no cargo, no Nix. The store's project is this job's own and
@@ -105,12 +140,17 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: release
-          llvm: true
-      # build_release.py runs in the repository's Python workspace (typed_input).
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-        with:
-          version: '0.13.5'
-          enable-cache: false
+          llvm: ${{ !matrix.cross }}
+      # The target's archive of the pinned LLVM, where the action fetches the host's.
+      - if: matrix.cross
+        name: LLVM for x86_64-unknown-linux-gnu (the pin)
+        run: |
+          prefix=/usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+          sudo mkdir -p /usr/local/lib/blaze-llvm
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir "$prefix"
+          "$prefix/bin/llvm-config" --version
+          echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
       # `blaze --version` names the commit and its date (UTC), as rustc does:
       # `blaze 0.20261028.9 (fb82b09 2026-10-28)` (crates/blaze-engine/build.rs).
       - run: |
@@ -141,6 +181,11 @@ jobs:
           # goes by neither name), linked twice: shipped once, as a hard link, which tar keeps,
           # so the archive holds one copy.
           ln -f "$NAME/blaze-engine" "$NAME/blaze"
+          # x86-64's binaries, cross-compiled on arm64 (build_release.py checked they are x86-64
+          # ELF), run here under qemu-user, through binfmt_misc with the cross runtime as
+          # QEMU_LD_PREFIX, and only for `--version`: it starts no daemon and uses none of the
+          # kernel features blaze's floor is for (docs/kernel.md), past the floor's uname check,
+          # which qemu-user answers with the runner's own kernel.
           "$NAME/blaze-engine" --version | tee /dev/stderr | sed -n 1p | grep -E "^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$"
           # `blaze` runs the one beside it.
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
