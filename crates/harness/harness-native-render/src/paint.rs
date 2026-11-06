@@ -618,7 +618,7 @@ impl Painter {
                     let c = if dark { dark_c } else { light_c };
                     (c.a > 0.0).then(|| rgba(c))
                 };
-                let code_ink = md.and_then(|m| pick(m.code_dark, m.code_light));
+                let inline_code_ink = md.and_then(|m| pick(m.code_dark, m.code_light));
                 let strong_ink = md.and_then(|m| pick(m.strong_dark, m.strong_light));
                 let faced: Vec<(usize, usize, [f32; 4])> = shown_md
                     .as_ref()
@@ -626,7 +626,7 @@ impl Painter {
                         m.runs
                             .iter()
                             .filter_map(|r| match r.face {
-                                Face::InlineCode => code_ink.map(|c| (r.start, r.end, c)),
+                                Face::InlineCode => inline_code_ink.map(|c| (r.start, r.end, c)),
                                 Face::Bold | Face::BoldItalic => strong_ink.map(|c| (r.start, r.end, c)),
                                 _ => None,
                             })

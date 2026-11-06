@@ -241,7 +241,7 @@ impl App {
             };
             let state = it.state.and_then(|s| w.try_lookup(&format!("{}::{component}::{}", vocab::MODULE, state_name(s))));
             let mark = it.ci.and_then(|c| w.try_lookup(&format!("{}::marks::{}", vocab::MODULE, ci_name(c))));
-            for (rel, to) in [(InlineState::id(), state), (InlineMark::id(), mark)] {
+            for (rel, to) in [(*w.component::<InlineState>().id(), state), (*w.component::<InlineMark>().id(), mark)] {
                 let cur = e.target(rel, 0).map(|t| *t.id());
                 match to {
                     Some(t) if cur != Some(*t.id()) => _ = e.add((rel, *t.id())),

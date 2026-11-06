@@ -520,7 +520,7 @@ export const chat_h3_below = 0
 // (tone_chat_marker), a number the body's size in the muted ink with tabular figures.
 export const chat_list_mark_w = 18
 export const chat_list_inset = 2
-export const chat_list_nest = $chat_list_mark_w
+export const chat_list_nest_w = $chat_list_mark_w
 export const chat_item_gap = 3
 export const chat_item_half = $chat_item_gap / 2
 export const size_chat_bullet = 10
@@ -675,14 +675,14 @@ export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: 
 // inline_peek_pad in, its lines inline_peek_gap apart: a GitHub item's title, state and checks, author and lines changed,
 // then its description's first lines; a page's site, title, description and picture (inline_peek_image_h tall); a
 // file's first lines in the code face. It closes when the pointer leaves the chip and the card both.
-export const inline_peek_dwell = 0.35
+export const inline_peek_dwell_s = 0.35
 export const inline_peek_w = 360
 export const inline_peek_pad = 12
 export const inline_peek_gap = 6
 export const inline_peek_image_h = 160
 export const inline_peek_radius = 8
 export const inline_peek_badge_pad = 6
-export const inline_peek_lines = 8
+export const inline_peek_lines_n = 8
 export const size_peek_title = 14
 export const line_peek_title = 19
 export const size_peek_body = 12.5

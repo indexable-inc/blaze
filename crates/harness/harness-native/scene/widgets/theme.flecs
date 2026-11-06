@@ -55,15 +55,15 @@ hn {
     lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
     // How far a nested list item steps in a level (src/app/chat.rs fill_row; points, as a width).
     chat_list_nest {
-      Size: {w: {kind: Fixed, value: $chat_list_nest, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      Size: {w: {kind: Fixed, value: $chat_list_nest_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     // A chip's hover card (src/app/chat/peek.rs, scene/widgets/peek.flecs): how long the pointer rests on a chip before
     // it opens (seconds), and how many of a file's lines a path's card shows (each as Size.w's value).
     inline_peek_dwell {
-      Size: {w: {kind: Fixed, value: $inline_peek_dwell, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      Size: {w: {kind: Fixed, value: $inline_peek_dwell_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     inline_peek_lines {
-      Size: {w: {kind: Fixed, value: $inline_peek_lines, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      Size: {w: {kind: Fixed, value: $inline_peek_lines_n, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     // A reply streaming in (src/app/chat.rs): the follow to its end, each glyph's arrival, the pace bursts show at. The
     // follow's far is Size.w's value (it lands at once past it from rest).
