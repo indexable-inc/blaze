@@ -54,8 +54,10 @@ concurrency:
   # each run ends and covers every merge up to its commit. A group of its own per push stacked
   # up a full three-platform run per merge (17 at once on 2026-10-28, each waiting on macOS
   # runners) and none of them got runners in time. A merge-queue entry or a run by hand is
-  # still a group of its own.
-  group: blaze-${{ github.event_name == 'push' && 'main' || format('{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.sha) }}
+  # still a group of its own. A push groups by its ref: a push to a lane branch shares no group
+  # with main (2026-11-05: lane-branch pushes sat in `blaze-main` and kept replacing main's
+  # waiting run, so no main run finished all day).
+  group: blaze-${{ github.event_name == 'push' && github.ref || format('{0}-{1}', github.event_name, github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
