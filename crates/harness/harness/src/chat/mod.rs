@@ -14,7 +14,7 @@
 //! | `session` | `agent`, `model`, `session_id`, `effort` | the agent started (or resumed) with this model and effort, or a switch to them took; `session_id` is its own id for the conversation (Claude's session id, Codex's thread id), what a resume names |
 //! | `models` | `models` (`id`, `model`, `name`, `about`, `efforts`, `effort`) | the models the agent offers, from its own list, as it starts |
 //! | `choice` | `model`, `effort` | the person switched the model and/or effort for the turns from here on (`set_model`); a resume starts with the latest |
-//! | `context` | `used`, `window` | tokens of the model's context window the conversation fills, after a turn |
+//! | `context` | `used`, `window`, `last` (`input`, `cache_read`, `cache_write`, `output`, `thinking`), `parts` (`id`, `name`, `tokens`, `of`, `estimate`) | tokens of the model's context window the conversation fills, after a turn; the last call's exact split and what the context holds part by part, each the agent's count or harness's named estimate ([`context`]) |
 //! | `user` | `text` | the user's message (written by the daemon as it sends it) |
 //! | `busy` | `busy` | a turn started (true) or ended (false) |
 //! | `block_start` | `block`, `kind` (`text` \| `thinking`) | a block began streaming *(partial)* |
@@ -88,6 +88,7 @@
 //! harness-proto's `migrate`), and marked in the index (`meta.chat_log`); [`Chat::open`] refuses one it finds unconverted.
 pub mod claude;
 pub mod codex;
+pub mod context;
 pub mod models;
 
 use crate::daemon::Ev;

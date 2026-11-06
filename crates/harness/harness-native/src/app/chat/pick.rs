@@ -19,7 +19,7 @@
 //! ([`App::remember_choice`]): cmd+N starts on the last agent, model and effort.
 //!
 //! After them, the context meter: a ring filling as the conversation fills its model's window, and the percentage (den's:
-//! muted, the warning tone from [`WARN`], the failed tone from [`FULL`]), its tooltip the tokens.
+//! muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer, its popover (context.rs).
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
@@ -106,8 +106,8 @@ fn effort_word(e: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
-/// A token count as den's tooltip says it: 950, 46.2k, 258k, 1M.
-fn tokens(n: u64) -> String {
+/// A token count as the meter's popover says it: 950, 46.2k, 258k, 1M.
+pub(super) fn tokens(n: u64) -> String {
     let (v, unit) = match n {
         1_000_000.. => (n as f64 / 1e6, "M"),
         1_000.. => (n as f64 / 1e3, "k"),
@@ -158,7 +158,7 @@ impl App {
         let models = models_of(t, kind, &kept);
         let cur = current(t, models);
         let name = cur.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(model);
-        let context = t.context.filter(|&(_, window)| window > 0);
+        let context = t.context.as_ref().filter(|c| c.window > 0);
         let Some(pick) = status.part("pick") else { return };
         let mut parts: Vec<(&str, &str)> = Vec::with_capacity(4); // alloc: four parts at most, once a frame per chat
         if !name.is_empty() {
@@ -186,10 +186,15 @@ impl App {
             "more" => control(v, &format!("chat:pick:{sid}:all"), "icon", None, word, hot),
             _ => {
                 if let Some(c) = context {
-                    meter(v, c, ink);
+                    meter(v, (c.used, c.window), ink);
                 }
             }
         });
+        // Under the pointer, the meter's popover (context.rs); never over the open menu.
+        if let Some(pop) = status.part("pop") {
+            let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
+            super::context::fill_context_pop(pop, pick.part("context"), context, agent, open.is_some());
+        }
         // Open, the menu floats above what opened it, its leading edge on that control's (the whole picker for the
         // chevron's menu of both, so it lines up with the model's name; the chevron when the effort's word is not there).
         let trigger = open.and_then(|p| if p == Pick::All { Some(pick) } else { pick.part(p.trigger()).or_else(|| pick.part("more")) });
@@ -451,7 +456,7 @@ fn control(v: View<'_>, action: &str, part: &str, words: Option<&str>, rest: Fil
 }
 
 /// The context meter for `(used, window)` tokens: the ring's arc and the percentage in their tone, the track in `ink`
-/// faintly, the tokens in its tooltip.
+/// faintly.
 fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     let w = v.entity().world();
     let f = used as f64 / window as f64;
@@ -460,10 +465,6 @@ fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     if let Some(p) = v.part("pct") {
         p.text(&format!("{pct}%"));
         set_fill(p, tone);
-    }
-    let tip = Tooltip { text: format!("{} of {} tokens ({pct}%)", tokens(used), tokens(window)).as_str().into() };
-    if v.entity().try_cloned::<&Tooltip>().as_ref() != Some(&tip) {
-        v.set(tip);
     }
     let Some(ring) = v.part("ring") else { return };
     if let Some(track) = ring.part("track") {

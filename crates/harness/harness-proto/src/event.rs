@@ -51,11 +51,8 @@ pub enum Body {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
-    /// How much of the model's context window the conversation fills (tokens), as the agent last reported it: claude's
-    /// last call of a turn (its input, cache and output tokens) against `modelUsage`'s `contextWindow`; codex's
-    /// `thread/tokenUsage/updated` (`last.totalTokens` against `modelContextWindow`). `window` is 0 when the agent did not
-    /// say.
-    Context { used: u64, window: u64 },
+    /// How much of the model's context window the conversation fills, after a turn.
+    Context(ContextUse),
     /// The person's message (written by the daemon as it sends it).
     User { text: String },
     /// A turn started (true) or ended (false).
@@ -94,6 +91,66 @@ pub enum Body {
         #[serde(default)]
         text: String,
     },
+}
+
+/// How much of the model's context window the conversation fills (tokens), as the agent last reported it
+/// ([`Body::Context`]): claude's last call of a turn (its input, cache and output tokens) against `modelUsage`'s
+/// `contextWindow`; codex's `thread/tokenUsage/updated` (`last.totalTokens` against `modelContextWindow`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextUse {
+    pub used: u64,
+    /// 0 when the agent did not say.
+    pub window: u64,
+    /// That call's own split, exact (from the agent's usage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<ContextCall>,
+    /// What the context holds, part by part, each the agent's own count or harness's named estimate (the meter's
+    /// popover; harness/src/chat/context.rs). Empty when nothing split it, and in a log from before parts existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ContextPart>,
+}
+
+/// The call that filled the context ([`ContextUse::last`]), as the agent's usage reports it: exact.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextCall {
+    /// Input tokens neither read from the prompt cache nor written to it.
+    pub input: u64,
+    /// Input tokens read from the prompt cache.
+    pub cache_read: u64,
+    /// Input tokens written to the prompt cache (claude's `cache_creation_input_tokens`; codex reports none).
+    pub cache_write: u64,
+    pub output: u64,
+    /// Thinking tokens: claude's turn's `output_tokens_details.thinking_tokens` (the whole turn's), codex's last call's
+    /// `reasoningOutputTokens`. None when the agent did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<u64>,
+}
+
+/// One part of what the context holds ([`ContextUse::parts`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextPart {
+    /// What it is, stable across turns: claude's category id (`system_prompt`, `mcp_tools`, ...), `note.<topic>` for a
+    /// topic of harness's system note, `messages.<role>` (`user`, `assistant`, `tool_calls`, `tool_results`, `thinking`),
+    /// `rest`.
+    pub id: String,
+    /// Its name as the popover says it.
+    pub name: String,
+    pub tokens: u64,
+    /// The part this one splits (its `id`), empty for a part of the whole: a split is shown under its part and is not
+    /// added to the whole again.
+    #[serde(default)]
+    pub of: String,
+    /// How harness estimated it (`o200k_base`: counted with that tokenizer; `rest`: the agent's exact total less the other
+    /// parts), empty when the number is the agent's own count.
+    #[serde(default)]
+    pub estimate: String,
+}
+
+impl ContextPart {
+    /// [`ContextPart::estimate`] for a part counted with harness's tokenizer.
+    pub const O200K: &str = "o200k_base";
+    /// [`ContextPart::estimate`] for a part that is the agent's exact total less the others.
+    pub const REST: &str = "rest";
 }
 
 /// One model an agent offers ([`Body::Models`]).
@@ -216,7 +273,12 @@ impl Event {
                 }).collect(),
             },
             "choice" => Body::Choice { model: v["model"].as_str().map(str::to_owned), effort: v["effort"].as_str().map(str::to_owned) },
-            "context" => Body::Context { used: v["used"].as_u64().unwrap_or(0), window: v["window"].as_u64().unwrap_or(0) },
+            // The NDJSON of before schema 1 had no split and no parts.
+            "context" => Body::Context(ContextUse {
+                used: v["used"].as_u64().unwrap_or(0),
+                window: v["window"].as_u64().unwrap_or(0),
+                ..ContextUse::default()
+            }),
             "user" => Body::User { text: s("text") },
             "busy" => Body::Busy { busy: v["busy"].as_bool().unwrap_or(false) },
             "block_start" => Body::BlockStart { block: block(), kind: kind() },
@@ -307,7 +369,7 @@ impl Body {
             Self::Session { .. } => "session",
             Self::Models { .. } => "models",
             Self::Choice { .. } => "choice",
-            Self::Context { .. } => "context",
+            Self::Context(_) => "context",
             Self::User { .. } => "user",
             Self::Busy { .. } => "busy",
             Self::BlockStart { .. } => "block_start",

@@ -56,6 +56,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
     ("scene/widgets/chat_status.flecs", include_str!("../scene/widgets/chat_status.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
+    ("scene/widgets/context.flecs", include_str!("../scene/widgets/context.flecs")),
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),

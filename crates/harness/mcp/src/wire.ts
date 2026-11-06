@@ -120,12 +120,16 @@ export type Detail = {
 export type Kind = "text" | "thinking";
 /** One model an agent offers (a models event). */
 export type ModelChoice = { id: string; model: string; name: string; about: string; efforts: string[]; effort?: string };
+/** The call that filled the context, as the agent's usage reports it (a context event's `last`). */
+export type ContextCall = { input: number; cache_read: number; cache_write: number; output: number; thinking?: number };
+/** One part of what the context holds; `of` names the part it splits, `estimate` how harness estimated it ("": the agent's count). */
+export type ContextPart = { id: string; name: string; tokens: number; of: string; estimate: string };
 /** What happened. */
 export type Body =
   | { ev: "session"; agent: string; model: string; session_id?: string; effort?: string }
   | { ev: "models"; models: ModelChoice[] }
   | { ev: "choice"; model?: string; effort?: string }
-  | { ev: "context"; used: number; window: number }
+  | { ev: "context"; used: number; window: number; last?: ContextCall; parts?: ContextPart[] }
   | { ev: "user"; text: string }
   | { ev: "busy"; busy: boolean }
   | { ev: "block_start"; block: string; kind: Kind }
@@ -143,7 +147,7 @@ export type Body =
 export type Event = { ts: number } & Body;
 
 // A field's type as serde reads it: required (no default), defaulted when missing, or optional (missing or null is none).
-type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects" | "models";
+type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects" | "models" | "parts" | "call";
 type Spec = Record<string, [F, "req" | "def" | "opt"]>;
 const DETAIL: Spec = {
   block: ["s", "req"], cell: ["s", "req"], status: ["s", "req"], ms: ["u", "opt"], code: ["s", "def"], effects: ["effects", "def"],
@@ -157,7 +161,7 @@ const BODIES: Record<Body["ev"], Spec> = {
   session: { agent: ["s", "req"], model: ["s", "req"], session_id: ["s", "opt"], effort: ["s", "opt"] },
   models: { models: ["models", "req"] },
   choice: { model: ["s", "opt"], effort: ["s", "opt"] },
-  context: { used: ["u", "req"], window: ["u", "req"] },
+  context: { used: ["u", "req"], window: ["u", "req"], last: ["call", "opt"], parts: ["parts", "opt"] },
   user: { text: ["s", "req"] },
   busy: { busy: ["b", "req"] },
   block_start: { block: ["s", "req"], kind: ["k", "req"] },
@@ -175,7 +179,14 @@ const BODIES: Record<Body["ev"], Spec> = {
 const MODEL: Spec = {
   id: ["s", "req"], model: ["s", "def"], name: ["s", "def"], about: ["s", "def"], efforts: ["v", "def"], effort: ["s", "opt"],
 };
-const EMPTY: Record<F, () => unknown> = { s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [], models: () => [] };
+const CALL: Spec = { input: ["u", "req"], cache_read: ["u", "req"], cache_write: ["u", "req"], output: ["u", "req"], thinking: ["u", "opt"] };
+const PART: Spec = { id: ["s", "req"], name: ["s", "req"], tokens: ["u", "req"], of: ["s", "def"], estimate: ["s", "def"] };
+// The lists of maps, each read by its spec.
+const LISTS: Partial<Record<F, Spec>> = { effects: EFFECT, models: MODEL, parts: PART };
+const EMPTY: Record<F, () => unknown> = {
+  s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [], models: () => [], parts: () => [],
+  call: () => null,
+};
 
 const isMap = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Uint8Array);
 
@@ -195,13 +206,16 @@ function fields(m: Record<string, unknown>, spec: Spec, what: string): Record<st
       : f === "u" ? (typeof x === "number" && Number.isInteger(x) && x >= 0) || (typeof x === "bigint" && x >= 0n)
       : f === "f" ? typeof x === "number" || typeof x === "bigint"
       : f === "k" ? x === "text" || x === "thinking"
-      : f === "effects" || f === "models" ? Array.isArray(x)
+      : f === "call" ? isMap(x)
+      : LISTS[f] ? Array.isArray(x)
       : true;
-    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list", models: "a list" }[f]}`);
-    out[k] = f === "effects" || f === "models" ? (x as unknown[]).map((e, i) => {
+    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list", models: "a list", parts: "a list", call: "a map" }[f]}`);
+    const list = LISTS[f];
+    out[k] = list ? (x as unknown[]).map((e, i) => {
       if (!isMap(e)) throw new Error(`${what}: ${k}[${i}] is not a map`);
-      return fields(e, f === "effects" ? EFFECT : MODEL, `${what} ${k}[${i}]`);
-    }) : f === "f" && typeof x === "bigint" ? Number(x) : x;
+      return fields(e, list, `${what} ${k}[${i}]`);
+    }) : f === "call" ? fields(x as Record<string, unknown>, CALL, `${what} ${k}`)
+    : f === "f" && typeof x === "bigint" ? Number(x) : x;
   }
   return out;
 }

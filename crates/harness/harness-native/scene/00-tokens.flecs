@@ -460,6 +460,24 @@ export const chat_foot_pad_t = 4
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets and gap, the status
 // line, the composer's own inset): the words grow to textarea_grow_share of the pane less it.
 export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_foot_gap + $chat_pick_h + 2 * $chat_input_pad_y
+// The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
+// a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
+// chat_ctx_gap apart: a head, the window as a bar chat_ctx_bar_h tall (chat_ctx_bar_r round, chat_ctx_bar_pad above
+// and below) holding a segment a part, then a row a part chat_ctx_row_h tall: a dot chat_ctx_dot across in its ink,
+// chat_ctx_dot_gap before its name, its tokens, its share of the window flush right in chat_ctx_share_w. A part's splits
+// sit under it with no dot, quieter. The foot (the last call's cache split, whose counts these are) at size_caption.
+export const chat_ctx_w = 296
+export const chat_ctx_pad = 10
+export const chat_ctx_gap = 0
+export const chat_ctx_bar_h = 4
+export const chat_ctx_bar_r = 2
+export const chat_ctx_bar_pad = 7
+export const chat_ctx_row_h = 20
+export const chat_ctx_dot = 7
+export const chat_ctx_dot_gap = 7
+export const chat_ctx_share_w = 36
+export const chat_ctx_foot_pad = 7
+export const chat_ctx_foot_gap = 2
 export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
 // one says more than a word (scene/widgets/chat_status.flecs: a thought's sparkle leads, a call's running dot trails),
