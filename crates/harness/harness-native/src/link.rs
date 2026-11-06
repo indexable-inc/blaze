@@ -13,6 +13,7 @@ use harness_native_model::{LinkState, Mailbox, Msg};
 use harness_proto::frame::{self, T_CBOR, T_DATA, T_EVENT};
 use harness_proto::event::ModelChoice;
 use harness_proto::msg::{Down, Reply, Request, RunReq, Up};
+use harness_proto::peek::{GhItem, GhRef, PageMeta, REFS_MAX};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -341,6 +342,20 @@ pub struct Link {
     /// By agent kind, the models it last listed to the daemon (`list`'s `models`): what a chat whose own log has none
     /// picks from (chat/pick.rs).
     models: Arc<Mutex<Arc<BTreeMap<String, Vec<ModelChoice>>>>>,
+    /// What the daemon said of the things chats' chips point at (`github_status`, `page_peek`), for the chips and their
+    /// hover cards (src/app/chat/peek.rs); bumped `rev` and a wake each time an answer lands.
+    peeks: Arc<Mutex<Peeks>>,
+}
+
+/// The daemon's answers about chips' targets: a pull request's or issue's state by ref, a page's card by URL, what is
+/// being asked now (asked once at a time), and a revision that moves with each answer.
+#[derive(Default)]
+pub struct Peeks {
+    pub gh: BTreeMap<GhRef, GhItem>,
+    pub pages: BTreeMap<String, PageMeta>,
+    pub asking_gh: std::collections::BTreeSet<GhRef>,
+    pub asking_pages: std::collections::BTreeSet<String>,
+    pub rev: u64,
 }
 
 /// One event on a cell's UI: cell `<repl>.<task>` runs handler `handler` with `value`.
@@ -365,6 +380,7 @@ impl Link {
             run_bytes: Arc::default(),
             ui: ui_sender(),
             models: Arc::default(),
+            peeks: Arc::default(),
         };
         let (rtt_us, pid, agent_models) = (link.rtt_us.clone(), link.pid.clone(), link.models.clone());
         std::thread::Builder::new()
@@ -648,6 +664,81 @@ impl Link {
                 Err(e) => eprintln!("harness-native: set-model {id} ({what}): {e}"),
             }
             let _ = poke.send(());
+        });
+    }
+
+    /// The answers about chips' targets so far ([`Peeks`]).
+    pub fn peeks(&self) -> std::sync::MutexGuard<'_, Peeks> {
+        self.peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Ask the daemon after `refs` (`github_status`, in batches of [`REFS_MAX`]; `fresh` past its cache), those not
+    /// already being asked. Each answer lands in [`Peeks::gh`]; a failed request lands as an item per ref whose error
+    /// names it and why, its state unknown.
+    pub fn github(&self, refs: Vec<GhRef>, fresh: bool) {
+        let refs: Vec<GhRef> = {
+            let mut p = self.peeks();
+            let new: Vec<GhRef> = refs.into_iter().filter(|r| !p.asking_gh.contains(r)).collect();
+            p.asking_gh.extend(new.iter().cloned());
+            new
+        };
+        if refs.is_empty() {
+            return;
+        }
+        let (peeks, wake) = (self.peeks.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            for batch in refs.chunks(REFS_MAX) {
+                let failed = |why: String| -> Vec<GhItem> {
+                    batch.iter().map(|r| GhItem::failed(r, format!("{}#{}: {why}", r.repo, r.n))).collect()
+                };
+                let items = match request(Request::GithubStatus { refs: batch.to_vec(), fresh }) {
+                    Ok(Ok(Reply::Github { items })) if items.len() == batch.len() => items,
+                    Ok(Ok(r)) => failed(format!("the daemon answered github_status with {r:?}")),
+                    Ok(Err(e)) => failed(e),
+                    Err(e) => failed(format!("no daemon: {e}")),
+                };
+                for it in items.iter().filter(|it| !it.error.is_empty()) {
+                    eprintln!("harness-native: github: {}", it.error);
+                }
+                let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (r, it) in batch.iter().zip(items) {
+                    p.asking_gh.remove(r);
+                    p.gh.insert(r.clone(), it);
+                }
+                p.rev += 1;
+                drop(p);
+                wake();
+            }
+        });
+    }
+
+    /// Ask the daemon for `url`'s card (`page_peek`) unless it is known or being asked; it lands in [`Peeks::pages`],
+    /// a failure as a card whose error names the URL.
+    pub fn page(&self, url: &str) {
+        {
+            let mut p = self.peeks();
+            if p.pages.contains_key(url) || !p.asking_pages.insert(url.to_owned()) {
+                return;
+            }
+        }
+        let (peeks, wake, url) = (self.peeks.clone(), self.wake.clone(), url.to_owned());
+        std::thread::spawn(move || {
+            let failed = |why: String| PageMeta { url: url.clone(), error: format!("{url}: {why}"), ..PageMeta::default() };
+            let page = match request(Request::PagePeek { url: url.clone() }) {
+                Ok(Ok(Reply::Page { page })) => page,
+                Ok(Ok(r)) => failed(format!("the daemon answered page_peek with {r:?}")),
+                Ok(Err(e)) => failed(e),
+                Err(e) => failed(format!("no daemon: {e}")),
+            };
+            if !page.error.is_empty() {
+                eprintln!("harness-native: page: {}", page.error);
+            }
+            let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.asking_pages.remove(&url);
+            p.pages.insert(url, page);
+            p.rev += 1;
+            drop(p);
+            wake();
         });
     }
 

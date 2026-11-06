@@ -1,0 +1,97 @@
+// A chip's hover card (src/app/chat/peek.rs): after the pointer rests on an inline component (a <PR>, an <Issue>, a
+// <Link>, a <Path>) for inline_peek_dwell seconds, a plate under it says what it points at; it goes when the pointer
+// leaves the chip and the plate both. The plate is a ui.Menu (the shared popover: an overlay placed against what it is
+// anchored to, flipped to fit, its lift and motion), anchored to a Placed node the host lays over the chip. Its lines
+// are a keyed list the host keeps (harness_native_ui_view::for_each_of), one prefab a kind of line; the host passes
+// words and which scene entity's Fill an ink is, never a colour or a size.
+@tree ChildOf
+hn {
+  // Where the plate opens against: a node the host lays over the chip's rectangle (Placed: layout keeps the Laid it is
+  // given), drawing nothing.
+  prefab ChatPeekAnchor : ui.Node {
+    Placed
+  }
+
+  // The plate: under the chip (above it when there is no room below), inline_peek_w wide, a column of lines.
+  prefab ChatPeek : ui.Menu {
+    Side: {edge: Bottom, dx: 0, dy: $menu_gap}
+    Transition: {kind: Grow, from: Top, scale: $menu_in_scale, fade: true}
+    Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fixed, value: $inline_peek_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
+  }
+
+  // The head: the thing's icon in its state's ink (the host copies the Fill of the component's state child,
+  // ui.inline.PR.merged), then its title, strong, wrapping.
+  prefab PeekHead : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: FirstBaseline, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Symbol {
+      AlignSelf: {align: Start}
+      Padding: {l: 0, r: 0, t: 2, b: 0}
+    }
+    title : ui.Words, Strong {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_peek_title, line: $line_peek_title, role: 0, bold: 1}
+    }
+  }
+
+  // Its state as GitHub shows it: a pill in the state's ink with its name (Open, Draft, Merged, Closed), then the head
+  // commit's checks, their mark in its ink and a word.
+  prefab PeekState : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    badge : ui.Row {
+      Shape: {radius: 100, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $inline_peek_badge_pad, r: $inline_peek_badge_pad, t: 1, b: 1}
+      label : ui.Line {
+        Fill: $tone_peek_badge_ink
+        TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 1}
+      }
+    }
+    mark : ui.Symbol {
+      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    }
+    checks : ui.Line, Muted {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+    }
+  }
+
+  // A quiet line: who opened it and how many lines it changes; a page's site; a file's path.
+  prefab PeekMeta : ui.Words, Muted {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+  }
+
+  // A description's first lines (a pull request's, a page's), in the body ink.
+  prefab PeekBody : ui.Words, Ink {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_body, line: $line_peek_body, role: 0, bold: 0}
+  }
+
+  // A file's first lines, in the code face.
+  prefab PeekCode : ui.Words, Ink {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
+  }
+
+  // A page's og:image (the daemon saves it as a file), cut to the plate's width and inline_peek_image_h, rounded.
+  prefab PeekImage : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $inline_peek_radius, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_image_h, min: 0, max: 0}}
+  }
+
+  // The seam for a live view of the page (an embedded browser, CEF): PageView names the URL; until a browser host
+  // renders it and sets `ready` (harness-native-ui-text-api PageView) the line is laid out at no height, and the card is
+  // the page's OpenGraph data above.
+  prefab PeekPage : ui.Node {
+    PageView: {url: "", key: 0, ready: false}
+    Clip
+    Shape: {radius: $inline_peek_radius, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  }
+}

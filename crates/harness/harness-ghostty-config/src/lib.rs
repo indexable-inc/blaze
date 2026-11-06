@@ -112,7 +112,8 @@ pub fn xterm_256(i: u8) -> Rgb {
 
 /// harness's built-in dark theme: what shows with no Ghostty config.
 pub const BUILTIN_FG: Rgb = [0xdc, 0xdc, 0xe0];
-pub const BUILTIN_BG: Rgb = [0x12, 0x12, 0x14];
+/// The blaze site's --bg (#101011), as the scene's tone_term_ground is.
+pub const BUILTIN_BG: Rgb = [0x10, 0x10, 0x11];
 pub const BUILTIN_ANSI: [Rgb; 16] = [
     [0x2a, 0x2a, 0x2e],
     [0xeb, 0x6b, 0x6b],

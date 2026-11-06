@@ -18,6 +18,11 @@ hn {
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
       }
     }
+    // A chip's hover card while the pointer rests on it (src/app/chat/peek.rs): the anchor laid over the chip and the
+    // card (scene/widgets/peek.flecs), out of the flow, over the transcript.
+    peek : ui.Node {
+      Overlay
+    }
     // The foot is opaque, in the page's own ground: the transcript ends at its top (thinning out under it), and nothing
     // drawn behind the pane shows around the composer.
     foot : ui.Column {
@@ -205,7 +210,8 @@ hn {
     }
   }
 
-  // A paragraph of the agent's words (inline markdown).
+  // A paragraph of the agent's words (inline markdown): the body ink, bold a semibold step in the strong ink, inline code
+  // in the code face in the site's coral on its faint plate.
   prefab ChatProse : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -213,42 +219,75 @@ hn {
     text : ui.Words {
       Fill: $tone_chat_ink
       MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light}
+        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
+        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light,
+        strong_dark: $tone_chat_strong.dark, strong_light: $tone_chat_strong.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
 
-  // Headings, by level.
+  // Headings, by level: semibold, a step up the scale each, in the strong ink; more room above than below, so each sits
+  // with what it heads.
   prefab ChatH1 : hn.ChatProse {
-    Padding: {l: 0, r: 0, t: 12, b: 4}
-    text : ui.Words { TextStyle: {size: $size_chat_h1, line: 26, role: 0, bold: 1} }
+    Padding: {l: 0, r: 0, t: $chat_h1_above, b: $chat_h1_below}
+    text : ui.Words {
+      Fill: $tone_chat_strong
+      TextStyle: {size: $size_chat_h1, line: $line_chat_h1, role: 0, bold: 1}
+    }
   }
   prefab ChatH2 : hn.ChatProse {
-    Padding: {l: 0, r: 0, t: 10, b: 2}
-    text : ui.Words { TextStyle: {size: $size_chat_h2, line: 23, role: 0, bold: 1} }
+    Padding: {l: 0, r: 0, t: $chat_h2_above, b: $chat_h2_below}
+    text : ui.Words {
+      Fill: $tone_chat_strong
+      TextStyle: {size: $size_chat_h2, line: $line_chat_h2, role: 0, bold: 1}
+    }
   }
   prefab ChatH3 : hn.ChatProse {
-    Padding: {l: 0, r: 0, t: 8, b: 2}
-    text : ui.Words { TextStyle: {size: $size_chat_h3, line: $line_chat, role: 0, bold: 1} }
+    Padding: {l: 0, r: 0, t: $chat_h3_above, b: $chat_h3_below}
+    text : ui.Words {
+      Fill: $tone_chat_strong
+      TextStyle: {size: $size_chat_h3, line: $line_chat_h3, role: 0, bold: 1}
+    }
   }
 
-  // A list item: its bullet or number in a fixed gutter, then its words; `indent` is its depth.
+  // A list item: its marker in a fixed gutter (a hanging indent: wrapped lines align with the words, not the marker),
+  // then its words; `indent` is its depth (src/app/chat.rs sets it, hn.Theme.chat_list_nest a level). The row aligns on
+  // the first baseline, so a small marker sits on the words' first line. Items are chat_item_gap apart.
   prefab ChatItem : ui.Row {
-    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Flex: {axis: Row, gap: 0, align: FirstBaseline, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 2, r: 0, t: 1, b: 3}
+    Padding: {l: $chat_list_inset, r: 0, t: $chat_item_half, b: $chat_item_half}
     indent : ui.Node {
+      AlignSelf: {align: Start}
       Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
-    mark : ui.Words, Muted {
-      Size: {w: {kind: Fixed, value: 22, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    // A bullet: small and faint.
+    mark : ui.Words {
+      Fill: $tone_chat_marker
+      Size: {w: {kind: Fixed, value: $chat_list_mark_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_chat_bullet, line: $line_chat, role: 0, bold: 0}
     }
     text : ui.Words {
       Fill: $tone_chat_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light}
+        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
+        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light,
+        strong_dark: $tone_chat_strong.dark, strong_light: $tone_chat_strong.light, chip_radius: $chat_code_radius}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+  // An ordered item: its number at the body's size in the muted ink, tabular figures (role 10) so a column of them lines up.
+  prefab ChatItemNumber : hn.ChatItem {
+    mark : ui.Words {
+      Fill: $tone_chat_muted
+      TextStyle: {size: $size_chat, line: $line_chat, role: 10, bold: 0}
+    }
+  }
+  // A task item: its box at the body's size in the muted ink.
+  prefab ChatItemTask : hn.ChatItem {
+    mark : ui.Words {
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -263,7 +302,8 @@ hn {
       Fill: $tone_chat_muted
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light}
+        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
+        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }

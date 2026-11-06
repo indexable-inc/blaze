@@ -59,6 +59,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
     ("scene/widgets/context_plate.flecs", include_str!("../scene/widgets/context_plate.flecs")),
     ("scene/widgets/context.flecs", include_str!("../scene/widgets/context.flecs")),
+    ("scene/widgets/peek.flecs", include_str!("../scene/widgets/peek.flecs")),
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/steps.flecs", include_str!("../scene/widgets/steps.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
@@ -200,6 +201,8 @@ pub struct App {
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
     genui: std::cell::RefCell<chat::GenLive>,
+    /// The live inline components' keys and the link's answers last written to the world (chat/peek.rs).
+    peek_live: std::cell::RefCell<chat::PeekLive>,
     /// The universal handlers' pointer, key and focus state (genui/common.rs).
     gen_prims: std::cell::RefCell<chat::GenPrims>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
@@ -373,10 +376,13 @@ fn scene_world() -> Result<World, String> {
             bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
         }
     });
-    match bad {
-        Some(err) => Err(err),
-        None => Ok(world),
+    if let Some(err) = bad {
+        return Err(err);
     }
+    // The inline components' labels and marks (`<PR repo=.. n={..}/>` shows `#n`), for the typesetter, which reads no
+    // world.
+    harness_native_render::inline::install(world.world_ref());
+    Ok(world)
 }
 
 impl App {
@@ -484,6 +490,7 @@ impl App {
             chats,
             chat: std::cell::RefCell::default(),
             genui: std::cell::RefCell::default(),
+            peek_live: std::cell::RefCell::default(),
             gen_prims: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
@@ -2452,7 +2459,9 @@ mod tests {
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatPickInk.rest", "hn.ChatPickInk.hot",
-            "hn.ChatContext", "hn.ChatSend", "hn.ChatSendReady", "hn.ChatStop",
+            "hn.ChatContext", "hn.ChatSend", "hn.ChatSendReady", "hn.ChatStop", "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
+            "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekHead", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
+            "hn.PeekImage", "hn.PeekPage",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
@@ -2473,7 +2482,11 @@ mod tests {
         for m in ["ui::inline", "hn::chat_status", "hn::tree"] {
             assert!(w.try_lookup(m).is_some_and(|e| e.has(module)), "{m} is not a module");
         }
-        for e in ["look", "unknown", "Path", "FileRef", "Symbol", "Link"] {
+        for e in [
+            "look", "unknown", "hover", "pressed", "underline", "live", "marks::success", "marks::failure", "marks::pending",
+            "Path", "FileRef", "Symbol", "Link", "PR::open", "PR::draft", "PR::merged", "PR::closed", "PR::unknown",
+            "Issue::open", "Issue::closed", "Issue::not_planned", "Issue::unknown",
+        ] {
             let path = format!("{}::{e}", harness_native_render::inline::MODULE);
             assert!(w.try_lookup(&path).is_some(), "the scene has no {path}");
         }

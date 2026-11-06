@@ -6,6 +6,9 @@ it as an inline component instead: the reader sees a chip with its icon, and a p
   (self-closing shows the last part of the path).
 - A symbol in code: <Symbol loc="/abs/path/file.rs" line={40}>Foo::bar</Symbol>.
 - A web page: <Link href="https://example.com/doc">the design doc</Link>.
+- A GitHub pull request or issue: <PR repo="indexable-inc/ix" n={7652} /> or <Issue repo="indexable-inc/ix" n={812} />.
+  Always name the repository as owner/name; the chip shows #7652 with its live state (open, draft, merged, closed)
+  and checks, and its title on hover. A bare #7652 stays plain words, so write the tag whenever you mean the PR.
 
-Props are string literals (loc="..."), or a number in braces for a line. Relative paths are from the session's
+Props are string literals (loc="..."), or a number in braces for a line or a PR or issue number. Relative paths are from the session's
 directory. Use them sparingly, for things worth opening; ordinary words stay words.

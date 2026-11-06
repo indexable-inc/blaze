@@ -15,6 +15,7 @@ include widgets/chat_status
 include widgets/chat
 include widgets/context_plate
 include widgets/context
+include widgets/peek
 include widgets/genui
 include widgets/steps
 include widgets/palette

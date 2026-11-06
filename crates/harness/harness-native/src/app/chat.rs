@@ -25,10 +25,12 @@ use std::sync::Arc;
 
 mod context;
 mod genui;
+mod peek;
 mod pick;
 mod steps;
 
 pub(super) use genui::Live as GenLive;
+pub(super) use peek::Live as PeekLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
 
 /// The text being written in a chat's input: its words, the caret and the selection's other end (byte offsets), and an
@@ -235,6 +237,8 @@ pub struct ChatState {
     /// Kept at the bottom on a spring while it sticks; the pane clock's time it was last stepped.
     follow: Follow,
     stepped: f64,
+    /// The chip under the pointer, its hover card, and the GitHub refs its words name (chat/peek.rs).
+    peek: peek::Peek,
 }
 
 /// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
@@ -302,6 +306,7 @@ impl Default for ChatState {
             row_born: HashMap::new(),
             follow: Follow::default(),
             stepped: 0.0,
+            peek: peek::Peek::default(),
         }
     }
 }
@@ -342,6 +347,9 @@ impl Row {
             Row::Heading(1, _) => "hn.ChatH1",
             Row::Heading(2, _) => "hn.ChatH2",
             Row::Heading(..) => "hn.ChatH3",
+            // A bullet small and faint, a number or a task's box at the words' size, muted.
+            Row::ListItem { mark, .. } if mark.ends_with('.') => "hn.ChatItemNumber",
+            Row::ListItem { mark, .. } if mark == "\u{2610}" || mark == "\u{2611}" => "hn.ChatItemTask",
             Row::ListItem { .. } => "hn.ChatItem",
             Row::Quote(_) => "hn.ChatQuote",
             Row::Code { .. } => "hn.ChatCode",
@@ -1187,6 +1195,8 @@ impl App {
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
         let focused =
             self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing();
+        // Its chips: the one under the pointer, its card, and the live state of the pull requests and issues it names.
+        self.fill_chat_peek(pv, st, t, &rows, focused);
         let ended = self.status_of(e) != "running";
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
@@ -2128,7 +2138,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
             text("mark", mark);
             text("text", s);
             if let Some(i) = row.part("indent") {
-                let want = *depth as f32 * 18.0;
+                let want = *depth as f32 * crate::look::width(row.entity().world(), "chat_list_nest");
                 let e = i.entity();
                 if e.try_cloned::<&Size>().is_none_or(|z| (z.w.value - want).abs() > 0.01) {
                     e.set(Size {
@@ -2526,6 +2536,14 @@ mod tests {
         assert_eq!(kinds, ["hn.ChatH1", "hn.ChatProse", "hn.ChatItem", "hn.ChatItem", "hn.ChatCode", "hn.ChatQuote"]);
         assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words* wrapped."));
         assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one more"));
+        // An ordered item and a task take their own markers' prefabs (a number and a box at the words' size).
+        let mut out = Vec::new();
+        blocks("1. first
+2. second
+- [ ] todo
+- [x] done", false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatItemNumber", "hn.ChatItemNumber", "hn.ChatItemTask", "hn.ChatItemTask"]);
     }
 
     /// A markdown table becomes one table row: typed cells, its alignment, numbers at the end; while it streams, its last

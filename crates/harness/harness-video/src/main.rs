@@ -108,6 +108,8 @@ impl Stage {
         harness_native_ui_input::install(w);
         harness_native_ui_motion::install(w);
         harness_native_ui_draw::install(w);
+        // The inline components' labels, for the typesetter (which reads no world).
+        harness_native_render::inline::install(w);
         let mut videos = Vec::new();
         world.new_query::<&Video>().each_entity(|e, v| videos.push((e.path(), *v)));
         let video = match videos.as_slice() {

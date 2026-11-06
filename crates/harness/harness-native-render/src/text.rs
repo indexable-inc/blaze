@@ -78,8 +78,9 @@ pub enum Face {
     CodeWeight(u16),
     /// Code's slant: a comment, the prose the program skips.
     CodeItalic,
-    /// Code amid prose (markdown's `` `code` ``): the words' own UI face on a chip (prose is never monospace; only a fenced
-    /// block is), untracked, with room for the chip either side of it ([`crate::markdown::chip_room`]).
+    /// Code amid prose (markdown's `` `code` ``): the code face on a chip (the one place prose is monospace, as the site
+    /// sets it), a step smaller than the words ([`INLINE_CODE_EM`]), untracked, with room for the chip either side of it
+    /// ([`crate::markdown::chip_room`]).
     InlineCode,
     /// An inline component's icon hole and label (`<Path loc="...">blaze</Path>`, [`crate::markdown::InlineTag`]): the UI
     /// face at medium weight, with room for its chip either side as inline code has.
@@ -90,6 +91,10 @@ pub enum Face {
     /// machine has none of that name.
     Named(&'static str),
 }
+
+/// Inline code's size against the words around it: the site's `code { font-size: 0.88em }` (site/styles/base.css), on
+/// top of the code face's own scale to the UI face.
+pub const INLINE_CODE_EM: f32 = 0.92;
 
 impl Face {
     fn is_code(self) -> bool {
@@ -818,7 +823,7 @@ impl Fonts {
             Face::Code => code_font(size * self.look.code_scale, 400, false),
             Face::CodeWeight(weight) => code_font(size * self.look.code_scale, weight, false),
             Face::CodeItalic => code_font(size * self.look.code_scale, 400, true),
-            Face::InlineCode => self.ui_font(size, false),
+            Face::InlineCode => code_font(size * self.look.code_scale * INLINE_CODE_EM, 400, false),
             Face::InlineRef => self.face_font(size, Face::Medium),
             Face::Heading(level) => self.ui_font(self.heading_size(level), true),
             Face::Named(name) => text_font(name, size).unwrap_or_else(|| self.ui_font(size, false)),
