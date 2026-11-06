@@ -35,6 +35,9 @@ fn main() {
         .file(&stubs)
         .include(&dir)
         .define("CEF_API_VERSION", API_VERSION)
+        // What CEF's own libcef_dll/CMakeLists.txt gives the wrapper target: the stubs include the test C API headers,
+        // which refuse any other translation unit.
+        .define("WRAPPING_CEF_SHARED", None)
         .define("NDEBUG", None)
         .flag("-fno-exceptions")
         .flag("-fno-rtti")

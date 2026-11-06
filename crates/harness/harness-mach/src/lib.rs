@@ -241,7 +241,8 @@ impl SendRight {
         }
         let names: Vec<u32> = ports.iter().map(|p| p.0).collect(); // alloc: at most MAX_PORTS names, once per message
         let mut buf = codec::encode(self.0, &names, body);
-        let size = buf.len() as u32;
+        // The size mach_msg takes is in bytes; the buffer is words.
+        let size = std::mem::size_of_val(buf.as_slice()) as u32;
         // SAFETY: buf is a whole message codec::encode laid out (header, body count, descriptors, bytes), 4-aligned.
         let kr = unsafe { mach_msg(buf.as_mut_ptr().cast(), MACH_SEND_MSG | MACH_SEND_TIMEOUT, size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) };
         match kr {

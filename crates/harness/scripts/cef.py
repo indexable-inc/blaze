@@ -53,13 +53,14 @@ SERVER = "https://cef-builds.spotifycdn.com/"
 FRAMEWORK = "Chromium Embedded Framework.framework"
 APP = "Harness Browser"
 BUNDLE_ID = "inc.indexable.harness.browser"
-# CEF's helper kinds on macOS: the suffix Chromium appends to the helper's name, and our bundle id's.
+# CEF's helper kinds on macOS: the suffix Chromium appends to the helper's name, and our bundle id's. No "(Alerts)"
+# helper: it exists only to post macOS notifications, which the host turns off (harness-browser/src/handlers.rs), and its
+# first launch makes macOS ask the person for notification permission. Anything that still asks for it fails to launch.
 HELPERS = (
     ("", ""),
     (" (GPU)", ".gpu"),
     (" (Renderer)", ".renderer"),
     (" (Plugin)", ".plugin"),
-    (" (Alerts)", ".alerts"),
 )
 
 
@@ -213,8 +214,9 @@ async def bundle(inp: Input) -> None:
     make_app(staging, APP, BUNDLE_ID, binary)
     frameworks = staging / "Contents/Frameworks"
     frameworks.mkdir()
-    # `cp -c` clones (APFS clonefile): the 300 MB framework costs no space and no copy time.
-    await run("clone framework", "cp", "-cR", str(dist / "Release" / FRAMEWORK), str(frameworks / FRAMEWORK))
+    # macOS's `/bin/cp -c` clones (APFS clonefile): the 300 MB framework costs no space and no copy time. Not `cp` from
+    # PATH: GNU coreutils (nix) has no `-c`.
+    await run("clone framework", "/bin/cp", "-cR", str(dist / "Release" / FRAMEWORK), str(frameworks / FRAMEWORK))
     helpers: list[Path] = []
     for suffix, ident in HELPERS:
         name = f"{APP} Helper{suffix}"

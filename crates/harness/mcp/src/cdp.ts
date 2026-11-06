@@ -429,7 +429,7 @@ export async function newPage(opts: { url?: string; keep?: boolean } = {}): Prom
   const page = new Page(v, String(v.info.view), v.info.target, v.info.url, v.info.title);
   try {
     await Promise.all([page.send("Page.enable"), page.send("Runtime.enable")]);
-    if (opts.url) await waitLoaded(page, 20_000);
+    if (opts.url) await waitLoaded(page, opts.url, 20_000);
   } catch (e) {
     if (!opts.keep) await page.close();
     throw e;
@@ -437,11 +437,15 @@ export async function newPage(opts: { url?: string; keep?: boolean } = {}): Prom
   return page;
 }
 
-/** Wait (at most `ms`) for a page opened at a url to finish loading; a page still loading then is returned as it is. */
-async function waitLoaded(page: Page, ms: number) {
+/** Wait (at most `ms`) for a page opened at a url to finish loading; a page still loading then is returned as it is.
+ *  A new view starts on about:blank, already `complete`, before its navigation commits: loaded means that document has
+ *  been replaced (by the page, a redirect or an error page) and the new one is complete. */
+async function waitLoaded(page: Page, url: string, ms: number) {
   const deadline = Date.now() + ms;
+  const blank = url === "about:blank";
   while (Date.now() < deadline) {
-    if (await page.evaluate(() => document.readyState === "complete").catch(() => false)) break;
+    const done = await page.evaluate((b) => document.readyState === "complete" && (b || location.href !== "about:blank"), blank).catch(() => false);
+    if (done) break;
     await Bun.sleep(100);
   }
   await page.refresh();

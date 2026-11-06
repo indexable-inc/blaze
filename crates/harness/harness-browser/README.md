@@ -44,10 +44,9 @@ Harness Browser.app/Contents/
   Frameworks/Harness Browser Helper (GPU).app           ... (GPU)
   Frameworks/Harness Browser Helper (Renderer).app      ... (Renderer)
   Frameworks/Harness Browser Helper (Plugin).app        ... (Plugin)
-  Frameworks/Harness Browser Helper (Alerts).app        ... (Alerts)
 ```
 
-  Each helper has its own Info.plist (`inc.indexable.harness.browser.helper[.gpu|.renderer|.plugin|.alerts]`), and every
+  Each helper has its own Info.plist (`inc.indexable.harness.browser.helper[.gpu|.renderer|.plugin]`), and every
   bundle is signed ad hoc, inside out (arm64 runs nothing unsigned). The daemon finds the bundle at `$HARNESS_BROWSER_APP`,
   else beside its own executable (`target/<profile>/Harness Browser.app`), and its error names both and `cef.py bundle`.
 
@@ -61,10 +60,14 @@ The **daemon** owns the browser: the daemon outlives the app, and agents use the
   `HARNESS_DAEMON_PID` and exits when that pid does (kqueue `EVFILT_PROC NOTE_EXIT`); the daemon kills it on shutdown.
 - `Harness Browser` (the host) is CEF's browser process, its main thread CEF's UI thread. Every page is an off-screen
   view: a windowless browser (Alloy style, `shared_texture_enabled`), its frames IOSurfaces from Chromium's GPU process.
-- The helpers are CEF's renderer, GPU, plugin and alert processes, the same binary: with `--type=` it initialises the
+- The helpers are CEF's renderer, GPU and plugin processes, the same binary: with `--type=` it initialises the
   macOS sandbox (`libcef_sandbox.dylib`'s `cef_sandbox_initialize`, before the framework is loaded), loads the framework
   from `../../..` and runs `cef_execute_process`. Renderers run sandboxed; `no_sandbox` is never set.
 - The **app** draws views and forwards input. It never runs Chromium.
+- **No notifications.** The browser process runs with `--disable-notifications` and the `SystemNotifications` and
+  `NativeNotifications` features off (handlers.rs), and the bundle has no `(Alerts)` helper: nothing reaches
+  UNUserNotificationCenter, so macOS never asks for notification permission. A page's `Notification.requestPermission()`
+  is denied.
 
 State is per daemon, `$HARNESS_HOME/browser/` (0700): `profile/` (CEF's `cache_path`, under `root_cache_path` = the
 directory: cookies, logins, history, Web Store extensions), `extensions/` (unpacked extensions, each loaded at start
@@ -151,7 +154,10 @@ So:
 ## Logged-in sessions and Gmail
 
 The profile starts empty: Dia's cookies are Dia's. Andrew signs in to Google once in the pane (the profile keeps the
-session; cookies are encrypted with the host's own Keychain item, "Harness Browser Safe Storage", asked once). Until then
+session). The host never touches the login Keychain: it runs with `--use-mock-keychain` (and os_crypt_async's
+`UseKeychainKeyProvider` off), because a Keychain item would make macOS ask for the person's Keychain password after
+every rebuild (a new ad hoc signature), with every navigation waiting on the answer. Chromium on macOS has no
+file-backed cookie key, so the key is the mock's fixed one, and the profile is protected by `browser/` being 0700. Until then
 `gmail.*` fails naming it: "Gmail is not signed in in the harness browser: open mail.google.com in the browser pane and
 sign in". Google may refuse sign-in in embedded browsers; if it does, that error says so and the explicit path is:
 

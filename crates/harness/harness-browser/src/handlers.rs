@@ -13,12 +13,24 @@ wrap_app! {
 
     impl App {
         fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
-            // Only the browser process (no --type) loads extensions; helpers get Chromium's own switches.
             let is_browser = process_type.is_none_or(|t| t.to_string().is_empty());
             let Some(cl) = command_line else { return };
+            // Never the login Keychain, in any process (the network service encrypts cookies too): Chromium's cookie
+            // key would be a "Harness Browser Safe Storage" item, and every rebuilt (re-signed) host makes macOS ask the
+            // person for their Keychain password, while cookie access, and so every navigation, waits on the answer.
+            // Chromium on macOS has no file-backed key (`--password-store` is Linux's), so the mock keychain: a fixed
+            // key, the profile protected by `$HARNESS_HOME/browser/` being 0700.
+            cl.append_switch(Some(&CefString::from("use-mock-keychain")));
+            // The rest is the browser process's (no --type); helpers get Chromium's own switches from it.
             if !is_browser {
                 return;
             }
+            // No notifications, ever: no Web Notification API for pages, and no macOS notification bridge (the
+            // SystemNotifications and NativeNotifications features route them to UNUserNotificationCenter, whose
+            // first use makes macOS ask the person for permission, once for the host and once for its Alerts helper).
+            cl.append_switch(Some(&CefString::from("disable-notifications")));
+            // UseKeychainKeyProvider: os_crypt_async's Keychain provider, kept off with the mock keychain above.
+            let mut off: Vec<&str> = vec!["SystemNotifications", "NativeNotifications", "UseKeychainKeyProvider"]; // alloc: once per process start
             let dirs = match crate::extensions::unpacked_dirs(&host::config().dir) {
                 Ok(d) => d,
                 Err(e) => {
@@ -27,27 +39,39 @@ wrap_app! {
                     std::process::exit(1);
                 }
             };
-            if dirs.is_empty() {
-                return;
-            }
-            let mut list = String::new();
-            for d in &dirs {
-                let Some(s) = d.to_str() else {
-                    println!("harness-browser failed: the unpacked extension directory {} is not UTF-8", d.display());
-                    std::process::exit(1);
-                };
-                if s.contains(',') {
-                    println!("harness-browser failed: the unpacked extension directory {s} has a comma, which --load-extension cannot carry");
-                    std::process::exit(1);
+            if !dirs.is_empty() {
+                let mut list = String::new();
+                for d in &dirs {
+                    let Some(s) = d.to_str() else {
+                        println!("harness-browser failed: the unpacked extension directory {} is not UTF-8", d.display());
+                        std::process::exit(1);
+                    };
+                    if s.contains(',') {
+                        println!("harness-browser failed: the unpacked extension directory {s} has a comma, which --load-extension cannot carry");
+                        std::process::exit(1);
+                    }
+                    if !list.is_empty() {
+                        list.push(',');
+                    }
+                    list.push_str(s);
                 }
-                if !list.is_empty() {
-                    list.push(',');
-                }
-                list.push_str(s);
+                cl.append_switch_with_value(Some(&CefString::from("load-extension")), Some(&CefString::from(list.as_str())));
+                // Chromium 137+ ignores --load-extension unless this feature is off.
+                off.push("DisableLoadExtensionCommandLineSwitch");
             }
-            cl.append_switch_with_value(Some(&CefString::from("load-extension")), Some(&CefString::from(list.as_str())));
-            // Chromium 137+ ignores --load-extension unless this feature is off.
-            cl.append_switch_with_value(Some(&CefString::from("disable-features")), Some(&CefString::from("DisableLoadExtensionCommandLineSwitch")));
+            // Chromium reads one --disable-features: keep what is there (CEF's or the caller's) and add ours to it.
+            let name = CefString::from("disable-features");
+            let had = CefString::from(&cl.switch_value(Some(&name))).to_string();
+            let mut value = had.clone();
+            for f in off {
+                if !value.split(',').any(|x| x == f) {
+                    if !value.is_empty() {
+                        value.push(',');
+                    }
+                    value.push_str(f);
+                }
+            }
+            cl.append_switch_with_value(Some(&name), Some(&CefString::from(value.as_str())));
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {

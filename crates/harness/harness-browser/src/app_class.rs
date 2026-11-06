@@ -1,10 +1,13 @@
-//! The NSApplication CEF needs on macOS: `NSApp` must be an instance of a class that conforms to `CefAppProtocol`
-//! (`CrAppControlProtocol` and `CrAppProtocol`: `isHandlingSendEvent` / `setHandlingSendEvent:`, kept true while
+//! The NSApplication CEF needs on macOS: `NSApp` must be an instance of a class that conforms to
+//! `CrAppControlProtocol` and `CrAppProtocol` (`isHandlingSendEvent` / `setHandlingSendEvent:`, kept true while
 //! `sendEvent:` runs) before `cef_initialize`, or Chromium's message pump refuses it. cefclient defines it in Objective-C;
 //! here it is one class registered at run time with objc2's `ClassBuilder` (no AppKit bindings needed), made the shared
 //! application before anything else touches `NSApp`.
 //!
 //! The protocols are the framework's (it references them, so they exist once it is loaded): install after loading it.
+//! `CefAppProtocol` itself is not among them: cef_application_mac.h declares it, but only a client compiled against
+//! that header registers it, and the framework never asks for it (its binary names `CrAppProtocol` and
+//! `CrAppControlProtocol` only; Chromium's pump checks `CrAppProtocol`). So the class conforms to those two.
 use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, Sel};
 use objc2::{msg_send, sel};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +48,7 @@ pub fn install() -> Result<(), String> {
         b.add_method(sel!(setHandlingSendEvent:), set_handling as extern "C-unwind" fn(_, _, _));
         b.add_method(sel!(sendEvent:), send_event as extern "C-unwind" fn(_, _, _));
     }
-    for name in [c"CrAppProtocol", c"CrAppControlProtocol", c"CefAppProtocol"] {
+    for name in [c"CrAppProtocol", c"CrAppControlProtocol"] {
         let p = AnyProtocol::get(name).ok_or_else(|| {
             format!("the Objective-C protocol {} is not registered: the Chromium Embedded Framework must be loaded before app_class::install", name.to_string_lossy())
         })?;
