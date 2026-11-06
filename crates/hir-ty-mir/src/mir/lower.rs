@@ -320,7 +320,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     assigned_from: MirSpan,
     /// Whether each type asked about is `Copy`. Every statement that may panic asks of every
     /// local in scope, which in a long body is the most of lowering it.
-    copy: FrameMap<'f, Ty<'db>, bool>,
+    copy: blaze_hash::HashMap<Ty<'db>, bool, &'f Frame>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
     /// Buffers reused across statements, each taken out while it is in use and put back.
@@ -515,7 +515,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             deref_temps: framed::map_in(frame),
             assigned: Vec::new_in(frame),
             assigned_from: MirSpan::Unknown,
-            copy: framed::map_in(frame),
+            copy: blaze_hash::HashMap::new_in(frame),
             env,
             infcx,
             order_buf: Vec::new_in(frame),
@@ -584,7 +584,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     /// `mark_moves` asks for.
     fn finish(
         mut self,
-    ) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, FrameMap<'f, Ty<'db>, bool>) {
+    ) -> (
+        MirBody<'db>,
+        InferCtxt<'db>,
+        ParamEnv<'db>,
+        blaze_hash::HashMap<Ty<'db>, bool, &'f Frame>,
+    ) {
         let Building {
             blocks,
             locals,
