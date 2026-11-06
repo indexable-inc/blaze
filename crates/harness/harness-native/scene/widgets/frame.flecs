@@ -101,11 +101,11 @@ hn {
   // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
   // bottom edges (the window's corners round it). Nothing sits over its top (no title); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
-  // a split is a second node. Its panes lay out at the width it rests at (LaysAtRest: the sidebar's clip says where its fold
-  // goes, src/app.rs lay_chrome), so through a cmd+S fold the plate follows the spring while the panes keep one width: a
-  // terminal resizes once, words wrap once.
+  // a split is a second node. Through a cmd+S fold the plate and its panes follow the spring; what each pane shows lays
+  // out at one width per fold (LaysAtRest on the node that places it: the sidebar's clip says which width, src/app.rs
+  // lay_chrome), so a terminal resizes once and words wrap once, and it stays placed by that node's alignment in the
+  // moving frame (a terminal rides its pane's leading edge, the chat's column stays centred).
   prefab Main : ui.Row, Plate {
-    LaysAtRest
     Fill: $tone_term_ground
     Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
     Shape: {radius: 0, n: 4, border: 0, feather: 0}
@@ -134,6 +134,7 @@ hn {
 
   // A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane.
   prefab TermPane : hn.Pane {
+    LaysAtRest
     term : hn.Terminal {}
   }
 
@@ -155,6 +156,7 @@ hn {
   // A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
   // they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
   prefab RunPane : hn.Pane {
+    LaysAtRest
     info : ui.Column {
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
