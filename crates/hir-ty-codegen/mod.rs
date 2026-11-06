@@ -3411,36 +3411,53 @@ impl<'db> Relocations<'_, 'db> {
         matches!(self.map, MemoryMap::Complex(_))
     }
 
-    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number.
+    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number. The ranges
+    /// of one memory are kept sorted, disjoint and merged where they touch, so a table of N
+    /// numbers is one range and [`Self::is_number`] is a binary search: a linear scan per word
+    /// made a constant's check quadratic (`half`'s conversion tables held a build 18 minutes).
+    /// A walk goes through a memory in ascending order, so the insert is almost always a push
+    /// or a merge with the last range.
     fn number(&mut self, kept: Option<usize>, start: usize, size: usize) {
-        if size > 0 {
-            // alloc: the numbers of one allocation, for its walk
-            self.numbers.entry(kept).or_insert_with(Vec::new).push((start, start + size));
+        if size == 0 {
+            return;
         }
+        // alloc: the numbers of one allocation, for its walk
+        add_number_range(self.numbers.entry(kept).or_insert_with(Vec::new), start, start + size);
     }
 
     /// Whether a type says every byte of the `word` at `at` of the memory at `kept` is a
-    /// number.
+    /// number: one merged range holds all of them.
     fn is_number(&self, kept: Option<usize>, at: usize, word: usize) -> bool {
-        let Some(ranges) = self.numbers.get(&kept) else { return false };
-        let mut pos = at;
-        // Each step moves `pos` to the end of a range that holds it, so at most one a range.
-        for _ in 0..=ranges.len() {
-            if pos >= at + word {
-                return true;
-            }
-            match ranges.iter().find(|&&(start, end)| start <= pos && pos < end) {
-                Some(&(_, end)) => pos = end,
-                None => return false,
-            }
-        }
-        pos >= at + word
+        self.numbers.get(&kept).is_some_and(|ranges| numbers_cover(ranges, at, at + word))
     }
 
     /// The union the byte at `at` of the memory at `kept` is in, if a walk went through one.
     fn union_at(&self, kept: Option<usize>, at: usize) -> Option<Ty<'db>> {
         (self.unions.iter()).find(|it| it.0 == kept && it.1 <= at && at < it.2).map(|it| it.3)
     }
+}
+
+/// Adds `lo..hi` to `ranges`, kept sorted, disjoint and merged where two touch, so a run of
+/// number bytes is one range. A walk goes through a memory in ascending order, so this is almost
+/// always a push or a merge with the last range.
+fn add_number_range(ranges: &mut Vec<(usize, usize)>, mut lo: usize, mut hi: usize) {
+    // The first range that ends at or after `lo`: it touches or follows the new one.
+    let first = ranges.partition_point(|&(_, end)| end < lo);
+    // Every range from `first` that starts at or before `hi` touches it: merged into one.
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= hi {
+        lo = lo.min(ranges[last].0);
+        hi = hi.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(lo, hi)]);
+}
+
+/// Whether `ranges` (as [`add_number_range`] keeps them) hold every byte of `lo..hi`: merged
+/// ranges never touch, so the run is in exactly one, the last starting at or before `lo`.
+fn numbers_cover(ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    let after = ranges.partition_point(|&(start, _)| start <= lo);
+    after > 0 && ranges[after - 1].1 >= hi
 }
 
 /// Whether a value of `ty` is a number, with no pointer in it.
@@ -16600,6 +16617,47 @@ type LaneValues = smallvec::SmallVec<[Value; 64]>;
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[cfg(test)]
+mod number_ranges {
+    use super::{add_number_range, numbers_cover};
+
+    /// The merged ranges answer as the byte set they stand for: every byte of `lo..hi` was
+    /// added. Ranges in a scrambled order, touching, overlapping and apart, against a byte
+    /// model; and a table of many numbers stays one range.
+    #[test]
+    fn number_ranges_answer_as_the_bytes_they_hold() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for _ in 0..200 {
+            let mut ranges = Vec::new();
+            let mut bytes = [false; 96];
+            for _ in 0..next(12) {
+                let lo = next(90);
+                let hi = lo + 1 + next(6);
+                add_number_range(&mut ranges, lo, hi);
+                bytes[lo..hi].iter_mut().for_each(|b| *b = true);
+            }
+            assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "sorted, apart: {ranges:?}");
+            for lo in 0..88 {
+                for word in [1, 4, 8] {
+                    let want = bytes[lo..lo + word].iter().all(|&b| b);
+                    assert_eq!(numbers_cover(&ranges, lo, lo + word), want, "{ranges:?} {lo} {word}");
+                }
+            }
+        }
+        let mut table = Vec::new();
+        for i in 0..65_536 {
+            add_number_range(&mut table, i * 4, i * 4 + 4);
+        }
+        assert_eq!(table, [(0, 65_536 * 4)]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
