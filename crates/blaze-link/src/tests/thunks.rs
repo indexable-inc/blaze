@@ -2,7 +2,8 @@
 //! 200 MiB function between them link, each `bl` landing on a thunk that jumps to its target,
 //! in a release image (direct calls) and a dev image with a jump table (calls to slot stubs,
 //! past the patch room too), and in an incremental link's new code; and a `bl` from a native
-//! object's `.init`, which ELF lays out after the code and its islands.
+//! object's `.init`, which ELF lays out after the code and its islands. A branch to a weak name
+//! nothing defines, 200 MiB into the code, takes no thunk: it lands on the next instruction.
 
 use blaze_codegen::{Arch, CompiledFunction, RelocKind, Relocation, Target};
 
@@ -216,5 +217,80 @@ fn a_bl_from_init_past_its_reach_goes_through_a_thunk() {
         let to = thunk(&linked, via);
         assert_eq!(linked.u32_at(to), MOV_42, "incremental {incremental}: `call_weak_fn`");
         assert!(to.abs_diff(init) > 1 << 27, "incremental {incremental}: out of a `bl`'s reach");
+    }
+}
+
+/// An AArch64 object whose `.text`, `far_code`, is 200 MiB of code ending in `bl hook; b hook`,
+/// `hook` being a weak name nothing defines: zstd's `ZSTD_trace_compress_begin` call, which C
+/// guards with a test of its address, past a branch's reach of address 0.
+fn far_weak_call() -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+    let text = b.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    let mut code = vec![0u8; 200 * MIB];
+    let end = code.len();
+    code[end - 8..end - 4].copy_from_slice(&[0, 0, 0, 0x94]);
+    code[end - 4..].copy_from_slice(&[0, 0, 0, 0x14]);
+    b.append_section_data(text, &code, 16);
+    // What `_start` calls, so the section is live.
+    b.add_symbol(Def {
+        name: b"far_code".to_vec(),
+        value: 0,
+        size: code.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let hook = b.add_symbol(Def {
+        name: b"hook".to_vec(),
+        value: 0,
+        size: 0,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Unknown,
+        weak: true,
+        section: SymbolSection::Undefined,
+        flags: SymbolFlags::None,
+    });
+    for (at, r_type) in [(end - 8, elf::R_AARCH64_CALL26), (end - 4, elf::R_AARCH64_JUMP26)] {
+        let flags = RelocationFlags::Elf { r_type };
+        b.add_relocation(text, Reloc { offset: at as u64, symbol: hook, addend: 0, flags })
+            .unwrap();
+    }
+    b.write().unwrap()
+}
+
+#[test]
+fn a_branch_to_an_undefined_weak_past_128_mib_lands_on_the_next_instruction() {
+    let object: std::sync::Arc<[u8]> = far_weak_call().into();
+    let start = caller(1, Target::Extern("far_code".into()));
+    for incremental in [false, true] {
+        let mut image = Image::new(name(TO), a64(incremental)).unwrap();
+        let mut disk = Disk::default();
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            natives: vec![Native {
+                id: id(61),
+                name: "zstd_compress.o",
+                bytes: &object,
+                kind: NativeKind::Object,
+                order: 0,
+            }],
+            ..Change::default()
+        };
+        disk.link(&mut image, change)
+            .unwrap_or_else(|it| panic!("incremental {incremental}: {it}"));
+        let linked = Linked::of(disk.file(TO));
+        let (text, size) = section_of(&linked, ".text");
+        // The object's code is the 200 MiB run ending at the last `bl`'s `b`.
+        let at = (0..size / 4)
+            .map(|it| text + size - 4 * (it + 1))
+            .find(|it| linked.u32_at(*it) == 0x1400_0001)
+            .unwrap_or_else(|| panic!("incremental {incremental}: no `b .+4` in the code"));
+        let call = at - 4;
+        let past = call > 1 << 27;
+        assert!(past, "incremental {incremental}: the `bl` at {call:#x} is in reach of 0");
+        assert_eq!(bl(&linked, call), at, "incremental {incremental}: `bl hook` steps past itself");
     }
 }

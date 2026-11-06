@@ -785,6 +785,10 @@ impl Reloc<'_> {
                         ),
                     ));
                 }
+                // A branch to a weak name nothing defines ([`thunk::weak_branch`]).
+                Value::Absolute(0) if piece.weak().binary_search(&fixup.target).is_ok() => {
+                    thunk::weak_branch(fixup.apply, p).unwrap_or(s)
+                }
                 _ => s,
             };
             if fixup.apply == Apply::Abs64 && slid {

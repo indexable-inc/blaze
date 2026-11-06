@@ -76,6 +76,18 @@ pub(crate) fn extends(apply: Apply) -> bool {
     matches!(apply, Apply::A64Call26 | Apply::A64Jump26)
 }
 
+/// Where an AArch64 branch at `p` to a weak name nothing defines goes, `None` for a fixup that
+/// is no AArch64 branch: the next instruction, as lld's (bfd writes a `nop` there instead), so
+/// a call C guards with a test of the function's address (zstd's `ZSTD_trace_compress_begin`)
+/// is linked as a step past it. Never address 0: a branch is relative, so in a PIE 0 is the
+/// image's base rather than null, and past 128 MiB of code it is out of reach, where no thunk
+/// helps (a thunk to 0 would jump to the base too).
+#[inline]
+pub(crate) fn weak_branch(apply: Apply, p: u64) -> Option<u64> {
+    matches!(apply, Apply::A64Call26 | Apply::A64Jump26 | Apply::A64CondBr19 | Apply::A64TstBr14)
+        .then(|| p.wrapping_add(4))
+}
+
 /// Whether a branch at `p` reaches `to` within `reach` either way.
 #[inline]
 pub(crate) fn reaches(p: u64, to: u64, reach: i64) -> bool {
