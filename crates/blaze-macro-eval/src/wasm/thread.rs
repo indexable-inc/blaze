@@ -30,9 +30,9 @@ use std::{
 };
 
 use base_db::Db;
-use blaze_graph::{sched::Event, wait};
+use blaze_graph::sched::Event;
 use blaze_lower::{SubRequest, SubResponse};
-use parking_lot::{Condvar, Mutex};
+use blaze_core::lock::{Lock, Signal};
 use span::{Edition, SyntaxContext};
 
 use crate::{guest::Stop, server::Answer};
@@ -40,9 +40,6 @@ use crate::{guest::Stop, server::Answer};
 /// An expansion thread's stack: past Wasmtime's 4 MiB for wasm (`engine.rs`), with the host's
 /// shims and the server under it.
 const STACK: usize = 16 << 20;
-
-/// What [`run`]'s board is locked as, said when another holds it.
-const BOARD: &str = "a wasm expansion's link";
 
 enum Question {
     Span(SubRequest),
@@ -68,27 +65,27 @@ struct Board<T> {
 
 /// One expansion's two sides. The expansion thread asks through it as its [`Answer`].
 pub(crate) struct Link<T> {
-    board: Mutex<Board<T>>,
-    replied: Condvar,
+    board: Lock<Board<T>>,
+    replied: Signal,
 }
 
 impl<T> Link<T> {
     fn new() -> Link<T> {
         Link {
-            board: Mutex::new(Board {
+            board: Lock::new("macro.thread.board", Board {
                 question: None,
                 reply: None,
                 done: None,
                 gone: false,
                 wake: None,
             }),
-            replied: Condvar::new(),
+            replied: Signal::new("macro.thread.replied"),
         }
     }
 
     /// Posts on the board, ending the job's wait.
     fn post(&self, post: impl FnOnce(&mut Board<T>)) {
-        let mut board = wait::lock(&self.board, BOARD);
+        let mut board = self.board.lock();
         post(&mut board);
         let wake = board.wake.take();
         drop(board);
@@ -100,10 +97,8 @@ impl<T> Link<T> {
     /// The job's reply to `question`, the expansion thread blocked until it comes.
     fn ask(&self, question: Question) -> Result<Reply, Stop> {
         self.post(|board| board.question = Some(question));
-        let board = wait::lock(&self.board, BOARD);
-        let mut board = wait::wait_until(&self.replied, board, "a wasm expansion's answer", |it| {
-            it.reply.is_some() || it.gone
-        });
+        let mut board = self.board.lock();
+        self.replied.wait_while(&mut board, |it| it.reply.is_none() && !it.gone);
         board.reply.take().ok_or_else(|| {
             Stop("asked the database of a span after the job that ran it was gone".to_owned()) // alloc: error path
         })
@@ -133,7 +128,7 @@ struct Gone<'l, T>(&'l Link<T>);
 
 impl<T> Drop for Gone<'_, T> {
     fn drop(&mut self) {
-        wait::lock(&self.0.board, BOARD).gone = true;
+        self.0.board.lock().gone = true;
         self.0.replied.notify_all();
     }
 }
@@ -170,7 +165,7 @@ pub(crate) fn run<T: Send + 'static>(
     )?;
     let _gone = Gone(&link);
     loop {
-        let mut board = wait::lock(&link.board, BOARD);
+        let mut board = link.board.lock();
         if let Some(done) = board.done.take() {
             return done;
         }
@@ -182,7 +177,7 @@ pub(crate) fn run<T: Send + 'static>(
                 Question::Edition(ctx) => Reply::Edition(db.edition(ctx)?),
             };
             drop(answering);
-            wait::lock(&link.board, BOARD).reply = Some(reply);
+            link.board.lock().reply = Some(reply);
             link.replied.notify_all();
             continue;
         }
@@ -212,10 +207,8 @@ struct Threads {
     started: usize,
 }
 
-static THREADS: Mutex<Threads> =
-    Mutex::new(Threads { idle: Vec::new(), queued: VecDeque::new(), started: 0 }); // alloc: none: empty in a const
-
-const THREADS_NAME: &str = "the wasm expansion threads";
+static THREADS: Lock<Threads> =
+    Lock::new("macro.thread.pool", Threads { idle: Vec::new(), queued: VecDeque::new(), started: 0 }); // alloc: none: empty in a const
 
 /// The expansion threads alive now, idle ones included: the proc-macro lane's width the build
 /// view shows (`proc macros 3 of 32 expanding`).
@@ -299,7 +292,7 @@ impl Drop for Answering {
 /// its expansion. A nested one past the ceiling is refused, naming the counts.
 fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
     let cap = cap();
-    let mut threads = wait::lock(&THREADS, THREADS_NAME);
+    let mut threads = THREADS.lock();
     while let Some(idle) = threads.idle.pop() {
         match idle.send(job) {
             Ok(()) => return Ok(()),
@@ -330,7 +323,7 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
     let (jobs, taken) = mpsc::channel::<Job>();
     let mine = jobs.clone();
     if jobs.send(job).is_err() {
-        wait::lock(&THREADS, THREADS_NAME).started -= 1;
+        THREADS.lock().started -= 1;
         return Err(Stop("could not hand its expansion to a new thread".to_owned())); // alloc: error path
     }
     let spawned = thread::Builder::new()
@@ -341,7 +334,7 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
                     job();
-                    let mut threads = wait::lock(&THREADS, THREADS_NAME);
+                    let mut threads = THREADS.lock();
                     if threads.started > cap {
                         // Started past the cap for a nested expansion: it ends with it.
                         threads.started -= 1;
@@ -356,7 +349,7 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
             }
         });
     spawned.map(drop).map_err(|error| {
-        wait::lock(&THREADS, THREADS_NAME).started -= 1;
+        THREADS.lock().started -= 1;
         // alloc: error path
         Stop(format!("could not start a thread to run its wasm module on: {error}"))
     })
@@ -372,23 +365,34 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use parking_lot::{Condvar, Mutex};
+    use blaze_core::lock::{Lock, Signal};
 
     use super::{cap, ceiling, submit};
 
     /// Held by each test: they share the process's expansion threads, and one holding the
     /// ceiling would refuse another's nested expansion.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    static SERIAL: Lock<()> = Lock::new("macro.thread.test.serial", ());
 
     /// A gate the test's expansions wait at until it opens, and how many of them run now, ran
     /// at most at once, and are done.
-    #[derive(Default)]
     struct Gate {
-        open: Mutex<bool>,
-        opened: Condvar,
+        open: Lock<bool>,
+        opened: Signal,
         running: AtomicUsize,
         most: AtomicUsize,
         done: AtomicUsize,
+    }
+
+    impl Default for Gate {
+        fn default() -> Gate {
+            Gate {
+                open: Lock::new("macro.thread.test.gate", false),
+                opened: Signal::new("macro.thread.test.opened"),
+                running: AtomicUsize::new(0),
+                most: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+            }
+        }
     }
 
     impl Gate {
@@ -399,7 +403,7 @@ mod tests {
                 gate.most.fetch_max(now, Ordering::AcqRel);
                 let mut open = gate.open.lock();
                 let deadline = Instant::now() + Duration::from_secs(60);
-                while !*open && !gate.opened.wait_until(&mut open, deadline).timed_out() {}
+                while !*open && !gate.opened.wait_until(&mut open, deadline) {}
                 drop(open);
                 gate.running.fetch_sub(1, Ordering::AcqRel);
                 gate.done.fetch_add(1, Ordering::AcqRel);

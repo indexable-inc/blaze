@@ -104,7 +104,7 @@ pub struct Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> {
     queue: Queue,
     started: AtomicBool,
     #[cfg(test)]
-    ran: parking_lot::Mutex<Vec<Ran>>,
+    ran: blaze_core::lock::Lock<Vec<Ran>>,
 }
 
 impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
@@ -158,7 +158,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             queue,
             started: AtomicBool::new(false),
             #[cfg(test)]
-            ran: parking_lot::Mutex::new(Vec::new()),
+            ran: blaze_core::lock::Lock::new("test.hir.check.ran", Vec::new()),
         }
     }
 

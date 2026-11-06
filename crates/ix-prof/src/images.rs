@@ -16,7 +16,7 @@
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 /// An image loaded in this process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,8 +72,8 @@ pub fn boot() -> Option<&'static str> {
 /// is not the image loaded (its build id differs: replaced since).
 pub fn blake3(image: &Image) -> Result<String, String> {
     // alloc: once a process
-    static HASHED: Mutex<BTreeMap<(u64, String), Result<String, String>>> =
-        Mutex::new(BTreeMap::new());
+    static HASHED: Lock<BTreeMap<(u64, String), Result<String, String>>> =
+        Lock::new("ixprof.images.hashed", BTreeMap::new());
     let key = (image.base, image.path.clone());
     if let Some(it) = HASHED.lock().get(&key) {
         return it.clone();

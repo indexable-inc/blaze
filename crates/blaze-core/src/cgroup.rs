@@ -27,7 +27,7 @@ use std::{
 
 use blaze_mem::scratch;
 use crossbeam_queue::ArrayQueue;
-use parking_lot::Mutex;
+use crate::lock::Lock;
 
 use crate::wait::{Clock as _, Deadline};
 
@@ -40,7 +40,7 @@ static KERNEL_CHECKED: AtomicBool = AtomicBool::new(false);
 static PARENT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Held while [`PARENT`] is readied, so that one thread readies it.
-static READYING: Mutex<()> = Mutex::new(());
+static READYING: Lock<()> = Lock::new("core.cgroup.readying", ());
 
 /// The paths of cgroups that ended, each taken by one made after: a spawn's cgroup allocates
 /// nothing once as many have ended as run at once.

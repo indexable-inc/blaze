@@ -311,8 +311,8 @@ fn in_chunks<E: Send>(
     if n <= 1 {
         return check(0..total);
     }
-    #[allow(clippy::disallowed_types, reason = "taken only by a chunk that failed, an error path")]
-    let failed = parking_lot::Mutex::new(None::<(usize, E)>);
+    #[expect(clippy::disallowed_types, reason = "taken only by a chunk that failed, an error path")]
+    let failed = blaze_core::lock::Lock::new("intern.table.check_failed", None::<(usize, E)>);
     jobs(n, &|job| {
         if let Err(error) = check(job * chunk..((job + 1) * chunk).min(total)) {
             let mut failed = failed.lock();

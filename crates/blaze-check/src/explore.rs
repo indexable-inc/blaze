@@ -4,7 +4,6 @@
 
 use std::{any::Any, env, rc::Rc, str::FromStr};
 
-use parking_lot::Mutex;
 
 use crate::{
     clock::MAX_THREADS,
@@ -45,7 +44,11 @@ pub struct Builder {
 /// One model at a time in a process: a shim names its object in the running execution by
 /// storing that execution's epoch in itself, so two models on two OS threads (libtest's default)
 /// touching one `static` would keep renaming it under each other.
-static MODELS: Mutex<()> = Mutex::new(());
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the one-model-at-a-time lock of a test process"
+)]
+static MODELS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 impl Default for Builder {
     fn default() -> Builder {

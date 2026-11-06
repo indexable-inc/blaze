@@ -15,15 +15,23 @@ use blaze_resolve::{
     DepKind, Dependency, IndexSummary, MemRegistry, PackageId, QueryKind, Registry, SourceId,
     block_on,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 
-#[derive(Default)]
 struct Server {
-    files: Mutex<HashMap<String, Vec<u8>, Global>>,
-    asked: Mutex<Vec<String>>,
+    files: Lock<HashMap<String, Vec<u8>, Global>>,
+    asked: Lock<Vec<String>>,
+}
+
+impl Default for Server {
+    fn default() -> Server {
+        Server {
+            files: Lock::new("registry.test.query.files", HashMap::new_in(Global)),
+            asked: Lock::new("registry.test.query.asked", Vec::new()),
+        }
+    }
 }
 
 impl Server {

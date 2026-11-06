@@ -11,9 +11,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use super::{Answer, FactRef, Refusal, record};
@@ -33,8 +33,13 @@ pub(super) struct Pending {
 }
 
 #[repr(align(128))]
-#[derive(Default)]
-struct Padded(Mutex<Shard>);
+struct Padded(Lock<Shard>);
+
+impl Default for Padded {
+    fn default() -> Padded {
+        Padded(Lock::new("ty.goal_store.pending.shard", Shard::default()))
+    }
+}
 
 #[derive(Default)]
 struct Shard {
@@ -67,7 +72,7 @@ impl Pending {
         Pending { shards: (0..SHARDS).map(|_| Padded::default()).collect() }
     }
 
-    fn shard(&self) -> parking_lot::MutexGuard<'_, Shard> {
+    fn shard(&self) -> LockGuard<'_, Shard> {
         let at = SHARD.with(|at| *at);
         self.shards[at].0.lock()
     }

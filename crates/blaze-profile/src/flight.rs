@@ -40,7 +40,7 @@ use std::{
 };
 
 use blaze_hash::{FixedHasher, HashMap, HashSet};
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 
 use crate::{
@@ -95,7 +95,7 @@ const ALLOCS_MAX: u64 = (1 << ALLOCS_BITS) - 1;
 const SHARE_SHIFT: u32 = 64 - cpu::SHARE_BITS;
 const BYTES_MAX: u64 = (1 << SHARE_SHIFT) - 1;
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
@@ -140,7 +140,7 @@ fn field_of(name: &str) -> u8 {
 /// The callsites recorded, open-addressed by the address of their metadata: written under
 /// [`TAKEN`] as a callsite registers, read with no lock by every span.
 static SITES: [OnceLock<Site>; SLOTS] = [const { OnceLock::new() }; SLOTS];
-static TAKEN: Mutex<usize> = Mutex::new(0);
+static TAKEN: Lock<usize> = Lock::unrecorded("profile.flight.taken", 0);
 
 fn home(meta: &tracing::Metadata<'_>) -> usize {
     let address = std::ptr::from_ref(meta).addr() as u64;
@@ -224,8 +224,8 @@ const _: () = assert!(FOREIGN_FROM + FOREIGN_MAX <= u16::MAX as usize, "a foreig
 static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; FOREIGN_MAX];
 /// The [`FOREIGN`] slots of each hash of a text ([`foreign_key`]), and how many are taken.
 // alloc: none until a postmortem names a site; grows to the distinct sites of dead processes
-static FOREIGN_BY_TEXT: Mutex<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
-    Mutex::new((0, None));
+static FOREIGN_BY_TEXT: Lock<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
+    Lock::unrecorded("profile.flight.foreign_by_text", (0, None));
 
 fn foreign_key(name: &str, target: &str, level: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -327,7 +327,7 @@ impl Table {
 
 /// Names that live as long as the process: threads', and `&'static str`s
 /// ([`span::Name::kept`]). Logged for a postmortem as they are given.
-static KEPT: Mutex<Option<Table>> = Mutex::new(None);
+static KEPT: Lock<Option<Table>> = Lock::unrecorded("profile.flight.kept", None);
 /// Names past [`KEPT`]'s room: the index bits of a kept sym.
 const KEPT_MAX: usize = (1 << 30) - 1;
 
@@ -395,12 +395,28 @@ struct Reader {
     table: ReadTable,
 }
 
-static READER: Mutex<Option<Reader>> = Mutex::new(None);
+static READER: Lock<Option<Reader>> = Lock::unrecorded("profile.flight.reader", None);
 
-fn reader() -> parking_lot::MappedMutexGuard<'static, Reader> {
-    MutexGuard::map(lock(&READER), |it| {
-        it.get_or_insert_with(|| Reader { streams: names::Streams::default(), table: ReadTable::default() })
-    })
+/// The reader, made on first use, under [`READER`]'s lock.
+struct ReaderGuard(LockGuard<'static, Option<Reader>>);
+
+impl std::ops::Deref for ReaderGuard {
+    type Target = Reader;
+    fn deref(&self) -> &Reader {
+        self.0.as_ref().expect("`reader` made it")
+    }
+}
+
+impl std::ops::DerefMut for ReaderGuard {
+    fn deref_mut(&mut self) -> &mut Reader {
+        self.0.as_mut().expect("`reader` made it")
+    }
+}
+
+fn reader() -> ReaderGuard {
+    let mut guard = lock(&READER);
+    guard.get_or_insert_with(|| Reader { streams: names::Streams::default(), table: ReadTable::default() });
+    ReaderGuard(guard)
 }
 
 /// The live rings, as the readers' [`names::Source`].
@@ -603,7 +619,7 @@ pub fn name_counts() -> NameCounts {
 
 /// Names of rows a postmortem read back from a process that died ([`postmortem`]), for as
 /// long as one postmortem writes them. `None` between postmortems.
-static RECOVERED: Mutex<Option<Table>> = Mutex::new(None);
+static RECOVERED: Lock<Option<Table>> = Lock::unrecorded("profile.flight.recovered", None);
 /// Names one postmortem may give: the index bits of a recovered sym.
 const RECOVERED_MAX: usize = (1 << 30) - 1;
 
@@ -993,7 +1009,7 @@ struct Parked {
 }
 
 // alloc: none here; grows to the most jobs parked at once, then is kept.
-static PARKED: Mutex<Parked> = Mutex::new(Parked { jobs: Vec::new(), free: Vec::new() });
+static PARKED: Lock<Parked> = Lock::unrecorded("profile.flight.parked", Parked { jobs: Vec::new(), free: Vec::new() });
 
 /// Moves the parking job's enter stack and build off this thread, leaving it inside no span and
 /// working for no build: the `take` of `blaze_graph::sched::fiber::carry` ([`crate::install`]
@@ -1294,8 +1310,18 @@ pub fn begun_creator() -> Option<u64> {
 /// creator ([`job_begins`]). Kept: a span a job names is written whole, never folded
 /// ([`fold_below`]).
 pub fn giving_span() -> u64 {
+    span_now()
+}
+
+/// The span this thread is inside now, 0 for none (and for one the recorder could not open).
+/// Kept: a span another row names (a job's creator, a lock wait's waiter or holder,
+/// [`crate::locks::Recorder`]) is written whole, never folded ([`fold_below`]).
+pub fn span_now() -> u64 {
     let Some(ring) = MINE.with(Cell::get) else { return 0 };
     let id = ring.innermost();
+    if id == UNRECORDED {
+        return 0;
+    }
     keep(id);
     id
 }
@@ -2447,9 +2473,9 @@ pub(crate) struct Ring {
     /// What takes longest on this ring's threads: its sketches ([`crate::hot`]), written as
     /// each span closes here.
     hot: Box<[AtomicU64]>,
-    owners: Mutex<Vec<Owner>>,
+    owners: Lock<Vec<Owner>>,
     /// What the sampler needs of the thread, under the lock the thread takes to leave.
-    pub(crate) sampled: Mutex<crate::sampler::Thread>,
+    pub(crate) sampled: Lock<crate::sampler::Thread>,
     /// What its thread was inside, moment by moment: the sampler's way from a sample's time
     /// to its span, job and fiber ([`Ring::context_at`]).
     context: ContextLog,
@@ -2507,8 +2533,8 @@ impl Ring {
             current: AtomicU64::new(0),
             hot: crate::hot::record::cells(),
             // alloc: once per thread, as it first records
-            owners: Mutex::new(Vec::new()),
-            sampled: Mutex::new(crate::sampler::Thread::default()),
+            owners: Lock::unrecorded("profile.flight.owners", Vec::new()),
+            sampled: Lock::unrecorded("profile.flight.sampled", crate::sampler::Thread::default()),
             context: ContextLog::new(),
             job: AtomicU64::new(0),
             fiber: AtomicU64::new(0),
@@ -2791,7 +2817,7 @@ fn slot_of(id: u64) -> usize {
 
 /// Every ring, in the order made: a ring's number is its place here plus one.
 // alloc: once a process
-static RINGS: Mutex<Vec<&'static Ring>> = Mutex::new(Vec::new());
+static RINGS: Lock<Vec<&'static Ring>> = Lock::unrecorded("profile.flight.rings", Vec::new());
 /// Every ring by its number, read with no lock by a span closed on another thread.
 static BY_NUMBER: [OnceLock<&'static Ring>; RINGS_MAX] = [const { OnceLock::new() }; RINGS_MAX];
 /// Spans made on threads past [`RINGS_MAX`] alive at once, so with no ring: not recorded.
@@ -2893,6 +2919,9 @@ fn claim() -> Option<&'static Ring> {
         drop(owners);
         ring.lease.fetch_add(1, Ordering::Relaxed);
         ring.current.store(u64::from(tid) << 32 | u64::from(name), Ordering::Release);
+        // The lock module's wait-for graph names the thread as its rows do, so a stall's threads
+        // are the profile's (`locks::Recorder::thread`).
+        blaze_core::lock::set_thread_mark(u64::from(tid));
         ring.depth.store(0, Ordering::Relaxed);
         // The thread before left its own stretch, ended by its last boundary.
         ring.top_since.store(0, Ordering::Relaxed);
@@ -5293,7 +5322,7 @@ mod tests {
     /// once the fast core frees, opens a span there, then waits for a job on the core it left.
     struct Carry {
         started: AtomicBool,
-        seen: Mutex<CarrySeen>,
+        seen: Lock<CarrySeen>,
     }
 
     enum CarryJob {
@@ -5369,7 +5398,7 @@ mod tests {
         static CARRY: OnceLock<Carry> = OnceLock::new();
         let work = CARRY.get_or_init(|| Carry {
             started: AtomicBool::new(false),
-            seen: Mutex::new(CarrySeen::default()),
+            seen: Lock::unrecorded("profile.test.flight.carry_seen", CarrySeen::default()),
         });
         let cores = Cores::classes(&[(1024, 1), (512, 1)]).unwrap();
         let config = fiber::Config { fibers: 4, stack: 256 << 10, spin: 64 };

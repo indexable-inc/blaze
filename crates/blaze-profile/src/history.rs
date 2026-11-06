@@ -102,7 +102,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -1725,8 +1725,13 @@ impl Drop for History {
 /// What the drain thread drained and the history has not flushed yet, and where it is in the
 /// rings: one reader, so the drain thread and a flush take turns under one lock, held for a
 /// read of the rings or a swap of the rows, never for a write.
-#[derive(Default)]
-struct Drained(Mutex<Draining>);
+struct Drained(Lock<Draining>);
+
+impl Default for Drained {
+    fn default() -> Drained {
+        Drained(Lock::new("profile.history.drained", Draining::default()))
+    }
+}
 
 #[derive(Default)]
 struct Draining {

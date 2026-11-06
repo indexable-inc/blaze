@@ -15,7 +15,6 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 crossbeam-queue.workspace = true
-parking_lot.workspace = true
 rustc_lexer.workspace = true
 
 # local deps

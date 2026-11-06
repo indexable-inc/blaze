@@ -21,7 +21,6 @@ blaze-serde.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
-parking_lot.workspace = true
 postcard.workspace = true
 blaze-query.workspace = true
 serde.workspace = true

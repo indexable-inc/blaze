@@ -35,7 +35,7 @@ fn span(name: &str, for_ms: u64) -> Span {
 }
 
 fn look<'a>(threads: &'a [Worker], downloads: &'a [Download], memory: &'a Memory) -> Look<'a> {
-    Look { workers: 16, threads, downloads, stage: "", memory, expanders: &[], expansion_threads: 0 }
+    Look { workers: 16, threads, downloads, stage: "", stall: None, memory, expanders: &[], expansion_threads: 0 }
 }
 
 fn named(now: &Now) -> Vec<&str> {
@@ -373,6 +373,10 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
         at_ms: 914_000,
         phase: Phase::Testing,
         stage: "waits for its pinned native inputs, 1 of 1 layouts left".into(),
+        stall: Some(
+            "convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is running"
+                .into(),
+        ),
         tally: Tally { waiting: 81, ready: 2, running: 1, done: 488, failed: 3, total: 575 },
         workers: 16,
         busy: vec![Busy {

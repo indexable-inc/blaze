@@ -53,7 +53,7 @@ use blaze_reclaim::{Guard, Limbo};
 use crate::{
     Mode,
     sync::{
-        Mutex,
+        Lock,
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
     },
 };
@@ -997,7 +997,7 @@ pub(crate) struct Shared {
     table: AtomicPtr<Table>,
     /// The tables replaced by collections, until no reader's task can be in them. Locked by
     /// the writer alone (readers never touch it), so never contended.
-    retired: Mutex<Limbo>,
+    retired: Lock<Limbo>,
 }
 
 impl Shared {
@@ -1053,7 +1053,8 @@ impl Writer {
     fn publish(table: Table) -> Writer {
         // alloc: once per store made, the first published table.
         let table = Box::into_raw(Box::new(table));
-        let shared = Shared { table: AtomicPtr::new(table), retired: Mutex::new(Limbo::new()) };
+        let retired = Lock::new("vfs.store.retired", Limbo::new());
+        let shared = Shared { table: AtomicPtr::new(table), retired };
         // alloc: once per store made, what readers share.
         Writer { shared: Arc::new(shared) }
     }

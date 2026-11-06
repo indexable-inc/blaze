@@ -66,6 +66,7 @@ mod lenient_deserialize;
 #[cfg(test)]
 mod lenient_deserialize_tests;
 mod lock_across_query;
+mod lock_held_across_slow;
 mod loops;
 mod missing_size_hint;
 mod native_contracts;
@@ -228,6 +229,7 @@ pub enum Lint {
     NativeContracts,
     ThreadLocalInWaitingFn,
     LenientDeserialize,
+    LockHeldAcrossSlow,
 }
 
 /// Which workspaces a lint is for.
@@ -389,6 +391,7 @@ impl Lint {
         Lint::NativeContracts,
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
+        Lint::LockHeldAcrossSlow,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -465,6 +468,7 @@ impl Lint {
             | Lint::HeldAcrossWait
             | Lint::ThreadLocalInWaitingFn
             | Lint::LockAcrossQuery
+            | Lint::LockHeldAcrossSlow
             | Lint::BlockingOnPool
             | Lint::UnnamedWait
             | Lint::SharedCollectionLock
@@ -586,6 +590,7 @@ impl Lint {
             Lint::NativeContracts => "native_contracts",
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
+            Lint::LockHeldAcrossSlow => "lock_held_across_slow",
         }
     }
 
@@ -677,6 +682,7 @@ impl Lint {
             Lint::NativeContracts => concat!(general_docs!(), "#native_contracts"),
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
+            Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/may-suspend/fiber-boundary.md"
             }
@@ -726,6 +732,9 @@ impl Lint {
             }
             Lint::LockAcrossQuery => {
                 "copy out what the query needs and drop the guard before the call, or make the locked state a query input"
+            }
+            Lint::LockHeldAcrossSlow => {
+                "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
             }
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
@@ -1027,6 +1036,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         held_across_wait::check(cx);
         thread_local_in_waiting_fn::check(cx);
         lock_across_query::check(cx);
+        lock_held_across_slow::check(cx);
         blocking_on_pool::check(cx);
         unnamed_wait::check(cx);
         shared_collection_lock::check(cx);

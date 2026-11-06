@@ -5,7 +5,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 use blaze_graph::wait::WaitKind;
 use blaze_hash::HashMap;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use super::{CountMin, Counters, DdSketch, PartRef, Quantile, Shared, record};
@@ -145,7 +145,7 @@ impl Summed {
 
 /// The sums at the ends of the last two builds: the one before the last (`None`: the process's
 /// start) and the last.
-static MARKS: Mutex<Option<(Option<Summed>, Summed)>> = Mutex::new(None);
+static MARKS: Lock<Option<(Option<Summed>, Summed)>> = Lock::new("profile.hot.marks", None);
 
 /// A build ended: what [`Since::LastBuild`] reads from now on ends here. Reads every ring once.
 pub(crate) fn mark() {

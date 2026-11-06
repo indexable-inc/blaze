@@ -18,8 +18,11 @@
 //!
 //! Targeted faults, each until a crash: [`Sim::fail_syncs`] (a disk gone bad),
 //! [`Sim::hold_syncs`] (a disk that stopped answering), [`Sim::slow_writes`],
-//! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], and [`Sim::fill`] (a disk
-//! out of room: what does not fit fails with ENOSPC, an append keeping the part that fits).
+//! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], [`Sim::fill`] (a disk
+//! out of room: what does not fit fails with ENOSPC, an append keeping the part that fits), and
+//! [`Sim::stall_holders`] (a lock holder descheduled or paging mid critical section: a test's
+//! holder runs its section through [`Sim::critical_section`], or [`Sim::hold_for`] when other
+//! actors step while it holds, and once in a while it stalls on the virtual clock).
 //!
 //! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
 //! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
@@ -345,6 +348,9 @@ pub struct Sim {
     /// The tags of each [`Effect::Pressure`] in flight, in the order asked: each is told of
     /// the memory pressure a test makes ([`Sim::press`]).
     pressures: Vec<Tag>,
+    /// A critical section stalls once in `.0` (never 0), for a drawn time up to `.1`
+    /// ([`Sim::stall_holders`]).
+    stall_holders: Option<(u32, Duration)>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -421,6 +427,7 @@ impl Sim {
             outside: HashMap::new_in(Global),
             // alloc: none until memory pressure is watched.
             pressures: Vec::new(),
+            stall_holders: None,
         }
     }
 
@@ -527,6 +534,7 @@ impl Sim {
         self.held_lists.clear();
         self.fail_lists = None;
         self.slow = None;
+        self.stall_holders = None;
         self.spawns.clear();
         self.watches.clear();
         self.ending = 0;
@@ -657,6 +665,40 @@ impl Sim {
     /// The syncs held so far ([`Sim::hold_syncs`]).
     pub fn held_syncs(&self) -> usize {
         self.held.len()
+    }
+
+    /// From now on, once in `one_in` critical sections ([`Sim::critical_section`],
+    /// [`Sim::hold_for`]), chosen by the seed, the holder stalls for a time drawn up to `most`
+    /// on top of its work, until a crash or a call with `one_in` 0: a lock holder descheduled,
+    /// paging or preempted by a signal handler while it holds the lock. For a test that a slow
+    /// holder never holds up what must not wait on it (a turn loop), and that its waiters say
+    /// who they waited behind.
+    pub fn stall_holders(&mut self, one_in: u32, most: Duration) {
+        self.stall_holders = (one_in > 0).then_some((one_in, most));
+    }
+
+    /// How long a lock holder's critical section of `work` takes, a stall drawn by
+    /// [`Sim::stall_holders`] included, without moving the clock: for a test that steps other
+    /// actors while the holder holds, and lets it go at the virtual time this returns past its
+    /// start. Draws from the seed only while stalls are on, so a test that never turns them on
+    /// sees the same numbers it did before.
+    pub fn hold_for(&mut self, work: Duration) -> Duration {
+        let Some((one_in, most)) = self.stall_holders else { return work };
+        if self.rng.below(u64::from(one_in)) != 0 {
+            return work;
+        }
+        let most = u64::try_from(most.as_nanos()).unwrap_or(u64::MAX);
+        let stall = Duration::from_nanos(self.rng.below(most.saturating_add(1)));
+        work.saturating_add(stall)
+    }
+
+    /// A lock holder's critical section of `work`, run now: the clock moves on by
+    /// [`Sim::hold_for`]`(work)` (a stall included, once in a while), which it returns. The
+    /// holder lets go after it, at the clock's new now.
+    pub fn critical_section(&mut self, work: Duration) -> Duration {
+        let took = self.hold_for(work);
+        self.advance(took);
+        took
     }
 
     /// The virtual clock moved on by `by`, with nothing done: time a test lets pass while

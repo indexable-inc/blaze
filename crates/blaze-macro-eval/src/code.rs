@@ -81,9 +81,14 @@ pub(crate) fn included(db: &Db, krate: Crate, out: &mut Vec<PathBuf>) {
 
 /// [`of`], kept for one revision of one database: an expansion asks for it every time, and the
 /// closure's files are hashed once a revision.
-#[derive(Default)]
 pub(crate) struct Memo {
-    last: parking_lot::Mutex<Option<((Nonce, blaze_query::db::View), ContentId)>>,
+    last: blaze_core::lock::Lock<Option<((Nonce, blaze_query::db::View), ContentId)>>,
+}
+
+impl Default for Memo {
+    fn default() -> Memo {
+        Memo { last: blaze_core::lock::Lock::new("macro.code.memo", None) }
+    }
 }
 
 impl Memo {

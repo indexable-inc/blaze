@@ -20,7 +20,7 @@ use std::{
 };
 
 use blaze_inproc_rt::live::{self, HOST_ARCH};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::{
     core::Symbolize,
@@ -94,7 +94,7 @@ struct Table {
     /// and length in `data`, by index into `starts`.
     rest: Vec<(u32, u32, u32)>,
     /// Demangled names by index into `starts`, made the first time each is asked for.
-    demangled: Mutex<BTreeMap<u32, Box<str>>>,
+    demangled: Lock<BTreeMap<u32, Box<str>>>,
 }
 
 impl Table {
@@ -157,7 +157,7 @@ impl Table {
             stubs,
             starts,
             rest,
-            demangled: Mutex::new(BTreeMap::new()),
+            demangled: Lock::new("ixprof.symbols.demangled", BTreeMap::new()),
         })
     }
 
@@ -617,9 +617,9 @@ fn static_dwarf_of(data: &'static [u8]) -> Option<addr2line::Context<StaticReade
 /// unit an address looked up falls in, kept for the process's life (bounded by the units samples
 /// land in). The [`Symbolizer`]'s reader ([`Table::dwarf`]) instead copies every section each
 /// time one is made, 1.4 GiB building blaze's own tree when blaze-profile made one a flush.
-fn own_dwarf() -> Option<&'static Mutex<addr2line::Context<StaticReader>>> {
-    static DWARF: OnceLock<Option<Mutex<addr2line::Context<StaticReader>>>> = OnceLock::new();
-    DWARF.get_or_init(|| own().and_then(Table::static_dwarf).map(Mutex::new)).as_ref()
+fn own_dwarf() -> Option<&'static Lock<addr2line::Context<StaticReader>>> {
+    static DWARF: OnceLock<Option<Lock<addr2line::Context<StaticReader>>>> = OnceLock::new();
+    DWARF.get_or_init(|| own().and_then(Table::static_dwarf).map(|it| Lock::new("ixprof.symbols.own_dwarf", it))).as_ref()
 }
 
 /// How [`functions`] names this executable's frames: `dwarf` (functions and the functions
@@ -927,7 +927,7 @@ mod tests {
             stubs: None,
             starts: vec![0x1000],
             rest: vec![(0, 0, 1)],
-            demangled: Mutex::new(BTreeMap::new()),
+            demangled: Lock::new("ixprof.symbols.demangled", BTreeMap::new()),
         };
         assert_eq!(table.name(0x1010, 0).as_deref(), Some("f+0x10"));
         assert_eq!(table.name(0x3010, 0), None, "an address of the next code section");

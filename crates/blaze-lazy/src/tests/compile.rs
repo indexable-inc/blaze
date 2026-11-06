@@ -10,7 +10,7 @@ use blaze_cas::{Key, Kind};
 use blaze_codegen::driver::Put;
 use blaze_codegen::{CompiledFunction, InstanceKey};
 use blaze_stencil::tier::Tier;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::hit::{pause, start, target_of};
 use super::{compiled, id, key};
@@ -20,7 +20,6 @@ use crate::wire::{self, ASK_KIND, FAILED_KIND, Frame, READY_KIND};
 
 /// A database and a lazy build over it: the next `stops` compiles are stopped by a write, each
 /// moving it one revision on.
-#[derive(Default)]
 struct Db {
     revision: AtomicU64,
     /// Readers held now.
@@ -36,10 +35,28 @@ struct Db {
     /// No reader can be had: the job's front end is gone.
     gone: bool,
     /// Each compile's key, tier and the revision its reader read.
-    compiles: Mutex<Vec<(InstanceKey, Option<Tier>, u64)>>,
-    kept: Mutex<Vec<Put>>,
+    compiles: Lock<Vec<(InstanceKey, Option<Tier>, u64)>>,
+    kept: Lock<Vec<Put>>,
     /// The memo hits whose template was kept.
-    hits_kept: Mutex<Vec<InstanceKey>>,
+    hits_kept: Lock<Vec<InstanceKey>>,
+}
+
+impl Default for Db {
+    fn default() -> Db {
+        Db {
+            revision: AtomicU64::new(0),
+            held: AtomicU32::new(0),
+            stops: AtomicU32::new(0),
+            moved: Vec::new(),
+            stored: Vec::new(),
+            memo: Vec::new(),
+            broken: Vec::new(),
+            gone: false,
+            compiles: Lock::new("lazy.test.db.compiles", Vec::new()),
+            kept: Lock::new("lazy.test.db.kept", Vec::new()),
+            hits_kept: Lock::new("lazy.test.db.hits_kept", Vec::new()),
+        }
+    }
 }
 
 struct Fake(Arc<Db>);

@@ -23,8 +23,8 @@ use hir_expand::proc_macro::{
     Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacrosBuilder,
 };
+use blaze_core::lock::Lock;
 use intern::Symbol;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use span::Edition;
 use std::alloc::Global;
@@ -131,7 +131,7 @@ struct Replay {
     name: String,
     expansions: Arc<Expansions>,
     /// Calls there was no expansion for.
-    missed: Arc<Mutex<Vec<Call>>>,
+    missed: Arc<Lock<Vec<Call>>>,
 }
 
 /// A call that panicked adds no miss: the misses kept are each whole.
@@ -185,7 +185,7 @@ pub struct Project {
     pub roots: Vec<SourceRoot>,
     pub graph: CrateGraphBuilder,
     pub macros: ProcMacrosBuilder,
-    pub missed: Arc<Mutex<Vec<Call>>>,
+    pub missed: Arc<Lock<Vec<Call>>>,
     pub main: FileId,
 }
 
@@ -241,7 +241,7 @@ impl Pack {
         let cwd = triomphe::Arc::new(AbsPathBuf::assert("/".into()));
         let expansions: Arc<Expansions> =
             Arc::new(self.expansions.into_iter().map(|it| (it.call, it.output)).collect());
-        let missed = Arc::new(Mutex::new(Vec::new()));
+        let missed = Arc::new(Lock::new("wasm_pack.missed", Vec::new()));
         let mut graph = CrateGraphBuilder::default();
         let mut macros = ProcMacrosBuilder::default();
         let mut ids = Vec::new();

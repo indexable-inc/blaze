@@ -21,7 +21,6 @@ use std::{
 };
 
 use blaze_hash::{FixedState, HashMap};
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use crate::{clock::Clock, rt};
@@ -60,8 +59,12 @@ impl<S: Spec> Event<S> {
 }
 
 /// The operations of one execution, each with its thread, result, call and return.
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the history a model's threads record into"
+)]
 pub struct History<S: Spec> {
-    events: Mutex<Vec<Event<S>>>,
+    events: parking_lot::Mutex<Vec<Event<S>>>,
     clock: AtomicU32,
 }
 
@@ -72,8 +75,12 @@ impl<S: Spec> Default for History<S> {
 }
 
 impl<S: Spec> History<S> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "below blaze-core: blaze-check is a dependency of blaze-core; `History::events`"
+    )]
     pub fn new() -> History<S> {
-        History { events: Mutex::new(Vec::with_capacity(MAX_OPS)), clock: AtomicU32::new(0) }
+        History { events: parking_lot::Mutex::new(Vec::with_capacity(MAX_OPS)), clock: AtomicU32::new(0) }
     }
 
     /// Runs `run` as the operation `op` of the calling thread, and records it with its result.

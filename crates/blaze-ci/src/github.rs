@@ -17,7 +17,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use blaze_api::http::{self, HttpResponse};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use ring::{
     rand::SystemRandom,
     signature::{RSA_PKCS1_SHA256, RsaKeyPair},
@@ -202,7 +202,7 @@ pub struct GitHub {
     /// This connection's copy of the token.
     token: Minted,
     /// The token every lane shares: one mints it and the others copy it, once an hour.
-    minted: Arc<Mutex<Minted>>,
+    minted: Arc<Lock<Minted>>,
     kept: Option<Kept>,
     /// The next request's JSON body, then the whole request; both reused, so a check run's
     /// update allocates no buffer once they have grown to its size.
@@ -311,7 +311,7 @@ impl GitHub {
         }
         // alloc: none until the first call, then reused
         let (body, request) = (Vec::new(), Vec::new());
-        let minted = Arc::new(Mutex::new(None)); // alloc: once per App, shared by its lanes
+        let minted = Arc::new(Lock::new("ci.github.minted", None)); // alloc: once per App, shared by its lanes
         let app = Arc::new(app); // alloc: once per App, shared by its lanes
         Ok(GitHub { app, repo, tls: tls()?, token: None, minted, kept: None, body, request })
     }

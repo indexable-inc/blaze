@@ -11,7 +11,6 @@ use std::{
 };
 
 use blaze_mem::Tag;
-use parking_lot::Mutex;
 
 use super::{
     Id, MemoryUsage, counts,
@@ -59,17 +58,19 @@ pub(crate) struct InputTable<I: Input> {
     /// Its bits, 0 until reserved.
     singleton: AtomicU32,
     /// Held while the singleton is reserved, so it is reserved once.
-    reserving: Mutex<()>,
+    #[expect(clippy::disallowed_types, reason = "held once, while a singleton is reserved")]
+    reserving: blaze_core::lock::Lock<()>,
     _of: PhantomData<fn() -> I>,
 }
 
 impl<I: Input> Table for InputTable<I> {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     fn new(_: &Storage, _: u32) -> InputTable<I> {
         InputTable {
             pages: Pages::new(Tag::Query),
             ids: Ids::new(Tag::Query),
             singleton: AtomicU32::new(0),
-            reserving: Mutex::new(()),
+            reserving: blaze_core::lock::Lock::new("query.input.reserving", ()),
             _of: PhantomData,
         }
     }

@@ -288,7 +288,7 @@ impl std::error::Error for Stall {}
 mod tests {
     use std::sync::{Arc, Barrier};
 
-    use parking_lot::{Condvar, Mutex};
+    use blaze_core::lock::{Lock, Signal};
 
     use super::*;
 
@@ -296,7 +296,7 @@ mod tests {
 
     /// A job of the request: inside its span, it waits for the next job, which waits for the
     /// one after, around to itself, until the test lets them go.
-    fn job(k: usize, ready: &Barrier, gate: &(Mutex<bool>, Condvar)) {
+    fn job(k: usize, ready: &Barrier, gate: &(Lock<bool>, Signal)) {
         let _span = match k {
             0 => tracing::info_span!(target: "blaze", "job a").entered(),
             1 => tracing::info_span!(target: "blaze", "job b").entered(),
@@ -316,7 +316,7 @@ mod tests {
         crate::install();
         const JOBS: usize = 3;
         let ready = Arc::new(Barrier::new(JOBS + 1));
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = Arc::new((Lock::new("profile.test.watchdog.gate", false), Signal::new("profile.test.watchdog.opened")));
         let workers: Vec<_> = (0..JOBS)
             .map(|k| {
                 let (ready, gate) = (ready.clone(), gate.clone());
@@ -516,7 +516,7 @@ mod tests {
     fn running_names_the_query_key_each_worker_is_inside_and_what_it_waits_on() {
         crate::install();
         let ready = Barrier::new(2);
-        let gate = (Mutex::new(false), Condvar::new());
+        let gate = (Lock::new("profile.test.watchdog.gate", false), Signal::new("profile.test.watchdog.opened"));
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("worker running".to_owned())

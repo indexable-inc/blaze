@@ -13,6 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-hash.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
@@ -63,7 +64,6 @@ blaze-format.workspace = true
 blaze-units.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-parking_lot.workspace = true
 test-utils.workspace = true
 
 [lints]

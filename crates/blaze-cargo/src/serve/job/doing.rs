@@ -59,6 +59,10 @@ pub struct Look<'a> {
     pub fetching: &'a [now::Download],
     /// The daemon's memory now, the same for every build's model ([`memory`]).
     pub memory: &'a now::Memory,
+    /// The daemon's top stall in its wait-for graph, in one line, while one lasts: what its
+    /// loop watchdog last named ([`crate::serve::pulse::Pulse::stall`]), the same for every
+    /// build's model ([`now::Now::stall`]).
+    pub stall: Option<&'a str>,
 }
 
 impl<S: Steps> Jobs<S> {
@@ -218,6 +222,7 @@ impl<'a> Seen<'a> {
             threads: &threads,
             downloads: look.fetching,
             stage: &stage,
+            stall: look.stall,
             memory: look.memory,
             expanders: &expanders,
             expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads()).unwrap_or(u32::MAX),

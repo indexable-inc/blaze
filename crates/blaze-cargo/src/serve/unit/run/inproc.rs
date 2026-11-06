@@ -26,7 +26,7 @@ use blaze_live::patch::ask::{
     self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK,
 };
 use crossbeam_queue::SegQueue;
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 
 #[cfg(test)]
 mod tests;
@@ -158,13 +158,17 @@ pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, S
 pub(crate) struct DevRuns {
     /// Where the host listens: the daemon's state directory's `inproc`.
     dir: PathBuf,
-    host: parking_lot::Mutex<Option<Arc<Host>>>,
+    host: Lock<Option<Arc<Host>>>,
     programs: SharedMap<String, Arc<Loaded>>,
 }
 
 impl DevRuns {
     pub(crate) fn new(dir: PathBuf) -> DevRuns {
-        DevRuns { dir, host: parking_lot::Mutex::new(None), programs: SharedMap::default() }
+        DevRuns {
+            dir,
+            host: Lock::new("serve.dev_runs.host", None),
+            programs: SharedMap::default(),
+        }
     }
 
     /// The host, made and listening at its first use.
@@ -426,7 +430,7 @@ type Failures = Arc<SegQueue<String>>;
 /// A dev executable in its code memory, which every run and test process of it maps.
 pub(crate) struct Loaded {
     program: Arc<Program>,
-    patch: Arc<Mutex<Patch>>,
+    patch: Arc<Lock<Patch>>,
     failures: Failures,
     launched: Launched,
     /// The image's lineage ([`Image::lineage`]), or for a file adopted from a record
@@ -515,11 +519,11 @@ fn held(
     generation: u64,
     lineage: [u8; 16],
 ) -> Result<Loaded, String> {
-    let patch: Arc<Mutex<Patch>> = Arc::new(Mutex::new(Patch { generation, message: None }));
+    let patch = Arc::new(Lock::new("serve.dev_run.patch", Patch { generation, message: None }));
     let failures: Failures = Arc::default();
     let (sessions, started) = crossbeam_channel::unbounded();
-    let program =
-        Arc::new(Program::new(host.clone(), Arc::new(Mutex::new(memory)), file, sessions));
+    let memory = Arc::new(Lock::new("serve.dev_run.memory", memory));
+    let program = Arc::new(Program::new(host.clone(), memory, file, sessions));
     let launched: Launched = Arc::default();
     let served = Served {
         patch: patch.clone(),
@@ -542,7 +546,7 @@ type Launched = Arc<SharedMap<u32, Started>>;
 /// What the thread that serves a program's runs holds of it: the program itself only weakly,
 /// so dropping the program ends the thread.
 struct Served {
-    patch: Arc<Mutex<Patch>>,
+    patch: Arc<Lock<Patch>>,
     failures: Failures,
     launched: Launched,
     program: std::sync::Weak<Program>,
@@ -740,7 +744,7 @@ fn sessions_of(
 
 /// Answers one run's asks until it hangs up: `blaze-live`'s, and a refusal naming the kind
 /// for any other.
-fn serve(session: Session, patch: &Mutex<Patch>, failures: &SegQueue<String>) {
+fn serve(session: Session, patch: &Lock<Patch>, failures: &SegQueue<String>) {
     let pid = session.pid;
     let (mut reader, sender) = session.split();
     // alloc: once per run, the answers' body, reused
@@ -807,6 +811,6 @@ fn answer(
     }
 }
 
-fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(it: &Lock<T>) -> LockGuard<'_, T> {
     it.lock()
 }

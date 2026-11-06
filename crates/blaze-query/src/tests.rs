@@ -16,7 +16,7 @@ use blaze_ids::{
 use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
 use blaze_vfs::{Bytes, Mode, View, ViewId};
 use intern::Live;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Mark, MemTree, Names as Lent,
@@ -1591,7 +1591,7 @@ const BROKEN: Corrupt =
 /// A [`MemTree`] whose file `broken` names fails its check while it is set.
 struct Breaking {
     files: MemTree,
-    broken: Mutex<Option<&'static str>>,
+    broken: Lock<Option<&'static str>>,
 }
 
 impl Tree for Breaking {
@@ -1613,7 +1613,7 @@ impl Tree for Breaking {
 #[test]
 fn a_file_that_fails_its_check_fails_the_request_and_is_read_again() {
     reset();
-    let tree = Arc::new(Breaking { files: MemTree::default(), broken: Mutex::new(Some("a")) });
+    let tree = Arc::new(Breaking { files: MemTree::default(), broken: Lock::new("query.test.lib.broken", Some("a")) });
     let mut db =
         Database::new(Config { tree: Some(tree.clone()), dir: FileName::new("db"), tags: TAGS });
     register(&mut db);
@@ -1815,7 +1815,7 @@ fn a_tree_that_lists_out_of_order_stops_the_read_naming_the_directory() {
     );
 }
 
-static SPREAD: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+static SPREAD: Lock<Option<HashMap<String, usize>>> = Lock::new("query.test.lib.spread", None);
 
 fn spread_runs(name: &str) -> usize {
     SPREAD.lock().as_ref().and_then(|runs| runs.get(name).copied()).unwrap_or(0)

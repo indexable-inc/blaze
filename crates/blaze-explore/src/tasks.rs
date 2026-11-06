@@ -37,7 +37,7 @@ use blaze_protocol::{
     now::{MOST_TASKS, Record, State},
 };
 use ix_prof::explore::{Kind, OpError, Rule, Tick, frame};
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 
 /// How long a settled task stays in the live set after its `end_ns`: 60 s.
 pub const SETTLED_NS: i64 = 60_000_000_000;
@@ -54,9 +54,14 @@ pub const BYTES: &str = "bytes";
 
 /// The daemon's tasks, shared by the loop (which writes them as the plane says its records) and
 /// every session's feed (which reads them each tick).
-#[derive(Default)]
 pub struct Tasks {
-    table: Mutex<Table>,
+    table: Lock<Table>,
+}
+
+impl Default for Tasks {
+    fn default() -> Tasks {
+        Tasks { table: Lock::new("explore.tasks.table", Table::default()) }
+    }
 }
 
 impl Tasks {
@@ -65,7 +70,7 @@ impl Tasks {
     }
 
     /// The table, for the plane's loop to say a run of records into under one lock.
-    pub fn lock(&self) -> MutexGuard<'_, Table> {
+    pub fn lock(&self) -> LockGuard<'_, Table> {
         self.table.lock()
     }
 

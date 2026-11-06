@@ -1937,8 +1937,8 @@ mod tests {
     type Observed = Vec<(TaskKind, Option<Key>, u64, u64)>;
 
     struct Recording {
-        asked: Arc<parking_lot::Mutex<Asked>>,
-        observed: Arc<parking_lot::Mutex<Observed>>,
+        asked: Arc<blaze_core::lock::Lock<Asked>>,
+        observed: Arc<blaze_core::lock::Lock<Observed>>,
     }
 
     impl Predict for Recording {
@@ -1958,7 +1958,9 @@ mod tests {
 
     #[test]
     fn every_node_is_predicted_and_its_own_run_teaches_the_predictor() {
-        let (asked, observed) = (Arc::default(), Arc::default());
+        let asked = Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.asked", Vec::new()));
+        let observed =
+            Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.observed", Vec::new()));
         let predict = Recording { asked: Arc::clone(&asked), observed: Arc::clone(&observed) };
         let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
         let mut plane = Plane::new(config, predict, Runner::Inline(Inline::new(9))).unwrap();
@@ -2016,7 +2018,7 @@ mod tests {
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane =
             Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
-        let ran_on: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let ran_on = Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.ran_on", Vec::<String>::new()));
         let work = Each({
             let ran_on = Arc::clone(&ran_on);
             move |arg| {

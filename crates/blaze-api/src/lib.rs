@@ -91,7 +91,9 @@ use serde::{Deserialize, Serialize};
 /// [`Building::now`], the build's live model (`blaze_protocol::now::Now`). 43: `Now` gains
 /// its running tasks, longest first (`running`), the tasks settled in the last 30 s
 /// (`recent`), the failed tasks (`failures`) and the proc-macro expansion lane (`expanding`).
-pub const SCHEMA: u32 = 43;
+/// 44: `Now::stall`, the daemon's top stall in its wait-for graph (a deadlock or a convoy of
+/// named locks), in one line, which `blaze status` and the build view say.
+pub const SCHEMA: u32 = 44;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.

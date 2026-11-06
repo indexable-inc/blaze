@@ -12,9 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blaze_cas::{Config, Key, Kind, Mismatch, Reader, Store, Ticket, Writer, content_of};
-use blaze_core::{Effect, FileName};
+use blaze_core::{Effect, FileName, lock::Lock};
 use blaze_ids::{ContentId, Hasher};
-use parking_lot::Mutex;
 
 use crate::actors::{Actors, Next, Resume, Turn};
 use crate::explore::{Bounds, Chooser, Failure, Memo};
@@ -423,7 +422,7 @@ pub struct Run<'a> {
     /// First, so its threads are joined before the store goes.
     pub actors: Actors,
     pub store: Store,
-    pub ledger: Arc<Mutex<Ledger>>,
+    pub ledger: Arc<Lock<Ledger>>,
     fs: CrashFs,
     effects: Vec<Effect>,
     model: &'a Model,
@@ -454,7 +453,7 @@ impl<'a> Run<'a> {
         Ok(Run {
             actors: Actors::default(),
             store,
-            ledger: Arc::default(),
+            ledger: Arc::new(Lock::new("storemodel.ledger", Ledger::default())),
             fs,
             effects: Vec::new(),
             model,
@@ -697,7 +696,7 @@ fn writes(
     name: &str,
     mut writer: Writer,
     reader: &Reader,
-    ledger: &Mutex<Ledger>,
+    ledger: &Lock<Ledger>,
     ops: &[Op],
     wait: Wait,
 ) {

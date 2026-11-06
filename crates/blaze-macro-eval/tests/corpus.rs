@@ -60,7 +60,7 @@ fn expand() -> Result<Expanded, String> {
 /// says.
 fn expand_with(ahead: &Ahead) -> Result<Expanded, String> {
     let config = Corpus::read()?;
-    let records = record::Records::default();
+    let records = record::records();
     let keeping = blaze_macro_eval::Macros::nothing(
         "the corpus compares each expansion that runs, so none is kept",
     );

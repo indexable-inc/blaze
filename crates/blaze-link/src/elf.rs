@@ -38,7 +38,7 @@ mod tests;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::model::{
     Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special,
@@ -83,7 +83,7 @@ pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
             )));
         }
     }
-    let last = output.incremental.then(Mutex::default);
+    let last = output.incremental.then(|| Lock::new("link.elf.last", Last::default()));
     // clone: once per link, the writer owns its `Output` (the public API's type)
     Ok(Elf { output: output.clone(), last })
 }
@@ -92,7 +92,7 @@ pub(crate) struct Elf {
     pub(crate) output: Output,
     /// An incremental output's last tables, which the next synthesis patches when its
     /// [`crate::model::Delta`] is from theirs.
-    pub(crate) last: Option<Mutex<Last>>,
+    pub(crate) last: Option<Lock<Last>>,
 }
 
 /// The tables the writer made last, each with the [`Placed::synthesis`] it was made in (0

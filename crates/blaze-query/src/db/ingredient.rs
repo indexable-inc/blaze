@@ -10,7 +10,7 @@ use super::{
     budget::Held,
     storage::{Relocate, Restamp},
 };
-use crate::sync::Mutex;
+use crate::table::ShortLock;
 
 /// Ingredients a binary may have: the front end has ~600. Node keys give an ingredient 12 bits.
 pub(crate) const MAX_INGREDIENTS: usize = 2048;
@@ -111,7 +111,7 @@ pub struct Ingredient {
     pub vtable: &'static Vtable,
 }
 
-static REGISTERED: Mutex<u32> = Mutex::new(0);
+static REGISTERED: ShortLock<u32> = ShortLock::new("query.ingredient.registered", 0);
 static VTABLES: [AtomicPtr<Vtable>; MAX_INGREDIENTS] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_INGREDIENTS];
 

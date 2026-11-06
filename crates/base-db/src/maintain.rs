@@ -45,7 +45,7 @@ use blaze_dbsp::Work;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 use smallvec::SmallVec;
 use span::FileId;
 use std::alloc::Global;
@@ -197,8 +197,8 @@ impl Reads {
         read: fn(&Db, &Written<'_>, &mut K),
     ) {
         // alloc: a step's keys, once per batch asked for
-        let keys: Box<[Mutex<Option<K>>]> =
-            keys.into_iter().map(|key| Mutex::new(Some(key))).collect();
+        let keys: Box<[Lock<Option<K>>]> =
+            keys.into_iter().map(|key| Lock::new("db.maintain.read_key", Some(key))).collect();
         if !keys.is_empty() {
             // alloc: a batch, once per kind of key a step reads
             self.batches.push(Box::new(Each { tag, read, keys }));
@@ -254,7 +254,7 @@ struct Each<K> {
     read: fn(&Db, &Written<'_>, &mut K),
     /// Each key out of its slot while its read runs: no lock is held across a query, which may
     /// move the read to another thread.
-    keys: Box<[Mutex<Option<K>>]>,
+    keys: Box<[Lock<Option<K>>]>,
 }
 
 impl<K: Send + 'static> Batch for Each<K> {
@@ -279,7 +279,8 @@ impl<K: Send + 'static> Batch for Each<K> {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+#[track_caller]
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
@@ -312,11 +313,10 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
 }
 
 /// The [`Db`] field behind maintenance.
-#[derive(Default)]
 pub(crate) struct Maintenance {
     /// Behind a lock so a maintainer's reads, on `&Db`, can have it lent ([`Db::lend_state`]).
     // dyn: write-side state, one lookup per maintainer per write
-    state: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>, Global>>,
+    state: Lock<HashMap<TypeId, Box<dyn Any + Send + Sync>, Global>>,
     /// Whether a maintainer's reads are running: only they are lent state on `&Db`.
     reading: bool,
     pending: Pending,
@@ -333,6 +333,23 @@ pub(crate) struct Maintenance {
     /// The passes run since the database was made ([`Db::maintain_passes`]).
     passes_ever: u64,
     maintained: Vec<Maintained>,
+}
+
+impl Default for Maintenance {
+    fn default() -> Maintenance {
+        Maintenance {
+            state: Lock::new("db.maintain.state", Default::default()),
+            reading: false,
+            pending: Pending::default(),
+            depth: 0,
+            maintaining: false,
+            keep: false,
+            batches_only: false,
+            passes: 0,
+            passes_ever: 0,
+            maintained: Vec::new(), // alloc: empty, allocates nothing
+        }
+    }
 }
 
 /// A pending [`Written`], owned. Its buffers are kept from one pass to the next, and made with

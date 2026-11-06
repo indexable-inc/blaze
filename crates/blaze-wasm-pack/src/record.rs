@@ -10,8 +10,8 @@ use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros,
 };
+use blaze_core::lock::Lock;
 use intern::sym;
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use super::{Call, Dep, Expansion, Expansions, File, Kind, Krate, Macro, Origin, Pack, Root};
@@ -23,7 +23,7 @@ struct Recorder {
     name: String,
     // dyn: the proc macro it records, as `ProcMacro::expander` holds it: the edge to user code.
     inner: Arc<dyn ProcMacroExpander>,
-    expansions: Arc<Mutex<Expansions>>,
+    expansions: Arc<Lock<Expansions>>,
 }
 
 /// An expansion that panicked records nothing: the expansions kept are each whole.
@@ -135,7 +135,7 @@ pub fn record(
     let reading: &Db = db;
     let crates = closure(reading, program);
 
-    let expansions = Arc::new(Mutex::new(Expansions::default()));
+    let expansions = Arc::new(Lock::new("wasm_pack.record.expansions", Expansions::default()));
     let loaded = ProcMacros::get(reading).by_crate(reading).clone();
     let recording: Vec<_> = loaded
         .iter()

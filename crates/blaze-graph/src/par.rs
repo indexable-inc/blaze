@@ -518,7 +518,7 @@ pub fn for_each_giving_way(
 ) -> Vec<usize> {
     let again: SegQueue<usize> = SegQueue::new();
     // dyn: as above
-    let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.par.giving_way_panic", None);
     let next = AtomicUsize::new(0);
     let near = pool::group();
     let jobs = count.min(pool::threads_here() * WINDOW);
@@ -535,14 +535,14 @@ pub fn for_each_giving_way(
                 // toward no bound, however many tasks give way to one run.
                 pump::rerun_later();
             } else {
-                other.lock_said("a loop's first panic").get_or_insert(panic);
+                other.lock().get_or_insert(panic);
             }
         }
     };
     // A job's own unwind (not a task's: each is caught above) is a panic of the loop too.
     let caught = |ran: thread::Result<()>| {
         if let Err(panic) = ran {
-            other.lock_said("a loop's first panic").get_or_insert(panic);
+            other.lock().get_or_insert(panic);
         }
     };
     pool::scope_here(|scope| {
@@ -589,7 +589,7 @@ fn split<St>(
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     // dyn: a panic's payload, as `catch_unwind` gives it
-    let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.par.split_panic", None);
     let gave: SegQueue<usize> = SegQueue::new();
     let claim = || {
         let mut state = None;
@@ -624,7 +624,7 @@ fn split<St>(
     let caught = |ran: thread::Result<()>| {
         if let Err(it) = ran {
             failed.store(true, Ordering::Relaxed);
-            panic.lock_said("a loop's first panic").get_or_insert(it);
+            panic.lock().get_or_insert(it);
         }
     };
     if jobs <= 1 {
@@ -780,7 +780,7 @@ where
     let items = items.into_source();
     let len = items.len();
     let first = AtomicUsize::new(usize::MAX);
-    let found: Lock<Option<(usize, R)>> = Lock::new(None);
+    let found: Lock<Option<(usize, R)>> = Lock::new("graph.par.first_found", None);
     split(
         len,
         <I::Source as Source>::AGAIN,
@@ -794,7 +794,7 @@ where
                 }
                 if let Some(made) = f(item) {
                     first.fetch_min(at, Ordering::Relaxed);
-                    let mut found = found.lock_said("a search's find");
+                    let mut found = found.lock();
                     if found.as_ref().is_none_or(|&(was, _)| at < was) {
                         *found = Some((at, made));
                     }
@@ -838,7 +838,7 @@ mod tests {
 
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::unbounded;
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
 
     use crate::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};
 
@@ -1029,7 +1029,7 @@ mod tests {
                 let caller = std::thread::current().id();
                 let runs: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
                 let gave: Vec<AtomicBool> = (0..64).map(|_| AtomicBool::new(false)).collect();
-                let reruns = Mutex::new(Vec::new());
+                let reruns = Lock::new("graph.test.par.reruns", Vec::new());
                 let made = super::map(0..64, |at| {
                     runs[at].fetch_add(1, Ordering::Relaxed);
                     if gave[at].load(Ordering::Relaxed) {
@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn an_items_panic_is_the_callers_and_the_pool_goes_on() {
         let pool = Pool::new(&Topology::flat(4), false).unwrap();
-        let ran = Mutex::new(0usize);
+        let ran = Lock::new("graph.test.par.ran", 0usize);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.install(|| {
                 super::for_each(0..10_000usize, |at| {

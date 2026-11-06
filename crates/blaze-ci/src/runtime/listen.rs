@@ -23,7 +23,7 @@ use std::{
 use blaze_api::http::{self, RequestParser};
 use blaze_hash::FixedState;
 use hashbrown::HashTable;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::log;
 use crate::{
@@ -113,7 +113,7 @@ pub(crate) struct Listener {
     pub(crate) verifier: Verifier,
     pub(crate) repo: String,
     pub(crate) service: crossbeam_channel::Sender<Input>,
-    pub(crate) seen: Mutex<Seen>,
+    pub(crate) seen: Lock<Seen>,
     open: AtomicUsize,
 }
 
@@ -138,7 +138,7 @@ impl Listener {
             verifier,
             repo,
             service,
-            seen: Mutex::new(Seen::new(most)),
+            seen: Lock::new("ci.listen.seen", Seen::new(most)),
             open: AtomicUsize::new(0),
         }
     }

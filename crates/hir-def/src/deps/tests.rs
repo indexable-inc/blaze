@@ -15,7 +15,7 @@ use hir_expand::proc_macro::{
     Expanded, ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
     ProcMacroKind, StateUse,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use super::*;
@@ -51,7 +51,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::derive; } }
 "#;
 
 /// The differences frozen bytes record are the process's: the tests that read them take turns.
-pub(super) static TURN: Mutex<()> = Mutex::new(());
+pub(super) static TURN: Lock<()> = Lock::new("test.def.deps.turn", ());
 
 const BUILD: ContentId = ContentId([7; 32]);
 
@@ -63,10 +63,18 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
-#[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
-    gets: Mutex<usize>,
+    images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+    gets: Lock<usize>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory {
+            images: Lock::new("test.def.deps.memory.images", Default::default()),
+            gets: Lock::new("test.def.deps.memory.gets", 0),
+        }
+    }
 }
 
 impl ImageStore for Memory {

@@ -14,11 +14,11 @@ use std::{
 };
 
 use anyhow::bail;
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_hash::HashMap;
 use blaze_manifest::config::{Config, OptValue, PathAndArgs, Value, env_key};
 use blaze_manifest::files::Disk;
 use blaze_source::SourceId;
-use parking_lot::Mutex;
 use serde_derive::Serialize;
 use std::alloc::Global;
 
@@ -289,7 +289,7 @@ impl fmt::Display for AuthorizationError {
 /// registries' credentials as read, behind one lock, so that fetches at once ask a provider
 /// once, as cargo, which asks from one thread.
 pub struct Auth {
-    state: Mutex<State>,
+    state: Lock<State>,
     // dyn: the CLI's output, written to only while a token is found, once per registry per run.
     shell: Box<dyn Shell>,
 }
@@ -307,10 +307,10 @@ impl Auth {
     pub fn new(config: Config<Disk>, shell: Box<dyn Shell>) -> Auth {
         let state =
             State { config, tokens: HashMap::new_in(Global), registries: HashMap::new_in(Global) };
-        Auth { state: Mutex::new(state), shell }
+        Auth { state: Lock::new("registry.auth.state", state), shell }
     }
 
-    fn state(&self) -> parking_lot::MutexGuard<'_, State> {
+    fn state(&self) -> LockGuard<'_, State> {
         self.state.lock()
     }
 

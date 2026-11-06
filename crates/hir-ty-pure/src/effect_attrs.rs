@@ -385,10 +385,32 @@ const ROOM: &str = "waits for room in the channel";
 const PARK: &str = "parks the thread";
 const ONCE: &str = "waits for another thread's initialization";
 
-/// The blocking functions of the registry crates blaze and its users wait through. The
-/// toolchain's are `crate::effects::MODELS` rows; any other crate's waits reach a [`FOREIGN`]
-/// leaf (`futex`, `read`).
+/// The blocking functions of the registry crates blaze and its users wait through, and of
+/// blaze's own lock home ([`WORKSPACE_ROW_CRATES`]). The toolchain's are
+/// `crate::effects::MODELS` rows; any other crate's waits reach a [`FOREIGN`] leaf (`futex`,
+/// `read`).
 pub(crate) const ROWS: &[Row] = &[
+    row(
+        "blaze_core::lock::Lock::{lock, try_lock_for}",
+        "blaze_core",
+        At::Methods(&["lock", "Lock"], &["lock", "try_lock_for"]),
+        LOCK,
+    ),
+    row(
+        "blaze_core::lock::ReadLock::{read, write}",
+        "blaze_core",
+        At::Methods(&["lock", "ReadLock"], &["read", "write"]),
+        LOCK,
+    ),
+    row(
+        "blaze_core::lock::Signal::wait*",
+        "blaze_core",
+        At::Methods(
+            &["lock", "Signal"],
+            &["wait", "wait_while", "wait_until", "wait_for", "wait_while_until", "wait_while_for"],
+        ),
+        CONDVAR,
+    ),
     row("parking_lot_core::park", "parking_lot_core", At::Fn(&["park"]), PARK),
     row("lock_api::Mutex::lock", "lock_api", At::Methods(&["Mutex"], &["lock"]), LOCK),
     row(
@@ -460,19 +482,35 @@ pub(crate) const ROWS: &[Row] = &[
     ),
 ];
 
-/// The row of `func`, a function of a registry crate a row of [`ROWS`] names. A crate is known
+/// The workspace crates rows are of, known by their crate name: blaze's lock home
+/// (docs/v2/plan/design/named-locks.md), whose `Lock::lock` and `ReadLock::{read, write}` are
+/// lock acquires as `lock_api`'s are.
+const WORKSPACE_ROW_CRATES: &[&str] = &["blaze_core"];
+
+/// The row of `func`, a function of a crate a row of [`ROWS`] names. A registry crate is known
 /// by its crates.io name, and only with a registry origin, so a workspace crate named
-/// `lock_api` is never taken for it.
+/// `lock_api` is never taken for it; a workspace member only when it is one of
+/// [`WORKSPACE_ROW_CRATES`].
 pub(crate) fn row_of(db: &Db, func: FunctionId) -> Option<&'static Row> {
     let krate = HasModule::krate(&func, db);
     registry_name(db, krate)?;
     crate_rows(db, krate).by_fn.get(&func).map(|&at| &ROWS[usize::from(at)])
 }
 
-/// The crates.io name of `krate` when a row is of it.
+/// The name rows know `krate` by, when a row is of it: its crates.io name for a registry
+/// crate, its crate name for one of [`WORKSPACE_ROW_CRATES`].
 fn registry_name(db: &Db, krate: Crate) -> Option<&'static str> {
-    let CrateOrigin::Library { name, .. } = &krate.data(db).origin else { return None };
-    ROWS.iter().map(|row| row.krate).find(|it| *it == name.as_str())
+    match &krate.data(db).origin {
+        CrateOrigin::Library { name, .. } => {
+            ROWS.iter().map(|row| row.krate).find(|it| *it == name.as_str())
+        }
+        CrateOrigin::Local { .. } => {
+            let display = krate.extra_data(db).display_name.as_ref()?;
+            let name = display.crate_name().symbol().as_str();
+            WORKSPACE_ROW_CRATES.iter().copied().find(|it| *it == name)
+        }
+        CrateOrigin::Rustc { .. } | CrateOrigin::Lang(_) => None,
+    }
 }
 
 /// [`ROWS`] resolved in one crate, and the rows of it that resolve to nothing (a stale table).

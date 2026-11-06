@@ -65,7 +65,7 @@ use blaze_ui::{
     test_view::{BinaryEnd, Event, Paint, TestView, Verdict, ansi, wrap},
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -905,7 +905,7 @@ struct Running {
     child: Child,
     pid: u32,
     /// What it printed, as read so far.
-    captured: Arc<Mutex<Captured>>,
+    captured: Arc<Lock<Captured>>,
     /// When its process exited, once [`Run::Exited`] said so: its output is read until
     /// [`Runner::drain`] past this.
     exited: Option<Instant>,
@@ -1197,7 +1197,7 @@ impl Runner {
         let mut child = child;
         let pid = child.id();
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let captured = Arc::new(Mutex::new(Captured::default())); // alloc: one an executable run
+        let captured = Arc::new(Lock::new("live.run.captured", Captured::default())); // alloc: one an executable run
         let read = {
             let (to_screen, to_runner, captured) =
                 (self.to_screen.clone(), self.to_runner.clone(), captured.clone());
@@ -1366,7 +1366,7 @@ fn read(
     json: bool,
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
-    captured: &Arc<Mutex<Captured>>,
+    captured: &Arc<Lock<Captured>>,
     to_screen: &Sender<Msg>,
     to_runner: &Sender<Run>,
 ) {

@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use blaze_source::SourceId;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::{
     Context, git,
@@ -21,7 +21,7 @@ pub(crate) struct GitIndex {
     source: SourceId,
     db: PathBuf,
     context: Arc<Context>,
-    state: Mutex<State>,
+    state: Lock<State>,
 }
 
 #[derive(Default)]
@@ -33,7 +33,7 @@ struct State {
 
 impl GitIndex {
     pub(crate) fn new(source: SourceId, dir: &Path, context: Arc<Context>) -> GitIndex {
-        GitIndex { source, db: dir.join(".git"), context, state: Mutex::default() }
+        GitIndex { source, db: dir.join(".git"), context, state: Lock::new("registry.git_index.state", State::default()) }
     }
 
     pub(crate) fn invalidate(&self) {

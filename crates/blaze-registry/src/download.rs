@@ -72,8 +72,8 @@ impl Registry {
     pub fn fetch(&self, packages: &[Package]) -> anyhow::Result<Vec<(PathBuf, From)>> {
         let _lock = crate::PackageCacheLock::acquire(&self.context().cargo_home)?;
         let next = AtomicUsize::new(0);
-        let results: Vec<parking_lot::Mutex<Option<anyhow::Result<(PathBuf, From)>>>> =
-            packages.iter().map(|_| parking_lot::Mutex::new(None)).collect();
+        let results: Vec<blaze_core::lock::Lock<Option<anyhow::Result<(PathBuf, From)>>>> =
+            packages.iter().map(|_| blaze_core::lock::Lock::new("registry.fetch.result", None)).collect();
         let jobs = self.context().net.jobs.max(1).min(packages.len().max(1));
         std::thread::scope(|scope| {
             for _ in 0..jobs {

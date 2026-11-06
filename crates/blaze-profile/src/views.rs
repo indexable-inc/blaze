@@ -13,8 +13,9 @@ use crate::{
 };
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
-/// `fiber_stacks`, `job_waits`, `job_spans`, `span_sums`, `event_values` and `events_wide`. Each
-/// `@<table>` in it is the list of that table's files, filled in by [`prelude`].
+/// `fiber_stacks`, `job_waits`, `job_spans`, `span_sums`, `event_values`, `events_wide`,
+/// `lock_waits` and `stalls`. Each `@<table>` in it is the list of that table's files, filled in
+/// by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
 const EXAMPLES: &str = include_str!("../sql/examples.sql");

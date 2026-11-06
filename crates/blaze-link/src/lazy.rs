@@ -51,7 +51,7 @@ use blaze_lazy::runner::Placer;
 use blaze_lazy::stub::{self, Layout, Stubs};
 use blaze_lazy::{Session, hook};
 use blaze_mem::align::align_up_u64;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use crate::model::{Apply, Sym};
@@ -180,8 +180,8 @@ pub trait Slots: Send + 'static {
 /// stages and commits them; a placement locks the image, then the memory, and holds neither
 /// while [`Slots::publish`] waits on the run processes.
 pub struct LazyPlacer<S: Slots> {
-    image: Arc<Mutex<Image>>,
-    memory: Arc<Mutex<CodeMemory>>,
+    image: Arc<Lock<Image>>,
+    memory: Arc<Lock<CodeMemory>>,
     slots: S,
     slide: u64,
     /// The arena code each slot runs, by the key the slot is named for: what a replacement
@@ -279,8 +279,8 @@ impl<S: Slots> LazyPlacer<S> {
     /// linked addresses. Stores the hook's address in the region's cell, before any process
     /// runs.
     pub fn new(
-        image: Arc<Mutex<Image>>,
-        memory: Arc<Mutex<CodeMemory>>,
+        image: Arc<Lock<Image>>,
+        memory: Arc<Lock<CodeMemory>>,
         slots: S,
         slide: u64,
     ) -> Result<LazyPlacer<S>, LinkError> {

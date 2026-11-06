@@ -4,7 +4,7 @@
 //! contends. Releasing is no schedule point (as loom's): the releaser's next operation is.
 #![expect(
     clippy::disallowed_types,
-    reason = "the model of `std`'s locks, poisoning included, keeps the data in `std`'s own"
+    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the model of `std`'s locks, poisoning included, keeps the data in `std`'s own"
 )]
 
 pub mod lot;

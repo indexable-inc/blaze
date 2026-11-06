@@ -36,6 +36,31 @@ pub(crate) fn adt_is(db: &Db, adt: hir::Adt, krate: &str, name: &str) -> bool {
     adt.name(db).as_str() == name && crate_is(db, adt.module(db).krate(db), krate)
 }
 
+/// blaze's lock guards, by name in the module `lock` of `blaze_core`
+/// (docs/v2/plan/design/named-locks.md): what every lint of held guards takes for one beside
+/// `lock_api`'s and std's.
+pub(crate) const BLAZE_CORE_GUARDS: &[&str] = &["LockGuard", "ReadGuard", "WriteGuard"];
+
+/// Whether `adt` is one of [`BLAZE_CORE_GUARDS`], in `blaze_core::lock`.
+pub(crate) fn is_blaze_core_guard(db: &Db, adt: hir::Adt) -> bool {
+    let module = adt.module(db);
+    BLAZE_CORE_GUARDS.contains(&adt.name(db).as_str())
+        && crate_is(db, module.krate(db), "blaze_core")
+        && module.name(db).is_some_and(|it| it.as_str() == "lock")
+}
+
+/// blaze's locks, by name in the module `lock` of `blaze_core`: what hands out
+/// [`BLAZE_CORE_GUARDS`].
+pub(crate) const BLAZE_CORE_LOCKS: &[&str] = &["Lock", "ReadLock"];
+
+/// Whether `adt` is one of [`BLAZE_CORE_LOCKS`], in `blaze_core::lock`.
+pub(crate) fn is_blaze_core_lock(db: &Db, adt: hir::Adt) -> bool {
+    let module = adt.module(db);
+    BLAZE_CORE_LOCKS.contains(&adt.name(db).as_str())
+        && crate_is(db, module.krate(db), "blaze_core")
+        && module.name(db).is_some_and(|it| it.as_str() == "lock")
+}
+
 /// The hash maps and sets of crates other than std, by crate: their iteration order is their
 /// hasher's and their table's, never their keys'.
 const HASH_CRATES: &[(&str, &[&str])] = &[

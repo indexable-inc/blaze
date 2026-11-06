@@ -24,7 +24,7 @@ use blaze_mem::{Region, Tag};
 use blaze_reclaim::{Grace, Guard, Horizon};
 
 #[allow(clippy::disallowed_types)]
-use crate::sync::{Mutex, MutexGuard};
+use crate::sync::{Lock, LockGuard};
 use crate::{
     Edge, QueryKey, QueryKind,
     sync::{
@@ -45,35 +45,26 @@ pub(crate) type FxSet<K> = std::collections::HashSet<K, blaze_hash::FixedState>;
 
 /// A lock held for a few loads and stores: claiming or swapping a slot, copying a table to
 /// grow it, claiming rows, holding what was unlinked. Nothing that holds it calls a query,
-/// the tree or another lock, so it is never held across a call into the database.
+/// the tree or another lock, so it is never held across a call into the database. It is
+/// `blaze_core::lock`'s named lock: a contended acquire waits in a span naming it.
 pub(crate) struct ShortLock<T> {
     #[allow(clippy::disallowed_types)]
-    inner: Mutex<T>,
+    inner: Lock<T>,
 }
 
 #[allow(clippy::disallowed_types)]
 impl<T> ShortLock<T> {
-    pub(crate) const fn new(value: T) -> ShortLock<T> {
-        ShortLock { inner: Mutex::new(value) }
+    /// A lock named `name`, `"query.<what it guards>"`.
+    pub(crate) const fn new(name: &'static str, value: T) -> ShortLock<T> {
+        ShortLock { inner: Lock::new(name, value) }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+    pub(crate) fn lock(&self) -> LockGuard<'_, T> {
         self.inner.lock()
     }
 
     pub(crate) fn get_mut(&mut self) -> &mut T {
         self.inner.get_mut()
-    }
-}
-
-impl<T: Default> Default for ShortLock<T> {
-    fn default() -> ShortLock<T> {
-        let lock = ShortLock::new(T::default());
-        // alloc: `std`'s mutex is a pthread one on macOS, boxed at its first lock: taken here,
-        // where the owner is made, so a new view's first insert in a shard allocates nothing.
-        #[cfg(not(blaze_check))]
-        drop(lock.lock());
-        lock
     }
 }
 
@@ -746,7 +737,7 @@ impl<V: Send + Sync + 'static> Map<V> {
         Map {
             shards: (0..count)
                 .map(|_| Shard {
-                    writer: ShortLock::default(),
+                    writer: ShortLock::new("query.table.shard_writer", Writer::default()),
                     due: AtomicBool::new(false),
                     table: Published::null(),
                 })
@@ -1535,4 +1526,5 @@ impl Aligned {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests;

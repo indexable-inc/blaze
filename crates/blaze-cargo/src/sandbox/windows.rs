@@ -46,7 +46,6 @@ use std::{
 };
 
 use blaze_usercode::confine::Spec;
-use parking_lot::{Condvar, Mutex};
 use windows_sys::{
     Win32::{
         Foundation::{
@@ -1626,10 +1625,14 @@ impl Drop for Granted {
 
 /// The jobs of the runs in progress, for the console's interrupt to end.
 // alloc: none: an empty `Vec` in a static, which grows once per sandbox.
-static JOBS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static JOBS: blaze_core::lock::Lock<Vec<usize>> =
+    blaze_core::lock::Lock::new("sandbox.windows.jobs", Vec::new());
 
 /// How many runs have not taken back their grants yet, for the console's close to wait on.
-static RUNS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+static RUNS: (blaze_core::lock::Lock<usize>, blaze_core::lock::Signal) = (
+    blaze_core::lock::Lock::new("sandbox.windows.runs", 0),
+    blaze_core::lock::Signal::new("sandbox.windows.run_ended"),
+);
 
 /// Counts a run in [`RUNS`] while it is not dropped.
 struct Running;

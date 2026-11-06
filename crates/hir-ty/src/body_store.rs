@@ -42,11 +42,11 @@ use std::{
 };
 
 use base_db::{Db, Nonce};
+use blaze_core::lock::Lock;
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
 use hir_def::{DefWithBodyId, deps::ImageStore};
-use parking_lot::Mutex;
 
 pub use facts::{BodyFacts, Classified, Step};
 pub(crate) use infer::inference;
@@ -108,7 +108,7 @@ struct Store {
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key, a stored result that differs from running the step under
     /// [`Mode::Verify`]): [`Installed::flush`] stops with it.
-    error: Mutex<Option<String>>,
+    error: Lock<Option<String>>,
 }
 
 /// The buffers an offer fills, kept for the thread's next one. Taken out for the offer and put
@@ -455,12 +455,8 @@ static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 /// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
 static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the process's one body store reclamation pool: all unlinked stores are retired together"
-)]
-static LIMBO: std::sync::LazyLock<Mutex<Limbo>> =
-    std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
+/// The process's one body store reclamation pool: all unlinked stores are retired together.
+static LIMBO: Lock<Limbo> = Lock::new("ty.body_store.limbo", Limbo::new());
 
 /// Runs `f` on the item store of `db`, if one is installed.
 #[inline]
@@ -638,7 +634,7 @@ pub fn install(
         images,
         facts,
         pending: Pending::new(),
-        error: Mutex::new(None),
+        error: Lock::new("ty.body_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
         if slot

@@ -12,6 +12,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-bytes.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
@@ -21,7 +22,6 @@ text-size.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-spin.workspace = true
-parking_lot.workspace = true
 
 [lints]
 workspace = true

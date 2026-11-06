@@ -75,14 +75,13 @@ use blaze_api::{
     UnitTarget,
 };
 use blaze_cas::Store;
-use blaze_core::{Completion, Effect, Tag};
+use blaze_core::{Completion, Effect, Tag, lock::Lock};
 use blaze_ids::ContentId;
 use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
 use blaze_units::{
     query::{BuildConfig, EnvMoved, EnvReads, Fetch, Units},
     schema::{Mode, Unit},
 };
-use parking_lot::Mutex;
 
 use crate::serve::{
     Paths,
@@ -1271,7 +1270,7 @@ pub(crate) struct Job {
     /// once per unit.
     pub(crate) made: Box<[OnceLock<compile::Made>]>,
     /// What each unit's phases made for the phases after them, by unit.
-    pub(crate) phases: Box<[Mutex<compile::Phases>]>,
+    pub(crate) phases: Box<[Lock<compile::Phases>]>,
     /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
     /// both read it.
     pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
@@ -1287,7 +1286,7 @@ pub(crate) struct Job {
     pub(crate) runs: Box<[OnceLock<artifact::Runs>]>,
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
     /// Only the loop touches it: the lock is never contended.
-    pub(crate) starts: Box<[Mutex<Option<Box<script::Start>>>]>,
+    pub(crate) starts: Box<[Lock<Option<Box<script::Start>>>]>,
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
@@ -1309,10 +1308,10 @@ pub(crate) struct Job {
     pub(crate) began: Instant,
     /// The dependency crates checked this build, kept with the front end until the head's next
     /// build stores their outcomes ([`deps::store`]); one write per such crate.
-    later: Mutex<Vec<deps::Later>>,
+    later: Lock<Vec<deps::Later>>,
     /// The trees the job's last edit reparsed in place ([`intent::edit`]), kept with the front
     /// end for the next build.
-    seeds: Mutex<Vec<blaze_intent::Seed>>,
+    seeds: Lock<Vec<blaze_intent::Seed>>,
     /// The seeds its front end took: the database holds a seed weakly, so it lives as long as
     /// the job.
     _seeded: Vec<blaze_intent::Seed>,
@@ -1354,21 +1353,23 @@ impl Job {
             identities: (0..slots).map(|_| Default::default()).collect(),
             scripts: (0..slots).map(|_| Default::default()).collect(),
             made: (0..slots).map(|_| Default::default()).collect(),
-            phases: (0..slots).map(|_| Mutex::default()).collect(),
+            phases: (0..slots)
+                .map(|_| Lock::new("serve.unit.phases", compile::Phases::default()))
+                .collect(),
             keys: (0..slots).map(|_| Default::default()).collect(),
             runs: (0..slots).map(|_| Default::default()).collect(),
             mounted,
             inert: (0..slots).map(|_| Default::default()).collect(),
             pure: (0..slots).map(|_| Default::default()).collect(),
-            starts: (0..slots).map(|_| Mutex::new(None)).collect(),
+            starts: (0..slots).map(|_| Lock::new("serve.unit.starts", None)).collect(),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
             lint_profiles: Default::default(),
             layout: Default::default(),
             ub: Default::default(),
             began: Instant::now(),
-            later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
-            seeds: Mutex::new(Vec::new()),
+            later: Lock::new("serve.unit.later", Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
+            seeds: Lock::new("serve.unit.seeds", Vec::new()),
             _seeded: Vec::new(),
             memo,
             memo_used: (0..slots).map(|_| Default::default()).collect(),

@@ -39,7 +39,6 @@ use blaze_graph::{
     Key,
     pump::{Held, NotHeld},
 };
-use parking_lot::Mutex;
 
 use super::{Cancelled, Database, local};
 
@@ -149,7 +148,8 @@ pub struct Slot<T> {
     /// has ([`key`]).
     serial: u64,
     /// Held only to write `value` once and to compare a second fill with it.
-    writing: Mutex<()>,
+    #[expect(clippy::disallowed_types, reason = "held only to write a slot's value once and to compare a second fill")]
+    writing: blaze_core::lock::Lock<()>,
     /// Stored with release once `value` is written; read with acquire before `value` is.
     full: AtomicBool,
     /// Where its claim is: [`UNCLAIMED`], [`CLAIMED`], [`GIVEN_BACK`] or [`ABANDONED`], stored
@@ -200,11 +200,12 @@ fn key(serial: u64) -> Key {
 
 impl<T> Slot<T> {
     /// An empty slot named `name`.
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     pub fn empty(name: SlotName) -> Slot<T> {
         Slot {
             name,
             serial: SERIAL.fetch_add(1, Ordering::Relaxed),
-            writing: Mutex::new(()),
+            writing: blaze_core::lock::Lock::new("query.slot.writing", ()),
             full: AtomicBool::new(false),
             claim: AtomicU8::new(UNCLAIMED),
             claimer: AtomicU64::new(0),

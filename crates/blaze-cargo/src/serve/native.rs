@@ -37,12 +37,12 @@ use std::{
 };
 
 use blaze_api::ApiError;
+use blaze_core::lock::Lock;
 use blaze_fetch::{
     tree,
     unpack::{self, Modes, NameRules, Rules, Twice},
 };
 use blaze_units::query::NativeInput;
-use parking_lot::Mutex;
 
 /// The directory under blaze's home the inputs are laid out in.
 pub(crate) const NATIVE: &str = "native";
@@ -82,8 +82,13 @@ pub struct NativeDir {
 
 /// The digests whose layouts this daemon has walked and held to their marks (or laid out
 /// itself): each is walked once a daemon.
-#[derive(Default)]
-pub(crate) struct Verified(Mutex<BTreeSet<String>>);
+pub(crate) struct Verified(Lock<BTreeSet<String>>);
+
+impl Default for Verified {
+    fn default() -> Verified {
+        Verified(Lock::new("serve.native.verified", BTreeSet::new()))
+    }
+}
 
 /// Where the archive pinned by `sha256` is laid out under `native` (`<home>/native`).
 pub(crate) fn dir_of(native: &Path, sha256: &str) -> PathBuf {

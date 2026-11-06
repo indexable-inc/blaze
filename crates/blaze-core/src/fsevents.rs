@@ -40,7 +40,7 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::{Mutex, MutexGuard};
+use crate::lock::{Lock, LockGuard};
 
 use crate::{Completion, Cursor, Done, FileName, Journaled, Lost, Tag};
 
@@ -203,12 +203,12 @@ struct Shared<S> {
     /// the flush that wrote each.
     cookies: PathBuf,
     /// Each flush whose cookie the stream has not heard of yet.
-    flushes: Mutex<Vec<Tag>>,
+    flushes: Lock<Vec<Tag>>,
     /// `cookies`, kept to name a flush's cookie in without allocating ([`with_cookie`]).
-    writing: Mutex<PathBuf>,
+    writing: Lock<PathBuf>,
     /// The callback's buffers, kept for the watch's life: on its queue only, so never waited
     /// for.
-    heard: Mutex<Heard>,
+    heard: Lock<Heard>,
     sink: S,
     stopped: AtomicBool,
     mode: Mode,
@@ -246,7 +246,7 @@ impl Heard {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
@@ -515,10 +515,10 @@ impl<S: Tell> Watch<S> {
             // alloc: setup, once per watch: the resolved paths, at the size most have.
             root: PathBuf::with_capacity(256),
             real_dir: PathBuf::with_capacity(256), // alloc: as above.
-            writing: Mutex::new(cookie_buffer(&cookies)),
+            writing: Lock::new("core.fsevents.writing", cookie_buffer(&cookies)),
             // alloc: setup, once per watch: the callback's buffers at the size a batch of a
             // few names and cookies needs.
-            heard: Mutex::new(Heard {
+            heard: Lock::new("core.fsevents.heard", Heard {
                 cookies: Vec::with_capacity(4),
                 told: Vec::with_capacity(4),
                 path: cookie_buffer(&cookies),
@@ -527,7 +527,7 @@ impl<S: Tell> Watch<S> {
                 lost: Vec::with_capacity(4),
             }),
             cookies,
-            flushes: Mutex::new(Vec::with_capacity(4)), // alloc: setup, once per watch.
+            flushes: Lock::new("core.fsevents.flushes", Vec::with_capacity(4)), // alloc: setup, once per watch.
             sink,
             stopped: AtomicBool::new(true),
             mode: Mode::Watch,

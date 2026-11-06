@@ -2,10 +2,10 @@
 
 use std::{collections::VecDeque, io::Write, path::Path, sync::Arc};
 
+use blaze_core::lock::Lock;
 use blaze_registry::http::{Http, Response, Retry, Transport};
 use blaze_units::query::{Fetch, FetchKind};
 use blaze_vfs::Mode;
-use parking_lot::Mutex;
 
 use blaze_fetch::scrub as redact;
 
@@ -19,15 +19,17 @@ enum Answer {
     Reset,
 }
 
-#[derive(Default)]
 struct Fake {
-    answers: Mutex<VecDeque<Answer>>,
-    asked: Mutex<Vec<(String, Vec<(String, String)>)>>,
+    answers: Lock<VecDeque<Answer>>,
+    asked: Lock<Vec<(String, Vec<(String, String)>)>>,
 }
 
 impl Fake {
     fn new(answers: Vec<Answer>) -> Arc<Fake> {
-        Arc::new(Fake { answers: Mutex::new(answers.into()), asked: Mutex::default() })
+        Arc::new(Fake {
+            answers: Lock::new("serve.fetch.tests.answers", answers.into()),
+            asked: Lock::new("serve.fetch.tests.asked", Vec::new()),
+        })
     }
 
     fn asked(&self) -> Vec<(String, Vec<(String, String)>)> {

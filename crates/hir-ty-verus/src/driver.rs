@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use air::{
@@ -257,13 +257,17 @@ fn prove_inner(
     vir::well_formed::check_crate_merged(&krate).map_err(vir("vir"))?;
 
     // The verifier (`verify_crate_inner`, then `verify_bucket` for the function's module).
+    #[expect(
+        clippy::disallowed_types,
+        reason = "vendored vir's `GlobalCtx::new` takes `Arc<std::sync::Mutex<..>>` for its logs; blaze passes none"
+    )]
     let mut global = GlobalCtx::new(
         &krate,
         lowered.crate_id.clone(),
         lowered.span.clone(),
         config.rlimit as f32 / RLIMIT_PER_SECOND as f32,
-        Arc::new(Mutex::new(None)),
-        Arc::new(Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(None)),
         Arc::new(warning_ctx),
         SmtSolver::Z3,
         false,

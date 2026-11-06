@@ -24,7 +24,7 @@ use hir_def::nameres::crate_def_map;
 use hir_expand::proc_macro::{
     Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use tt::TopSubtree;
 
 use config::Corpus;
@@ -41,7 +41,7 @@ struct Compared {
     difference: Option<String>,
 }
 
-type Comparisons = Arc<Mutex<Vec<Compared>>>;
+type Comparisons = Arc<Lock<Vec<Compared>>>;
 
 /// A macro that expands each call on the evaluator and in its module, noting how the two
 /// compare, and gives the evaluator's output.
@@ -191,7 +191,7 @@ fn a_modules_expansion_is_the_evaluators_in_every_token() {
     let config = Corpus::read().unwrap_or_else(|why| panic!("{why}"));
     let modules =
         config.wasm.clone().unwrap_or_else(|| panic!("{}: no `wasm` modules", config::VAR));
-    let compared = Comparisons::default();
+    let compared: Comparisons = Arc::new(Lock::new("macro.test.wasm.compared", Vec::new()));
     let loaded = blaze_macro_eval::Modules::new().unwrap_or_else(|why| panic!("{why}"));
     // Each call runs on both engines to compare them, so none is kept or found.
     let macros = blaze_macro_eval::Macros::nothing("each call is compared on both engines");

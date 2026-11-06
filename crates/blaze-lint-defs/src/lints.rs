@@ -939,6 +939,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lock_across_query", Allow, "detects a lock guard held across a query call")
         .externally_loaded(),
+    l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
+        .externally_loaded(),
     l("blaze::blocking_on_pool", Allow, "detects a blocking call on a pool thread or fiber")
         .externally_loaded(),
     l("blaze::unnamed_wait", Allow, "detects a wait with no span naming what it waits for")

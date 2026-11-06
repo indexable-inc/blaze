@@ -5,8 +5,6 @@
 
 use std::fmt::Write as _;
 
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
 use crate::pump::Waiting;
 
 /// What a wait waits on.
@@ -103,49 +101,6 @@ pub fn wait<R>(on: WaitOn<'_>, owner: Option<u64>, block: impl FnOnce() -> R) ->
     result
 }
 
-/// `lock`, said as a wait on `name` only when another holds it: an uncontended lock costs a
-/// `try_lock`.
-pub fn lock<'a, T>(lock: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
-    match lock.try_lock() {
-        Some(held) => held,
-        None => wait(WaitOn::Lock(name), None, || lock.lock()),
-    }
-}
-
-/// `lock.read()`, said as a wait on `name` only when a writer holds it or waits for it.
-pub fn read<'a, T>(lock: &'a RwLock<T>, name: &'static str) -> RwLockReadGuard<'a, T> {
-    match lock.try_read() {
-        Some(held) => held,
-        None => wait(WaitOn::Lock(name), None, || lock.read()),
-    }
-}
-
-/// `lock.write()`, said as a wait on `name` only when another holds it.
-pub fn write<'a, T>(lock: &'a RwLock<T>, name: &'static str) -> RwLockWriteGuard<'a, T> {
-    match lock.try_write() {
-        Some(held) => held,
-        None => wait(WaitOn::Lock(name), None, || lock.write()),
-    }
-}
-
-/// `condvar.wait(&mut held)` until `until` holds, said as a wait on the channel `name`.
-pub fn wait_until<'a, T>(
-    condvar: &Condvar,
-    mut held: MutexGuard<'a, T>,
-    name: &'static str,
-    mut until: impl FnMut(&mut T) -> bool,
-) -> MutexGuard<'a, T> {
-    if until(&mut held) {
-        return held;
-    }
-    wait(WaitOn::Channel(name), None, || {
-        while !until(&mut held) {
-            condvar.wait(&mut held);
-        }
-        held
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,34 +118,5 @@ mod tests {
         assert_eq!(named(WaitOn::Child(42)), "child 42");
         assert_eq!(named(WaitOn::Scope(9)), "scope 9");
         assert_eq!(named(WaitOn::Key("infer_query(Id(7))")), "infer_query(Id(7))");
-    }
-
-    #[test]
-    fn an_uncontended_lock_is_taken_and_a_held_one_waited_for() {
-        let guarded = std::sync::Arc::new(Mutex::new(0));
-        *lock(&guarded, "a test's") += 1;
-        let held = guarded.lock();
-        let other = std::sync::Arc::clone(&guarded);
-        let waiter = std::thread::spawn(move || *lock(&other, "a test's"));
-        crate::spin::busy(std::time::Duration::from_millis(20));
-        drop(held);
-        assert_eq!(waiter.join().unwrap(), 1);
-    }
-
-    #[test]
-    fn readers_share_an_rwlock_and_a_writer_waits_for_them() {
-        let guarded = std::sync::Arc::new(RwLock::new(0));
-        *write(&guarded, "a test's") += 1;
-        let first = read(&guarded, "a test's");
-        assert_eq!(*read(&guarded, "a test's"), 1, "a second reader takes it beside the first");
-        let other = std::sync::Arc::clone(&guarded);
-        let writer = std::thread::spawn(move || {
-            *write(&other, "a test's") += 1;
-            *read(&other, "a test's")
-        });
-        crate::spin::busy(std::time::Duration::from_millis(20));
-        assert_eq!(*first, 1, "the writer waits while a reader holds it");
-        drop(first);
-        assert_eq!(writer.join().unwrap(), 2);
     }
 }

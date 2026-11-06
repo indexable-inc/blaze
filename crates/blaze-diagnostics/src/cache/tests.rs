@@ -7,7 +7,7 @@ use blaze_ids::ContentId;
 use hir_def::deps::{self as deps, ImageBuf, ImageStore};
 use hir_expand::fixture;
 use hir_ty_borrowck::Mode;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use span::FileId;
 
@@ -378,9 +378,14 @@ fn a_served_outcome_renders_byte_identical() {
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
-#[derive(Default)]
 struct Memory {
-    values: Mutex<blaze_hash::HashMap<ContentId, Arc<Aligned>, Global>>,
+    values: Lock<blaze_hash::HashMap<ContentId, Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { values: Lock::new("test.diag.cache_images", Default::default()) }
+    }
 }
 
 impl ImageStore for Memory {

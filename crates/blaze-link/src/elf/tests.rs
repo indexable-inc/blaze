@@ -8,7 +8,7 @@ use super::dynamic::{elf_hash, gnu_hash};
 use super::image::section_name;
 use super::{Elf, Segment, section, writer};
 use crate::model::zeroed;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::cow::CowBytes;
 use crate::model::{
@@ -74,7 +74,8 @@ struct Fixture {
 impl Fixture {
     /// An incremental `output` gets a writer that keeps its tables.
     fn new(output: Output, pieces: &[(Class, u64, u64)], counts: &Counts) -> Fixture {
-        let writer = Elf { last: output.incremental.then(Mutex::default), output };
+        let last = output.incremental.then(|| Lock::new("link.elf.last", Default::default()));
+        let writer = Elf { last, output };
         let plan = writer.plan();
         let mut wanted = pieces.to_vec();
         for (class, size) in writer.synthetic(counts) {

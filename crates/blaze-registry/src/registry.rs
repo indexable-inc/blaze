@@ -9,8 +9,8 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_hash::SharedMap;
-use parking_lot::Mutex;
 use semver::{Version, VersionReq};
 
 use blaze_source::SourceId;
@@ -47,9 +47,14 @@ pub struct Registry {
 }
 
 /// One index file read once for every query that asks for it while it is read.
-#[derive(Default)]
 struct Read {
-    state: Mutex<ReadState>,
+    state: Lock<ReadState>,
+}
+
+impl Default for Read {
+    fn default() -> Read {
+        Read { state: Lock::new("registry.index.read", ReadState::default()) }
+    }
 }
 
 enum ReadState {
@@ -83,7 +88,7 @@ impl Read {
         .await
     }
 
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ReadState> {
+    fn lock(&self) -> LockGuard<'_, ReadState> {
         self.state.lock()
     }
 }

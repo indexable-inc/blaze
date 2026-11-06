@@ -29,7 +29,7 @@ use hir_ty::{
         goal_store::{FactObject, FactRef},
     },
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use rustc_type_ir::fast_reject::SimplifiedType;
 use std::alloc::Global;
 
@@ -528,7 +528,7 @@ const REFUSALS: &[(&str, &str)] = &[
 /// Lane item-hash's side, with a body's identity its debug name (one database only) and every
 /// classification kept.
 struct Probe {
-    seen: Mutex<Vec<Seen>>,
+    seen: Lock<Vec<Seen>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -584,9 +584,14 @@ impl BodyFacts for Probe {
 }
 
 /// A store in memory.
-#[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
+    images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { images: Lock::new("test.itemhash.images", Default::default()) }
+    }
 }
 
 impl ImageStore for Memory {
@@ -608,7 +613,7 @@ impl ImageStore for Memory {
 /// store installed, and gives what each read was classified as.
 fn steps_seen() -> (Db, Vec<Seen>) {
     let db = db_of(STEPS);
-    let probe = Arc::new(Probe { seen: Mutex::default() });
+    let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
     let installed = body_store::install(
         &db,
         Arc::new(Memory::default()),

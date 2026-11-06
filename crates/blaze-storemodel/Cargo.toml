@@ -21,7 +21,6 @@ blaze-kernel.workspace = true
 blaze-rng.workspace = true
 blaze-store-check.workspace = true
 crossbeam-channel.workspace = true
-parking_lot.workspace = true
 
 [lints]
 workspace = true

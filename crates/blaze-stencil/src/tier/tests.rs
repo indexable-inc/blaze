@@ -11,7 +11,7 @@ use cranelift_codegen::{
     isa::CallConv,
     settings,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::*;
 
@@ -549,8 +549,8 @@ fn the_round_trip_in_simulation() {
 struct Threaded {
     memory: Arc<[AtomicU64]>,
     next: AtomicU64,
-    slots: Mutex<Vec<(Tier, Option<u64>)>>,
-    recompiles: Mutex<Vec<Promote>>,
+    slots: Lock<Vec<(Tier, Option<u64>)>>,
+    recompiles: Lock<Vec<Promote>>,
 }
 
 impl Recompile for Arc<Threaded> {
@@ -572,10 +572,11 @@ fn the_runner_tiers_a_running_program() {
     let daemon = Arc::new(Threaded {
         memory: (0..128).map(|_| AtomicU64::new(0)).collect(),
         next: AtomicU64::new(u64::from(FUNCTIONS)),
-        slots: Mutex::new(
+        slots: Lock::new(
+            "test.stencil.slots",
             (0..FUNCTIONS).map(|it| (Tier::Stencil, Some(u64::from(it * CELLS)))).collect(),
         ),
-        recompiles: Mutex::new(Vec::new()),
+        recompiles: Lock::new("test.stencil.recompiles", Vec::new()),
     });
     let config = Config { period: Duration::from_millis(1), workers: 2 };
     let runner =
@@ -624,8 +625,8 @@ fn cells_that_cannot_be_read_stop_the_tiering_and_say_so() {
     let daemon = Arc::new(Threaded {
         memory: Arc::clone(&memory),
         next: AtomicU64::new(1),
-        slots: Mutex::new(vec![(Tier::Stencil, None)]),
-        recompiles: Mutex::new(Vec::new()),
+        slots: Lock::new("test.stencil.slots", vec![(Tier::Stencil, None)]),
+        recompiles: Lock::new("test.stencil.recompiles", Vec::new()),
     });
     let config = Config { period: Duration::from_millis(1), workers: 1 };
     let runner = Runner::start(1, policy(), config, memory, daemon).unwrap();
@@ -654,8 +655,8 @@ fn a_panic_reading_the_cells_stops_the_tiering_and_says_so() {
     let daemon = Arc::new(Threaded {
         memory: (0..2).map(|_| AtomicU64::new(0)).collect(),
         next: AtomicU64::new(1),
-        slots: Mutex::new(vec![(Tier::Stencil, None)]),
-        recompiles: Mutex::new(Vec::new()),
+        slots: Lock::new("test.stencil.slots", vec![(Tier::Stencil, None)]),
+        recompiles: Lock::new("test.stencil.recompiles", Vec::new()),
     });
     let config = Config { period: Duration::from_millis(1), workers: 1 };
     let runner = Runner::start(1, policy(), config, Panicking, daemon).unwrap();
@@ -675,8 +676,8 @@ fn a_zero_period_is_refused() {
     let daemon = Arc::new(Threaded {
         memory: Arc::clone(&memory),
         next: AtomicU64::new(0),
-        slots: Mutex::new(Vec::new()),
-        recompiles: Mutex::new(Vec::new()),
+        slots: Lock::new("test.stencil.slots", Vec::new()),
+        recompiles: Lock::new("test.stencil.recompiles", Vec::new()),
     });
     let config = Config { period: Duration::ZERO, workers: 1 };
     assert!(Runner::start(1, policy(), config, memory, daemon).is_err());

@@ -932,7 +932,7 @@ struct Exports<B: Prepare> {
     /// The making under way of each, by function.
     making: blaze_graph::pump::Flights<()>,
     /// The IR each was made from, until that function's own compile takes it.
-    spare: parking_lot::Mutex<HashMap<InstanceKey, B::Prepared>>,
+    spare: blaze_core::lock::Lock<HashMap<InstanceKey, B::Prepared>>,
 }
 
 impl<B: Prepare> Default for Exports<B> {
@@ -941,7 +941,7 @@ impl<B: Prepare> Default for Exports<B> {
             made: blaze_hash::SharedByHash::default(),
             making: blaze_graph::pump::Flights::default(),
             // alloc: per release build, the IR its exports were made from
-            spare: parking_lot::Mutex::new(HashMap::new()),
+            spare: blaze_core::lock::Lock::new("codegen.driver.export_spare", HashMap::new()),
         }
     }
 }

@@ -2237,7 +2237,7 @@ mod tests {
     };
 
     use blaze_ids::rng::SplitMix64;
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
 
     use super::{keeps, Expand, FlatTree, Splice, HUGE, LONG};
     use crate::{
@@ -2311,7 +2311,8 @@ mod tests {
 
     /// The parts of the lazy nodes of every outline the tests build, by the number in their
     /// first token.
-    static PARTS: Mutex<BTreeMap<usize, FlatTree>> = Mutex::new(BTreeMap::new());
+    static PARTS: Lock<BTreeMap<usize, FlatTree>> =
+        Lock::new("test.syntax.flat_parts", BTreeMap::new());
     static NEXT_PART: AtomicUsize = AtomicUsize::new(0);
     const DATA: u32 = 0x5eed;
 

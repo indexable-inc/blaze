@@ -625,11 +625,11 @@ fn a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling() {
 fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
 
     let mut vfs = new_vfs();
     let reader = vfs.reader();
-    let published = Mutex::new(Vec::<ContentId>::new());
+    let published = Lock::new("vfs.test.published", Vec::<ContentId>::new());
     let finished = AtomicUsize::new(0);
     const READERS: usize = 4;
     std::thread::scope(|scope| {

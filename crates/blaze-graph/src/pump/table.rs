@@ -30,7 +30,7 @@ use crate::{
     sched::CounterId,
     spin::SpinWait,
     sync::{
-        MutexGuard,
+        LockGuard,
         atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -166,7 +166,7 @@ unsafe impl<V: Send> Sync for Bucket<V> {}
 impl<V> Bucket<V> {
     fn new() -> Bucket<V> {
         Bucket {
-            latch: Lock::new(false),
+            latch: Lock::new("graph.runs.bucket_latch", false),
             runs: [AtomicU64::new(0), AtomicU64::new(0)],
             entries: UnsafeCell::new(Entries {
                 keys: [Key([0; 32]); ENTRIES],
@@ -249,7 +249,7 @@ impl<V> Table<V> {
 struct Latched<'a, V> {
     table: &'a Table<V>,
     home: &'a Bucket<V>,
-    _held: MutexGuard<'a, bool>,
+    _held: LockGuard<'a, bool>,
 }
 
 impl<'a, V> Latched<'a, V> {
@@ -333,7 +333,7 @@ impl<V> Runs<V> {
             // alloc: the first table, once
             table: AtomicPtr::new(Box::into_raw(Box::new(Table::new(buckets)))),
             retired: SegQueue::new(),
-            grow: Lock::new(()),
+            grow: Lock::new("graph.runs.grow", ()),
             _owns: PhantomData,
         }
     }
@@ -349,7 +349,7 @@ impl<V> Runs<V> {
         loop {
             let table = self.current();
             let home = table.home(key);
-            let held = home.latch.lock_said("a key's bucket of the table of runs");
+            let held = home.latch.lock();
             if !*held {
                 return Latched { table, home, _held: held };
             }
@@ -589,7 +589,7 @@ impl<V> Runs<V> {
         // alloc: the next table, at a grow
         let next = Box::new(Table::new(2 * from.buckets.len()));
         for home in &from.buckets {
-            let mut moved = home.latch.lock_said("a key's bucket of the table of runs, to move it");
+            let mut moved = home.latch.lock();
             // SAFETY: the latch is held.
             for bucket in unsafe { chain(home) } {
                 for at in 0..ENTRIES {

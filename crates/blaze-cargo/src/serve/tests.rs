@@ -32,7 +32,6 @@ use blaze_units::{
     schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Change, Op, ViewId};
-use parking_lot::Mutex;
 
 use super::{
     Daemon, Options,
@@ -484,9 +483,14 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
 }
 
 /// The build of fakes; `fetched` counts each fetch by its `at`.
-#[derive(Default)]
 pub(super) struct Fake {
-    fetched: Mutex<BTreeMap<String, usize>>,
+    fetched: blaze_core::lock::Lock<BTreeMap<String, usize>>,
+}
+
+impl Default for Fake {
+    fn default() -> Fake {
+        Fake { fetched: blaze_core::lock::Lock::new("serve.tests.fetched", BTreeMap::new()) }
+    }
 }
 
 impl Steps for Fake {

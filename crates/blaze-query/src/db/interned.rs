@@ -13,7 +13,6 @@ use std::{
 
 use blaze_hash::LazyKey;
 use blaze_mem::{Tag, swiss};
-use parking_lot::Mutex;
 
 use super::{
     DatabaseKeyIndex, EventKind, Id, MemoryUsage,
@@ -55,7 +54,8 @@ pub(crate) struct InternRow<F> {
 struct Shard {
     index: swiss::Index,
     /// How many values the shard's index holds; its lock serializes inserts.
-    len: Mutex<usize>,
+    #[expect(clippy::disallowed_types, reason = "a shard's insert lock: held to look again and insert one value, never across a call")]
+    len: blaze_core::lock::Lock<usize>,
 }
 
 pub(crate) struct InternTable<F> {
@@ -66,6 +66,7 @@ pub(crate) struct InternTable<F> {
 }
 
 impl<F: Send + Sync + 'static> Table for InternTable<F> {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     fn new(_: &Storage, _: u32) -> InternTable<F> {
         InternTable {
             pages: Pages::new(Tag::Intern),
@@ -73,7 +74,7 @@ impl<F: Send + Sync + 'static> Table for InternTable<F> {
             // alloc: once per interned ingredient per storage
             shards: Box::new(std::array::from_fn(|_| Shard {
                 index: swiss::Index::new(),
-                len: Mutex::new(0),
+                len: blaze_core::lock::Lock::new("query.interned.shard_len", 0),
             })),
             _of: PhantomData,
         }

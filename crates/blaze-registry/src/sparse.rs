@@ -13,8 +13,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use blaze_core::lock::Lock;
 use blaze_hash::SharedSet;
-use parking_lot::Mutex;
 
 use blaze_source::SourceId;
 
@@ -56,7 +56,7 @@ pub struct SparseIndex {
     update: AtomicBool,
     /// The files asked for since the index was last updated.
     fresh: SharedSet<String>,
-    config: Mutex<Option<RegistryConfig>>,
+    config: Lock<Option<RegistryConfig>>,
     auth: Option<Arc<Auth>>,
     /// The registry's name in the configuration, found once a token is first asked for.
     #[expect(
@@ -67,9 +67,9 @@ pub struct SparseIndex {
     /// Whether requests carry the token.
     auth_required: AtomicBool,
     /// The `login_url` of the last 401's `www-authenticate: Cargo` challenge.
-    login_url: Mutex<Option<String>>,
+    login_url: Lock<Option<String>>,
     /// The headers of the last 401, which the providers are given.
-    auth_error_headers: Mutex<Vec<String>>,
+    auth_error_headers: Lock<Vec<String>>,
 }
 
 impl SparseIndex {
@@ -96,12 +96,12 @@ impl SparseIndex {
             offline,
             update: AtomicBool::new(false),
             fresh: SharedSet::default(),
-            config: Mutex::default(),
+            config: Lock::new("registry.sparse.config", None),
             auth,
             name: Default::default(),
             auth_required: AtomicBool::new(false),
-            login_url: Mutex::default(),
-            auth_error_headers: Mutex::default(),
+            login_url: Lock::new("registry.sparse.login_url", None),
+            auth_error_headers: Lock::new("registry.sparse.auth_error_headers", Vec::new()),
         })
     }
 

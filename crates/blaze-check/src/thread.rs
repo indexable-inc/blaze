@@ -66,6 +66,10 @@ impl Builder {
         }
         let name: Option<Arc<str>> = self.name.map(Arc::from);
         // alloc: the spawned thread's result, once per spawn, as std's `spawn`
+        #[expect(
+            clippy::disallowed_types,
+            reason = "below blaze-core: blaze-check is a dependency of blaze-core; a model thread's result slot"
+        )]
         let result = Arc::new(parking_lot::Mutex::new(None));
         let slot = Arc::clone(&result);
         // alloc: the spawned thread's body, once per spawn, as std's `spawn`
@@ -98,6 +102,10 @@ pub struct JoinHandle<T> {
     inner: Handle<T>,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core: blaze-check is a dependency of blaze-core; a model thread's result slot"
+)]
 enum Handle<T> {
     Std(std::thread::JoinHandle<T>, Thread),
     Model { tid: Tid, result: Arc<parking_lot::Mutex<Option<T>>>, thread: Thread },

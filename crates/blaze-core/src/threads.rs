@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use crate::lock::{Lock, LockGuard, Signal};
 
 #[cfg(unix)]
 use blaze_mem::{Slab, Tag as MemTag};
@@ -248,15 +248,15 @@ pub(crate) mod tagged {
 #[cfg_attr(not(unix), allow(unused_imports))]
 use tagged::{Id, Tagged};
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
 /// A queue many threads put into and one or a few take from, under a lock. A put never
 /// blocks, and wakes a taker only when one waits.
 struct Mailbox<T> {
-    state: Mutex<Inbox<T>>,
-    ready: Condvar,
+    state: Lock<Inbox<T>>,
+    ready: Signal,
 }
 
 struct Inbox<T> {
@@ -270,8 +270,8 @@ impl<T> Mailbox<T> {
         // alloc: once per driver, the room of what is told between two polls.
         let items = VecDeque::with_capacity(room);
         Mailbox {
-            state: Mutex::new(Inbox { items, waiting: 0, closed: false }),
-            ready: Condvar::new(),
+            state: Lock::new("core.threads.inbox", Inbox { items, waiting: 0, closed: false }),
+            ready: Signal::new("core.threads.inbox_ready"),
         }
     }
 
@@ -358,9 +358,9 @@ struct Shared {
     done: Mailbox<Told>,
     files: Mailbox<Effect>,
     #[cfg(unix)]
-    errands: Mutex<Errands>,
+    errands: Lock<Errands>,
     #[cfg(unix)]
-    errand: Condvar,
+    errand: Signal,
     #[cfg(test)]
     off: OffThread,
 }
@@ -455,9 +455,9 @@ impl Threads {
             files: Mailbox::new(RESERVE),
             #[cfg(unix)]
             // alloc: once per driver, the room of the errands asked for at once.
-            errands: Mutex::new(Errands { errands: VecDeque::with_capacity(RESERVE), idle: 0, closed: false }),
+            errands: Lock::new("core.threads.errands", Errands { errands: VecDeque::with_capacity(RESERVE), idle: 0, closed: false }),
             #[cfg(unix)]
-            errand: Condvar::new(),
+            errand: Signal::new("core.threads.errand_ready"),
             #[cfg(test)]
             off: OffThread::default(),
         });
@@ -1160,8 +1160,14 @@ impl Listening {
 /// Where a spawn is, shared by the driver, which kills it, and its errand, which starts and
 /// reaps it.
 #[cfg(unix)]
-#[derive(Default)]
-struct Life(Mutex<Stage>);
+struct Life(Lock<Stage>);
+
+#[cfg(unix)]
+impl Default for Life {
+    fn default() -> Life {
+        Life(Lock::new("core.threads.spawn_life", Stage::default()))
+    }
+}
 
 #[cfg(unix)]
 #[derive(Default)]
@@ -1529,7 +1535,7 @@ mod linux {
         sync::Arc,
     };
 
-    use parking_lot::{Condvar, Mutex};
+    use crate::lock::{Lock, Signal};
 
     use super::{Id, Room, Shared, Told, Watching, lock};
     use crate::{Completion, Done, FileName, IoError, Tag};
@@ -1540,8 +1546,8 @@ mod linux {
         stop: OwnedFd,
         /// Written once flushes are added.
         wake: OwnedFd,
-        state: Mutex<State>,
-        started: Condvar,
+        state: Lock<State>,
+        started: Signal,
     }
 
     struct State {
@@ -1575,7 +1581,7 @@ mod linux {
             let flushes = Vec::with_capacity(4);
             let state = State { flushes, open: false, started: None, spare: None };
             // alloc: as above.
-            Ok(Arc::new(Control { stop, wake, state: Mutex::new(state), started: Condvar::new() }))
+            Ok(Arc::new(Control { stop, wake, state: Lock::new("core.test.threads.control", state), started: Signal::new("core.test.threads.started") }))
         }
 
         /// Ready for a watch: nothing signalled, nothing asked for.

@@ -33,7 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use crate::lock::Lock;
 
 use crate::{Command, Confine, Confined, Exit, Sandbox, Tag};
 
@@ -71,7 +71,7 @@ pub(crate) struct Finish {
 /// The children [`start`] made that [`reap`] has not reaped, in the order they started: a few
 /// hundred at most (the spawns in flight), each a field update under the lock, which no wait
 /// is made under.
-static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+static CHILDREN: Lock<Vec<Child>> = Lock::new("core.process.children", Vec::new());
 
 /// A child as [`CHILDREN`] lists it.
 struct Child {

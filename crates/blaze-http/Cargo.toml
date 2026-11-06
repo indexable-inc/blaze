@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 # A proxy's `Proxy-Authorization: Basic` credentials.
 base64.workspace = true
 # The SHA-256 of a pinned certificate (h3's `serverCertificateHashes` check).

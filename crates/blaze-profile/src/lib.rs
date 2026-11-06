@@ -40,6 +40,7 @@ pub mod history;
 pub mod hot;
 pub mod identity;
 pub mod live;
+pub mod locks;
 pub mod logs;
 pub mod panics;
 pub mod perf;
@@ -75,8 +76,10 @@ pub fn install() {
 /// Moves each fiber job's open spans and build with it when it resumes on another thread
 /// (`blaze_graph::sched::fiber::carry`), records its switches, spans each wait for a key
 /// another task runs (`blaze_graph::pump::span_waits`) and each job a pool runs
-/// (`blaze_graph::pool::span_jobs`). Once a process, before any driver
-/// runs: [`install`] calls it.
+/// (`blaze_graph::pool::span_jobs`), and makes the profiler the named locks' probe
+/// (`blaze_core::lock::install`, [`locks::Recorder`]): their contended waits open the same
+/// `wait` span and each is a `lock_waits` row. Once a process, before any driver runs:
+/// [`install`] calls it.
 fn carry_with_fiber_jobs() {
     use blaze_graph::{pool, pump, sched::fiber};
     static CARRIED: std::sync::Once = std::sync::Once::new();
@@ -100,6 +103,7 @@ fn carry_with_fiber_jobs() {
             driving: worker_began,
             drove: worker_ended,
         });
+        blaze_core::lock::install(&locks::RECORDER);
     });
 }
 

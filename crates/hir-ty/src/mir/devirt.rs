@@ -17,9 +17,9 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use hir_def::TraitId;
-use parking_lot::Mutex;
 use rustc_type_ir::{
     Binder, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind as _,
 };
@@ -171,7 +171,7 @@ impl fmt::Debug for World {
 
 /// The worlds given and still held, by ID: a handful a process (one a final binary being
 /// built), so a list.
-static GIVEN: Mutex<Vec<(DevirtWorld, Weak<World>)>> = Mutex::new(Vec::new());
+static GIVEN: Lock<Vec<(DevirtWorld, Weak<World>)>> = Lock::new("ty.devirt.given", Vec::new());
 
 /// A world [`given`] hands out while this is held: the code generator holds it for as long as
 /// it builds bodies against it.

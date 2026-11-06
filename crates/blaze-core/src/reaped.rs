@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use crate::lock::Lock;
 
 use crate::Tag;
 
@@ -64,7 +64,7 @@ pub struct Reaped<'a> {
 pub const MOST_LABELS: usize = 4096;
 
 /// The labels no reap has taken yet, oldest first: each a field update under the lock.
-static LABELS: Mutex<Vec<(Tag, Label)>> = Mutex::new(Vec::new());
+static LABELS: Lock<Vec<(Tag, Label)>> = Lock::new("core.reaped.labels", Vec::new());
 
 /// Where a reaped child goes, and what says the build and span a label is asked inside.
 struct Observer {

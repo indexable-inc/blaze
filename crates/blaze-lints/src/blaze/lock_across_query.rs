@@ -3,9 +3,10 @@
 //! fiber: a query may run long or wait itself, and every task that wants the lock queues behind
 //! it, the convoy rule 9 bans.
 //!
-//! A guard is `parking_lot`'s (`lock_api`'s `MutexGuard`, `RwLock` read, write and upgradable
-//! guards, the mapped, `Arc` and reentrant ones) or std's (`MutexGuard`, `RwLock`'s guards, the
-//! mapped ones, `ReentrantLockGuard`), itself or held in a tuple, an array or a field. A query is
+//! A guard is blaze's (`blaze_core::lock`'s `LockGuard`, `ReadGuard` and `WriteGuard`),
+//! `parking_lot`'s (`lock_api`'s `MutexGuard`, `RwLock` read, write and upgradable guards, the
+//! mapped, `Arc` and reentrant ones) or std's (`MutexGuard`, `RwLock`'s guards, the mapped
+//! ones, `ReentrantLockGuard`), itself or held in a tuple, an array or a field. A query is
 //! a function an attribute macro of `blaze_query_macros` made (`#[blaze_query::tracked]`,
 //! `input`, `interned`: the macro the attribute resolves to, read off the function's own
 //! definition), or a method of a trait implemented for `base_db::Db` (`HirDatabase`'s).
@@ -217,7 +218,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     found
 }
 
-fn is_guard(db: &Db, adt: hir::Adt) -> bool {
+/// Whether `adt` is a lock guard: blaze-core's, `lock_api`'s or std's.
+pub(super) fn is_guard(db: &Db, adt: hir::Adt) -> bool {
+    if facts::is_blaze_core_guard(db, adt) {
+        return true;
+    }
     let name = adt.name(db);
     let krate = adt.module(db).krate(db);
     GUARDS

@@ -40,11 +40,11 @@ use std::{
 };
 
 use base_db::{Crate, Db, Nonce};
+use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
 use blaze_reclaim::Limbo;
 use hir_def::deps::ImageStore;
-use parking_lot::Mutex;
 
 use super::{
     DbInterner, SolverDefId,
@@ -178,7 +178,7 @@ struct Store {
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key): [`Installed::flush`] stops with it. The goal it met it on was
     /// solved instead, which gives the same answer, so the build's error comes at the flush.
-    error: Mutex<Option<String>>,
+    error: Lock<Option<String>>,
 }
 
 /// The buffers an offer fills, kept for the thread's next one. Taken out for the offer and put
@@ -455,12 +455,8 @@ static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 /// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
 static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the process's one goal store reclamation pool: all unlinked stores are retired together"
-)]
-static LIMBO: std::sync::LazyLock<Mutex<Limbo>> =
-    std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
+/// The process's one goal store reclamation pool: all unlinked stores are retired together.
+static LIMBO: Lock<Limbo> = Lock::new("ty.goal_store.limbo", Limbo::new());
 
 /// Runs `f` on the goal store of `db`, if one is installed.
 #[inline]
@@ -521,7 +517,7 @@ pub fn install(
         images,
         facts,
         pending: Pending::new(),
-        error: Mutex::new(None),
+        error: Lock::new("ty.goal_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
         if slot

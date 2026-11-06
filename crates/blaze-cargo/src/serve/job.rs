@@ -75,7 +75,7 @@ use blaze_api::{
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
-use blaze_core::{Completion, Done, Effect, FileName, Meta, Tag};
+use blaze_core::{Completion, Done, Effect, FileName, Meta, Tag, lock::Lock};
 use blaze_graph::{
     Key, Outcome, Pool, RequestId, RequestStats, admission::TaskKind, machine::NodeId,
     plane::NodeRef,
@@ -98,7 +98,6 @@ use blaze_units::{
 };
 use blaze_vfs::{Change, Ticket, Vfs, ViewId};
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use blaze_mem::{Handle, MemError, Tag as MemTag};
@@ -336,8 +335,8 @@ pub(super) enum Does<S: Steps> {
     Lower {
         steps: Arc<S>,
         input: JobInput,
-        kept: Mutex<Option<S::KeptFront>>,
-        leases: Arc<Mutex<Leases>>,
+        kept: Lock<Option<S::KeptFront>>,
+        leases: Arc<Lock<Leases>>,
         checkout: String,
         builds: String,
     },
@@ -406,7 +405,7 @@ pub(super) enum Does<S: Steps> {
     /// ([`Steps::store_kept`]); taken by the task and given back in its value.
     StoreKept {
         steps: Arc<S>,
-        kept: Mutex<Option<S::KeptFront>>,
+        kept: Lock<Option<S::KeptFront>>,
         checkout: String,
     },
 }
@@ -1928,7 +1927,7 @@ struct Job<S: Steps> {
     /// The leases of the build dirs it builds into ([`lease_build_dirs`]), taken by its
     /// lowering and held until the job is dropped: the collector renames no dir while a build
     /// holds it (docs/gc.md, "Leases").
-    leases: Arc<Mutex<Leases>>,
+    leases: Arc<Lock<Leases>>,
     /// What its client is told of its wait for memory ([`Jobs::tell_paused`]).
     paused: blaze_graph::pressure::Paused,
     /// When it began, on the injected clock ([`World::now`]): what its [`Response::Doing`]
@@ -2654,7 +2653,7 @@ pub struct Jobs<S: Steps> {
     pub started: Vec<BuildRow>,
     /// The build dir leases of jobs dropped while their tasks may still write (a stall): each
     /// held until the last task lets go of the job's cancel flag ([`Jobs::release_leases`]).
-    held_leases: Vec<(JobId, Arc<AtomicBool>, Arc<Mutex<Leases>>)>,
+    held_leases: Vec<(JobId, Arc<AtomicBool>, Arc<Lock<Leases>>)>,
     /// Lowerings waiting for their root's front end to be stored ([`Jobs::lower`]).
     lowering: Vec<Lowering>,
     /// The plane requests of kept front ends' stores ([`Jobs::store_kept`]), until each
@@ -2971,7 +2970,7 @@ impl<S: Steps> Jobs<S> {
             opened_cpu: None,
             opened_ns: 0,
             opened_unix_ns: None,
-            leases: Arc::default(), // alloc: once per job, shared with its lowering
+            leases: Arc::new(Lock::new("serve.job.leases", Leases::default())), // alloc: once per job, shared with its lowering
             paused: blaze_graph::pressure::Paused::default(),
             began: w.now,
             doing_said: None,
@@ -4178,7 +4177,10 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        let kept = Mutex::new(root.and_then(|root| self.roots.fronts[root as usize].take()));
+        let kept = Lock::new(
+            "serve.job.lower.kept",
+            root.and_then(|root| self.roots.fronts[root as usize].take()),
+        );
         let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
         let (leases, builds) = (Arc::clone(&job.leases), self.setup.builds.clone()); // clone: a refcount and a path, once per view
         let learn = lower_cost_key(&checkout);
@@ -4219,7 +4221,7 @@ impl<S: Steps> Jobs<S> {
         // clone: the checkout's path, once per build, for the task's span
         let does = Does::StoreKept {
             steps: Arc::clone(w.steps),
-            kept: Mutex::new(Some(kept)),
+            kept: Lock::new("serve.job.store_kept.kept", Some(kept)),
             checkout: checkout.clone(),
         };
         let work = Step::of(&job.cancelled, does);

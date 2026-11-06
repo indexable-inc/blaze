@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
 use blaze_stencil::tier::Tier;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::flight::{Addresses, Counting, Mail, Mailbox, session};
 use super::{compiled, function, key};
@@ -82,8 +82,8 @@ fn a_miss_after_a_probe_is_compiled_by_a_worker() {
 #[test]
 fn a_hits_callees_are_prefetched_by_the_workers() {
     /// Has function 0, which calls 1 to 7, compiled already; compiles the rest.
-    #[derive(Clone, Default)]
-    struct Memo(Arc<Mutex<Vec<InstanceKey>>>);
+    #[derive(Clone)]
+    struct Memo(Arc<Lock<Vec<InstanceKey>>>);
     impl Compiler for Memo {
         fn compile(&self, at: InstanceKey) -> Result<CompiledFunction, String> {
             let n = (1..8).find(|n| key(*n) == at).ok_or("compiled, not a miss")?;
@@ -97,7 +97,7 @@ fn a_hits_callees_are_prefetched_by_the_workers() {
             Err(format!("{at:?}: not tiered"))
         }
     }
-    let memo = Memo::default();
+    let memo = Memo(Arc::new(Lock::new("lazy.test.memo.compiled", Vec::new())));
     let (runner, mail) = start(8, memo.clone(), 3);
     pause();
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();

@@ -2185,6 +2185,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = doing::memory();
         let pool = blaze_graph::exec::shared();
         let working = pool.working();
+        let stall = self.pulse.stall();
         let look = doing::Look {
             now,
             running: &running,
@@ -2195,6 +2196,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             workers: u32::try_from(pool.workers()).unwrap_or(u32::MAX),
             fetching: &fetching,
             memory: &memory,
+            stall: stall.as_deref(),
         };
         let mut said = self.spare.said.pop().unwrap_or_default();
         let mut builds = std::mem::take(&mut self.builds);

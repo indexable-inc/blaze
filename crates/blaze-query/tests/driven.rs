@@ -3,14 +3,15 @@
 //! `wasm64-blaze-wasip1`. The scheduler's wait graph is the process's and the scenarios' queries
 //! keep statics, so each test holds [`ONE`] and the binary is their own.
 #![cfg(not(blaze_check))]
+#![allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 #[path = "driven/scenarios.rs"]
 mod scenarios;
 
 /// One test at a time: the wait graph and the queries' statics are the whole process's.
-static ONE: Mutex<()> = Mutex::new(());
+static ONE: Lock<()> = Lock::new("query.test.driven.one", ());
 
 fn run(name: &str) {
     let _one = ONE.lock();

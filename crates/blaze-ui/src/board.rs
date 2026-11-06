@@ -44,7 +44,9 @@
 //! always there, colored by pressure; over the limit it moves above the header. When the area
 //! is shorter than the content, the running rows shrink first, then the other sections go from
 //! the bottom up, then the footer; the header, the workers, the memory and the warnings stay
-//! while there is room. Drawing never panics on any size, 0 by 0 included: every write is
+//! while there is room, and so does the stall: the daemon's top stall in its wait-for graph
+//! ([`Now::stall`], ` ⚠ convoy: 61 behind thread 7 on lock flight.intern ...`), under the
+//! warning in both forms and at the end of the compact line, while one lasts. Drawing never panics on any size, 0 by 0 included: every write is
 //! clipped to the area.
 
 #![blaze::sans_io]
@@ -147,6 +149,8 @@ struct Mark {
     pressure: Pressure,
     stalled: bool,
     slow: bool,
+    /// The daemon named a stall in its wait-for graph ([`Now::stall`]).
+    locked: bool,
 }
 
 /// Whether a block of the full form stays when the area is too short for every block.
@@ -257,6 +261,7 @@ impl Board {
             pressure: now.memory.pressure(),
             stalled: now.stalled(),
             slow: now.slow(),
+            locked: now.stall.is_some(),
         };
         let due = match self.last {
             None => true,
@@ -266,6 +271,7 @@ impl Board {
                     || last.pressure != mark.pressure
                     || (mark.stalled && !last.stalled)
                     || (mark.slow && !last.slow)
+                    || (mark.locked && !last.locked)
                     || mark.at_ms >= last.at_ms.saturating_add(LINE_EVERY_MS)
             }
         };
@@ -345,6 +351,9 @@ impl Board {
         if let Some(warning) = self.warning() {
             blocks.push(one(Keep::Always, warning));
         }
+        if let Some(stall) = self.stall_row(width) {
+            blocks.push(one(Keep::Always, stall));
+        }
         if let Some(longest) = self.longest() {
             blocks.push(one(Keep::Always, longest));
         }
@@ -387,6 +396,9 @@ impl Board {
             rows.push(warning);
         } else if matches!(now.memory.pressure(), Pressure::Squeezed | Pressure::Over) {
             rows.push(self.memory_row(width));
+        }
+        if let Some(stall) = self.stall_row(width) {
+            rows.push(stall);
         }
         let mut tail = Vec::with_capacity(2); // alloc: a draw's last rows
         if let Some(blocker) = now.blockers.first() {
@@ -563,6 +575,16 @@ impl Board {
         } else {
             return None;
         };
+        Some(Line::from(vec![Span::raw(" "), Span::styled(text, style)])) // alloc: a row
+    }
+
+    /// ` ⚠ convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is
+    /// running`: the daemon's top stall in its wait-for graph ([`Now::stall`]), red and bold,
+    /// cut to the width; none while no stall lasts.
+    fn stall_row(&self, width: usize) -> Option<Line<'static>> {
+        let line = self.now.stall.as_deref()?;
+        let text = fit(&format!("⚠ {line}"), width.saturating_sub(1)); // alloc: a row's text
+        let style = self.style(Color::Red).add_modifier(Modifier::BOLD);
         Some(Line::from(vec![Span::raw(" "), Span::styled(text, style)])) // alloc: a row
     }
 
@@ -1010,7 +1032,8 @@ fn shorten(mut blocks: Vec<Block>, height: usize) -> Vec<Line<'static>> {
 /// `[15m14s] compiling 488 of 570 done · 1 of 16 busy · 3 running: codegen core 1.0.0 lib
 /// (host) 4m30s, ... · mem 20.1/24.0 GB squeezed · on codegen core (core::ptr::is_freeze,
 /// 4m30s), holds 82 · slow: nothing settled for 4m30s`. After the memory it names the first
-/// blocker, else the first download, else the stage.
+/// blocker, else the first download, else the stage; last, the
+/// daemon's stall in its wait-for graph while one lasts (`· convoy: 61 behind thread 7 ...`).
 fn compact(now: &Now, out: &mut String) {
     let start = out.len();
     put!(out, "[{}] {}", time(now.at_ms), now.phase.word());
@@ -1061,6 +1084,9 @@ fn compact(now: &Now, out: &mut String) {
         put!(out, " · stalled: nothing settled for {}", time(now.quiet_ms));
     } else if now.slow() {
         put!(out, " · slow: nothing settled for {}", time(now.quiet_ms));
+    }
+    if let Some(stall) = &now.stall {
+        put!(out, " · {stall}");
     }
     let end = start + out[start..].trim_end().len();
     out.truncate(end);
