@@ -43,6 +43,24 @@ pub struct Truncate {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct OneLine;
 
+/// What a one-line node (`OneLine`, `Truncate`) shows of `text`: its first line that is not blank, with an ellipsis when
+/// more lines follow. A one-line node is one line tall in a box laid for one line (a table row is fixed height), so a hard
+/// line break must never reach the shaper: it would measure and draw every line from the node's origin, over its
+/// neighbours. Measuring and drawing both go through this, so they agree.
+#[must_use]
+pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut lines = text.lines().map(str::trim_end).skip_while(|l| l.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    if lines.any(|l| !l.trim().is_empty()) {
+        std::borrow::Cow::Owned(format!("{first} \u{2026}"))
+    } else {
+        std::borrow::Cow::Borrowed(first)
+    }
+}
+
 /// The glyph of an `Icon`, by name in den's icon set.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Icon {
@@ -285,4 +303,18 @@ pub fn register(world: &World) {
     world.component::<Truncate>().writable();
     world.component::<Vector>().writable();
     world.component::<VectorText>().writable();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::one_line;
+
+    #[test]
+    fn one_line_never_breaks() {
+        assert_eq!(one_line("plain"), "plain");
+        assert_eq!(one_line("395: a\n396: b"), "395: a \u{2026}");
+        assert_eq!(one_line("\n\n  first  \n"), "  first");
+        assert_eq!(one_line("a\r\nb"), "a \u{2026}");
+        assert_eq!(one_line("\n"), "");
+    }
 }
