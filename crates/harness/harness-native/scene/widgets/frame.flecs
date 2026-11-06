@@ -83,9 +83,9 @@ hn {
 
   // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
   // frame on every side so it hugs the row's content with air between neighbours, and matched by id: the tree's one
-  // highlight, whichever row holds it, springing (position and height, the tree's spring family) from where it was drawn
-  // to the new row, and growing with a row that is still folding in (a folding row poses only its words, never its
-  // pill). The row picks the plate's Fill (tone_row_select, or tone_select_focus while the tree has the keyboard).
+  // highlight, whichever row holds it, its position springing (the tree's spring family) from where it was drawn to the
+  // new row while its size is always the new row's, so it is never shorter than the words it sits under. A row still
+  // folding in is Settling: its pill holds where it was until the row has opened, then slides in. The row picks the plate's Fill (tone_row_select, or tone_select_focus while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}

@@ -16,7 +16,7 @@ use harness_native_ui_layout_api::{
 };
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
-    Animate, CopyFlash, Drawn, FillTween, FromEdge, Leaving, Flip, Matched, MatchedGeometry, Motion, PadTween, Pose, Posed, Posing, Reveal, Shown, ShownWhen, SizeTween, Target,
+    Animate, CopyFlash, Drawn, FillTween, FromEdge, Leaving, Flip, Matched, MatchedGeometry, Motion, PadTween, Pose, Posed, Posing, Reveal, Settling, Shown, ShownWhen, SizeTween, Target,
     Transition, TransitionKind,
 };
 use harness_native_ui_node_api::{Hidden, Laid};
@@ -128,8 +128,10 @@ fn scrolled(e: EntityView<'_>) -> (f32, f32) {
     (x, y)
 }
 
-/// One frame of a matched id's springs toward `to` (content space); whether it still moves. A slide retargets from where
-/// it is drawn and how fast it goes. From rest (not moving last frame), a move of more than `jump` of its heights lands
+/// One frame of a matched id's springs toward `to` (content space); whether it still moves. Its position springs; its
+/// size lands on `to`'s every frame (a slide between a session's row and a shorter run's never passes through a height
+/// neither has, and a pill is never drawn shorter than the row under it). A slide retargets from where it is drawn and
+/// how fast it goes. From rest (not moving last frame), a move of more than `jump` of its heights lands
 /// at once; mid-slide it never does. Its height is the taller of where it is and where it goes: a node that is still
 /// unfolding (a new row growing in from nothing, its pill with it) is not hundreds of its own heights away. With no
 /// tune, on its first frame or when `land` (the view was rescaled under it: its node moved because the room did, not
@@ -141,13 +143,14 @@ fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, land: bool, 
     let still = match tune.filter(|_| st.started && !far && !land) {
         Some(tune) => {
             let mut still = false;
-            for (s, v) in [(&mut st.x, to.x), (&mut st.y, to.y), (&mut st.w, to.w), (&mut st.h, to.h)] {
+            for (s, v) in [(&mut st.x, to.x), (&mut st.y, to.y)] {
                 still |= settle(s, v, tune, dt);
             }
+            (st.w, st.h) = (Spring::at(to.w), Spring::at(to.h));
             if !still {
                 // At rest exactly on its node (a settled spring is only within 1e-3 of it), so the painter sees a node at
                 // rest and puts it on the pixel grid with the row it sits behind.
-                (st.x, st.y, st.w, st.h) = (Spring::at(to.x), Spring::at(to.y), Spring::at(to.w), Spring::at(to.h));
+                (st.x, st.y) = (Spring::at(to.x), Spring::at(to.y));
             }
             still
         }
@@ -292,12 +295,21 @@ pub fn install(world: WorldRef<'_>) {
             let o = w.entity_from_id(owner);
             let (sx, sy) = scrolled(o);
             let mut st = holder.try_cloned::<&Matched>().unwrap_or_default();
-            // Not laid out yet: drawn where the slide is, going on toward where it was last sent (a new selection's pill,
-            // made this frame, neither lands on its row for a frame nor loses one of the slide).
-            let to = match l {
+            // Not laid out yet, or laid in a frame that is not its own yet (a Settling ancestor: a row still folding in):
+            // drawn where the slide is, going on toward where it was last sent (a new selection's pill neither lands on
+            // its row for a frame, nor loses one of the slide, nor squeezes into a row that has not opened). With
+            // nowhere it was going, it is drawn nowhere until it has a frame.
+            let settling = std::iter::successors(Some(o), |n| n.parent()).any(|n| n.has(Settling::id()));
+            let to = match l.filter(|_| !settling) {
                 Some(l) => Laid { x: l.x + sx, y: l.y + sy, ..l },
                 None if st.started => Laid { x: st.gx, y: st.gy, w: st.gw, h: st.gh },
-                None => continue,
+                None => {
+                    let d = Drawn { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                    if l.is_some() && o.try_cloned::<&Drawn>() != Some(d) {
+                        o.set(d);
+                    }
+                    continue;
+                }
             };
             (st.gx, st.gy, st.gw, st.gh) = (to.x, to.y, to.w, to.h);
             let land = rescaled(&mut st, room, now) || still_motion;
@@ -521,8 +533,8 @@ mod tests {
         assert!(!st.moving && st.y.x == 0.0);
     }
 
-    /// A new row two rows down, still unfolding (laid next to nothing tall): its pill slides there from rest instead of
-    /// counting the move in the new row's sliver of a height and landing at once, and grows with it.
+    /// A move to a node laid next to nothing tall, two rows down: it slides there from rest instead of counting the move
+    /// in that sliver of a height and landing at once.
     #[test]
     fn matched_slides_into_a_row_that_unfolds() {
         let tune = Some(Tune { omega: 26.0, zeta: 1.0 });
@@ -531,6 +543,24 @@ mod tests {
         let sliver = Laid { x: 0.0, y: 60.0, w: 200.0, h: 0.5 };
         assert!(chase(&mut st, sliver, tune, 3.0, false, 1.0 / 60.0));
         assert!(st.moving && st.y.x > 0.0 && st.y.x < 60.0, "{}", st.y.x);
+    }
+
+    /// A slide from a session's row to a shorter run's under it: its position springs, its size is the run's from the
+    /// first frame (never a height between the two, never shorter than the row it lands on).
+    #[test]
+    fn matched_springs_position_and_lands_size() {
+        let tune = Some(Tune { omega: 26.0, zeta: 1.0 });
+        let mut st = Matched::default();
+        chase(&mut st, Laid { x: 0.0, y: 0.0, w: 200.0, h: 26.0 }, tune, 8.0, false, 1.0 / 60.0);
+        let run = Laid { x: 8.0, y: 30.0, w: 192.0, h: 20.0 };
+        for frame in 0..40 {
+            chase(&mut st, run, tune, 8.0, false, 1.0 / 60.0);
+            assert_eq!((st.w.x, st.h.x), (run.w, run.h), "frame {frame}: size between rows");
+            if frame == 0 {
+                assert!(st.y.x < run.y && st.x.x < run.x, "the position landed at once instead of springing");
+            }
+        }
+        assert!(!st.moving && st.y.x == run.y);
     }
 
     /// A zoom (the room changes) lands a slide on its node at once, mid-slide too, and through every layout pass of that
