@@ -215,6 +215,10 @@ pub struct ImageInst {
     pub clip: [f32; 4],
     /// The band across, as a panel's `clipx` (left, right, then the fades).
     pub clipx: [f32; 4],
+    /// A light layer (x > 1): the texture is a picture's light (its colour, and in alpha how hot each pixel is), drawn
+    /// over that picture to lift each pixel, in linear light, to up to `x` times its colour; it adds and covers nothing.
+    /// 0 for a plain picture.
+    pub light: [f32; 4],
 }
 
 /// A live picture from the host's Media (a Shader's or a Video's latest finished frame, media/): its texture, premultiplied,

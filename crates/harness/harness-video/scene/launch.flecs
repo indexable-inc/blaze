@@ -57,6 +57,8 @@ launch_part {
 // The mark's timeline: its letters start falling at `drop`, and it burns away from `burn`.
 const drop = 0.35
 const burn = 3.8
+// How bright the hottest fire burns, in SDR whites: the HDR10 peak over its white (1000 / 203 nits).
+const glow = 4.93
 // The low A the exit's sound comes home on.
 const home = $burn + 1.8
 
@@ -69,7 +71,7 @@ launch : ui.ZStack {
 
   stage : launch_part.Layer {
     mark : ui.Node {
-      BlazeMark: {start: $drop, exit: $burn}
+      BlazeMark: {start: $drop, exit: $burn, glow: $glow}
       Size: {w: {kind: Fixed, value: 43 * $mark_cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $mark_cell, min: 0, max: 0}}
       cue.PushIn push(at: 1.6, dur: 3.6, by: 0.05)
     }

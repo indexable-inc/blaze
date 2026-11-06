@@ -974,7 +974,7 @@ impl Painter {
                     s
                 }
             };
-            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4] };
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
             d.image(img, sheet.frames[0].clone());
             return Ok(());
         }
@@ -984,7 +984,7 @@ impl Painter {
             .map_err(|err| format!("{path}: {err}"))?;
         let frame = ((time * frames.fps).floor().max(0.0) as usize) % sheet.frames.len();
         let img =
-            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4] };
+            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
         d.image(img, sheet.frames[frame].clone());
         Ok(())
     }
@@ -1024,7 +1024,13 @@ impl Painter {
         let k = if rest[2] > 0.0 { rect[2] / rest[2] } else { 1.0 };
         let place = |r: [f32; 4]| [rect[0] + (r[0] - rest[0]) * k, rect[1] + (r[1] - rest[1]) * k, r[2] * k, r[3] * k];
         let size = [img.w as f32, img.h as f32, alpha, 0.0];
-        d.image(ImageInst { rect: place([x, y, img.w as f32 / sc, img.h as f32 / sc]), size, clip: [0.0; 4], clipx: [0.0; 4] }, img.rgba.into());
+        let at = place([x, y, img.w as f32 / sc, img.h as f32 / sc]);
+        d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] }, img.rgba.into());
+        // Past white: the hot pixels again, as light over the picture, lifting them by heat up to `glow` whites.
+        if m.glow > 1.0 {
+            let light = [m.glow, 0.0, 0.0, 0.0];
+            d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light }, img.light.into());
+        }
         Ok(())
     }
 

@@ -86,11 +86,14 @@ pub struct Frames {
 
 /// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
 /// falling in from the top of the view at `start` seconds on the frame clock, the fire catches a beat after the last lands,
-/// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file.
+/// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file. `glow` is how
+/// bright the hottest fire burns, in SDR whites: 0 or 1 is no brighter than white; above, the flames, the white-hot
+/// letters and the embers rise past it by their heat (an HDR10 video at 203-nit white and a 1000-nit peak sets 4.93).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct BlazeMark {
     pub start: f32,
     pub exit: f32,
+    pub glow: f32,
 }
 
 /// Kip, den's mascot (harness-native-kip), drawn live: a small voxel creature `size` points tall that plays the moods
