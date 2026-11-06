@@ -37,5 +37,9 @@ harness = false
 name = "record"
 harness = false
 
+[[bench]]
+name = "flight_names"
+harness = false
+
 [lints]
 workspace = true

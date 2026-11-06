@@ -200,7 +200,7 @@ fn hot(summed: &Summed, top: usize, since: Since) -> Hot {
         let Some(meta) = flight::meta(site) else { continue };
         let function = match function {
             0 => Function::None,
-            sym => flight::name(sym).map_or(Function::Forgotten(sym), Function::Named),
+            sym => flight::hot_name(sym).map_or(Function::Forgotten(sym), Function::Named),
         };
         let upper = summed.count_min.estimate(key);
         let it = named.entry((meta.name(), function)).or_default();

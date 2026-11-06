@@ -1194,6 +1194,7 @@ impl History {
                     t_ns,
                     value,
                     fiber: None,
+                    named: 0,
                 }),
             );
         }
@@ -1211,9 +1212,8 @@ impl History {
                     (Plot::ProfileSpansMade, cost.spans),
                     (Plot::ProfileCpuReads, cost.cpu_reads),
                     (Plot::ProfileNamesGiven, names.given),
-                    (Plot::ProfileNamesRaced, names.raced),
+                    (Plot::ProfileNamesLinked, names.linked),
                     (Plot::ProfileNamesLost, names.lost),
-                    (Plot::ProfileNamesHandedOff, names.handed_off),
                 ]
                 .map(|(plot, value)| CounterRow {
                     build,
@@ -1221,6 +1221,7 @@ impl History {
                     t_ns,
                     value,
                     fiber: None,
+                    named: 0,
                 }),
             );
         }
@@ -1255,6 +1256,7 @@ impl History {
                 t_ns,
                 value: total,
                 fiber: None,
+                named: 0,
             });
         }
         if !grew {
@@ -2110,6 +2112,7 @@ mod tests {
                 t_ns: i as i64,
                 value: i as u64 * 3,
                 fiber: None,
+                named: 0,
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
@@ -2158,6 +2161,7 @@ mod tests {
                     t_ns: i as i64,
                     value: i,
                     fiber: None,
+                    named: 0,
                 })
                 .collect();
             batches::counters(&rows, process).unwrap()
@@ -2866,7 +2870,7 @@ mod tests {
     #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
     fn what_a_flush_costs() {
         let functions: Vec<flight::Sym> =
-            (0..1000).map(|i| flight::intern(&format!("app::f{i}"))).collect();
+            (0..1000).map(|i| flight::read_sym(&format!("app::f{i}"))).collect();
         let rows: Vec<SpanRow> = (0..1_000_000u64)
             .map(|i| SpanRow {
                 build: 1,

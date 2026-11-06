@@ -37,31 +37,39 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, SpanRow, Sym},
+    flight::{self, SpanRow, names::Token},
     schema::{self, Type},
 };
 
 // --- Values -----------------------------------------------------------------------------
 
-/// A name a field holds (a crate, a macro's path, a unit, a key), interned: a [`Sym`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Name(Sym);
+/// A name a field holds (a crate, a macro's path, a unit, a key): a token of the thread that
+/// named it ([`flight::names`]), or a [`Sym`] of this process (under 2^32) for one read back
+/// from a row or a table. Two names are equal when their text is, whichever thread named them.
+#[derive(Clone, Copy, Debug)]
+pub struct Name(Token);
 
 impl Name {
-    /// `text`'s name: a hash and one lock of a shard of the recorder's names ([`flight::intern`]).
+    /// `text`'s name on this thread: a hash and a lookup of the thread's own names; the first
+    /// time in the thread's generation, its definition written into the thread's ring. Nothing
+    /// shared is touched ([`flight::names::Local`]).
     pub fn of(text: &str) -> Name {
         Name(flight::intern(text))
     }
 
-    pub fn sym(self) -> Sym {
-        self.0
-    }
-
     /// Its text: none once its generation of names was let go.
     pub fn text(self) -> Option<Arc<str>> {
-        flight::name(self.0)
+        flight::token_text(self.0)
     }
 }
+
+impl PartialEq for Name {
+    fn eq(&self, other: &Name) -> bool {
+        self.0 == other.0 || (self.0 != 0 && other.0 != 0 && self.text() == other.text())
+    }
+}
+
+impl Eq for Name {}
 
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
@@ -83,7 +91,8 @@ impl Name {
 
     #[cold]
     fn keep(key: (usize, usize), text: &'static str) -> Name {
-        let name = Name(flight::intern_kept(text));
+        let kept = flight::intern_kept(text);
+        let name = Name(if kept == 0 { 0 } else { flight::names::KEPT_TOKEN | u64::from(kept & !flight::names::CLASS) });
         _ = KEPT.try_with(|kept| kept.borrow_mut().insert(key, name));
         name
     }
@@ -164,9 +173,8 @@ pub trait Value: Copy + fmt::Debug + PartialEq {
     fn number(word: u64) -> Option<u64>;
     /// The word of a text cell read back from a table (0: none of these is named so).
     fn of_text(text: &str) -> u64;
-    /// Whether its word is a [`Sym`] of the process that wrote it: the flight recorder's
-    /// postmortem gives each such word of a dead process a number of this one
-    /// ([`SYM_COLUMNS`]).
+    /// Whether its word is a name ([`Name`]): a token in a slot, an id of the ring's own in a
+    /// row, which reading a ring turns into a [`Sym`] of this process ([`SYM_COLUMNS`]).
     const SYM: bool = false;
 }
 
@@ -176,15 +184,15 @@ impl Value for Name {
 
     #[inline]
     fn word(self) -> u64 {
-        u64::from(self.0)
+        self.0
     }
 
     fn of_word(word: u64) -> Option<Name> {
-        Sym::try_from(word).ok().filter(|it| *it != 0).map(Name)
+        (word != 0).then_some(Name(word))
     }
 
     fn text(word: u64) -> Option<Arc<str>> {
-        flight::name(Sym::try_from(word).ok()?)
+        flight::token_text(word)
     }
 
     fn number(_: u64) -> Option<u64> {
@@ -192,7 +200,7 @@ impl Value for Name {
     }
 
     fn of_text(text: &str) -> u64 {
-        Name::of(text).word()
+        u64::from(flight::read_sym(text))
     }
 }
 
@@ -309,9 +317,9 @@ pub trait Column {
 /// and the typed ones (0: not said).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Said {
-    pub krate: Sym,
-    pub function: Sym,
-    pub unit: Sym,
+    pub krate: Token,
+    pub function: Token,
+    pub unit: Token,
     pub typed: [u64; TYPED],
 }
 
@@ -326,21 +334,20 @@ impl Said {
     #[inline]
     pub fn get(&self, at: usize) -> u64 {
         match at {
-            CRATE => u64::from(self.krate),
-            FUNCTION => u64::from(self.function),
-            UNIT => u64::from(self.unit),
+            CRATE => self.krate,
+            FUNCTION => self.function,
+            UNIT => self.unit,
             _ => at.checked_sub(GENERIC).and_then(|it| self.typed.get(it)).copied().unwrap_or(0),
         }
     }
 
-    /// Sets the column at `at` to `word`; a generic column's word is a [`Sym`].
+    /// Sets the column at `at` to `word`; a generic column's word is a name's ([`Name`]).
     #[inline]
     pub fn set(&mut self, at: usize, word: u64) {
-        let sym = || Sym::try_from(word).unwrap_or(0);
         match at {
-            CRATE => self.krate = sym(),
-            FUNCTION => self.function = sym(),
-            UNIT => self.unit = sym(),
+            CRATE => self.krate = word,
+            FUNCTION => self.function = word,
+            UNIT => self.unit = word,
             _ => {
                 if let Some(it) = at.checked_sub(GENERIC).and_then(|it| self.typed.get_mut(it)) {
                     *it = word;

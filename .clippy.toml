@@ -3,6 +3,9 @@
 # instead of this one: these rules and a ban on locks (docs/v2/plan/design/concurrency.md). A
 # change here is made in theirs too.
 disallowed-types = [
+    # docs/v2/plan/design/profile-names.md: the flight recorder names per thread, sharing nothing.
+    { path = "blaze_profile::flight::Names", replacement = "blaze_profile::flight::names::Local", reason = "one process-wide name table shared cache lines across every recording thread: a thread names into its own table, defined in its own ring (docs/v2/plan/design/profile-names.md)", allow-invalid = true },
+    { path = "blaze_profile::flight::Shared", replacement = "blaze_profile::flight::names::Local", reason = "as for `flight::Names`: names are per thread", allow-invalid = true },
     { path = "std::collections::HashMap", replacement = "blaze_hash::HashMap", reason = "SipHash, seeded per map: blaze's maps are on `blaze_hash`'s fixed hasher, or `blaze_hash::ByHash` for keys that are hashes" },
     { path = "std::collections::HashSet", replacement = "blaze_hash::HashSet", reason = "SipHash, seeded per set: as for `HashMap`" },
     { path = "std::collections::hash_map::RandomState", replacement = "blaze_hash::FixedState", reason = "SipHash, seeded per map" },
@@ -56,6 +59,7 @@ disallowed-macros = [
 ]
 
 disallowed-methods = [
+    { path = "blaze_profile::flight::postmortem::handed_off", replacement = "blaze_profile::flight::names::Streams", reason = "a postmortem reads names from the dead process's rings (docs/v2/plan/design/profile-names.md): there is no name log to hand off to", allow-invalid = true },
     { path = "blaze_resolve::lockfile::lockfile_to_write", replacement = "blaze_units::lock::after_resolve", reason = "one place decides a resolve's lock files, with the lock policy (CI, `lock = \"required\"`, `--no-locked`) and `blaze.lock`: docs/cargo.md, \"Lock files\"", allow-invalid = true },
     { path = "blaze_cargo::toolchain::own::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },
     { path = "blaze_cargo::toolchain::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },
