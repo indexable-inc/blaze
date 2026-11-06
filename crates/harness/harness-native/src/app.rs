@@ -252,7 +252,7 @@ pub struct App {
     pub title: String,
     /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
     chrome: Chrome,
-    chrome_laid: Option<(Chrome, f32, f32)>,
+    chrome_laid: Option<(Chrome, f32, f32, f32)>,
     /// The dark appearance (the window's effective NSAppearance; the scene's fills pick their dark or light half).
     pub dark: bool,
     /// The window's screen's EDR headroom (window.rs reads it every frame and when the screen changes; the shot sets it
@@ -1660,6 +1660,10 @@ impl App {
         if self.paint.get_mut().end_frame() {
             self.poke();
         }
+        // Words streaming in fade in glyph by glyph (GlyphsArrive): draw until the last has.
+        if self.paint.get_mut().arriving {
+            self.poke_why("glyphs arriving");
+        }
         // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
         // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
         if self.paint.get_mut().kip_wake == harness_native_render::kips::Wake::Lively {
@@ -1698,10 +1702,13 @@ impl App {
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
         let width = open * x;
-        if self.chrome_laid == Some((self.chrome, z, width)) {
+        // Where the fold is going: the main card lays its panes out at the width it has once the fold rests there
+        // (hn.Main is LaysAtRest), so a terminal resizes and words wrap once per cmd+S, not on every frame of the spring.
+        let rest = open * f32::from(u8::from(self.side_open));
+        if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
         }
-        self.chrome_laid = Some((self.chrome, z, width));
+        self.chrome_laid = Some((self.chrome, z, width, rest));
         let top = self.chrome.strip / z;
         // The sidebar keeps its open width (its rows never relayout mid-fold); its clip (hn.SideClip) takes the
         // spring's width and slides it left by the part folded away.
@@ -1714,6 +1721,7 @@ impl App {
                 size.w = Sizing::fixed(width);
                 clip.set(size);
                 clip.set(ScrollState { x: open - width, y: 0.0 });
+                clip.set(harness_native_ui_layout_api::RestSize { len: rest });
             }
         }
         // The strip is the window's safe-area inset: the sidebar and the main card pad themselves out of it

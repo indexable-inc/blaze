@@ -827,6 +827,7 @@ dependencies = [
  "harness-native-ui-spring-api",
  "harness-native-ui-state-api",
  "harness-native-ui-text-api",
+ "harness-native-ui-timeline-api",
  "harness-native-ui-view",
  "harness-proto",
  "harness-vt",
@@ -1095,6 +1096,7 @@ dependencies = [
  "harness-native-ui-node-api",
  "harness-native-ui-state-api",
  "harness-native-ui-text-api",
+ "harness-native-ui-timeline-api",
 ]
 
 [[package]]

@@ -51,4 +51,5 @@ pub fn register(world: &World) {
     harness_native_ui_motion_api::register(world);
     harness_native_ui_look_api::register(world);
     harness_native_ui_draw_api::register(world);
+    harness_native_ui_timeline_api::register(world);
 }

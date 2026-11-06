@@ -9,8 +9,9 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
 use harness_native_ui_input_api::Pressed;
 use harness_native_ui_look_api::{Fill, HoverLook, Inks, PressGive, Rgba};
-use harness_native_ui_motion_api::{Motion, Pose, Reveal};
+use harness_native_ui_motion_api::{Motion, Pace, Pose, Reveal};
 use harness_native_ui_text_api::{Icon, Mark};
+use harness_native_ui_timeline_api::GlyphsArrive;
 use harness_native_ui_view as view;
 
 /// A running status dot's breath: a spring chasing 0 and 1 in turn (`up` its current target).
@@ -121,6 +122,18 @@ pub fn width(w: WorldRef<'_>, name: &str) -> f32 {
         .unwrap_or_else(|| panic!("hn.Theme.{name} has no Size"))
         .w
         .value
+}
+
+/// A role's glyph arrival (`chat_stream`: how words streaming in fade in).
+pub fn arrive(w: WorldRef<'_>, name: &str) -> GlyphsArrive {
+    role(w, name)
+        .try_cloned::<&GlyphsArrive>()
+        .unwrap_or_else(|| panic!("hn.Theme.{name} has no GlyphsArrive"))
+}
+
+/// A role's pace (`chat_stream`: how fast words that came in a burst show).
+pub fn pace(w: WorldRef<'_>, name: &str) -> Pace {
+    role(w, name).try_cloned::<&Pace>().unwrap_or_else(|| panic!("hn.Theme.{name} has no Pace"))
 }
 
 /// The sidebar drag's numbers (`hn.Theme.side_drag`).

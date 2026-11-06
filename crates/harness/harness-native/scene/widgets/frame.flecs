@@ -101,8 +101,11 @@ hn {
   // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
   // bottom edges (the window's corners round it). Nothing sits over its top (no title); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
-  // a split is a second node.
+  // a split is a second node. Its panes lay out at the width it rests at (LaysAtRest: the sidebar's clip says where its fold
+  // goes, src/app.rs lay_chrome), so through a cmd+S fold the plate follows the spring while the panes keep one width: a
+  // terminal resizes once, words wrap once.
   prefab Main : ui.Row, Plate {
+    LaysAtRest
     Fill: $tone_term_ground
     Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
     Shape: {radius: 0, n: 4, border: 0, feather: 0}
