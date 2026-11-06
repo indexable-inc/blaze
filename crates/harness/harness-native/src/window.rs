@@ -490,6 +490,11 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
+            // AppKit sends wheel events to the window under the pointer even when it is not key, but the tracking area
+            // (ActiveInKeyWindow) sends no moves then, so the app's pointer is stale and the wheel would go to the wrong
+            // place or nowhere. Take the pointer from the wheel event itself first.
+            with(|st| st.inside = true);
+            self.pointer_move(event);
             let ev = crate::app::Wheel {
                 dx: event.scrollingDeltaX() as f32,
                 dy: event.scrollingDeltaY() as f32,
