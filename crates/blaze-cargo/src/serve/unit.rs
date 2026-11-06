@@ -1531,8 +1531,8 @@ pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
 /// taught by (`plane::Plane::push_program`), when `unit` builds a program its client runs: a
 /// binary, test, bench, example or `cdylib`. A build script and a proc macro are not: many
 /// and small, they are admitted as any compile. The same program of the same profile and
-/// platform has the same key in every build and daemon.
-pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key> {
+/// platform has the same key in every build and daemon. `asked`: [`codegen::asked`].
+pub(crate) fn program_key(unit: &Unit, asked: bool, phase: Phase) -> Option<blaze_graph::Key> {
     // A wasm proc macro's units run in the macro host, never as a program of the client's.
     if unit.target.is_custom_build()
         || unit.macro_wasm
@@ -1541,7 +1541,7 @@ pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key>
         return None;
     }
     if !matches!(
-        codegen::makes(unit),
+        codegen::makes(unit, asked),
         Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })
     ) {
         return None;

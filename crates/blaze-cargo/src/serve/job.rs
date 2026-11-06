@@ -4457,6 +4457,8 @@ impl<S: Steps> Jobs<S> {
         // request stays open after it.
         let applying = job.applying.is_some();
         let all = &input.units.graph.units;
+        // The units the build is asked for (`codegen::asked`), which a program key reads.
+        let all_roots = &input.units.graph.roots;
         let picked = match picked {
             None => None,
             Some(picked) => {
@@ -4588,7 +4590,7 @@ impl<S: Steps> Jobs<S> {
                 };
                 // A program's codegen and link are each admitted by what that program's held,
                 // one never measured alone.
-                match program.zip(super::unit::program_key(unit, phase)) {
+                match program.zip(super::unit::program_key(unit, all_roots.contains(&at), phase)) {
                     Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
                     None => {
                         let learn = super::unit::cost_key(unit, Some(phase));

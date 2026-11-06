@@ -314,8 +314,10 @@ fn with_record_inputs<T>(
     let lint_profile = lint_profile(job, unit)?.map(|it| it.profile.id);
     // The profiles the images it links are laid out by: their heat is the input
     // (docs/v2/plan/lanes/layout/layout.md).
-    let links =
-        matches!(codegen::makes(u), Ok(Makes::Executable | Makes::Shared { proc_macro: false }));
+    let links = matches!(
+        codegen::makes(u, codegen::asked(job, unit)),
+        Ok(Makes::Executable | Makes::Shared { proc_macro: false })
+    );
     let layout = match links && !checks_only(job.input.goal, u) {
         true => super::layout::key(job, job.plan(unit)?)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?,
@@ -1367,7 +1369,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     // A library compiled only as a program reaches it has no code of its own to build. A proc
     // macro built for wasm is a program, its module ([`macros`] loads it); any other proc
     // macro's lib has none that is loaded: its expanders run its MIR.
-    let makes = codegen::makes(u);
+    let makes = codegen::makes(u, codegen::asked(job, unit));
     let library_reached = reached && makes.as_ref().is_ok_and(|it| *it == Makes::Library);
     let proc_macro = makes.is_ok_and(|it| it == Makes::Shared { proc_macro: true })
         && !codegen::wasm_macro(job, unit);
@@ -1640,7 +1642,7 @@ fn generate(
     let krate = crate_of(job, unit, u)?;
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     let checks = checking.as_deref().map(|it| it as &dyn BodyChecks);
-    let generated = codegen::makes(u).map(|makes| {
+    let generated = codegen::makes(u, codegen::asked(job, unit)).map(|makes| {
         let generated = codegen::generate(job, reader, unit, krate, &makes, &job.mounted, checks);
         (makes, generated)
     });
@@ -2278,7 +2280,10 @@ fn script_link_args(job: &Job, unit: usize) -> Result<Vec<(String, String)>, Api
 /// ([`codegen::linked_rustflag_libs`]): none for a unit that links nothing.
 fn linked_rustflag_libs(job: &Job, unit: usize) -> Result<Vec<(String, String)>, ApiError> {
     let u = job.unit(unit)?;
-    if !matches!(codegen::makes(u), Ok(Makes::Executable | Makes::Shared { .. })) {
+    if !matches!(
+        codegen::makes(u, codegen::asked(job, unit)),
+        Ok(Makes::Executable | Makes::Shared { .. })
+    ) {
         // alloc: none, empty
         return Ok(Vec::new());
     }

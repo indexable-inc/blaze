@@ -2813,3 +2813,29 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
         "its value typed, not text"
     );
 }
+
+/// A library that also lists a `staticlib` or `dylib` (tree-sitter-highlight's `crate-type =
+/// ["lib", "staticlib"]`) is built as the rlib its dependents link when the build only depends
+/// on it; asked for itself, or with no rlib to link, it is refused, naming the crate and kind.
+#[test]
+fn a_dependencys_staticlib_or_dylib_is_built_as_its_rlib_and_refused_where_asked_for() {
+    for kind in ["staticlib", "dylib"] {
+        let mut lib = target("tree_sitter_highlight", "lib", "src/lib.rs");
+        lib.kind = vec!["lib".to_owned(), kind.to_owned()];
+        lib.crate_types = lib.kind.clone(); // clone: the test's target
+        let dep = unit("registry+tree-sitter-highlight", lib, Mode::Build, &[]);
+        assert_eq!(codegen::makes(&dep, false), Ok(codegen::Makes::Library), "{kind}");
+        let asked = codegen::makes(&dep, true).unwrap_err();
+        assert!(
+            asked.contains("`tree_sitter_highlight`") && asked.contains(&format!("`{kind}`"))
+                && asked.contains("asked for this library"),
+            "{asked}"
+        );
+        // Control: without its rlib there is nothing a dependent could link instead.
+        let mut only = dep.clone(); // clone: the test's unit
+        only.target.kind = vec![kind.to_owned()];
+        only.target.crate_types = vec![kind.to_owned()];
+        let none = codegen::makes(&only, false).unwrap_err();
+        assert!(none.contains("no `lib` or `rlib`"), "{none}");
+    }
+}
