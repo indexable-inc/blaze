@@ -72,11 +72,16 @@ pub fn query(refs: &[GhRef]) -> (String, Vec<Option<Alias>>, Vec<(usize, String)
         doc.push_str("  }\n");
     }
     doc.push_str("}\n");
-    doc.push_str(
-        "fragment Pr on PullRequest { title state isDraft merged url additions deletions body author { login } \
-         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }\n\
-         fragment Is on Issue { title state stateReason url body author { login } }\n",
-    );
+    // Only the fragments the document spreads: GitHub refuses the whole query over one defined but unused.
+    if refs.iter().zip(&aliases).any(|(r, a)| a.is_some() && r.kind == GhKind::Pr) {
+        doc.push_str(
+            "fragment Pr on PullRequest { title state isDraft merged url additions deletions body author { login } \
+             commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }\n",
+        );
+    }
+    if refs.iter().zip(&aliases).any(|(r, a)| a.is_some() && r.kind == GhKind::Issue) {
+        doc.push_str("fragment Is on Issue { title state stateReason url body author { login } }\n");
+    }
     (doc, aliases, bad)
 }
 
@@ -112,6 +117,8 @@ pub fn parse(refs: &[GhRef], aliases: &[Option<Alias>], bad: &[(usize, String)],
                 .find(|(p, _)| p.len() >= 2 && p[0] == a.repo && p[1] == a.item)
                 .or_else(|| errors.iter().find(|(p, _)| p.len() == 1 && p[0] == a.repo))
                 .or_else(|| errors.iter().find(|(p, _)| p.is_empty()))
+                // No data at all: the query itself was refused (its error's path names no ref, e.g. a fragment).
+                .or_else(|| answer["data"].is_null().then(|| errors.first()).flatten())
                 .map(|(_, m)| m.clone());
             let kind = match r.kind {
                 GhKind::Pr => "pull request",
@@ -317,6 +324,12 @@ mod tests {
         assert_eq!(aliases[2], Some(Alias { repo: "r0".into(), item: "i2".into() }));
         assert_eq!(bad.len(), 1);
         assert!(bad[0].1.starts_with("x\"){evil}#2: not a GitHub repository"));
+        assert!(doc.contains("fragment Pr on PullRequest") && doc.contains("fragment Is on Issue"));
+        // GitHub refuses a query that defines a fragment it never spreads: pull requests alone define only Pr.
+        let (prs, ..) = query(&refs[..1]);
+        assert!(prs.contains("fragment Pr on PullRequest") && !prs.contains("fragment Is"));
+        let (issues, ..) = query(&refs[1..2]);
+        assert!(issues.contains("fragment Is on Issue") && !issues.contains("fragment Pr"));
     }
 
     /// The states and the checks as GitHub says them; an error under a ref's path, or none at all, names it.
@@ -348,6 +361,10 @@ mod tests {
         // No answer at all: each ref fails by name, none guessed.
         let none = parse(&refs[..1], &aliases[..1], &[], &Value::Null);
         assert_eq!((none[0].state, none[0].error.as_str()), (None, "o/a#1: GitHub's answer has no such pull request"));
+        // A refused query (no data, an error on no ref's path) names GitHub's reason, not a missing pull request.
+        let refused = json!({"errors": [{"path": ["fragment Is"], "message": "Fragment Is was defined, but not used"}]});
+        let r = parse(&refs[..1], &aliases[..1], &[], &refused);
+        assert_eq!(r[0].error, "o/a#1: Fragment Is was defined, but not used");
     }
 
     /// Kept for TTL seconds of the injected clock, a failure for TTL_FAILED.
