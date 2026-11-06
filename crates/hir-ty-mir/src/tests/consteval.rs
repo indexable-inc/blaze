@@ -3953,6 +3953,113 @@ fn a_loaded_constants_pointers_in_an_unsized_tail_are_its_own() {
     );
 }
 
+/// A loaded constant's piece that two of its pointers share (`Fill::RECIPE`, named by both of
+/// `Inks`'s fields; `f32::RECIPE`, by all of `Rgba`'s) is relocated once: walked again, its
+/// pointers are this evaluation's and were moved a second time, onto whichever piece had that
+/// address in the constant's evaluation, or onto no memory (harness-native-ui-look-api's
+/// `LAYOUT_HASH`: "read invalid memory address 4 with size 56", a `&Recipe` moved onto an
+/// empty piece of alignment 4). The shape is hyperion-layout's recipes under `api_layouts!`.
+#[test]
+fn a_loaded_constants_shared_pointee_is_relocated_once() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice, str
+    pub enum Recipe {
+        Prim { size: usize, align: usize },
+        Struct { fields: &'static [Field], size: usize, align: usize },
+    }
+    pub struct Field { pub offset: usize, pub ty: &'static Recipe }
+    pub trait Layout { const RECIPE: &'static Recipe; }
+    impl Layout for f32 { const RECIPE: &'static Recipe = &Recipe::Prim { size: 4, align: 4 }; }
+    impl Layout for u8 { const RECIPE: &'static Recipe = &Recipe::Prim { size: 1, align: 1 }; }
+    pub struct Rgba;
+    pub struct Fill;
+    pub struct Inks;
+    pub struct HoverInk;
+    impl Layout for Rgba {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 4, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 8, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 12, ty: <f32 as Layout>::RECIPE },
+            ],
+            size: 16,
+            align: 4,
+        };
+    }
+    impl Layout for Fill {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Rgba as Layout>::RECIPE },
+                Field { offset: 16, ty: <Rgba as Layout>::RECIPE },
+            ],
+            size: 32,
+            align: 4,
+        };
+    }
+    impl Layout for Inks {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 32, ty: <Fill as Layout>::RECIPE },
+            ],
+            size: 64,
+            align: 4,
+        };
+    }
+    impl Layout for HoverInk {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 32, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 64, ty: <u8 as Layout>::RECIPE },
+            ],
+            size: 68,
+            align: 4,
+        };
+    }
+    pub struct ApiType { pub rust: &'static str, pub recipe: &'static Recipe }
+    pub const fn api_type<T: Layout>(rust: &'static str) -> ApiType {
+        ApiType { rust, recipe: T::RECIPE }
+    }
+    const fn feed(r: &Recipe) -> usize {
+        match r {
+            Recipe::Prim { size, align } => *size + *align,
+            Recipe::Struct { fields, size, align } => {
+                let mut h = *size + *align;
+                let mut i = 0;
+                while i < fields.len() {
+                    h += fields[i].offset + feed(fields[i].ty);
+                    i += 1;
+                }
+                h
+            }
+        }
+    }
+    const fn fold(types: &[ApiType]) -> usize {
+        let mut sum = 0;
+        let mut i = 0;
+        while i < types.len() {
+            let t = &types[i];
+            sum += t.rust.as_bytes().len() + feed(t.recipe);
+            i += 1;
+        }
+        sum
+    }
+    pub const API_TYPES: &[ApiType] = &[
+        api_type::<Rgba>("Rgba"),
+        api_type::<Fill>("Fill"),
+        api_type::<Inks>("Inks"),
+        api_type::<HoverInk>("HoverInk"),
+    ];
+    const GOAL: usize = fold(API_TYPES);
+        "#,
+        // Rgba 76, Fill 204, Inks 508, HoverInk 578 (f32 8, u8 2), and 20 bytes of names.
+        1386,
+    );
+}
+
 #[test]
 fn a_loaded_constants_vtable_behind_an_alias_or_a_tail_is_its_own() {
     check_number(
