@@ -2,7 +2,7 @@
 //! value as JSON (`fixtures/<name>.json`). This crate's test checks its encoder writes exactly the checked-in bytes;
 //! `mcp/src/wire.test.ts` checks the kernel decodes each `.cbor` to its `.json` and encodes that back to the same bytes.
 //! `HARNESS_PROTO_BLESS=1 cargo test -p harness-proto` rewrites them after a deliberate schema change.
-use crate::event::{Body, Detail, Effect, Event, Kind, ModelChoice};
+use crate::event::{Body, ContextCall, ContextPart, ContextUse, Detail, Effect, Event, Kind, ModelChoice};
 use crate::msg::{Down, Reply, Request, RunReq, SessionInfo, Up};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -111,7 +111,28 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
             },
         ),
         one("event-choice", &Event { ts: 2, body: Body::Choice { model: None, effort: Some("xhigh".into()) } }),
-        one("event-context", &Event { ts: 3, body: Body::Context { used: 46_200, window: 200_000 } }),
+        one("event-context", &Event { ts: 3, body: Body::Context(ContextUse { used: 46_200, window: 200_000, ..ContextUse::default() }) }),
+        one(
+            "event-context-parts",
+            &Event {
+                ts: 4,
+                body: Body::Context(ContextUse {
+                    used: 31_289,
+                    window: 1_000_000,
+                    last: Some(ContextCall { input: 2, cache_read: 30_000, cache_write: 1_277, output: 10, thinking: Some(0) }),
+                    parts: vec![
+                        ContextPart { id: "system_prompt".into(), name: "System prompt".into(), tokens: 3_796, ..ContextPart::default() },
+                        ContextPart {
+                            id: "note.tools".into(),
+                            name: "tools".into(),
+                            tokens: 240,
+                            of: "system_prompt".into(),
+                            estimate: "o200k_base".into(),
+                        },
+                    ],
+                }),
+            },
+        ),
         one("event-block", &Event { ts: 5, body: Body::Block { block: "m:0".into(), kind: Kind::Thinking, text: "list them\n\u{2026}".into() } }),
         one(
             "event-tool-call",

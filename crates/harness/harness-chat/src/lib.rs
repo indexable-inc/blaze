@@ -129,9 +129,9 @@ pub struct Transcript {
     /// never chose. What a resume starts the agent with.
     pub chosen_model: String,
     pub chosen_effort: String,
-    /// Tokens of the model's context window the conversation fills, and the window (0: unknown), as the agent last said
-    /// (its `context` event); None before it said.
-    pub context: Option<(u64, u64)>,
+    /// How much of the model's context window the conversation fills, as the agent last said (its `context` event: the
+    /// tokens, the window (0: unknown), the last call's split and the parts); None before it said.
+    pub context: Option<ev::ContextUse>,
     /// What the conversation has cost so far (the sum of its turns' `cost_usd`); None while no turn said.
     pub cost_usd: Option<f64>,
     /// The first user message's first line, cut to [`TITLE_CHARS`].
@@ -150,8 +150,8 @@ pub struct Transcript {
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.models, &self.chosen_model, &self.chosen_effort, self.context, self.cost_usd)
-            == (&o.models, &o.chosen_model, &o.chosen_effort, o.context, o.cost_usd)
+        (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, self.cost_usd)
+            == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, o.cost_usd)
             && (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
                 == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
     }
@@ -245,7 +245,7 @@ impl Transcript {
                     self.effort.clone_from(e);
                 }
             }
-            Body::Context { used, window } => self.context = Some((*used, *window)),
+            Body::Context(c) => self.context = Some(c.clone()),
             Body::User { text } => {
                 if self.title.is_empty() {
                     self.title = title_of(text);

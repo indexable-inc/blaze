@@ -64,6 +64,10 @@ hn {
         menu : ui.Node {
           Overlay
         }
+        // The context meter's popover while the pointer is on the meter or on it (src/app/chat/context.rs).
+        pop : ui.Node {
+          Overlay
+        }
       }
     }
   }
@@ -118,11 +122,11 @@ hn {
   // the current row ticked, a model's line about it muted at the end; where nothing can be chosen, a ui.MenuNote says
   // why.
   // The context meter (den's): a ring filling as the conversation fills its model's window, and the percentage; muted,
-  // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Its tooltip says the tokens.
+  // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer, hn.ChatContextPop
+  // (widgets/context.flecs) says what fills it.
   prefab ChatContext : ui.Row {
     Hoverable
     Cursor: {shape: Arrow}
-    Tooltip: {text: ""}
     Flex: {axis: Row, gap: $chat_context_gap, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
     Padding: {l: $chat_context_lead, r: 0, t: 0, b: 0}
