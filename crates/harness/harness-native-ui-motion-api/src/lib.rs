@@ -213,7 +213,9 @@ impl CopyFlash {
 pub struct Target(pub f32);
 
 /// A node whose frame animates from wherever the last node with the same `id` was drawn to where layout puts it (SwiftUI's
-/// `matchedGeometryEffect`): the selection pill on one row and then another slides between them. The springs live on an
+/// `matchedGeometryEffect`): the selection pill on one row and then another slides between them. Its position springs;
+/// its size is always its node's (never between two, so a pill is never shorter than the row it lands on), and inside a
+/// [`Settling`] node it holds until that node's frame is its own. The springs live on an
 /// entity of their own per id (`Matched`), so the old node may be gone; the tune is the node's `Motion`, else the
 /// `ui.spring.matched` token.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
@@ -223,6 +225,13 @@ pub struct MatchedGeometry {
     /// of sliding; mid-slide it never does. 0: always slides.
     pub jump: f32,
 }
+
+/// A tag on a node whose frame is not its own yet: its size is on a spring of its owner's (a sidebar row folding in
+/// from no height), so what is laid inside it is squeezed. A `MatchedGeometry` node in it holds its slide where it was
+/// going (and, with nowhere it was going, is drawn nowhere) instead of chasing a frame smaller than what it highlights;
+/// once the tag goes, it slides to its node's frame from there.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Settling;
 
 /// The springs of one `MatchedGeometry` id (on `ui_matched::<id>`): the drawn frame chasing its node's `Laid`, in its
 /// scroll content's space (the `Laid` plus every scrolling ancestor's `ScrollState`), so a scroll under a slide carries
@@ -424,6 +433,7 @@ impl Follow {
 hyperion_api_layouts::api_layouts! {
     "MatchedGeometry" => alias MatchedGeometry,
     "Matched" => alias Matched,
+    "Settling" => alias Settling,
     "Drawn" => alias Drawn,
     "Transition" => alias Transition,
     "Leaving" => alias Leaving,
@@ -466,6 +476,7 @@ pub fn register(world: &World) {
     world.component::<Pace>().writable();
     world.component::<MatchedGeometry>().writable();
     world.component::<Matched>();
+    world.component::<Settling>();
     world.component::<Drawn>();
     world.component::<Transition>().writable();
     world.component::<Leaving>().writable();
