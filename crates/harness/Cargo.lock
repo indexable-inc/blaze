@@ -814,6 +814,7 @@ dependencies = [
  "harness-native-scroll-physics",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
+ "harness-native-ui-inline",
  "harness-native-ui-input",
  "harness-native-ui-input-api",
  "harness-native-ui-layout",
@@ -932,6 +933,7 @@ dependencies = [
  "harness-native-kip",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
+ "harness-native-ui-inline",
  "harness-native-ui-input-api",
  "harness-native-ui-layout",
  "harness-native-ui-layout-api",
@@ -992,6 +994,10 @@ dependencies = [
  "harness-native-ui-node-api",
  "hyperion-api-layouts",
 ]
+
+[[package]]
+name = "harness-native-ui-inline"
+version = "0.1.0"
 
 [[package]]
 name = "harness-native-ui-input"
@@ -1140,6 +1146,7 @@ version = "0.1.0"
 dependencies = [
  "harness-native-api",
  "harness-native-flecs",
+ "harness-native-scroll-physics",
  "harness-native-ui-input-api",
  "harness-native-ui-layout-api",
  "harness-native-ui-look-api",

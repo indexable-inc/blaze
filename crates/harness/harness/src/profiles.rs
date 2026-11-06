@@ -36,6 +36,7 @@ const SYSTEM_NOTE_PARTS: &[&str] = &[
     include_str!("system_note/output.md"),  // the person already sees every cell: don't restate it
     include_str!("system_note/ui.md"),      // cells as Svelte 5 UI: the element vocabulary
     include_str!("system_note/replies.md"), // how replies to Andrew read
+    include_str!("system_note/prose.md"),   // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
 ];
 
 static SYSTEM_NOTE: std::sync::LazyLock<String> =

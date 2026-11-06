@@ -10,6 +10,7 @@
 //! A plain library linked into each module that uses it: an edit swaps those modules in, as an edit of their own code does.
 use std::collections::HashSet;
 
+pub mod field;
 pub mod menu;
 pub mod search;
 pub mod table;

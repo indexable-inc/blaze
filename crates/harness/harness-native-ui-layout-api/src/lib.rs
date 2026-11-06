@@ -145,6 +145,27 @@ pub struct Viewport {
     pub h: f32,
 }
 
+/// Caps a `Fit` height at `share` (0 to 1) of the height of its nearest ancestor whose height does not come from its
+/// content (a `Grow`, `Fixed` or `Percent` one, such as a pane), less `keep` points (what else that ancestor shows
+/// around it), and never under its `Size.h.min` or 1 point. Its `Size.h.max`, when set, caps it too; with no such ancestor
+/// only that does. A text area that grows with its words stops this way near its pane's full height, then scrolls
+/// (`ui.field.GrowingTextArea`). Solved in the height pass (`harness_native_ui_layout::solve`).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GrowLimit {
+    pub share: f32,
+    pub keep: f32,
+}
+
+/// On a scroll that holds editable words (`ui.field.GrowingTextArea`): when the caret moves out of view its host glides
+/// the scroll, on a spring of `omega` (rad/s) and `zeta`, until the caret's line shows `margin` points inside the view
+/// (`harness_native_ui_view::field::FieldScroll`).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaretScroll {
+    pub margin: f32,
+    pub omega: f32,
+    pub zeta: f32,
+}
+
 /// How far a `Scroll`'s children are shifted (points scrolled).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollState {
@@ -545,6 +566,8 @@ hyperion_api_layouts::api_layouts! {
     "Flex" => alias Flex,
     "Sizing" => alias Sizing,
     "Size" => alias Size,
+    "GrowLimit" => alias GrowLimit,
+    "CaretScroll" => alias CaretScroll,
     "Padding" => alias Padding,
     "Aspect" => alias Aspect,
     "Centre" => alias Centre,
@@ -575,6 +598,8 @@ pub fn register(world: &World) {
     world.component::<Sizing>().writable();
     world.component::<Flex>().writable();
     world.component::<Size>().writable();
+    world.component::<GrowLimit>().writable();
+    world.component::<CaretScroll>().writable();
     world.component::<Padding>().writable();
     world.component::<Aspect>().writable();
     world.component::<Centre>().writable();

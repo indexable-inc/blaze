@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
-    AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, Intrinsic, Lazy,
+    AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, GrowLimit, Intrinsic, Lazy,
     LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
     ScrollerPart, ScrollerState, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
 };
@@ -17,7 +17,7 @@ use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Pl
 
 pub mod solve;
 pub mod typeset;
-pub use solve::{GridSpec, Item, LazySpec, Role, anchored, lazy_range, shift, solve};
+pub use solve::{GridSpec, Item, LazySpec, LimitSpec, Role, anchored, lazy_range, shift, solve};
 pub use typeset::{Estimate, Measure, elide, typeset};
 
 /// Read one node's layout components into an [`Item`] (inherited values included).
@@ -74,6 +74,7 @@ fn read(e: EntityView<'_>) -> Item {
         clip: e.has(Clip::id()),
         safe: [safe.l, safe.r, safe.t, safe.b],
         safe_pad: [safe_pad.l, safe_pad.r, safe_pad.t, safe_pad.b],
+        limit: e.try_cloned::<&GrowLimit>().map(|g| LimitSpec { share: g.share, keep: g.keep, max: size.h.max }),
         ..Item::default()
     }
 }
@@ -242,6 +243,7 @@ fn extras(it: &Item) -> Vec<u64> {
     v.extend(it.safe.iter().map(|&s| f(s)));
     v.extend(it.safe_pad.iter().map(|&b| u64::from(b)));
     v.extend(it.adaptive.into_iter().flatten().map(f));
+    v.extend(it.limit.into_iter().flat_map(|l| [f(l.share), f(l.keep), f(l.max)]));
     v.extend(it.lazy.into_iter().flat_map(|l| [u64::from(l.count), f(l.row), u64::from(l.overscan)]));
     if let Some(g) = &it.grid {
         v.extend([f(g.hgap), f(g.vgap), g.align as u64, g.valign as u64]);

@@ -218,13 +218,11 @@ pub struct ChatState {
     reading: bool,
     /// The table rows opened below their rows as records, by the transcript row the table is (its key).
     rows_open: HashMap<String, usize>,
-    /// Kip on the composer ([`App::chat_kip`]): this pane saw its agent at work, and how the turn it ended ended (ok or
-    /// not) and when (the clock), while he still shows it.
-    kip_busy: bool,
-    kip_end: Option<(bool, f32)>,
     /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
     pick: Option<pick::Pick>,
     pick_nav: pick::PickNav,
+    /// The composer's scroll once its words outgrow it: wheels on AppKit's physics, the caret kept in view.
+    input_scroll: view::field::FieldScroll,
 }
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
@@ -274,10 +272,9 @@ impl Default for ChatState {
             drag: None,
             reading: false,
             rows_open: HashMap::new(),
-            kip_busy: false,
-            kip_end: None,
             pick: None,
             pick_nav: pick::PickNav::default(),
+            input_scroll: view::field::FieldScroll::default(),
         }
     }
 }
@@ -291,9 +288,9 @@ enum Row {
     ListItem { depth: usize, mark: String, text: String },
     Quote(String),
     Code { lang: String, text: String },
-    /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: running,
-    /// no result) and, opened, its input and result.
-    Tool { block: String, name: String, arg: String, state: String, shown: Shown, failed: bool, input: String, result: String },
+    /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: its `hn.chat_status`,
+    /// running or no_result, while it has no result) and, opened, its input and result.
+    Tool { block: String, name: String, arg: String, state: Option<&'static str>, shown: Shown, failed: bool, input: String, result: String },
     /// A harness REPL cell's line (`open`: shown past its line): what it did in words, a detail ("5 results"), and how long it took as
     /// the line's tooltip ([`line`]).
     Card { block: String, words: String, detail: String, tip: String, error: bool, open: bool },
@@ -776,10 +773,11 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
             } else {
                 let failed = result.as_ref().is_some_and(|r| r.error);
                 // A failure says so in its words' tone, not in words of its own.
+                // How it is going, as a status icon (scene/widgets/chat_status.flecs): none once it has a result.
                 let state = match result {
-                    Some(_) => String::new(),
-                    None if *done && !t.busy => "no result".to_owned(),
-                    None => "running\u{2026}".to_owned(),
+                    Some(_) => None,
+                    None if *done && !t.busy => Some("no_result"),
+                    None => Some("running"),
                 };
                 let input_text = if *done { tool_input(input) } else { partial.clone() };
                 let result = result.as_ref().map(|r| r.text.clone()).unwrap_or_default();
@@ -1086,60 +1084,13 @@ fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
     View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")
 }
 
-/// How a turn that just ended ended, for Kip: false when the agent failed, None when the person stopped it (or no turn
-/// end came).
-fn turn_outcome(t: &Transcript) -> Option<bool> {
-    let turn = t.items.iter().rposition(|i| matches!(i, Item::User { .. })).map_or(&t.items[..], |u| &t.items[u..]);
-    let failed = turn.iter().any(|i| matches!(i, Item::Error { .. }));
-    match turn.iter().rev().find(|i| matches!(i, Item::TurnEnd { .. })) {
-        Some(Item::TurnEnd { stop, .. }) if stop == "interrupted" => None,
-        Some(Item::TurnEnd { ok, .. }) => Some(*ok && !failed),
-        _ => failed.then_some(false),
-    }
-}
-
-/// How long a chat must have been attached and still empty before Kip greets in it: a past chat's log replays in less.
-const KIP_GREET_AFTER: f32 = 0.35;
-
 impl App {
-    /// Kip on a chat pane's composer, as its transcript `t` stands (`attached`: its stream is in): the look and mood to
-    /// show him in (None: not there) and his fade. Perched while the agent works (busy with a tool: working; else
-    /// thinking); happy, or oops on an error, for a moment after a turn this pane saw ends; greeting in an empty chat.
-    fn chat_kip(&self, st: &mut ChatState, t: &Transcript, attached: bool) -> (Option<(&'static str, Option<&'static str>)>, f32) {
-        if t.busy {
-            st.kip_busy = true;
-            st.kip_end = None;
-            let tool = matches!(t.items.last(), Some(Item::Tool { result: None, .. }));
-            return (Some(("hn.KipPerch", Some(if tool { "working" } else { "thinking" }))), 0.0);
-        }
-        if std::mem::take(&mut st.kip_busy) {
-            st.kip_end = turn_outcome(t).map(|ok| (ok, self.time));
-        }
-        if let Some((ok, at)) = st.kip_end {
-            let w = self.world.world_ref();
-            let linger = view::prefab(w, "hn.KipPerch")
-                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::KipLinger>())
-                .unwrap_or_else(|| panic!("the scene's hn.KipPerch has no KipLinger"));
-            let since = self.time - at;
-            if since < linger.secs {
-                let fade = (since - (linger.secs - linger.fade)) / linger.fade.max(1e-3);
-                return (Some(("hn.KipPerch", Some(if ok { "happy" } else { "oops" }))), fade);
-            }
-            st.kip_end = None;
-        }
-        let settled = attached && st.tried.is_some_and(|at| self.time - at > KIP_GREET_AFTER);
-        if t.items.is_empty() && settled {
-            return (Some(("hn.KipGreet", None)), 0.0);
-        }
-        (None, 0.0)
-    }
-
     /// The genui gallery (`HARNESS_NATIVE_GALLERY=genui`, src/gallery.rs): fill its `hn.ChatUi` with `tree`, a cell's
     /// tree as the kernel sends it, measured by this app's typesetter and drawn in its ground's scheme, as a chat card's is.
     pub(crate) fn fill_genui_gallery(&self, root: u64, tree: &Value) {
         let w = self.world.world_ref();
         let v = View::of(w.entity_from_id(root));
-        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.chat_dark() };
         if v.entity().try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme) {
             v.entity().set(scheme);
         }
@@ -1149,6 +1100,11 @@ impl App {
         // HARNESS_NATIVE_GENUI_CELLS: the cells a CellRef in the tree shows (checked as the shot starts).
         let cells = crate::gallery::genui_cells().ok().flatten();
         genui::fill_in(ui, tree, "gallery.0", cells, Some(&self.genui), true, &mut measure);
+    }
+
+    /// Whether a chat (its transcript, composer and cells, on `tone_chat_ground`) draws dark: the window's appearance.
+    pub(super) fn chat_dark(&self) -> bool {
+        self.dark
     }
 
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
@@ -1202,9 +1158,9 @@ impl App {
                 self.link.attach(sid, 80, 24, true);
             }
         }
-        // Drawn in the appearance of the ground it sits on (the terminal's, dark in both appearances unless the Ghostty
-        // theme says otherwise), so its inks, plates and washes read on it whatever the window's appearance.
-        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        // Drawn in the window's appearance on the chat's own ground (`tone_chat_ground`, not the terminal's): a chat is a
+        // page, so it takes the app's palette, not the Ghostty theme's.
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.chat_dark() };
         for part in ["list", "foot"] {
             if let Some(v) = pv.part(part)
                 && v.entity().try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme)
@@ -1320,20 +1276,8 @@ impl App {
                     te = next;
                     txt.entity().set(te);
                 }
-                // Grown past its most: the caret's end in view (the end when the caret is at the end, else the top).
-                let th = txt.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.h);
-                let ah = area.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.h);
-                let y = if st.draft.caret == st.draft.text.len() { (th - ah).max(0.0) } else { 0.0 };
-                if area.entity().try_cloned::<&ScrollState>().is_none_or(|s| (s.y - y).abs() > 0.5) {
-                    scroll_quietly(area.entity(), ScrollState { x: 0.0, y });
-                }
+                // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
-        }
-        if let Some(kip) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("kip")) {
-            // Its own stream is in (a transcript gets an entry only once an event comes, and a new chat may send none).
-            let attached = st.ours && self.link.attached(sid);
-            let (look, fade) = self.chat_kip(st, t, attached);
-            panes::show_kip(kip, look, fade);
         }
         if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
             let o = w.entity_from_id(e);
@@ -1347,15 +1291,18 @@ impl App {
                 (t.model.clone(), effort.to_owned())
             };
             self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
+            // The agent's state as an icon (scene/widgets/chat_status.flecs), its words the icon's tooltip; breathing only
+            // while it works, so an idle chat lets the window rest.
             let state = if self.status_of(e) != "running" {
-                "ended \u{00B7} a message resumes it"
+                Some("ended")
             } else if t.busy {
-                "Working\u{2026}  esc to interrupt"
+                Some("working")
             } else {
-                ""
+                None
             };
             if let Some(s) = status.part("state") {
-                s.text(state);
+                let words = status_on(s, state);
+                tooltip(s, &words);
             }
         }
     }
@@ -1426,6 +1373,7 @@ impl App {
                 }
             }
         }
+        moving |= self.step_chat_inputs();
         if moving {
             self.poke();
         }
@@ -1446,11 +1394,58 @@ impl App {
         self.step_genui_common();
     }
 
-    /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
-    /// over one.
+    /// Step every chat pane's composer scroll a frame (harness_native_ui_view::field): its caret's line from the last
+    /// layout kept in view, a wheel's physics advanced. Whether one still moves.
+    fn step_chat_inputs(&self) -> bool {
+        let w = self.world.world_ref();
+        let points_per_pixel = 1.0 / f64::from(self.grid.scale.max(0.5));
+        let mut moving = false;
+        for p in self.panes() {
+            let Some(o) = model::shows(w, p) else { continue };
+            if model::pane_kind(o) != model::PaneKind::Chat {
+                continue;
+            }
+            let Some(sid) = self.session_of(*o.id()) else { continue };
+            let Some(area) = View::of(w.entity_from_id(p)).part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) else {
+                continue;
+            };
+            let caret =
+                input_text(w, p).and_then(|t| words_caret(&mut self.paint.borrow_mut(), t.entity())).map(|[_, y, _, h]| [y, y + h]);
+            let mut states = self.chat.borrow_mut();
+            moving |= states.entry(sid).or_default().input_scroll.step(area.entity(), caret, points_per_pixel);
+        }
+        moving
+    }
+
+    /// A scroll over a chat pane's composer while its words outgrow it scrolls them (its FieldScroll's physics); else
+    /// over its transcript, the transcript's physics take it (scrolling up lets go of the bottom). Whether it was over
+    /// either.
     pub(super) fn chat_wheel(&mut self, ev: &sidebar::Wheel, z: f32) -> bool {
         let w = self.world.world_ref();
         let (x, y) = (self.pointer.x, self.pointer.y);
+        let k = if ev.precise { 1.0 / z } else { 1.0 };
+        let input = self.panes().into_iter().find_map(|p| {
+            let o = model::shows(w, p)?;
+            if model::pane_kind(o) != model::PaneKind::Chat {
+                return None;
+            }
+            let area = View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?;
+            area.entity().try_cloned::<&Laid>()?.contains(x, y).then_some(())?;
+            Some((self.session_of(*o.id())?, area.entity()))
+        });
+        if let Some((sid, area)) = input {
+            let took = self.chat.borrow_mut().entry(sid).or_default().input_scroll.wheel(
+                area,
+                [ev.dx * k, ev.dy * k],
+                ev.precise,
+                ev.phase,
+                ev.momentum,
+            );
+            if took {
+                self.poke();
+                return true;
+            }
+        }
         let Some((sid, _)) = self.panes().into_iter().find_map(|p| {
             let o = model::shows(w, p)?;
             if model::pane_kind(o) != model::PaneKind::Chat {
@@ -1464,7 +1459,6 @@ impl App {
         let mut states = self.chat.borrow_mut();
         let st = states.entry(sid).or_default();
         let t = st.clock.elapsed().as_secs_f64();
-        let k = if ev.precise { 1.0 / z } else { 1.0 };
         st.engine.wheel(
             Input {
                 delta: Vec2::new(f64::from(ev.dx * k), f64::from(ev.dy * k)),
@@ -1994,18 +1988,57 @@ impl App {
     /// a chat was dragged in.
     pub(super) fn chat_pointer_up(&mut self) -> bool {
         let mut any = self.genui_common_up() | self.genui_pointer_up();
-        for st in self.chat.borrow_mut().values_mut() {
-            if st.drag.take().is_some() {
+        let mut pressed = None;
+        for (sid, st) in self.chat.borrow_mut().iter_mut() {
+            if let Some(drag) = st.drag.take() {
                 any = true;
                 if st.sel.is_some_and(|(a, b)| a == b) {
                     st.sel = None;
+                    // A single press that selected nothing: a press on an inline component or a link there opens it.
+                    if let Drag::List { unit: Unit::Cell, span: (s, _) } = drag {
+                        pressed = Some((*sid, s));
+                    }
                 }
             }
+        }
+        if let Some((sid, s)) = pressed {
+            self.chat_open_at(sid, s);
         }
         if any {
             self.poke();
         }
         any
+    }
+
+    /// Open what transcript place `s` of session `sid` is on: an inline component (`<Path loc="...">`, through the scene's
+    /// `ui.inline`, relative paths from the session's directory) or a markdown link, in the app its kind opens in; an
+    /// Option-press shows a file in the Finder. A component that cannot open says why in the log, naming it.
+    fn chat_open_at(&mut self, sid: u64, s: Spot) {
+        let rows = self.chat_rows(sid);
+        let Some((_, src, true)) = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)) else { return };
+        let m = harness_native_render::markdown::inline(&src);
+        let w = self.world.world_ref();
+        let target = if let Some(t) = m.tags.iter().find(|t| (t.start..t.end).contains(&s.at)) {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let cwd = self
+                .focused_chat()
+                .filter(|c| c.2 == sid)
+                .and_then(|(_, e, _)| w.entity_from_id(e).try_cloned::<&model::Cwd>())
+                .map(|c| c.s.as_str().to_owned())
+                .unwrap_or_else(|| home.clone());
+            match harness_native_render::inline::target(w, &t.tag, &cwd, &home) {
+                Ok(target) => target,
+                Err(why) => {
+                    eprintln!("harness-native: chat {sid}: {why}");
+                    return;
+                }
+            }
+        } else if let Some(l) = m.links.iter().find(|l| (l.0..l.1).contains(&s.at)) {
+            l.2.clone()
+        } else {
+            return;
+        };
+        crate::open::open(&target, self.press.1.alt);
     }
 
     /// Session `sid`'s transcript as rows.
@@ -2129,7 +2162,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Tool { block, name, arg, state, shown, input, result, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, name, arg, state, "", Some(*shown != Shown::Folded));
+                line(h, name, arg, "", "", Some(*shown != Shown::Folded), (*state).map(|s| ("state", s)));
             }
             if let Some(c) = row.part("body").and_then(|b| b.part("card")) {
                 if let Some(i) = c.part("input") {
@@ -2143,7 +2176,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Thinking { block, text: s, live, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, if *live { "Thinking\u{2026}" } else { "Thought" }, "", "", "", Some(*open));
+                line(h, "", "", "", "", Some(*open), Some(("glyph", if *live { "thinking" } else { "thought" })));
             }
             if let Some(t) = row.part("body").and_then(|b| b.part("text")) {
                 t.text(s.trim());
@@ -2152,17 +2185,19 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Card { block, words, detail, tip, open, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, words, "", detail, tip, Some(*open));
+                line(h, words, "", detail, tip, Some(*open), None);
             }
         }
         Row::Run { key, words, failed, running, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{key}"));
-                let detail = if *failed > 0 { format!("{failed} failed") } else if *running { "running\u{2026}".into() } else { String::new() };
-                line(h, words, "", &detail, "", Some(*open));
+                // How many failed, in words (a count is no icon); else a run still going, its running dot.
+                let detail = if *failed > 0 { format!("{failed} failed") } else { String::new() };
+                let state = (*failed == 0 && *running).then_some(("state", "running"));
+                line(h, words, "", &detail, "", Some(*open), state);
             }
         }
-        Row::Step { words, detail, .. } => line(row, words, "", detail, "", None),
+        Row::Step { words, detail, .. } => line(row, words, "", detail, "", None, None),
         Row::Grid { v, cap } => fill_grid(row, v, *cap, ctx, measure),
         Row::Table(t) => {
             if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
@@ -2364,9 +2399,10 @@ fn select_all_words(e: EntityView<'_>, on: bool) {
 }
 
 /// Fill one line (hn.ChatLine: a call's, a run's, a step's, a thought's): its words, argument in the code face, detail,
-/// on hover `tip` (how long it took; none when empty), and its hover-only chevron turned to `open` (None: a step, which
-/// opens nothing).
-fn line(h: View<'_>, words: &str, arg: &str, detail: &str, tip: &str, open: Option<bool>) {
+/// its hover-only chevron turned to `open` (None: a step, which opens nothing), and `status` (the line part that shows it,
+/// `glyph` leading or `state` trailing, and its `hn.chat_status` name; the other part takes no room). On hover its
+/// tooltip: the status's words, then `tip` (how long it took; none when both are empty).
+fn line(h: View<'_>, words: &str, arg: &str, detail: &str, tip: &str, open: Option<bool>, status: Option<(&str, &str)>) {
     if let (Some(p), Some(open)) = (h.part("chevron"), open) {
         p.icon(crate::look::CHEVRON);
         crate::look::disclose(p.entity(), open);
@@ -2377,28 +2413,89 @@ fn line(h: View<'_>, words: &str, arg: &str, detail: &str, tip: &str, open: Opti
         }
     }
     // An argument with nothing to say takes no room, the room after it neither.
-    for (part, s) in [("arg", arg)] {
+    if let Some(p) = h.part("arg") {
+        p.text(arg);
+        room(p, "arg", arg.is_empty());
+    }
+    // A status icon where one says it, nothing (and no room) where none does.
+    let mut said = String::new();
+    for part in ["glyph", "state"] {
         if let Some(p) = h.part(part) {
-            p.text(s);
-            let e = p.entity();
-            let gone = s.is_empty();
-            if gone != e.try_cloned::<&Size>().is_some_and(|z| z.w == Sizing::fixed(0.0)) {
-                if gone {
-                    p.set(Size { w: Sizing::fixed(0.0), h: Sizing::FIT });
-                    p.set(harness_native_ui_layout_api::Padding::default());
-                } else {
-                    // Back to the prefab's own: its natural width, the room after it.
-                    e.remove(Size::id());
-                    let lead = view::prefab(e.world(), "hn.ChatLineLook")
-                        .and_then(|l| View::of(l).part(part))
-                        .and_then(|a| a.entity().try_cloned::<&harness_native_ui_layout_api::Padding>())
-                        .unwrap_or_default();
-                    p.set(lead);
-                }
+            let name = status.filter(|(at, _)| *at == part).map(|(_, name)| name);
+            let words = status_on(p, name);
+            room(p, part, name.is_none());
+            if !words.is_empty() {
+                said = words;
             }
         }
     }
-    tooltip(h, tip);
+    match (said.is_empty(), tip.is_empty()) {
+        (true, _) => tooltip(h, tip),
+        (false, true) => tooltip(h, &said),
+        (false, false) => tooltip(h, &format!("{said} \u{00B7} {tip}")),
+    }
+}
+
+/// Fold line part `p` (its `part` in hn.ChatLineLook) to nothing (`gone`): no width, no room after it; or give it back
+/// the prefab's own size (none: its natural width) and the room after it. Written only on change.
+fn room(p: View<'_>, part: &str, gone: bool) {
+    let e = p.entity();
+    if gone == e.try_cloned::<&Size>().is_some_and(|z| z.w == Sizing::fixed(0.0)) {
+        return;
+    }
+    if gone {
+        p.set(Size { w: Sizing::fixed(0.0), h: Sizing::FIT });
+        p.set(harness_native_ui_layout_api::Padding::default());
+        return;
+    }
+    let look = view::prefab(e.world(), "hn.ChatLineLook")
+        .and_then(|l| View::of(l).part(part))
+        .unwrap_or_else(|| panic!("the scene's hn.ChatLineLook has no {part}"));
+    match look.entity().try_cloned::<&Size>() {
+        Some(z) => {
+            p.set(z);
+        }
+        None => {
+            e.remove(Size::id());
+        }
+    }
+    p.set(look.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default());
+}
+
+/// Show chat status `name` (`hn.chat_status.<name>`, scene/widgets/chat_status.flecs) on icon node `v`: its glyph, its
+/// tone and, for one that breathes, the running dot's breath (src/look.rs) while it shows, so nothing moves once the agent
+/// is done; `None` shows nothing. Returns its words (the tooltip of whatever shows it), empty for none. Written only on
+/// change. The scene is compiled in, so a status it lacks is a bug.
+fn status_on(v: View<'_>, name: Option<&str>) -> String {
+    use crate::look::Breath;
+    let e = v.entity();
+    let Some(name) = name else {
+        v.icon("");
+        if e.has(Breath::id()) {
+            e.remove(Breath::id());
+        }
+        return String::new();
+    };
+    let s = view::prefab(e.world(), &format!("hn.chat_status.{name}"))
+        .unwrap_or_else(|| panic!("the scene has no hn.chat_status.{name} (scene/widgets/chat_status.flecs)"));
+    let glyph = s
+        .try_cloned::<&harness_native_ui_text_api::Icon>()
+        .unwrap_or_else(|| panic!("hn.chat_status.{name} has no Icon"));
+    v.icon(glyph.glyph.as_str());
+    let fill = s.try_cloned::<&Fill>().unwrap_or_else(|| panic!("hn.chat_status.{name} has no Fill"));
+    if e.try_cloned::<&Fill>() != Some(fill) {
+        v.set(fill);
+    }
+    match (s.try_cloned::<&Breath>(), e.has(Breath::id())) {
+        (Some(b), false) => {
+            v.set(b);
+        }
+        (None, true) => {
+            e.remove(Breath::id());
+        }
+        _ => {}
+    }
+    s.try_cloned::<&Tooltip>().map(|t| t.text.as_str().to_owned()).unwrap_or_default()
 }
 
 /// Set node `v`'s tooltip to `s`, or take it away when `s` is empty (written only on change).

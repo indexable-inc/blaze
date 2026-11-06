@@ -39,14 +39,14 @@ hn {
   // The ink of each tone an element takes (`tone="muted"`): genui.rs copies the Fill of the one named onto the words.
   // Drawn on the terminal's ground, as the transcript is.
   prefab GenTone {
-    ink { Fill: $tone_term_ink }
-    muted { Fill: $tone_term_muted }
-    strong { Fill: $tone_term_ink }
+    ink { Fill: $tone_chat_ink }
+    muted { Fill: $tone_chat_muted }
+    strong { Fill: $tone_chat_ink }
     error { Fill: $tone_failed }
     accent { Fill: $tone_accent }
     success { Fill: $tone_running }
     warning { Fill: $tone_lost }
-    faint { Fill: $tone_term_faint }
+    faint { Fill: $tone_chat_faint }
     series1 { Fill: $tone_series1 }
     series2 { Fill: $tone_series2 }
     series3 { Fill: $tone_series3 }
@@ -71,7 +71,7 @@ hn {
 
   // Words in the transcript's face, in a tone (`bold` sets them bold; `strong` is the ink, bold).
   prefab GenText : ui.Words {
-    Fill: $tone_term_ink
+    Fill: $tone_chat_ink
     TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
   }
 
@@ -101,7 +101,7 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 7, r: 7, t: 1, b: 2}
     text : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0, weight: $weight_label}
     }
   }
@@ -120,11 +120,11 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 12, t: 0, b: 0}
     label : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0, weight: $weight_label}
     }
     value : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_stat, line: $line_gen_stat, role: 0, bold: 1}
     }
     note : ui.Line, Faint {
@@ -135,7 +135,7 @@ hn {
   // Children on the card's plate, a column; a `title` goes first, bold.
   prefab GenCard : ui.Column {
     Fill: $tone_chat_card
-    Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+    Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
     Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
     Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -190,7 +190,7 @@ hn {
     }
   }
   prefab GenChartTick : ui.Line {
-    Fill: $tone_term_muted
+    Fill: $tone_chat_muted
     TextStyle: {size: $size_caption, line: 14, role: 10, bold: 0}
   }
   // A bar: a share of its cell's height, round at its corners, its value on hover.
@@ -220,7 +220,7 @@ hn {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     text : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     }
   }
@@ -238,11 +238,11 @@ hn {
       Size: {w: {kind: Fixed, value: 9, min: 0, max: 0}, h: {kind: Fixed, value: 9, min: 0, max: 0}}
     }
     label : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
     }
     value : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_caption, line: 16, role: 10, bold: 0}
     }
   }
@@ -262,11 +262,11 @@ hn {
     Overlay
     Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
     value : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_stat, line: $line_gen_stat, role: 10, bold: 1}
     }
     caption : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     }
   }
@@ -281,7 +281,7 @@ hn {
   }
   // A control's label over it (a field's, a slider's, a select's): small, muted; it takes no room when there is none.
   prefab GenLabel : ui.Line {
-    Fill: $tone_term_muted
+    Fill: $tone_chat_muted
     TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0, weight: $weight_label}
   }
 
@@ -296,7 +296,7 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 56, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
     Padding: {l: 12, r: 12, t: 0, b: 0}
     label : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
     }
   }
@@ -319,7 +319,7 @@ hn {
   prefab GenButtonMuted : hn.GenButton {
     Fill: $tone_clear
     Padding: {l: 8, r: 8, t: 0, b: 0}
-    label : ui.Line { Fill: $tone_term_muted }
+    label : ui.Line { Fill: $tone_chat_muted }
   }
 
   // A switch and its label: the track off (a quiet rail, the knob at its start) or on (the accent, the knob at its end).
@@ -341,7 +341,7 @@ hn {
       }
     }
     label : ui.Words {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -369,7 +369,7 @@ hn {
       }
     }
     label : ui.Words {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -408,7 +408,7 @@ hn {
       }
     }
     label : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -438,7 +438,7 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 40, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Padding: {l: 11, r: 11, t: 0, b: 0}
     label : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
     }
   }
@@ -447,7 +447,7 @@ hn {
     Edge: {dark: $tone_clear.dark, light: $tone_gen_edge.light}
     Shape: {radius: 5, n: 4, border: 0.5, feather: 0}
     Lift: {blur: 2, alpha: 0.14, dy: 0.5}
-    label : ui.Line { Fill: $tone_term_ink }
+    label : ui.Line { Fill: $tone_chat_ink }
   }
 
   // A labelled control (a slider, a field, a number, a select) is a column of its parts, made by genui/control.rs in
@@ -487,7 +487,7 @@ hn {
       }
     }
     value : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 16, role: 10, bold: 0}
       Size: {w: {kind: Fit, value: 0, min: 28, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
@@ -506,13 +506,13 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
     Padding: {l: 9, r: 9, t: 0, b: 0}
     text : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+        caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
     }
     hint : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -530,16 +530,16 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 64, max: 0}}
     Padding: {l: 9, r: 9, t: 6, b: 6}
     text : ui.Words {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 19, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+        caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
     }
     // Over the words' place (out of the flow, laid on the box's frame and drawn in by its padding), so an empty
     // field's first line is the hint's.
     hint : ui.Words {
       Overlay
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       Pose: {dx: 9, dy: 6, shrink: 0, fade: 0, cut: 0}
       TextStyle: {size: $size_gen_control, line: 19, role: 0, bold: 0}
     }
@@ -554,7 +554,7 @@ hn {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     sign : ui.Line {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: 15, line: 18, role: 0, bold: 0}
     }
   }
@@ -578,13 +578,13 @@ hn {
       Size: {w: {kind: Fixed, value: 72, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
       Padding: {l: 6, r: 6, t: 0, b: 0}
       text : ui.Line {
-        Fill: $tone_term_ink
+        Fill: $tone_chat_ink
         TextStyle: {size: $size_gen_control, line: 18, role: 10, bold: 0}
         TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-          caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+          caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
       }
       hint : ui.Line {
-        Fill: $tone_term_muted
+        Fill: $tone_chat_muted
         TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
       }
     }
@@ -607,12 +607,12 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 160, max: $gen_field_w}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
     Padding: {l: 9, r: 7, t: 0, b: 0}
     text : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
     chevron : ui.Symbol {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
     }
   }
@@ -640,7 +640,7 @@ hn {
       Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
     }
     label : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -787,7 +787,7 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_tab_h, min: 0, max: 0}}
       Padding: {l: 10, r: 10, t: 0, b: 0}
       label : ui.Line {
-        Fill: $tone_term_muted
+        Fill: $tone_chat_muted
         TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: 500}
       }
     }
@@ -800,7 +800,7 @@ hn {
   prefab GenTabOn : hn.GenTab {
     head : ui.Row {
       label : ui.Line {
-        Fill: $tone_term_ink
+        Fill: $tone_chat_ink
         TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: $weight_label}
       }
     }
@@ -823,11 +823,11 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_tab_h, min: 0, max: 0}}
     Padding: {l: 4, r: 8, t: 0, b: 0}
     chevron : ui.Symbol {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
     }
     title : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0, weight: $weight_label}
     }
@@ -884,12 +884,12 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
     Padding: {l: 10, r: 10, t: 0, b: 0}
     label : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
     keys : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
     }
   }
@@ -945,7 +945,7 @@ hn {
     Padding: {l: 20, r: 20, t: 16, b: 22}
   }
   prefab GenFloatTitle : ui.Words {
-    Fill: $tone_term_ink
+    Fill: $tone_chat_ink
     TextStyle: {size: $size_gen_title, line: 20, role: 0, bold: 1}
   }
   prefab GenFloatBody : ui.Column {
@@ -967,12 +967,12 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_toast_w}, h: {kind: Fit, value: 0, min: 40, max: 0}}
     Padding: {l: 14, r: 16, t: 8, b: 8}
     mark : ui.Node {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       Shape: {radius: 4, n: 2, border: 0, feather: 0}
       Size: {w: {kind: Fixed, value: 8, min: 0, max: 0}, h: {kind: Fixed, value: 8, min: 0, max: 0}}
     }
     text : ui.Words {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -1018,18 +1018,18 @@ hn {
       ring : ui.Node {
         Overlay
         Fill: $tone_clear
-        Stroke: {dark: $tone_term_faint.dark, light: $tone_term_faint.light}
+        Stroke: {dark: $tone_chat_faint.dark, light: $tone_chat_faint.light}
         Vector: {d: "M8 1.5 A6.5 6.5 0 1 1 8 14.5 A6.5 6.5 0 1 1 8 1.5", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: 2}
       }
       arc : ui.Node {
         Overlay
         Fill: $tone_clear
-        Stroke: {dark: $tone_term_muted.dark, light: $tone_term_muted.light}
+        Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
         Vector: {d: "M8 1.5 A6.5 6.5 0 0 1 14.18 10.01", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: 2}
       }
     }
     label : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
     }
   }
@@ -1049,7 +1049,7 @@ hn {
 
   // A file kind's icon (in the kind's colour, hn.GenFileKind) or a symbol (in the ink), $gen_icon square.
   prefab GenIcon : ui.Symbol {
-    Fill: $tone_term_ink
+    Fill: $tone_chat_ink
     Size: {w: {kind: Fixed, value: $gen_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_icon, min: 0, max: 0}}
   }
   prefab GenFileKind {
@@ -1104,7 +1104,7 @@ hn {
     Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
     Padding: {l: 12, r: 12, t: 12, b: 12}
     text : ui.Words {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
     }
   }
@@ -1123,11 +1123,11 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_field_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: 12, r: 12, t: 8, b: 8}
       text : ui.Words {
-        Fill: $tone_term_muted
+        Fill: $tone_chat_muted
         TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
       }
       run : ui.Line {
-        Fill: $tone_term_ink
+        Fill: $tone_chat_ink
         Text: {s: "Run again"}
         TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
       }
@@ -1214,19 +1214,19 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_chip_h, min: 0, max: 0}}
     Padding: {l: 12, r: 12, t: 0, b: 0}
     label : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
     }
   }
   prefab GenChipOn : hn.GenChip {
     Fill: $tone_gen_chip_on
     Edge: {dark: $tone_gen_chip_on_edge.dark, light: $tone_gen_chip_on_edge.light}
-    label : ui.Line { Fill: $tone_term_ink }
+    label : ui.Line { Fill: $tone_chat_ink }
   }
   // A column pressed as a whole, on the card's plate; it shows the hover while it takes a press.
   prefab GenTile : ui.Column {
     Fill: $tone_chat_card
-    Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+    Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
     Shape: {radius: 10, n: 4, border: 1, feather: 0}
     Flex: {axis: Column, gap: 8, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -1257,11 +1257,11 @@ hn {
       Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
     }
     name : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
     }
     line : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_small, line: 16, role: 10, bold: 0}
     }
   }
@@ -1272,7 +1272,7 @@ hn {
     // Scrolls, so a cell taller than the window keeps its natural height (a column that does not shrinks Fit children).
     Clip
     ScrollState: {x: 0, y: 0}
-    Fill: $tone_term_ground
+    Fill: $tone_chat_ground
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
     Padding: {l: 40, r: 40, t: 24, b: 24}
@@ -1303,11 +1303,11 @@ hn {
       Size: {w: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}}
     }
     name : ui.Lead {
-      Fill: $tone_term_ink
+      Fill: $tone_chat_ink
       TextStyle: {size: $size_body, line: $line_gen_file, role: 0, bold: 0}
     }
     meta : ui.Line {
-      Fill: $tone_term_muted
+      Fill: $tone_chat_muted
       TextStyle: {size: $size_gen_small, line: $line_gen_meta, role: 10, bold: 0}
     }
   }
@@ -1353,7 +1353,7 @@ hn {
     Size: {w: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}}
   }
   prefab GenSwatchDot : ui.Node {
-    Fill: $tone_term_ink
+    Fill: $tone_chat_ink
     Edge: {dark: $tone_gen_swatch_edge.dark, light: $tone_gen_swatch_edge.light}
     Shape: {radius: $gen_swatch_radius, n: 2, border: 1, feather: 0}
     Size: {w: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}}
@@ -1409,7 +1409,7 @@ hn {
     Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
   }
   prefab GenDropLabel : ui.Line {
-    Fill: $tone_term_muted
+    Fill: $tone_chat_muted
     TextStyle: {size: $size_body, line: $line_gen_file, role: 0, bold: 0}
   }
   prefab GenDropBody : ui.Column {

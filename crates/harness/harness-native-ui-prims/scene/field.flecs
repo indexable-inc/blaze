@@ -1,0 +1,16 @@
+module ui.field
+
+// Text fields beyond ui.TextArea, as their own module (`ui.field.<Name>`; `using ui.field` names them bare). Loaded after
+// prims (it builds on ui.TextArea) and the tokens.
+
+@tree ChildOf
+// A text area that grows with its words to a share of its pane's height (GrowLimit: `share` of the nearest ancestor whose
+// height is not its content's, less `keep` points for what the pane shows around it), then scrolls on AppKit's physics.
+// When the caret leaves the view (typing, arrows, a paste) it glides back into view, CaretScroll's margin inside the
+// edges. The host keeps a harness_native_ui_view::field::FieldScroll per area: it steps it each frame with the caret's
+// line and hands it the wheels over the area.
+prefab GrowingTextArea : ui.TextArea {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  GrowLimit: {share: $textarea_grow_share, keep: 0}
+  CaretScroll: {margin: $textarea_caret_margin, omega: $textarea_glide_omega, zeta: $textarea_glide_zeta}
+}
