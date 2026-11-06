@@ -19,17 +19,25 @@ use blaze_registry::{
     pinned::crate_pin,
 };
 use blaze_source::SourceId;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use semver::{Version, VersionReq};
 use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 
 /// Files by URL, each with an ETag, and every request asked of it.
-#[derive(Default)]
 struct Server {
-    files: Mutex<HashMap<String, (Vec<u8>, String), Global>>,
-    asked: Mutex<Vec<(String, Vec<(String, String)>)>>,
+    files: Lock<HashMap<String, (Vec<u8>, String), Global>>,
+    asked: Lock<Vec<(String, Vec<(String, String)>)>>,
+}
+
+impl Default for Server {
+    fn default() -> Server {
+        Server {
+            files: Lock::new("registry.test.fetch.files", HashMap::new_in(Global)),
+            asked: Lock::new("registry.test.fetch.asked", Vec::new()),
+        }
+    }
 }
 
 impl Server {

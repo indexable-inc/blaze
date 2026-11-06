@@ -29,6 +29,7 @@ mod row;
 mod slot;
 mod storage;
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests;
 mod tracked;
 mod value;
@@ -729,10 +730,11 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
 }
 
 /// `f(at)` for each `at` in `0..count`, in order, run as [`par_for_each`] runs its tasks.
+#[expect(clippy::disallowed_types, reason = "a result's slot, each locked once by the task that fills it")]
 pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    let made: Vec<parking_lot::Mutex<Option<R>>> =
+    let made: Vec<blaze_core::lock::Lock<Option<R>>> =
         // alloc: a slot per result, once per loop
-        (0..count).map(|_| parking_lot::Mutex::new(None)).collect();
+        (0..count).map(|_| blaze_core::lock::Lock::new("query.par_map.slot", None)).collect();
     par_for_each(count, |at| {
         let it = f(at);
         *made[at].lock() = Some(it);

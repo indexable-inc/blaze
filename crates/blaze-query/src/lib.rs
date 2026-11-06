@@ -54,6 +54,7 @@ mod table;
 pub mod tree;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests;
 
 pub use blaze_query_macros::{Supertype, Value, input, interned, tracked};
@@ -607,7 +608,8 @@ fn try_with_stacks<R>(f: impl FnOnce(&RefCell<Stacks>) -> R) -> Option<R> {
 
 /// Empty stacks threads left when a job's were put on them, for the next job to switch out.
 // alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
-static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> = ShortLock::new(Vec::new());
+static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> =
+    ShortLock::new("query.fiber.spare_stacks", Vec::new());
 
 /// Moves a thread-local of a crate above the engine with each job on a fiber across its waits,
 /// as [`carry_with_fiber_jobs`] does the engine's: one a job sets and reads again after a query
@@ -1203,7 +1205,8 @@ struct Marking<'a> {
 pub(crate) fn on_workers(most: usize, job: impl Fn() + Sync) {
     let pool = blaze_graph::exec::shared();
     // dyn: a panic's payload, as `catch_unwind` gives it
-    let mut panic: ShortLock<Option<Box<dyn Any + Send>>> = ShortLock::new(None);
+    let mut panic: ShortLock<Option<Box<dyn Any + Send>>> =
+        ShortLock::new("query.workers.first_panic", None);
     pool.scope(|scope| {
         for _ in 0..pool.workers().min(most) {
             scope.submit(None, &job, |ran| {
@@ -1641,12 +1644,12 @@ impl Database {
             newest: AtomicU32::new(0),
             contexts: FxMap::default(),
             flights: Flights::new(),
-            spare_views: ShortLock::default(),
+            spare_views: ShortLock::new("query.db.spare_views", SpareViews::default()),
             generation: AtomicU32::new(0),
             store: Store::new(),
             image: None,
             image_slotted: std::sync::atomic::AtomicBool::new(false),
-            io: ShortLock::default(),
+            io: ShortLock::new("query.db.io", Io::default()),
         };
         db.register::<subtree::Subtree>();
         db
@@ -1889,7 +1892,8 @@ impl Database {
             let marks = reached.as_slice();
             if matches!(how, Mark::Parallel { .. }) {
                 // alloc: a parallel collection's list of what young keys read, once a collection
-                let young_inputs: ShortLock<Vec<QueryKey>> = ShortLock::new(Vec::new());
+                let young_inputs: ShortLock<Vec<QueryKey>> =
+                    ShortLock::new("query.collect.young_inputs", Vec::new());
                 self.slots.edit_all_parallel(
                     || (blaze_mem::scratch::lend_u32s(), blaze_mem::scratch::lend_u32s()),
                     |(live, _), task, key, slot| {
@@ -2061,13 +2065,13 @@ impl Database {
             reached: AtomicBitSlice::from_words(&reached_words),
             hot: AtomicBitSlice::from_words(&hot_words),
             // alloc: here and below, a parallel collection's shared lists, once each a collection
-            late_hot: ShortLock::new(Vec::new()),
-            spill: ShortLock::new(Vec::new()), // alloc: see above
+            late_hot: ShortLock::new("query.collect.late_hot", Vec::new()),
+            spill: ShortLock::new("query.collect.spill", Vec::new()), // alloc: see above
             spilled: std::sync::atomic::AtomicUsize::new(0),
             hungry: std::sync::atomic::AtomicBool::new(false),
             busy: std::sync::atomic::AtomicUsize::new(0),
-            inputs: ShortLock::new(Vec::new()), // alloc: see above
-            late: ShortLock::new(Vec::new()),   // alloc: see above
+            inputs: ShortLock::new("query.collect.inputs", Vec::new()), // alloc: see above
+            late: ShortLock::new("query.collect.late", Vec::new()), // alloc: see above
         };
         on_workers(usize::MAX, || self.mark_job(&marking));
         let found = std::mem::take(marking.inputs.get_mut());

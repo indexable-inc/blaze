@@ -1,6 +1,6 @@
 -- The DuckDB views over blaze's Parquet history (crates/blaze-profile/src/history.rs): one a
--- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`, and
--- `span_sums` over `spans` and `folded`.
+-- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`,
+-- `span_sums` over `spans` and `folded`, and `lock_waits` and `stalls` over `events`.
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
 -- that table's files the history's manifest lists (`history/manifest.rs`), all of them or
 -- those that can hold one build's rows: `['<dir>/schema.<table>.parquet', '<dir>/<file>', ...]`.
@@ -103,6 +103,58 @@ LEFT JOIN (
     GROUP BY process, event_id
 ) AS said
     ON said.process = events.process AND said.event_id = events.event_id;
+
+-- One row a wait for a named lock (blaze_core::lock, docs/v2/plan/design/named-locks.md): each
+-- event of the target `blaze::lock` (message `lock_wait`, blaze_profile::locks::record) with its
+-- fields as typed columns. `lock` is the lock's name and `value_type` the type it guards; `mode`
+-- lock, read or write; `site` the waiter's `file:line`; `span` the waiter's span (a
+-- `spans.span_id` of the same process, 0 for none) and `thread` its thread; `start_ns` when the
+-- wait began, on the profile's clock, and `wait_ns` how long it took. The holder it waited
+-- behind, as the holder left itself at its release: `holder_site`, `holder_span`,
+-- `holder_thread`, `holder_mode`, and `hold_ns` how long it held the lock, from its acquire when
+-- `hold_whole`, else only from when the first of the waiters then began. A wait whose holder
+-- said nothing has `holder_thread` 0 and `holder_site` ''. `blaze debug locks` ranks these and
+-- the gate's `lock_waits` sums them a lock.
+CREATE OR REPLACE VIEW lock_waits AS
+SELECT
+    events.build_id, events.process, events.t_ns, events.event_id,
+    max(f.value_str) FILTER (WHERE f.key = 'lock') AS lock,
+    max(f.value_str) FILTER (WHERE f.key = 'value_type') AS value_type,
+    max(f.value_str) FILTER (WHERE f.key = 'mode') AS mode,
+    max(f.value_str) FILTER (WHERE f.key = 'site') AS site,
+    max(f.value_u64) FILTER (WHERE f.key = 'span') AS span,
+    max(f.value_u64) FILTER (WHERE f.key = 'thread') AS thread,
+    max(f.value_u64) FILTER (WHERE f.key = 'start_ns') AS start_ns,
+    max(f.value_u64) FILTER (WHERE f.key = 'wait_ns') AS wait_ns,
+    coalesce(max(f.value_str) FILTER (WHERE f.key = 'holder_site'), '') AS holder_site,
+    max(f.value_u64) FILTER (WHERE f.key = 'holder_span') AS holder_span,
+    max(f.value_u64) FILTER (WHERE f.key = 'holder_thread') AS holder_thread,
+    coalesce(max(f.value_str) FILTER (WHERE f.key = 'holder_mode'), '') AS holder_mode,
+    max(f.value_u64) FILTER (WHERE f.key = 'hold_ns') AS hold_ns,
+    max(f.value_bool) FILTER (WHERE f.key = 'hold_whole') AS hold_whole
+FROM events
+JOIN event_fields AS f ON f.process = events.process AND f.event_id = events.event_id
+WHERE events.target = 'blaze::lock'
+GROUP BY events.build_id, events.process, events.t_ns, events.event_id;
+
+-- One row a stall the daemon's watchdog found in the wait-for graph (blaze_core::lock::stall):
+-- each event of the target `blaze::stall` with its fields as columns. `kind` is deadlock or
+-- convoy; `line` the one line `blaze status` says; `head` the thread a convoy waits behind;
+-- `waiters` how many wait in it; `threads` the threads in it, a comma list; `oldest_ns` how long
+-- the oldest of them had waited.
+CREATE OR REPLACE VIEW stalls AS
+SELECT
+    events.build_id, events.process, events.t_ns, events.event_id,
+    max(f.value_str) FILTER (WHERE f.key = 'kind') AS kind,
+    max(f.value_str) FILTER (WHERE f.key = 'line') AS line,
+    max(f.value_u64) FILTER (WHERE f.key = 'head') AS head,
+    max(f.value_u64) FILTER (WHERE f.key = 'waiters') AS waiters,
+    max(f.value_str) FILTER (WHERE f.key = 'threads') AS threads,
+    max(f.value_u64) FILTER (WHERE f.key = 'oldest_ns') AS oldest_ns
+FROM events
+JOIN event_fields AS f ON f.process = events.process AND f.event_id = events.event_id
+WHERE events.target = 'blaze::stall'
+GROUP BY events.build_id, events.process, events.t_ns, events.event_id;
 
 CREATE OR REPLACE VIEW errors AS
 SELECT * FROM read_parquet(@errors, union_by_name = true);

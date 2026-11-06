@@ -81,6 +81,7 @@ hot_alloc = "warn"
 fiber_boundary = "warn"
 held_across_wait = "warn"
 lock_across_query = "warn"
+# A guard held across IO or a global-heap allocation (docs/v2/plan/design/named-locks.md).
 error_debug = "warn"
 blocking_on_pool = "warn"
 shared_collection_lock = "warn"

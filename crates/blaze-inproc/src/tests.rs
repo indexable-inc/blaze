@@ -1344,7 +1344,7 @@ mod linux {
         use std::sync::Arc;
 
         use blaze_core::{Command, Sandbox};
-        use parking_lot::Mutex;
+        use blaze_core::lock::Lock;
 
         use super::*;
         use crate::handshake::HOST_VAR;
@@ -1598,7 +1598,7 @@ mod linux {
             let dir = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
-            let memory = Arc::new(Mutex::new(memory));
+            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
             let (sessions, got) = crossbeam_channel::unbounded();
             let image = Image { key: [9; 32], len: 2 * page, store: None };
             let program = Program::new(host, memory.clone(), image, sessions);

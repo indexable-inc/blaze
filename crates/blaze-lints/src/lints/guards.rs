@@ -4,8 +4,9 @@
 //!
 //! A guard is known by resolution: std's lock guards and `RefCell`'s borrows by the diagnostic
 //! items clippy names them by (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`,
-//! `RefCellRef`, `RefCellRefMut`), std's others by name in std, and `lock_api`'s (the guards
-//! `parking_lot`'s locks hand out) by name in `lock_api`. A type holds one when it is one, or
+//! `RefCellRef`, `RefCellRefMut`), std's others by name in std, `lock_api`'s (the guards
+//! `parking_lot`'s locks hand out) by name in `lock_api`, and blaze's own (`blaze_core::lock`'s
+//! `LockGuard`, `ReadGuard`, `WriteGuard`) by name in that module. A type holds one when it is one, or
 //! one is among its generic arguments, its tuple's fields or its struct's fields, a few levels
 //! down (`LockResult<MutexGuard<..>>`, `Option<RefMut<..>>`, a struct with a guard field); a
 //! reference to a guard holds none of its own.
@@ -108,7 +109,8 @@ impl Guards {
         let named = |names: &[&str], krate_name| {
             names.contains(&name.as_str()) && facts::crate_is(db, krate, krate_name)
         };
-        (named(STD, "std") || named(LOCK_API, "lock_api")).then_some(Kind::Lock)
+        (named(STD, "std") || named(LOCK_API, "lock_api") || facts::is_blaze_core_guard(db, adt))
+            .then_some(Kind::Lock)
     }
 
     /// The guard of kind `kind` that `ty` holds: itself, or one in its arguments or fields.

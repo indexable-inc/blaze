@@ -889,7 +889,8 @@ fn explorer_flush(profiling: &Profiling) -> blaze_explore::Flush {
     let (ended, doing) = (profiling.ended.clone(), Arc::clone(&profiling.doing));
     let tickets = AtomicU64::new(0);
     // The last flush done for the explorer: the ticket it took as it began, and its number.
-    let last: parking_lot::Mutex<Option<(u64, u64)>> = parking_lot::Mutex::new(None);
+    let last: blaze_core::lock::Lock<Option<(u64, u64)>> =
+        blaze_core::lock::Lock::new("serve.observe.explorer_flush.last", None);
     blaze_explore::Flush::new(move || {
         let asked = tickets.fetch_add(1, Ordering::SeqCst);
         let _span = tracing::info_span!(target: "blaze", "wait for the profile history's flush for the explorer", asked).entered();

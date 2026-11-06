@@ -518,10 +518,12 @@ const CASE: Duration = Duration::from_secs(90);
 const RUN: Duration = Duration::from_secs(200);
 
 /// Where the running case is, as [`Watch::at`] last named it.
-static PLACE: parking_lot::Mutex<String> = parking_lot::const_mutex(String::new());
+static PLACE: blaze_core::lock::Lock<String> =
+    blaze_core::lock::Lock::new("graph.test.oracle.place", String::new());
 
 /// The first wait of the run that timed out ([`hung`]).
-static HUNG: parking_lot::Mutex<Option<String>> = parking_lot::const_mutex(None);
+static HUNG: blaze_core::lock::Lock<Option<String>> =
+    blaze_core::lock::Lock::new("graph.test.oracle.hung", None);
 
 /// A bounded wait of the case timed out: said on stderr at once (hegel keeps a case's panic
 /// until it ends shrinking) and kept as the run's first hang, then the case fails with it.

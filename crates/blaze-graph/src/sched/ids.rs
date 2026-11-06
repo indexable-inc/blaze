@@ -17,8 +17,6 @@ use std::sync::{
     atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
-use parking_lot::Mutex;
-
 use super::{CounterId, FIRST_GENERATION, JobId, MAX_JOBS, domain::Cell};
 
 /// Slots a chunk of a [`Table`] holds.
@@ -100,7 +98,11 @@ fn shard() -> usize {
 /// A shard's list grows only past the most ids ever free in it at once, so a warm thread's
 /// take and free allocate nothing (a lock-free queue's would: a block per few frees).
 struct Pool {
-    free: [Mutex<Vec<u32>>; FREE_SHARDS],
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a thread's shard of free ids: held for one push or pop, never across a call"
+    )]
+    free: [blaze_core::lock::Lock<Vec<u32>>; FREE_SHARDS],
     /// Ids in `free`, over every shard: none, and a take goes fresh without visiting them.
     freed: AtomicUsize,
     next: AtomicU32,
@@ -108,9 +110,10 @@ struct Pool {
 
 impl Pool {
     /// Ids from `first` up.
+    #[expect(clippy::disallowed_types, reason = "makes `Pool::free`, which allows it")]
     const fn new(first: u32) -> Pool {
         Pool {
-            free: [const { Mutex::new(Vec::new()) }; FREE_SHARDS],
+            free: [const { blaze_core::lock::Lock::new("sched.ids.free", Vec::new()) }; FREE_SHARDS],
             freed: AtomicUsize::new(0),
             next: AtomicU32::new(first),
         }
@@ -223,7 +226,12 @@ pub(super) fn take_member(bits: u32) -> u32 {
 /// Every scheduler of the process by id, for a job's or counter's id to find its own, and the
 /// process-wide reports ([`super::waits_now`]) to visit each: a slot each, behind a lock of
 /// its own, which only that scheduler's making, dropping and lookups take.
-static DOMAINS: Table<Mutex<Weak<Cell>>> = Table::new(|| Mutex::new(Weak::new()));
+#[expect(
+    clippy::disallowed_types,
+    reason = "a scheduler's slot: taken only as it is made, dropped or looked up by id"
+)]
+static DOMAINS: Table<blaze_core::lock::Lock<Weak<Cell>>> =
+    Table::new(|| blaze_core::lock::Lock::new("sched.ids.domain_slot", Weak::new()));
 
 /// A scheduler id no live scheduler has: one that dropped may be taken again. A stale lookup
 /// (of a job that ended as it was looked up, its scheduler gone and its id taken again) finds

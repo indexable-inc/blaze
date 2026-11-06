@@ -24,6 +24,7 @@ use std::{fmt, sync::Arc};
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
 use blaze_codegen::{driver::ProfileCounts, settings::Pgo};
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_diagnostics::{Diag, Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
@@ -31,7 +32,6 @@ use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
 use blaze_profile::span::{self, Name};
 use blaze_units::schema::{Mode, Unit};
 use hir_ty_codegen::v2::BodyChecks;
-use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -1297,7 +1297,7 @@ pub(crate) fn span_unit(unit: &Unit) -> String {
 
 /// A unit's phases, each holding the lock while it changes them. Only [`Phase::Bodies`] and
 /// [`Phase::Codegen`], side by side, ever wait on it, each only to read or leave a field.
-fn lock(slot: &Mutex<Phases>) -> MutexGuard<'_, Phases> {
+fn lock(slot: &Lock<Phases>) -> LockGuard<'_, Phases> {
     // A phase that panicked took nothing it read: it changes the unit's only once it is done.
     slot.lock()
 }
@@ -1305,7 +1305,7 @@ fn lock(slot: &Mutex<Phases>) -> MutexGuard<'_, Phases> {
 /// [`Phase::Names`]: the unit's record, replayed when the store keeps it; otherwise its
 /// lint flags, its crate's def map, what it does, and its check: served from the store, none
 /// (what a program reaches of the crate is type-checked by its walk), or of every body.
-fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
+fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Result<(), Failed> {
     let kept = {
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
@@ -1440,7 +1440,7 @@ pub(super) fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) 
 
 /// [`Phase::Bodies`]: the check of every body of the unit's crate, when one runs, its outcome
 /// kept to be stored as a dependency crate's.
-fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
+fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Result<(), Failed> {
     // clone: a refcount, once per unit checked
     let Some(checking) = lock(slot).checking.clone() else { return Ok(()) };
     let u = job.unit(unit)?;
@@ -1625,7 +1625,7 @@ fn generate(
     job: &Job,
     reader: &UnitReader,
     unit: usize,
-    slot: &Mutex<Phases>,
+    slot: &Lock<Phases>,
 ) -> Result<(), Failed> {
     let (does, checking) = {
         let phases = lock(slot);

@@ -19,7 +19,7 @@ use std::{
     },
 };
 
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use blaze_core::lock::{Lock, LockGuard, ReadLock};
 
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, VfsPath};
 use blaze_format::cursor::Put;
@@ -98,7 +98,7 @@ pub struct Files {
     /// What only the setters read and write. Every setter runs on `&mut` of the database and
     /// no query takes this lock, so no query waits on it. A setter holds it across the input
     /// writes it makes; those call no query.
-    writer: Mutex<Writer>,
+    writer: Lock<Writer>,
     /// The files outside the VFS that a macro read: `include_bytes!` and `include_str!` their
     /// bytes, `include!` its source as well ([`Included::source`]). The one home of what a
     /// macro read from the disk: every reader that keys, files or re-reads such a file reads it
@@ -120,7 +120,7 @@ pub struct Files {
     env_unset: Table<(Crate, Box<str>)>,
     /// What each proc-macro expansion read besides its call, by the crate the call is in and
     /// where the reads come from: a later note from the same place replaces them.
-    expansions_read: RwLock<HashMap<(Crate, ReadBy), Box<[ExpansionRead]>, Global>>,
+    expansions_read: ReadLock<HashMap<(Crate, ReadBy), Box<[ExpansionRead]>, Global>>,
     /// Every list of directories whose files are read from another directory that
     /// [`Files::set_view`] made, kept for readers that may hold one; `view` names the one in use.
     views: Log<Box<[View]>>,
@@ -343,14 +343,14 @@ impl Default for Files {
             raw: Column::new(),
             file_source_roots: Column::new(),
             source_roots: Column::new(),
-            writer: Mutex::default(),
+            writer: Lock::new("db.files.writer", Default::default()),
             included: Table::new(1 << 22),
             included_by: Table::new(1 << 22),
             included_sources: Table::new(1 << 22),
             sources_included_by: Table::new(1 << 22),
             env_read: Table::new(1 << 22),
             env_unset: Table::new(1 << 22),
-            expansions_read: RwLock::default(),
+            expansions_read: ReadLock::new("db.files.expansions_read", Default::default()),
             views: Log::new(1 << 16),
             view: AtomicU32::new(0),
         }
@@ -364,7 +364,8 @@ impl fmt::Debug for Files {
 }
 
 impl Files {
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Writer> {
+    #[track_caller]
+    pub(crate) fn lock(&self) -> LockGuard<'_, Writer> {
         self.writer.lock()
     }
 

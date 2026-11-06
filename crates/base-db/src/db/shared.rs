@@ -8,7 +8,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use blaze_query::db::Database as _;
-use parking_lot::{Condvar, Mutex};
+use blaze_core::lock::{Lock, Signal};
 
 use super::Db;
 
@@ -33,10 +33,18 @@ pub struct Reader {
     left: Left,
 }
 
-#[derive(Default)]
 struct Gone {
-    lock: Mutex<()>,
-    left: Condvar,
+    lock: Lock<()>,
+    left: Signal,
+}
+
+impl Default for Gone {
+    fn default() -> Gone {
+        Gone {
+            lock: Lock::new("db.shared.readers", ()),
+            left: Signal::new("db.shared.reader_left"),
+        }
+    }
 }
 
 struct Left(Arc<Gone>);
@@ -71,11 +79,10 @@ impl Shared {
     pub fn write(&mut self) -> &mut Db {
         if Arc::strong_count(&self.db) > 1 {
             self.db.storage().stop_readers();
-            let held = blaze_graph::wait::lock(&self.gone.lock, "db readers left");
+            let mut held = self.gone.lock.lock();
             let db = &self.db;
-            drop(blaze_graph::wait::wait_until(&self.gone.left, held, "db readers gone", |_| {
-                Arc::strong_count(db) == 1
-            }));
+            self.gone.left.wait_while(&mut held, |_| Arc::strong_count(db) > 1);
+            drop(held);
         }
         let db = Arc::get_mut(&mut self.db).expect(
             "a reader of the database is held past its last `Reader`: only `Reader`s clone it",

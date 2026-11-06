@@ -15,7 +15,7 @@ use blaze_registry::{
     http::{Http, Response},
 };
 use blaze_source::SourceId;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use semver::Version;
 use std::alloc::Global;
 
@@ -26,8 +26,8 @@ const LOGIN: &str = "https://private.example.com/me";
 /// Files by URL, every one of which wants `authorization: <token>`, and what was asked.
 struct Server {
     token: String,
-    files: Mutex<HashMap<String, Vec<u8>, Global>>,
-    asked: Mutex<Vec<(String, Option<String>)>>,
+    files: Lock<HashMap<String, Vec<u8>, Global>>,
+    asked: Lock<Vec<(String, Option<String>)>>,
 }
 
 impl Http for Server {
@@ -51,8 +51,14 @@ impl Http for Server {
     }
 }
 
-#[derive(Clone, Default)]
-struct Said(Arc<Mutex<Vec<String>>>);
+#[derive(Clone)]
+struct Said(Arc<Lock<Vec<String>>>);
+
+impl Default for Said {
+    fn default() -> Said {
+        Said(Arc::new(Lock::new("registry.test.auth.said", Vec::new())))
+    }
+}
 
 impl Shell for Said {
     fn warn(&self, text: &str) {
@@ -117,8 +123,8 @@ impl Fixture {
         ], Global);
         let server = Arc::new(Server {
             token: token.to_owned(),
-            files: Mutex::new(files),
-            asked: Mutex::default(),
+            files: Lock::new("registry.test.auth.files", files),
+            asked: Lock::new("registry.test.auth.asked", Vec::new()),
         });
         let package =
             Package { name: "secret".to_owned(), version: Version::new(1, 0, 0), checksum: sum };

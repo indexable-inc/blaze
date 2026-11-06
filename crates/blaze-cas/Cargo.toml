@@ -23,7 +23,6 @@ blaze-mem.workspace = true
 blaze-reclaim.workspace = true
 blaze-serde.workspace = true
 lz4_flex.workspace = true
-parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true
 zstd.workspace = true

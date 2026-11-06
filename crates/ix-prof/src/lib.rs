@@ -41,7 +41,7 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 pub mod alloc;
 pub mod chrome;
@@ -211,26 +211,26 @@ pub(crate) struct Session {
     pub(crate) config: Config,
     /// Shared with the sampler's sink, which feeds it directly (not through [`SESSION`]), so
     /// the sampler's last batch lands while [`Guard::stop`] joins it.
-    pub(crate) recorder: Arc<Mutex<core::Recorder>>,
-    pub(crate) log: Mutex<live::Log>,
+    pub(crate) recorder: Arc<Lock<core::Recorder>>,
+    pub(crate) log: Lock<live::Log>,
     pub(crate) live_wanted: AtomicBool,
     /// The live stream's session id, also in the profile's file name.
     id: String,
     stop: AtomicBool,
     #[cfg(feature = "sampler")]
-    sampler: Mutex<Option<sampler::Sampler>>,
-    ticker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    sampler: Lock<Option<sampler::Sampler>>,
+    ticker: Lock<Option<std::thread::JoinHandle<()>>>,
     #[cfg(all(feature = "http", unix))]
-    http: Mutex<Option<http::Server>>,
+    http: Lock<Option<http::Server>>,
 }
 
 /// Held by every test that starts the profiler or turns the allocator on: they share
 /// [`SESSION`], [`RECORDING`] and the allocator's globals.
 #[cfg(test)]
-pub(crate) static TEST_GLOBALS: Mutex<()> = Mutex::new(());
+pub(crate) static TEST_GLOBALS: Lock<()> = Lock::new("ixprof.session.test_globals", ());
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
-static SESSION: Mutex<Option<Arc<Session>>> = Mutex::new(None);
+static SESSION: Lock<Option<Arc<Session>>> = Lock::new("ixprof.session.session", None);
 
 /// Whether the profiler is on: what every driver checks first.
 #[inline]
@@ -316,7 +316,10 @@ pub fn start(config: Config) -> Result<Guard, Error> {
         labels: config.labels.iter().cloned().collect(),
     };
     let recorder =
-        Arc::new(Mutex::new(core::Recorder::new(pid, &program, meta, config.limits.clone())));
+        Arc::new(Lock::unrecorded(
+            "ixprof.session.recorder",
+            core::Recorder::new(pid, &program, meta, config.limits.clone()),
+        ));
     let id = live::session_id(pid, start_ns, start_unix_ns, nonce());
     let log = live::Log::new(id.clone(), config.retain_bytes);
     #[cfg(feature = "sampler")]
@@ -353,16 +356,16 @@ pub fn start(config: Config) -> Result<Guard, Error> {
     let session = Arc::new(Session {
         config,
         recorder,
-        log: Mutex::new(log),
+        log: Lock::unrecorded("ixprof.session.log", log),
         // With an endpoint, batches are kept from the start so a client can resume and backfill.
         live_wanted: AtomicBool::new(serving),
         id,
         stop: AtomicBool::new(false),
         #[cfg(feature = "sampler")]
-        sampler: Mutex::new(sampler),
-        ticker: Mutex::new(None),
+        sampler: Lock::new("ixprof.session.sampler", sampler),
+        ticker: Lock::new("ixprof.session.ticker", None),
         #[cfg(all(feature = "http", unix))]
-        http: Mutex::new(None),
+        http: Lock::new("ixprof.session.http", None),
     });
     let started = (|| -> Result<(), Error> {
         let ticking = std::thread::Builder::new()

@@ -4,12 +4,12 @@
 //! ([`record`]), and the daemon's one [`Selector`] per suite ([`Selectors`]).
 
 use blaze_codegen::{ExecTable, InstanceKey, driver::Built};
+use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_testsel::{Bound, FnId, Image, Record, Selector, Version};
 use blaze_usercode::test::Executed;
 use hir_ty_codegen::v2::RootTest;
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 /// The execution table of the test binary `binary`, linked from `built` with the span tables
@@ -62,8 +62,13 @@ pub(crate) fn record(executed: Executed) -> Record {
 /// result ([`Selectors::give`]). A run that did not drops it, and the next makes it again from
 /// the store, so a selector is always the only writer of its suite's history. The lock is
 /// taken twice per suite per run, never per test.
-#[derive(Default)]
-pub(crate) struct Selectors(Mutex<HashMap<ContentId, Held, Global>>);
+pub(crate) struct Selectors(Lock<HashMap<ContentId, Held, Global>>);
+
+impl Default for Selectors {
+    fn default() -> Selectors {
+        Selectors(Lock::new("serve.test.selectors", HashMap::default()))
+    }
+}
 
 /// A selector, with the binary its image is of.
 struct Held {

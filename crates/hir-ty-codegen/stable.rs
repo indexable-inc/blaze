@@ -13,7 +13,6 @@ use hir_def::{
     StaticId, TraitId, expr_store::Body, item_scope::ItemScope, nameres::crate_def_map,
 };
 use hir_expand::{HirFileId, MacroCallKind};
-use parking_lot::Mutex;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
     AliasTy, AliasTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,

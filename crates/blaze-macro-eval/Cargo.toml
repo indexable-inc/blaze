@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-parking_lot.workspace = true
 rustc_lexer.workspace = true
 unicode-normalization.workspace = true
 

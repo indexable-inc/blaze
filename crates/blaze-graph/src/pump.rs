@@ -26,7 +26,7 @@ use crate::{
     Cancelled, Key,
     sched::{self, CounterId, JobId, Wait},
     sync::{
-        MutexGuard,
+        LockGuard,
         atomic::{AtomicU64, Ordering},
         thread_local,
     },
@@ -35,6 +35,7 @@ use crate::{
 #[cfg(all(test, blaze_check))]
 mod model;
 #[cfg(all(test, not(blaze_check)))]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod oracle;
 #[cfg(all(test, not(blaze_check)))]
 mod sharded;
@@ -49,32 +50,20 @@ const LEAST: usize = 64;
 /// The executor's one kind of lock, held only to claim or hand over a slot (a key's flight, a
 /// wait's edge, a spare pool, a panic to raise later, a cap's bytes), never across a call into
 /// work or the database: no guard lives across a query, so none can deadlock or invert a
-/// priority (docs/v2/plan/design/concurrency.md, "No guard lives across a query call").
+/// priority (docs/v2/plan/design/concurrency.md, "No guard lives across a query call"). It is
+/// `blaze_core::lock`'s named lock: a contended acquire waits in a span naming it.
 #[allow(clippy::disallowed_types)]
-pub(crate) struct Lock<T>(crate::sync::Mutex<T>);
+pub(crate) struct Lock<T>(crate::sync::Lock<T>);
 
 #[allow(clippy::disallowed_types)]
 impl<T> Lock<T> {
-    pub(crate) const fn new(value: T) -> Lock<T> {
-        Lock(crate::sync::Mutex::new(value))
+    /// A lock named `name`, `"graph.<what it guards>"`.
+    pub(crate) const fn new(name: &'static str, value: T) -> Lock<T> {
+        Lock(crate::sync::Lock::new(name, value))
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+    pub(crate) fn lock(&self) -> LockGuard<'_, T> {
         self.0.lock()
-    }
-
-    /// [`Lock::lock`], said as a wait on `name` ([`crate::wait`]) only when another holds it.
-    #[cfg(not(blaze_check))]
-    pub(crate) fn lock_said(&self, name: &'static str) -> MutexGuard<'_, T> {
-        match self.0.try_lock() {
-            Some(held) => held,
-            None => crate::wait::wait(crate::wait::WaitOn::Lock(name), None, || self.lock()),
-        }
-    }
-
-    #[cfg(blaze_check)]
-    pub(crate) fn lock_said(&self, _name: &'static str) -> MutexGuard<'_, T> {
-        self.lock()
     }
 
     pub(crate) fn into_inner(self) -> T {

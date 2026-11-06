@@ -44,7 +44,7 @@ use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::{self, Tier};
 use crossbeam_queue::SegQueue;
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard, Signal};
 use std::alloc::Global;
 
 use crate::{
@@ -181,8 +181,8 @@ const SPIN_LOADS: u32 = 64;
 struct Shared<C: Compiler, P: Placer, A: Answers> {
     session: Session,
     /// The fetcher's state: held only to take or record a compile, never across one.
-    state: Mutex<State>,
-    wake: Condvar,
+    state: Lock<State>,
+    wake: Signal,
     /// Bumped, under the fetcher's lock, whenever a compile is queued or the runner closes:
     /// what the spinning worker watches.
     jobs: AtomicU64,
@@ -190,18 +190,18 @@ struct Shared<C: Compiler, P: Placer, A: Answers> {
     spinning: AtomicBool,
     compiler: C,
     /// Held across one placement: the image is placed into one function at a time.
-    placer: Mutex<P>,
+    placer: Lock<P>,
     answers: A,
     idle: bool,
     /// The tier-up, taken out (and closed) before the workers stop. Held across a bind,
     /// never with the fetcher's or the placer's lock.
-    tier: Mutex<Option<Tiered<C, P, A>>>,
+    tier: Lock<Option<Tiered<C, P, A>>>,
     /// The functions whose first code could not be bound to the tier runner, and why.
     unbound: SegQueue<(LazyId, String)>,
     /// The asking threads' buffers, between the hits they answer: popped and pushed once a lone
     /// hit, which allocates nothing, so a lock held for the one pop or push (a `SegQueue` takes a
     /// new block every 31 pushes, and the asking threads are too many to bound an `ArrayQueue`).
-    spare: Mutex<Vec<Buffers>>,
+    spare: Lock<Vec<Buffers>>,
 }
 
 /// One lazy run's daemon side.
@@ -221,7 +221,7 @@ pub struct Closed {
     pub unbound: Vec<(LazyId, String)>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
@@ -246,23 +246,26 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         // alloc: setup, once per run.
         let shared = Arc::new(Shared {
             session,
-            state: Mutex::new(State {
-                fetcher,
-                closing: false,
-                idle_queued: false,
-                parked: 0,
-                last_ask: None,
-            }),
-            wake: Condvar::new(),
+            state: Lock::new(
+                "lazy.runner.fetcher",
+                State {
+                    fetcher,
+                    closing: false,
+                    idle_queued: false,
+                    parked: 0,
+                    last_ask: None,
+                },
+            ),
+            wake: Signal::new("lazy.runner.compile_queued"),
             jobs: AtomicU64::new(0),
             spinning: AtomicBool::new(false),
             compiler,
-            placer: Mutex::new(placer),
+            placer: Lock::new("lazy.runner.placer", placer),
             answers,
             idle: config.idle,
-            tier: Mutex::new(None),
+            tier: Lock::new("lazy.runner.tier", None),
             unbound: SegQueue::new(),
-            spare: Mutex::new(Vec::new()), // alloc: setup; a buffer per thread that asks at once
+            spare: Lock::new("lazy.runner.spare", Vec::new()), // alloc: setup; a buffer per thread that asks at once
         });
         if let Some(up) = tier {
             let recompiler = Recompiler(Arc::downgrade(&shared));

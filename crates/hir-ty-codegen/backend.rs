@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use stdx::time::Instant;
 
 use super::{CodegenError, Result, debuginfo::SlotPlaces, fragment::Code, fragment::Recorder};
@@ -380,9 +380,9 @@ struct Counts {
     /// What a report read of each word last, written by reports alone.
     reported: Lines<[AtomicU64; word::COUNT]>,
     /// Why a function of a unit was compiled alone, and how often.
-    alone: Mutex<BTreeMap<String, usize>>,
+    alone: Lock<BTreeMap<String, usize>>,
     /// Where Cranelift's time went on this thread, with `BLAZE_STATS`.
-    passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
+    passes: Lock<Option<cranelift_codegen::timing::PassTimes>>,
     /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
     /// none and shared by all: their words are added to with `fetch_add`.
     held: AtomicBool,
@@ -403,8 +403,8 @@ impl Counts {
         Counts {
             words: Lines([const { AtomicU64::new(0) }; word::COUNT]),
             reported: Lines([const { AtomicU64::new(0) }; word::COUNT]),
-            alone: Mutex::new(BTreeMap::new()),
-            passes: Mutex::new(None),
+            alone: Lock::new("codegen.tally.alone", BTreeMap::new()),
+            passes: Lock::new("codegen.tally.passes", None),
             held: AtomicBool::new(held),
             next: std::sync::OnceLock::new(),
         }

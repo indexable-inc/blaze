@@ -3,6 +3,25 @@
 # instead of this one: these rules and a ban on locks (docs/v2/plan/design/concurrency.md). A
 # change here is made in theirs too.
 disallowed-types = [
+    # docs/v2/plan/design/profile-names.md: the flight recorder names per thread, sharing nothing.
+    { path = "blaze_profile::flight::Names", replacement = "blaze_profile::flight::names::Local", reason = "one process-wide name table shared cache lines across every recording thread: a thread names into its own table, defined in its own ring (docs/v2/plan/design/profile-names.md)", allow-invalid = true },
+    { path = "blaze_profile::flight::Shared", replacement = "blaze_profile::flight::names::Local", reason = "as for `flight::Names`: names are per thread", allow-invalid = true },
+    # Locks (rule standard-structures): raw std and parking_lot locks are banned outside crates/blaze-core/src/lock.rs.
+    { path = "std::sync::Mutex", replacement = "blaze_core::lock::Lock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "std::sync::RwLock", replacement = "blaze_core::lock::ReadLock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "std::sync::Condvar", replacement = "blaze_core::lock::Signal", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "std::sync::MutexGuard", replacement = "blaze_core::lock::LockGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "std::sync::RwLockReadGuard", replacement = "blaze_core::lock::ReadGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "std::sync::RwLockWriteGuard", replacement = "blaze_core::lock::WriteGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
+    { path = "parking_lot::Mutex", replacement = "blaze_core::lock::Lock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::RwLock", replacement = "blaze_core::lock::ReadLock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::Condvar", replacement = "blaze_core::lock::Signal", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::MutexGuard", replacement = "blaze_core::lock::LockGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::RwLockReadGuard", replacement = "blaze_core::lock::ReadGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::RwLockWriteGuard", replacement = "blaze_core::lock::WriteGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
+    { path = "parking_lot::ReentrantMutex", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only; a reentrant lock hides a call back into what holds it: split the critical section", allow-invalid = true },
+    { path = "parking_lot::ReentrantMutexGuard", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only; a reentrant lock hides a call back into what holds it: split the critical section", allow-invalid = true },
+    { path = "parking_lot::FairMutex", replacement = "blaze_core::lock::Lock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only", allow-invalid = true },
     { path = "std::collections::HashMap", replacement = "blaze_hash::HashMap", reason = "SipHash, seeded per map: blaze's maps are on `blaze_hash`'s fixed hasher, or `blaze_hash::ByHash` for keys that are hashes" },
     { path = "std::collections::HashSet", replacement = "blaze_hash::HashSet", reason = "SipHash, seeded per set: as for `HashMap`" },
     { path = "std::collections::hash_map::RandomState", replacement = "blaze_hash::FixedState", reason = "SipHash, seeded per map" },
@@ -15,13 +34,6 @@ disallowed-types = [
     { path = "ahash::AHashSet", replacement = "blaze_hash::HashSet", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
     { path = "ahash::RandomState", replacement = "blaze_hash::FixedState", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
     { path = "ahash::AHasher", replacement = "blaze_hash::FixedHasher", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
-    { path = "std::sync::Mutex", replacement = "parking_lot::Mutex", reason = "no poisoning to handle: a holder that panicked leaves the data as it was" },
-    { path = "std::sync::RwLock", replacement = "parking_lot::RwLock", reason = "no poisoning to handle: a holder that panicked leaves the data as it was" },
-    { path = "std::sync::Condvar", replacement = "parking_lot::Condvar", reason = "waits on the guard in place, with no poisoning to handle" },
-    { path = "std::sync::MutexGuard", replacement = "parking_lot::MutexGuard", reason = "the guard of `parking_lot::Mutex`, which replaces std's" },
-    { path = "std::sync::RwLockReadGuard", replacement = "parking_lot::RwLockReadGuard", reason = "the guard of `parking_lot::RwLock`, which replaces std's" },
-    { path = "std::sync::RwLockWriteGuard", replacement = "parking_lot::RwLockWriteGuard", reason = "the guard of `parking_lot::RwLock`, which replaces std's" },
-    { path = "blaze_mem::lock::SpinLock", replacement = "parking_lot::Mutex", reason = "the one lock is parking_lot's (AGENTS.md rule 10): a spin lock has no fairness and no named wait, so under a hot lock a waiter that keeps losing spins out its bound (T4: the trait solver's cache table, 2026-11-02)", allow-invalid = true },
     { path = "std::sync::mpsc::Sender", replacement = "crossbeam_channel::Sender", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
     { path = "std::sync::mpsc::SyncSender", replacement = "crossbeam_channel::Sender", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
     { path = "std::sync::mpsc::Receiver", replacement = "crossbeam_channel::Receiver", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
@@ -56,6 +68,7 @@ disallowed-macros = [
 ]
 
 disallowed-methods = [
+    { path = "blaze_profile::flight::postmortem::handed_off", replacement = "blaze_profile::flight::names::Streams", reason = "a postmortem reads names from the dead process's rings (docs/v2/plan/design/profile-names.md): there is no name log to hand off to", allow-invalid = true },
     { path = "blaze_resolve::lockfile::lockfile_to_write", replacement = "blaze_units::lock::after_resolve", reason = "one place decides a resolve's lock files, with the lock policy (CI, `lock = \"required\"`, `--no-locked`) and `blaze.lock`: docs/cargo.md, \"Lock files\"", allow-invalid = true },
     { path = "blaze_cargo::toolchain::own::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },
     { path = "blaze_cargo::toolchain::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },

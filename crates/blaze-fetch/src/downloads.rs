@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::progress::{LOG_EVERY, Line, Meter, STALL};
 
@@ -30,7 +30,7 @@ pub struct Downloads {
 struct Entry {
     what: String,
     url: String,
-    meter: Mutex<Meter>,
+    meter: Lock<Meter>,
 }
 
 /// One download in flight, from [`Downloads::begin`] until it drops.
@@ -89,7 +89,7 @@ impl Downloads {
         let entry = Arc::new(Entry {
             what: what.to_owned(),
             url: crate::redact(url),
-            meter: Mutex::new(Meter::new(self.now(), total, LOG_EVERY, STALL)),
+            meter: Lock::new("fetch.download.meter", Meter::new(self.now(), total, LOG_EVERY, STALL)),
         });
         self.open.pin().insert(id, Arc::clone(&entry));
         Download { downloads: self, id, entry }

@@ -16,6 +16,7 @@ ignored = ["unicode-ident"]
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 arrayvec.workspace = true
 bitflags.workspace = true
 blaze-hash.workspace = true
@@ -26,7 +27,6 @@ hashbrown.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
 la-arena.workspace = true
-parking_lot.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 smallvec.workspace = true
 triomphe.workspace = true

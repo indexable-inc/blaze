@@ -12,11 +12,11 @@ use cranelift_codegen::{
     isa::{self, CallConv, OwnedTargetIsa},
     settings::{self, Configurable, OptLevel},
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 /// Each target a unit has named ([`Target::of`]), parsed once and kept for the process. A
 /// process builds for a handful (the host, wasm32 for proc macros), so a scan finds one.
-static NAMED: Mutex<Vec<&'static Target>> = Mutex::new(Vec::new());
+static NAMED: Lock<Vec<&'static Target>> = Lock::new("codegen.target.named", Vec::new());
 
 /// The most targets one process lowers units for. A code generator is kept per target and
 /// set of features (`crate::target_of`), by the target's place in [`NAMED`].
@@ -53,7 +53,7 @@ struct FeatureSet {
 }
 
 /// Held while a set is added to [`FEATURE_SETS`].
-static ADDING: Mutex<()> = Mutex::new(());
+static ADDING: Lock<()> = Lock::new("codegen.target.feature_sets.adding", ());
 
 /// A CPU and a set of target features past the baseline of [`Target::cpu`] that code is
 /// compiled with: `+name` and `-name` in rustc's names, sorted, each once, as

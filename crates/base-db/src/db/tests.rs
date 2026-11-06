@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use blaze_mem::Tag;
 use span::{FileId, TextSize};
@@ -41,7 +41,7 @@ fn run_all_runs_each_task_in_the_order_asked() {
     ];
     for (order, expected) in cases {
         let before = set_run_order(order);
-        let ran = Mutex::new(Vec::new());
+        let ran = Lock::new("test.db.ran", Vec::new());
         db.run_all(Tag::Query, 5, |_, at| ran.lock().push(at));
         set_run_order(before);
         assert_eq!(ran.into_inner(), expected, "{order:?}");

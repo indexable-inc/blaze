@@ -128,7 +128,21 @@ pub fn until<T>(
     deadline: Option<Deadline>,
     once: impl FnMut(Option<Duration>) -> std::io::Result<Once<T>>,
 ) -> Result<Waited<T>, WaitError> {
-    retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once)
+    // The wait-for graph's row for this wait (docs/v2/plan/design/named-locks.md): what this
+    // thread is blocked on, so a convoy whose head sits in a kernel wait names it.
+    let probe = crate::lock::installed();
+    let registered = probe.map(|probe| {
+        crate::lock::graph::register(
+            crate::lock::stall::Blocked::Wait(what),
+            probe.span(),
+            probe.now_ns(),
+            None,
+            None,
+        )
+    });
+    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
+    drop(registered);
+    waited
 }
 
 /// One thread's park, woken from any thread: a token, as std's `thread::park` is (an unpark
@@ -140,7 +154,7 @@ pub fn until<T>(
 pub struct Parker {
     word: std::sync::atomic::AtomicU32,
     #[cfg(not(target_os = "linux"))]
-    thread: parking_lot::Mutex<Option<std::thread::Thread>>,
+    thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
 
 impl Parker {
@@ -148,7 +162,7 @@ impl Parker {
         Parker {
             word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
             #[cfg(not(target_os = "linux"))]
-            thread: parking_lot::Mutex::new(None),
+            thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
     }
 
@@ -188,7 +202,7 @@ impl Default for Parker {
 /// The park of a system with no wait of this module on an address yet: std's thread park,
 /// the thread recorded before it says it is parked.
 #[cfg(not(target_os = "linux"))]
-struct ThreadPark<'a>(&'a parking_lot::Mutex<Option<std::thread::Thread>>);
+struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
 #[cfg(not(target_os = "linux"))]
 impl parking::Futex for ThreadPark<'_> {

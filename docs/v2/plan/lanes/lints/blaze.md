@@ -399,6 +399,28 @@ its closures), so a guard dropped before the call is fine however its scope is w
 One finding per call, at the call, naming each guard (its binding or "a temporary", and its
 type), the query, and what makes it one.
 
+## `lock_held_across_slow`
+
+Warn. Rule standard-structures: a lock is held only for a field update
+(docs/v2/plan/design/named-locks.md, part 7). Every task that wants the lock queues behind a holder
+that waits on the disk, the network, a child or the allocator.
+
+A guard is `lock_across_query`'s, plus blaze-core's `lock::{LockGuard, ReadGuard, WriteGuard}`. A
+call is slow when it reaches IO through `hot_alloc`'s walk with the root set `Roots::Io` (std's
+`fs`, `net`, `process` and stdio, `libc`, `rustix`, `nix`, tokio, mio, and blaze-core's
+`Driver::{submit, poll}`), through the workspace's own functions; when it is a method of std's
+`io::{Read, Write, BufRead}` on a `dyn` or type-parameter receiver; or when it reaches the global
+allocator as `hot_alloc` finds it (not through workspace functions, and not a push onto a buffer
+the caller keeps). std's locks, threads, clock and environment, `parking_lot`, `lock_api`,
+`tracing`, `log`, `blaze_mem` and blaze-core's `lock` and `wait` modules end the walk. A lock's
+own calls (a second acquire) are not slow here, and a call that may park the fiber is
+`held_across_wait`'s and the may-suspend check's. What is live across the call is the MIR's, as
+for `lock_across_query`.
+
+One finding per call, naming each guard (its binding and type), the call, the IO root it
+reaches or that it allocates, and the rule. Not seen: an allocation inside a workspace helper,
+IO behind a `Box<dyn Write>`.
+
 ## `blocking_on_pool`
 
 Warn. AGENTS.md rule 9: on a pool thread or fiber, a wait goes through the scheduler. A blocked

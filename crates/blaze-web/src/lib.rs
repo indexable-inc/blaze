@@ -36,9 +36,9 @@ use std::{
     },
 };
 
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_protocol::events::{Event, Record};
 use kept::{KEPT, Kept};
-use parking_lot::{Mutex, MutexGuard};
 use world::{Answer, Applied, Program, World};
 
 /// The most bytes a page may have waiting to be sent: one that falls this far behind is hung
@@ -182,7 +182,7 @@ struct Roots {
     len: AtomicU32,
     /// The root of the last record: the next is nearly always of it.
     last: AtomicU32,
-    adding: Mutex<()>,
+    adding: Lock<()>,
 }
 
 const FIRST: usize = 16;
@@ -195,7 +195,7 @@ impl Default for Roots {
             levels: [const { OnceLock::new() }; LEVELS],
             len: AtomicU32::new(0),
             last: AtomicU32::new(0),
-            adding: Mutex::new(()),
+            adding: Lock::new("web.roots.adding", ()),
         }
     }
 }
@@ -499,7 +499,7 @@ fn gzip(bytes: &[u8]) -> Option<Arc<[u8]>> {
 }
 
 /// A lock whose holder panicked holds what it held whole: it is only ever taken to add a root.
-fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(it: &Lock<T>) -> LockGuard<'_, T> {
     it.lock()
 }
 

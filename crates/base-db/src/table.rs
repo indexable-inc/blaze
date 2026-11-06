@@ -22,7 +22,7 @@ use blaze_hash::SipKey;
 use blaze_mem::{AppendVec, Tag};
 use blaze_query::db::{AsId, FromId, Id};
 use intern::swiss::Index;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 /// A query input per ID up to [`Column::MAX`]: a word of the input's ID per ID, 0 for none
 /// (no ID is 0), in one region reserved for `MAX + 1` words and committed as
@@ -128,7 +128,7 @@ pub(crate) struct Table<T> {
 
 struct Shard {
     /// Held to insert; holds how many values the shard has.
-    lock: Mutex<u32>,
+    lock: Lock<u32>,
     /// The shard's values by [`probe_hash`] of their hash.
     index: Index,
 }
@@ -184,7 +184,7 @@ impl<T> Table<T> {
         }
         let shard = self.shard(hash).get_or_init(|| {
             // alloc: a shard, on its first insert.
-            Box::new(Shard { lock: Mutex::new(0), index: Index::new() })
+            Box::new(Shard { lock: Lock::new("db.table.shard", 0), index: Index::new() })
         });
         let mut count = shard.lock.lock();
         if let Some(found) = self.probe(shard, hash, &eq) {

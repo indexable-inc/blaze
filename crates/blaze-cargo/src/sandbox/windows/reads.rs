@@ -37,7 +37,7 @@ use std::{
     ptr::{null, null_mut},
 };
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 // The table's atomics are the model checker's in a model build (`--cfg blaze_check`), so its
 // model tests explore the same lines a launcher runs.
@@ -109,7 +109,7 @@ pub(super) struct Reads {
     /// names none of them is let go of with two lookups.
     above: Table,
     /// The volumes watched, or whose watch ended; touched only by a check not kept.
-    roots: Mutex<Vec<&'static Root>>,
+    roots: Lock<Vec<&'static Root>>,
     tokens: AtomicU64,
 }
 
@@ -125,7 +125,7 @@ impl Reads {
             paths: Table::new(SLOTS),
             above: Table::new(SLOTS),
             // alloc: once per launcher; a volume is pushed once.
-            roots: Mutex::new(Vec::with_capacity(8)),
+            roots: Lock::new("sandbox.windows.reads.roots", Vec::with_capacity(8)),
             tokens: AtomicU64::new(1),
         }
     }

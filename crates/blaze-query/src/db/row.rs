@@ -33,7 +33,6 @@ use std::{
 };
 
 use blaze_mem::Tag;
-use parking_lot::Mutex;
 
 use super::{
     dense::{Heap, MAX_ALIGN, Whole},
@@ -166,16 +165,18 @@ impl<V> Row<V> {
 /// which only the entries written are committed.
 pub(crate) struct Pages {
     dir: Whole<AtomicPtr<u8>, MAX_PAGES>,
-    grow: Mutex<()>,
+    #[expect(clippy::disallowed_types, reason = "held only while a row page is made")]
+    grow: blaze_core::lock::Lock<()>,
     /// Pages made: what the memory report counts without reading the directory.
     count: AtomicUsize,
 }
 
 impl Pages {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     pub(crate) fn new(tag: Tag) -> Pages {
         Pages {
             dir: Whole::sparse(tag, "an ingredient's row page directory"),
-            grow: Mutex::new(()),
+            grow: blaze_core::lock::Lock::new("query.rows.grow", ()),
             count: AtomicUsize::new(0),
         }
     }

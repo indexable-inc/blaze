@@ -8,9 +8,9 @@
 use std::sync::Arc;
 
 use blaze_codegen::memo::Memo;
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use parking_lot::{Mutex, MutexGuard};
 use std::alloc::Global;
 
 /// How many entries the memo may hold past what the kept front ends used before a job's start
@@ -20,8 +20,8 @@ pub(crate) const SLACK: usize = 1 << 16;
 
 /// The daemon's one memo, and what each kept front end's last build used of it.
 pub(crate) struct Memos {
-    memo: Mutex<Arc<Memo>>,
-    kept: Mutex<KeptSets>,
+    memo: Lock<Arc<Memo>>,
+    kept: Lock<KeptSets>,
 }
 
 #[derive(Default)]
@@ -43,8 +43,8 @@ impl Memos {
     pub(crate) fn new() -> Arc<Memos> {
         // alloc: once a daemon
         Arc::new(Memos {
-            memo: Mutex::new(blaze_codegen::driver::shared_memo()),
-            kept: Mutex::default(),
+            memo: Lock::new("serve.memo.memo", blaze_codegen::driver::shared_memo()),
+            kept: Lock::new("serve.memo.kept", KeptSets::default()),
         })
     }
 
@@ -101,7 +101,7 @@ impl Drop for Held {
     }
 }
 
-fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(it: &Lock<T>) -> LockGuard<'_, T> {
     // Nothing is left half-changed under either lock by a panic: each change is one step.
     it.lock()
 }

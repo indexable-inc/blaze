@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
@@ -27,7 +28,6 @@ blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-store-check.workspace = true
 hashbrown.workspace = true
-parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

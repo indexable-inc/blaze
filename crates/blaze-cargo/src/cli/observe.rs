@@ -38,7 +38,8 @@ const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's lin
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
-                           | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
+                           | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
+                           | blaze debug locks [--build N] [--top N] [--json]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
@@ -101,7 +102,7 @@ fn open(link: &str) -> Result<(), String> {
     }
 }
 
-/// `blaze debug profile`, `blaze debug live` or `blaze debug sql`.
+/// `blaze debug profile`, `live`, `sql`, `hot`, `time`, `gate` or `locks`.
 pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
     let mut words = words.into_iter();
     let verb = words.next();
@@ -118,6 +119,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
+        Some("locks") => locks(words.collect()),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -391,6 +393,45 @@ fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
         true => Ok(()),
         false => Err(Refusal::Failed(format!("the profile's gate: {}", verdict.summary()))),
     }
+}
+
+/// `blaze debug locks [--build N] [--top N] [--json]`: the named locks a build (the last that
+/// ended unless `--build` says) waited for, the most waited first (20 unless `--top` says), each
+/// with its call sites, the spans its waiters and holders were in, its share of the pool
+/// workers' time and what to use instead; then the build's stalls (blaze_profile::locks).
+fn locks(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str = "blaze debug locks [--build N] [--top N] [--json]";
+    let (mut build, mut top, mut json) = (None, 20usize, false);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let mut number = |what: &str| -> Result<u64, Refusal> {
+            words
+                .next()
+                .and_then(|it| it.parse().ok())
+                .ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes {what}")))
+        };
+        match word.as_str() {
+            "--build" => build = Some(number("a build id")?),
+            "--top" => top = usize::try_from(number("a number of locks")?).unwrap_or(usize::MAX),
+            "--json" => json = true,
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    let (duckdb, dir) = history_source()?;
+    let report = blaze_profile::locks::load(&duckdb, &dir, build, top)
+        .map_err(|error| error.to_string())?;
+    let text = match json {
+        true => {
+            serde_json::to_string(&report)
+                .map_err(|error| format!("`blaze debug locks`'s report as JSON: {error}"))?
+                + "\n"
+        }
+        false => blaze_profile::locks::text(&report),
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 enum Refusal {

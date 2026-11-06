@@ -327,11 +327,14 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
 mod freed {
     use std::collections::BTreeMap;
 
-    use parking_lot::Mutex;
-
     /// First page to page count. A `BTreeMap` because merging a range with its neighbours
     /// needs them by address.
-    static FREE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+    #[expect(
+        clippy::disallowed_types,
+        reason = "below blaze-core: blaze-mem is a dependency of blaze-core; the released ranges, taken only as a reservation is made or released"
+    )]
+    static FREE: parking_lot::Mutex<BTreeMap<usize, usize>> =
+        parking_lot::Mutex::new(BTreeMap::new());
 
     /// The first page of the smallest released range of at least `pages`, its tail filed
     /// again, or `None` when no range is big enough.

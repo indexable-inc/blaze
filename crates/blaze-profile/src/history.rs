@@ -102,7 +102,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -1194,6 +1194,7 @@ impl History {
                     t_ns,
                     value,
                     fiber: None,
+                    named: 0,
                 }),
             );
         }
@@ -1211,9 +1212,8 @@ impl History {
                     (Plot::ProfileSpansMade, cost.spans),
                     (Plot::ProfileCpuReads, cost.cpu_reads),
                     (Plot::ProfileNamesGiven, names.given),
-                    (Plot::ProfileNamesRaced, names.raced),
+                    (Plot::ProfileNamesLinked, names.linked),
                     (Plot::ProfileNamesLost, names.lost),
-                    (Plot::ProfileNamesHandedOff, names.handed_off),
                 ]
                 .map(|(plot, value)| CounterRow {
                     build,
@@ -1221,6 +1221,7 @@ impl History {
                     t_ns,
                     value,
                     fiber: None,
+                    named: 0,
                 }),
             );
         }
@@ -1255,6 +1256,7 @@ impl History {
                 t_ns,
                 value: total,
                 fiber: None,
+                named: 0,
             });
         }
         if !grew {
@@ -1723,8 +1725,13 @@ impl Drop for History {
 /// What the drain thread drained and the history has not flushed yet, and where it is in the
 /// rings: one reader, so the drain thread and a flush take turns under one lock, held for a
 /// read of the rings or a swap of the rows, never for a write.
-#[derive(Default)]
-struct Drained(Mutex<Draining>);
+struct Drained(Lock<Draining>);
+
+impl Default for Drained {
+    fn default() -> Drained {
+        Drained(Lock::new("profile.history.drained", Draining::default()))
+    }
+}
 
 #[derive(Default)]
 struct Draining {
@@ -2110,6 +2117,7 @@ mod tests {
                 t_ns: i as i64,
                 value: i as u64 * 3,
                 fiber: None,
+                named: 0,
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
@@ -2158,6 +2166,7 @@ mod tests {
                     t_ns: i as i64,
                     value: i,
                     fiber: None,
+                    named: 0,
                 })
                 .collect();
             batches::counters(&rows, process).unwrap()
@@ -2866,7 +2875,7 @@ mod tests {
     #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
     fn what_a_flush_costs() {
         let functions: Vec<flight::Sym> =
-            (0..1000).map(|i| flight::intern(&format!("app::f{i}"))).collect();
+            (0..1000).map(|i| flight::read_sym(&format!("app::f{i}"))).collect();
         let rows: Vec<SpanRow> = (0..1_000_000u64)
             .map(|i| SpanRow {
                 build: 1,

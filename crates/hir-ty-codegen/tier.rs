@@ -28,7 +28,7 @@ use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
 use cranelift_codegen::ir::{self, InstBuilder, Opcode, types};
 use hir_def::{FunctionId, HasModule, attrs::AttrFlags};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
@@ -175,7 +175,6 @@ impl Tiered {
 }
 
 /// The functions of a program at a level above 1.
-#[derive(Default)]
 pub struct Tiers {
     nodes: HashMap<Node, Arc<Tiered>, Global>,
     /// What was installed since a patch last held the code, with the code each replaced.
@@ -183,10 +182,22 @@ pub struct Tiers {
     /// Code installed together with code no patch could hold, to install again one by one.
     trial: Vec<(Node, Arc<Tiered>)>,
     /// The functions an edit sent back to level 1, and why, since this was last asked.
-    demoted: Arc<Mutex<Vec<(Node, String)>>>,
+    demoted: Arc<Lock<Vec<(Node, String)>>>,
     /// The functions whose code no patch could hold, the level they are back at, and why,
     /// since this was last asked.
     refused: Vec<(Node, Level, String)>,
+}
+
+impl Default for Tiers {
+    fn default() -> Tiers {
+        Tiers {
+            nodes: Default::default(),
+            fresh: Vec::new(),
+            trial: Vec::new(),
+            demoted: Arc::new(Lock::new("codegen.tier.demoted", Vec::new())),
+            refused: Vec::new(),
+        }
+    }
 }
 
 impl Tiers {

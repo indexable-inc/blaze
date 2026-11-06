@@ -16,20 +16,44 @@
 //! reads the daemon's footprint against its memory ceiling ([`super::ceiling`], judged by
 //! [`CeilingWatch`]): past it, the daemon writes what it held by tag and what each thread was
 //! inside, and ends ([`Exit::MemoryCeiling`]). A look allocates nothing and takes no lock.
+//!
+//! At each look too, before a stop and during one, it names the stalls in the wait-for graph
+//! of named locks, signals and kernel waits ([`Stalls`], blaze-core's `lock::graph`): once a
+//! wait is older than [`STALL_THRESHOLD`], each deadlock and each convoy is said once as a
+//! `blaze::stall` event while it lasts, and the top one's line goes in each build's live model
+//! (`Now::stall`, through [`Pulse::set_stall`]), so `blaze status` and the build view say it
+//! long before the loop's own bound ends the daemon.
 
 #![forbid(unsafe_code)]
 
 use std::{io::Read as _, os::fd::AsFd as _, sync::Arc, thread::JoinHandle, time::Duration};
 
-use blaze_core::exit::Exit;
+use blaze_core::{
+    exit::Exit,
+    lock::{
+        graph,
+        stall::{Stall, WaitRow},
+    },
+};
 use blaze_profile::{Watchdog, watchdog::Progress};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{
     ceiling::{EASED, Gib, NEAR, STOPPED},
-    pulse::{CeilingLook, CeilingWatch, Look, LoopWatch, Pulse},
+    pulse::{CeilingLook, CeilingWatch, Look, LoopWatch, Pulse, StallWatch},
     signals,
 };
+
+/// How long a wait in the wait-for graph (a named lock, a signal, a kernel wait) lasts before
+/// the guard looks for the stall behind it. Far under the loop's own bounds (a stuck turn is
+/// reported at half the stall bound, 60 s by default, and the daemon ends at the whole of it,
+/// [`Exit::LoopStalled`]), so a convoy or a deadlock is named, with who holds what, before the
+/// loop watchdog says only that nothing moved. 2 s: longer than any lock should be held (the
+/// flight-recorder convoy of 2026-11-05 held 60 threads for minutes; a healthy hold is
+/// microseconds) and than a fair queue behind one long hold, short enough that a person
+/// watching the build view sees the stall while it is the reason. A daemon run with a stall
+/// bound under 8 s takes a quarter of it instead, to stay under its report.
+const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long the guard waits for the scheduler's lock to read its waits: a deadlock may hold it.
 const WAITS_READ: Duration = Duration::from_secs(2);
@@ -93,10 +117,13 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
     let mut memory = Memory::default();
+    let mut stalls = Stalls::new(bound);
     let pid = std::process::id();
     loop {
         // A stop that writes its image takes memory too: held to the ceiling as before it.
         memory.look(pid);
+        // And may stall on a lock: named as before it.
+        stalls.look(pid, pulse);
         let progress = Progress {
             jobs: pool.ended(),
             queries: blaze_query::db::completed(),
@@ -147,11 +174,13 @@ fn watch_turns(
     let every = look_every(bound);
     let pid = std::process::id();
     let mut memory = Memory::default();
+    let mut stalls = Stalls::new(bound);
     loop {
         if !matches!(over.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)) {
             return false;
         }
         memory.look(pid);
+        stalls.look(pid, pulse);
         let now = now_ns();
         let turns = pulse.turns();
         let look = turning.look(now, turns);
@@ -200,6 +229,109 @@ fn watch_turns(
             Err(error) => return unread(&error),
         }
     }
+}
+
+/// The guard's watch of the wait-for graph: the driver of [`StallWatch`]. Each look reads the
+/// oldest wait in progress (one pass over the registry, under its lock, allocating nothing);
+/// only past the threshold does it take the graph's snapshot and analysis
+/// ([`graph::stalls`]), say each stall new since the last look ([`said`]) and put the top
+/// one's line in the pulse for the loop's live models.
+#[derive(Debug)]
+struct Stalls {
+    watch: StallWatch,
+    /// [`STALL_THRESHOLD`], or a quarter of a shorter stall bound.
+    threshold_ns: u64,
+    /// The pulse holds a line from an earlier look, to clear once no stall lasts.
+    named: bool,
+    /// No lock probe is installed, and the guard said so once.
+    unprobed: bool,
+}
+
+impl Stalls {
+    fn new(bound: Duration) -> Stalls {
+        let threshold = STALL_THRESHOLD.min(bound / 4);
+        Stalls {
+            watch: StallWatch::default(),
+            threshold_ns: u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX),
+            named: false,
+            unprobed: false,
+        }
+    }
+
+    /// One look. The graph's times are on the lock probe's clock (blaze-profile installs it in
+    /// a daemon), so it is read from the probe; without one no wait is timed, and the guard
+    /// says once that it names no stall rather than guess at a clock.
+    fn look(&mut self, pid: u32, pulse: &Pulse) {
+        let Some(probe) = blaze_core::lock::installed() else {
+            if !self.unprobed {
+                self.unprobed = true;
+                tracing::error!(target: "blaze", "blaze serve: pid {pid}: {UNPROBED}");
+                eprintln!("blaze serve: pid {pid}: {UNPROBED}");
+            }
+            return;
+        };
+        let now = probe.now_ns();
+        let past = graph::oldest_since_ns()
+            .is_some_and(|since| now.saturating_sub(since) >= self.threshold_ns);
+        // `Vec::new` allocates nothing: a look with no wait past the threshold stays free.
+        let stalls = if past { graph::stalls(now, self.threshold_ns) } else { Vec::new() };
+        for at in self.watch.look(&stalls) {
+            said(pid, &stalls[at], now);
+        }
+        match stalls.first() {
+            Some(top) => {
+                pulse.set_stall(Some(top.line(now)));
+                self.named = true;
+            }
+            None if self.named => {
+                pulse.set_stall(None);
+                self.named = false;
+            }
+            None => {}
+        }
+    }
+}
+
+/// What a guard with no lock probe to time waits by says, once.
+const UNPROBED: &str = "no lock probe is installed (blaze-profile installs it), so the stop's guard \
+     times no wait in the wait-for graph and names no deadlock or convoy";
+
+/// Says one stall as the `blaze::stall` event the profile's `stalls` view reads, and on the
+/// daemon's stderr: `kind` (`deadlock` or `convoy`), its `line` ([`Stall::line`]), the convoy's
+/// `head` thread (0 for a deadlock), how many `waiters` (a convoy's waits behind its head, a
+/// deadlock's threads in its cycle), the `threads` by mark, comma-separated (a deadlock's
+/// cycle in its order; a convoy's head, then its oldest waiter) and `oldest_ns`, how long the
+/// oldest of its waits has waited, on the probe's clock.
+fn said(pid: u32, stall: &Stall, now_ns: u64) {
+    use std::fmt::Write as _;
+    let age = |row: &WaitRow| now_ns.saturating_sub(row.since_ns);
+    let mut threads = String::new(); // alloc: a stall's report, once a stall
+    let (kind, head, waiters, oldest_ns) = match stall {
+        Stall::Deadlock { cycle } => {
+            for (at, row) in cycle.iter().enumerate() {
+                let comma = if at == 0 { "" } else { "," };
+                _ = write!(threads, "{comma}{}", row.thread);
+            }
+            let oldest = cycle.iter().map(age).max().unwrap_or(0);
+            ("deadlock", 0, cycle.len() as u64, oldest)
+        }
+        Stall::Convoy { head, waiters, oldest, .. } => {
+            _ = write!(threads, "{head},{}", oldest.thread);
+            ("convoy", *head, *waiters as u64, age(oldest))
+        }
+    };
+    let line = stall.line(now_ns);
+    tracing::warn!(
+        target: "blaze::stall",
+        kind,
+        line = %line,
+        head,
+        waiters,
+        threads = %threads,
+        oldest_ns,
+        "stall"
+    );
+    eprintln!("blaze serve: pid {pid} stall: {line}");
 }
 
 /// What a guard that can't read the daemon's footprint says, once until it reads it again.

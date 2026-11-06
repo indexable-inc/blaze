@@ -4,6 +4,7 @@
 //! graph and stall check are the process's, so each test holds [`ONE`] and the binary is their
 //! own.
 #![cfg(not(blaze_check))]
+#![allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 
 use std::{
     sync::{
@@ -19,13 +20,13 @@ use blaze_graph::{
     sched::{self, Wait},
     topology::Topology,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 #[path = "driven/scenarios.rs"]
 mod scenarios;
 
 /// One test at a time: the wait graph and its stall check are the whole process's.
-static ONE: Mutex<()> = Mutex::new(());
+static ONE: Lock<()> = Lock::new("graph.test.driven.one", ());
 
 fn run(name: &str) {
     let _one = ONE.lock();
@@ -130,7 +131,7 @@ fn a_driven_pools_stall_fails_its_waiting_jobs() {
     let _one = ONE.lock();
     let pool = Arc::new(Pool::driven(&Topology::flat(1)).expect("a driven pool"));
     let at = Key([0x5a; 32]);
-    let failed = Arc::new(Mutex::new(Vec::new()));
+    let failed = Arc::new(Lock::new("graph.test.driven.failed", Vec::new()));
     let message = |panic: &(dyn std::any::Any + Send)| {
         panic
             .downcast_ref::<String>()

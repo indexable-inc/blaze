@@ -29,6 +29,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
+use blaze_core::lock::Lock;
 use blaze_diagnostics::{Diag, cache};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
@@ -36,7 +37,6 @@ use blaze_lower::Lowered;
 use blaze_units::query::EnvReads;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
 use hir_ty::{body_store, next_solver::goal_store};
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use super::{Job, compile, graph};
@@ -773,12 +773,12 @@ struct Images {
     macros: Arc<blaze_macro_eval::Macros>,
     /// What it asked to keep, in the order asked; a write path, once per crate it images and
     /// per goal a flush writes.
-    puts: Mutex<Vec<Put>>,
+    puts: Lock<Vec<Put>>,
 }
 
 impl Images {
     fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
-        Images { store, macros, puts: Mutex::new(Vec::new()) }
+        Images { store, macros, puts: Lock::new("serve.deps.images.puts", Vec::new()) }
     }
 
     /// What it was asked to keep since the last take, in the order asked.

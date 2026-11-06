@@ -33,7 +33,6 @@ use std::{
 
 use blaze_mem::Tag;
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
 
 use super::{
     AsId, Cancelled, Cycle, Database, DatabaseKeyIndex, EventKind, FromIdIn, Id, MemoryUsage,
@@ -127,11 +126,13 @@ pub(crate) struct FnTable<F: Function> {
     fresh: SegQueue<u32>,
     /// Keys that hold a value or held one, unsorted, a key perhaps more than once: what a pass
     /// reads, sorted and cut to the keys that hold one then, and at twice the values held.
-    held: Mutex<Vec<u32>>,
+    #[expect(clippy::disallowed_types, reason = "held to push a key that now holds a value, or to take the list at a pass")]
+    held: blaze_core::lock::Lock<Vec<u32>>,
     _of: PhantomData<fn() -> F>,
 }
 
 impl<F: Function> Table for FnTable<F> {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     fn new(storage: &Storage, index: u32) -> FnTable<F> {
         storage.check_db::<F::Db>(F::NAME);
         if F::BUDGETED {
@@ -143,7 +144,7 @@ impl<F: Function> Table for FnTable<F> {
             bytes: AtomicI64::new(0),
             fresh: SegQueue::new(),
             // alloc: none until a value is held, then a budgeted function's index
-            held: Mutex::new(Vec::new()),
+            held: blaze_core::lock::Lock::new("query.function.held", Vec::new()),
             _of: PhantomData,
         }
     }

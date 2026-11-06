@@ -20,8 +20,8 @@ use std::alloc::Global;
 
 use crate::{
     flight::{
-        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Read, SpanRow,
-        SwitchRow, ThreadNow, WaitedOn,
+        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Plot, Read,
+        SpanRow, SwitchRow, ThreadNow, WaitedOn,
     },
     sampler::Sample,
     schema::{self, Table},
@@ -217,9 +217,13 @@ fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, Arrow
 pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = counters.len();
     let mut names = Dict::new();
-    let name_keys = UInt32Array::from_iter_values(
-        counters.iter().map(|it| names.key(it.plot as u64, || it.plot.name())),
-    );
+    let name_keys = UInt32Array::from_iter_values(counters.iter().map(|it| match it.plot {
+        // A named counter's own name: `?` when it was let go before this read.
+        Plot::Named => names.key(1 << 32 | u64::from(it.named), || {
+            flight::name(it.named).unwrap_or_else(|| "?".into())
+        }),
+        plot => names.key(plot as u64, || plot.name()),
+    }));
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(counters.iter().map(|it| build_id(it.build)))),
@@ -617,6 +621,185 @@ mod tests {
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
     }
 
+    /// A named counter is a `counters` row whose `name` is its own, kept once a process.
+    #[test]
+    fn a_named_counter_is_a_counters_row_of_its_name() {
+        crate::install();
+        std::thread::spawn(|| {
+            flight::plot_named("owner bytes: batches test", 41);
+            flight::plot_named("owner bytes: batches test", 42);
+        })
+        .join()
+        .unwrap();
+        let mut read = Read::default();
+        flight::window(Duration::from_secs(600), &mut read);
+        let process = Process { pid: 7, name: "blaze test", commit: None };
+        let batch = counters(&read.counters, process).unwrap();
+        let plot = batch.column(schema::COUNTERS.column("name").unwrap()).as_dictionary::<UInt32Type>();
+        let names = plot.values().as_string::<i32>();
+        let values = batch.column(schema::COUNTERS.column("value").unwrap());
+        let values = values.as_primitive::<arrow_array::types::Float64Type>();
+        let mut ours: Vec<f64> = (0..batch.num_rows())
+            .filter(|it| names.value(plot.keys().value(*it) as usize) == "owner bytes: batches test")
+            .map(|it| values.value(it))
+            .collect();
+        ours.sort_by(f64::total_cmp);
+        assert_eq!(ours, [41.0, 42.0]);
+    }
+
+    /// Names given on many threads at once, each thread in its own table and ring, written as
+    /// the spans, events and event fields parquet and read back: every dynamic name is the text
+    /// recorded, a span opened on one thread and closed on another included
+    /// (docs/v2/plan/design/profile-names.md#proof).
+    #[test]
+    fn names_given_on_many_threads_read_back_from_parquet_as_recorded() {
+        use bytes::Bytes;
+        use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+
+        const THREADS: usize = 6;
+        crate::install();
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                std::thread::Builder::new()
+                    .name(format!("names round trip {t}"))
+                    .spawn_scoped(scope, move || {
+                        let _build = flight::building(31);
+                        let krate = format!("round_trip_crate_{t}");
+                        let function = format!("round_trip::{}::f", "segment".repeat(t * 3));
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "names round trip",
+                            krate = krate.as_str(),
+                            function = function.as_str()
+                        )
+                        .entered();
+                        let item = format!("round trip item {t}");
+                        tracing::info!(target: "blaze", item = item.as_str(), "round trip event {t}");
+                    })
+                    .unwrap();
+            }
+            // Opened here, named and closed on another thread: its names go in as links.
+            let span = tracing::info_span!(
+                target: "blaze",
+                "names round trip moved",
+                krate = "round_trip_opened_here",
+                function = tracing::field::Empty
+            );
+            std::thread::Builder::new()
+                .name("names round trip closer".to_owned())
+                .spawn_scoped(scope, move || {
+                    span.record("function", "round_trip::closed_elsewhere");
+                    drop(span);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
+        // A span closed a moment ago may wait for its thread's CPU rate before a read takes it:
+        // read again, a bounded number of times, until every one is in.
+        let ours = |read: &Read| {
+            read.spans
+                .iter()
+                .filter(|it| {
+                    flight::meta(it.site)
+                        .is_some_and(|it| it.name().starts_with("names round trip"))
+                })
+                .count()
+        };
+        let mut read = Read::default();
+        for _ in 0..100 {
+            read = Read::default();
+            flight::window(Duration::from_secs(600), &mut read);
+            if ours(&read) > THREADS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let process = Process { pid: 7, name: "blaze test", commit: None };
+        let parquet = |batch: RecordBatch| {
+            // alloc: a test's file
+            let mut bytes = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut batches = reader.map(Result::unwrap);
+            let back = batches.next().unwrap();
+            assert!(batches.next().is_none(), "a test's rows are one batch");
+            assert_eq!(back.num_rows(), batch.num_rows());
+            back
+        };
+        let text = |batch: &RecordBatch, table: &Table, name: &str, row: usize| {
+            let column = batch.column(table.column(name).unwrap());
+            match column.data_type() {
+                arrow_schema::DataType::Dictionary(..) => {
+                    let it = column.as_dictionary::<UInt32Type>();
+                    let values = it.values().as_string::<i32>();
+                    it.keys()
+                        .is_valid(row)
+                        .then(|| values.value(it.keys().value(row) as usize).to_owned())
+                }
+                _ => {
+                    let it = column.as_string::<i32>();
+                    it.is_valid(row).then(|| it.value(row).to_owned())
+                }
+            }
+        };
+        let spans = parquet(spans(&read.spans, process).unwrap());
+        let rows = |name: &str| -> Vec<(Option<String>, Option<String>)> {
+            (0..spans.num_rows())
+                .filter(|it| text(&spans, &schema::SPANS, "name", *it).as_deref() == Some(name))
+                .map(|it| {
+                    (
+                        text(&spans, &schema::SPANS, "crate", it),
+                        text(&spans, &schema::SPANS, "function", it),
+                    )
+                })
+                .collect()
+        };
+        let mut got = rows("names round trip");
+        got.sort();
+        let mut want: Vec<_> = (0..THREADS)
+            .map(|t| {
+                (
+                    Some(format!("round_trip_crate_{t}")),
+                    Some(format!("round_trip::{}::f", "segment".repeat(t * 3))),
+                )
+            })
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "each thread's span, its names as it gave them");
+        assert_eq!(
+            rows("names round trip moved"),
+            [(
+                Some("round_trip_opened_here".to_owned()),
+                Some("round_trip::closed_elsewhere".to_owned())
+            )],
+            "a span opened on one thread and closed on another"
+        );
+        let events = parquet(super::events(&read.events, process).unwrap());
+        let mut messages: Vec<String> = (0..events.num_rows())
+            .filter_map(|it| text(&events, &schema::EVENTS, "message", it))
+            .filter(|it| it.starts_with("round trip event "))
+            .collect();
+        messages.sort();
+        let mut want: Vec<String> = (0..THREADS).map(|t| format!("round trip event {t}")).collect();
+        want.sort();
+        assert_eq!(messages, want, "each thread's event message");
+        let fields = parquet(event_fields(&read.fields, process).unwrap());
+        let mut items: Vec<String> = (0..fields.num_rows())
+            .filter_map(|it| text(&fields, &schema::EVENT_FIELDS, "value_str", it))
+            .filter(|it| it.starts_with("round trip item "))
+            .collect();
+        items.sort();
+        let mut want: Vec<String> = (0..THREADS).map(|t| format!("round trip item {t}")).collect();
+        want.sort();
+        assert_eq!(items, want, "each thread's event field");
+    }
+
     /// A sample's row: its stack named outermost first, each address by the frames it is looked
     /// up at (a return address at the call before it, an inlined function's frames together),
     /// its raw addresses outermost first in `stack_pcs`, and the span and build it was taken in.
@@ -715,7 +898,7 @@ mod tests {
             alloc: None,
             copied: None,
             krate: 0,
-            function: flight::intern("serde_derive::Serialize"),
+            function: flight::read_sym("serde_derive::Serialize"),
             unit: 0,
             self_cpu_ns: Some(700),
             typed: typed.typed,

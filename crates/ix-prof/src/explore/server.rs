@@ -23,7 +23,7 @@ use blaze_http::h3::{
     self, Identity, ServerConfig, Transport,
     tokio_driver::{Driver, RecvStream, Request as Incoming, SendStream, Session},
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use serde_json::{Map, Value};
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -31,7 +31,7 @@ use tokio::{
 };
 
 use super::{
-    Kind, OpError, Source, Stop, Tick,
+    CoreWasm, Kind, OpError, Source, Stop, Tick,
     cert::{Cert, CertError, Rotation},
     frame,
     link::{self, Origins, Token},
@@ -294,7 +294,7 @@ async fn rotate(driver: &Driver, shared: &Shared, rotation: &mut Rotation) {
 }
 
 /// A session's core, shared by its streams: each locks it for one step.
-type Core = Arc<Mutex<session::Session>>;
+type Core = Arc<Lock<session::Session>>;
 
 /// A request's [`Slot`], given back to the core however the request's task ends.
 struct Held {
@@ -344,7 +344,7 @@ async fn session(shared: Arc<Shared>, request: Incoming) {
         return;
     }
     let Ok(connection) = request.accept().await else { return };
-    let core: Core = Arc::new(Mutex::new(session::Session::new(shared.name)));
+    let core: Core = Arc::new(Lock::new("ixprof.explore.core", session::Session::new(shared.name)));
     // Until a good hello, one request at a time.
     loop {
         let Some((mut send, mut recv, held)) = next_stream(&connection, &core).await else {

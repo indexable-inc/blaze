@@ -28,6 +28,7 @@ fn andrew() -> Now {
         at_ms: 914_000,
         phase: Phase::Compiling,
         stage: String::new(),
+        stall: None,
         tally: Tally { waiting: 80, ready: 0, running: 3, done: 487, failed: 0, total: 570 },
         workers: 16,
         busy: vec![Busy {
@@ -299,6 +300,35 @@ fn a_stall_says_nothing_runs_and_names_the_ready_blocker() {
     let line = line(&mut board);
     expect_file!["snapshots/stall.txt"]
         .assert_eq(&sections(&[("full 100x20", &full), ("line", &line)]));
+}
+
+/// The daemon's stall in its wait-for graph is said in every form while it lasts: a row under
+/// the warning in the full and inline forms, and at the end of the compact line, which is due
+/// as it appears. Drop the row or the line's part and these fail.
+#[test]
+fn a_lock_stall_is_said_in_every_form_while_it_lasts() {
+    const CONVOY: &str =
+        "convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is running";
+    let mut board = board(andrew());
+    let mut out = String::new();
+    assert!(board.line(&mut out));
+    assert!(!out.contains("convoy"), "{out}");
+    let mut now = andrew();
+    now.at_ms += 1;
+    now.stall = Some(CONVOY.to_owned());
+    board.take(now);
+    out.clear();
+    assert!(board.line(&mut out), "a stall appearing makes a line due");
+    assert!(out.ends_with(&format!(" · {CONVOY}")), "{out}");
+    let said = format!("⚠ {CONVOY}");
+    let full = draw(&board, Form::Full, 120, 30);
+    assert!(full.contains(&said), "{full}");
+    let short = draw(&board, Form::Full, 120, 4);
+    assert!(short.contains(&said), "kept while there is room: {short}");
+    let height = board.height(Form::Inline, 120);
+    assert!(usize::from(height) <= INLINE_ROWS);
+    let inline = draw(&board, Form::Inline, 120, height);
+    assert!(inline.contains(&said), "{inline}");
 }
 
 #[test]

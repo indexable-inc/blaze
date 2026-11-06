@@ -37,7 +37,7 @@ use hir_expand::{
 };
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
-use parking_lot::Mutex;
+use blaze_core::lock::{Lock, LockGuard};
 use smallvec::SmallVec;
 use span::{
     Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
@@ -132,10 +132,10 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
 /// testing the bytes, never serving them), the reader is whoever set the mode, outside any
 /// query, and each method takes it once and drops it before returning, so it is never held
 /// across a database call. [`Mode::Serve`] never touches it.
-struct Differences(Mutex<Vec<(Crate, &'static str, String)>>);
+struct Differences(Lock<Vec<(Crate, &'static str, String)>>);
 
 impl Differences {
-    fn found(&self) -> parking_lot::MutexGuard<'_, Vec<(Crate, &'static str, String)>> {
+    fn found(&self) -> LockGuard<'_, Vec<(Crate, &'static str, String)>> {
         self.0.lock()
     }
 
@@ -153,7 +153,8 @@ impl Differences {
 }
 
 // alloc: Check/Verify only, which record differences; never when serving
-static DIFFERENCES: Differences = Differences(Mutex::new(Vec::new()));
+static DIFFERENCES: Differences =
+    Differences(Lock::new("def.frozen.differences", Vec::new()));
 
 /// The differences [`Mode::Check`] and [`Mode::Verify`] found since this was last called.
 pub fn differences() -> Vec<String> {
@@ -3713,7 +3714,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
 "#;
 
     /// The differences are recorded for the whole process: the tests that read them take turns.
-    static TURN: Mutex<()> = Mutex::new(());
+    static TURN: Lock<()> = Lock::new("test.def.frozen.turn", ());
 
     fn crate_named(db: &TestDB, name: &str) -> Crate {
         *base_db::all_crates(db)

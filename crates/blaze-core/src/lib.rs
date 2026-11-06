@@ -62,6 +62,7 @@ mod journal;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, reason = "the kqueue driver: kevent and the records it reads")]
 pub mod kqueue;
+pub mod lock;
 mod locks;
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "sockets: descriptors owned from raw and the calls std lacks")]

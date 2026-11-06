@@ -4,7 +4,7 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use expect_test::{expect, expect_file};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use crate::{
@@ -524,7 +524,7 @@ fn the_executor_runs_every_ready_node_at_once() {
 
 #[test]
 fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
-    let ran = Mutex::new(Vec::new());
+    let ran = Lock::new("graph.test.lib.ran", Vec::new());
     let mut machine = Machine::new(Config { io: 2, work: 2, keep_going: true }).unwrap();
     let mut trace = Vec::new();
     let mut records = Vec::new();

@@ -1111,8 +1111,8 @@ mod tests {
         let s = 1_000_000_000i64;
         let counters = batches::counters(
             &[
-                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None },
-                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None },
+                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None, named: 0 },
+                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None, named: 0 },
             ],
             process,
         )

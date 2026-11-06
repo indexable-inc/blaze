@@ -35,8 +35,8 @@ use hir::{Crate, Module};
 use hir_def::{AssocItemId, FunctionId, ItemContainerId, Lookup as _, ModuleDefId};
 use hir_expand::change::ChangeWithProcMacros;
 use hir_ty_codegen::v2::{Backends, BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, Runs};
+use blaze_core::lock::Lock;
 use intern::Symbol;
-use parking_lot::Mutex;
 use span::Edition;
 use triomphe::Arc as TArc;
 
@@ -68,7 +68,7 @@ pub struct Compiler {
     /// What the builds put in the store, which the next reads: the page has no other.
     store: Stored,
     /// Proc macro calls of a pack that it had no expansion for.
-    missed: Arc<Mutex<Vec<pack::Call>>>,
+    missed: Arc<Lock<Vec<pack::Call>>>,
 }
 
 /// The store of a compiler with no disk: every put of its builds, by key.
@@ -141,7 +141,7 @@ impl Default for Compiler {
             linker: Linker::default(),
             memo: Memo::new(),
             store: Stored::default(),
-            missed: Default::default(),
+            missed: Arc::new(Lock::new("wasm.compiler.missed", Vec::new())),
         }
     }
 }

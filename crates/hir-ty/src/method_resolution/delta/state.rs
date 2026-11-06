@@ -34,6 +34,7 @@ use base_db::{
     Crate, Db, Written,
     maintain::nodes::{Begin, Costs, Plan},
 };
+use blaze_core::lock::Lock;
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
 use blaze_hash::{HashMap, HashSet};
 use blaze_mem::Tag;
@@ -50,7 +51,6 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use intern::Symbol;
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::{
     alloc::Global,
@@ -343,11 +343,11 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
     let nodes = Nodes {
         // alloc: once per pass, a node's slot, job and run time per crate maintained
         slots: jobs.iter().map(|job| job.crate_state.published.unfilled()).collect(),
-        jobs: jobs.drain(..).map(|job| Mutex::new(Some(job))).collect(),
+        jobs: jobs.drain(..).map(|job| Lock::new("ty.impls_pass.job", Some(job))).collect(),
         ran_ns: predicted.iter().map(|_| AtomicU64::new(0)).collect(),
         predicted: &predicted,
-        plan: Mutex::new(plan),
-        failed: Mutex::new(None),
+        plan: Lock::new("ty.impls_pass.plan", plan),
+        failed: Lock::new("ty.impls_pass.failed", None),
     };
     let ran = {
         let shared = Shared {
@@ -464,16 +464,16 @@ fn tests_record_failed_pass(before: Vec<(Box<str>, SlotRead)>, after: Vec<(Box<s
 struct Nodes<'a> {
     /// What a node may begin, decided under this lock alone, held for the decision and the
     /// claims of the slots of the nodes begun, never across a query.
-    plan: Mutex<Plan>,
+    plan: Lock<Plan>,
     /// Each node's job, out of its slot while it runs: no lock is held across a query.
-    jobs: Box<[Mutex<Option<Job>>]>,
+    jobs: Box<[Lock<Option<Job>>]>,
     /// Each node's slot to fill, for a crate first maintained.
     slots: Box<[Option<DirectorySlot>]>,
     predicted: &'a [u64],
     /// What each node took, measured by the driver: what the plan learns from.
     ran_ns: Box<[AtomicU64]>,
     /// The first node that could not run again: the pass fails naming it.
-    failed: Mutex<Option<NodeFailed>>,
+    failed: Lock<Option<NodeFailed>>,
 }
 
 /// Why a crate's node ended the pass.

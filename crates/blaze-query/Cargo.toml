@@ -32,7 +32,6 @@ either.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
 intern.workspace = true
-parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 thin-vec.workspace = true

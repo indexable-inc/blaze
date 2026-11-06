@@ -13,9 +13,9 @@
 //!   registers ([`super::register`]);
 //! - the builds running: a record a build, written as the history notes it started and freed
 //!   as it ends ([`build_started`], [`build_ended`]);
-//! - the names rows hold: a log a shard of [`super::NAMES`] and one of [`super::KEPT`] (threads'
-//!   names), appended as a name is first given and read back newest first, so a name the log
-//!   wrapped past is the oldest, long gone from every ring;
+//! - the kept names ([`super::KEPT`]: threads' names, `&'static str`s): one log, appended as a
+//!   name is first given and read back newest first. Every other name a row holds is defined
+//!   in the rows of its ring ([`super::names`]), so the rings are all a postmortem needs of them;
 //! - the rings' [`Store`]s: [`MAPPED_RINGS`] of them, back to back, reserved on disk and
 //!   mapped as one when the recorder is persisted, and handed to rings as they are made.
 //!
@@ -31,9 +31,10 @@
 //! bound was hit ([`failed`]). Handing out a store, a name or a site writes the file under the
 //! lock its caller already holds and does no system call.
 //!
-//! The file's size is fixed as it is made: the fixed part (about 19.3 MiB: the header 64 KiB,
-//! sites 2 MiB, builds 256 KiB, names 17 MiB) and [`MAPPED_RINGS`] stores of a [`Store`] each
-//! (2 MiB of rows, [`super::CAP`] rows of 64 bytes, and 4 KiB of head), about 532 MiB in all.
+//! The file's size is fixed as it is made: the fixed part (about 3.3 MiB: the header 64 KiB,
+//! sites 2 MiB, builds 256 KiB, kept names 1 MiB) and [`MAPPED_RINGS`] stores of a [`Store`]
+//! each (2 MiB of rows, [`super::CAP`] rows of 64 bytes, and 4 KiB of head), about 516 MiB in
+//! all.
 //! The history counts it, and the crash records beside it, against its cap
 //! ([`crate::history::CAP_BYTES`]).
 //!
@@ -73,18 +74,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         OnceLock,
-        atomic::{AtomicU64, Ordering, fence},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use blaze_hash::HashMap;
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 use stdx::file_lock::Locked;
 
 use super::{
-    CAP, KEPT, MARK_SLOTS, NAMES, Owner, RINGS, Read, SHARDS, SITES, SLOTS, Store, Sym, TAKEN,
-    WORDS, clock, decode, lock, span,
+    CAP, KEPT, MARK_SLOTS, Owner, RINGS, Read, SITES, SLOTS, Store, Sym, TAKEN, WORDS, clock,
+    decode, lock, names, span,
 };
 use crate::logs::HOLD_BUILDS;
 
@@ -99,7 +100,7 @@ const MAGIC: u64 = u64::from_le_bytes(*b"BLZFLGHT");
 const ENDIAN: u64 = 0x0102_0304_0506_0708;
 /// The layout of the file. Bump it with any change to the parts below, the header's words or
 /// a [`Store`]'s.
-pub(crate) const LAYOUT: u64 = 3;
+pub(crate) const LAYOUT: u64 = 4;
 
 const SITE_RECORD: usize = 512;
 const SITES_AT: usize = PAGE;
@@ -109,8 +110,9 @@ const BUILD_SLOTS: usize = 32;
 const BUILD_RECORD: usize = 8192;
 const BUILDS_AT: usize = SITES_AT + SITES_BYTES;
 const BUILDS_BYTES: usize = BUILD_SLOTS * BUILD_RECORD;
-/// A log a shard of names, and one of kept names (threads'), at [`SHARDS`].
-const LOGS: usize = SHARDS + 1;
+/// The one log of kept names (threads'); in layout 3 also a log a shard of the shared names,
+/// which names defined in the rings replaced ([`super::names`]).
+const LOGS: usize = 1;
 const LOG_BYTES: usize = 1 << 20;
 const LOGS_AT: usize = BUILDS_AT + BUILDS_BYTES;
 /// Where the first ring's store is: what is mapped as one, the fixed part.
@@ -212,7 +214,7 @@ const fn fnv_word(hash: u64, word: u64) -> u64 {
 pub(crate) const ROWS_FINGERPRINT: u64 = {
     use super::{
         ALLOCS_BITS, BYTES_MAX, COL_WORDS, CPU_COL, CPU_READ, CPU_ROW, CPU_VALID, CpuWhy,
-        DEPTH_BITS, EPOCHS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
+        DEPTH_BITS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
         FIELD_SLOT_SHIFT, FOLD_ALLOCS, FOLD_CPU, FOLD_PARENT_SHIFT, FOLD_ROOT, FOLD_ROW,
         FOLD_SPANS_MAX, FOLD_SPANS_SHIFT, FOLDED_COL, FOLDED_TICKS_COL, FieldValue, KIND_MARK,
         KIND_PLOT, KIND_SPAN, NO_COL, OWNERS_KEPT, Plot, QUEUED_LOW_SHIFT, RING_BITS, SHARE_SHIFT,
@@ -261,9 +263,15 @@ pub(crate) const ROWS_FINGERPRINT: u64 = {
         WORDS as u64,
         OWNERS_KEPT as u64,
         STORE_HEAD as u64,
-        // A `Sym`: 4 bits of shard, 8 of epoch, the index from 1 above.
-        SHARDS as u64,
-        EPOCHS as u64,
+        // Names: a row's own ids, its ring's definitions and links ([`super::names`]), and a
+        // kept name's class.
+        names::GEN_ROW,
+        names::NAME_ROW,
+        names::NAME_MORE_ROW,
+        names::LINK_ROW,
+        names::KEPT_SYM as u64,
+        names::INDEX_MAX as u64,
+        names::WINDOW as u64,
         // A boundary's row, and a span row's CPU share above its allocated bytes.
         CPU_ROW,
         CPU_VALID,
@@ -451,25 +459,6 @@ fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -
 
 // --- The writer -------------------------------------------------------------------------
 
-/// A name log of the mapping: its head under the lock of its one writer, and the names given
-/// while another thread held it, which that writer writes before it lets go. A thread that
-/// gives a name only ever tries the lock, so a writer stopped mid-entry (sampled, preempted)
-/// delays the names behind it, never their givers.
-#[derive(Default)]
-struct NameLog {
-    head: Mutex<u64>,
-    // alloc: a name a pusher found its log's writer busy for, until the writer writes it
-    pending: crossbeam_queue::SegQueue<(Sym, Box<str>)>,
-}
-
-/// Names a thread left to its log's writer ([`Mapping::log_name`]) since the process began.
-static HANDED_OFF: AtomicU64 = AtomicU64::new(0);
-
-/// See [`HANDED_OFF`]: [`super::Plot::ProfileNamesHandedOff`].
-pub(crate) fn handed_off() -> u64 {
-    HANDED_OFF.load(Ordering::Relaxed)
-}
-
 /// The file of a live process: the fixed part mapped, and its stores, handed to rings as they
 /// are made.
 pub(crate) struct Mapping {
@@ -479,26 +468,27 @@ pub(crate) struct Mapping {
     file: Locked,
     /// The fixed part, `0..RINGS_AT`, mapped shared and never unmapped.
     fixed: std::ptr::NonNull<u8>,
-    /// Each log's bytes ever written, and the names waiting for its writer ([`NameLog`]).
-    logs: [NameLog; LOGS],
+    /// The kept names' log's bytes ever written, taken under the kept table's lock: a name is
+    /// kept only the first time a thread asks for it, never on a thread's hot path.
+    log: Lock<u64>,
     /// One writer of the site records at a time.
-    sites: Mutex<()>,
+    sites: Lock<()>,
     /// The build each build record holds, 0 for none.
-    builds: Mutex<[u64; BUILD_SLOTS]>,
+    builds: Lock<[u64; BUILD_SLOTS]>,
     /// The stores' part, `RINGS_AT..FILE_BYTES`, mapped shared and never unmapped.
     stores: std::ptr::NonNull<u8>,
     /// Stores handed to rings.
-    given: Mutex<usize>,
+    given: Lock<usize>,
     /// Its nonce ([`H_NONCE`]).
     nonce: u64,
     /// One flush marks at a time ([`mark_flush`]).
-    marking: Mutex<()>,
+    marking: Lock<()>,
 }
 
 // SAFETY: `fixed` and `stores` point into shared mappings that are never unmapped; a store is
 // handed to one ring and written through atomics only; every write through `fixed`
 // is either to an atomic word (`Mapping::word`) or to bytes of a log, a site record or a build
-// record under the `Mutex` that keeps that part to one writer, and no thread of this process
+// record under the `Lock` that keeps that part to one writer, and no thread of this process
 // reads those bytes (only a postmortem, in another process, after this one died).
 unsafe impl Send for Mapping {}
 // SAFETY: as for `Send`.
@@ -553,7 +543,7 @@ impl Mapping {
                 _ = fs::remove_file(&path);
                 return Err(io_error(
                     &path,
-                    "reserving the disk of every ring's store (about 532 MiB) for",
+                    "reserving the disk of every ring's store (about 516 MiB) for",
                 )(error));
             }
             let fixed = sys::map(&file, 0, RINGS_AT)
@@ -564,13 +554,13 @@ impl Mapping {
                 path,
                 file,
                 fixed,
-                logs: std::array::from_fn(|_| NameLog::default()),
-                sites: Mutex::new(()),
-                builds: Mutex::new([0; BUILD_SLOTS]),
+                log: Lock::unrecorded("profile.postmortem.kept_log", 0),
+                sites: Lock::unrecorded("profile.postmortem.sites", ()),
+                builds: Lock::unrecorded("profile.postmortem.builds", [0; BUILD_SLOTS]),
                 stores,
-                given: Mutex::new(0),
+                given: Lock::unrecorded("profile.postmortem.given", 0),
                 nonce: nonce(pid),
-                marking: Mutex::new(()),
+                marking: Lock::unrecorded("profile.postmortem.marking", ()),
             };
             mapping.header(pid, blaze, process, counting_copies);
             Ok(mapping)
@@ -658,48 +648,10 @@ impl Mapping {
         Ok(store)
     }
 
-    /// Logs `name` as `sym` in log `log` (a shard, or [`SHARDS`] for kept names). A name is
-    /// given on the hot path ([`super::intern`]), so no thread waits for a log: one that finds
-    /// it being written leaves its name to the writer ([`NameLog`]), counted as handed off.
-    pub(crate) fn log_name(&self, log: usize, sym: Sym, name: &str) {
-        let Some(at) = self.logs.get(log) else { return };
-        let base = LOGS_AT + log * LOG_BYTES;
-        if let Some(mut head) = at.head.try_lock() {
-            self.write_name(base, &mut head, sym, name);
-            self.drain_names(base, at, head);
-            return;
-        }
-        // alloc: a name whose log another thread is writing, until that thread writes it
-        at.pending.push((sym, name.into()));
-        HANDED_OFF.fetch_add(1, Ordering::Relaxed);
-        // The push before the try below, as the writer's unlock before its look at the queue:
-        // one of the two sees the other, so no name waits in the queue with no writer.
-        fence(Ordering::SeqCst);
-        if let Some(head) = at.head.try_lock() {
-            self.drain_names(base, at, head);
-        }
-    }
-
-    /// Writes the names waiting for `at` while its lock is held as `head`, lets the lock go,
-    /// and takes it again for any pushed meanwhile whose pusher found it held. Bounded: each
-    /// round writes a name pushed after the round before let go, by a thread that then tried
-    /// the lock and failed, so it ends once the pushers stop.
-    fn drain_names<'a>(&self, base: usize, at: &'a NameLog, mut head: MutexGuard<'a, u64>) {
-        loop {
-            while let Some((sym, name)) = at.pending.pop() {
-                self.write_name(base, &mut head, sym, &name);
-            }
-            drop(head);
-            fence(Ordering::SeqCst);
-            if at.pending.is_empty() {
-                return;
-            }
-            match at.head.try_lock() {
-                Some(again) => head = again,
-                // Another writer took it, and drains what is left.
-                None => return,
-            }
-        }
+    /// Logs the kept name `name` as `sym`, under [`super::KEPT`]'s lock.
+    pub(crate) fn log_name(&self, sym: Sym, name: &str) {
+        let mut head = self.log.lock();
+        self.write_name(LOGS_AT, &mut head, sym, name);
     }
 
     /// Writes one entry of the log at `base`, its head `head`: the name's bytes, then its
@@ -959,7 +911,7 @@ mod sys {
 static MAPPING: OnceLock<Mapping> = OnceLock::new();
 /// What failed to be kept since the history last asked ([`failed`]): a store not made, a build
 /// past [`BUILD_SLOTS`].
-static FAILED: Mutex<Option<PostmortemError>> = Mutex::new(None);
+static FAILED: Lock<Option<PostmortemError>> = Lock::unrecorded("profile.postmortem.failed", None);
 
 fn failing(error: PostmortemError) {
     let mut failed = lock(&FAILED);
@@ -1022,18 +974,13 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         }
     }
     let Some(mapping) = MAPPING.get() else { return Ok(()) };
-    // The names given so far; those given from here on log themselves as they are given
-    // ([`named`]). A name given in between is logged twice, the same text both times. The
-    // mapping set before the names are read, as `intern` inserts a name before it reads the
-    // mapping: of the two, at least one sees the other.
-    fence(Ordering::SeqCst);
-    for shard in 0..SHARDS {
-        NAMES.each(shard, |sym, name| mapping.log_name(shard, sym, name));
-    }
+    // The kept names given so far, under their lock; those given from here on log themselves
+    // as they are given ([`named`]), under the same lock, so each is logged once. Every other
+    // name is in the rows of its ring, which the stores carry.
     {
         let kept = lock(&KEPT);
         for (at, name) in kept.as_ref().map_or(&[][..], |it| &it.names[..]).iter().enumerate() {
-            mapping.log_name(SHARDS, super::sym(0, 0, at), name);
+            mapping.log_name(names::KEPT_SYM | (at as u32 + 1), name);
         }
     }
     {
@@ -1075,11 +1022,10 @@ pub(super) fn store_for(number: u16) -> StoreFor {
     }
 }
 
-/// Logs a name just given, under the lock of its shard (or of the kept names, `log` [`SHARDS`]).
-#[inline]
-pub(super) fn named(log: usize, sym: Sym, name: &str) {
+/// Logs a kept name just given, under [`KEPT`]'s lock.
+pub(super) fn named(sym: Sym, name: &str) {
     if let Some(mapping) = MAPPING.get() {
-        mapping.log_name(log, sym, name);
+        mapping.log_name(sym, name);
     }
 }
 
@@ -1228,10 +1174,10 @@ pub struct Recovered {
     _session: Session,
 }
 
-static RECOVERING: Mutex<()> = Mutex::new(());
+static RECOVERING: Lock<()> = Lock::unrecorded("profile.postmortem.recovering", ());
 
 /// A postmortem's hold on [`super::RECOVERED`]: the names it gave are let go as it drops.
-struct Session(#[allow(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
+struct Session(#[allow(dead_code, reason = "held for its drop")] LockGuard<'static, ()>);
 
 impl Session {
     fn begin() -> Session {
@@ -1397,39 +1343,37 @@ impl Found {
         let counting_copies = h(H_COPIES) != 0;
         recovered.last_ns = h(H_FLUSHED_NS) as i64;
 
-        let names = self.names(&header)?;
+        let kept = self.names(&header)?;
         let sites = self.sites()?;
         recovered.builds = self.builds()?;
+        // Pass one: every name each ring's rows define, oldest to newest, so a link from one
+        // ring to another resolves whichever ring is decoded first.
+        let mut streams = names::Streams::default();
+        for ring in 0..rings as usize {
+            let (number, head, _, store) = self.dead_ring(ring)?;
+            let oldest = (head + 1).saturating_sub(CAP as u64);
+            // alloc: a ring's rows, once a ring of a dead process
+            let rows: Vec<(u64, [u64; WORDS])> =
+                (oldest..head).map(|i| (i, row_at(&store, i))).collect();
+            streams.feed(number, oldest, head, rows.iter().map(|(i, row)| (*i, row)));
+        }
+        let mut namer = DeadNamer {
+            streams,
+            kept: &kept,
+            // alloc: once a postmortem, a kept name its rows hold
+            kept_syms: HashMap::new_in(Global),
+            lost: 0,
+            failed: false,
+        };
         let mut read = Read::default();
         // The rows before the marks, of which only the held DEBUG rows are kept.
         let mut held = Read::default();
         for ring in 0..rings as usize {
-            let store = self.bytes(
-                RINGS_AT + ring * STORE_BYTES,
-                std::mem::size_of::<Store>(),
-                "reading a ring's store of",
-            )?;
-            let field = |offset: usize| word(&store, offset);
-            let head = field(std::mem::offset_of!(Store, head));
-            let number = u16::try_from(field(std::mem::offset_of!(Store, number)))
-                .map_err(|_| self.torn("a ring's number"))?;
-            let owners_at = std::mem::offset_of!(Store, owners);
-            let owners_len = usize::try_from(field(std::mem::offset_of!(Store, owners_len)))
-                .unwrap_or(usize::MAX);
-            if owners_len > super::OWNERS_KEPT {
-                return Err(self.torn("a ring's owners"));
-            }
-            // alloc: a ring's owners, once a ring of a dead process
-            let owners: Vec<Owner> = (0..owners_len)
-                .map(|at| {
-                    let (from, who) = (field(owners_at + at * 16), field(owners_at + at * 16 + 8));
-                    Owner { from, tid: (who >> 32) as u32, name: who as Sym }
-                })
-                .collect();
+            let (number, head, owners, store) = self.dead_ring(ring)?;
             let (mark, held_mark) = match slot {
                 Some(slot) => {
                     let at = std::mem::offset_of!(Store, marks) + slot * 16;
-                    (field(at), field(at + 8))
+                    (word(&store, at), word(&store, at + 8))
                 }
                 None => (0, 0),
             };
@@ -1441,8 +1385,7 @@ impl Found {
             for (into, range) in [(&mut held, held_from..from), (&mut read, from..head)] {
                 into.ring_begins();
                 for i in range {
-                    let at = super::STORE_HEAD + (i as usize & (CAP - 1)) * WORDS * 8;
-                    let row: [u64; WORDS] = std::array::from_fn(|it| field(at + it * 8));
+                    let row = row_at(&store, i);
                     let Some(by) = super::Ring::owner(&owners, i) else {
                         recovered.unowned += 1;
                         continue;
@@ -1454,6 +1397,7 @@ impl Found {
                         &row,
                         &scale,
                         counting_copies,
+                        &mut namer,
                     );
                 }
                 // A span whose CPU waited on a boundary row the process died before writing
@@ -1461,6 +1405,15 @@ impl Found {
                 into.ring_ends();
             }
         }
+        if namer.failed {
+            // alloc: an error
+            return Err(PostmortemError::Full {
+                path: self.path.clone(),
+                what: "names of a dead process's rows",
+                most: super::RECOVERED_MAX,
+            });
+        }
+        recovered.names_lost = namer.lost + namer.streams.forgotten;
         // Of the rows before the marks, the DEBUG events and their fields of the builds the
         // flush held them for: in no file. Those of other builds were written or dropped.
         let debug_held = |site: u16, build: u32| {
@@ -1473,7 +1426,7 @@ impl Found {
         };
         read.events.extend(held.events.iter().filter(|it| debug_held(it.site, it.build)));
         read.fields.extend(held.fields.iter().filter(|it| debug_held(it.site, it.build)));
-        self.renumber(&mut read, &names, &sites, &mut recovered)?;
+        self.renumber(&mut read, &sites, &mut recovered)?;
         let last = [
             read.spans.iter().map(|it| it.start_ns + it.dur_ns).max(),
             read.counters.iter().map(|it| it.t_ns).max(),
@@ -1605,41 +1558,45 @@ impl Found {
         Ok(builds)
     }
 
-    /// Gives every name and site `read` holds a number of this process: names for the life of
-    /// `recovered`'s session, sites for the process's.
+    /// One ring's store of the dead process, by its place in the mapping: its number, its head,
+    /// its owners and its bytes.
+    fn dead_ring(&self, ring: usize) -> Result<(u16, u64, Vec<Owner>, &[u8]), PostmortemError> {
+        let store = self.bytes(
+            RINGS_AT + ring * STORE_BYTES,
+            std::mem::size_of::<Store>(),
+            "reading a ring's store of",
+        )?;
+        let field = |offset: usize| word(&store, offset);
+        let head = field(std::mem::offset_of!(Store, head));
+        let number = u16::try_from(field(std::mem::offset_of!(Store, number)))
+            .map_err(|_| self.torn("a ring's number"))?;
+        let owners_at = std::mem::offset_of!(Store, owners);
+        let owners_len =
+            usize::try_from(field(std::mem::offset_of!(Store, owners_len))).unwrap_or(usize::MAX);
+        if owners_len > super::OWNERS_KEPT {
+            return Err(self.torn("a ring's owners"));
+        }
+        // alloc: a ring's owners, once a ring of a dead process
+        let owners: Vec<Owner> = (0..owners_len)
+            .map(|at| {
+                let (from, who) = (field(owners_at + at * 16), field(owners_at + at * 16 + 8));
+                Owner { from, tid: (who >> 32) as u32, name: who as Sym }
+            })
+            .collect();
+        Ok((number, head, owners, store))
+    }
+
+    /// Gives every site `read` holds a number of this process, for the process's life. Names
+    /// were given theirs as the rows were decoded ([`DeadNamer`]).
     fn renumber(
         &self,
         read: &mut Read,
-        names: &HashMap<Sym, String, Global>,
         sites: &[Option<(String, String, &'static str)>],
         recovered: &mut Recovered,
     ) -> Result<(), PostmortemError> {
-        // alloc: once a postmortem, a name or site its rows hold
-        let mut sym_of: HashMap<Sym, Sym, Global> = HashMap::new_in(Global);
-        // alloc: as above
+        // alloc: once a postmortem, a site its rows hold
         let mut site_of: HashMap<u16, u16, Global> = HashMap::new_in(Global);
-        let mut failed = None;
-        let (mut names_lost, mut sites_lost) = (0, 0);
-        let mut sym = |old: Sym| -> Sym {
-            if old == 0 {
-                return 0;
-            }
-            if let Some(&new) = sym_of.get(&old) {
-                return new;
-            }
-            let new = match names.get(&old) {
-                Some(text) => super::recovered(text).unwrap_or_else(|| {
-                    failed.get_or_insert(super::RECOVERED_MAX);
-                    0
-                }),
-                None => {
-                    names_lost += 1;
-                    0
-                }
-            };
-            sym_of.insert(old, new);
-            new
-        };
+        let mut sites_lost = 0;
         let mut sites_failed = false;
         let mut site = |old: u16| -> u16 {
             if old == 0 {
@@ -1664,45 +1621,18 @@ impl Found {
         };
         for row in &mut read.spans {
             row.site = site(row.site);
-            row.thread_name = sym(row.thread_name);
-            row.krate = sym(row.krate);
-            row.function = sym(row.function);
-            row.unit = sym(row.unit);
-            for (at, typed) in row.typed.iter_mut().enumerate() {
-                if span::SYM_COLUMNS[span::GENERIC + at] {
-                    *typed = u64::from(sym(Sym::try_from(*typed).unwrap_or(0)));
-                }
-            }
-        }
-        for row in &mut read.switches {
-            row.thread_name = sym(row.thread_name);
         }
         for row in &mut read.events {
             row.site = site(row.site);
-            row.thread_name = sym(row.thread_name);
-            row.message = sym(row.message);
         }
         for row in &mut read.fields {
             row.site = site(row.site);
-            if let super::FieldValue::Str(text) = &mut row.value {
-                *text = sym(*text);
-            }
         }
         for row in &mut read.folds {
             row.site = site(row.site);
             row.parent_site = site(row.parent_site);
-            row.thread_name = sym(row.thread_name);
         }
-        recovered.names_lost = names_lost;
         recovered.sites_lost = sites_lost;
-        if let Some(most) = failed {
-            // alloc: an error
-            return Err(PostmortemError::Full {
-                path: self.path.clone(),
-                what: "names in one dead process's rows",
-                most,
-            });
-        }
         if sites_failed {
             return Err(PostmortemError::Full {
                 // alloc: an error
@@ -1722,12 +1652,81 @@ impl Found {
     }
 }
 
+/// Row `i` of a dead ring's store, as its bytes hold it.
+fn row_at(store: &[u8], i: u64) -> [u64; WORDS] {
+    let at = super::STORE_HEAD + (i as usize & (CAP - 1)) * WORDS * 8;
+    std::array::from_fn(|it| word(store, at + it * 8))
+}
+
+/// How a postmortem gives the names of a dead process's rows numbers of this one: a ring's own
+/// ids through the definitions its rings hold ([`names::Streams`]), kept names through its
+/// kept log, each as [`super::recovered`] numbers it for the postmortem's session.
+struct DeadNamer<'a> {
+    streams: names::Streams,
+    kept: &'a HashMap<Sym, String, Global>,
+    kept_syms: HashMap<Sym, Sym, Global>,
+    /// Kept names the log no longer held.
+    lost: u64,
+    /// Past [`super::RECOVERED_MAX`] names.
+    failed: bool,
+}
+
+impl DeadNamer<'_> {
+    fn recovered(&mut self, text: &str) -> Sym {
+        super::recovered(text).unwrap_or_else(|| {
+            self.failed = true;
+            0
+        })
+    }
+}
+
+impl super::Namer for DeadNamer<'_> {
+    fn sym(&mut self, ring: u16, at: u64, word: u64) -> Sym {
+        let word = word as u32;
+        if word == 0 {
+            return 0;
+        }
+        if word & names::CLASS == names::KEPT_SYM {
+            if let Some(&sym) = self.kept_syms.get(&word) {
+                return sym;
+            }
+            let sym = match self.kept.get(&word) {
+                Some(text) => super::recovered(text).unwrap_or_else(|| {
+                    self.failed = true;
+                    0
+                }),
+                None => {
+                    self.lost += 1;
+                    0
+                }
+            };
+            self.kept_syms.insert(word, sym);
+            return sym;
+        }
+        match self.streams.resolve(ring, at, word, &mut names::Fed) {
+            Some(text) => self.recovered(&text),
+            None => 0,
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::flight::{
-        DEPTH_BITS, KIND_PLOT, KIND_SPAN, Plot, Ring, SITE_BITS, SpanRow, name, site_text, sym,
+        DEPTH_BITS, KIND_PLOT, KIND_SPAN, Namer, Plot, Ring, SITE_BITS, SpanRow, Writing, name,
+        site_text,
     };
+
+    /// A namer that leaves every id as the row holds it: what the expected rows are decoded
+    /// with, their names compared as text.
+    struct AsWritten;
+
+    impl Namer for AsWritten {
+        fn sym(&mut self, _: u16, _: u64, word: u64) -> Sym {
+            word as Sym
+        }
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -1753,62 +1752,18 @@ mod tests {
         [t0 + i * 10, i, 0, 0, KIND_PLOT << 62 | Plot::Queued as u64, 0, 7, 0]
     }
 
-    /// Threads giving names while their log's writer is stopped mid-entry (as the sampler
-    /// stops a thread) wait for no one: each leaves its name to the writer and returns, the
-    /// writer writes them all before it lets go, and a postmortem reads every one.
-    #[test]
-    fn names_given_while_their_log_is_held_wait_for_no_one_and_all_read_back() {
-        const THREADS: u32 = 8;
-        const EACH: u32 = 100;
-        let dir = scratch("handoff");
-        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
-        let log = &mapping.logs[3];
-        let held = log.head.lock();
-        let before = handed_off();
-        let named = |t: u32, i: u32| (sym(3, 1, (t * EACH + i) as usize), format!("name {t} {i}"));
-        std::thread::scope(|scope| {
-            for t in 0..THREADS {
-                let mapping = &mapping;
-                scope.spawn(move || {
-                    for i in 0..EACH {
-                        let (sym, text) = named(t, i);
-                        mapping.log_name(3, sym, &text);
-                    }
-                });
-            }
-            // Every giver handed its names off with the log still held: none waited on it.
-            blaze_graph::spin::SpinWait::within(
-                "every name to be handed to the stopped writer",
-                std::time::Duration::from_secs(30),
-                || handed_off() - before >= u64::from(THREADS * EACH),
-            );
-        });
-        mapping.drain_names(LOGS_AT + 3 * LOG_BYTES, log, held);
-        assert!(log.pending.is_empty(), "the writer wrote every name left to it");
-        drop(mapping);
-        let found = dead(&dir).unwrap();
-        let header = found[0].bytes(0, PAGE, "test").unwrap();
-        let names = found[0].names(&header).unwrap();
-        for t in 0..THREADS {
-            for i in 0..EACH {
-                let (sym, text) = named(t, i);
-                assert_eq!(names.get(&sym), Some(&text), "the name of thread {t}'s give {i}");
-            }
-        }
-    }
-
     /// A process writes rows into its mapping and dies (its lock let go): a postmortem reads
     /// back exactly the rows past the history's last flush, as the process would have read
-    /// them, with their names and sites, and the build that was running.
+    /// them, with their names (a kept one from the log, a ring's from its definition, written
+    /// before the flush's marks) and sites, and the build that was running.
     #[test]
     fn a_dead_process_s_rows_past_its_last_flush_read_back_whole() {
         let dir = scratch("rows");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         let scale = clock::Scale::now();
         mapping.set_clock(&scale);
-        let (worker, serde) = (sym(0, 0, 0), sym(3, 1, 4));
-        mapping.log_name(SHARDS, worker, "worker 1");
-        mapping.log_name(3, serde, "serde");
+        let worker = names::KEPT_SYM | 1;
+        mapping.log_name(worker, "worker 1");
         mapping.site(9, "compile", "blaze::unit", "INFO");
         mapping
             .build_started(&RunningBuild {
@@ -1834,6 +1789,13 @@ mod tests {
         let store = mapping.store(1).unwrap();
         let ring = Ring::with_store(1, store);
         store.mirror(&[Owner { from: 0, tid: 42, name: worker }]);
+        // `serde` is defined in the ring's own rows: a generation's start and its definition.
+        let mut local = names::Local::new(1, 0);
+        let mut words = [local.intern("serde", &mut Writing(&ring))];
+        local.row_syms(&mut words, &mut Writing(&ring));
+        let serde = words[0] as Sym;
+        let base = store.head.load(Ordering::Relaxed);
+        assert_eq!(base, 2, "a generation's row and one definition");
         let t0 = clock::ticks();
         let rows: Vec<[u64; WORDS]> = (0..40)
             .map(|i| if i % 2 == 0 { span_row(t0, i, 9, serde) } else { plot_row(t0, i) })
@@ -1859,14 +1821,15 @@ mod tests {
             },
         );
         expected.ring_begins();
-        for (i, row) in rows.iter().enumerate().skip(25) {
+        for (i, row) in rows.iter().enumerate().skip(25 - base as usize) {
             decode(
                 &mut expected,
                 (42, worker),
-                super::super::event_id(1, i as u64),
+                super::super::event_id(1, base + i as u64),
                 row,
                 &line,
                 false,
+                &mut AsWritten,
             );
         }
         expected.ring_ends();

@@ -8,7 +8,7 @@ use std::{
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::*;
 use crate::{
@@ -45,7 +45,6 @@ struct Function {
     anchors: Option<[ContentId; crate::template::OWN_TABLES]>,
 }
 
-#[derive(Default)]
 struct Program {
     functions: HashMap<u32, Function>,
     /// Each static's value byte and section.
@@ -53,7 +52,7 @@ struct Program {
     /// The functions a static's value points to.
     static_calls: HashMap<u32, Vec<u32>>,
     /// The functions of each level the walk reached, in the order it told them.
-    reached: Mutex<Vec<Vec<u32>>>,
+    reached: Lock<Vec<Vec<u32>>>,
     stop: AtomicBool,
     /// Each counted function's body and whether it is drop glue: none is counted unless named.
     bodies: HashMap<u32, (u32, bool)>,
@@ -65,6 +64,22 @@ struct Program {
     crates: HashMap<u32, (u32, bool)>,
     /// The recursion limit of each crate other than 0.
     limits: HashMap<u32, u32>,
+}
+
+impl Default for Program {
+    fn default() -> Program {
+        Program {
+            functions: HashMap::default(),
+            statics: HashMap::default(),
+            static_calls: HashMap::default(),
+            reached: Lock::new("test.codegen.driver.reached", Vec::new()),
+            stop: AtomicBool::new(false),
+            bodies: HashMap::default(),
+            recursion_limit: None,
+            crates: HashMap::default(),
+            limits: HashMap::default(),
+        }
+    }
 }
 
 impl Program {
@@ -252,20 +267,33 @@ impl Frontend for Program {
     }
 }
 
-#[derive(Default)]
 struct Machine {
     prepared: AtomicUsize,
     emitted: AtomicUsize,
     summarized: AtomicUsize,
     statics: AtomicUsize,
     /// The body byte of each function emitted, in the order emitted.
-    emitted_bodies: Mutex<Vec<u8>>,
+    emitted_bodies: Lock<Vec<u8>>,
     /// Added to each prepared function's shape when not 0: IR that differs from another
     /// machine's under the same key, as a key missing an input would let through.
     salt: u8,
     /// A code the release compile of each function of this body byte says it built in, which
     /// nothing of the build is: as a backend that built in a body its key misses would.
     unkept: Option<(u8, CodeHash)>,
+}
+
+impl Default for Machine {
+    fn default() -> Machine {
+        Machine {
+            prepared: AtomicUsize::new(0),
+            emitted: AtomicUsize::new(0),
+            summarized: AtomicUsize::new(0),
+            statics: AtomicUsize::new(0),
+            emitted_bodies: Lock::new("test.codegen.driver.emitted_bodies", Vec::new()),
+            salt: 0,
+            unkept: None,
+        }
+    }
 }
 
 /// Whether a function of body byte `body` is one nothing may import ([`Hint::Never`]): the

@@ -28,6 +28,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // Kept with `#[expect(..)]`: where a function reads a thread-local is its own choice.
         | Lint::ThreadLocalInWaitingFn
         | Lint::LockAcrossQuery
+        | Lint::LockHeldAcrossSlow
         | Lint::BlockingOnPool
         | Lint::UnnamedWait
         | Lint::SharedCollectionLock

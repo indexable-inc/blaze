@@ -15,12 +15,12 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-bytes.workspace = true
 blaze-codegen.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 cranelift-codegen.workspace = true
-parking_lot.workspace = true
 smallvec.workspace = true
 
 [build-dependencies]

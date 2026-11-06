@@ -27,7 +27,7 @@
 
 use std::{sync::atomic::AtomicBool, time::Instant};
 
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 
 use crate::{dump::Sampled, flight::Epoch};
 
@@ -96,16 +96,16 @@ impl Samples {
 /// [`start`]ed in this process keeps into; a history reads the ring it is given
 /// ([`crate::history::History::open`]), so a test's history reads a ring of the test's own and
 /// never what a sampler of the same process took.
-pub struct Ring(Mutex<Samples>);
+pub struct Ring(Lock<Samples>);
 
 impl Ring {
     /// An empty ring.
     pub const fn new() -> Ring {
         // alloc: none until the first sample, then once a ring
-        Ring(Mutex::new(Samples { ring: Vec::new(), next: 0, state: String::new() }))
+        Ring(Lock::unrecorded("profile.sampler.ring", Samples { ring: Vec::new(), next: 0, state: String::new() }))
     }
 
-    fn lock(&self) -> MutexGuard<'_, Samples> {
+    fn lock(&self) -> LockGuard<'_, Samples> {
         self.0.lock()
     }
 

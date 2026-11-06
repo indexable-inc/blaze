@@ -10,7 +10,6 @@ use std::{
 
 use blaze_graph::{Key, pump::Flights};
 use blaze_mem::{Tag, tag};
-use parking_lot::Mutex;
 
 use super::{
     Event, EventKind, MemoryUsage,
@@ -230,7 +229,8 @@ pub struct Storage {
     dirs: Box<[AtomicPtr<AtomicPtr<u8>>; MAX_INGREDIENTS]>,
     /// Each ingredient's table, null until first use.
     tables: Box<[AtomicPtr<()>; MAX_INGREDIENTS]>,
-    making: Mutex<()>,
+    #[expect(clippy::disallowed_types, reason = "held only while an ingredient's table or page directory is made, once each")]
+    making: blaze_core::lock::Lock<()>,
     pub(crate) heap: Heap,
     pub(crate) intern_heap: Heap,
     owners: Owners,
@@ -263,7 +263,8 @@ pub struct Storage {
     pub(crate) flights: Flights<()>,
     hook: Option<Hook>,
     /// The functions whose values are kept by their bytes (`lru`), weighed at each new view.
-    weighed: Mutex<Vec<u32>>,
+    #[expect(clippy::disallowed_types, reason = "held to add a function or take the list at a new view, never across a call")]
+    weighed: blaze_core::lock::Lock<Vec<u32>>,
     /// [`Storage::keep_every_value`].
     keep: bool,
     /// The values the last view's passes read, over every tag ([`Storage::swept`]).
@@ -274,7 +275,8 @@ pub struct Storage {
     /// weighed again once it has grown by a [`budget::SPARE`]th of the budget since.
     passed_at: [u64; Tag::COUNT],
     /// The database type of its first function table ([`Storage::check_db`]).
-    db_type: Mutex<Option<TypeId>>,
+    #[expect(clippy::disallowed_types, reason = "held once per function table made, to check its database type")]
+    db_type: blaze_core::lock::Lock<Option<TypeId>>,
 }
 
 // The tables behind the raw pointers are `Send + Sync` (each typed table's fields are atomics,
@@ -294,6 +296,7 @@ unsafe impl Send for Storage {}
 unsafe impl Sync for Storage {}
 
 impl Storage {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     pub fn new(hook: Option<Hook>) -> Storage {
         crate::carry_with_fiber_jobs();
         let view = 1;
@@ -309,7 +312,7 @@ impl Storage {
             written: [[0; 2]; HISTORY],
             dirs,
             tables,
-            making: Mutex::new(()),
+            making: blaze_core::lock::Lock::new("query.storage.making", ()),
             heap: Heap::new(HEAP, Tag::Query),
             intern_heap: Heap::new(INTERN_HEAP, Tag::Intern),
             owners: Owners::sparse(Tag::Query, "page owners"),
@@ -329,12 +332,12 @@ impl Storage {
             flights: Flights::new(),
             hook,
             // alloc: none, empty: one entry per `lru` function, pushed once
-            weighed: Mutex::new(Vec::new()),
+            weighed: blaze_core::lock::Lock::new("query.storage.weighed", Vec::new()),
             keep: false,
             swept: 0,
             budgets: [None; Tag::COUNT],
             passed_at: [0; Tag::COUNT],
-            db_type: Mutex::new(None),
+            db_type: blaze_core::lock::Lock::new("query.storage.db_type", None),
         }
     }
 
@@ -1275,15 +1278,17 @@ pub(crate) struct Relocate {
 pub(crate) struct Ids {
     next: AtomicU32,
     pages: Dense<AtomicU32>,
-    making: Mutex<()>,
+    #[expect(clippy::disallowed_types, reason = "held only while one of an ingredient's ID pages is made")]
+    making: blaze_core::lock::Lock<()>,
 }
 
 impl Ids {
+    #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     pub(crate) fn new(tag: Tag) -> Ids {
         Ids {
             next: AtomicU32::new(0),
             pages: Dense::growing(MAX_PAGES, tag, "an ingredient's ID pages"),
-            making: Mutex::new(()),
+            making: blaze_core::lock::Lock::new("query.ids.making", ()),
         }
     }
 

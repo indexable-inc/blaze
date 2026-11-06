@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use blaze_mem::Tag;
 use blaze_mem::blocks::Slice;
 use derive_where::derive_where;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use rustc_hash::FxBuildHasher;
 
 use super::{AvailableDepth, Cx, NestedGoals, RequiredDepth};
@@ -156,8 +156,7 @@ impl<X: Cx> GlobalCache<X> {
         let writers = self
             .writers
             .get_or_init(|| table("writer locks", self.sharing.shards(), |_| Writer::new()));
-        let mut claimed =
-            blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
+        let mut claimed = writers[goal as usize & (writers.len() - 1)].0.lock();
         let column = if encountered_overflow { &self.with_overflow } else { &self.success };
         let head = column.get_or_init(goal, || AtomicU32::new(0));
         let latest = head.load(Ordering::Acquire);
@@ -378,17 +377,16 @@ struct Claims {
     nested_goals: Claimed,
 }
 
-/// What a wait for a writer's lock is said to wait on ([`blaze_graph::wait::lock`]): a contended
-/// one blocks the thread inside a `wait` span naming it.
-const WRITER: &str = "the trait solver's global cache writer";
+/// The writer locks' name: a contended one blocks the thread inside a `wait` span naming it.
+const WRITER: &str = "solver.global_cache.writer";
 
 /// One cache line pair each, so writers under neighbouring locks don't share a line.
 #[repr(align(128))]
-struct Writer(Mutex<Claims>);
+struct Writer(Lock<Claims>);
 
 impl Writer {
     fn new() -> Writer {
-        Writer(Mutex::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
+        Writer(Lock::new(WRITER, Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
     }
 }
 
@@ -423,13 +421,13 @@ struct Interned<T> {
     shards: OnceLock<Slice<Shard>>,
 }
 
-/// What a wait for a shard's lock is said to wait on, as [`WRITER`].
-const SHARD: &str = "the trait solver's global cache shard";
+/// The shard locks' name, as [`WRITER`].
+const SHARD: &str = "solver.global_cache.shard";
 
 #[repr(align(128))]
 struct Shard {
     /// Held only to look again and insert.
-    lock: Mutex<Claimed>,
+    lock: Lock<Claimed>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
     /// Which of `tables` is the one in use.
@@ -440,7 +438,7 @@ struct Shard {
 impl Shard {
     fn new() -> Shard {
         Shard {
-            lock: Mutex::new(Claimed::EMPTY),
+            lock: Lock::new(SHARD, Claimed::EMPTY),
             len: AtomicU32::new(0),
             level: AtomicUsize::new(0),
             tables: [const { OnceLock::new() }; TABLES],
@@ -515,7 +513,7 @@ impl<T: Hash + Eq> Interned<T> {
         {
             return found;
         }
-        let mut claimed = blaze_graph::wait::lock(&shard.lock, SHARD);
+        let mut claimed = shard.lock.lock();
         let mut level = shard.level.load(Ordering::Acquire);
         if let Ok(found) = self.probe(shard.table(level), hash, &value) {
             return found;

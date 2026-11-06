@@ -38,7 +38,7 @@ use blaze_hash::LazyKey;
 use blaze_mem::{AppendVec, MemError, RegionVec};
 
 use crate::sync::{
-    Mutex,
+    Lock,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
@@ -145,7 +145,7 @@ pub struct Dirs {
     paths: AppendVec<u8>,
     places: AppendVec<AtomicU64>,
     /// Held to add a directory: cold, once per directory per process.
-    adding: Mutex<()>,
+    adding: Lock<()>,
 }
 
 /// The places of table `level` in `places`.
@@ -248,7 +248,7 @@ impl Dirs {
             entries: AppendVec::new(MOST as usize, tag)?,
             paths: AppendVec::new(PATH_BYTES, tag)?,
             places: AppendVec::new(PLACES, tag)?,
-            adding: Mutex::new(()),
+            adding: Lock::new("vfs.outside.adding", ()),
         })
     }
 

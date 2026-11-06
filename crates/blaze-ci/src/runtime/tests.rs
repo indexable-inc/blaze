@@ -9,7 +9,7 @@ use std::{
 use blaze_api::http;
 use blaze_ids::ContentId;
 use blaze_vfs::{Mode, Op};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{
     GITHUB_RETRIES, Post, Posts, batches, listen,
@@ -374,7 +374,7 @@ fn run_check() -> CheckRun {
 #[test]
 fn github_errors_are_retried_five_times() {
     for (failing, created) in [(0, true), (5, true), (6, false)] {
-        let github = Mutex::new(Flaky { failing, calls: 0 });
+        let github = Lock::new("ci.test.flaky", Flaky { failing, calls: 0 });
         let (posts, receive) = crossbeam_channel::unbounded();
         let (service, inputs) = crossbeam_channel::unbounded();
         posts.send(Post::Create { run: RunId(3), check: run_check() }).unwrap();
@@ -415,7 +415,7 @@ fn update(run: u64, id: u64, status: CheckStatus) -> Post {
 
 #[test]
 fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
-    let github = Mutex::new(Recorded::default());
+    let github = Lock::new("ci.test.recorded", Recorded::default());
     let (posts, receive) = crossbeam_channel::unbounded();
     let (service, inputs) = crossbeam_channel::unbounded();
     posts.send(update(1, 11, CheckStatus::Queued)).unwrap();
@@ -433,7 +433,7 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
 
 #[test]
 fn updates_of_different_runs_are_all_sent_in_order() {
-    let github = Mutex::new(Recorded::default());
+    let github = Lock::new("ci.test.recorded", Recorded::default());
     let (posts, receive) = crossbeam_channel::unbounded();
     let (service, _inputs) = crossbeam_channel::unbounded();
     for id in [5, 4, 6] {
@@ -451,7 +451,7 @@ struct Slow {
     wait: Duration,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     most: Arc<std::sync::atomic::AtomicUsize>,
-    calls: Arc<Mutex<Vec<(u64, CheckStatus)>>>,
+    calls: Arc<Lock<Vec<(u64, CheckStatus)>>>,
 }
 
 impl Checks for Slow {
@@ -477,12 +477,12 @@ fn slow_lanes(
 ) -> (
     Posts,
     Arc<std::sync::atomic::AtomicUsize>,
-    Arc<Mutex<Vec<(u64, CheckStatus)>>>,
+    Arc<Lock<Vec<(u64, CheckStatus)>>>,
     crossbeam_channel::Receiver<Input>,
 ) {
     let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Lock::new("ci.test.slow.calls", Vec::new()));
     let (service, inputs) = crossbeam_channel::unbounded();
     let mut lanes = Vec::new();
     for _ in 0..super::POST_LANES {
@@ -490,7 +490,7 @@ fn slow_lanes(
         let fake =
             Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
         let service = service.clone();
-        thread::spawn(move || post(&Mutex::new(fake), &posts, &service, Duration::ZERO));
+        thread::spawn(move || post(&Lock::new("ci.test.slow", fake), &posts, &service, Duration::ZERO));
         lanes.push(to_lane);
     }
     (Posts { lanes }, most, calls, inputs)

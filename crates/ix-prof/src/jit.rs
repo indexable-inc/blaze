@@ -13,7 +13,7 @@
 
 use std::any::Any;
 
-use parking_lot::RwLock;
+use blaze_core::lock::ReadLock;
 
 /// A function in a code map, by its offset from the map's start.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,7 +40,8 @@ pub struct CodeMap {
 
 /// The maps registered, by start, each with what keeps its code alive.
 // alloc: once a process
-static MAPS: RwLock<Vec<(CodeMap, Box<dyn Any + Send + Sync>)>> = RwLock::new(Vec::new());
+static MAPS: ReadLock<Vec<(CodeMap, Box<dyn Any + Send + Sync>)>> =
+    ReadLock::new("ixprof.jit.maps", Vec::new());
 
 /// Registers `map`, keeping `keep` (what owns its code) alive with it for the process's life.
 /// A map whose range is already registered (the same code registered twice) is left as it was.

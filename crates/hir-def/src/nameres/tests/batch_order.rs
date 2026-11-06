@@ -315,7 +315,7 @@ struct CountedState {
 #[derive(Debug)]
 struct Counted {
     counts: Counts,
-    state: parking_lot::Mutex<CountedState>,
+    state: blaze_core::lock::Lock<CountedState>,
 }
 
 /// A call that panicked leaves the state as it was at the panic.
@@ -419,7 +419,7 @@ fn counted_in(order: RunOrder, counts: Counts) -> (Vec<(String, u32)>, usize, us
     let previous = set_run_order(order);
     let counted = std::sync::Arc::new(Counted {
         counts,
-        state: parking_lot::Mutex::new(CountedState::default()),
+        state: blaze_core::lock::Lock::new("test.def.batch_order.counted", CountedState::default()),
     });
     let extra = vec![(
         "#[proc_macro_attribute]\npub fn counted(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n".to_owned(),

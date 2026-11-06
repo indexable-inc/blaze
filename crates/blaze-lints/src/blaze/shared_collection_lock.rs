@@ -2,7 +2,7 @@
 //! the structure to use instead.
 //!
 //! - A field, a static, or a local in an `Arc` whose type is a `Mutex` or `RwLock` (std's, or
-//!   `lock_api`'s, which `parking_lot`'s are) around a map (std's `HashMap` with any hasher,
+//!   `lock_api`'s, which `parking_lot`'s are), or a `blaze_core::lock::{Lock, ReadLock}`, around a map (std's `HashMap` with any hasher,
 //!   `BTreeMap`, hashbrown's and blaze-hash's `HashMap`, indexmap's `IndexMap`) or a set (std's
 //!   `HashSet` and `BTreeSet`, hashbrown's and blaze-hash's `HashSet`, indexmap's `IndexSet`),
 //!   the lock itself or inside `Arc`s, `LazyLock`s and `OnceLock`s (std's, or once_cell's
@@ -225,7 +225,7 @@ fn locked_collection(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Locked> {
     let is_std_lock = [item("Mutex"), item("RwLock")].contains(&Some(adt));
     let is_lock_api =
         facts::adt_is(db, adt, "lock_api", "Mutex") || facts::adt_is(db, adt, "lock_api", "RwLock");
-    if !is_std_lock && !is_lock_api {
+    if !is_std_lock && !is_lock_api && !facts::is_blaze_core_lock(db, adt) {
         return None;
     }
     let inner = ty.type_arguments().last()?;

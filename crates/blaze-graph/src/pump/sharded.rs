@@ -54,7 +54,7 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
             .next_power_of_two()
             .max(64);
         Sharded {
-            shards: (0..count).map(|_| Shard(Lock::new(ByKey::default()))).collect(),
+            shards: (0..count).map(|_| Shard(Lock::new("graph.flights.shard", ByKey::default()))).collect(),
             mask: count - 1,
         }
     }

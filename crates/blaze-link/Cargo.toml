@@ -33,7 +33,6 @@ blaze-mem.workspace = true
 blaze-sha256.workspace = true
 gimli.workspace = true
 object.workspace = true
-parking_lot.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
 

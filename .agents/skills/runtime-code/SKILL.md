@@ -29,15 +29,21 @@ See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
 ## standard-structures (rule 12)
 
-One choice per need, never a hand-rolled or std stand-in: locks are `parking_lot::{Mutex, RwLock}`,
-held only for a field update and never across a query call; a shared map is `papaya::HashMap`; a
-single-owner map or set is `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed
-seed, its allocator named: a frame's for a task, `Global` with a reason otherwise), with
-`blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
-persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never
-pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
-`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
-`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
+One choice per need, never a hand-rolled or std stand-in: a lock is `blaze_core::lock::{Lock,
+ReadLock}` (with `Signal` for a driver thread's condition), named where it is made
+(`Lock::new("store.packs", v)`), held only for a field update and never across a query call, IO or a
+global allocation (`blaze::lock_held_across_slow`); raw `std::sync` and `parking_lot` locks are
+banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contended wait records who
+waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to
+use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
+queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is
+`blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named: a
+frame's for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that
+are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of
+parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue
+is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
+is an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order
+is part of the output.
 
 ## sans-io-cores (rule 14)
 

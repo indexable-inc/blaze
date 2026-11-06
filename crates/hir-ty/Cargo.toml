@@ -13,13 +13,13 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-serde.workspace = true
 cov-mark.workspace = true
 crossbeam-queue.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
-parking_lot.workspace = true
 smallvec.workspace = true
 serde.workspace = true
 serde_derive.workspace = true

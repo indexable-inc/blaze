@@ -89,7 +89,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         opened_cpu: None,
         opened_ns: 0,
         opened_unix_ns: None,
-        leases: Arc::default(),
+        leases: Arc::new(blaze_core::lock::Lock::new("serve.job.leases", Leases::default())),
     }
 }
 

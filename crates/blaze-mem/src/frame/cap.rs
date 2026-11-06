@@ -19,6 +19,10 @@
 
 use std::{cell::Cell, fmt, marker::PhantomData, ptr};
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core: blaze-mem is a dependency of blaze-core, and the allocator's lock is std's"
+)]
 use crate::sync::{
     Condvar, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -54,7 +58,7 @@ impl Spills {
     not(blaze_check),
     expect(
         clippy::disallowed_types,
-        reason = "std's `Mutex` and `Condvar` for the backstop's wait (a reserve past `limit` blocks until bytes are given back), a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; holding threads reserve and give back with atomics"
+        reason = "below blaze-core: blaze-mem is a dependency of blaze-core; std's `Mutex` and `Condvar` for the backstop's wait (a reserve past `limit` blocks until bytes are given back), a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; holding threads reserve and give back with atomics"
     )
 )]
 struct Shared {
@@ -125,7 +129,7 @@ impl Cap {
             not(blaze_check),
             expect(
                 clippy::disallowed_types,
-                reason = "`Shared::state` and `changed`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
+                reason = "below blaze-core: blaze-mem is a dependency of blaze-core; `Shared::state` and `changed`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
             )
         )]
         let shared: &'static Shared = Box::leak(Box::new(Shared {
@@ -261,7 +265,7 @@ impl Shared {
         not(blaze_check),
         expect(
             clippy::disallowed_types,
-            reason = "the guard of `Shared::state`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
+            reason = "below blaze-core: blaze-mem is a dependency of blaze-core; the guard of `Shared::state`: a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation"
         )
     )]
     fn lock(&self) -> MutexGuard<'_, State> {

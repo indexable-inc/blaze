@@ -10,13 +10,16 @@
 use std::{path::PathBuf, sync::OnceLock};
 
 use blaze_core::FileName;
-use parking_lot::Mutex;
 
 use crate::{Corrupt, Entry, Key, Kind, Mismatch, Pinned, Reader, Store, Ticket, Writer, enter};
 
 pub struct Handle {
     reader: Reader,
-    writer: Mutex<Writer>,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one store writer: puts are rare (a module compiled, a verdict seen)"
+    )]
+    writer: blaze_core::lock::Lock<Writer>,
     /// The driver's root, which the store's file names are under.
     root: PathBuf,
 }
@@ -25,8 +28,10 @@ static INSTALLED: OnceLock<Handle> = OnceLock::new();
 
 impl Handle {
     /// A handle on `store`, which must be open, whose driver's root is `root`.
+    #[expect(clippy::disallowed_types, reason = "makes `Handle::writer`, which allows it")]
     pub fn new(store: &mut Store, root: PathBuf) -> Handle {
-        Handle { reader: store.reader(), writer: Mutex::new(store.writer()), root }
+        let writer = blaze_core::lock::Lock::new("cas.handle.writer", store.writer());
+        Handle { reader: store.reader(), writer, root }
     }
 
     /// Makes `handle` the process's, for [`Handle::installed`]. A process has one store, so a

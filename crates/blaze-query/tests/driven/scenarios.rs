@@ -19,7 +19,7 @@ use blaze_graph::{
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Config, Cx, Database, DbError, MemTree, Query, QueryKind};
 use blaze_vfs::{View, ViewId};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -70,7 +70,7 @@ impl Query for Len {
 }
 
 /// What [`Gate`] waits on, set by the scenario before it is asked.
-static GATE: Mutex<Option<EventWait>> = Mutex::new(None);
+static GATE: Lock<Option<EventWait>> = Lock::new("query.test.driven.gate", None);
 
 /// 5, once the scenario's event fired: a query that waits inside its run, holding its key.
 struct Gate;
@@ -110,7 +110,7 @@ impl Query for AsksGate {
 
 /// How many runs of [`Chain`] began, and the event its first waits on for the second.
 static MET: AtomicUsize = AtomicUsize::new(0);
-static MEETING: Mutex<Option<Event>> = Mutex::new(None);
+static MEETING: Lock<Option<Event>> = Lock::new("query.test.driven.meeting", None);
 
 /// The file names another; 1 + [`Chain`] of it, 0 for an empty file. Its first run waits for
 /// the second to begin, so two runs hold a key each before asking the other's.
@@ -183,7 +183,7 @@ pub const ON_THE_SEED: &[(&str, fn())] = &[
 /// query that asks its key waits on its flight, parked too, and a third job's query runs
 /// meanwhile, sees both parked and lets the first go; both waiting queries then get the value.
 pub fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
-    type Ended = Mutex<(Vec<(&'static str, Result<u64, DbError>)>, Option<Event>)>;
+    type Ended = Lock<(Vec<(&'static str, Result<u64, DbError>)>, Option<Event>)>;
     /// Notes what a job's query came to; the third to end fires the scenario's own wait.
     fn end(ended: &Ended, job: &'static str, value: Result<u64, DbError>) {
         let mut ended = ended.lock();
@@ -199,7 +199,7 @@ pub fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     *GATE.lock() = Some(gate.waiter());
     let all = Event::new();
     let all_ended = all.waiter();
-    let ended: Arc<Ended> = Arc::new(Mutex::new((Vec::new(), Some(all))));
+    let ended: Arc<Ended> = Arc::new(Lock::new("query.test.driven.ended", (Vec::new(), Some(all))));
     let parked = Arc::new(AtomicUsize::new(usize::MAX));
     let job = {
         let (db, pool, ended, parked) =

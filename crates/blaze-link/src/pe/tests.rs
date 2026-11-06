@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::Arch;
@@ -57,8 +57,8 @@ fn dll() -> Output {
 }
 
 fn pe(output: Output) -> Pe {
-    let last = output.incremental.then(Mutex::default);
-    Pe { output, descriptors: Mutex::default(), last }
+    let last = output.incremental.then(|| Lock::new("link.pe.last", Default::default()));
+    Pe { output, descriptors: Lock::new("link.pe.descriptors", Default::default()), last }
 }
 
 fn pdata_class() -> Class {

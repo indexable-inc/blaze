@@ -9,7 +9,7 @@ use std::{
 
 use hegel::TestCase;
 use hegel::generators as gs;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::fiber::{Config, Cx, Driver, Handle, NoWait, Work};
 use super::*;
@@ -176,7 +176,7 @@ fn a_job_waits_on_a_flight_of_another_drivers_job() {
 /// the refused job ends its flight and the other goes on.
 struct CrossedDrivers {
     claimed: AtomicU32,
-    refused: Mutex<Vec<Cycle>>,
+    refused: Lock<Vec<Cycle>>,
 }
 
 impl Work for &'static CrossedDrivers {
@@ -199,7 +199,7 @@ impl Work for &'static CrossedDrivers {
 fn a_cycle_of_waits_through_two_drivers_is_refused_once() {
     let work: &'static CrossedDrivers = Box::leak(Box::new(CrossedDrivers {
         claimed: AtomicU32::new(0),
-        refused: Mutex::new(Vec::new()),
+        refused: Lock::new("graph.test.fiber.refused", Vec::new()),
     }));
     let first = start(Cores::flat(1).unwrap(), work);
     let second = start(Cores::flat(1).unwrap(), work);
@@ -332,7 +332,7 @@ fn a_dag_with_maps_runs_every_node_and_item_once() {
 struct Pair {
     first: OnceLock<Handle>,
     second: OnceLock<Handle>,
-    refused: Mutex<Vec<Cycle>>,
+    refused: Lock<Vec<Cycle>>,
 }
 
 impl Work for &'static Pair {
@@ -359,7 +359,7 @@ fn a_cycle_of_waits_on_fibers_is_refused_naming_both_jobs() {
     let pair = PAIR.get_or_init(|| Pair {
         first: OnceLock::new(),
         second: OnceLock::new(),
-        refused: Mutex::new(Vec::new()),
+        refused: Lock::new("graph.test.fiber.refused", Vec::new()),
     });
     let driver = start(Cores::flat(2).unwrap(), pair);
     let first = driver.spawn(true, Spawn::root());
@@ -517,7 +517,7 @@ fn off_a_fiber_the_thread_waits_as_a_job_of_its_own() {
 
 /// The free functions reach the running job: a wait through them suspends it like `Cx::wait`.
 struct Free {
-    seen: Mutex<Vec<JobId>>,
+    seen: Lock<Vec<JobId>>,
 }
 
 impl Work for &'static Free {
@@ -535,7 +535,7 @@ impl Work for &'static Free {
 #[test]
 fn the_free_wait_suspends_the_running_job() {
     static FREE: OnceLock<Free> = OnceLock::new();
-    let work = FREE.get_or_init(|| Free { seen: Mutex::new(Vec::new()) });
+    let work = FREE.get_or_init(|| Free { seen: Lock::new("graph.test.fiber.seen", Vec::new()) });
     let driver = start(Cores::flat(2).unwrap(), work);
     for _ in 0..8 {
         driver.spawn((), Spawn::root());
@@ -551,7 +551,7 @@ const ONE_KEY_ASKERS: usize = 6;
 struct OneKey {
     flights: crate::pump::Flights<u32>,
     runs: AtomicU32,
-    got: Mutex<Vec<u32>>,
+    got: Lock<Vec<u32>>,
 }
 
 enum OneKeyJob {
@@ -592,7 +592,7 @@ fn a_key_asked_on_fibers_runs_once_and_its_waiters_suspend() {
     let work = WORK.get_or_init(|| OneKey {
         flights: crate::pump::Flights::new(),
         runs: AtomicU32::new(0),
-        got: Mutex::new(Vec::new()),
+        got: Lock::new("graph.test.fiber.got", Vec::new()),
     });
     let driver = start(Cores::flat(1).unwrap(), work);
     driver.spawn(OneKeyJob::Root(ONE_KEY_ASKERS as u32), Spawn::root());
@@ -610,7 +610,7 @@ struct Crossed {
     /// Runs under way: each asks for the other's key only once both are, so neither can end
     /// before the other claimed its key, however late the driver starts the second.
     running: AtomicU32,
-    ended: Mutex<Vec<Result<u32, crate::Cancelled>>>,
+    ended: Lock<Vec<Result<u32, crate::Cancelled>>>,
 }
 
 impl Work for &'static Crossed {
@@ -642,7 +642,7 @@ fn crossed_runs_on_fibers_give_way_once() {
     let work = WORK.get_or_init(|| Crossed {
         flights: crate::pump::Flights::new(),
         running: AtomicU32::new(0),
-        ended: Mutex::new(Vec::new()),
+        ended: Lock::new("graph.test.fiber.ended", Vec::new()),
     });
     let driver = start(Cores::flat(1).unwrap(), work);
     driver.spawn(0, Spawn::root());
@@ -1059,8 +1059,8 @@ fn a_job_recursing_past_its_fiber_stack_grows_and_keeps_its_limit_across_waits()
 struct ScopeWait {
     flights: crate::pump::Flights<u32>,
     /// What each side came to: the owner's run of key 1 and the scope job's ask.
-    owner: Mutex<Vec<Result<u32, crate::Cancelled>>>,
-    asked: Mutex<Vec<Result<u32, crate::Cancelled>>>,
+    owner: Lock<Vec<Result<u32, crate::Cancelled>>>,
+    asked: Lock<Vec<Result<u32, crate::Cancelled>>>,
 }
 
 enum ScopeJob {
@@ -1074,8 +1074,8 @@ impl ScopeWait {
     fn leak() -> &'static ScopeWait {
         Box::leak(Box::new(ScopeWait {
             flights: crate::pump::Flights::new(),
-            owner: Mutex::new(Vec::new()),
-            asked: Mutex::new(Vec::new()),
+            owner: Lock::new("graph.test.fiber.owner", Vec::new()),
+            asked: Lock::new("graph.test.fiber.asked", Vec::new()),
         }))
     }
 

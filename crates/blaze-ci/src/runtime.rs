@@ -31,10 +31,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use blaze_core::lock::Lock;
 use blaze_api::{ApiError, Request, Response, ViewRef, client::Client};
 use blaze_hash::HashMap;
 use blaze_vfs::{Op, View};
-use parking_lot::Mutex;
 use std::alloc::Global;
 
 use crate::{
@@ -62,8 +62,8 @@ pub const EMPTY_HEAD: &str = "ci/empty";
 /// What every thread shares.
 pub(crate) struct Shared {
     pub(crate) socket: PathBuf,
-    pub(crate) git: Mutex<Git>,
-    pub(crate) github: Arc<Mutex<GitHub>>,
+    pub(crate) git: Lock<Git>,
+    pub(crate) github: Arc<Lock<GitHub>>,
     pub(crate) pins: crossbeam_channel::Sender<pins::Command>,
     pub(crate) service: crossbeam_channel::Sender<Input>,
 }
@@ -99,7 +99,7 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
     for lane in 0..POST_LANES {
         let (to_lane, posts) = crossbeam_channel::unbounded();
         // clone: a lane's client and sender, once at start
-        let (client, service) = (Mutex::new(github.lane()), to_service.clone());
+        let (client, service) = (Lock::new("ci.post.lane", github.lane()), to_service.clone());
         thread::Builder::new()
             .name(format!("blaze-ci github {lane}")) // alloc: once per lane, at start
             .spawn(move || post(&client, &posts, &service, Duration::from_secs(1)))
@@ -112,8 +112,11 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
         // alloc: once, at start, what every worker shares
         socket: config.daemon.socket.clone(), // clone: once, at start
         // clone: once, at start
-        git: Mutex::new(Git { dir: config.git.dir.clone(), remote: config.git.remote.clone() }),
-        github: Arc::new(Mutex::new(github)), // alloc: once, at start
+        git: Lock::new(
+            "ci.runtime.git",
+            Git { dir: config.git.dir.clone(), remote: config.git.remote.clone() },
+        ),
+        github: Arc::new(Lock::new("ci.runtime.github", github)), // alloc: once, at start
         pins: to_pins,
         service: to_service.clone(), // clone: once, at start
     });
@@ -315,7 +318,7 @@ fn take_snapshot(
 /// all of it. A run that goes queued, in progress and done while an earlier post is retried, or
 /// while its creation is answered, costs one request, not three.
 pub(crate) fn post(
-    github: &Mutex<impl Checks>,
+    github: &Lock<impl Checks>,
     posts: &crossbeam_channel::Receiver<Post>,
     service: &crossbeam_channel::Sender<Input>,
     backoff: Duration,
@@ -344,7 +347,7 @@ pub(crate) fn post(
 
 /// One post, retried; a creation's id goes back to the service.
 fn send(
-    github: &Mutex<impl Checks>,
+    github: &Lock<impl Checks>,
     post: Post,
     service: &crossbeam_channel::Sender<Input>,
     backoff: Duration,

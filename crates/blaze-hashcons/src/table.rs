@@ -49,16 +49,16 @@ type Chunk<T> = Box<[OnceLock<Node<T>>]>;
 /// interner.
 struct ShardLock {
     #[allow(clippy::disallowed_types)]
-    inner: parking_lot::Mutex<()>,
+    inner: blaze_core::lock::Lock<()>,
 }
 
 #[allow(clippy::disallowed_types)]
 impl ShardLock {
     fn new() -> ShardLock {
-        ShardLock { inner: parking_lot::Mutex::new(()) }
+        ShardLock { inner: blaze_core::lock::Lock::new("hashcons.shard.writer", ()) }
     }
 
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+    fn lock(&self) -> blaze_core::lock::LockGuard<'_, ()> {
         self.inner.lock()
     }
 }

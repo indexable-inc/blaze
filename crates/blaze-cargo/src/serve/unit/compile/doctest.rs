@@ -27,10 +27,10 @@ use std::path::Path;
 
 use blaze_api::{ApiError, Level};
 use blaze_cas::Key;
+use blaze_core::lock::Lock;
 use blaze_doc::doctest::{self as doc, Built, Program, Verdict};
 use blaze_ids::{ContentId, Hasher};
 use blaze_lower::{Appended, DoctestProgram, LowerError, Lowered};
-use parking_lot::Mutex;
 
 use super::{
     Does, Failed, Image, ImageRecord, Job, Linked, Making, Phases, Put, UnitReader, Written,
@@ -226,7 +226,7 @@ pub(crate) struct Generated {
 
 /// [`Phase::Names`](super::Phase) of a `Doctest` unit not kept: no check of its own (the
 /// library's is its lib unit's), and its crates made.
-pub(super) fn names(job: &Job, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
+pub(super) fn names(job: &Job, unit: usize, slot: &Lock<Phases>) -> Result<(), Failed> {
     expanded(job, unit)?;
     let mut phases = lock(slot);
     phases.does = Some(Does { inert: false, builds_code: true });
@@ -328,7 +328,7 @@ pub(super) fn generate(
     job: &Job,
     reader: &UnitReader,
     unit: usize,
-    slot: &Mutex<Phases>,
+    slot: &Lock<Phases>,
 ) -> Result<(), Failed> {
     let expanded = expanded(job, unit)?;
     let u = job.unit(unit)?;

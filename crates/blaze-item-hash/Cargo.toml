@@ -36,10 +36,10 @@ span.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-parking_lot.workspace = true
 
 [lints]
 workspace = true
