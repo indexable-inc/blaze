@@ -4,6 +4,32 @@
 // straight; a video draws only the dark half, so each Fill's light half repeats it.
 
 // ---- what the prims read ----
+// Menus, bubbles and icon buttons (the video shows none; the prims read them), as harness-native/scene/00-tokens.flecs.
+export const menu_radius = 10
+export const menu_pad = 5
+export const menu_gap = 6
+export const menu_min_w = 120
+export const menu_lift_blur = 18
+export const menu_in_scale = 0.94
+export const menu_omega = 34
+export const menu_item_h = 22
+export const menu_item_radius = 5
+export const menu_gutter_l = 6
+export const menu_check = 11
+export const menu_gutter_gap = 5
+export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
+export const menu_trail_gap = 20
+export const menu_head_h = 20
+export const size_menu = 13
+export const size_menu_head = 11
+export const tone_menu: Fill = {dark: {0.157, 0.157, 0.169, 1}, light: {0.988, 0.988, 0.992, 1}}
+export const tone_menu_edge: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.11}}
+export const tone_menu_hot: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.07}}
+export const tone_menu_press: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.11}}
+export const tone_menu_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.09}}
+export const radius_bubble = 12
+export const bubble_max_w = 480
+export const icon_press_scale = 0.92
 export const size_caption = 11
 export const size_body = 13
 export const size_code = 11.5
@@ -58,6 +84,7 @@ export const tone_ground: Fill = {dark: {0.051, 0.067, 0.090, 1}, light: {0.051,
 export const tone_ink_1: Fill = {dark: {0.941, 0.965, 0.988, 1}, light: {0.941, 0.965, 0.988, 1}}
 export const tone_ink_2: Fill = {dark: {0.941, 0.965, 0.988, 0.86}, light: {0.941, 0.965, 0.988, 0.86}}
 export const tone_ink_3: Fill = {dark: {0.941, 0.965, 0.988, 0.52}, light: {0.941, 0.965, 0.988, 0.52}}
+export const tone_ink_4: Fill = {dark: {0.941, 0.965, 0.988, 0.32}, light: {0.941, 0.965, 0.988, 0.32}}
 export const tone_accent: Fill = {dark: {1.0, 0.561, 0.122, 1}, light: {1.0, 0.561, 0.122, 1}}
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {1, 1, 1, 0.06}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {1, 1, 1, 0.045}}
@@ -99,3 +126,18 @@ export const mark_cell = 12
 
 // The fire's hottest colour but one (docs/brand/fire/gen.py's dark theme).
 export const fire_3: Rgba = {1.0, 0.831, 0.231, 1}
+export const menu_lift_dy = 6
+export const spring_press_omega = 38
+export const spring_press_zeta = 0.62
+export const tone_icon_rest: Fill = $tone_ink_3
+prefab Faint {
+  Fill: $tone_ink_4
+}
+export const icon_press_dim = 0.7
+export const line_menu = 16
+export const menu_item_pad_r = 10
+export const menu_lift_alpha = 0.28
+export const menu_max_w = 380
+export const menu_sep_pad = 5
+export const menu_zeta = 1
+export const tone_icon_hover: Fill = $tone_ink_1

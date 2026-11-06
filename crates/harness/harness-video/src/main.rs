@@ -1,21 +1,24 @@
 //! harness-video: a video from a flecs scene (README.md). The scene is the native stack's UI (ui.* prims, layout, motion,
 //! draw) with a root that carries [`Video`] and a timeline of `Cue`s as data; this drives it on a fixed frame clock
-//! (frame `i` is at `i / fps` seconds, never the wall clock), draws each frame with the app's Metal renderer offscreen and
-//! pipes the pixels to ffmpeg.
+//! (frame `i` is at `i / fps` seconds, never the wall clock), draws each frame with the app's Metal renderer offscreen,
+//! converts it to HDR10 on the GPU straight into the encoder's pixel buffer (`hdr.rs`), and encodes it with VideoToolbox on
+//! the media engine into an mp4 by AVAssetWriter (`encode.rs`). No ffmpeg.
 //!
-//!     harness-video SCENE.flecs OUT.mp4            the whole video (H.264 High, yuv420p, BT.709, faststart)
+//!     harness-video SCENE.flecs OUT.mp4            the whole video (H.265 Main 10 on VideoToolbox, HDR10: PQ, BT.2020, 4:2:0 10-bit)
 //!     harness-video SCENE.flecs OUT.png AT         one frame, at AT seconds
 //!     harness-video SCENE.flecs DIR/ EVERY         a frame every EVERY seconds, DIR/<ms>.png (to look the video over)
 //!     harness-video SCENE.flecs OUT.wav            the soundtrack alone
 //!
-//! The soundtrack is the scene's `BlazeMark`'s (harness-native-blaze's `sound`): synthesised offline from the mark's own
-//! timeline, deterministic, and muxed in as AAC. A scene without one is silent.
+//! The soundtrack is synthesised offline (harness-native-blaze's `sound`), deterministic, placed binaurally, and written
+//! lossless (ALAC) by AVAssetWriter: the `BlazeMark`'s score from the mark's own timeline, plus every `Sound` the scene
+//! declares as data. A scene with neither is silent.
 //!
 //! The scene's directory holds `tokens.flecs` (the names the prims read: tones, radii, sizes, springs and the Ink, Muted,
 //! Plate... prefabs), loaded before the prims and the scene, and the media its `Picture`s name.
-use std::io::Write as _;
+mod encode;
+mod hdr;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use harness_native_api::Clock;
 use harness_native_flecs::prelude::*;
@@ -78,6 +81,8 @@ impl Stage {
         scripts.extend(
             harness_native_ui_prims::SCENES.iter().map(|(n, s)| ((*n).to_owned(), (*s).to_owned())),
         );
+        // The soundtrack's voices as prefabs (`sound.Bell`...), for every scene.
+        scripts.push(("sound".into(), include_str!("sound.flecs").to_owned()));
         for (name, src) in &scripts {
             let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
             if let Some(err) = script_error(*e) {
@@ -133,7 +138,7 @@ impl Stage {
         let (pw, ph) = (video.width * video.scale, video.height * video.scale);
         if pw.fract() != 0.0 || ph.fract() != 0.0 || pw as u32 % 2 != 0 || ph as u32 % 2 != 0 {
             return Err(format!(
-                "{path}: Video {video:?} is {pw}x{ph} pixels; yuv420p needs whole, even sides"
+                "{path}: Video {video:?} is {pw}x{ph} pixels; 4:2:0 needs whole, even sides"
             ));
         }
         let mut painter =
@@ -142,10 +147,12 @@ impl Stage {
         Ok(Self { world, painter, video })
     }
 
-    /// The soundtrack at `sr` Hz: the one `BlazeMark`'s, or None for a scene without one.
+    /// The soundtrack at `sr` Hz: the one `BlazeMark`'s score (if any) and every `Sound` the scene declares, or None for
+    /// a scene with neither.
     fn sound(&self, sr: u32) -> Result<Option<Vec<[f32; 2]>>, String> {
+        use harness_native_blaze::sound::{Note, Voice as V};
         use harness_native_ui_text_api::{BlazeMark, Text};
-        use harness_native_ui_timeline_api::GlyphsIn;
+        use harness_native_ui_timeline_api::{Gain, GlyphsIn, Lasts, Onset, Pan, Pitch, Sound, Voice};
         let mut marks = Vec::new();
         self.world.new_query::<&BlazeMark>().each_entity(|e, m| marks.push((e.path(), *m)));
         // Each glyph that arrives (a `GlyphsIn`) rings as it does, in time order.
@@ -155,22 +162,55 @@ impl Stage {
             glints.extend((0..n).map(|i| g.at + g.per * i as f32));
         });
         glints.sort_by(f32::total_cmp);
-        match marks.as_slice() {
-            [] => Ok(None),
-            [(_, m)] => Ok(Some(harness_native_blaze::sound::soundtrack(
-                sr,
-                self.video.seconds,
-                m.start,
-                (m.exit > m.start).then_some(m.exit),
-                &glints,
-                7,
-            ))),
-            many => Err(format!(
-                "{} BlazeMarks ({}): the soundtrack follows one",
-                many.len(),
-                many.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ")
-            )),
+        // The scene's own sounds (a `Sound` and its `Onset`; the rest default as the voice's prefab would leave them),
+        // sorted by time then path so the mix is the same every run.
+        let mut notes = Vec::new();
+        let mut bad = None;
+        self.world.new_query::<(&Sound, &Onset)>().each_entity(|e, (s, o)| {
+            let dur = e.try_get::<&Lasts>(|l| l.dur).unwrap_or(0.0);
+            let freq = e.try_get::<&Pitch>(|p| p.hz).unwrap_or(0.0);
+            let amp = e.try_get::<&Gain>(|g| g.amp).unwrap_or(0.0);
+            let Pan { pos, sweep } = e.try_get::<&Pan>(|p| *p).unwrap_or_default();
+            if !(o.at >= 0.0 && dur >= 0.0 && amp >= 0.0 && freq >= 0.0 && (-1.0..=1.0).contains(&pos)) && bad.is_none() {
+                bad = Some(format!(
+                    "{}: sound at {} for {dur} s, {freq} Hz, gain {amp}, pan {pos}: Onset, Lasts, Pitch and Gain must be \
+                     at least 0 and Pan's pos within -1 to 1",
+                    e.path(),
+                    o.at
+                ));
+            }
+            let voice = match s.voice {
+                Voice::Bell => V::Bell,
+                Voice::Mallet => V::Mallet,
+                Voice::Bass => V::Bass,
+                Voice::Click => V::Click,
+                Voice::Thud => V::Thud,
+                Voice::Whoosh => V::Whoosh,
+                Voice::Fire => V::Fire,
+            };
+            notes.push((e.path(), Note { voice, at: o.at, dur, freq, amp, pan: pos, sweep }));
+        });
+        if let Some(err) = bad {
+            return Err(err);
         }
+        notes.sort_by(|a, b| a.1.at.total_cmp(&b.1.at).then_with(|| a.0.cmp(&b.0)));
+        let notes: Vec<Note> = notes.into_iter().map(|(_, n)| n).collect();
+        let mark = match marks.as_slice() {
+            [] => None,
+            [(_, m)] => Some((m.start, (m.exit > m.start).then_some(m.exit))),
+            many => {
+                return Err(format!(
+                    "{} BlazeMarks ({}): the soundtrack follows one",
+                    many.len(),
+                    many.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        };
+        if mark.is_none() && notes.is_empty() {
+            return Ok(None);
+        }
+        let glints = if mark.is_some() { glints } else { Vec::new() };
+        Ok(Some(harness_native_blaze::sound::soundtrack(sr, self.video.seconds, mark, &glints, &notes, 7)))
     }
 
     fn pixels(&self) -> (u32, u32) {
@@ -295,7 +335,7 @@ fn run() -> Result<(), String> {
     if let Out::Audio(path) = &out {
         let sound = stage
             .sound(SR)?
-            .ok_or_else(|| format!("{}: no BlazeMark, so no soundtrack", scene.display()))?;
+            .ok_or_else(|| format!("{}: no BlazeMark and no Sound, so no soundtrack", scene.display()))?;
         std::fs::write(path, harness_native_blaze::sound::wav(SR, &sound))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         eprintln!("harness-video: wrote {} ({} s at {SR} Hz)", path.display(), v.seconds);
@@ -319,73 +359,23 @@ fn run() -> Result<(), String> {
         }
     };
     let last = *wanted.last().ok_or("no frames to draw")?;
-    let mut sound_file = None;
-    let mut ffmpeg = match &out {
-        Out::Video(path) => {
-            let size = format!("{pw}x{ph}");
-            let fps = format!("{}", v.fps);
-            let mut cmd = Command::new("ffmpeg");
-            cmd.args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "-s",
-                &size,
-                "-framerate",
-                &fps,
-                "-i",
-                "-",
-            ]);
-            if let Some(sound) = stage.sound(SR)? {
-                let wav = path.with_extension("soundtrack.wav");
-                std::fs::write(&wav, harness_native_blaze::sound::wav(SR, &sound))
-                    .map_err(|e| format!("{}: {e}", wav.display()))?;
-                cmd.arg("-i").arg(&wav).args([
-                    "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
-                ]);
-                sound_file = Some(wav);
-            }
-            let child = cmd
-                .args([
-                    "-vf",
-                    "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "slow",
-                    "-crf",
-                    "14",
-                    "-profile:v",
-                    "high",
-                ])
-                .args([
-                    "-colorspace",
-                    "bt709",
-                    "-color_primaries",
-                    "bt709",
-                    "-color_trc",
-                    "bt709",
-                    "-color_range",
-                    "tv",
-                    "-movflags",
-                    "+faststart",
-                ])
-                .arg(path)
-                .stdin(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("ffmpeg: cannot start: {e}"))?;
-            Some(child)
-        }
+    let mut encoder = match &out {
+        Out::Video(path) => Some(encode::Encoder::new(
+            renderer.device(),
+            path,
+            (pw, ph),
+            v.fps,
+            stage.sound(SR)?.map(|s| (SR, s)),
+        )?),
         _ => None,
     };
     if let Out::Sheet(dir, _) = &out {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    let hdr = match &out {
+        Out::Video(_) => Some(hdr::P010::new(renderer.device(), pw, ph)?),
+        _ => None,
+    };
     let mut next = wanted.iter().peekable();
     for i in 0..=last {
         let r = &renderer;
@@ -397,14 +387,19 @@ fn run() -> Result<(), String> {
         }
         next.next();
         renderer.render(&draw, Dest::Texture(tex.clone()));
+        if let Some(enc) = encoder.as_mut() {
+            let target = enc.target()?;
+            hdr.as_ref().ok_or("hdr: no P010 pass")?.convert(&tex, &target.luma, &target.chroma)?;
+            enc.encode(target, i)?;
+            if i % 60 == 0 {
+                eprintln!("harness-video: frame {i}/{total}");
+            }
+            continue;
+        }
         let mut px = renderer.read(&tex);
         opaque(&mut px);
         match &out {
-            Out::Video(_) => {
-                let stdin =
-                    ffmpeg.as_mut().and_then(|c| c.stdin.as_mut()).ok_or("ffmpeg: no stdin")?;
-                stdin.write_all(&px).map_err(|e| format!("ffmpeg: frame {i}: {e}"))?;
-            }
+            Out::Video(_) => unreachable!("encoded above"),
             Out::Still(path, _) => write_png(path, &px, (pw, ph))?,
             Out::Sheet(dir, _) => write_png(
                 &dir.join(format!("{:05}.png", (i as f32 / v.fps * 1000.0).round() as u32)),
@@ -414,18 +409,16 @@ fn run() -> Result<(), String> {
             Out::Audio(_) => unreachable!("written above"),
         }
     }
-    if let Some(mut child) = ffmpeg {
-        drop(child.stdin.take());
-        let status = child.wait().map_err(|e| format!("ffmpeg: {e}"))?;
-        if !status.success() {
-            return Err(format!("ffmpeg: exited with {status}"));
-        }
+    if let Some(enc) = encoder {
+        enc.finish()?;
     }
-    if let Some(wav) = sound_file {
-        std::fs::remove_file(&wav).map_err(|e| format!("{}: {e}", wav.display()))?;
-    }
+    let peak = hdr.as_ref().map_or(0.0, hdr::P010::peak_nits);
     let what = match &out {
-        Out::Video(p) => format!("{} ({total} frames, {pw}x{ph} at {} fps)", p.display(), v.fps),
+        Out::Video(p) => format!(
+            "{} ({total} frames, {pw}x{ph} at {} fps, HDR10, brightest pixel {peak:.0} nits)",
+            p.display(),
+            v.fps
+        ),
         Out::Still(p, at) => format!("{} (at {at} s)", p.display()),
         Out::Sheet(d, _) => format!("{} ({} frames)", d.display(), wanted.len()),
         Out::Audio(_) => unreachable!("written above"),

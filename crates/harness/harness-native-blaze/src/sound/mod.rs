@@ -7,7 +7,7 @@
 
 mod fire;
 
-use std::f32::consts::{PI, SQRT_2, TAU};
+use std::f32::consts::{PI, TAU};
 
 use crate::mark as blaze;
 
@@ -52,6 +52,38 @@ impl Rng {
     }
 }
 
+/// An instrument of the soundtrack's, for a [`Note`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Voice {
+    /// Risset's bell: `freq` its pitch, ringing `dur`.
+    Bell,
+    /// A felt mallet on a marimba-like bar with a detuned twin opposite for width: `freq`, ringing `dur`.
+    Mallet,
+    /// A round sine bass swelling in, centred: `freq`, for `dur`.
+    Bass,
+    /// A short noise tick with a ringing tone at `freq`.
+    Click,
+    /// A low thump, its pitch falling, `amp` its size; centred.
+    Thud,
+    /// Filtered noise over `dur`, brightening to `freq` as it goes: something passing.
+    Whoosh,
+    /// The physically modelled fire, catching over its first third (at most 0.8 s) and burning `dur`; `freq` is unused.
+    Fire,
+}
+
+/// One sound of a scene's score: `voice` from `at` seconds for `dur`, at `freq` Hz and `amp` (the mark's mallets are
+/// about 0.05), placed at `pan` (-1 the frame's left edge, 1 its right) and moving by `sweep` over its length (a whoosh).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Note {
+    pub voice: Voice,
+    pub at: f32,
+    pub dur: f32,
+    pub freq: f32,
+    pub amp: f32,
+    pub pan: f32,
+    pub sweep: f32,
+}
+
 struct Track {
     sr: f32,
     dry: Vec<[f32; 2]>,
@@ -65,9 +97,8 @@ impl Track {
         (t.max(0.0) * self.sr) as usize
     }
 
-    /// Adds `f(seconds since start)` for `dur` seconds from `t0`. It pans
-    /// from `pan.0` to `pan.1` (-1 left, 1 right) and sends `send` of itself
-    /// to the reverb.
+    /// Adds `f(seconds since start)` for `dur` seconds from `t0`, placed by ear ([`binaural`]): it moves from `pan.0` to
+    /// `pan.1` (-1 the frame's left edge, 1 its right) and sends `send` of itself to the reverb.
     fn add(
         &mut self,
         t0: f32,
@@ -77,17 +108,30 @@ impl Track {
         mut f: impl FnMut(f32, &mut Rng) -> f32,
     ) {
         let (a, n) = (self.at(t0), self.at(dur));
-        let (dry, wet, rng) = (&mut self.dry, &mut self.send, &mut self.rng);
+        let n = n.min(self.dry.len().saturating_sub(a));
+        let mut mono = Vec::with_capacity(n);
         for i in 0..n {
-            let Some(d) = dry.get_mut(a + i) else { break };
-            let t = i as f32 / self.sr;
-            let v = f(t, rng);
-            // Equal power, so a sound keeps its loudness as it moves.
-            let p = pan.0 + (pan.1 - pan.0) * (i as f32 / n as f32);
-            let angle = (p.clamp(-1.0, 1.0) + 1.0) * PI / 4.0;
-            d[0] += v * angle.cos() * SQRT_2;
-            d[1] += v * angle.sin() * SQRT_2;
-            wet[a + i] += v * send;
+            let v = f(i as f32 / self.sr, &mut self.rng);
+            self.send[a + i] += v * send;
+            mono.push(v);
+        }
+        let step = (pan.1 - pan.0) / n.max(1) as f32;
+        binaural(&mut self.dry, a, &mono, self.sr, |i| pan.0 + step * i as f32);
+    }
+
+    fn note(&mut self, n: &Note) {
+        let dur = n.dur.max(0.01);
+        match n.voice {
+            Voice::Bell => self.bell(n.at, n.freq, n.amp, dur, n.pan),
+            Voice::Mallet => self.mallet(n.at, n.freq, n.amp, dur, n.pan),
+            Voice::Bass => self.bass(n.at, n.freq, n.amp, dur),
+            Voice::Click => self.click(n.at, n.amp, n.freq, n.pan),
+            Voice::Thud => self.thud(n.at, n.amp),
+            Voice::Whoosh => {
+                let top = n.freq.max(200.0);
+                self.whoosh(n.at, dur, n.amp, (n.pan, n.pan + n.sweep), move |p| 0.15 * top + 0.85 * top * p);
+            }
+            Voice::Fire => self.fire(n.at, (dur / 3.0).min(0.8), dur),
         }
     }
 
@@ -336,6 +380,54 @@ impl Track {
     }
 }
 
+/// The widest a sound is placed, degrees off centre: the frame's edges, as a screen a little nearer than arm's length
+/// spans.
+const EDGE_DEG: f32 = 75.0;
+/// The spherical head (Brown and Duda, "A structural model for binaural sound synthesis", 1998): its radius, metres, and
+/// the speed of sound, metres a second.
+const HEAD: f32 = 0.0875;
+const SOUND: f32 = 343.0;
+
+/// Mix `mono` into `out` from frame `at`, as a head at the centre of the frame hears it from `pan(i)` (-1 left edge, 1
+/// right): each ear gets the sound delayed by the path around the head (Woodworth's ITD, up to ~0.65 ms) and through the
+/// head's shadow (a one-pole, one-zero shelf that lifts the near ear's highs up to 6 dB and darkens the far ear's), so a
+/// voice sits where it is on screen on headphones and stays a plain stereo mix on speakers. Every ear's level at low
+/// frequencies is 1: a centred sound reaches both ears as it did with the old equal-power pan.
+fn binaural(out: &mut [[f32; 2]], at: usize, mono: &[f32], sr: f32, pan: impl Fn(usize) -> f32) {
+    // Shelf from Brown and Duda: H(s) = (1 + a s / 2w0) / (1 + s / 2w0), w0 = c / r, bilinear at `sr`.
+    let k = sr * HEAD / SOUND;
+    let shadow = |incidence: f32| {
+        let (alpha_min, theta_min) = (0.1f32, 150f32.to_radians());
+        (1.0 + alpha_min / 2.0) + (1.0 - alpha_min / 2.0) * (incidence / theta_min * PI).cos()
+    };
+    // Each ear's filter state (x1, y1).
+    let mut state = [[0.0f32; 2]; 2];
+    for (i, &x) in mono.iter().enumerate() {
+        let az = pan(i).clamp(-1.0, 1.0) * EDGE_DEG.to_radians();
+        for (ch, ear) in [-PI / 2.0, PI / 2.0].into_iter().enumerate() {
+            // The angle between the source and this ear's axis, 0 facing it, pi behind the head from it.
+            let incidence = (az - ear).abs().min(PI);
+            let alpha = shadow(incidence);
+            let (b0, b1, a1) = ((1.0 + alpha * k) / (1.0 + k), (1.0 - alpha * k) / (1.0 + k), (1.0 - k) / (1.0 + k));
+            let [x1, y1] = state[ch];
+            let y = b0 * x + b1 * x1 - a1 * y1;
+            state[ch] = [x, y];
+            // Woodworth's path to the ear, offset so the nearest an ear can be is no delay.
+            let path = if incidence < PI / 2.0 { -incidence.cos() } else { incidence - PI / 2.0 };
+            let delay = (path + 1.0) * HEAD / SOUND * sr;
+            // Splat at the fractional delay, linear between the two frames it falls between.
+            let (whole, frac) = (delay.floor() as usize, delay.fract());
+            let j = at + i + whole;
+            if let Some(o) = out.get_mut(j) {
+                o[ch] += y * (1.0 - frac);
+            }
+            if let Some(o) = out.get_mut(j + 1) {
+                o[ch] += y * frac;
+            }
+        }
+    }
+}
+
 /// Freeverb: eight damped combs in parallel and four allpasses in series per
 /// side, the right side slightly detuned from the left for width.
 fn reverb(input: &[f32], sr: f32) -> Vec<[f32; 2]> {
@@ -394,21 +486,8 @@ impl Track {
     }
 }
 
-/// The mark's soundtrack, `seconds` long at `sr` Hz: the letters start falling at `start` seconds and, with `exit`, burn away
-/// from then. Stereo frames, peaking under 0.75 (AAC's overshoot stays below full scale), the last fifth of a second faded out so the video ends clean.
-#[must_use]
-pub fn soundtrack(
-    sr: u32,
-    seconds: f32,
-    start: f32,
-    exit: Option<f32>,
-    glints: &[f32],
-    seed: u64,
-) -> Vec<[f32; 2]> {
-    let mut rng = Rng(seed | 1);
-    let len = (seconds * sr as f32) as usize;
-    let mut tr =
-        Track { sr: sr as f32, dry: vec![[0.0; 2]; len], send: vec![0.0; len], rng: rng.fork() };
+/// The mark's score: the letters landing on a climbing A major, the fire catching on the I chord, and the glints.
+fn score(tr: &mut Track, seconds: f32, start: f32, exit: Option<f32>, glints: &[f32]) {
     let off = start;
     // The letters fall in left to right, climbing A B C# E to the leading tone G# over an E pedal, each a little louder:
     // a V that hangs unresolved until the fire catches on the I, A major, with a high A ringing over it as the peak.
@@ -435,6 +514,32 @@ pub fn soundtrack(
     tr.ignite(lit, blaze::IGNITE, burns.max(1.6));
     tr.resolve(lit);
     tr.glints(glints);
+}
+
+/// A scene's soundtrack, `seconds` long at `sr` Hz: the mark's score when there is one (`mark`: its letters start falling
+/// at `start` seconds and, with an exit, burn away from then; `glints` ring as words arrive), and the scene's own `notes`,
+/// all in one room. Stereo frames placed binaurally, peaking under 0.75, the last fifth of a second faded out so the
+/// video ends clean.
+#[must_use]
+pub fn soundtrack(
+    sr: u32,
+    seconds: f32,
+    mark: Option<(f32, Option<f32>)>,
+    glints: &[f32],
+    notes: &[Note],
+    seed: u64,
+) -> Vec<[f32; 2]> {
+    let mut rng = Rng(seed | 1);
+    let len = (seconds * sr as f32) as usize;
+    let mut tr =
+        Track { sr: sr as f32, dry: vec![[0.0; 2]; len], send: vec![0.0; len], rng: rng.fork() };
+    let exit = mark.and_then(|(_, e)| e);
+    if let Some((start, _)) = mark {
+        score(&mut tr, seconds, start, exit, glints);
+    }
+    for n in notes {
+        tr.note(n);
+    }
     let (mut out, gain) = tr.mix();
     if let Some(at) = exit {
         // The exit as anim plays it: its own track through the same room, at the soundtrack's scale.

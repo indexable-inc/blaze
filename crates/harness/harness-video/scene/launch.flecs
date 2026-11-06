@@ -39,6 +39,7 @@ cue {
   }
 }
 
+
 // ---- the parts ----
 @tree ChildOf
 launch_part {
@@ -61,7 +62,7 @@ const home = $burn + 1.8
 
 @tree ChildOf
 launch : ui.ZStack {
-  Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 2}
+  Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 8}
   Fill: $tone_ground
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}

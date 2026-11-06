@@ -95,14 +95,90 @@ impl GlyphsIn {
     }
 }
 
+/// An instrument a [`Sound`] plays (harness-native-blaze's soundtrack voices); the members it reads are on each.
+#[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Voice {
+    /// Risset's bell: Pitch, Lasts, Gain, Pan.
+    #[default]
+    Bell,
+    /// A felt mallet on a marimba-like bar: Pitch, Lasts, Gain, Pan.
+    Mallet,
+    /// A round sine bass, centred: Pitch, Lasts, Gain.
+    Bass,
+    /// A short tick with a ringing tone: Pitch, Gain, Pan.
+    Click,
+    /// A low thump, centred, Gain its size.
+    Thud,
+    /// Filtered noise brightening to its Pitch: something passing (Pan's sweep moves it). Lasts, Gain.
+    Whoosh,
+    /// The physically modelled fire, burning for its Lasts.
+    Fire,
+}
+
+/// A sound of the scene's soundtrack, as data, one component per concern so a prefab carries a voice's defaults and an
+/// instance sets only what differs (`ding : sound.Bell { Onset: {2.0} Pitch: {1760} }`): which voice ([`Sound`]), when it
+/// starts ([`Onset`], required), how long it rings ([`Lasts`]), its pitch ([`Pitch`]), level ([`Gain`]) and where it is
+/// heard from ([`Pan`]). harness-video ships the `sound.*` prefabs, one a voice, and mixes every entity with a `Sound`
+/// and an `Onset` into the soundtrack, in the same room as the mark's score.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sound {
+    pub voice: Voice,
+}
+
+/// When a [`Sound`] starts, seconds on the frame clock.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Onset {
+    pub at: f32,
+}
+
+/// How long a [`Sound`] rings or lasts, seconds.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Lasts {
+    pub dur: f32,
+}
+
+/// A [`Sound`]'s pitch, Hz (a whoosh's brightest, a click's ring).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pitch {
+    pub hz: f32,
+}
+
+/// A [`Sound`]'s level (the mark's mallets are about 0.05; a thud's is its size).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Gain {
+    pub amp: f32,
+}
+
+/// Where a [`Sound`] is heard from: `pos` across the frame (-1 its left edge, 1 its right; placed binaurally, so on
+/// headphones it comes from there), moving by `sweep` over its length.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pan {
+    pub pos: f32,
+    pub sweep: f32,
+}
+
 hyperion_api_layouts::api_layouts! {
     "Cue" => alias Cue,
     "GlyphsIn" => alias GlyphsIn,
+    "Sound" => alias Sound,
+    "Onset" => alias Onset,
+    "Lasts" => alias Lasts,
+    "Pitch" => alias Pitch,
+    "Gain" => alias Gain,
+    "Pan" => alias Pan,
     Ease,
+    Voice,
 }
 
 /// Register the timeline's components before any scene resolves them.
 pub fn register(world: &World) {
     world.component::<Cue>().writable();
     world.component::<GlyphsIn>().writable();
+    world.component::<Sound>().writable();
+    world.component::<Onset>().writable();
+    world.component::<Lasts>().writable();
+    world.component::<Pitch>().writable();
+    world.component::<Gain>().writable();
+    world.component::<Pan>().writable();
 }
