@@ -18,6 +18,10 @@ import type { Node } from 'web-tree-sitter';
  * arguments and the pipeline after it (`| sort -rn | head -5` becomes `sort: 'size', limit: 5`): a message the model
  * reads at the moment of the mistake teaches it better than a rule in its instructions.
  *
+ * The same goes for the programs whose work has a typed call of its own: GitHub's reads through `gh` (`gh api`, `gh pr
+ * list|status|view|checks`, `gh issue list|view`) are github.* (functions/github.ts), and HTTP through curl or wget is
+ * fetch. `gh`'s writes (`gh pr create`, `gh pr merge`) and what has no call (`gh run view --log`) run.
+ *
  * A filter on a program's output is not a read: `cargo test 2>&1 | grep FAIL` and `git log | head` run. The escape
  * for a real need is a comment that says why, `# why: <reason>`, anywhere in the command (or `.why(reason)` on a
  * `$\`...\`` template); the command then runs, and the verdict keeps the typed call as its `equivalent`.
@@ -532,6 +536,80 @@ function callFor(cmd: Cmd, shape: After): string {
   }
 }
 
+/** A flag's value: `--state open`, `--state=open`, `-s open`. */
+function flagValue(args: Word[], ...names: string[]): string | undefined {
+  for (let at = 0; at < args.length; at++) {
+    const text = args[at]!.text;
+    if (names.includes(text)) return args[at + 1]?.text;
+    for (const name of names) if (name.startsWith('--') && text.startsWith(`${name}=`)) return text.slice(name.length + 1);
+  }
+  return undefined;
+}
+
+/** What a program with a typed call does instead, and why: GitHub's reads through `gh`, and HTTP through curl or wget. */
+type Covered = { call: string; kind: 'github' | 'http' };
+
+/** The typed call for a `gh` read: the api, a pull request's or issue's list or view. Writes (`gh pr create`, `merge`,
+ *  `comment`) and what has no call (`gh run view --log`, `gh auth`) run. */
+function ghCall(args: Word[]): string | undefined {
+  const words = args.map(word => word.text);
+  const [group, verb] = words;
+  const fromUrl = words.map(word => /github\.com\/([\w.-]+\/[\w.-]+)\/(?:pull|issues)\/(\d+)/.exec(word)).find(match => match !== null);
+  const repo = flagValue(args, '-R', '--repo') ?? fromUrl?.[1];
+  const repoArg: [string, unknown] = ['repo', repo ?? new Code("'owner/name'")];
+  const numberOf = () => {
+    if (fromUrl) return Number(fromUrl[2]);
+    for (const word of words.slice(2)) {
+      const n = /^#?(\d+)$/.exec(word);
+      if (n) return Number(n[1]);
+    }
+    return undefined;
+  };
+  if (group === 'api') {
+    // The endpoint is the first operand: not a flag, nor the value a flag takes.
+    const valued = new Set(['-X', '--method', '-f', '--raw-field', '-F', '--field', '-H', '--header', '-q', '--jq', '-t', '--template', '--input', '--hostname', '--cache', '-p', '--preview']);
+    let path: string | undefined;
+    for (let at = 1; at < words.length && path === undefined; at++) {
+      if (valued.has(words[at]!)) at++;
+      else if (!words[at]!.startsWith('-')) path = words[at];
+    }
+    if (path === 'graphql') return "await github.graphql<{ ... }>(`query { ... }`, { ...vars })";
+    const method = flagValue(args, '-X', '--method')?.toUpperCase();
+    return call('github.rest', js((path ?? 'repos/owner/name/...').replace(/^\/+/, '')), method && method !== 'GET' ? object([['method', method]]) : '');
+  }
+  if (group === 'pr' && (verb === 'list' || verb === 'status')) {
+    const state = flagValue(args, '-s', '--state');
+    const author = flagValue(args, '-A', '--author');
+    const limit = flagValue(args, '-L', '--limit');
+    return call('github.prs', object([repoArg, ['state', state], ['author', author], ['limit', limit === undefined ? undefined : Number(limit)]]));
+  }
+  if (group === 'pr' && (verb === 'view' || verb === 'checks')) {
+    return call('github.pr', object([repoArg, ['n', numberOf() ?? new Code('n')]]));
+  }
+  if (group === 'issue' && verb === 'list') {
+    const labels = flagValue(args, '-l', '--label');
+    return call('github.issues', object([repoArg, ['state', flagValue(args, '-s', '--state')], ['author', flagValue(args, '-A', '--author')],
+      ['assignee', flagValue(args, '-a', '--assignee')], ['labels', labels === undefined ? undefined : labels.split(',')]]));
+  }
+  if (group === 'issue' && verb === 'view') return "await github.graphql<{ ... }>(`query { repository(owner: ..., name: ...) { issue(number: n) { title body comments(first: 100) { nodes { body } } } } }`)";
+  return undefined;
+}
+
+/** The typed call a command has that is not a read of files: `gh`'s GitHub reads and HTTP. */
+function coveredBy(cmd: Cmd): Covered | undefined {
+  if (cmd.name === 'gh') {
+    const c = ghCall(cmd.args);
+    return c === undefined ? undefined : { call: c, kind: 'github' };
+  }
+  if (cmd.name === 'curl' || cmd.name === 'wget') {
+    const url = cmd.args.map(word => word.text).find(text => /^https?:\/\//.test(text)) ?? 'https://...';
+    const out = flagValue(cmd.args, '-o', '--output', '-O', '--output-document');
+    const fetched = `await fetch(${js(url)})`;
+    return { call: out && out !== '-' ? `await Bun.write(${js(out)}, ${fetched})` : `await (${fetched}).text()`, kind: 'http' };
+  }
+  return undefined;
+}
+
 /** Where the host's tools differ between the Mac (BSD) and Linux (GNU): the typed call is the same on both. */
 function platformNote(cmd: Cmd): string | undefined {
   const name = programOf(cmd);
@@ -581,12 +659,14 @@ function vet(parser: Parser, script: string, reason?: string): ShellVerdict {
   const tree = parser.parse(script);
   if (!tree) return {};
   try {
-    const found: { cmd: Cmd; call: string }[] = [];
+    const found: { cmd: Cmd; call: string; kind: 'read' | Covered['kind'] }[] = [];
     const all: Cmd[] = [];
     for (const pipeline of pipelines(tree.rootNode, parser)) {
       all.push(...pipeline);
       for (let at = 0; at < pipeline.length; at++) {
         const cmd = pipeline[at]!;
+        const covered = coveredBy(cmd);
+        if (covered) { found.push({ cmd, ...covered }); continue; }
         if (!reads(cmd)) continue;
         // A path-taking read fed by an earlier read (`find | xargs wc -l`) is part of that read's call.
         if (cmd.fed && pipeline.slice(0, at).some(item => !item.fed && reads(item))) continue;
@@ -595,7 +675,7 @@ function vet(parser: Parser, script: string, reason?: string): ShellVerdict {
         const shape = after(rest.filter(item => !own(item)));
         // find's -exec is the first thing done with each path, before anything piped.
         const inline = rest.find(own);
-        found.push({ cmd, call: callFor(cmd, inline ? { ...shape, each: inline } : shape) });
+        found.push({ cmd, call: callFor(cmd, inline ? { ...shape, each: inline } : shape), kind: 'read' });
         // What follows a lister in its pipeline is folded into its call.
         if (LISTERS.has(programOf(cmd))) break;
       }
@@ -603,15 +683,21 @@ function vet(parser: Parser, script: string, reason?: string): ShellVerdict {
     if (!found.length) return {};
     const calls = [...new Set(found.map(item => item.call))];
     if (reason?.trim() || why(tree.rootNode)) return { equivalent: calls.join('; ') };
-    const names = [...new Set(found.map(item => `\`${programOf(item.cmd)}\``))];
+    const namesOf = (kind: (typeof found)[number]['kind']) => [...new Set(found.filter(item => item.kind === kind).map(item => `\`${programOf(item.cmd)}\``))];
     const notes = [...new Set(all.map(platformNote).filter((note): note is string => note !== undefined))];
     const lead = calls.length === 1
       ? `Not run: use ${calls[0]}`
       : `Not run: use the typed calls:\n${found.map(item => `- ${item.call}   (for \`${clip(item.cmd.source, 60)}\`)`).join('\n')}`;
+    const readers = namesOf('read');
+    const said = [
+      readers.length ? `${readers.join(', ')} only ${readers.length === 1 ? 'reads' : 'read'} files or the tree, which the typed helpers return as data.` : '',
+      namesOf('github').length ? "GitHub's reads are github.* in ts (rows as Tables, gh's token, one step per call; await skill('github')), not `gh` in a shell." : '',
+      namesOf('http').length ? 'HTTP is fetch in ts (one step per request), not curl or wget.' : '',
+    ].filter(Boolean).join(' ');
     return {
       refusal: [
         lead,
-        `${names.join(', ')} only ${names.length === 1 ? 'reads' : 'read'} files or the tree, which the typed helpers return as data. The shell is for running programs (blaze, git, just, bun, builds, servers). If this really needs the shell, add a comment saying why, \`# why: <reason>\`, and it runs.`,
+        `${said} The shell is for running programs no typed call covers (blaze, git, just, bun, builds, servers). If this really needs the shell, add a comment saying why, \`# why: <reason>\`, and it runs.`,
         ...notes,
       ].join('\n'),
     };

@@ -6,5 +6,12 @@ that the person sees as what it did: read a file with await Bun.file(p).text(); 
 main', {path, type: 'rust', context: 2}); files by name with await glob('src/**/*.rs') ({stat: true, sort:
 'size'} for sizes); a folder with await ls(dir); disk use with await du(dir); history with gitLog(); a build,
 lint or test with await cargo.check(args) (build, test, clippy; follow(cmd) for any other), which the person
-watches live and which returns you a digest of its errors, not its log. The shell ($`cmd`, sh) is for running
-programs (git, bun, make, servers); a command that only reads files or the tree is refused.
+watches live and which returns you a digest of its errors, not its log; GitHub with github.prs, pr, issues,
+checks or graphql; HTTP with fetch. An npm package imports by name, pinned on first use (import { z } from
+'zod', or await import('lodash@4.17.21') for a version).
+
+Rule: whatever a typed call covers (files, search, listing, builds, git history, GitHub, HTTP, packages), use the
+call, never a shell command. The shell ($`cmd`, sh) is only for running a real program no call covers (git
+commit, bun, make, a server), and when you use it, say in one clause why no ts call fits. A command that reads
+files or the tree, gh's GitHub reads (gh api, gh pr list/view/checks, gh issue list/view) and curl/wget are
+refused with the call to use.
