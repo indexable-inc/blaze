@@ -6,6 +6,7 @@ hn {
   // the pane has the keyboard), the filter chips, then a scrolling list by day (Today, Yesterday, This week, Older):
   // sessions with their runs folded under them, runs, and at its foot the next page of older runs from the daemon.
   prefab ArchivePane : hn.Pane {
+    LaysAtRest
     head : ui.Column {
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}

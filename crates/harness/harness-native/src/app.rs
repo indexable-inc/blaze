@@ -1696,9 +1696,10 @@ impl App {
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
         let width = open * x;
-        // Where the fold is going: the main card lays its panes out at the width it has once the fold rests there
-        // (hn.Main is LaysAtRest), so a terminal resizes and words wrap once per cmd+S, not on every frame of the spring.
-        let rest = open * f32::from(u8::from(self.side_open));
+        // What the panes' LaysAtRest nodes lay out against while the fold moves: the open width, where the card is
+        // narrowest, so their content never overflows the moving frame, and a terminal resizes and words wrap once per
+        // cmd+S, not on every frame of the spring: opening, on its first frame; folding, once the spring rests closed.
+        let rest = if self.side_x.settled(0.0) { 0.0 } else { open };
         if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
         }
