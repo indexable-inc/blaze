@@ -4,8 +4,9 @@
 //! keyboard, and Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
 //! `tree_fold` tune of the sidebar's one spring family): a row that comes grows in from no height, pushing the rows under
 //! it down, and its words fade in and settle into place once there is room for them; one that goes lets its words go
-//! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill and glides to the
-//! row as it opens. Under Reduce Motion rows come and go at once. What is expanded is kept in native.json (`folds`, by
+//! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill, which holds where it
+//! was while the row opens (the row is `Settling`) and then slides to it at its full height, so it never squeezes under
+//! the row's words. Under Reduce Motion rows come and go at once. What is expanded is kept in native.json (`folds`, by
 //! stable key: `false` for expanded, as it was saved before).
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +14,7 @@ use super::*;
 use crate::look::FoldIn;
 use harness_native_api::reduced;
 use harness_native_ui_layout_api::Background;
-use harness_native_ui_motion_api::Pose;
+use harness_native_ui_motion_api::{Pose, Settling};
 
 /// A tree row as the view lists it: its key, its prefab and the model's row.
 pub type Listed = (String, &'static str, model::Row);
@@ -49,14 +50,24 @@ fn content_share(x: f32, lead: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Pose a folding row as its spring has it: its height, and its parts faded and lifted by what of them shows.
+/// Pose a folding row as its spring has it: its height, and its parts faded and lifted by what of them shows. Until it
+/// is within a point of its own height it is `Settling`: its selection pill (matched geometry) holds where it was rather
+/// than squeeze into the sliver, and slides in once the row has opened.
 fn shape(row: EntityView<'_>, f: RowFold, look: FoldIn) {
     let x = f.spring.x.clamp(0.0, 1.0);
-    if let Some(mut s) = row.try_cloned::<&Size>() {
-        let h = f.h * x;
-        if (s.h.value - h).abs() > 0.01 {
-            s.h = Sizing::fixed(h);
-            row.set(s);
+    let h = f.h * x;
+    if let Some(mut s) = row.try_cloned::<&Size>()
+        && (s.h.value - h).abs() > 0.01
+    {
+        s.h = Sizing::fixed(h);
+        row.set(s);
+    }
+    let settling = f.h - h >= 1.0;
+    if settling != row.has(Settling::id()) {
+        if settling {
+            row.add(Settling::id());
+        } else {
+            row.remove(Settling::id());
         }
     }
     let a = content_share(x, look.lead);
@@ -68,9 +79,38 @@ fn shape(row: EntityView<'_>, f: RowFold, look: FoldIn) {
     }
 }
 
+/// One frame of the tree's folding rows (before layout): each spring stepped and its row shaped; one that has opened goes
+/// back to its own height. Returns the rows that have folded away (to drop from the next list) and whether any still
+/// moves. Under Reduce Motion each lands where it is going.
+fn step(tree: EntityView<'_>, dt: f32) -> (Vec<String>, bool) {
+    let w = tree.world();
+    let (tune, look, still) = (crate::look::tune(w, "tree_fold"), crate::look::fold_in(w), reduced(w));
+    let mut done = Vec::new();
+    let mut moving = false;
+    for c in harness_native_ui_node_api::children(tree) {
+        let Some(mut f) = c.try_cloned::<&RowFold>() else { continue };
+        if !still && settle(&mut f.spring, f.target, tune, dt) {
+            shape(c, f, look);
+            c.set(f);
+            moving = true;
+        } else if f.target > 0.5 {
+            rest(c, f);
+        } else {
+            f.spring = Spring::at(0.0);
+            shape(c, f, look);
+            c.set(f);
+            done.push(c.name());
+        }
+    }
+    (done, moving)
+}
+
 /// A row that has opened: its own height and its parts at rest.
 fn rest(row: EntityView<'_>, f: RowFold) {
     row.remove(RowFold::id());
+    if row.has(Settling::id()) {
+        row.remove(Settling::id());
+    }
     if let Some(mut s) = row.try_cloned::<&Size>() {
         s.h = Sizing::fixed(f.h);
         row.set(s);
@@ -162,26 +202,7 @@ impl App {
     /// Step each folding row's spring and shape it; one that has unfolded goes back to its own height, one that has
     /// folded away is dropped from the next list. Under Reduce Motion each lands where it is going.
     pub(super) fn step_fold(&mut self, dt: f32) {
-        let w = self.world.world_ref();
-        let tree = w.entity_from_id(self.ids.tree);
-        let (tune, look, still) = (crate::look::tune(w, "tree_fold"), crate::look::fold_in(w), reduced(w));
-        let mut done = Vec::new();
-        let mut moving = false;
-        for c in harness_native_ui_node_api::children(tree) {
-            let Some(mut f) = c.try_cloned::<&RowFold>() else { continue };
-            if !still && settle(&mut f.spring, f.target, tune, dt) {
-                shape(c, f, look);
-                c.set(f);
-                moving = true;
-            } else if f.target > 0.5 {
-                rest(c, f);
-            } else {
-                f.spring = Spring::at(0.0);
-                shape(c, f, look);
-                c.set(f);
-                done.push(c.name());
-            }
-        }
+        let (done, moving) = step(self.world.entity_from_id(self.ids.tree), dt);
         if !done.is_empty() || moving {
             self.fold.done.extend(done);
             self.poke();
@@ -279,4 +300,109 @@ fn fold_key(e: EntityView<'_>) -> Option<String> {
         return None;
     }
     e.try_cloned::<&model::Run>().map(|r| format!("r{}", r.n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_native_api::Clock;
+    use harness_native_ui_layout_api::{Align, Flex, FlexAxis, Justify, Viewport};
+    use harness_native_ui_motion_api::{Drawn, Matched};
+    use harness_native_ui_node_api::Laid;
+    use harness_native_ui_view::View;
+
+    /// The selection pill is never drawn shorter than the words of the row it is on, and at rest it holds them: through
+    /// a Cmd-N (a new session's row folding in from no height, selected at once) and an Up from it to a shorter run's
+    /// row. While the new row opens its pill holds where it was (the row is `Settling`), then slides in at the row's full
+    /// height; a slide between rows of two heights takes the new row's height at once and only its position springs.
+    /// Headless: the scene's hn.Selection, layout, motion and this fold's own step and animate, frame by frame. It failed
+    /// when the pill chased the frame of a row still growing in (its height springing toward a sliver under the words)
+    /// and when its height sprang between rows.
+    #[test]
+    fn the_pill_never_squeezes_under_its_row_words() {
+        let world = super::super::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Viewport { w: 400.0, h: 600.0 });
+        let dt = 1.0 / 60.0;
+        let column = |axis: FlexAxis, align: Align| Flex { axis, gap: 0.0, align, justify: Justify::Start, wrap: false };
+        let tree = View::root(w, "ui.Column")
+            .set(Size { w: Sizing::fixed(240.0), h: Sizing::fixed(400.0) })
+            .set(column(FlexAxis::Column, Align::Stretch));
+        // A row as rows.flecs lays one: `h` tall, its words (`line` tall) centred in it.
+        let row = |name: &str, h: f32, line: f32| {
+            let r = tree
+                .child("ui.Row")
+                .named(name)
+                .set(Size { w: Sizing::GROW, h: Sizing::fixed(h) })
+                .set(column(FlexAxis::Row, Align::Center));
+            r.child("ui.Node").named("name").set(Size { w: Sizing::fixed(120.0), h: Sizing::fixed(line) });
+            r
+        };
+        let select = |r: View<'_>| {
+            r.child("hn.Selection").named("pill");
+        };
+        let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().expect("laid out");
+        let words = |r: View<'_>| laid(r.part("name").expect("the row's words"));
+        fn plate(r: View<'_>) -> View<'_> {
+            r.part("pill").and_then(|p| p.part("plate")).expect("the row's pill")
+        }
+        let drawn = |r: View<'_>| plate(r).entity().try_cloned::<&Drawn>().expect("the pill is drawn");
+        let sliding = || {
+            w.try_lookup("ui_matched::hn_selection").and_then(|h| h.try_cloned::<&Matched>()).is_some_and(|m| m.moving)
+        };
+        // One frame as App::frame runs it (the fold, then layout and motion), then the pill against the selected row's
+        // words: never shorter, and holding them once it rests on a row that is not still opening. Whether anything
+        // still moves.
+        let frame = |sel: View<'_>| {
+            let (_, folding) = step(tree.entity(), dt);
+            world.get::<&mut Clock>(|c| c.time += dt);
+            world.progress_time(dt);
+            let (d, t) = (drawn(sel), words(sel));
+            assert!(d.h >= t.h, "the pill ({} tall) is shorter than its row's words ({})", d.h, t.h);
+            let opening = sel.entity().has(Settling::id());
+            if !sliding() && !opening {
+                assert!(d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill at rest {d:?} does not hold its row's words {t:?}");
+            }
+            folding || sliding() || opening
+        };
+        let session = row("o1", 30.0, 16.0);
+        let run = row("o2", 24.0, 15.0);
+        select(session);
+        for _ in 0..30 {
+            frame(session);
+        }
+        // Cmd-N: a new session's row comes (unfolding from nothing) and takes the selection.
+        session.part("pill").expect("o1's pill").entity().destruct();
+        let new = row("o3", 30.0, 16.0);
+        select(new);
+        let mut fold = TreeFold::default();
+        fold.entering.insert("o3".to_owned());
+        fold.animate(tree.entity(), crate::look::fold_in(w));
+        assert!(new.entity().has(RowFold::id()) && new.entity().has(Settling::id()), "the new row folds in");
+        let mut frames = 0;
+        while frame(new) {
+            frames += 1;
+            assert!(frames < 240, "Cmd-N never settles");
+        }
+        let (d, t) = (drawn(new), words(new));
+        assert!(d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill did not land on the new row: {d:?} {t:?}");
+        // Up: to the run's row above it, shorter: its height at once, its position on the spring.
+        new.part("pill").expect("o3's pill").entity().destruct();
+        select(run);
+        let mut frames = 0;
+        loop {
+            let going = frame(run);
+            if frames > 0 {
+                assert_eq!(drawn(run).h, laid(plate(run)).h, "frame {frames}: the pill's height sprang between rows");
+            }
+            if !going {
+                break;
+            }
+            frames += 1;
+            assert!(frames < 240, "the move never settles");
+        }
+        assert!(frames > 2, "the move slid ({frames} frames)");
+    }
 }

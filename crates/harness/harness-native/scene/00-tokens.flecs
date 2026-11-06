@@ -82,7 +82,7 @@ export const sidebar_omega = 24
 export const sidebar_zeta = 1
 // The sidebar tree's one spring family: what moves in it together lands together, critically damped (no overshoot,
 // no ring) on tree_omega. A row folding in or away (a new chat's row growing in, a finished run folding off), the
-// selection pill sliding between rows (and growing with a row that opens under it), the scroll gliding to the
+// selection pill sliding between rows (its position; its size is always its row's), the scroll gliding to the
 // selection and a disclosure chevron's quarter turn all ride it; Reduce Motion lands each at once.
 export const tree_omega = 26
 export const tree_zeta = 1
