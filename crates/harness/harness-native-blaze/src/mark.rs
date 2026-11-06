@@ -115,12 +115,19 @@ enum Cell {
     Shadow(u8),
 }
 
-/// One drawn frame: `w` by `h` pixels of straight RGBA8, row by row from the top.
+/// One drawn frame: `w` by `h` pixels of straight RGBA8, row by row from the top, and its light: the same pixels'
+/// colour with, in alpha, how hot each is (0: not lit; 255: the hottest the fire gets), for a renderer with headroom
+/// over white to lift by (`harness-native-render`'s light layer).
 pub struct Image {
     pub w: u32,
     pub h: u32,
     pub rgba: Vec<u8>,
+    pub light: Vec<u8>,
 }
+
+/// How lit each fire colour is, coolest first: the deep reds stay at their colour, orange starts to shine, the
+/// yellow-white core is the hottest.
+const LIT: [u8; 5] = [0, 20, 90, 170, 255];
 
 pub struct Blaze {
     w: usize,
@@ -349,16 +356,21 @@ impl Blaze {
             ((ch as f32 + lead) * s).round().max(1.0) as usize,
         );
         let mut px = vec![[0u8; 4]; pw * ph];
+        let mut lit = vec![[0u8; 4]; pw * ph];
+        let theme = self.theme;
+        // How lit a colour is: a fire colour by its place in the palette, anything else (ink, ash) not at all.
+        let glow = |rgb: Rgb| theme.fire.iter().position(|f| *f == rgb).map_or(0, |k| LIT[k]);
         // Fills the box from (x0, y0) to (x1, y1), in cells, snapped to whole pixels.
         let mut rect = |x0: f32, y0: f32, x1: f32, y1: f32, rgb: Rgb| {
             let c = [rgb[0], rgb[1], rgb[2], 255];
+            let l = [rgb[0], rgb[1], rgb[2], glow(rgb)];
             let snap = |v: f32, max: usize| ((v * s).round().max(0.0) as usize).min(max);
             let (x0, x1) = (snap(x0, pw), snap(x1, pw));
             for py in snap(y0 + lead, ph)..snap(y1 + lead, ph) {
                 px[py * pw + x0..py * pw + x1].fill(c);
+                lit[py * pw + x0..py * pw + x1].fill(l);
             }
         };
-        let theme = self.theme;
         // Fire first, then shadows, then letters, so falling letters cover the
         // rest, then the embers of burnt letters over everything.
         let offsets: Vec<Option<f32>> =
@@ -398,7 +410,13 @@ impl Blaze {
                 }
             }
         }
-        Image { w: pw as u32, h: ph as u32, rgba: px.into_iter().flatten().collect() }
+        Image {
+            w: pw as u32,
+            h: ph as u32,
+            // In place, no copy: a byte-at-a-time flatten was the whole cost of an 8K video's frame.
+            rgba: px.into_flattened(),
+            light: lit.into_flattened(),
+        }
     }
 
     /// A letter cell's colour `u` seconds after it caught: ink, white hot

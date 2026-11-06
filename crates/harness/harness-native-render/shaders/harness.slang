@@ -501,6 +501,7 @@ struct ImageInst
     float4 size;     // the texture's width and height (texels), opacity, 1 to filter it smoothly (a glow) rather than fetch texels
     float4 clip;     // the band it shows in, as a panel's
     float4 clipx;    // the band across, as a panel's
+    float4 light;    // a light layer when x > 1: lift the picture under it to up to x times its colour (linear), by heat
 };
 
 struct ImageV
@@ -535,8 +536,32 @@ float4 image_fs(ImageV v, ConstantBuffer<Frame> frame, StructuredBuffer<ImageIns
     ImageInst m = insts[v.inst];
     int2 at = clamp(int2(floor(v.uv * m.size.xy)), int2(0, 0), int2(m.size.xy) - 1);
     float4 t = m.size.w > 0.5 ? tex.SampleLevel(smp, v.uv, 0) : tex.Load(int3(at, 0));
-    float a = t.a * m.size.z * in_band(v.y, m.clip, m.clip.zw, frame.scale) * in_band(v.x, m.clipx, m.clipx.zw, frame.scale);
+    float cover = m.size.z * in_band(v.y, m.clip, m.clip.zw, frame.scale) * in_band(v.x, m.clipx, m.clipx.zw, frame.scale);
+    if (m.light.x > 1.0)
+    {
+        // A light layer over the same picture: its colour c is already drawn here; add what takes it, in linear light,
+        // to c times 1 + (gain - 1) * heat. Alpha 0, so over-blending adds and covers nothing.
+        float k = 1.0 + (m.light.x - 1.0) * t.a;
+        float3 lifted = srgb_encode_ext(srgb_decode_ext(t.rgb) * k);
+        return float4((lifted - t.rgb) * cover, 0.0);
+    }
+    float a = t.a * cover;
     return float4(t.rgb * a, a);
+}
+
+// sRGB's curve, extended past 1 (the target is extended-range sRGB-encoded half floats).
+float3 srgb_decode_ext(float3 c)
+{
+    float3 a = abs(c);
+    float3 l = select(a <= 0.04045, a / 12.92, pow((a + 0.055) / 1.055, 2.4));
+    return l * sign(c);
+}
+
+float3 srgb_encode_ext(float3 l)
+{
+    float3 a = abs(l);
+    float3 c = select(a <= 0.0031308, a * 12.92, 1.055 * pow(a, 1.0 / 2.4) - 0.055);
+    return c * sign(l);
 }
 
 // ---- live pictures (media/: a Shader's or a Video's latest finished frame) ------------------------------------------

@@ -30,10 +30,12 @@ sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 po
   component can be cued: `Size.w.value` relays out the neighbours, `Pose` (`dx`, `dy`, `shrink`, `fade`, `cut`) moves,
   scales, fades or types on only the node and what is under it. Cues on one member take turns by `at`. Templates name the
   moves a video makes (`cue.FadeIn show(at: 2.0)`; see `scene/launch.flecs`).
-- `BlazeMark: {start, exit}` is blaze's wordmark set on fire, live (`harness-native-blaze`, ported from
+- `BlazeMark: {start, exit, glow}` is blaze's wordmark set on fire, live (`harness-native-blaze`, ported from
   indexable-inc/anim): its letters drop in from the top of the frame at `start`, the fire catches, and from `exit` the
   letters burn into embers. Its soundtrack (the landings climbing to A major, the physically modelled fire, the burn) is
-  synthesised offline from the same times and is the video's sound; a scene without a `BlazeMark` is silent.
+  synthesised offline from the same times and is the video's sound; a scene without a `BlazeMark` is silent. `glow` takes it past white: the
+  flames, white-hot letters and embers rise by their heat to `glow` SDR whites (4.93 in `launch.flecs`: the 1000-nit
+  HDR10 peak over 203-nit white), drawn as a light layer over the mark; the UI stays at white.
 - Sound is data, one component per concern: `Sound: {voice}` (`Bell`, `Mallet`, `Bass`, `Click`, `Thud`, `Whoosh`,
   `Fire`), `Onset: {at}`, `Lasts: {dur}`, `Pitch: {hz}`, `Gain: {amp}`, `Pan: {pos, sweep}` (-1 the frame's left edge,
   1 its right; `sweep` moves it). `src/sound.flecs` (loaded before every scene) has a `sound.*` prefab per voice with its
