@@ -1241,7 +1241,7 @@ impl App {
                 } else {
                     ("ready", "hn.ChatSendReady", format!("chat:send:{sid}"))
                 };
-                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| v.action(&action));
+                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| { v.action(&action); });
             }
         }
     }
