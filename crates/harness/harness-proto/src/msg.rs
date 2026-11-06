@@ -169,6 +169,10 @@ pub enum Request {
         #[serde(default)]
         args: Value,
     },
+    /// The embedded browser (crates/harness/harness-browser): start this daemon's host if it is not running, and say
+    /// where it listens. Answered by [`Reply::Browser`] once the host is ready, or an error naming what failed (its app
+    /// bundle missing, CEF failing to start), never a stand-in browser.
+    Browser,
     /// Shell runs with every pipeline stage's output stored (crates/harness/harness/src/runs.rs).
     #[serde(untagged)]
     Runs(RunReq),
@@ -273,6 +277,9 @@ pub enum Reply {
     Watching,
     /// `ui_listen`: the UI feed follows.
     Listening,
+    /// `browser`: the host's pid, its socket for the kernel (`$HARNESS_HOME/browser/host.sock`) and the Mach service the
+    /// app looks up (crate::browser).
+    Browser { pid: u32, sock: String, service: String },
     /// A run's or an object's answer, an open record whose shape runs.rs and object.rs define.
     Record(Value),
 }
