@@ -36,7 +36,6 @@ use super::{
     frame,
     link::{self, Origins, Token},
     session::{self, Emit, Served, Slot, Step},
-    wasm::CoreWasm,
 };
 use crate::clock;
 
