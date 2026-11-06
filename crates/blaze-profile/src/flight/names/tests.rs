@@ -405,17 +405,17 @@ impl<'p> Run<'p> {
             self.reader.catch_up(at as u16 + 1, &mut Rings(&self.rings));
         }
         for at in 0..self.rings.len() {
-            let ring = &self.rings[at];
-            let first = self.cursor[at].max(ring.oldest());
+            let (oldest, head) = (self.rings[at].oldest(), self.rings[at].head);
+            let first = self.cursor[at].max(oldest);
             self.seen.skipped += first - self.cursor[at];
-            for i in first..ring.head {
-                let row = *ring.row(i).expect("a row the ring holds");
+            for i in first..head {
+                let row = *self.rings[at].row(i).expect("a row the ring holds");
                 if is_names_row(&row) {
                     continue;
                 }
                 self.check(at as u16 + 1, i, &row)?;
             }
-            self.cursor[at] = ring.head;
+            self.cursor[at] = head;
         }
         Ok(())
     }
