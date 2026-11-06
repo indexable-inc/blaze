@@ -46,6 +46,7 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Who truncates first | `ui.Lead` (`ShrinkFirst`), `LayoutPriority {value}`, `FixedSize {h, v}` (name truncates before badge) |
 | Alignment | `Align: FirstBaseline/LastBaseline`, `AlignSelf`, `AlignmentGuide {dx, dy}` |
 | Background / overlay | `Background` / `Overlay` tags on a child (laid to the parent's frame, out of flow); floating: `ui.Overlay` + `(AnchoredTo, node)` |
+| Menu, popover, hover card past the window's edge | `Windowed` on the floating node (`ui.Menu`, `ui.Overlay`, `hn.GenFloat` carry it): its own borderless child window (`harness-native/src/window/overlay.rs`), placed and kept on the screen's visible frame (`Screen`), the system shadow under it; input stays in the main view's points. Toasts, sheets and dialogs over a pane stay in the window |
 | Title-bar inset | `SafeAreaInset` / `SafeAreaPadding`, never hardcoded top padding |
 | Responsive | `ui.ViewThatFits` (first child variant that fits) |
 | Button / icon button | `ui.Button`; `ui.IconButton` (square wash hugging one `ui.Symbol`; never a full-width row wash) |

@@ -854,8 +854,10 @@ hn {
     Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
+  // A cell's popover or menu plate, in a window of its own (`Windowed`): it may reach past the main window's edge.
   prefab GenFloat : ui.Column {
     Placed
+    Windowed
     Hoverable
     Layer: {level: Overlay}
     Side: {edge: Bottom, dx: 0, dy: $gen_float_gap}

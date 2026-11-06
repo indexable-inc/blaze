@@ -48,19 +48,27 @@ fn part(id: &str, name: &str, tokens: u64, of: &str, estimate: &str) -> ContextP
 
 /// The parts of claude's `get_context_usage` answer (`detail: "full"`): its used categories in its order, the harness
 /// note's topics under its system prompt, and its split of the messages under them. Claude leaves out the messages
-/// category when the split is all it has (after a turn, as 2.1.319 does): then the split's sum stands for it. Its
-/// attachments (the reminders it adds to a turn: the date, its listings) go under the messages only when it named them.
+/// category when the split is all it has (after a turn, as 2.1.319 does): then the split's sum stands for it.
+///
+/// Its messages category is exact (2.1.319: the call's total less the other categories), its split is not: it counts
+/// every entry of its transcript, and its `attachmentTokens` sums every attachment there, the memory files, skill and
+/// deferred-tool listings that the categories already count among them, so it can pass the messages it is said to be a
+/// part of (a popover read "Reminders 9.2k" under "Messages 1.1k" of a 7.3k context). It is never shown. What the
+/// messages hold past the split's user, assistant, tool call and tool result counts (the reminders a turn carries: the
+/// date, a listing that changed) is the messages less those, `messages.other`, so the rows under it add up to it.
 #[must_use]
 pub fn claude_parts(a: &Value) -> Vec<ContextPart> {
     let mut out = Vec::new(); // alloc: the popover's rows once a turn
-    let mut messages = false;
+    let mut messages = None;
     for c in a["categories"].as_array().into_iter().flatten().filter(|c| c["kind"] == "used") {
         let (Some(id), Some(tokens)) = (c["id"].as_str(), c["tokens"].as_u64()) else { continue };
         out.push(part(id, c["name"].as_str().unwrap_or(id), tokens, "", ""));
         if id == "system_prompt" {
             out.extend(note_parts("system_prompt"));
         }
-        messages |= id == "messages";
+        if id == "messages" {
+            messages = Some(tokens);
+        }
     }
     let b = &a["messageBreakdown"];
     let n = |k: &str| b[k].as_u64().unwrap_or(0);
@@ -71,14 +79,14 @@ pub fn claude_parts(a: &Value) -> Vec<ContextPart> {
         ("messages.tool_results", "Tool results", n("toolResultTokens")),
     ];
     let said: u64 = split.iter().map(|s| s.2).sum();
-    if !messages && said > 0 {
+    if messages.is_none() && said > 0 {
         out.push(part("messages", "Messages", said, "", ""));
     }
-    if messages || said > 0 {
+    if messages.is_some() || said > 0 {
         out.extend(split.iter().filter(|s| s.2 > 0).map(|&(id, name, t)| part(id, name, t, "messages", "")));
     }
-    if messages && n("attachmentTokens") > 0 {
-        out.push(part("messages.attachments", "Reminders", n("attachmentTokens"), "messages", ""));
+    if let Some(other) = messages.map(|m| m.saturating_sub(said)).filter(|o| *o > 0) {
+        out.push(part("messages.other", "Reminders and other", other, "messages", ""));
     }
     out
 }
@@ -198,6 +206,35 @@ mod tests {
         assert_eq!(p.iter().find(|p| p.id == "messages").map(|p| p.tokens), Some(22));
         assert!(p.iter().filter(|p| !p.id.starts_with("note.")).all(|p| p.estimate.is_empty()));
         assert!(p.iter().filter(|p| p.id.starts_with("note.")).all(|p| p.estimate == O200K && p.of == "system_prompt"));
+    }
+
+    /// The answer that read "Reminders 9.2k" under "Messages 1.1k" of a 7.3k context: claude's transcript-wide attachment
+    /// count is not shown; the messages' rows are claude's split and what the messages hold past it, and add up to them.
+    #[test]
+    fn claude_messages_split_adds_up() {
+        let a = json!({
+            "categories": [
+                {"id": "system_prompt", "name": "System prompt", "tokens": 3796, "kind": "used"},
+                {"id": "mcp_tools", "name": "MCP tools", "tokens": 2400, "kind": "used"},
+                {"id": "messages", "name": "Messages", "tokens": 1100, "kind": "used"},
+            ],
+            "messageBreakdown": {"toolCallTokens": 120, "toolResultTokens": 80, "attachmentTokens": 9200,
+                "assistantMessageTokens": 300, "userMessageTokens": 400},
+        });
+        let p = claude_parts(&a);
+        let under: Vec<(&str, u64)> = p.iter().filter(|p| p.of == "messages").map(|p| (p.id.as_str(), p.tokens)).collect();
+        assert_eq!(
+            under,
+            [
+                ("messages.user", 400),
+                ("messages.assistant", 300),
+                ("messages.tool_calls", 120),
+                ("messages.tool_results", 80),
+                ("messages.other", 200)
+            ]
+        );
+        assert_eq!(under.iter().map(|u| u.1).sum::<u64>(), 1100);
+        assert!(p.iter().all(|p| p.tokens != 9200));
     }
 
     /// Codex's parts add up to its exact total: the rest is what harness's counts leave.

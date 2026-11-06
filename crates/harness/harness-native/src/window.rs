@@ -67,7 +67,11 @@ struct State {
     inside: bool,
     /// Where the window rests while the sidebar's over-drag pulls it aside (`App::window_shift`).
     rest: Option<NSPoint>,
+    /// The windows the open menus, popovers and hover cards float in (overlay.rs).
+    overlays: overlay::Overlays,
 }
+
+mod overlay;
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -508,6 +512,12 @@ define_class!(
             if NSEvent::pressedMouseButtons() != 0 {
                 return;
             }
+            // From the view into an overlay's window or back (overlay.rs): still over the app, the hover holds (a hover
+            // card opened from the view stays open while the pointer goes onto it); the next move there places it.
+            if with(|st| st.overlays.holds(&st.window, NSEvent::mouseLocation())).unwrap_or(false) {
+                with(|st| st.inside = true);
+                return;
+            }
             with(|st| st.app.pointer_move(-1.0e4, -1.0e4, KeyMods::default()));
             wake();
         }
@@ -680,9 +690,24 @@ define_class!(
                 st.inside = false;
                 st.cursor = None;
                 st.app.focused = false;
+                // Another app or window took the keyboard: open menus and popovers close, as NSMenu and NSPopover do.
+                st.app.close_floats();
                 st.app.poke();
             });
             wake();
+        }
+
+        /// The window moved (to another screen, or across one): the room the overlays are kept in moves with it.
+        #[unsafe(method(windowMoved:))]
+        fn window_moved(&self, _note: &NSNotification) {
+            let changed = with(|st| {
+                let Some(room) = overlay::screen_room(&st.window, self) else { return false };
+                st.app.set_screen(room);
+                true
+            });
+            if changed == Some(true) {
+                wake();
+            }
         }
     }
 
@@ -800,8 +825,10 @@ impl HarnessView {
         panel.orderFront(None);
     }
 
+    /// Where `event` is in the view's points: from the main window, or from an overlay's window (overlay.rs hands its
+    /// events on here), whose points go through the screen's.
     fn local(&self, event: &NSEvent) -> NSPoint {
-        self.convertPoint_fromView(event.locationInWindow(), None)
+        overlay::local(self, event)
     }
 
     /// Hand key `event` to the app: `text` what the input method typed for it, else the event's own characters
@@ -952,6 +979,10 @@ impl HarnessView {
             let dt = st.last.map_or(1.0 / 120.0, |l| (t - l).clamp(0.0, 0.1)) as f32;
             st.last = Some(t);
             (st.points, st.backing) = ((points.width as f32, points.height as f32), backing as f32);
+            // The screen the windowed overlays are kept on, before layout places them.
+            if let Some(room) = overlay::screen_room(&st.window, self) {
+                st.app.set_screen(room);
+            }
             let renderer = &st.renderer;
             let draw = st.app.frame(
                 (points.width as f32, points.height as f32),
@@ -960,7 +991,21 @@ impl HarnessView {
                 &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b),
             );
             let built = objc2_quartz_core::CACurrentMediaTime();
-            st.renderer.render(&draw, dest);
+            // The open overlays into their own windows, drawn in the same command buffer as the window.
+            let floats = st.app.take_floats();
+            let dests = st.overlays.prepare(&st.window, &floats, st.app.zoom(), backing as f32);
+            let drawn: Vec<bool> = dests.iter().map(Option::is_some).collect(); // alloc: a flag per open overlay
+            let mut passes = Vec::with_capacity(1 + floats.len()); // alloc: the window's pass and one per open overlay
+            passes.push(gpu::Pass { draw: &draw, dest, over: false });
+            for (f, d) in floats.iter().zip(dests) {
+                if let Some(dest) = d {
+                    passes.push(gpu::Pass { draw: &f.draw, dest, over: false });
+                }
+            }
+            st.renderer.render_passes(&passes);
+            drop(passes);
+            let tip = st.app.tooltip();
+            st.overlays.shown(&st.window, &floats, &drawn, &tip);
             framelog::note(
                 entered,
                 t,
@@ -975,7 +1020,6 @@ impl HarnessView {
             }
             apply_cursor(st);
             shift_window(st);
-            let tip = st.app.tooltip();
             if tip != st.tip {
                 st.tip = tip;
                 self.setToolTip(
@@ -1386,6 +1430,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
         Some(&*view),
     )));
     let menu_gen = app.keys_gen();
+    let overlays = overlay::Overlays::new(view.clone(), renderer.device().clone());
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             app,
@@ -1404,6 +1449,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             cursor: None,
             inside: false,
             rest: None,
+            overlays,
         })
     });
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
@@ -1476,6 +1522,12 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             sel!(screenChanged:),
             Some(objc2_app_kit::NSApplicationDidChangeScreenParametersNotification),
             None,
+        );
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(windowMoved:),
+            Some(objc2_app_kit::NSWindowDidMoveNotification),
+            Some(&window),
         );
         // AppKit lays the title bar (and the traffic lights) out again after these.
         for name in [

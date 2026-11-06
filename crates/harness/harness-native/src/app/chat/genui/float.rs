@@ -84,7 +84,9 @@ fn popover(v: View<'_>, node: &Value, menu: bool, kids: &[&Value], depth: usize,
     let lead = if context { "region" } else { "trigger" };
     let open = match b.live.as_deref_mut() {
         Some(live) if hover => {
-            let on = [v.part("trigger"), v.part("float")].into_iter().flatten().any(pointer_on);
+            // On its trigger or its plate, or crossing the gap between them (the plate's own window, overlay.rs).
+            let on = [v.part("trigger"), v.part("float")].into_iter().flatten().any(pointer_on)
+                || v.part("trigger").zip(v.part("float")).is_some_and(|(t, f)| view::bridged(t.entity(), f.entity()));
             let was = live.hovering.insert(id, on).unwrap_or(said);
             if was != on
                 && let Some(h) = &toggle
