@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 mod genui;
 mod pick;
-pub(in crate::app) use pick::kind_title;
 
 pub(super) use genui::Live as GenLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};

@@ -206,7 +206,8 @@ impl App {
             plate.anchored(trigger.id());
             let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
             let hovered = w.entity_named(APP).target(Hovered::id(), 0);
-            let ctx = MenuCtx { sid, own: models, kind, kept: &kept, cur, name, effort };
+            let titles = self.agent_titles();
+            let ctx = MenuCtx { sid, own: models, kind, kept: &kept, cur, name, effort, titles: &titles };
             menu_rows(w, plate, &ctx, page, hovered, nav);
         }
     }
@@ -291,6 +292,11 @@ impl App {
             (kind, model.or(cur), effort)
         };
         self.remember_choice(&kind, model.as_deref(), effort.as_deref());
+    }
+
+    /// Each agent kind's name, from the act.Spawn actions that have a title (scene/20-keys.flecs `SpawnKind`).
+    pub(in crate::app) fn agent_titles(&self) -> BTreeMap<String, String> {
+        self.spawns().into_iter().filter(|p| !p.title.is_empty()).map(|p| (p.kind, p.title)).collect()
     }
 
     /// Type into chat `sid`'s open searchable menu (the models', or both): whether it took the text.
@@ -511,16 +517,14 @@ struct MenuCtx<'a> {
     cur: Option<&'a ModelChoice>,
     name: &'a str,
     effort: &'a str,
+    /// Each agent kind's name ([`App::agent_titles`]).
+    titles: &'a BTreeMap<String, String>,
 }
 
-/// An agent kind's name, as a head and in a note.
-pub(in crate::app) fn kind_title(kind: &str) -> &str {
-    match kind {
-        "claude" | "" => "Claude",
-        "codex" => "Codex",
-        "cursor" => "Cursor",
-        other => other,
-    }
+/// Agent kind `kind`'s name, as a head and in a note: its act.Spawn's `SpawnKind.title` (scene/20-keys.flecs, in
+/// `titles`), else the kind itself.
+fn kind_title<'a>(titles: &'a BTreeMap<String, String>, kind: &'a str) -> &'a str {
+    titles.get(kind).map_or(kind, String::as_str)
 }
 
 /// The open menu's rows on its plate (the efforts' `ui.Menu`, else a `ui.SearchMenu`'s `items` under its filter): the
@@ -535,16 +539,16 @@ fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hove
             if !rows.is_empty() {
                 rows.push(Entry::Sep);
             }
-            rows.push(Entry::Head(kind_title(kind).to_owned()));
+            rows.push(Entry::Head(kind_title(c.titles, kind).to_owned()));
             if models.is_empty() {
-                rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(kind))));
+                rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.titles, kind))));
                 continue;
             }
             let own = kind == c.kind;
             rows.extend(models.iter().map(|m| {
                 let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
                 Entry::Item {
-                    text: format!("{label} {} {} {}", m.id, m.about, kind_title(kind)),
+                    text: format!("{label} {} {} {}", m.id, m.about, kind_title(c.titles, kind)),
                     data: Choice {
                         label,
                         about: m.about.clone(),
@@ -577,7 +581,7 @@ fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hove
                 },
             })),
             Some(_) => rows.push(Entry::Note(format!("{} has no effort levels.", c.name))),
-            None if c.own.is_empty() => rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.kind)))),
+            None if c.own.is_empty() => rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.titles, c.kind)))),
             None => rows.push(Entry::Note(format!("{} is not in the model list, so its efforts are unknown.", c.name))),
         }
     }

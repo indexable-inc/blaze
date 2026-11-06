@@ -1529,8 +1529,9 @@ impl App {
         let kept = self.link.agent_models();
         let listed = kept.get(&kind);
         let entry = c.model.as_deref().and_then(|m| listed.map(|l| l.iter().find(|x| x.is(m))));
+        let title = self.agent_titles().remove(&kind).unwrap_or_else(|| kind.clone());
         let why = match (&c.model, entry, &c.effort) {
-            (Some(m), Some(None), _) => Some(format!("{m}, the model last used, is no longer offered by {}. Pick one.", chat::kind_title(&kind))),
+            (Some(m), Some(None), _) => Some(format!("{m}, the model last used, is no longer offered by {title}. Pick one.")),
             (Some(m), Some(Some(x)), Some(e)) if !x.efforts.contains(e) => {
                 Some(format!("{m} no longer takes effort {e}, the effort last used. Pick a model."))
             }
