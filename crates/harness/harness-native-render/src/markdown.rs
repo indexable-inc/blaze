@@ -1,20 +1,24 @@
 //! Inline markdown (`MarkdownText`): a paragraph's, heading's or list item's words with their markers taken out and the
 //! faces they asked for as runs: `**bold**` / `__bold__`, `*italic*` / `_italic_`, `***both***`, `` `code` `` (and
-//! ``` ``code with ` in it`` ```), `[words](url)` as its words (in the link ink), `\*` as a plain star. Blocks (fences,
-//! lists, quotes) are the host's rows, not this; [`table`] reads a GitHub table's lines into its cells for the host's
-//! table row. Inline components (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar) become their label
-//! after a hole the painter draws the component's icon in, on a chip. Ranges are UTF-16 units of the plain text, as
-//! layouts count.
+//! ``` ``code with ` in it`` ```), `[words](url)` as its words (in the link ink), `~~struck~~` and `~struck~`
+//! (GitHub's strikethrough: a range the painter draws a hairline through), autolinks (`<https://...>`, `<someone@host>`)
+//! and bare `https://`, `http://` and `www.` addresses as links, a newline after two spaces or a backslash as a hard line
+//! break (any other newline a space), `\*` as a plain star. Blocks (fences, lists, quotes) are the host's rows, not this;
+//! [`table`] reads a GitHub table's lines into its cells for the host's table row. Inline components
+//! (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar) become their label after a hole the painter draws
+//! the component's icon in, on a chip. Ranges are UTF-16 units of the plain text, as layouts count.
 use crate::text::{Face, Hole, Run};
 
-/// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip) and the links (their
-/// words' range and where they go).
+/// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip), the links (their
+/// words' range and where they go) and the struck-through stretches.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Inline {
     pub text: String,
     pub runs: Vec<Run>,
     pub code: Vec<(usize, usize)>,
     pub links: Vec<(usize, usize, String)>,
+    /// The struck-through stretches (`~~words~~`), sorted; one may hold code, links and emphasis.
+    pub strike: Vec<(usize, usize)>,
     /// The inline components: each one's range (its icon's hole first, then its label) and its tag.
     pub tags: Vec<InlineTag>,
 }
@@ -84,9 +88,11 @@ pub fn chip_room(units: &[u16], lo: usize, hi: usize, size: f32) -> (f32, f32) {
 pub fn inline(src: &str) -> Inline {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Inline::default();
-    // The UTF-16 length of what is out so far, and where each open emphasis started (in it).
+    // The UTF-16 length of what is out so far, and where each open emphasis started (in it). An open strike also keeps
+    // how many tildes opened it: only as many close it.
     let mut at = 0usize;
     let (mut bold, mut italic): (Option<usize>, Option<usize>) = (None, None);
+    let mut strike: Option<(usize, usize)> = None;
     let mut spans: Vec<(usize, usize, u8)> = Vec::new();
     let push = |out: &mut Inline, at: &mut usize, c: char| {
         out.text.push(c);
@@ -100,28 +106,34 @@ pub fn inline(src: &str) -> Inline {
                 push(&mut out, &mut at, chars[i + 1]);
                 i += 2;
             }
+            // A backslash before a newline: a hard line break.
+            '\\' if chars.get(i + 1) == Some(&'\n') => {
+                push(&mut out, &mut at, '\n');
+                i = past_indent(&chars, i + 2);
+            }
+            '\n' => {
+                // Two spaces or more before it: a hard line break; else a soft one, a space. The spaces go either way,
+                // and so does the next line's indent; never a space a code span or a chip ends in.
+                let floor = settled(&out);
+                let spaces = out.text.chars().rev().take_while(|&s| s == ' ').count().min(at - floor);
+                for _ in 0..spaces {
+                    out.text.pop();
+                }
+                at -= spaces;
+                push(&mut out, &mut at, if spaces >= 2 { '\n' } else { ' ' });
+                i = past_indent(&chars, i + 1);
+            }
             '`' => {
-                let ticks = chars[i..].iter().take_while(|&&t| t == '`').count();
-                // The closing run of as many ticks.
-                let close = (i + ticks..chars.len()).find(|&j| {
-                    chars[j..].iter().take_while(|&&t| t == '`').count() == ticks
-                        && (j == 0 || chars[j - 1] != '`')
-                });
-                match close {
-                    Some(j) => {
-                        let inner: String = chars[i + ticks..j].iter().collect();
-                        let inner = if inner.starts_with(' ') && inner.ends_with(' ') && inner.trim() != "" {
-                            inner[1..inner.len() - 1].to_owned()
-                        } else {
-                            inner
-                        };
+                let ticks = run(&chars, i, '`');
+                match code_span(&chars, i) {
+                    Some((inner, next)) => {
                         let start = at;
                         for ch in inner.chars() {
                             push(&mut out, &mut at, ch);
                         }
                         out.runs.push(Run { start, end: at, face: Face::InlineCode });
                         out.code.push((start, at));
-                        i = j + ticks;
+                        i = next;
                     }
                     None => {
                         for _ in 0..ticks {
@@ -131,8 +143,27 @@ pub fn inline(src: &str) -> Inline {
                     }
                 }
             }
+            '~' => {
+                // GitHub's strikethrough: one or two tildes open where they are left-flanking and the same number
+                // closes where right-flanking; three or more, and any without a partner, are tildes.
+                let n = run(&chars, i, '~');
+                let (left, right) = flanking(&chars, i, n);
+                match strike {
+                    Some((s, k)) if k == n && right => {
+                        out.strike.push((s, at));
+                        strike = None;
+                    }
+                    None if n <= 2 && left && has_closer(&chars, i + n, '~', n) => strike = Some((at, n)),
+                    _ => {
+                        for _ in 0..n {
+                            push(&mut out, &mut at, '~');
+                        }
+                    }
+                }
+                i += n;
+            }
             '*' | '_' => {
-                let n = chars[i..].iter().take_while(|&&t| t == c).count();
+                let n = run(&chars, i, c);
                 let before = i.checked_sub(1).map(|k| chars[k]);
                 let after = chars.get(i + n).copied();
                 let space = |ch: Option<char>| ch.is_none_or(char::is_whitespace);
@@ -166,9 +197,17 @@ pub fn inline(src: &str) -> Inline {
                 }
                 i += n;
             }
-            '<' if chars.get(i + 1).is_some_and(char::is_ascii_uppercase) => match harness_native_ui_inline::tag(&chars, i) {
-                // An inline component: a hole for its icon, then its label (plain words), all in the chip's face.
-                Some((tag, next)) => {
+            '<' => {
+                if let Some((shown, href, next)) = autolink(&chars, i) {
+                    // <https://...> and <someone@host>: the address as written, a link to it.
+                    let start = at;
+                    for &ch in &chars[shown] {
+                        push(&mut out, &mut at, ch);
+                    }
+                    out.links.push((start, at, href));
+                    i = next;
+                } else if let Some((tag, next)) = harness_native_ui_inline::tag(&chars, i) {
+                    // An inline component: a hole for its icon, then its label (plain words), all in the chip's face.
                     let start = at;
                     push(&mut out, &mut at, crate::text::HOLE);
                     for ch in tag.label.chars() {
@@ -180,48 +219,52 @@ pub fn inline(src: &str) -> Inline {
                     out.runs.push(Run { start, end: at, face: Face::InlineRef });
                     out.tags.push(InlineTag { start, end: at, tag });
                     i = next;
+                } else {
+                    push(&mut out, &mut at, c);
+                    i += 1;
+                }
+            }
+            '[' => match link(&chars, i) {
+                // [words](url): the words, the url dropped. A link holds no link (GitHub's rule): an address in its
+                // words is words.
+                Some((words, url, next)) => {
+                    let inner = inline(&chars[words].iter().collect::<String>());
+                    let base = at;
+                    for ch in inner.text.chars() {
+                        push(&mut out, &mut at, ch);
+                    }
+                    for r in inner.runs {
+                        out.runs.push(Run { start: r.start + base, end: r.end + base, face: r.face });
+                    }
+                    for (a, b) in inner.code {
+                        out.code.push((a + base, b + base));
+                    }
+                    for (a, b) in inner.strike {
+                        out.strike.push((a + base, b + base));
+                    }
+                    out.links.push((base, at, chars[url].iter().collect()));
+                    i = next;
                 }
                 None => {
                     push(&mut out, &mut at, c);
                     i += 1;
                 }
             },
-            '[' => {
-                // [words](url): the words, the url dropped.
-                let close = chars[i + 1..].iter().position(|&t| t == ']').map(|k| i + 1 + k);
-                match close.filter(|&j| chars.get(j + 1) == Some(&'(')) {
-                    Some(j) => match chars[j + 2..].iter().position(|&t| t == ')') {
-                        Some(k) => {
-                            let words: String = chars[i + 1..j].iter().collect();
-                            let inner = inline(&words);
-                            let base = at;
-                            for ch in inner.text.chars() {
-                                push(&mut out, &mut at, ch);
-                            }
-                            for r in inner.runs {
-                                out.runs.push(Run { start: r.start + base, end: r.end + base, face: r.face });
-                            }
-                            for (a, b) in inner.code {
-                                out.code.push((a + base, b + base));
-                            }
-                            out.links.push((base, at, chars[j + 2..j + 2 + k].iter().collect()));
-                            i = j + 2 + k + 1;
-                        }
-                        None => {
-                            push(&mut out, &mut at, c);
-                            i += 1;
-                        }
-                    },
-                    None => {
-                        push(&mut out, &mut at, c);
-                        i += 1;
+            _ => match bare_url(&chars, i) {
+                // A bare https://, http:// or www. address: its words as written, a link to it.
+                Some((next, href)) => {
+                    let start = at;
+                    for &ch in &chars[i..next] {
+                        push(&mut out, &mut at, ch);
                     }
+                    out.links.push((start, at, href));
+                    i = next;
                 }
-            }
-            _ => {
-                push(&mut out, &mut at, c);
-                i += 1;
-            }
+                None => {
+                    push(&mut out, &mut at, c);
+                    i += 1;
+                }
+            },
         }
     }
     // Emphasis as runs: each UTF-16 stretch between span edges gets the face of the spans over it; code keeps its face.
@@ -252,25 +295,58 @@ pub fn inline(src: &str) -> Inline {
         }
     }
     out.runs.sort_by_key(|r| r.start);
+    out.strike.sort_unstable();
     out
 }
 
-/// Whether a run of `want` `c`s closes later in `chars` (from `from`), so an opener is one.
+/// How many `c`s run from `i`.
+fn run(chars: &[char], i: usize, c: char) -> usize {
+    chars[i..].iter().take_while(|&&t| t == c).count()
+}
+
+/// Past the spaces and tabs from `i` (a continuation line's indent).
+fn past_indent(chars: &[char], i: usize) -> usize {
+    i + chars[i..].iter().take_while(|&&t| t == ' ' || t == '\t').count()
+}
+
+/// Where the last code span, chip or link of `out` ends: a line break's trailing spaces are never taken from before it.
+fn settled(out: &Inline) -> usize {
+    let runs = out.runs.iter().map(|r| r.end);
+    runs.chain(out.links.iter().map(|l| l.1)).max().unwrap_or(0)
+}
+
+/// CommonMark's punctuation, for flanking: ASCII punctuation and any other symbol that is no letter, digit or space.
+fn punct(c: char) -> bool {
+    c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace())
+}
+
+/// Whether the run of `n` delimiters at `i` is left-flanking (it may open) and right-flanking (it may close), as
+/// CommonMark has it: not before white space, and if before punctuation, only after white space or punctuation; and the
+/// mirror. The text's edges count as white space.
+fn flanking(chars: &[char], i: usize, n: usize) -> (bool, bool) {
+    let before = i.checked_sub(1).map(|k| chars[k]);
+    let after = chars.get(i + n).copied();
+    let space = |ch: Option<char>| ch.is_none_or(char::is_whitespace);
+    let loose = |ch: Option<char>| space(ch) || ch.is_some_and(punct);
+    let left = !space(after) && (!after.is_some_and(punct) || loose(before));
+    let right = !space(before) && (!before.is_some_and(punct) || loose(after));
+    (left, right)
+}
+
+/// Whether a run of `want` `c`s closes later in `chars` (from `from`), so an opener is one: never one inside a code
+/// span, link, component or address ([`atom`]), which the reading takes whole. A tilde's closer is a right-flanking run
+/// of exactly as many; emphasis's any run of as many or more after something other than white space.
 fn has_closer(chars: &[char], from: usize, c: char, want: usize) -> bool {
     let mut j = from;
     while j < chars.len() {
-        if chars[j] == '`' {
-            // Skip a code span.
-            let n = chars[j..].iter().take_while(|&&t| t == '`').count();
-            match (j + n..chars.len()).find(|&k| chars[k..].iter().take_while(|&&t| t == '`').count() == n) {
-                Some(k) => j = k + n,
-                None => j += n,
-            }
+        if let Some(next) = atom(chars, j) {
+            j = next;
             continue;
         }
         if chars[j] == c {
-            let n = chars[j..].iter().take_while(|&&t| t == c).count();
-            if n >= want && j > 0 && !chars[j - 1].is_whitespace() {
+            let n = run(chars, j, c);
+            let closes = if c == '~' { n == want && flanking(chars, j, n).1 } else { n >= want && j > 0 && !chars[j - 1].is_whitespace() };
+            if closes {
                 return true;
             }
             j += n;
@@ -279,6 +355,123 @@ fn has_closer(chars: &[char], from: usize, c: char, want: usize) -> bool {
         j += 1;
     }
     false
+}
+
+/// Where a construct [`inline`] reads whole ends, when one starts at `i`: an escape, a code span (or an unclosed run of
+/// ticks, which stays ticks), a link, an inline component, an autolink or a bare address.
+fn atom(chars: &[char], i: usize) -> Option<usize> {
+    match chars[i] {
+        '\\' => chars.get(i + 1).is_some_and(|n| n.is_ascii_punctuation()).then_some(i + 2),
+        '`' => Some(code_span(chars, i).map_or(i + run(chars, i, '`'), |(_, next)| next)),
+        '[' => link(chars, i).map(|(_, _, next)| next),
+        '<' => autolink(chars, i).map(|(_, _, next)| next).or_else(|| harness_native_ui_inline::tag(chars, i).map(|(_, next)| next)),
+        _ => bare_url(chars, i).map(|(next, _)| next),
+    }
+}
+
+/// The code span the ticks at `i` open: its words (a line break in them a space; one space each side taken off when both
+/// are there and it is not all spaces) and where it ends. None when no run of as many ticks closes it.
+fn code_span(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let ticks = run(chars, i, '`');
+    // The closing run of exactly as many ticks.
+    let j = (i + ticks..chars.len()).find(|&j| run(chars, j, '`') == ticks && chars[j - 1] != '`')?;
+    let inner: String = chars[i + ticks..j].iter().map(|&c| if c == '\n' { ' ' } else { c }).collect();
+    let inner = if inner.starts_with(' ') && inner.ends_with(' ') && inner.trim() != "" { inner[1..inner.len() - 1].to_owned() } else { inner };
+    Some((inner, j + ticks))
+}
+
+/// The link `[words](url)` at `i`: its words' and url's ranges in `chars`, and where it ends.
+fn link(chars: &[char], i: usize) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>, usize)> {
+    let j = i + 1 + chars[i + 1..].iter().position(|&t| t == ']')?;
+    if chars.get(j + 1) != Some(&'(') {
+        return None;
+    }
+    let k = j + 2 + chars[j + 2..].iter().position(|&t| t == ')')?;
+    Some((i + 1..j, j + 2..k, k + 1))
+}
+
+/// The autolink at `i` (CommonMark's): `<scheme:anything>` (a scheme of 2 to 32 letters, digits, `+`, `.` or `-` after a
+/// letter; no space, `<` or `>` in it), a link to itself, or `<someone@host>`, a `mailto:` link. Its words (the address,
+/// without the brackets), where it goes and where it ends.
+fn autolink(chars: &[char], i: usize) -> Option<(std::ops::Range<usize>, String, usize)> {
+    let end = i + 1 + chars[i + 1..].iter().position(|&t| t == '>' || t == '<' || t.is_whitespace() || t.is_control())?;
+    if chars[end] != '>' || end == i + 1 {
+        return None;
+    }
+    let inner = &chars[i + 1..end];
+    let address: String = inner.iter().collect();
+    let scheme = inner.iter().position(|&t| t == ':').is_some_and(|n| {
+        (2..=32).contains(&n)
+            && inner[0].is_ascii_alphabetic()
+            && inner[..n].iter().all(|&t| t.is_ascii_alphanumeric() || matches!(t, '+' | '.' | '-'))
+    });
+    if scheme {
+        return Some((i + 1..end, address, end + 1));
+    }
+    let at = inner.iter().position(|&t| t == '@')?;
+    let (local, host) = (&inner[..at], &inner[at + 1..]);
+    let local_ok = !local.is_empty() && local.iter().all(|&t| t.is_ascii_alphanumeric() || ".!#$%&'*+/=?^_`{|}~-".contains(t));
+    let label_ok = |l: &[char]| {
+        (1..=63).contains(&l.len()) && l.iter().all(|&t| t.is_ascii_alphanumeric() || t == '-') && l[0] != '-' && l[l.len() - 1] != '-'
+    };
+    let host_ok = !host.is_empty() && host.split(|&t| t == '.').all(label_ok);
+    (local_ok && host_ok).then(|| (i + 1..end, format!("mailto:{address}"), end + 1))
+}
+
+/// GitHub's extended autolink at `i`: `https://`, `http://` or `www.` where a word may start (the text's start, after
+/// white space or one of `*_~(`), a domain (letters, digits, `-`, `_` in labels split by dots; `www.` needs a dot after
+/// it, and no `_` in its last two labels), then anything up to white space or `<`, less trailing punctuation (`?!.,:*_~'"`,
+/// a `)` it does not balance, an entity's `&name;`). Where it ends and where it goes (`http://` before a `www.`).
+fn bare_url(chars: &[char], i: usize) -> Option<(usize, String)> {
+    if !(i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], '*' | '_' | '~' | '(')) {
+        return None;
+    }
+    let starts = |s: &str| s.chars().enumerate().all(|(k, c)| chars.get(i + k) == Some(&c));
+    let (domain_at, www) = if starts("https://") {
+        (i + 8, false)
+    } else if starts("http://") {
+        (i + 7, false)
+    } else if starts("www.") {
+        (i, true)
+    } else {
+        return None;
+    };
+    let domain_end = domain_at + chars[domain_at..].iter().take_while(|&&t| t.is_alphanumeric() || matches!(t, '-' | '_' | '.')).count();
+    let domain = &chars[domain_at..domain_end];
+    let labels: Vec<&[char]> = domain.split(|&t| t == '.').filter(|l| !l.is_empty()).collect();
+    // `www.` and at least one label after it; a scheme's domain may be one label (localhost).
+    if labels.len() < if www { 2 } else { 1 } || labels.iter().rev().take(2).any(|l| l.contains(&'_')) {
+        return None;
+    }
+    let mut end = domain_end + chars[domain_end..].iter().take_while(|&&t| !t.is_whitespace() && t != '<').count();
+    while end > domain_at {
+        let last = chars[end - 1];
+        if "?!.,:*_~'\"".contains(last) {
+            end -= 1;
+        } else if last == ')' {
+            let open = chars[i..end].iter().filter(|&&t| t == '(').count();
+            let close = chars[i..end].iter().filter(|&&t| t == ')').count();
+            if close <= open {
+                break;
+            }
+            end -= 1;
+        } else if last == ';' {
+            // `&amp;` at the end is an entity, not part of the address.
+            let name = chars[domain_at..end - 1].iter().rev().take_while(|t| t.is_ascii_alphanumeric()).count();
+            if name == 0 || end - 1 - name <= domain_at || chars[end - 2 - name] != '&' {
+                break;
+            }
+            end -= name + 2;
+        } else {
+            break;
+        }
+    }
+    // Trimmed into the domain (`www.` then only dots): no address.
+    if end <= domain_at + usize::from(www) * 4 {
+        return None;
+    }
+    let url: String = chars[i..end].iter().collect();
+    Some((end, if www { format!("http://{url}") } else { url }))
 }
 
 /// A table column's alignment, from its delimiter cell: `:--` left, `:-:` centre, `--:` right, `---` unsaid.
@@ -449,6 +642,129 @@ mod tests {
         assert!(table(&["| a | b |", "| c | d |"]).is_none());
         // An escaped pipe shows as a pipe.
         assert_eq!(inline(&cells(r"| a \| b |")[0]).text, "a | b");
+    }
+
+    /// Each link's words as shown and where it goes.
+    fn links(m: &Inline) -> Vec<(&str, &str)> {
+        m.links.iter().map(|l| (&m.text[l.0..l.1], l.2.as_str())).collect()
+    }
+
+    /// Each struck stretch's words as shown.
+    fn struck(m: &Inline) -> Vec<&str> {
+        m.strike.iter().map(|s| &m.text[s.0..s.1]).collect()
+    }
+
+    #[test]
+    fn strike_is_ranged() {
+        let m = inline("a ~~gone~~ b ~one~ c a~~mid~~d");
+        assert_eq!(m.text, "a gone b one c amidd");
+        assert_eq!(struck(&m), ["gone", "one", "mid"]);
+        assert!(m.runs.is_empty());
+    }
+
+    /// Strikethrough holds emphasis, links and code, and a link's words may hold it.
+    #[test]
+    fn strike_nests() {
+        let m = inline("~~**bold** struck~~ and ~~[x](u) `c` *i*~~ [a ~~b~~](v)");
+        assert_eq!(m.text, "bold struck and x c i a b");
+        assert_eq!(struck(&m), ["bold struck", "x c i", "b"]);
+        assert_eq!(m.runs.iter().find(|r| r.start == 0).map(|r| (r.end, r.face)), Some((4, Face::Bold)));
+        assert!(m.runs.iter().any(|r| r.face == Face::Italic && &m.text[r.start..r.end] == "i"));
+        assert_eq!(links(&m), [("x", "u"), ("a b", "v")]);
+        assert_eq!(m.code, [(18, 19)]);
+        // Across a soft break.
+        assert_eq!(struck(&inline("~~a\nb~~")), ["a b"]);
+    }
+
+    /// Tildes without a partner of the same count, three or more, or not flanking their words stay tildes.
+    #[test]
+    fn strike_unclosed_stays_tildes() {
+        for src in ["~~open", "~~a~", "~a~~", "~~~x~~~", "a ~~ b ~~", "~~a [b~~](u)"] {
+            let m = inline(src);
+            assert!(m.strike.is_empty(), "{src}: {:?}", m.strike);
+        }
+        assert_eq!(inline("~~open").text, "~~open");
+        assert_eq!(inline("~~~x~~~").text, "~~~x~~~");
+        assert_eq!(inline("~~a [b~~](u)").text, "~~a b~~");
+    }
+
+    #[test]
+    fn strike_escaped() {
+        let m = inline(r"\~\~a\~\~ \~~b~~");
+        assert_eq!(m.text, "~~a~~ ~~b~~");
+        assert!(m.strike.is_empty());
+        // An escaped tilde next to a real pair: the pair still strikes.
+        let m = inline(r"~~a\~~~");
+        assert_eq!(m.text, "a~");
+        assert_eq!(struck(&m), ["a~"]);
+    }
+
+    /// Code spans are literal: no strike inside, and a strike over one skips the ticks' tildes.
+    #[test]
+    fn strike_not_in_code() {
+        let m = inline("`~~x~~` and ``a ~~ b``");
+        assert_eq!(m.text, "~~x~~ and a ~~ b");
+        assert!(m.strike.is_empty());
+        let m = inline("~~a `~~` b~~");
+        assert_eq!(m.text, "a ~~ b");
+        assert_eq!(struck(&m), ["a ~~ b"]);
+        assert_eq!(m.code, [(2, 4)]);
+    }
+
+    /// `<scheme:...>` and `<someone@host>` are links to themselves; other angle brackets are words.
+    #[test]
+    fn autolinks() {
+        let m = inline("see <https://x.dev/a?b=1> or <me@x.dev>, not <a b> or <nope> or 1 < 2");
+        assert_eq!(m.text, "see https://x.dev/a?b=1 or me@x.dev, not <a b> or <nope> or 1 < 2");
+        assert_eq!(links(&m), [("https://x.dev/a?b=1", "https://x.dev/a?b=1"), ("me@x.dev", "mailto:me@x.dev")]);
+        // The address is not markdown: its underscores and stars are its own.
+        let m = inline("<https://x.dev/a_b_*c*>");
+        assert_eq!(m.text, "https://x.dev/a_b_*c*");
+        assert!(m.runs.is_empty());
+    }
+
+    /// Bare `https://`, `http://` and `www.` addresses are links, less the punctuation that ends their sentence.
+    #[test]
+    fn bare_urls() {
+        let m = inline("go to https://x.dev/a_b. (see https://y.dev/(p)) www.z.dev, http://localhost:3000/x! a&amp; https://q.io/?a=1&amp;");
+        assert_eq!(
+            links(&m),
+            [
+                ("https://x.dev/a_b", "https://x.dev/a_b"),
+                ("https://y.dev/(p)", "https://y.dev/(p)"),
+                ("www.z.dev", "http://www.z.dev"),
+                ("http://localhost:3000/x", "http://localhost:3000/x"),
+                ("https://q.io/?a=1", "https://q.io/?a=1"),
+            ]
+        );
+        assert_eq!(m.text, "go to https://x.dev/a_b. (see https://y.dev/(p)) www.z.dev, http://localhost:3000/x! a&amp; https://q.io/?a=1&amp;");
+        // Only where a word starts, never mid-word; `www.` needs a domain; emphasis around one still holds.
+        for src in ["xhttps://a.dev", "www.", "https://", "www.a_b.c_d"] {
+            assert!(inline(src).links.is_empty(), "{src}");
+        }
+        let m = inline("*see https://x.dev/a_b_c*");
+        assert_eq!(m.text, "see https://x.dev/a_b_c");
+        assert_eq!(m.runs.iter().map(|r| (r.start, r.end, r.face)).collect::<Vec<_>>(), [(0, 23, Face::Italic)]);
+        assert_eq!(links(&m), [("https://x.dev/a_b_c", "https://x.dev/a_b_c")]);
+        // A link holds no link: an address in its words is words.
+        assert_eq!(links(&inline("[https://x.dev](https://y.dev)")), [("https://x.dev", "https://y.dev")]);
+    }
+
+    /// Two trailing spaces or a backslash before a newline break the line; any other newline is a space, and the next
+    /// line's indent goes. A code span keeps its own spaces and reads a newline as a space.
+    #[test]
+    fn hard_breaks() {
+        assert_eq!(inline("a  \nb").text, "a\nb");
+        assert_eq!(inline("a   \n  b").text, "a\nb");
+        assert_eq!(inline("a\\\nb").text, "a\nb");
+        assert_eq!(inline("a \nb").text, "a b");
+        assert_eq!(inline("a\n   b").text, "a b");
+        assert_eq!(inline("**a**  \nb").text, "a\nb");
+        let m = inline("`a  `\nb");
+        assert_eq!((m.text.as_str(), m.code.as_slice()), ("a   b", &[(0, 3)][..]));
+        assert_eq!(inline("`a\nb`").text, "a b");
+        // An escaped backslash before a newline is a backslash, then a soft break.
+        assert_eq!(inline("a\\\\\nb").text, "a\\ b");
     }
 
     #[test]
