@@ -4,7 +4,7 @@
 use harness_native_flecs::prelude::*;
 use harness_native_ui_inline::{Tag, files, open_target};
 use harness_native_ui_look_api::{Fill, Shape};
-use harness_native_ui_text_api::{Icon, InlineRef};
+use harness_native_ui_text_api::InlineRef;
 
 /// The module's path, as lookups write it.
 pub const MODULE: &str = "ui::inline";
@@ -33,22 +33,22 @@ pub fn target(w: WorldRef<'_>, tag: &Tag, cwd: &str, home: &str) -> Result<Strin
     open_target(&loc, line, cwd, home)
 }
 
-/// The icon a chip for `tag` shows: its file kind's for a `file_icon` component, else the entity's `Icon`; `unknown`'s
+/// The icon a chip for `tag` shows: its file kind's for a `file_icon` component, else its `glyph`; `unknown`'s
 /// for a tag that cannot open (no such component, or a bad target).
 pub fn glyph(w: WorldRef<'_>, tag: &Tag) -> String {
-    let own = component(w, tag).and_then(|(e, r)| {
+    let own = component(w, tag).and_then(|(_, r)| {
         let loc = tag.prop(r.target.as_str()).ok()?;
         open_target(&loc, None, "/", "/").ok()?;
         if r.file_icon {
             Some(files::kind_glyph(files::kind_of(&loc)).to_string())
         } else {
-            e.try_cloned::<&Icon>().map(|i| i.glyph.as_str().to_owned())
+            Some(r.glyph.as_str().to_owned())
         }
     });
     own.unwrap_or_else(|| {
         w.try_lookup(&format!("{MODULE}::unknown"))
-            .and_then(|e| e.try_cloned::<&Icon>())
-            .map(|i| i.glyph.as_str().to_owned())
-            .unwrap_or_else(|| panic!("the scene has no {MODULE}::unknown with an Icon (inline.flecs)"))
+            .and_then(|e| e.try_cloned::<&InlineRef>())
+            .map(|r| r.glyph.as_str().to_owned())
+            .unwrap_or_else(|| panic!("the scene has no {MODULE}::unknown with an InlineRef (inline.flecs)"))
     })
 }

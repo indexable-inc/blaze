@@ -19,14 +19,16 @@ pub struct MarkdownText {
 }
 
 /// One inline component of inline markdown (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar): an entity
-/// of the `ui.inline` module per name (`ui.inline.Path`), drawn as a chip of its `Icon` and its label. `target` names the
-/// prop that says where a press goes (`loc`, `href`) and `line` the prop with a line in it (empty: none); with `file_icon`
-/// the icon is the target's file kind's (harness-native-ui-inline's files.rs), not the entity's own `Icon`.
+/// of the `ui.inline` module per name (`ui.inline.Path`), drawn as a chip of its `glyph` and its label. `target` names the
+/// prop that says where a press goes (`loc`, `href`; empty: the chip opens nothing) and `line` the prop with a line in it
+/// (empty: none); with `file_icon` the icon is the target's file kind's (harness-native-ui-inline's files.rs), not `glyph`.
+/// The glyph lives here, not in an `Icon`, because inside `ui.inline` the name `Icon` resolves to the `ui.Icon` prefab.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct InlineRef {
     pub target: ScriptString,
     pub line: ScriptString,
     pub file_icon: bool,
+    pub glyph: ScriptString,
 }
 
 /// Where a truncated line loses its words for the ellipsis.

@@ -292,7 +292,7 @@ impl Painter {
         }
         let lay = Rc::new(if md {
             let m = crate::markdown::inline(text);
-            Layout::rich(&mut self.fonts, &m.text, &m.runs, &m.holes(st.size), st, 0.0, width)
+            Layout::rich_with(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size), st, 0.0, width)
         } else if code {
             Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
         } else if tabular {
@@ -333,7 +333,7 @@ impl Painter {
         let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| {
             let n = text.encode_utf16().count();
             let holes: Vec<crate::text::Hole> = holes.iter().copied().filter(|h| h.end <= n).collect();
-            Layout::rich(fonts, text, runs, &holes, st, 0.0, 1.0e5)
+            Layout::rich_with(fonts, text, runs, &[], &holes, st, 0.0, 1.0e5)
         };
         let full = rich(&mut self.fonts, &m.text, &m.runs);
         if full.lines.iter().map(|l| l.width).fold(0.0, f32::max) <= room {
