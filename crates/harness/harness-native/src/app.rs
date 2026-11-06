@@ -100,6 +100,15 @@ struct Choice {
     effort: Option<String>,
 }
 
+/// A session to select once the list has it: a spawn's, with the model and effort it was asked to start on (seeded as
+/// its chat's choice when it is selected, so its picker never shows a placeholder), or a deep link's (neither).
+#[derive(Clone, Debug)]
+struct Spawned {
+    sid: u64,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// The agent kinds cmd+N may start (Claude and Codex in the chat pane, Cursor in its terminal).
 const CHAT_KINDS: [&str; 3] = ["claude", "codex", "cursor"];
 
@@ -241,8 +250,8 @@ pub struct App {
     pressed: Vec<u16>,
     /// Session ids attached since launch: an ended one is attached again only when it is still running.
     tried: HashMap<u64, f32>,
-    /// The session a spawn made, to select once the list shows it.
-    spawned: Arc<Mutex<Option<u64>>>,
+    /// The session a spawn made (with the model and effort it was asked to start on), to select once the list shows it.
+    spawned: Arc<Mutex<Option<Spawned>>>,
     /// Why cmd+N could not start on the remembered model, shown on the new chat's models menu once it is selected.
     refuse_spawned: Option<String>,
     /// What cmd+N starts on: the agent kind last used, and by kind the model and effort last chosen (native.json
@@ -773,13 +782,16 @@ impl App {
         }
         // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
         let mut refused = None;
-        let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
-        if let Some(sid) = pending {
-            if let Some(e) = self.entity_of(sid) {
+        let pending = self.spawned.lock().unwrap().clone().filter(|_| self.restore.is_none());
+        if let Some(p) = pending {
+            if let Some(e) = self.entity_of(p.sid) {
+                // Its chat shows what it was started on from the frame it is selected in, not what its agent says once
+                // it is up (chat.rs `chat_started_on`).
+                self.chat_started_on(p.sid, p.model.as_deref(), p.effort.as_deref());
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
                 if let Some(why) = self.refuse_spawned.take() {
-                    refused = Some((sid, why));
+                    refused = Some((p.sid, why));
                 }
             }
         }
@@ -2194,7 +2206,10 @@ impl App {
         let cwd = cwd.or_else(|| std::env::var("HOME").ok());
         let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();
-        self.link.spawn(kind, cwd, model, effort, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
+        let asked = (model.clone(), effort.clone());
+        self.link.spawn(kind, cwd, model, effort, cols, rows, move |sid| {
+            *slot.lock().unwrap() = Some(Spawned { sid, model: asked.0, effort: asked.1 });
+        });
     }
 
     fn kill(&mut self) {
@@ -2229,7 +2244,7 @@ impl App {
 
     /// Select the object of daemon session `sid` once the list has it (the shot's `HARNESS_NATIVE_SHOT_SELECT`).
     pub fn select_session(&mut self, sid: u64) {
-        *self.spawned.lock().unwrap() = Some(sid);
+        *self.spawned.lock().unwrap() = Some(Spawned { sid, model: None, effort: None });
     }
 
     /// Select run `r{n}` (or its stage `k`) once the runs show it (the shot's `HARNESS_NATIVE_SHOT_SELECT=r12[.0]`).
