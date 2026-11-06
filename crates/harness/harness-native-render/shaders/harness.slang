@@ -17,7 +17,7 @@ struct Frame
     float time;
     float dark;      // 1 in the dark appearance, 0 in the light one
     float live;      // device pixels to a point this frame (the eased zoom's; `scale` is the zoom stepped to), 0: scale
-    float2 textfx;   // expressive text (textfx.rs): x how far past SDR white glowing words go (1: none), y a motion's seconds (0: nothing moves)
+    float2 textfx;   // x the display's EDR headroom (linear over SDR white, 1: SDR; hdr.rs `Frame::headroom`, read by `frame_headroom`): how far past white HDR pictures, the mark's fire and glowing words go; y a motion's seconds (0: nothing moves)
     float4 tune;     // x: text gamma dark, y: text gamma light, z: frosted glass saturation, w: unused
     float4 slug;     // outline glyphs: x emboldening (ems a side), y coverage gamma dark, z light, w the emboldening's limit (device pixels)
 };
@@ -502,6 +502,7 @@ struct ImageInst
     float4 clip;     // the band it shows in, as a panel's
     float4 clipx;    // the band across, as a panel's
     float4 light;    // a light layer when x > 1: lift the picture under it to up to x times its colour (linear), by heat
+    float4 hdr;      // an HDR picture when x = 1: premultiplied linear half floats, y its brightest (0: unknown); tone-mapped to the headroom
 };
 
 struct ImageV
@@ -537,6 +538,15 @@ float4 image_fs(ImageV v, ConstantBuffer<Frame> frame, StructuredBuffer<ImageIns
     int2 at = clamp(int2(floor(v.uv * m.size.xy)), int2(0, 0), int2(m.size.xy) - 1);
     float4 t = m.size.w > 0.5 ? tex.SampleLevel(smp, v.uv, 0) : tex.Load(int3(at, 0));
     float cover = m.size.z * in_band(v.y, m.clip, m.clip.zw, frame.scale) * in_band(v.x, m.clipx, m.clipx.zw, frame.scale);
+    if (m.hdr.x > 0.5)
+    {
+        // An HDR photo: premultiplied linear light, 1.0 SDR white. Straight, rolled off to the display, then encoded as
+        // the target is; SDR colours under the knee come out as an SDR photo's would.
+        float3 lin = t.a > 0.0 ? t.rgb / t.a : float3(0.0, 0.0, 0.0);
+        float3 c = srgb_encode_ext(tone_map_rgb(lin, m.hdr.y, frame_headroom(frame)));
+        float ah = t.a * cover;
+        return float4(c * ah, ah);
+    }
     if (m.light.x > 1.0)
     {
         // A light layer over the same picture: its colour c is already drawn here; add what takes it, in linear light,
@@ -564,6 +574,93 @@ float3 srgb_encode_ext(float3 l)
     return c * sign(l);
 }
 
+// ---- HDR: the display's headroom and the tone map (ports of hdr.rs; its tests pin the curve) ------------------------
+
+static const float HDR_WHITE_NITS = 203.0;   // hdr.rs WHITE_NITS: reference white (BT.2408)
+static const float HDR_HLG_PEAK_NITS = 1000.0;
+static const float HDR_KNEE = 0.75;
+
+// The display's headroom this frame (hdr.rs `Frame::headroom`): linear over SDR white, at least 1.
+float frame_headroom(Frame f)
+{
+    float h = f.textfx.x;
+    return isfinite(h) ? max(h, 1.0) : 1.0;
+}
+
+float hdr_knee(float h)
+{
+    return min(HDR_KNEE * max(h, 1.0), 1.0);
+}
+
+// hdr.rs `tone_map`: identity to the knee, then rolled off so `peak` (0: unknown) lands on the headroom.
+float tone_map(float x, float peak, float headroom)
+{
+    float h = max(headroom, 1.0);
+    if (!(x > 0.0))
+        return 0.0;
+    bool known = isfinite(peak) && peak > 0.0;
+    if (known && peak <= h)
+        return min(x, h);
+    float k = hdr_knee(h);
+    if (x <= k)
+        return x;
+    float span = h - k;
+    float c = known ? 1.0 / span - 1.0 / (peak - k) : 1.0 / span;
+    float a = x - k;
+    if (isinf(a))
+        return h;
+    return min(k + a / (1.0 + a * c), h);
+}
+
+// hdr.rs `tone_map_rgb`: by the brightest channel, so hue and saturation hold.
+float3 tone_map_rgb(float3 rgb, float peak, float headroom)
+{
+    float m = max(rgb.r, max(rgb.g, rgb.b));
+    if (!(m > 0.0))
+        return float3(0.0, 0.0, 0.0);
+    return rgb * (tone_map(m, peak, headroom) / m);
+}
+
+// hdr.rs `pq_linear`: a PQ signal as linear light over reference white.
+float3 pq_linear(float3 e)
+{
+    const float M1 = 0.1593017578125;
+    const float M2 = 78.84375;
+    const float C1 = 0.8359375;
+    const float C2 = 18.8515625;
+    const float C3 = 18.6875;
+    float3 p = pow(saturate(e), 1.0 / M2);
+    float3 nits = 10000.0 * pow(max(p - C1, 0.0) / (C2 - C3 * p), 1.0 / M1);
+    return nits / HDR_WHITE_NITS;
+}
+
+// hdr.rs `hlg_scene`, per channel.
+float3 hlg_scene(float3 e)
+{
+    const float A = 0.17883277;
+    const float B = 0.28466892;
+    const float C = 0.55991073;
+    e = saturate(e);
+    return select(e <= 0.5, e * e / 3.0, (exp((e - C) / A) + B) / 12.0);
+}
+
+// hdr.rs `hlg_linear`: BT.2100's OOTF for a 1000-nit display (gamma 1.2), on BT.2020 primaries.
+float3 hlg_linear(float3 e)
+{
+    float3 s = hlg_scene(e);
+    float y = dot(s, float3(0.2627, 0.6780, 0.0593));
+    return s * (HDR_HLG_PEAK_NITS * pow(max(y, 0.0), 0.2) / HDR_WHITE_NITS);
+}
+
+// hdr.rs `bt2020_to_709` (BT.2087).
+float3 bt2020_to_709(float3 c)
+{
+    return float3(
+        1.660491 * c.r - 0.5876411 * c.g - 0.0728499 * c.b,
+        -0.1245505 * c.r + 1.1329 * c.g - 0.0083494 * c.b,
+        -0.0181508 * c.r - 0.1005789 * c.g + 1.1187297 * c.b);
+}
+
 // ---- live pictures (media/: a Shader's or a Video's latest finished frame) ------------------------------------------
 
 struct SurfaceInst
@@ -573,6 +670,7 @@ struct SurfaceInst
     float4 clip;     // the band it shows in, as a panel's
     float4 clipx;    // the band across, as a panel's
     float4 uv;       // the part of the texture shown: u0, v0, u1, v1
+    float4 hdr;      // how the texture encodes light: x 0 sRGB (as it is), 1 PQ, 2 HLG; y its brightest (0: unknown); z 1 BT.2020
 };
 
 struct SurfaceV
@@ -602,7 +700,9 @@ SurfaceV surface_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBu
 }
 
 // The texture is premultiplied (a shader's picture, stored as its prelude premultiplied it) or opaque (a video frame), and
-// may be brighter than white (EDR): only the corners' coverage, the clip bands and the opacity scale it.
+// may be brighter than white (EDR): only the corners' coverage, the clip bands and the opacity scale it. An HDR video's
+// frame holds its PQ or HLG signal: decoded to linear light, brought to BT.709 primaries, rolled off to the display's
+// headroom and encoded as the target is.
 [shader("fragment")]
 float4 surface_fs(SurfaceV v, ConstantBuffer<Frame> frame, StructuredBuffer<SurfaceInst> insts, Texture2D<float4> tex, SamplerState smp)
 {
@@ -612,7 +712,15 @@ float4 surface_fs(SurfaceV v, ConstantBuffer<Frame> frame, StructuredBuffer<Surf
     float d = sd_squircle(v.local, half_size, max(r, 1e-3), max(m.shape.y, 2.0));
     float cover = saturate(0.5 - d * frame.scale);
     float a = cover * m.shape.z * in_band(v.y, m.clip, m.clip.zw, frame.scale) * in_band(v.x, m.clipx, m.clipx.zw, frame.scale);
-    return tex.SampleLevel(smp, v.uv, 0) * a;
+    float4 t = tex.SampleLevel(smp, v.uv, 0);
+    if (m.hdr.x > 0.5)
+    {
+        float3 lin = m.hdr.x > 1.5 ? hlg_linear(t.rgb) : pq_linear(t.rgb);
+        if (m.hdr.z > 0.5)
+            lin = bt2020_to_709(lin);
+        t.rgb = srgb_encode_ext(tone_map_rgb(lin, m.hdr.y, frame_headroom(frame))) * t.a;
+    }
+    return t * a;
 }
 
 struct SpriteInst
