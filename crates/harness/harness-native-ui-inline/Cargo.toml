@@ -1,0 +1,9 @@
+[package]
+name = "harness-native-ui-inline"
+description = "Inline components in an agent's words (<Path>, <FileRef>, <Symbol>, <Link>) and the file kinds they and a cell's FileRef and Icon share: what each says, its label, icon and where a press opens. Sans-IO"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

@@ -15,6 +15,7 @@ harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
 harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
 harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+harness-native-scroll-physics = { path = "../harness-native-scroll-physics" }
 
 [lints.rust]
 unsafe_code = "forbid"

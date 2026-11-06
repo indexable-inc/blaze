@@ -10,6 +10,7 @@ include widgets/row
 include widgets/rows
 include widgets/panes
 include widgets/archive
+include widgets/chat_status
 include widgets/chat
 include widgets/genui
 include widgets/palette

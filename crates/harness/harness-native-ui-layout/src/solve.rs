@@ -23,7 +23,8 @@
 //! a `Grid` sizes columns by their widest cell; `GridColumns` makes adaptive columns; `Lazy` stands for rows that do not
 //! exist yet and says which are in view (`range`); a Row aligned on `FirstBaseline`/`LastBaseline` lines up its text;
 //! `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's `SafeAreaInset` (a
-//! second pass, once the first has said where the node is).
+//! second pass, once the first has said where the node is); a `GrowLimit` caps a growing height at a share of its pane's
+//! (`grow_limits`, a second height pass once the first has said how tall the pane is).
 use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, Side, SizeKind, Sizing};
 use harness_native_ui_node_api::Laid;
 
@@ -52,6 +53,15 @@ pub struct LazySpec {
     pub count: u32,
     pub row: f32,
     pub overscan: u32,
+}
+
+/// A `GrowLimit`: its height at most `share` of its nearest ancestor's whose height does not come from its content, less
+/// `keep`; `max` is its own `Size.h.max` (0: none), which still caps it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimitSpec {
+    pub share: f32,
+    pub keep: f32,
+    pub max: f32,
 }
 
 /// One node as the solver sees it.
@@ -94,6 +104,8 @@ pub struct Item {
     pub safe: [f32; 4],
     /// Its `SafeAreaPadding` edges, left, right, top, bottom.
     pub safe_pad: [bool; 4],
+    /// Its `GrowLimit` (`grow_limits` writes the cap it gives into `size[1].max`).
+    pub limit: Option<LimitSpec>,
     pub children: Vec<usize>,
     pub nat: [f32; 2],
     /// How far a parent's shortfall may shrink it on each axis.
@@ -185,8 +197,47 @@ fn pass(items: &mut [Item], root: usize, room: [f32; 2]) {
     natural(items, root, 1);
     let h = root_size(&items[root], 1, room[1]);
     assign(items, root, 1, h);
+    if grow_limits(items) {
+        natural(items, root, 1);
+        let h = root_size(&items[root], 1, room[1]);
+        assign(items, root, 1, h);
+    }
     let view = [items[root].out.x, items[root].out.y, items[root].out.x + room[0].max(w), items[root].out.y + room[1].max(h)];
     place(items, root, view);
+}
+
+/// Cap each `GrowLimit` node's height (its `size[1].max`) at its share of its nearest ancestor whose height does not come
+/// from its content, from the heights just assigned. That ancestor's height does not depend on the node's, so one more
+/// height pass settles it. Whether a cap moved.
+fn grow_limits(items: &mut [Item]) -> bool {
+    if items.iter().all(|it| it.limit.is_none()) {
+        return false;
+    }
+    let mut parent = vec![usize::MAX; items.len()];
+    for (i, it) in items.iter().enumerate() {
+        for &c in &it.children {
+            parent[c] = i;
+        }
+    }
+    let mut moved = false;
+    for i in 0..items.len() {
+        let Some(l) = items[i].limit else { continue };
+        let mut p = parent[i];
+        while p != usize::MAX && items[p].size[1].kind == SizeKind::Fit {
+            p = parent[p];
+        }
+        let cap = if p == usize::MAX {
+            l.max
+        } else {
+            let c = (l.share * items[p].out.h - l.keep).max(items[i].size[1].min).max(1.0);
+            if l.max > 0.0 { c.min(l.max) } else { c }
+        };
+        if (items[i].size[1].max - cap).abs() > 0.01 {
+            items[i].size[1].max = cap;
+            moved = true;
+        }
+    }
+    moved
 }
 
 /// Pad every `SafeAreaPadding` node by how far it reaches into the inset of the nearest `SafeAreaInset` above it (`safe`, as
@@ -1149,6 +1200,31 @@ mod tests {
         items[0].size[0] = Sizing::fixed(400.0);
         solve(&mut items, 0, [800.0, 600.0]);
         assert!(!items[1].hidden && items[2].hidden);
+    }
+
+    /// A pane 400 tall holding a transcript (Grow) over a foot (Fit) around a growing area of 1 000 points of words,
+    /// limited to 0.85 of the pane less 40: the area stops at 300 and the transcript keeps the rest; short words keep
+    /// their own height; the area's own `Size.h.max` still caps it.
+    #[test]
+    fn a_grow_limit_caps_a_fit_height_at_a_share_of_its_pane() {
+        let col = |children| Item { flex: Flex { axis: FlexAxis::Column, align: Align::Stretch, ..Flex::default() }, ..item([Sizing::GROW, Sizing::FIT], children) };
+        let pane = Item { size: [Sizing::GROW, Sizing::GROW], ..col(vec![1, 2]) };
+        let list = Item { size: [Sizing::GROW, Sizing::GROW], ..col(vec![]) };
+        let foot = Item { pad: [0.0, 0.0, 10.0, 10.0], ..col(vec![3]) };
+        let area = Item { scrolls: true, clip: true, limit: Some(LimitSpec { share: 0.85, keep: 40.0, max: 0.0 }), ..col(vec![4]) };
+        let mut items = vec![pane, list, foot, area, text(100.0, 1000.0, 15.0, 15.0)];
+        solve(&mut items, 0, [300.0, 400.0]);
+        let cap = 0.85f32 * 400.0 - 40.0;
+        assert_eq!(items[3].out.h, cap);
+        assert_eq!(items[2].out.h, cap + 20.0);
+        assert_eq!(items[1].out.h, 400.0 - (cap + 20.0));
+        items[4].intrinsic[1] = 60.0;
+        solve(&mut items, 0, [300.0, 400.0]);
+        assert_eq!(items[3].out.h, 60.0);
+        items[4].intrinsic[1] = 1000.0;
+        items[3].limit = Some(LimitSpec { share: 0.85, keep: 40.0, max: 132.0 });
+        solve(&mut items, 0, [300.0, 400.0]);
+        assert_eq!(items[3].out.h, 132.0);
     }
 
     /// The root's 32-point top inset pads a child at the top by 32 and one already below it by nothing.

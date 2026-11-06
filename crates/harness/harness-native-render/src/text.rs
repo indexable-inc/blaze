@@ -78,10 +78,12 @@ pub enum Face {
     CodeWeight(u16),
     /// Code's slant: a comment, the prose the program skips.
     CodeItalic,
-    /// Code amid prose (markdown's `` `code` ``): the code font a little smaller than the words
-    /// ([`crate::markdown::INLINE_CODE_EM`]), so it reads at their size, with room for the chip it is drawn on either side
-    /// of it ([`crate::markdown::chip_room`]).
+    /// Code amid prose (markdown's `` `code` ``): the words' own UI face on a chip (prose is never monospace; only a fenced
+    /// block is), untracked, with room for the chip either side of it ([`crate::markdown::chip_room`]).
     InlineCode,
+    /// An inline component's icon hole and label (`<Path loc="...">blaze</Path>`, [`crate::markdown::InlineTag`]): the UI
+    /// face at medium weight, with room for its chip either side as inline code has.
+    InlineRef,
     /// Level 1 to 6.
     Heading(u8),
     /// A font by its PostScript name (a font setting's preview, plugins/schema.rs `FONTS`); the text font when this
@@ -816,7 +818,8 @@ impl Fonts {
             Face::Code => code_font(size * self.look.code_scale, 400, false),
             Face::CodeWeight(weight) => code_font(size * self.look.code_scale, weight, false),
             Face::CodeItalic => code_font(size * self.look.code_scale, 400, true),
-            Face::InlineCode => code_font(size * self.look.code_scale * crate::markdown::INLINE_CODE_EM, 400, false),
+            Face::InlineCode => self.ui_font(size, false),
+            Face::InlineRef => self.face_font(size, Face::Medium),
             Face::Heading(level) => self.ui_font(self.heading_size(level), true),
             Face::Named(name) => text_font(name, size).unwrap_or_else(|| self.ui_font(size, false)),
         };
@@ -860,15 +863,15 @@ fn typesetter(
         if r.face.is_code() {
             attrs.kern[r.start..r.end.min(len)].fill(0.0);
             attrs.code[r.start..r.end.min(len)].fill(true);
-            if r.face == Face::InlineCode {
-                // The chip's room: after the unit before the span and after its last unit (runs come in order, so the
-                // unit before is already set).
-                let (before, after) = crate::markdown::chip_room(&units, r.start, r.end.min(len), style.size);
-                if r.start > 0 {
-                    attrs.kern[r.start - 1] += before;
-                }
-                attrs.kern[r.end.min(len) - 1] += after;
+        }
+        if matches!(r.face, Face::InlineCode | Face::InlineRef) {
+            // The chip's room: after the unit before the span and after its last unit (runs come in order, so the
+            // unit before is already set).
+            let (before, after) = crate::markdown::chip_room(&units, r.start, r.end.min(len), style.size);
+            if r.start > 0 {
+                attrs.kern[r.start - 1] += before;
             }
+            attrs.kern[r.end.min(len) - 1] += after;
         } else if let Face::Heading(level) = r.face {
             attrs.kern[r.start..r.end.min(len)]
                 .fill(fonts.look.heading_tracking * fonts.heading_size(level));

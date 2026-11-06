@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 harness-native-model = { path = "../harness-native-model" }
+harness-native-ui-inline = { path = "../harness-native-ui-inline" }
 harness-native-flecs = { path = "../harness-native-flecs", features = ["json"] }
 harness-native-ecs = { path = "../harness-native-ecs" }
 harness-native-api = { path = "../harness-native-api" }

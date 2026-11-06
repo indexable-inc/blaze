@@ -17,6 +17,7 @@ use objc2_app_kit::{
     NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
     NSVisualEffectView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
+use harness_native_render::hdr::Headroom;
 use harness_native_ui_input_api::Pointer;
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
@@ -219,6 +220,50 @@ fn arm_kip_nap(secs: f64) {
             st.app.kip_woke(secs);
             st.link.setPaused(false);
         });
+    });
+}
+
+/// The headroom of the screen `view`'s window is on (SDR when it is on none). Public NSScreen API: CoreDisplay's private
+/// `CoreDisplay_Display_Get{Current,Potential,Reference}Headroom` were measured to return the same numbers (macOS 27,
+/// built-in XDR: 1.0, 16.0, 0.0), so they would add nothing (rule macos-private-apis).
+fn screen_headroom(view: &NSView) -> Headroom {
+    let Some(screen) = view.window().and_then(|w| w.screen()) else { return Headroom::SDR };
+    Headroom {
+        current: screen.maximumExtendedDynamicRangeColorComponentValue() as f32,
+        potential: screen.maximumPotentialExtendedDynamicRangeColorComponentValue() as f32,
+        reference: screen.maximumReferenceExtendedDynamicRangeColorComponentValue() as f32,
+    }
+}
+
+/// How often an idle app on an HDR-capable screen looks at the headroom again: AppKit posts nothing when it moves (with
+/// brightness, or as other HDR content comes and goes; no public notification exists and CoreDisplay's private
+/// `CDNotificationRegisterCallback` is undocumented), and a drawn frame reads it anyway.
+const HEADROOM_WATCH: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The app went idle on a screen with room past white: look at the headroom once in [`HEADROOM_WATCH`] and draw again
+/// only if it moved (the frame re-arms this when it idles again), unless a frame was drawn meanwhile.
+fn arm_headroom_watch() {
+    let at = FRAMES_DRAWN.load(Ordering::SeqCst);
+    let when = dispatch2::DispatchTime::try_from(HEADROOM_WATCH).expect("a short delay");
+    let _ = DispatchQueue::main().after(when, move || {
+        if FRAMES_DRAWN.load(Ordering::SeqCst) != at {
+            return;
+        }
+        let moved = with(|st| {
+            let h = st.window.contentView().map_or(Headroom::SDR, |v| screen_headroom(&v));
+            h != st.app.headroom
+        });
+        match moved {
+            Some(true) => {
+                with(|st| {
+                    st.app.poke();
+                    st.link.setPaused(false);
+                });
+            }
+            // Unchanged: keep watching while idle.
+            Some(false) => arm_headroom_watch(),
+            None => {}
+        }
     });
 }
 
@@ -583,6 +628,19 @@ define_class!(
             self.sync_chrome();
         }
 
+        /// The window moved to another screen, or a screen changed: the next frame reads its headroom (`screen_headroom`).
+        #[unsafe(method(screenChanged:))]
+        fn screen_changed(&self, _note: &NSNotification) {
+            let headroom = screen_headroom(self);
+            with(|st| {
+                if headroom != st.app.headroom {
+                    st.app.headroom = headroom;
+                    st.app.poke();
+                    st.link.setPaused(false);
+                }
+            });
+        }
+
         /// The window came into sight or went out of it ([`UNSEEN`]).
         #[unsafe(method(windowOcclusionChanged:))]
         fn occlusion_changed(&self, _note: &NSNotification) {
@@ -874,7 +932,13 @@ impl HarnessView {
                 Some(self),
             )));
         }
+        let headroom = screen_headroom(self);
         with(|st| {
+            // The headroom moves with brightness and the screen: a change redraws (HDR pictures and the fire follow it).
+            if headroom != st.app.headroom {
+                st.app.headroom = headroom;
+                st.app.poke();
+            }
             let dt = st.last.map_or(1.0 / 120.0, |l| (t - l).clamp(0.0, 0.1)) as f32;
             st.last = Some(t);
             (st.points, st.backing) = ((points.width as f32, points.height as f32), backing as f32);
@@ -935,6 +999,9 @@ impl HarnessView {
                     }
                     if let Some(secs) = st.app.kip_nap() {
                         arm_kip_nap(secs);
+                    }
+                    if st.app.headroom.potential > 1.0 {
+                        arm_headroom_watch();
                     }
                 }
                 (false, _) if st.calm => {
@@ -1242,6 +1309,11 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     layer.setColorspace(
         CGColorSpace::with_name(Some(unsafe { kCGColorSpaceExtendedSRGB })).as_deref(),
     );
+    // EDR: values past 1.0 in the extended sRGB target show brighter than SDR white, up to the screen's headroom
+    // (`screen_headroom`); SDR content (everything at or under 1.0) is unchanged. `preferredDynamicRange` replaces the
+    // deprecated `wantsExtendedDynamicRangeContent` (macOS 26).
+    // SAFETY: CADynamicRangeHigh is a valid static dynamic range name.
+    layer.setPreferredDynamicRange(unsafe { objc2_quartz_core::CADynamicRangeHigh });
     // SAFETY: kCAGravityTopLeft is a valid static gravity name.
     layer.setContentsGravity(unsafe { kCAGravityTopLeft });
     view.setLayer(Some(&layer));
@@ -1362,6 +1434,19 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             sel!(windowOcclusionChanged:),
             Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
             Some(&window),
+        );
+        // The headroom is the screen's: moving to another screen, or a screen's mode changing, redraws at its headroom.
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(screenChanged:),
+            Some(objc2_app_kit::NSWindowDidChangeScreenNotification),
+            Some(&window),
+        );
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(screenChanged:),
+            Some(objc2_app_kit::NSApplicationDidChangeScreenParametersNotification),
+            None,
         );
         // AppKit lays the title bar (and the traffic lights) out again after these.
         for name in [

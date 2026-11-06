@@ -18,6 +18,19 @@ pub struct MarkdownText {
     pub link_light: harness_native_ui_look_api::Rgba,
 }
 
+/// One inline component of inline markdown (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar): an entity
+/// of the `ui.inline` module per name (`ui.inline.Path`), drawn as a chip of its `glyph` and its label. `target` names the
+/// prop that says where a press goes (`loc`, `href`; empty: the chip opens nothing) and `line` the prop with a line in it
+/// (empty: none); with `file_icon` the icon is the target's file kind's (harness-native-ui-inline's files.rs), not `glyph`.
+/// The glyph lives here, not in an `Icon`, because inside `ui.inline` the name `Icon` resolves to the `ui.Icon` prefab.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct InlineRef {
+    pub target: ScriptString,
+    pub line: ScriptString,
+    pub file_icon: bool,
+    pub glyph: ScriptString,
+}
+
 /// Where a truncated line loses its words for the ellipsis.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -42,6 +55,24 @@ pub struct Truncate {
 /// sidebar rows). Its height is one line's whatever its width. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct OneLine;
+
+/// What a one-line node (`OneLine`, `Truncate`) shows of `text`: its first line that is not blank, with an ellipsis when
+/// more lines follow. A one-line node is one line tall in a box laid for one line (a table row is fixed height), so a hard
+/// line break must never reach the shaper: it would measure and draw every line from the node's origin, over its
+/// neighbours. Measuring and drawing both go through this, so they agree.
+#[must_use]
+pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut lines = text.lines().map(str::trim_end).skip_while(|l| l.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    if lines.any(|l| !l.trim().is_empty()) {
+        std::borrow::Cow::Owned(format!("{first} \u{2026}"))
+    } else {
+        std::borrow::Cow::Borrowed(first)
+    }
+}
 
 /// The glyph of an `Icon`, by name in den's icon set.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
@@ -121,14 +152,6 @@ pub struct KipStand {
     pub y: f32,
     pub dx: f32,
     pub dy: f32,
-}
-
-/// How long a `Kip` shown for a moment (a turn's outcome on the composer) stays, `secs`, the last `fade` of them fading
-/// out. Read from a scene prefab by its host; nothing draws it.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct KipLinger {
-    pub secs: f32,
-    pub fade: f32,
 }
 
 /// A block caret after the last glyph a node's words show (a `Pose.cut` types them on), in `ink`, from `at` to `until`
@@ -242,6 +265,7 @@ pub struct VectorText {
 hyperion_api_layouts::api_layouts! {
     "Text" => alias Text,
     "MarkdownText" => alias MarkdownText,
+    "InlineRef" => alias InlineRef,
     "OneLine" => alias OneLine,
     "Icon" => alias Icon,
     "Mark" => alias Mark,
@@ -252,7 +276,6 @@ hyperion_api_layouts::api_layouts! {
     "BlazeMark" => alias BlazeMark,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
-    "KipLinger" => alias KipLinger,
     "Caret" => alias Caret,
     "TextEdit" => alias TextEdit,
     "Highlight" => alias Highlight,
@@ -269,6 +292,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Text>().writable();
     world.component::<MarkdownText>().writable();
+    world.component::<InlineRef>().writable();
     world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();
@@ -279,7 +303,6 @@ pub fn register(world: &World) {
     world.component::<BlazeMark>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
-    world.component::<KipLinger>().writable();
     world.component::<Caret>().writable();
     world.component::<TextEdit>().writable();
     world.component::<Highlight>().writable();
@@ -288,4 +311,18 @@ pub fn register(world: &World) {
     world.component::<Truncate>().writable();
     world.component::<Vector>().writable();
     world.component::<VectorText>().writable();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::one_line;
+
+    #[test]
+    fn one_line_never_breaks() {
+        assert_eq!(one_line("plain"), "plain");
+        assert_eq!(one_line("395: a\n396: b"), "395: a \u{2026}");
+        assert_eq!(one_line("\n\n  first  \n"), "  first");
+        assert_eq!(one_line("a\r\nb"), "a \u{2026}");
+        assert_eq!(one_line("\n"), "");
+    }
 }

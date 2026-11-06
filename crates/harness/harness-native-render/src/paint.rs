@@ -34,6 +34,9 @@ struct Sheet {
     w: u32,
     h: u32,
     frames: Vec<Rc<[u8]>>,
+    /// An HDR photo's brightest light (linear over reference white; its frames are premultiplied linear half floats,
+    /// photo.rs): None for sRGB RGBA8 texels.
+    peak: Option<f32>,
 }
 
 /// The host's fonts, glyph atlas and layout cache, and the pictures it has decoded.
@@ -292,7 +295,7 @@ impl Painter {
         }
         let lay = Rc::new(if md {
             let m = crate::markdown::inline(text);
-            Layout::rich(&mut self.fonts, &m.text, &m.runs, &[], st, 0.0, width)
+            Layout::rich_with(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size), st, 0.0, width)
         } else if code {
             Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
         } else if tabular {
@@ -329,7 +332,12 @@ impl Painter {
     fn layout_md_cut(&mut self, src: &str, style: &TextStyle, room: f32) -> (Rc<Layout>, crate::markdown::Inline) {
         let mut m = crate::markdown::inline(src);
         let st = set_of(style);
-        let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| Layout::rich(fonts, text, runs, &[], st, 0.0, 1.0e5);
+        let holes = m.holes(st.size);
+        let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| {
+            let n = text.encode_utf16().count();
+            let holes: Vec<crate::text::Hole> = holes.iter().copied().filter(|h| h.end <= n).collect();
+            Layout::rich_with(fonts, text, runs, &[], &holes, st, 0.0, 1.0e5)
+        };
         let full = rich(&mut self.fonts, &m.text, &m.runs);
         if full.lines.iter().map(|l| l.width).fold(0.0, f32::max) <= room {
             return (Rc::new(full), m);
@@ -352,6 +360,10 @@ impl Painter {
         m.links.retain_mut(|l| {
             l.1 = l.1.min(keep);
             l.0 < l.1
+        });
+        m.tags.retain_mut(|t| {
+            t.end = t.end.min(keep);
+            t.start < t.end
         });
         m.text = cut;
         (Rc::new(lay), m)
@@ -520,14 +532,16 @@ impl Painter {
                 // Whether the words were cut to fit (their glyphs are then not the text's).
                 let mut elided = false;
                 let lay = if let (Some(_), Some(_)) = (truncate, md) {
-                    // Inline markdown on one line (a table's cell): cut at its end, its faces kept.
-                    let (lay, m) = self.layout_md_cut(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                    // Inline markdown on one line (a table's cell): its first line (`one_line`), cut at its
+                    // end, its faces kept.
+                    let (lay, m) = self.layout_md_cut(&harness_native_ui_text_api::one_line(text.s.as_str()), &style, laid.w.max(1.0) + 0.5);
                     shown_md = Some(m);
                     lay
                 } else if let Some(mode) = truncate {
-                    // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
+                    // One line, never wrapped: its first line (`one_line`, as layout measured it), cut with an
+                    // ellipsis (at its end, middle or start) to the width layout gave it.
                     let room = laid.w.max(1.0) + 0.5;
-                    let cut = typeset::elide(text.s.as_str(), mode, room, |t| {
+                    let cut = typeset::elide(&harness_native_ui_text_api::one_line(text.s.as_str()), mode, room, |t| {
                         self.layout(t, &style, 1.0e5)
                             .lines
                             .iter()
@@ -650,6 +664,37 @@ impl Painter {
                             let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                             let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
+                        }
+                    }
+                    // Inline components on the same chip: one plate from the icon's hole to the end of the label, the
+                    // icon drawn in the hole in the look's ink (quiet: the label carries the meaning).
+                    let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
+                    if !tags.is_empty() {
+                        let (icon_ink, ref_shape) = crate::inline::look(e.world(), dark);
+                        let icon_style = TextStyle {
+                            size: size * crate::markdown::REF_ICON_SIZE_EM,
+                            line: set_of(&style).line,
+                            ..TextStyle::default()
+                        };
+                        for t in tags {
+                            let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
+                            let rects = spans_of(&lay, t.start, t.end);
+                            let last = rects.len().saturating_sub(1);
+                            for (k, r) in rects.iter().enumerate() {
+                                let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                                let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
+                                let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
+                                d.panel(panel_from(chip, [0.0; 4], ref_shape, rect, p.alpha));
+                            }
+                            // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
+                            let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
+                            let glyph = crate::inline::glyph(e.world(), &t.tag);
+                            let icon = self.layout(&glyph, &icon_style, 1.0e5);
+                            let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                            let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
+                            let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
+                            let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
+                            emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
                         }
                     }
                 }
@@ -933,6 +978,7 @@ impl Painter {
                 clip: [0.0; 4],
                 clipx: [0.0; 4],
                 uv: [0.0, 0.0, 1.0, 1.0],
+                hdr: [0.0; 4],
             };
             d.surface(inst, sf.key);
             return Ok(());
@@ -967,14 +1013,16 @@ impl Painter {
             let sheet = match self.sheets.get(&key) {
                 Some(s) => s.clone(),
                 None => {
-                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0))
+                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0), true)
                         .map_err(|err| format!("{path}: {err}"))?;
-                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba] });
+                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba], peak: ph.peak });
                     self.sheets.insert(key, s.clone());
                     s
                 }
             };
-            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
+            // An HDR photo is drawn in its own range, tone-mapped to the display's headroom from its brightest.
+            let hdr = sheet.peak.map_or([0.0; 4], |peak| [1.0, peak, 0.0, 0.0]);
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr };
             d.image(img, sheet.frames[0].clone());
             return Ok(());
         }
@@ -984,7 +1032,7 @@ impl Painter {
             .map_err(|err| format!("{path}: {err}"))?;
         let frame = ((time * frames.fps).floor().max(0.0) as usize) % sheet.frames.len();
         let img =
-            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
+            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] };
         d.image(img, sheet.frames[frame].clone());
         Ok(())
     }
@@ -1025,11 +1073,14 @@ impl Painter {
         let place = |r: [f32; 4]| [rect[0] + (r[0] - rest[0]) * k, rect[1] + (r[1] - rest[1]) * k, r[2] * k, r[3] * k];
         let size = [img.w as f32, img.h as f32, alpha, 0.0];
         let at = place([x, y, img.w as f32 / sc, img.h as f32 / sc]);
-        d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] }, img.rgba.into());
-        // Past white: the hot pixels again, as light over the picture, lifting them by heat up to `glow` whites.
-        if m.glow > 1.0 {
-            let light = [m.glow, 0.0, 0.0, 0.0];
-            d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light }, img.light.into());
+        d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] }, img.rgba.into());
+        // Past white: the hot pixels again, as light over the picture, lifting them by heat up to `glow` whites. A scene
+        // that sets its glow (a video's HDR10 master) gets that; otherwise the fire burns up to the display's headroom this
+        // frame (1 on an SDR display: no light layer at all, the picture exactly as before).
+        let glow = if m.glow > 0.0 { m.glow } else { d.frame.headroom() };
+        if glow > 1.0 {
+            let light = [glow, 0.0, 0.0, 0.0];
+            d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light, hdr: [0.0; 4] }, img.light.into());
         }
         Ok(())
     }
@@ -1077,7 +1128,7 @@ impl Painter {
         let h = info.height / count;
         let per = (info.width * h * 4) as usize;
         let frames = rgba.chunks_exact(per).map(Rc::from).collect();
-        let sheet = Rc::new(Sheet { w: info.width, h, frames });
+        let sheet = Rc::new(Sheet { w: info.width, h, frames, peak: None });
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
     }
@@ -1124,7 +1175,8 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
             let l = &lay.lines[li];
             (x, l.top, l.height)
         };
-        let w = (2.0 * sc).round().max(1.0) / sc;
+        // 1.5 points, whole device pixels (3 on a Retina display): crisp, never a smear between two.
+        let w = (1.5 * sc).round().max(1.0) / sc;
         let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
         let on = if t.blink { caret_blink(time - t.since) } else { 1.0 };
         if on > 0.004 {
@@ -1137,16 +1189,23 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
 pub const BLINK_PAUSE: f32 = 0.5;
 pub const BLINK_PERIOD: f32 = 1.2;
 
-/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then a smooth fade in and out
-/// every [`BLINK_PERIOD`].
+/// How long a blink's turn on or off takes, seconds: short, so the caret reads as on or off, not as pulsing.
+pub const BLINK_FADE: f32 = 0.08;
+
+/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then every [`BLINK_PERIOD`]
+/// on for half of it and off for the other half, each turn a [`BLINK_FADE`] ease (macOS's caret, softened by a frame).
 #[must_use]
 pub fn caret_blink(since: f32) -> f32 {
     let t = since - BLINK_PAUSE;
     if t <= 0.0 {
         return 1.0;
     }
-    let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
-    let k = (v + 0.5).clamp(0.0, 1.0);
+    let half = BLINK_PERIOD * 0.5;
+    let phase = t % BLINK_PERIOD;
+    // Off from `half`, back on from the period's end: the distance into each turn, as a share of its fade.
+    let k = if phase < half { 1.0 - ((phase - half + BLINK_FADE) / BLINK_FADE).clamp(0.0, 1.0) } else {
+        ((phase - BLINK_PERIOD + BLINK_FADE) / BLINK_FADE).clamp(0.0, 1.0)
+    };
     k * k * (3.0 - 2.0 * k)
 }
 

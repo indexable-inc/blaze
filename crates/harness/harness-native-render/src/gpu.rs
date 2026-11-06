@@ -204,12 +204,14 @@ impl Renderer {
         };
     }
 
-    /// A picture's texture: `w` by `h` texels of straight RGBA8.
-    fn picture(&self, w: usize, h: usize, px: &[u8]) -> Tex {
+    /// A picture's texture: `w` by `h` texels of `bytes` each: straight RGBA8 (4), or an HDR picture's RGBA half floats
+    /// (8, `ImageInst::texel_bytes`).
+    fn picture(&self, w: usize, h: usize, bytes: usize, px: &[u8]) -> Tex {
+        let format = if bytes == 8 { MTLPixelFormat::RGBA16Float } else { MTLPixelFormat::RGBA8Unorm };
         // SAFETY: a plain 2D descriptor of a supported format and a positive size.
         let d = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::RGBA8Unorm,
+                format,
                 w.max(1),
                 h.max(1),
                 false,
@@ -221,14 +223,15 @@ impl Renderer {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize { width: w, height: h, depth: 1 },
         };
-        assert_eq!(px.len(), w * h * 4, "picture texels");
-        // SAFETY: px holds w*h tightly packed RGBA texels and stays alive for the call; the region is the whole texture.
+        assert_eq!(px.len(), w * h * bytes, "picture texels");
+        // SAFETY: px holds w*h tightly packed texels of `bytes` each, the texture's format, and stays alive for the call;
+        // the region is the whole texture.
         unsafe {
             t.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,
                 0,
                 NonNull::new(px.as_ptr().cast_mut().cast::<c_void>()).unwrap(),
-                w * 4,
+                w * bytes,
             )
         };
         t
@@ -299,6 +302,8 @@ impl Renderer {
                 let mut inst = *inst;
                 if let Some((_, size)) = media.texture(*key) {
                     inst.uv = cover_uv(inst.rect, inst.shape[3] != 0.0, size);
+                    // How its texels encode light (an HDR video's PQ or HLG), so the pass brings it into the frame's range.
+                    inst.hdr = media.encoding(*key);
                 }
                 inst
             })
@@ -309,7 +314,7 @@ impl Renderer {
             .images
             .iter()
             .zip(&draw.texels)
-            .map(|(m, px)| self.picture(m.size[0] as usize, m.size[1] as usize, px))
+            .map(|(m, px)| self.picture(m.size[0] as usize, m.size[1] as usize, m.texel_bytes(), px))
             .collect();
         // Kips whose pose changed render their pictures first, in a command buffer committed before the frame's.
         self.kips.prepare(&self.queue, &draw.kips);
@@ -501,6 +506,12 @@ impl Renderer {
 
     /// Read an offscreen texture back as tightly packed RGBA8 bytes, extended range clipped to SDR.
     pub fn read(&self, t: &Tex) -> Vec<u8> {
+        self.read_float(t).into_iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+    }
+
+    /// Read an offscreen texture back as it is: RGBA floats, sRGB-encoded and extended (past 1.0 is brighter than SDR
+    /// white, up to the frame's headroom), premultiplied.
+    pub fn read_float(&self, t: &Tex) -> Vec<f32> {
         let (w, h) = (t.width(), t.height());
         let mut v = vec![0u16; w * h * 4];
         let region = MTLRegion {
@@ -516,7 +527,7 @@ impl Renderer {
                 0,
             )
         };
-        v.into_iter().map(|h| (half_to_f32(h).clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+        v.into_iter().map(half_to_f32).collect()
     }
 }
 
@@ -541,7 +552,7 @@ fn cover_uv(rect: [f32; 4], cover: bool, size: [u32; 2]) -> [f32; 4] {
 }
 
 /// An IEEE half float's bits as an f32.
-fn half_to_f32(h: u16) -> f32 {
+pub(crate) fn half_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = i32::from((h >> 10) & 0x1f);
     let frac = f32::from(h & 0x3ff);

@@ -76,7 +76,8 @@ impl Cell {
         match self.kind {
             Kind::Url => Cow::Borrowed(host(&self.text)),
             Kind::Bool => Cow::Borrowed(if self.text == "true" { "\u{2713}" } else { "\u{2013}" }),
-            _ => Cow::Borrowed(&self.text),
+            // One line in its row: a value of several shows its first (`OneLine` never breaks).
+            _ => harness_native_ui_text_api::one_line(&self.text),
         }
     }
 
@@ -452,9 +453,10 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
                     _ => false,
                 }
             });
+            // A value of several lines shows only its first ([`Cell::shown`]): cut too.
             let tip = match cell.kind {
                 Kind::Url => Some(cell.text.clone()),
-                _ if cut => Some(cell.text.clone()),
+                _ if cut || shown != cell.text.as_str() => Some(cell.text.clone()),
                 _ => None,
             };
             let had = v.entity().try_cloned::<&Tooltip>();

@@ -46,7 +46,8 @@ pub struct Draw {
     pub paths: Vec<PathInst>,
     /// Every path's edges (ax, ay, bx, by in points), each path a run of them.
     pub edges: Vec<[f32; 4]>,
-    /// Pictures and their straight RGBA8 texels (`size` wide and high), one texture each.
+    /// Pictures and their texels (`size` wide and high), one texture each: straight sRGB RGBA8, or for an HDR picture
+    /// (`ImageInst::hdr[0]` = 1) premultiplied linear RGBA half floats, 8 bytes a texel.
     pub images: Vec<ImageInst>,
     pub texels: Vec<Rc<[u8]>>,
     /// The Kips this frame draws (kip.rs renders each picture before the frame, the pass sets them in by `segs`).
@@ -106,9 +107,9 @@ impl Draw {
         self.push_seg(SegKind::Kip, self.kips.len() - 1);
     }
 
-    /// A picture: `texels` (straight RGBA8, `size[0]` by `size[1]`) over `img.rect`.
+    /// A picture: `texels` (`size[0]` by `size[1]`: straight RGBA8, or RGBA half floats for an HDR one) over `img.rect`.
     pub fn image(&mut self, img: ImageInst, texels: Rc<[u8]>) {
-        debug_assert_eq!(texels.len(), img.size[0] as usize * img.size[1] as usize * 4);
+        debug_assert_eq!(texels.len(), img.size[0] as usize * img.size[1] as usize * img.texel_bytes());
         self.images.push(img);
         self.texels.push(texels);
         self.push_seg(SegKind::Image, self.images.len() - 1);

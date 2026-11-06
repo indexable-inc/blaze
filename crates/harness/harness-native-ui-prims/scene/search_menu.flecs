@@ -1,0 +1,57 @@
+// A searchable menu: a ui.Menu whose first row is a filter field. While it is open the keys go to the filter (its owner
+// routes typing there), its rows are fuzzy-matched against what is typed (harness_native_ui_view::search: the matching
+// items of each section, heads and separators kept only around what is left, a note when nothing matches), the arrows
+// and Return pick (the first match is highlighted as soon as there is a query) and Escape closes it. Rows go under its
+// `items`, not on the plate. Any menu that offers more than a handful of choices uses it (the chat's model picker).
+
+@tree ChildOf
+ui {
+  // The filter: a magnifier in the check gutter, then what is typed, the caret after it, and the hint muted after the
+  // caret while nothing is typed (as a macOS search field's).
+  prefab MenuFilter : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
+    glyph : ui.Symbol, Muted {
+      Icon: {glyph: ""}
+      Size: {w: {kind: Fixed, value: $menu_check, min: 0, max: 0}, h: {kind: Fixed, value: $menu_check, min: 0, max: 0}}
+    }
+    gutter : ui.Node {
+      Size: {w: {kind: Fixed, value: $menu_gutter_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    text : ui.Line, Strong {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+    caret : ui.Node {
+      Fill: $tone_ink_1
+      Size: {w: {kind: Fixed, value: $menu_caret_w, min: 0, max: 0}, h: {kind: Fixed, value: $line_menu, min: 0, max: 0}}
+    }
+    hint : ui.Lead, Muted {
+      Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+  prefab SearchMenu : ui.Menu {
+    filter : ui.MenuFilter {}
+    rule : ui.MenuSep {}
+    items : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  // An item with a mark (a maker's, `Mark: {name}` set on `lead.icon` by its owner) between the check and the label.
+  prefab MenuItemMarked : ui.MenuItem {
+    lead {
+      icon : ui.Icon {
+        Size: {w: {kind: Fixed, value: $menu_mark, min: 0, max: 0}, h: {kind: Fixed, value: $menu_mark, min: 0, max: 0}}
+      }
+      after : ui.Node {
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
+    }
+  }
+  prefab MenuItemMarkedOn : ui.MenuItemMarked {
+    mark : ui.Check { Fill: $tone_ink_1 }
+  }
+}

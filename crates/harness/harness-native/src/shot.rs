@@ -1,6 +1,9 @@
 //! Offscreen frames to a PNG (`HARNESS_NATIVE_SHOT=<path>`): the same App and Renderer as the window, drawn into a texture
 //! and read back, after the daemon has had a moment to send its list and the selected terminal's screen.
 //! `HARNESS_NATIVE_SHOT_BACKING` sets the display scale (default 2) and `HARNESS_NATIVE_SHOT_ZOOM` the cmd-= steps.
+//! `HARNESS_NATIVE_SHOT_HEADROOM` draws for a display with that EDR headroom (default 1, SDR: the PNG is what it was);
+//! the PNG clips past white, so `HARNESS_NATIVE_SHOT_PFM=<path>` also writes the frame as it is, float RGB (a PFM of the
+//! extended sRGB-encoded, premultiplied values) and logs its brightest value.
 use crate::app::App;
 use crate::gpu::{Dest, Renderer};
 use std::sync::Arc;
@@ -34,6 +37,10 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
+    // HARNESS_NATIVE_SHOT_HEADROOM=h: a display with h times SDR white of room (an XDR screen at full brightness: 16).
+    if let Some(h) = std::env::var("HARNESS_NATIVE_SHOT_HEADROOM").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
+        app.headroom = harness_native_render::hdr::Headroom { current: h, potential: h, reference: 0.0 };
+    }
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }
@@ -282,6 +289,9 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    if let Ok(pfm) = std::env::var("HARNESS_NATIVE_SHOT_PFM") {
+        write_pfm(&pfm, &renderer.read_float(&tex), (w * backing) as usize, (h * backing) as usize)?;
+    }
     // The tooltip AppKit would show for the hovered node (it isn't drawn offscreen), when a hover was asked for.
     if std::env::var_os("HARNESS_NATIVE_SHOT_HOVER").is_some() {
         eprintln!("harness-native: tooltip {:?}", app.tooltip());
@@ -290,6 +300,27 @@ pub fn run(path: &str) -> Result<(), String> {
     if std::env::var_os("HARNESS_NATIVE_MENU_DUMP").is_some() {
         eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));
     }
+    Ok(())
+}
+
+/// The frame's floats (RGBA, rows top first) as a PFM: `PF`, little-endian (scale -1), RGB, rows bottom first. Logs the
+/// brightest value written and the linear light it is (over SDR white), so a check can read the headroom used.
+fn write_pfm(path: &str, px: &[f32], w: usize, h: usize) -> Result<(), String> {
+    let mut out = format!("PF\n{w} {h}\n-1.0\n").into_bytes();
+    out.reserve(w * h * 12);
+    for row in (0..h).rev() {
+        for p in px[row * w * 4..(row + 1) * w * 4].chunks_exact(4) {
+            for c in &p[..3] {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path, &out).map_err(|e| format!("{path}: {e}"))?;
+    let top = px.chunks_exact(4).flat_map(|p| p[..3].iter().copied()).filter(|v| v.is_finite()).fold(0.0f32, f32::max);
+    eprintln!(
+        "harness-native: wrote {path} (brightest {top:.4}, {:.3}x SDR white)",
+        harness_native_render::hdr::srgb_decode_ext(top)
+    );
     Ok(())
 }
 

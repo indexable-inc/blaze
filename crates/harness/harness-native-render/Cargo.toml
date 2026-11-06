@@ -27,6 +27,7 @@ harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-layout = { path = "../harness-native-ui-layout" }
 harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
 harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
+harness-native-ui-inline = { path = "../harness-native-ui-inline" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
 harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
@@ -55,6 +56,10 @@ block2 = "0.6"
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVReturn", "objc2", "objc2-metal"] }
+
+[dev-dependencies]
+# Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
+hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
 
 [lints.rust]
 unsafe_code = "allow"

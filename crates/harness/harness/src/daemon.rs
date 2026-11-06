@@ -323,6 +323,17 @@ impl Daemon {
         self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
         name: Option<String>, env: &BTreeMap<String, String>, cols: u16, rows: u16,
     ) -> Result<u64> {
+        self.spawn_full(kind, args, parent, cwd, prompt, name, env, cols, rows, None)
+    }
+
+    /// [`Self::spawn_named`], a Codex chat starting on `codex_choice` (its model and effort, on its thread/start and every
+    /// turn; recorded as the chat's choice, so a resume keeps them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_full(
+        self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
+        name: Option<String>, env: &BTreeMap<String, String>, cols: u16, rows: u16,
+        codex_choice: Option<(Option<String>, Option<String>)>,
+    ) -> Result<u64> {
         if let Some(n) = &name {
             db::check_name(n)?;
         }
@@ -354,7 +365,7 @@ impl Daemon {
             kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt: if chat { None } else { prompt }, chat },
         )?;
         if chat {
-            return self.spawn_chat(id, kind, launch, parent, cwd, prompt, name, env, meta, created_ms);
+            return self.spawn_chat(id, kind, launch, parent, cwd, prompt, name, env, meta, created_ms, codex_choice);
         }
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
@@ -458,10 +469,11 @@ impl Daemon {
     fn spawn_chat(
         self: &Arc<Self>, id: u64, kind: &str, launch: profiles::Launch, parent: Option<u64>, cwd: String,
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
+        codex_choice: Option<(Option<String>, Option<String>)>,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
             "claude" => Box::new(chat::claude::Claude::new(&launch)),
-            "codex" => Box::new(chat::codex::Codex::new(&cwd)),
+            "codex" => Box::new(chat::codex::Codex::new(&cwd).with_choice(codex_choice.clone().unwrap_or_default())),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
         let oid = format!("s{id}");
@@ -472,6 +484,9 @@ impl Daemon {
         });
         let c = Arc::new(chat::Chat::open(&oid, &db::object_dir(&oid), Box::new(chat::NoAdapter))?);
         let session = Arc::new(Session::chat(id, kind, name, parent, cwd, argv, created_ms, c, None, None));
+        if let (Some((model, effort)), Some(c)) = (codex_choice, &session.chat) {
+            c.record(Body::Choice { model, effort }, &session.tx);
+        }
         self.sessions.lock().insert(id, session.clone());
         self.start_agent(&session, &launch, adapter, env)?;
         changed();
@@ -697,11 +712,26 @@ impl Daemon {
             Req::SpawnObject { opts } => Reply::Record(crate::object::spawn(self, &opts)?),
             Req::Object { id } => Reply::Record(crate::object::info(self, &id)?),
             Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
-            Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode } => {
-                if mode.as_deref() == Some("tui") {
+            Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode, model, effort } => {
+                let tui = mode.as_deref() == Some("tui");
+                let codex_chat = kind == "codex" && !tui;
+                // The model and effort it starts on: checked against its kind's list, then its launch's own flags
+                // (claude's and cursor's `--model`, claude's `--effort`), or for a Codex chat its thread/start.
+                chat::models::check(&kind, model.as_deref(), effort.as_deref())?;
+                if !codex_chat {
+                    if let Some(m) = &model {
+                        args.extend(["--model".to_owned(), m.clone()]);
+                    }
+                    if let Some(e) = &effort {
+                        anyhow::ensure!(kind == "claude", "{kind} takes no effort at launch, so effort {e:?} is refused");
+                        args.extend(["--effort".to_owned(), e.clone()]);
+                    }
+                }
+                if tui {
                     args.push("--tui".into());
                 }
-                let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40))?;
+                let choice = if codex_chat && (model.is_some() || effort.is_some()) { Some((model, effort)) } else { None };
+                let id = self.spawn_full(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40), choice)?;
                 Reply::Spawned { id }
             }
             Req::Send { id, text, raw, submit } => {

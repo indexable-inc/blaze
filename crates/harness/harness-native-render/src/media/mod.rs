@@ -173,6 +173,16 @@ impl Media {
         Some((t, [t.width() as u32, t.height() as u32]))
     }
 
+    /// How what [`Media::texture`] gives for `key` encodes light, as `SurfaceInst::hdr`: an HDR video frame's PQ or HLG
+    /// signal, its peak and primaries; zeros for SDR (a shader's output and SDR video are sRGB-encoded, drawn as they are).
+    #[must_use]
+    pub fn encoding(&self, key: u64) -> [f32; 4] {
+        if self.shaders.front(key, self.serial).is_some() {
+            return [0.0; 4];
+        }
+        self.videos.encoding(key).unwrap_or([0.0; 4])
+    }
+
     /// A shader's state (None: Media has never seen `key`'s spec, or forgot it).
     #[must_use]
     pub fn status(&self, key: u64) -> Option<Status> {
