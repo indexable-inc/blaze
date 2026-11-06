@@ -695,8 +695,26 @@ mod tests {
                 .join()
                 .unwrap();
         });
+        // A span closed a moment ago may wait for its thread's CPU rate before a read takes it:
+        // read again, a bounded number of times, until every one is in.
+        let ours = |read: &Read| {
+            read.spans
+                .iter()
+                .filter(|it| {
+                    flight::meta(it.site)
+                        .is_some_and(|it| it.name().starts_with("names round trip"))
+                })
+                .count()
+        };
         let mut read = Read::default();
-        flight::window(Duration::from_secs(600), &mut read);
+        for _ in 0..100 {
+            read = Read::default();
+            flight::window(Duration::from_secs(600), &mut read);
+            if ours(&read) > THREADS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let process = Process { pid: 7, name: "blaze test", commit: None };
         let parquet = |batch: RecordBatch| {
             // alloc: a test's file
