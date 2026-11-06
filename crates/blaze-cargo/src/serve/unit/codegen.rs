@@ -320,7 +320,7 @@ pub(crate) struct Profiles(Box<[(String, Result<Profiled, String>)]>);
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) struct Profiled {
     id: ContentId,
-    unstored: parking_lot::Mutex<Option<Vec<u8>>>,
+    unstored: blaze_core::lock::Lock<Option<Vec<u8>>>,
     /// How its records are named, sorted once as it is read ([`blaze_lints::profile::names`]),
     /// or why they don't read: what tells a profile blaze made, which applying to nothing
     /// refuses, from one rustc or clang made, which only warns ([`judge`]).
@@ -376,7 +376,8 @@ fn profiled(
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
         // alloc: an error
         .map_err(|what| format!("the profile of `-C profile-use={path}`: {what}"))?;
-    Ok(Profiled { id, unstored: parking_lot::Mutex::new(Some(bytes)), names, _given: given })
+    let unstored = blaze_core::lock::Lock::new("serve.codegen.profile.unstored", Some(bytes));
+    Ok(Profiled { id, unstored, names, _given: given })
 }
 
 #[cfg(not(feature = "native"))]

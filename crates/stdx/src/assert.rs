@@ -137,14 +137,14 @@ pub mod reported {
         },
     };
 
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
 
     /// Bugs reported so far in this process, every site's.
     static TOTAL: AtomicU64 = AtomicU64::new(0);
 
     /// Each site that reported, in the order each first did: a few at most in a healthy
     /// process, so a list.
-    static SITES: Mutex<Vec<Site>> = Mutex::new(Vec::new());
+    static SITES: Lock<Vec<Site>> = Lock::new("stdx.assert.sites", Vec::new());
 
     /// Whether this process's exit is left as it is when it reported bugs ([`keep_exit_status`]).
     static KEEP_EXIT: AtomicBool = AtomicBool::new(false);

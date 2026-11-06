@@ -9,7 +9,7 @@ use std::{
 };
 
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 /// `N` counts, each how many and the nanoseconds they took, of one thread.
 #[repr(align(128))]
@@ -38,7 +38,7 @@ const _: () = assert!(std::mem::size_of::<Block<9>>() % 128 == 0);
 /// Every thread's block of `N` counts. The lock is taken only when a thread first counts, and
 /// by [`Tally::get`] for a report; never by a count, so never across a call.
 pub struct Tally<const N: usize> {
-    blocks: Mutex<Vec<&'static Block<N>>>,
+    blocks: Lock<Vec<&'static Block<N>>>,
     /// The blocks of threads that ended, for the next thread to count into: their counts stay
     /// in the sums.
     free: SegQueue<&'static Block<N>>,
@@ -46,7 +46,8 @@ pub struct Tally<const N: usize> {
 
 impl<const N: usize> Tally<N> {
     pub const fn new() -> Tally<N> {
-        Tally { blocks: Mutex::new(Vec::new()), free: SegQueue::new() } // alloc: empty, allocates nothing
+        // alloc: empty, allocates nothing
+        Tally { blocks: Lock::new("procmacro.kept.tally_blocks", Vec::new()), free: SegQueue::new() }
     }
 
     fn block(&'static self) -> &'static Block<N> {

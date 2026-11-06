@@ -36,6 +36,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_core::lock::Lock;
+
 use crate::{Kind, View, clock, live::Log};
 
 /// The most a request (its line and headers) may be; longer is refused unread.
@@ -226,8 +228,13 @@ fn admit(conn: TcpStream, gate: &Arc<Gate>, token: &Arc<str>) {
 /// each down. Anyone local can open these, so there are at most [`MAX_UNCHECKED`]: a new one
 /// evicts the oldest rather than being refused, or whoever holds the slots would lock the
 /// owner out. A connection leaves when it passes the check (it is then never evicted) or ends.
-#[derive(Default)]
-struct Gate(parking_lot::Mutex<GateState>);
+struct Gate(Lock<GateState>);
+
+impl Default for Gate {
+    fn default() -> Gate {
+        Gate(Lock::new("ixprof.http.gate", GateState::default()))
+    }
+}
 
 #[derive(Default)]
 struct GateState {

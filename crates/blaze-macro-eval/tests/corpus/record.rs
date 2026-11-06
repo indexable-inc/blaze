@@ -15,7 +15,7 @@ use base_db::{ContentId, Crate, Db, Env};
 use hir_expand::proc_macro::{
     Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use span::Span;
 use tt::TopSubtree;
 
@@ -126,7 +126,12 @@ impl Record {
     }
 }
 
-pub(crate) type Records = Arc<Mutex<Vec<Record>>>;
+pub(crate) type Records = Arc<Lock<Vec<Record>>>;
+
+/// No records yet: what a recorder records into.
+pub(crate) fn records() -> Records {
+    Arc::new(Lock::new("macro.test.corpus.records", Vec::new()))
+}
 
 /// Whether a recorder passes the front end's runs ahead of a call's turn on to its expander
 /// (`ProcMacroExpander::speculate`), as a build does, counting them; or runs each ordered call

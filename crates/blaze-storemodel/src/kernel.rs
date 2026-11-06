@@ -19,7 +19,7 @@ use blaze_kernel::{
     Seen, Step, StepError, StepId, Subject, World, WorldError,
 };
 use blaze_store_check::Setting;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::actors::{Resume, Turn};
 use crate::explore::{Bounds, Chooser, Failure, Memo};
@@ -201,7 +201,7 @@ struct Gated<'g> {
     writer: &'g mut Writer,
     guard: &'g Guard,
     turn: &'g Turn,
-    ledger: &'g Mutex<Ledger>,
+    ledger: &'g Lock<Ledger>,
     who: &'g str,
     tickets: Vec<Ticket>,
     kept: Vec<Key>,
@@ -295,7 +295,7 @@ fn asks(
     world: &Dials,
     mut writer: Writer,
     reader: &Reader,
-    ledger: &Mutex<Ledger>,
+    ledger: &Lock<Ledger>,
 ) {
     let guard = blaze_cas::enter();
     SALT.with(|it| it.set(asker.salt));

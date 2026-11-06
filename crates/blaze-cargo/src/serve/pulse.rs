@@ -1,6 +1,7 @@
 //! The loop's pulse as threads outside it read it ([`Pulse`]), the judge of a loop that
-//! stopped turning ([`LoopWatch`]) and the judge of a footprint against the daemon's memory
-//! ceiling ([`CeilingWatch`]): sans-IO cores the stop's guard (`serve::stop`) drives.
+//! stopped turning ([`LoopWatch`]), the judge of a footprint against the daemon's memory
+//! ceiling ([`CeilingWatch`]) and the dedupe of the wait-for graph's stalls ([`StallWatch`]):
+//! sans-IO cores the stop's guard (`serve::stop`) drives.
 //!
 //! The loop is the one thread that reaps the daemon's children and hands their completions on
 //! (blaze-core's drivers reap a child only as their `poll` sees it exit). A loop stuck inside a
@@ -13,18 +14,49 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(all(unix, feature = "native"))]
 use std::time::Duration;
 
+use blaze_core::lock::Lock;
+#[cfg(all(unix, feature = "native"))]
+use blaze_core::lock::stall::Stall;
+
 /// The loop's progress, written by the loop at the end of each turn and read by the stop's
-/// guard, which may be watching a loop that is stuck.
-#[derive(Default, Debug)]
+/// guard, which may be watching a loop that is stuck; and the guard's word back, the top stall
+/// it found in the wait-for graph, which the loop puts in each build's live model.
+#[derive(Debug)]
 pub struct Pulse {
     /// The loop's own progress: its effects that ended on their own, the plane's nodes settled
     /// and the jobs' effects ended, never its idle turns or a client's requests.
     moved: AtomicU64,
     /// The turns it finished, idle ones too: an idle loop turns at least every 50 ms.
     turns: AtomicU64,
+    /// The top stall's line ([`Stall::line`]) at the guard's last look, `None` for none. Set
+    /// by the guard only while a stall lasts and once as it ends; read by the loop once a look
+    /// at its builds (`doing::EVERY`), so neither holds it for more than a swap or a clone.
+    stall: Lock<Option<String>>,
+}
+
+impl Default for Pulse {
+    fn default() -> Pulse {
+        Pulse {
+            moved: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+            stall: Lock::new("serve.pulse.stall", None),
+        }
+    }
 }
 
 impl Pulse {
+    /// The guard's latest stall line, `None` once none lasts.
+    pub fn set_stall(&self, line: Option<String>) {
+        let was = std::mem::replace(&mut *self.stall.lock(), line);
+        // The old line drops here, after the lock is let go.
+        drop(was);
+    }
+
+    /// The top stall's line at the guard's last look, while one lasts.
+    pub fn stall(&self) -> Option<String> {
+        self.stall.lock().clone() // clone: a stall's line, rare, once a look at the builds
+    }
+
     /// A turn ended, with the loop's progress at `moved`.
     pub fn turned(&self, moved: u64) {
         self.moved.store(moved, Ordering::Relaxed);
@@ -152,6 +184,63 @@ impl CeilingWatch {
     }
 }
 
+/// One stall as the dedupe tells two apart: a deadlock by its cycle's threads, sorted, and a
+/// convoy by its head, whatever it waits on and however many queue behind it.
+#[cfg(all(unix, feature = "native"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StallKey {
+    Deadlock(Vec<u64>),
+    Convoy(u64),
+}
+
+#[cfg(all(unix, feature = "native"))]
+impl StallKey {
+    pub fn of(stall: &Stall) -> StallKey {
+        match stall {
+            Stall::Deadlock { cycle } => {
+                // alloc: a stall's key, kept while it lasts
+                let mut threads: Vec<u64> = cycle.iter().map(|it| it.thread).collect();
+                threads.sort_unstable();
+                StallKey::Deadlock(threads)
+            }
+            Stall::Convoy { head, .. } => StallKey::Convoy(*head),
+        }
+    }
+}
+
+/// Says each stall of the wait-for graph once while it lasts: told the stalls of each look
+/// ([`blaze_core::lock::graph::stalls`], or none when no wait is past the threshold), it hands
+/// back the ones the last look did not have, by [`StallKey`], and forgets the ones gone, so a
+/// stall that ends and comes back is said again. Reads no clock and does no IO.
+#[cfg(all(unix, feature = "native"))]
+#[derive(Debug, Default)]
+pub struct StallWatch {
+    /// The stalls the last look had, said already.
+    said: Vec<StallKey>,
+}
+
+#[cfg(all(unix, feature = "native"))]
+impl StallWatch {
+    /// One look at `stalls`: the indices into it of those new since the last look, in its
+    /// order (deadlocks first, then convoys, most behind first).
+    pub fn look(&mut self, stalls: &[Stall]) -> Vec<usize> {
+        if stalls.is_empty() {
+            self.said.clear();
+            return Vec::new();
+        }
+        // alloc: a look that found a stall, at most ten a second while one lasts
+        let keys: Vec<StallKey> = stalls.iter().map(StallKey::of).collect();
+        let new = keys
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| !self.said.contains(key))
+            .map(|(at, _)| at)
+            .collect(); // alloc: as above
+        self.said = keys;
+        new
+    }
+}
+
 #[cfg(all(test, unix, feature = "native"))]
 mod tests {
     use super::*;
@@ -240,6 +329,47 @@ mod tests {
         let mut small = CeilingWatch::default();
         assert_eq!(small.look(8, 8), Near);
         assert_eq!(small.look(9, 8), Passed);
+    }
+
+    fn convoy(head: u64, waiters: usize) -> Stall {
+        use blaze_core::lock::stall::{Blocked, WaitRow};
+        let on = Blocked::Signal("test.gate");
+        let oldest =
+            WaitRow { thread: head + 100, span: 0, since_ns: 0, on, holder: Some(head), site: None };
+        Stall::Convoy { head, head_wait: None, holds: on, waiters, oldest }
+    }
+
+    fn deadlock(threads: &[u64]) -> Stall {
+        use blaze_core::lock::stall::{Blocked, WaitRow};
+        let cycle = threads
+            .iter()
+            .map(|&thread| WaitRow {
+                thread,
+                span: 0,
+                since_ns: 0,
+                on: Blocked::Signal("test.gate"),
+                holder: None,
+                site: None,
+            })
+            .collect();
+        Stall::Deadlock { cycle }
+    }
+
+    /// Each stall is said once while it lasts, however its convoy grows or its cycle is
+    /// walked from; a stall gone from a look and back is said again. Make `look` keep nothing
+    /// and every look says every stall; make it never forget and one that came back is
+    /// never said.
+    #[test]
+    fn each_stall_is_said_once_while_it_lasts_and_again_after_it_ended() {
+        let mut watch = StallWatch::default();
+        assert_eq!(watch.look(&[convoy(7, 3)]), [0]);
+        assert_eq!(watch.look(&[convoy(7, 61)]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[2, 1]), convoy(7, 61)]), [0]);
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 61)]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2])]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 2)]), [1]);
+        assert_eq!(watch.look(&[]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(9, 2)]), [0, 1]);
     }
 
     #[test]

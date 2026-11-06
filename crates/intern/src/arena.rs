@@ -174,7 +174,7 @@ impl Store {
     pub(crate) fn new() -> Store {
         let bits = shard_bits();
         let shards = 1usize << bits;
-        let store = Store {
+        Store {
             // alloc: the shard array, once a store
             tables: (0..shards).map(|_| Published::new()).collect(),
             writers: (0..shards)
@@ -182,15 +182,7 @@ impl Store {
                 // alloc: as the tables
                 .collect(),
             bits,
-        };
-        // Where std's `Mutex` is a pthread mutex (Apple targets), its first lock boxes it:
-        // taken once here, so no insert allocates.
-        #[cfg(not(blaze_check))]
-        for writer in &store.writers {
-            // alloc: a shard lock's pthread mutex, once a store, on Apple targets
-            drop(writer.lock());
         }
-        store
     }
 
     #[inline]
@@ -302,7 +294,7 @@ mod lock {
     use std::ops::{Deref, DerefMut};
 
     use super::State;
-    use crate::sync::{Mutex, MutexGuard};
+    use crate::sync::{Lock, LockGuard};
 
     /// The lock a shard's writers take to look again for a value and insert it. It is held
     /// only for that: the caller's `Eq` against the shard's values, one bump allocation, the
@@ -312,13 +304,13 @@ mod lock {
     /// Padded to 128 bytes, the pair of lines arm64 and x86 prefetch together, so writers of
     /// two shards never share a line.
     #[repr(align(128))]
-    pub(super) struct InsertLock(Mutex<State>);
+    pub(super) struct InsertLock(Lock<State>);
 
-    pub(super) struct Locked<'a>(MutexGuard<'a, State>);
+    pub(super) struct Locked<'a>(LockGuard<'a, State>);
 
     impl InsertLock {
         pub(super) fn new(state: State) -> InsertLock {
-            InsertLock(Mutex::new(state))
+            InsertLock(Lock::new("intern.arena.insert", state))
         }
 
         pub(super) fn lock(&self) -> Locked<'_> {

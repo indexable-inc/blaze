@@ -40,6 +40,7 @@ pkg-fmt = "txz"
 disabled-strategies = ["quick-install"]
 
 [dependencies]
+blaze-core.workspace = true
 # blaze's cargo: the client, the daemon, the sandbox launcher, the release this is.
 blaze-cargo.workspace = true
 anyhow.workspace = true
@@ -56,7 +57,6 @@ stdx.workspace = true
 ix-prof = { workspace = true, features = ["sampler"] }
 # A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
 # (`versions.rs`).
-parking_lot.workspace = true
 toml.workspace = true
 toml_edit = { workspace = true, features = ["display", "parse"] }
 # The releases of blaze a workspace pins arrive over HTTPS as `.tar.xz` (`.tar.gz` before), checked against

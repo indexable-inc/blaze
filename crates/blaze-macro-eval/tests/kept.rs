@@ -46,7 +46,7 @@ use config::Corpus;
 use record::{Record, Recorder, Records};
 
 /// Held by each test while it builds and changes the scratch workspace.
-static SCRATCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static SCRATCH: blaze_core::lock::Lock<()> = blaze_core::lock::Lock::new("macro.test.kept.scratch", ());
 
 /// A store in `sim`, open and ready.
 fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
@@ -208,7 +208,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
 
     // A first build runs every macro and keeps what each stateless one made.
-    let records = Records::default();
+    let records = record::records();
     let mut loaded = Loaded::new();
     let first = build(&config, &dir, &macros, &records, &mut loaded);
     let firstly = taken(&records);
@@ -437,7 +437,7 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
     })
     .unwrap_or_else(|why| panic!("{why}"));
     let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
-    let records = Records::default();
+    let records = record::records();
     let mut loaded = Loaded::new();
     let crates = |workspace: &load::Workspace| {
         let krate = |name: &str| workspace.krate(name).unwrap_or_else(|why| panic!("{why}"));

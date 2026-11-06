@@ -30,10 +30,10 @@ use blaze_units::{
     schema::Mode as UnitMode,
     stdlib,
 };
+use blaze_core::lock::Lock;
 use blaze_vfs::{Bytes, Corrupt, Mode, View};
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use parking_lot::Mutex;
 
 /// Where the probe's package is named: under no directory of the machine's, so nothing of it is
 /// read from the disk.
@@ -365,7 +365,7 @@ struct ProbeFiles {
     package: [(&'static str, ContentId, Bytes); 2],
     library: ContentId,
     dir: PathBuf,
-    failed: Mutex<Option<String>>,
+    failed: Lock<Option<String>>,
 }
 
 impl ProbeFiles {
@@ -386,7 +386,7 @@ impl ProbeFiles {
             ],
             library: ContentId::of(LIBRARY_DOMAIN, library.commit.as_bytes()),
             dir: library.dir.clone(),
-            failed: Mutex::new(None),
+            failed: Lock::new("engine.probe.failed", None),
         }
     }
 

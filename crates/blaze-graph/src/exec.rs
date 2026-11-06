@@ -128,11 +128,11 @@ where
     let (done_tx, done_rx) = bounded::<(NodeId, Did, u64)>(config.work + config.io);
     // Taken only to keep a node's panic, once it has unwound.
     // dyn: a panic's payload, as `catch_unwind` gives it
-    let first_panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let first_panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.exec.first_panic", None);
     // dyn: as above, once per node that panicked
     let failed = |panic: Box<dyn Any + Send>| {
         let did = Did::failed(panicked(&*panic));
-        first_panic.lock_said("a build's first panic").get_or_insert(panic);
+        first_panic.lock().get_or_insert(panic);
         did
     };
     let over = workers.pool().scope(|jobs| {
@@ -215,7 +215,7 @@ where
 /// The pools no [`drive`] is using, each kept for the next build of its size, so a build
 /// starts no thread once one of its size has run. Taken only to take or give back a pool.
 // alloc: empty, allocates nothing; a pool's entry is pushed once per pool size
-static SPARE: Lock<Vec<Workers>> = Lock::new(Vec::new());
+static SPARE: Lock<Vec<Workers>> = Lock::new("graph.exec.spare_pools", Vec::new());
 
 /// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
 /// it's over: a build runs as many nodes at once as its machine says, whatever else runs.
@@ -224,7 +224,7 @@ struct Lent(Option<Workers>);
 impl Lent {
     fn take(workers: usize, what: &str) -> Lent {
         let spare = {
-            let mut spare = SPARE.lock_said("the spare pools");
+            let mut spare = SPARE.lock();
             spare.iter().position(|it| it.workers() == workers).map(|at| spare.swap_remove(at))
         };
         Lent(Some(spare.unwrap_or_else(|| {
@@ -241,7 +241,7 @@ impl Lent {
 impl Drop for Lent {
     fn drop(&mut self) {
         if let Some(pool) = self.0.take() {
-            SPARE.lock_said("the spare pools").push(pool);
+            SPARE.lock().push(pool);
         }
     }
 }
@@ -1348,7 +1348,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
     use std::alloc::Global;
 
     use blaze_mem::{Tag as MemTag, frame};
@@ -1402,7 +1402,7 @@ mod tests {
 
     /// The database a test's work puts each key's value in before its `Done`, as real work
     /// does; the scheduler's memo reads it.
-    type Db = Arc<Mutex<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
+    type Db = Arc<Lock<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
 
     fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
@@ -1420,7 +1420,7 @@ mod tests {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
-        let db = Db::default();
+        let db: Db = Arc::new(Lock::new("graph.test.exec.db", HashMap::default()));
         let memo = {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()
@@ -1437,7 +1437,7 @@ mod tests {
 
     /// A predictor that keeps what it is asked and told, and predicts `prediction` for all.
     struct Recorder {
-        asked: Arc<Mutex<Vec<Asked>>>,
+        asked: Arc<Lock<Vec<Asked>>>,
         prediction: Prediction,
     }
 
@@ -1462,7 +1462,7 @@ mod tests {
     /// the predictor's bytes.
     #[test]
     fn the_scheduler_asks_its_predictor_and_teaches_it_each_run() {
-        let asked: Arc<Mutex<Vec<Asked>>> = Arc::default();
+        let asked: Arc<Lock<Vec<Asked>>> = Arc::new(Lock::new("graph.test.exec.asked", Vec::new()));
         let recorder = Recorder {
             asked: Arc::clone(&asked),
             prediction: Prediction { cost: Some(5), peak: 1 << 10 },
@@ -1572,7 +1572,7 @@ mod tests {
     /// or box, and the runner reads each once, on the pool and the IO threads both.
     #[test]
     fn a_runner_reads_each_tasks_work_as_data() {
-        struct Squares(Arc<Mutex<Vec<u32>>>);
+        struct Squares(Arc<Lock<Vec<u32>>>);
         impl Runner for Squares {
             type Work = u32;
 
@@ -1581,7 +1581,7 @@ mod tests {
                 Ok(Did::built())
             }
         }
-        let seen: Arc<Mutex<Vec<u32>>> = Arc::default();
+        let seen: Arc<Lock<Vec<u32>>> = Arc::new(Lock::new("graph.test.exec.seen", Vec::new()));
         let pool = Workers::new(&Topology::flat(2), false).unwrap();
         let pool: &'static Workers = Box::leak(Box::new(pool));
         let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 4 };
@@ -1622,7 +1622,7 @@ mod tests {
     fn drive_runs_work_and_io_on_pools_apart_and_keeps_them_for_the_next_build() {
         // Sizes no other test drives, so no other build can borrow these pools in between.
         let build = || {
-            let ran: Mutex<Vec<(u32, ThreadId)>> = Mutex::new(Vec::new());
+            let ran: Lock<Vec<(u32, ThreadId)>> = Lock::new("graph.test.exec.ran", Vec::new());
             let mut machine = Machine::new(Config { io: 3, work: 7, keep_going: false }).unwrap();
             let nodes = vec![
                 spec(0, &[], Pool::Io, None),
@@ -1658,7 +1658,8 @@ mod tests {
     #[test]
     fn shared_keys_run_once_for_two_requests() {
         let (scheduler, db) = scheduler(4);
-        let runs: Arc<Mutex<HashMap<u8, u32, Global>>> = Arc::default(); // alloc: a test's model
+        let runs: Arc<Lock<HashMap<u8, u32, Global>>> =
+            Arc::new(Lock::new("graph.test.exec.runs", HashMap::default())); // alloc: a test's model
         let keyed = |id: u32, key: u8| {
             let (runs, db) = (Arc::clone(&runs), Arc::clone(&db));
             let work: Work = Arc::new(move || {

@@ -28,7 +28,7 @@ use hir_ty_mir::mir::{
     location::name_sources,
     print_mir_body,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use crate::db::TestDB;
@@ -465,8 +465,14 @@ fn returned_u32<'db>(db: &'db TestDB, body: &'db MirBody<'db>) -> u32 {
 }
 
 /// A subscriber that keeps each event with the name of the span it is in.
-#[derive(Clone, Default)]
-struct Capture(std::sync::Arc<Mutex<Captured>>);
+#[derive(Clone)]
+struct Capture(std::sync::Arc<Lock<Captured>>);
+
+impl Default for Capture {
+    fn default() -> Capture {
+        Capture(std::sync::Arc::new(Lock::new("test.mir.devirt.captured", Captured::default())))
+    }
+}
 
 #[derive(Default)]
 struct Captured {

@@ -237,9 +237,10 @@ mod tests {
     fn store_writes_overlap_compiles_and_a_second_request_reuses_them() {
         use std::{collections::HashMap, sync::Arc};
 
-        use parking_lot::Mutex;
+        use blaze_core::lock::Lock;
 
-        let db: Arc<Mutex<HashMap<Key, crate::machine::Outcome>>> = Arc::default();
+        let db: Arc<Lock<HashMap<Key, crate::machine::Outcome>>> =
+            Arc::new(Lock::new("graph.test.build.db", HashMap::new()));
         let memo = {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()

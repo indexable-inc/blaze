@@ -41,7 +41,6 @@ blaze-fmt.workspace = true
 # `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
 # blaze-wasm's `wasm` feature never reaches this build.
 blaze-wasm-pack.workspace = true
-parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

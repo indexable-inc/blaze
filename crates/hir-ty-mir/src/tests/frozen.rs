@@ -2,7 +2,7 @@
 //! `nameres::frozen`): read back, they equal what finding them gives, impls in bodies and in
 //! the blocks of macro expansions too.
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use base_db::{Crate, all_crates};
 use blaze_hash::HashMap;
@@ -66,7 +66,7 @@ impl<T> Wrap<T> { pub fn get(self) -> T { self.0 } }
 "#;
 
 /// The differences are recorded for the whole process: the tests that read them take turns.
-static TURN: Mutex<()> = Mutex::new(());
+static TURN: Lock<()> = Lock::new("test.mir.frozen.turn", ());
 
 fn crates(db: &TestDB) -> Vec<Crate> {
     all_crates(db).iter().copied().collect()

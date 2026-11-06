@@ -43,7 +43,7 @@ use std::{
 
 use blaze_core::wait::{Clock as _, Deadline, Monotonic};
 use ix_prof::perf::{Counter, Event, Record};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{DEPTH, Sample, Unsampled, keep};
 use crate::{clock::Scale, flight::Ring};
@@ -337,7 +337,7 @@ pub(super) fn run(hz: u32) {
 }
 
 /// Why the sampler's loop ended, if it did: its tick's wait failed. Said in every dump after.
-static STOPPED: Mutex<Option<String>> = Mutex::new(None);
+static STOPPED: Lock<Option<String>> = Lock::unrecorded("profile.sampler.stopped", None);
 
 /// What the sampler counted that a dump should say: samples older than their context log,
 /// records lost, threads not sampled. Empty when all are 0.

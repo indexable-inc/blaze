@@ -40,7 +40,7 @@ use inkwell::{
     types::AnyTypeEnum,
     values::{BasicValueEnum, FunctionValue},
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{OWN, Unhandled};
 use crate::backend::{Optimization, Passes};
@@ -125,7 +125,7 @@ impl Profile {
 /// The profiles given, by content ID, while something holds them: a [`Profile`], or the
 /// passes a thread keeps for one ([`super::Machinery`]).
 // alloc: none until a profile is given; one entry per profile a build uses
-static GIVEN: Mutex<Vec<(ContentId, Weak<[u8]>)>> = Mutex::new(Vec::new());
+static GIVEN: Lock<Vec<(ContentId, Weak<[u8]>)>> = Lock::new("codegen.pgo.given", Vec::new());
 
 /// Gives the process the profile `bytes`, read from the store under `id`, for the builds whose
 /// [`Pgo::Use`] names it while the [`Profile`] is held. Bytes whose content ID is not `id` are

@@ -23,12 +23,12 @@ use std::{
     },
 };
 
+use blaze_core::lock::LockGuard;
 use blaze_hash::hash_map;
-use parking_lot::{Mutex, MutexGuard};
 
 use super::{
     CounterId, JobId, Wait, World,
-    fiber::{Io, OwnIo, observing, spawner},
+    fiber::{Io, OwnIo},
     ids,
 };
 use crate::Key;
@@ -56,16 +56,17 @@ pub(crate) struct Cell {
     /// The union's rank: the smaller joins the bigger, so a chain is at most log2 of the
     /// schedulers long.
     rank: AtomicU32,
-    core: Mutex<Domain>,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the scheduler's one lock: held only to change its world, never across a call into work"
+    )]
+    core: blaze_core::lock::Lock<Domain>,
     /// Jobs a stall or a pool's stop woke to fail that were not told yet: while 0, a wait that
     /// ends asks nothing more ([`super::host`]). Of the scheduler at the root.
     pub(super) failing: AtomicUsize,
     /// When a pool job's timed wait is next due, on [`super::now`]'s clock (`u64::MAX` for
     /// none): set under the lock, read by workers without it. Of the scheduler at the root.
     pub(super) deadline: AtomicU64,
-    /// The job that took the lock last, as the profiler numbers it ([`spawner`]); 0 for none
-    /// or no profiler. A wait for the lock names it as its owner.
-    holder: AtomicU64,
 }
 
 /// What a scheduler's lock guards: the [`World`] (its wait graph, each driver's placement and
@@ -100,11 +101,12 @@ impl Scheduler {
     pub(crate) fn new(jobs: usize) -> Scheduler {
         let id = ids::take_domain();
         // alloc: a scheduler, once per pool, driver, client thread or event
+        #[expect(clippy::disallowed_types, reason = "makes `Cell::core`, which allows it")]
         let cell = Arc::new(Cell {
             id,
             parent: std::sync::OnceLock::new(),
             rank: AtomicU32::new(0),
-            core: Mutex::new(Domain {
+            core: blaze_core::lock::Lock::new("sched.domain.core", Domain {
                 world: World::new(jobs, id),
                 io: Vec::new(),
                 own: Vec::with_capacity(1),
@@ -114,7 +116,6 @@ impl Scheduler {
             }),
             failing: AtomicUsize::new(0),
             deadline: AtomicU64::new(u64::MAX),
-            holder: AtomicU64::new(0),
         });
         ids::register(id, &cell);
         Scheduler(cell)
@@ -150,7 +151,7 @@ impl Cell {
 /// leave the process's index.
 pub(crate) struct Guard<'a> {
     cell: &'a Arc<Cell>,
-    domain: MutexGuard<'a, Domain>,
+    domain: LockGuard<'a, Domain>,
 }
 
 impl Guard<'_> {
@@ -230,7 +231,11 @@ impl Drop for Guard<'_> {
 /// Shards of the key index, each behind a lock of its own: a flight's start and end take one.
 const SHARDS: usize = 128;
 
-type Shard = Mutex<blaze_hash::HashMap<Key, Arc<Cell>, std::alloc::Global>>;
+#[expect(
+    clippy::disallowed_types,
+    reason = "a shard of the process's index of flights: held to add, find or drop one key"
+)]
+type Shard = blaze_core::lock::Lock<blaze_hash::HashMap<Key, Arc<Cell>, std::alloc::Global>>;
 
 /// The shard of the process's index of flights that has `key`: every key with a flight now,
 /// and the scheduler that has it (or one joined into it), so a key has one flight in all the
@@ -239,11 +244,17 @@ type Shard = Mutex<blaze_hash::HashMap<Key, Arc<Cell>, std::alloc::Global>>;
 fn index(key: Key) -> &'static Shard {
     #[expect(clippy::disallowed_types, reason = "the process's one index of flights, made once")]
     static INDEX: std::sync::OnceLock<Box<[Shard]>> = std::sync::OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "makes the shards `Shard` allows")]
     let shards = INDEX.get_or_init(|| {
         // alloc: the index, once, each shard with room for a few flights so that a warm
         // process's flights allocate nothing (about 40 KiB)
         (0..SHARDS)
-            .map(|_| Mutex::new(blaze_hash::HashMap::with_capacity_in(4, std::alloc::Global)))
+            .map(|_| {
+                blaze_core::lock::Lock::new(
+                    "sched.flights.index",
+                    blaze_hash::HashMap::with_capacity_in(4, std::alloc::Global),
+                )
+            })
             .collect()
     });
     let hash = std::hash::BuildHasher::hash_one(&blaze_hash::FixedState, key);
@@ -293,26 +304,11 @@ pub(super) fn wait_cell(on: Wait) -> Option<Arc<Cell>> {
     }
 }
 
-/// `cell`'s lock, taken with a wait named for it after a failed try, which names the job that
-/// took it last as its owner.
-fn take(cell: &Cell) -> MutexGuard<'_, Domain> {
+/// `cell`'s lock: a contended acquire waits in the lock's own span, which names the holder.
+fn take(cell: &Cell) -> LockGuard<'_, Domain> {
     #[cfg(test)]
     LOCKS_TAKEN.with(|it| it.set(it.get() + 1));
-    let held = match cell.core.try_lock() {
-        Some(held) => held,
-        None => {
-            let owner = cell.holder.load(Ordering::Relaxed);
-            crate::wait::wait(
-                crate::wait::WaitOn::Lock("the scheduler"),
-                (owner != 0).then_some(owner),
-                || cell.core.lock(),
-            )
-        }
-    };
-    if observing() {
-        cell.holder.store(spawner().spawner, Ordering::Relaxed);
-    }
-    held
+    cell.core.lock()
 }
 
 /// The scheduler `cell` is joined into, locked.

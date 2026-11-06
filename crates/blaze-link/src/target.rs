@@ -65,7 +65,7 @@ use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use smallvec::SmallVec;
 use std::alloc::Global;
 
@@ -822,14 +822,17 @@ type Asked = Arc<Vec<(String, String)>>;
 /// The toolchains found, by what each was found from, and what the PE archives read for their
 /// default libraries ask for, by their bytes: a few of each per process, searched in order.
 pub(crate) struct Cache {
-    found: Mutex<Vec<(Key, Arc<Found>)>>,
-    asked: Mutex<Vec<(ContentId, u32, Asked)>>,
+    found: Lock<Vec<(Key, Arc<Found>)>>,
+    asked: Lock<Vec<(ContentId, u32, Asked)>>,
 }
 
 impl Cache {
     pub(crate) const fn new() -> Cache {
         // alloc: none, an empty `Vec` holds no buffer
-        Cache { found: Mutex::new(Vec::new()), asked: Mutex::new(Vec::new()) }
+        Cache {
+            found: Lock::new("link.toolchain.found", Vec::new()),
+            asked: Lock::new("link.toolchain.asked", Vec::new()),
+        }
     }
 
     /// What the PE archive, or the Mach-O object or archive for `arch`, at `path` (`name` on

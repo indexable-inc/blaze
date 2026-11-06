@@ -20,6 +20,7 @@ default = ["daemon"]
 daemon = ["dep:blaze-codegen", "dep:blaze-ids", "dep:blaze-items", "dep:blaze-mem", "dep:blaze-stencil", "dep:blaze-hash", "dep:crossbeam-queue"]
 
 [dependencies]
+blaze-core.workspace = true
 blaze-bytes.workspace = true
 blaze-hash = { workspace = true, optional = true }
 blaze-inproc.workspace = true
@@ -31,7 +32,6 @@ blaze-spin.workspace = true
 # Tier-up: when a run's code is recompiled at a higher tier (`blaze_stencil::tier`).
 blaze-stencil = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
-parking_lot.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

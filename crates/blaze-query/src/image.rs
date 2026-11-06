@@ -319,7 +319,7 @@ impl ImageMap {
             edge_count,
             table_len,
             input_count,
-            corrupt: ShortLock::default(),
+            corrupt: ShortLock::new("query.image.corrupt", Found::default()),
         })
     }
 

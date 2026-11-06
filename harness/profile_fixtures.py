@@ -122,6 +122,53 @@ def samples(count: int, *, stack: str, cpu: str, span_id: int | None) -> str:
     )
 
 
+def lock_wait(event_id: int, at: int, lock: str, wait_ns: int) -> tuple[str, str]:
+    """One `lock_wait` event of the worker (blaze_profile::locks::record), `at` after t0, as its
+    `events` row and its `event_fields` rows: (events select, event_fields select)."""
+    head = f"CAST({BUILD} AS UBIGINT) AS build_id, CAST({PROCESS} AS UINTEGER) AS process"
+    event = (
+        f"SELECT {head}, CAST({THREAD} AS UINTEGER) AS thread, 'blaze-work-0' AS thread_name, "
+        f"CAST({T0 + at} AS BIGINT) AS t_ns, CAST(1 AS UBIGINT) AS job, 'INFO' AS level, 'blaze::lock' AS target, "
+        f"'event crates/blaze-profile/src/locks.rs:1' AS name, 'lock_wait' AS message, "
+        f"CAST(NULL AS UBIGINT) AS span_id, CAST({event_id} AS UBIGINT) AS event_id"
+    )
+    said: list[tuple[str, str, str]] = [
+        ("lock", "str", f"'{lock}'"),
+        ("value_type", "str", "'blaze_hash::HashMap<u64, u32>'"),
+        ("mode", "str", "'lock'"),
+        ("site", "str", "'crates/a/src/lib.rs:7'"),
+        ("span", "u64", "0"),
+        ("thread", "u64", str(THREAD)),
+        ("start_ns", "u64", str(T0 + at - wait_ns)),
+        ("wait_ns", "u64", str(wait_ns)),
+        ("holder_site", "str", "'crates/a/src/lib.rs:9'"),
+        ("holder_span", "u64", "0"),
+        ("holder_thread", "u64", "8"),
+        ("holder_mode", "str", "'lock'"),
+        ("hold_ns", "u64", str(wait_ns)),
+        ("hold_whole", "bool", "false"),
+    ]
+    fields = " UNION ALL ".join(
+        f"SELECT {head}, CAST({event_id} AS UBIGINT) AS event_id, CAST({ordinal} AS USMALLINT) AS ordinal, "
+        f"'{key}' AS key, '{kind}' AS kind, "
+        f"CAST(NULL AS BIGINT) AS value_i64, "
+        f"CAST({value if kind == 'u64' else 'NULL'} AS UBIGINT) AS value_u64, "
+        f"CAST(NULL AS DOUBLE) AS value_f64, "
+        f"CAST({value if kind == 'bool' else 'NULL'} AS BOOLEAN) AS value_bool, "
+        f"CAST({value if kind == 'str' else 'NULL'} AS VARCHAR) AS value_str"
+        for ordinal, (key, kind, value) in enumerate(said)
+    )
+    return event, fields
+
+
+def lock_waits(*waits: tuple[str, str]) -> list[str]:
+    """`events` and `event_fields` of the `lock_wait` events `waits` ([`lock_wait`]'s)."""
+    return [
+        copy(" UNION ALL ".join(it[0] for it in waits), "1-00000001.events.parquet"),
+        copy(" UNION ALL ".join(it[1] for it in waits), "1-00000001.event_fields.parquet"),
+    ]
+
+
 MS = 1_000_000
 # The check each fixture fails, and the files beside its `builds` row that make it fail.
 FIXTURES: dict[str, list[str]] = {
@@ -150,6 +197,16 @@ FIXTURES: dict[str, list[str]] = {
     "self_cpu_in_duration": [BUSY, spans(span(1, 100 * MS, MS, self_cpu=5 * MS))],
     # The daemon used 1 s of CPU over the build (its `builds` row: BUILD_ROWS); its spans say 0.5 s.
     "cpu_matches_process": [BUSY, spans(span(1, 0, 900 * MS, self_cpu=500 * MS))],
+    # One lock waited for 50 ms in two waits of the worker's 1 s: 5%, past the gate's 2%; another
+    # 1 ms, under it.
+    "lock_waits": [
+        BUSY,
+        *lock_waits(
+            lock_wait(1, 300 * MS, "flight.names", 20 * MS),
+            lock_wait(2, 600 * MS, "flight.names", 30 * MS),
+            lock_wait(3, 700 * MS, "store.packs", MS),
+        ),
+    ],
     # A merged file whose metadata says its merge read 3 rows; it holds 2.
     "merged_rows_match": [
         BUSY,

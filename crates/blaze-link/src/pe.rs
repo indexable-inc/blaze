@@ -30,7 +30,7 @@ use std::fmt;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::model::{
     Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special,
@@ -102,9 +102,10 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
             "a dev run of a DLL: only an executable has a start hook and a code memory",
         ));
     }
-    let last = output.incremental.then(Mutex::default);
+    let last = output.incremental.then(|| Lock::new("link.pe.last", image::Last::default()));
+    let descriptors = Lock::new("link.pe.descriptors", coff::Descriptors::default());
     // alloc: once per link: the writer's own copy of the output it makes
-    Ok(Pe { output: output.clone(), descriptors: Mutex::default(), last })
+    Ok(Pe { output: output.clone(), descriptors, last })
 }
 
 /// An error, formatted only when it is returned.
@@ -124,10 +125,10 @@ pub(crate) struct Pe {
     /// from the descriptor members of the archives read so far: a long import member names
     /// only the descriptor. Written once per archive that has descriptors; read once per long
     /// import member the core reads on its own (an import library read whole uses its own).
-    pub(crate) descriptors: Mutex<coff::Descriptors>,
+    pub(crate) descriptors: Lock<coff::Descriptors>,
     /// An incremental output's last tables, which the next synthesis patches when its
     /// [`crate::model::Delta`] is from theirs.
-    pub(crate) last: Option<Mutex<image::Last>>,
+    pub(crate) last: Option<Lock<image::Last>>,
 }
 
 impl Pe {

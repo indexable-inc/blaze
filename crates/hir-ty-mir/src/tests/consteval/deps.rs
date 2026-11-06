@@ -11,7 +11,7 @@ use hir_def::{
     nameres::{crate_def_map, frozen},
 };
 use hir_expand::fixture;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use crate::{
@@ -58,9 +58,14 @@ impl Held for Bytes {
 }
 
 /// A store in memory; [`Memory::replace`] stands for one whose bytes changed under their key.
-#[derive(Default)]
 struct Memory {
-    values: Mutex<HashMap<ContentId, Arc<Bytes>, Global>>,
+    values: Lock<HashMap<ContentId, Arc<Bytes>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { values: Lock::new("test.mir.consteval.memory.values", Default::default()) }
+    }
 }
 
 impl ImageStore for Memory {

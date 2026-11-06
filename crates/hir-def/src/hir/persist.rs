@@ -1572,7 +1572,7 @@ mod tests {
         };
 
         use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
-        use parking_lot::Mutex;
+        use blaze_core::lock::Lock;
 
         fn scopes_here() -> (Option<Option<u64>>, usize) {
             (unrelocated(Kind::Struct, 0), blank_segments(0))
@@ -1594,7 +1594,7 @@ mod tests {
             });
             let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
             let waiting = Arc::new(AtomicUsize::new(0));
-            let order = Arc::new(Mutex::new(Vec::new()));
+            let order = Arc::new(Lock::new("test.def.persist.resume_order", Vec::new()));
             let parked = |count: usize| {
                 while waiting.load(Ordering::SeqCst) < count {
                     std::thread::yield_now();

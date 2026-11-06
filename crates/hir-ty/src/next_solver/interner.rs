@@ -3449,7 +3449,7 @@ mod attached_db {
         /// never panics, which would abort the process.
         #[test]
         fn an_adt_formatted_detached_while_unwinding_is_a_reported_bug() {
-            struct FormatsOnDrop(super::super::AdtDef, std::sync::Arc<parking_lot::Mutex<String>>);
+            struct FormatsOnDrop(super::super::AdtDef, std::sync::Arc<blaze_core::lock::Lock<String>>);
             impl Drop for FormatsOnDrop {
                 fn drop(&mut self) {
                     *self.1.lock() = format!("{:?}", self.0);
@@ -3457,7 +3457,10 @@ mod attached_db {
             }
             let db = fixture::db("struct S;").into_db();
             let adt = adt_of_s(&db);
-            let seen = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+            let seen = std::sync::Arc::new(blaze_core::lock::Lock::new(
+                "test.ty.interner.adt_formatted",
+                String::new(),
+            ));
             let guard = FormatsOnDrop(adt, seen.clone());
             let ((), reported) = stdx::assert::reported::expecting("AdtDef", || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -3588,7 +3591,8 @@ mod attached_db {
                 });
                 let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
                 let waiting = Arc::new(AtomicUsize::new(0));
-                let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let order =
+                    Arc::new(blaze_core::lock::Lock::new("test.ty.interner.flight_order", Vec::new()));
                 let parked = |count: usize| {
                     while waiting.load(Ordering::SeqCst) < count {
                         std::thread::yield_now();
@@ -3713,9 +3717,9 @@ pub(crate) mod table {
         sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     };
 
+    use blaze_core::lock::{Lock, LockGuard};
     use blaze_hash::{FixedState, SipKey, adaptive};
     use blaze_reclaim::{Horizon, Limbo};
-    use parking_lot::{Mutex, MutexGuard};
     use rustc_type_ir::{DebruijnIndex, TypeFlags};
 
     /// A count of the slots the indexes look at, kept only under `cfg(test)`: what the test
@@ -4143,7 +4147,7 @@ pub(crate) mod table {
     /// every one past its grace at once ([`collect`]); only an insert that grows a table takes
     /// its lock, after letting go of its shard's, and it holds it for a push and a walk of the
     /// held graces, never a scan of the reclaim slots nor a free.
-    static RETIRED: Mutex<Limbo> = Mutex::new(Limbo::new());
+    static RETIRED: Lock<Limbo> = Lock::new("ty.interner.retired", Limbo::new());
 
     /// Frees every retired table of every index whose grace has passed: what a front end
     /// release calls ([`crate::evict::free_retired_intern_tables`]), as otherwise a table is
@@ -4163,7 +4167,7 @@ pub(crate) mod table {
         /// `len`.
         slots: AtomicPtr<AtomicU64>,
         /// How many rows the shard holds.
-        len: Mutex<usize>,
+        len: Lock<usize>,
     }
 
     /// A shard's table is aligned to this, so the low bits of its address hold the log2 of its
@@ -4345,7 +4349,7 @@ pub(crate) mod table {
     /// A hash not in the index, with its shard's lock held until a row is inserted for it.
     struct Vacant<'a> {
         shard: &'a Shard,
-        len: MutexGuard<'a, usize>,
+        len: LockGuard<'a, usize>,
         hash: u32,
         /// The index's count of retired tables, for the test that they are freed.
         #[cfg(test)]
@@ -4355,8 +4359,12 @@ pub(crate) mod table {
     impl Index {
         const fn new() -> Index {
             const fn empty() -> [Shard; SHARDS] {
-                [const { Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) } };
-                    SHARDS]
+                [const {
+                    Shard {
+                        slots: AtomicPtr::new(ptr::null_mut()),
+                        len: Lock::new("ty.interner.shard.len", 0),
+                    }
+                }; SHARDS]
             }
             Index {
                 keyed: AtomicBool::new(false),
@@ -4505,7 +4513,7 @@ pub(crate) mod table {
         #[cold]
         #[inline(never)]
         fn switch(&self, rehash: &impl Fn(SipKey, NonZeroU32) -> u64) {
-            let held: [MutexGuard<'_, usize>; SHARDS] =
+            let held: [LockGuard<'_, usize>; SHARDS] =
                 std::array::from_fn(|at| self.fixed[at].len.lock());
             if self.keyed.load(Ordering::Relaxed) {
                 return;

@@ -18,7 +18,8 @@
 //!
 //! The walk is [`reaches_root`], parameterized by a [`Roots`]: the allocator's functions are
 //! one set, the ambient effects a sans-IO core may not reach (`sans_io_core`) another, the stats
-//! and opens of a path (`syscall_in_loop`) a third. Each set
+//! and opens of a path (`syscall_in_loop`) a third, IO a lock must not be held across
+//! (`lock_held_across_slow`) a fourth. Each set
 //! says which functions end the walk reaching ([`Roots::is_root`]) and which end it not
 //! reaching ([`Roots::stops`]); everything else is walked into the same way.
 
@@ -62,6 +63,9 @@ pub(crate) enum Roots {
     /// A stat or an open of a path (std's `fs::metadata`, `File::open`, libc's `stat`):
     /// `syscall_in_loop`.
     Syscall,
+    /// IO (std's `fs`, `net`, `process` and stdio, libc, blaze-core's driver effects):
+    /// `lock_held_across_slow`.
+    Io,
 }
 
 impl Roots {
@@ -73,6 +77,7 @@ impl Roots {
             Roots::Syscall => {
                 super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Root
             }
+            Roots::Io => super::lock_held_across_slow::io(db, f).is_root(),
         }
     }
 
@@ -84,6 +89,9 @@ impl Roots {
             Roots::Ambient => super::sans_io_core::ambient(db, f).stops(),
             Roots::Syscall => {
                 super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Stop
+            }
+            Roots::Io => {
+                super::lock_held_across_slow::io(db, f) == super::lock_held_across_slow::Io::Stop
             }
         }
     }

@@ -73,6 +73,12 @@ pub struct Now {
     /// What the daemon says its stage waits on (`waits for its pinned native inputs, 1 of 1
     /// layouts left`), or empty while its units build.
     pub stage: String,
+    /// The daemon's top stall in its wait-for graph, in one line, while one lasts: a deadlock
+    /// (`deadlock: thread 3 waits lock store.packs (2400 ms); ...`) or a convoy behind one head
+    /// (`convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is
+    /// running`), as `blaze_core::lock::stall::Stall::line` says it. Its loop watchdog
+    /// (`serve::stop`) checks each look once a wait passes its threshold; `None` for none.
+    pub stall: Option<String>,
     pub tally: Tally,
     /// The pool's workers; those not in `busy` are idle.
     pub workers: u32,
@@ -101,7 +107,7 @@ pub struct Now {
     /// The proc-macro expansion threads: how many there are and what the busy ones expand.
     pub expanding: Expansion,
 }
-keys [busy, at_ms, phase, stage, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
+keys [busy, at_ms, phase, stage, stall, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
 }
 
 impl Default for Phase {
@@ -461,6 +467,8 @@ pub struct Look<'a> {
     pub downloads: &'a [Download],
     /// The stage's words, empty while the units build ([`Now::stage`]).
     pub stage: &'a str,
+    /// The daemon's top stall's line, while one lasts ([`Now::stall`]).
+    pub stall: Option<&'a str>,
     /// The daemon's memory now: [`Memory::peak`] is the fold's to keep (the look's is ignored),
     /// and [`Memory::releases`] is the daemon's count since it started.
     pub memory: &'a Memory,
@@ -781,6 +789,8 @@ impl Fold {
             phase,
             // alloc: the look's answer owns its strings.
             stage: look.stage.to_owned(),
+            // alloc: the look's answer owns its strings; a stall's line, rare.
+            stall: look.stall.map(str::to_owned),
             tally,
             workers: look.workers,
             busy,

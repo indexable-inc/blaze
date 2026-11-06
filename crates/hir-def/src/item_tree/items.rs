@@ -32,7 +32,7 @@ use base_db::{Crate, Db, EditionedFileId, Nonce};
 use blaze_ids::Domain;
 use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     NodeOrToken, SyntaxKind, Text, TextRange, TextSize, ast as tag,
@@ -83,18 +83,19 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
 /// How many files' last trees are kept: the files being edited, and the last few others.
 const SLOTS: usize = 128;
 
-type Slot = Mutex<Option<Kept>>;
+type Slot = Lock<Option<Kept>>;
 
 /// The files' last trees, direct-mapped by database, file and crate: a lookup is one hash, one
 /// index and one short lock, and the slot is empty while its tree is worked from.
 #[cfg(not(test))]
-static KEPT: [Slot; SLOTS] = [const { Mutex::new(None) }; SLOTS];
+static KEPT: [Slot; SLOTS] = [const { Lock::new("def.item_tree.kept", None) }; SLOTS];
 
 #[cfg(test)]
 thread_local! {
     /// A test thread's own slots: a test that counts what an edit lowers sees no other test's
     /// file take its slot between its edits.
-    static KEPT: [Slot; SLOTS] = const { [const { Mutex::new(None) }; SLOTS] };
+    static KEPT: [Slot; SLOTS] =
+        const { [const { Lock::new("test.def.item_tree.kept", None) }; SLOTS] };
 }
 
 fn with_slot<R>(db: Nonce, file: EditionedFileId, krate: Crate, f: impl FnOnce(&Slot) -> R) -> R {

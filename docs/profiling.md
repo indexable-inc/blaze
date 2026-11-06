@@ -1012,6 +1012,53 @@ The build's top-level phases each have a span:
   the database's view in `function` (`View(1234)`). A serve at the view the same crates were last keyed at, none
   moved, walks nothing and opens no span.
 
+## Locks: who waited for whom
+
+Every lock in blaze is a named `blaze_core::lock::{Lock, ReadLock, Signal}`
+(docs/v2/plan/design/named-locks.md). An acquire that has to wait opens the same `wait` span the
+scheduler's waits do (`awaits` = `lock <name>`, or `signal <name>` for a `Signal`), and once it has
+the lock records one event of the target `blaze::lock`, message `lock_wait`
+(`blaze_profile::locks::record`, the profiler being the locks' probe from `blaze_profile::install`
+on). An uncontended acquire records nothing. Two views put the events' fields back as columns:
+
+- `lock_waits`, one row a wait: `lock` (its name), `value_type` (the type it guards), `mode`
+  (`lock`, `read`, `write`), `site` (the waiter's `file:line`), `span` and `thread` (the waiter's
+  `spans.span_id`, 0 for none, and its OS thread), `start_ns` (on the profile's clock) and
+  `wait_ns`; and the holder it waited behind, as the holder left itself at its release:
+  `holder_site`, `holder_span`, `holder_thread`, `holder_mode`, `hold_ns` and `hold_whole` (the
+  hold is from the holder's acquire when it too had waited; from when the first current waiter
+  began when it took the lock uncontended, which has no clock read). A wait whose holder said
+  nothing has `holder_thread` 0 and `holder_site` `''`.
+- `stalls`, one row a stall the daemon's watchdog found in the wait-for graph (events of the
+  target `blaze::stall`): `kind` (`deadlock` or `convoy`), `line`, `head` (the thread a convoy
+  waits behind), `waiters`, `threads` (a comma list) and `oldest_ns`.
+
+Thread ids are the profile's (the OS thread id, which the flight recorder gives the wait-for
+graph as each thread claims its ring), so they join `spans.thread`.
+
+`blaze debug locks [--build N] [--top N] [--json]` ranks a build's locks (the last that ended
+unless `--build` says; 20 unless `--top` says) by total wait: each with its count, its share of
+the pool workers' time, its three most waited call sites, the span its waiters waited in most and
+the span its holders held it in most, and what to use instead, read from its rows by the first
+rule that holds (`blaze_profile::locks::recommend`):
+
+| when | instead |
+| --- | --- |
+| reads are 80% or more of the waits, and most holders that said themselves wrote | arc-swap or RCU |
+| `value_type` is a `HashMap`, `BTreeMap`, `HashSet` or `IndexMap` | `papaya::HashMap` (shared), or `blaze_hash::HashMap` behind one owner |
+| `value_type` is an integer or `bool` | an atomic |
+| `value_type` is a `VecDeque` or `Vec` waited for on two threads or more | a crossbeam channel |
+| every holder that said itself is one thread | move it into its owner and send it messages |
+| otherwise | shorten the critical section |
+
+The build's stalls follow the table.
+
+```sql
+-- the locks of build 12 by total wait, with their worst site
+SELECT lock, count(*) AS waits, sum(wait_ns) / 1e6 AS wait_ms, arg_max(site, wait_ns) AS worst_site
+FROM lock_waits WHERE build_id = 12 GROUP BY lock ORDER BY wait_ms DESC;
+```
+
 ## The gate: what a profile must hold
 
 `blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]` runs the gate
@@ -1035,6 +1082,7 @@ threshold, a constant in gate.rs:
 | `slow_deterministic` | `blaze slow --json` of the build gives the same bytes twice | none |
 | `merged_rows_match` | every merged file of the build holds the rows its merge read from its inputs' footers (`blaze.merged_rows`) | none |
 | `merges_exact` | the build's files of each table merged again (`history::concat`) hold exactly their rows: by the footers, and as a multiset of DuckDB's row hashes | none |
+| `lock_waits` | no one named lock's waits (`lock_waits`) sum to more than a share of the build's pool-worker time (its workers, as `workers_covered` finds them, times its wall time); a build with no lock waited for passes, since an uncontended lock records nothing | `LOCK_WAIT_MAX_PCT`, 2% (set from the 2026-11-05 `flight::intern` convoy and the 1% uncovered budget; re-picked from the first ten gate builds) |
 
 The daemon's CPU is its `builds` row's `daemon_user_ns` and `daemon_system_ns`
 (`getrusage(RUSAGE_SELF)` at the build's end less at its start); a row with none (Windows, a blaze

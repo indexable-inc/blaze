@@ -15,14 +15,16 @@
 
 use std::ptr;
 
+// Under `blaze_check` the limbo's lock is the model checker's, which explores its interleavings;
+// otherwise it is blaze's named lock.
 #[cfg(blaze_check)]
 use blaze_check::sync::{
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-    lot::Mutex,
+    lot::Mutex as Lock,
 };
-use blaze_reclaim::{Guard, Limbo};
 #[cfg(not(blaze_check))]
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
+use blaze_reclaim::{Guard, Limbo};
 #[cfg(not(blaze_check))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
@@ -70,7 +72,18 @@ impl<K, S, V> Entry<K, S, V> {
 pub(super) struct Table<K, S, V> {
     slots: Box<[Slot<K, S, V>]>,
     /// Entries replaced, until no task can still be reading them. Locked only to replace.
-    limbo: Mutex<Limbo>,
+    limbo: Lock<Limbo>,
+}
+
+/// A table's limbo lock: named outside the model checker, whose lock takes no name.
+#[cfg(not(blaze_check))]
+fn limbo_lock() -> Lock<Limbo> {
+    Lock::new("ty.pick_cache.limbo", Limbo::new())
+}
+
+#[cfg(blaze_check)]
+fn limbo_lock() -> Lock<Limbo> {
+    Lock::new(Limbo::new())
 }
 
 /// A slot and the entry it was seen to hold.
@@ -89,7 +102,7 @@ where
         Table {
             // alloc: setup, once per table and process.
             slots: slots.collect(),
-            limbo: Mutex::new(Limbo::new()),
+            limbo: limbo_lock(),
         }
     }
 

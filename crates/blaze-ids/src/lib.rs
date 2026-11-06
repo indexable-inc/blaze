@@ -20,12 +20,12 @@ use blaze_mem::swiss::Index;
 
 #[allow(
     clippy::disallowed_types,
-    reason = "`Mutex` is named only by `Shard::lock`, which allows it"
+    reason = "`Lock` is named only by `Shard::lock`, which allows it"
 )]
 use crate::{
     b3::ContextKey,
     sync::{
-        Mutex, OnceLock,
+        Lock, OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -390,7 +390,7 @@ struct Claimed {
 )]
 struct Shard {
     /// Held only to look again and insert.
-    lock: Mutex<Claimed>,
+    lock: Lock<Claimed>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
     /// The shard's values by [`probe_hash`]: a find is one control word and one slot, then
@@ -421,7 +421,7 @@ impl<T: Send + Sync> Sharded<T> {
             next: AtomicU64::new(0),
             shards: (0..count)
                 .map(|_| Shard {
-                    lock: Mutex::new(Claimed { next: 0, end: 0 }),
+                    lock: Lock::new("ids.sharded.claim", Claimed { next: 0, end: 0 }),
                     len: AtomicU32::new(0),
                     index: Index::new(),
                 })
@@ -891,7 +891,7 @@ mod model {
     struct Model {
         interner: Sharded<Counted>,
         ids: Vec<ContentId>,
-        made: parking_lot::Mutex<Vec<Arc<AtomicBool>>>,
+        made: blaze_core::lock::Lock<Vec<Arc<AtomicBool>>>,
         history: History<Set>,
     }
 
@@ -903,7 +903,7 @@ mod model {
             Arc::new(Model {
                 interner: Sharded::new(),
                 ids,
-                made: parking_lot::Mutex::new(Vec::new()),
+                made: blaze_core::lock::Lock::new("ids.test.made", Vec::new()),
                 history: History::new(),
             })
         }

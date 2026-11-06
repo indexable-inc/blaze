@@ -14,6 +14,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+blaze-core.workspace = true
 blaze-cas = { path = "../blaze-cas" }
 blaze-codegen = { path = "../blaze-codegen" }
 blaze-format = { path = "../blaze-format" }
@@ -21,7 +22,6 @@ blaze-hash = { path = "../blaze-hash" }
 blaze-ids = { path = "../blaze-ids" }
 blaze-items = { path = "../blaze-items" }
 blaze-wasm-pack = { path = "../blaze-wasm-pack", version = "0.0.0" }
-parking_lot = "0.12.5"
 wasm-encoder = { version = "0.263", default-features = false, features = ["std"] }
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 

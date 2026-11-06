@@ -60,7 +60,7 @@ use std::{
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
-use blaze_graph::{Key, wait};
+use blaze_graph::Key;
 use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
@@ -74,8 +74,8 @@ use hir_expand::proc_macro::{
     Expanded, ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
     ProcMacroKind, ProcMacroLoadResult, StateUse,
 };
+use blaze_core::lock::{Lock, LockGuard};
 use intern::Symbol;
-use parking_lot::Mutex;
 use proc_macro_api::kept::verdict::{
     self as verdicts, Left, SETTLES, STATEFUL, STATELESS, Verdict,
 };
@@ -103,7 +103,7 @@ pub struct Macros {
     /// read under it is of the same file in every checkout ([`RootMap::with_sources`]). None
     /// where nothing is fetched (a test, a bench): such a read is then this checkout's.
     sources: Option<PathBuf>,
-    libraries: Mutex<Vec<Weak<Library>>>,
+    libraries: Lock<Vec<Weak<Library>>>,
     /// The daemon's wasm modules ([`load_wasm`]'s), made with it: or why Wasmtime made no
     /// engine, which every wasm macro's load then says.
     modules: Result<wasm::Modules, String>,
@@ -120,7 +120,7 @@ impl Macros {
         Arc::new(Macros {
             keeps,
             sources,
-            libraries: Mutex::new(Vec::new()),
+            libraries: Lock::new("macro.libraries", Vec::new()),
             modules: wasm::Modules::new(),
         })
     }
@@ -204,7 +204,7 @@ struct Library {
     /// For a crate that settles, the settled state its sessions' first calls left, the first
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
-    settled: Mutex<Option<Settled>>,
+    settled: Lock<Option<Settled>>,
 }
 
 /// The settled state of a crate that settles: its digest ([`start_digest`]), and the statics,
@@ -417,18 +417,12 @@ impl fmt::Debug for Library {
     }
 }
 
-/// What [`SessionOf::state`] is locked as, said when another holds it.
-const SESSION_STATE: &str = "a proc-macro session's state";
-
-/// What a wait on [`Library::settled`] says.
-const SETTLED_STATE: &str = "the settled state of a proc-macro crate that settles";
-
 /// One calling crate's session of a library: its state, and what its turn is held under.
 struct SessionOf {
     /// Locked only to read or write its fields, never across a run, a query or any other wait
     /// (standard-structures, no-wait-across-thread-locals): a call that runs from the state or
     /// changes it holds the session's turn ([`Library::turn`]) instead.
-    state: Mutex<Session>,
+    state: Lock<Session>,
     /// The session's turn's key in [`Library::turns`]: one of the process's, from a count.
     turn: Key,
 }
@@ -440,12 +434,12 @@ impl SessionOf {
         turn[..8].copy_from_slice(&SESSIONS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         turn[8..].copy_from_slice(b"a macro session's turn\0\0");
         // alloc: once per calling crate of a proc-macro crate
-        Arc::new(SessionOf { state: Mutex::new(Session::default()), turn: Key(turn) })
+        Arc::new(SessionOf { state: Lock::new("macro.session.state", Session::default()), turn: Key(turn) })
     }
 
     /// Its state, for a field's read or write: never held across a wait.
-    fn lock(&self) -> parking_lot::MutexGuard<'_, Session> {
-        wait::lock(&self.state, SESSION_STATE)
+    fn lock(&self) -> LockGuard<'_, Session> {
+        self.state.lock()
     }
 }
 
@@ -465,7 +459,7 @@ struct SessionTurn<'s> {
 impl SessionTurn<'_> {
     /// The session's state for a field's update, `None` when it was started again for another
     /// revision since the turn was taken: nothing of this turn's call is kept in that one.
-    fn update(&self) -> Option<parking_lot::MutexGuard<'_, Session>> {
+    fn update(&self) -> Option<LockGuard<'_, Session>> {
         let held = self.session.lock();
         (held.at == self.at).then_some(held)
     }
@@ -719,7 +713,7 @@ fn load_on(
         sessions: SharedMap::default(),
         turns: Turns::default(),
         kept_roots: SharedMap::default(),
-        settled: Mutex::new(None),
+        settled: Lock::new("macro.library.settled", None),
     });
     macros.libraries.lock().push(Arc::downgrade(&library));
     // None for a proc-macro crate with none, which rustc builds: a use fails at the use.
@@ -1170,7 +1164,7 @@ impl Evaluated {
                 let statics: Vec<(StaticId, Vec<u8>)> =
                     ran.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
                 let Some(digest) = start_digest(db, &statics) else { return Ok(Err(UNSHOWN)) };
-                let mut settled = wait::lock(&library.settled, SETTLED_STATE);
+                let mut settled = library.settled.lock();
                 if settled.as_ref().is_some_and(|it| it.digest != digest) {
                     drop(settled);
                     if demote {
@@ -1183,14 +1177,14 @@ impl Evaluated {
                 drop(settled);
                 statics
             }
-            (false, None) => match &*wait::lock(&library.settled, SETTLED_STATE) {
+            (false, None) => match &*library.settled.lock() {
                 // clone: once per such call, the statics it runs from
                 Some(it) if it.at == at => it.statics.clone(),
                 _ => return Ok(Err(UNSHOWN)),
             },
             // From the settled state: the other is the fresh one.
             (false, Some(digest)) => {
-                if wait::lock(&library.settled, SETTLED_STATE)
+                if library.settled.lock()
                     .as_ref()
                     .is_some_and(|it| it.digest != digest)
                 {

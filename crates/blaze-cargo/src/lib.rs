@@ -94,7 +94,7 @@ mod refused_tests {
 /// The lock, also after a thread panicked with it: a build that is interrupted or that
 /// panics unwinds, and what a lock here guards is whole between any two statements, so the
 /// requests after it go on with what is there.
-pub fn lock<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &blaze_core::lock::Lock<T>) -> blaze_core::lock::LockGuard<'_, T> {
     mutex.lock()
 }
 

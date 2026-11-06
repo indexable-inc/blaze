@@ -819,14 +819,14 @@ fn hold(
 /// follows [`Phase::Listening`]'s byte: the pipe is closed as that is said, or as this drops
 /// with a start that failed, and the reporter ends at its next tick, finding it gone.
 pub(crate) struct Ready {
-    pipe: Arc<parking_lot::Mutex<Option<std::fs::File>>>,
+    pipe: Arc<blaze_core::lock::Lock<Option<std::fs::File>>>,
 }
 
 impl Ready {
     /// The pipe, its reporter started: the calling thread is the start's, which it reports on.
     #[cfg(all(unix, feature = "native"))]
     fn new(pipe: std::fs::File) -> anyhow::Result<Ready> {
-        let pipe = Arc::new(parking_lot::Mutex::new(Some(pipe)));
+        let pipe = Arc::new(blaze_core::lock::Lock::new("serve.ready.pipe", Some(pipe)));
         let starting = blaze_profile::starting::Starting::here();
         let reported = Arc::clone(&pipe);
         std::thread::Builder::new()
@@ -881,7 +881,7 @@ const REPORTS_MAX: u64 = (BEFORE_ENDS.as_secs() + 600) * 1000 / REPORT_EVERY.as_
 /// as the tick before ended, so nothing restarts a wait that is interrupted.
 #[cfg(all(unix, feature = "native"))]
 fn report(
-    pipe: &parking_lot::Mutex<Option<std::fs::File>>,
+    pipe: &blaze_core::lock::Lock<Option<std::fs::File>>,
     starting: blaze_profile::starting::Starting,
 ) {
     use blaze_core::wait::{Clock, Deadline, Monotonic, sleep_until};

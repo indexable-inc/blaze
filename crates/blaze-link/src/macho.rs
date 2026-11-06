@@ -91,7 +91,7 @@ use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_sha256 as sha256;
 use object::macho;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use crate::cow::CowBytes;
 use crate::model::{
@@ -163,7 +163,7 @@ pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
              which OS and SDK it is for, and dyld refuses an image without it",
         ));
     };
-    let cache = output.incremental.then(Mutex::default);
+    let cache = output.incremental.then(|| Lock::new("link.macho.kept", Kept::default()));
     // alloc: clone: the writer and its copy of the output, once per image
     Ok(MachO { output: output.clone(), cpu, subtype, page, platform, cache })
 }
@@ -178,7 +178,7 @@ pub(crate) struct MachO {
     /// [`Writer::synthesize`] and [`Writer::file`], each called once per link of the image
     /// one after the other, so never contended and never held across a call out of the
     /// writer.
-    cache: Option<Mutex<Kept>>,
+    cache: Option<Lock<Kept>>,
 }
 
 /// [`push_core_name`] as a `String`: the readers' tests compare against it.
@@ -2395,7 +2395,7 @@ fn written_since(
 
 /// The kept state, started over after a panic while it was held: a page may be without its
 /// hash, a table half patched.
-fn lock(cache: &Mutex<Kept>) -> Reset<'_, Kept> {
+fn lock(cache: &Lock<Kept>) -> Reset<'_, Kept> {
     reset::lock(cache)
 }
 

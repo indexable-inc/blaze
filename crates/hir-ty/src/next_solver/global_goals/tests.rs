@@ -9,6 +9,7 @@ use std::{
 };
 
 use base_db::{Crate, Db, all_crates};
+use blaze_core::lock::Lock;
 use blaze_ids::rng::SplitMix64;
 use hir_def::{
     AdtId, FunctionId, HasModule, ModuleDefId, TraitId,
@@ -16,7 +17,6 @@ use hir_def::{
     signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
 use hir_expand::fixture;
-use parking_lot::Mutex;
 use rustc_type_ir::{Interner as _, MayBeErased, Upcast, inherent::Ty as _};
 
 use super::{GoalKey, mode_tag, shape, switch, table::Table};
@@ -42,7 +42,7 @@ fn value_of(key: GoalKey) -> u64 {
 #[test]
 fn the_table_agrees_with_a_locked_map_under_eight_threads() {
     let table = Table::<u64>::default();
-    let reference = Mutex::new(HashMap::new());
+    let reference = Lock::new("test.ty.global_goals.reference", HashMap::new());
     let keys: Vec<GoalKey> = {
         let mut rng = SplitMix64::new(7);
         (0..20_000).map(|_| key_of(rng.next_u64())).collect()

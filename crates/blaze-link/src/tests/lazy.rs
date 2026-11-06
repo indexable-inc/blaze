@@ -23,7 +23,7 @@ use blaze_lazy::runner::Placer as _;
 use blaze_lazy::stub::{Abi, Isa, Stubs, X86Save};
 use blaze_lazy::{Plan, Purpose, Session, hook};
 use blaze_live::patch::Message;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{Change, Disk, GROWTH, Image, Output, OutputKind, TO, function, id, key, name, output};
 use crate::model::{Class, Reserve};
@@ -392,12 +392,12 @@ fn cells_at(image: &Image) -> u64 {
 
 /// A [`Slots`] that stores nothing and records each publication.
 #[derive(Clone)]
-struct Recorder(Arc<Mutex<Vec<(Slot, u64)>>>);
+struct Recorder(Arc<Lock<Vec<(Slot, u64)>>>);
 
 impl Recorder {
     fn new() -> Recorder {
         // Room for every test's publications: one inside an allocation budget grows nothing.
-        Recorder(Arc::new(Mutex::new(Vec::with_capacity(64))))
+        Recorder(Arc::new(Lock::new("link.test.published", Vec::with_capacity(64))))
     }
 
     fn published(&self) -> Vec<(Slot, u64)> {
@@ -448,8 +448,8 @@ fn program(arch: Arch) -> Vec<CompiledFunction> {
 /// A placer over a lazy image of [`program`] committed into a laid-out code memory, at slide
 /// 0, or `None` where this host can't lay the image's memory out.
 struct Placed {
-    image: Arc<Mutex<Image>>,
-    memory: Arc<Mutex<CodeMemory>>,
+    image: Arc<Lock<Image>>,
+    memory: Arc<Lock<CodeMemory>>,
     placer: LazyPlacer<Recorder>,
     recorder: Recorder,
     session: Session,
@@ -477,7 +477,10 @@ fn placed(case: Case, output: Output, label: &str) -> Option<Placed> {
     .unwrap();
     assert_eq!(image.commit_into(staged, &mut memory), Ok(None));
     memory.lay_out(case.format()).unwrap();
-    let (image, memory) = (Arc::new(Mutex::new(image)), Arc::new(Mutex::new(memory)));
+    let (image, memory) = (
+        Arc::new(Lock::new("link.test.image", image)),
+        Arc::new(Lock::new("link.test.memory", memory)),
+    );
     let recorder = Recorder::new();
     let placer = LazyPlacer::new(image.clone(), memory.clone(), recorder.clone(), 0).unwrap();
     Some(Placed { image, memory, placer, recorder, session })
@@ -968,8 +971,8 @@ fn placing_what_the_image_cannot_reach_is_an_error_naming_the_function() {
             image.commit_into(staged, &mut memory).unwrap();
             memory.lay_out(case.format()).unwrap();
             let error = LazyPlacer::new(
-                Arc::new(Mutex::new(image)),
-                Arc::new(Mutex::new(memory)),
+                Arc::new(Lock::new("link.test.image", image)),
+                Arc::new(Lock::new("link.test.memory", memory)),
                 Recorder::new(),
                 0,
             )

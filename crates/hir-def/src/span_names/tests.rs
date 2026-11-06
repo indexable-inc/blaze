@@ -14,7 +14,7 @@ use blaze_query::db::Database as _;
 use hegel::generators as gs;
 use hegel::{Hegel, Settings};
 use hir_expand::fixture;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use super::write_body_path;
@@ -198,13 +198,21 @@ nonzero!(u64, outer);
 }
 
 /// The `function` each span was given, by a subscriber that records every span.
-#[derive(Default)]
 struct Named {
     next: AtomicU64,
-    functions: Mutex<Vec<String>>,
+    functions: Lock<Vec<String>>,
 }
 
-struct Functions<'a>(&'a Mutex<Vec<String>>);
+impl Default for Named {
+    fn default() -> Named {
+        Named {
+            next: AtomicU64::new(0),
+            functions: Lock::new("test.def.span_names.functions", Vec::new()),
+        }
+    }
+}
+
+struct Functions<'a>(&'a Lock<Vec<String>>);
 
 impl tracing::field::Visit for Functions<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {

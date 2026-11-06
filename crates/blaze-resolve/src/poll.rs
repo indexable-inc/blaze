@@ -155,7 +155,8 @@ pub(crate) mod tests {
     /// A future woken from another thread, as one waiting on a download is. Each poll leaves
     /// its waker for the thread, as a future must.
     fn woken_from_elsewhere() -> impl Future<Output = ()> {
-        let state = Arc::new(parking_lot::Mutex::new((false, None::<Waker>)));
+        let state =
+            Arc::new(blaze_core::lock::Lock::new("test.resolve.woken", (false, None::<Waker>)));
         let mut started = false;
         std::future::poll_fn(move |cx| {
             let mut guard = state.lock();

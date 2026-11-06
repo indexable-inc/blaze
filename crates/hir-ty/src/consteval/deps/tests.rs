@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use base_db::{Crate, Db, Env};
+use blaze_core::lock::Lock;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
@@ -10,7 +11,6 @@ use hir_def::{
     nameres::{crate_def_map, frozen},
 };
 use hir_expand::fixture;
-use parking_lot::Mutex;
 use rustc_abi::Size;
 use rustc_type_ir::{IntTy, Mutability, UintTy};
 use std::alloc::Global;
@@ -193,9 +193,14 @@ fn the_key_changes_with_each_input() {
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes.
-#[derive(Default)]
 struct Memory {
-    values: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
+    values: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { values: Lock::new("test.ty.consteval.memory", HashMap::default()) }
+    }
 }
 
 impl ImageStore for Memory {

@@ -24,7 +24,7 @@ use hir_def::{
 };
 use hir_expand::fixture;
 use hir_expand::name::Name;
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use super::{
@@ -114,9 +114,14 @@ impl P { pub fn p4(&self) {} }
 const BODIES: [&str; 4] = ["uses_show", "plain", "seven", "closures"];
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
-#[derive(Default)]
 pub(super) struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
+    images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { images: Lock::new("test.ty.body_store.memory", HashMap::default()) }
+    }
 }
 
 impl Memory {
@@ -154,7 +159,21 @@ impl ImageStore for Memory {
 
 /// The items every test database's keys name: a key is the hash of an item's portable form in
 /// `main`'s table (frontend-deps' frozen encoding), kept so another database finds it again.
-pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>), Global>>>;
+#[derive(Clone)]
+pub(super) struct Defs(Arc<Lock<HashMap<ContentId, (u8, Vec<u8>), Global>>>);
+
+impl Default for Defs {
+    fn default() -> Defs {
+        Defs(Arc::new(Lock::new("test.ty.body_store.defs", HashMap::default())))
+    }
+}
+
+impl std::ops::Deref for Defs {
+    type Target = Lock<HashMap<ContentId, (u8, Vec<u8>), Global>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Lane item-hash's part, for tests, one per database: a body's identity is its key and its HIR
 /// printed (no ids, no spans); every read of an impl table is [`IMPLS`], `refuse` is refused, and
@@ -162,9 +181,9 @@ pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>), Global>>>;
 pub(super) struct TestFacts {
     defs: Defs,
     main: Crate,
-    identities: Mutex<HashMap<DefWithBodyId, Option<ContentId>, Global>>,
+    identities: Lock<HashMap<DefWithBodyId, Option<ContentId>, Global>>,
     refuse: Option<&'static str>,
-    names: Mutex<Vec<&'static str>>,
+    names: Lock<Vec<&'static str>>,
 }
 
 impl TestFacts {
@@ -172,9 +191,9 @@ impl TestFacts {
         TestFacts {
             defs: defs.clone(),
             main: crate_named(db, "main"),
-            identities: Mutex::default(),
+            identities: Lock::new("test.ty.body_store.identities", Default::default()),
             refuse,
-            names: Mutex::default(),
+            names: Lock::new("test.ty.body_store.names", Default::default()),
         }
     }
 }

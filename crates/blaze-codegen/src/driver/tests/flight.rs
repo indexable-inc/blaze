@@ -4,17 +4,26 @@
 
 use std::{sync::Barrier, time::Duration};
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::*;
 
 /// [`Machine`] whose compiles take a while, so builds started together overlap, counting each
 /// function it prepares and compiles by key.
-#[derive(Default)]
 struct Slow {
     machine: Machine,
-    prepared: Mutex<Vec<InstanceKey>>,
-    emitted: Mutex<Vec<InstanceKey>>,
+    prepared: Lock<Vec<InstanceKey>>,
+    emitted: Lock<Vec<InstanceKey>>,
+}
+
+impl Default for Slow {
+    fn default() -> Slow {
+        Slow {
+            machine: Machine::default(),
+            prepared: Lock::new("test.codegen.driver.flight_prepared", Vec::new()),
+            emitted: Lock::new("test.codegen.driver.flight_emitted", Vec::new()),
+        }
+    }
 }
 
 impl Prepare for Slow {
@@ -146,7 +155,7 @@ fn alone(program: &Program, policy: &Policy, root: u32) -> Built {
         .unwrap()
 }
 
-fn sorted(keys: &Mutex<Vec<InstanceKey>>) -> Vec<InstanceKey> {
+fn sorted(keys: &Lock<Vec<InstanceKey>>) -> Vec<InstanceKey> {
     let mut keys = keys.lock().clone();
     keys.sort();
     keys

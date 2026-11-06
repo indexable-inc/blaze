@@ -79,7 +79,7 @@ fn a_parallel_edit_of_every_entry_is_the_serial_one() {
             |_, &value| decide(value),
             |&old, new| said.push((old, new.copied())),
         );
-        let heard = parking_lot::Mutex::new(Vec::new());
+        let heard = blaze_core::lock::Lock::new("query.test.table.heard", Vec::new());
         parallel.edit_all_parallel(
             Vec::new,
             |_, _, _, &value| decide(value),

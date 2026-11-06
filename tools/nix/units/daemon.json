@@ -9142,6 +9142,7 @@
       "jagged_vec": "warn",
       "key_ignores_field": "warn",
       "lock_across_query": "warn",
+      "lock_held_across_slow": "warn",
       "missing_size_hint": "warn",
       "open_wait_loop": "warn",
       "outline_generic_body": "warn",

@@ -14,7 +14,7 @@ use blaze_graph::{
     topology::Topology,
     wait::{self, WaitOn},
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{NoTurn, Turns};
 
@@ -36,14 +36,14 @@ fn named(it: &mut String) {
 /// each stopped.
 struct Scenario {
     turns: Turns,
-    log: Mutex<Vec<String>>,
+    log: Lock<Vec<String>>,
     /// Whether a call holds the turn now: a second one given it at once is a failure.
     in_turn: AtomicBool,
     /// How many of the other calls have come to ask for the turn.
     arrived: AtomicUsize,
     others: usize,
     /// The holder's expansion, which the last of the other calls to arrive ends.
-    expansion: Mutex<Option<Event>>,
+    expansion: Lock<Option<Event>>,
 }
 
 type Ended = mpsc::Sender<Result<&'static str, String>>;
@@ -101,11 +101,11 @@ fn calls_of_one_session_wait_their_turn_switched_out(workers: usize) {
     let done: EventWait = expansion.waiter();
     let scenario = Arc::new(Scenario {
         turns: Turns::default(),
-        log: Mutex::new(Vec::new()),
+        log: Lock::new("macro.turn.test.log", Vec::new()),
         in_turn: AtomicBool::new(false),
         arrived: AtomicUsize::new(0),
         others: workers,
-        expansion: Mutex::new(Some(expansion)),
+        expansion: Lock::new("macro.turn.test.expansion", Some(expansion)),
     });
     let (ended, endings) = mpsc::channel();
     {

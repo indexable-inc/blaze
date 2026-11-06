@@ -609,7 +609,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::disallowed_types,
-        reason = "the test's one writer at a time, which `Index` asks of its caller: a test thread, not the allocator"
+        reason = "below blaze-core: blaze-mem is a dependency of blaze-core; the test's one writer at a time, which `Index` asks of its caller: a test thread, not the allocator"
     )]
     fn readers_race_a_growing_index() {
         use std::sync::atomic::AtomicU64 as Key;

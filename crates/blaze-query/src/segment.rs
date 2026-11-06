@@ -23,7 +23,6 @@ use std::{
 
 use crate::{
     sync::{
-        Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering},
         freed_bytes, read_bytes, thread_local, wrote_bytes,
     },
@@ -38,7 +37,7 @@ struct LaneIds {
 /// The lane indices of the process: a thread takes one when it first copies in and gives it
 /// back when it ends, so the lanes in use stay as many as the threads.
 // alloc: none: an empty `Vec` in a static; it grows by one a thread.
-static LANE_IDS: ShortLock<LaneIds> = ShortLock::new(LaneIds { next: 0, free: Vec::new() });
+static LANE_IDS: ShortLock<LaneIds> = ShortLock::new("query.segment.lane_ids", LaneIds { next: 0, free: Vec::new() });
 
 struct Lane(u32);
 
@@ -87,7 +86,7 @@ pub(crate) struct Lanes<T> {
     /// of it asks.
     chunks: [AtomicPtr<T>; LANE_CHUNKS],
     /// Held while a chunk is made, so each is made once.
-    making: Mutex<()>,
+    making: ShortLock<()>,
     _owns: PhantomData<*mut T>,
 }
 
@@ -101,7 +100,7 @@ impl<T: Default> Lanes<T> {
     pub(crate) fn new() -> Lanes<T> {
         Lanes {
             chunks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            making: Mutex::new(()),
+            making: ShortLock::new("query.segment.lane_making", ()),
             _owns: PhantomData,
         }
     }
@@ -378,7 +377,7 @@ impl Segments {
     pub(crate) fn new(first: usize, max: usize, align: usize) -> Segments {
         debug_assert!(align.is_power_of_two() && align <= SEGMENT_ALIGN && first <= max);
         assert!(first > 0, "segments whose first is 0 never grow to fit a copy");
-        Segments { lanes: Lanes::new(), all: ShortLock::default(), first, max, align }
+        Segments { lanes: Lanes::new(), all: ShortLock::new("query.segment.all", All::default()), first, max, align }
     }
 
     fn make(&self, cap: usize, holds: i64, sealed: bool) -> *mut Segment {

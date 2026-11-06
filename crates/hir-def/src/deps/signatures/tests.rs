@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use blaze_core::lock::{Lock, LockGuard};
 
 use blaze_format::Aligned;
 use blaze_hash::{HashMap, HashSet};
@@ -135,9 +135,14 @@ fn all(db: &TestDB) -> Vec<Crate> {
 }
 
 /// A store in memory.
-#[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, std::sync::Arc<Aligned>, Global>>,
+    images: Lock<HashMap<ContentId, std::sync::Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { images: Lock::new("test.def.signatures.memory.images", Default::default()) }
+    }
 }
 
 impl ImageStore for Memory {
@@ -179,7 +184,7 @@ fn served_db(fixture: &str, memory: &Memory, mode: Mode) -> TestDB {
 
 /// The differences frozen bytes record are the process's: the tests that read them take turns
 /// with the other image tests.
-fn turn() -> parking_lot::MutexGuard<'static, ()> {
+fn turn() -> LockGuard<'static, ()> {
     crate::deps::tests::TURN.lock()
 }
 

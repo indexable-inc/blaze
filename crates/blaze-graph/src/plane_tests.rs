@@ -13,7 +13,7 @@ use std::sync::Arc;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use crate::{
@@ -262,7 +262,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
 
 /// What the query database has, as the plane's [`crate::plane::Memo`] sees it: the test puts a
 /// task's value in it before its `Done`, as the work does.
-type Db = Arc<Mutex<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
+type Db = Arc<Lock<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
 
 /// A test's [`Db`] as the plane's memo.
 struct DbMemo(Db);
@@ -274,7 +274,7 @@ impl Memo for DbMemo {
 }
 
 fn with_db(config: PlaneConfig) -> (Plane<DbMemo>, Db) {
-    let db = Db::default();
+    let db: Db = Arc::new(Lock::new("graph.test.plane.db", HashMap::default()));
     (Plane::with_memo(config, DbMemo(Arc::clone(&db))).unwrap(), db)
 }
 
@@ -1742,7 +1742,7 @@ fn releasing_requests_changes_no_output() {
 /// Puts the reference through what `simulated` did to the plane, and checks that it says the
 /// same to each act and of itself after it.
 fn replay(seed: u64, simulated: &Simulated) {
-    let db = Db::default();
+    let db: Db = Arc::new(Lock::new("graph.test.plane.db", HashMap::default()));
     let mut model =
         reference::Plane::with_memo(simulated.config.clone(), DbMemo(Arc::clone(&db))).unwrap();
     assert_eq!(model.config(), &simulated.config);

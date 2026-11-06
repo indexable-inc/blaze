@@ -20,6 +20,10 @@
 //! - `merged_rows_match`: every merged file of the build holds the rows its merge read
 //!   ([`crate::history::MERGED_ROWS`]).
 //! - `merges_exact`: merging the build's files again holds exactly their rows, as a multiset.
+//! - `lock_waits`: no one named lock's waits (`lock_waits`, blaze_core::lock) sum to more than
+//!   [`LOCK_WAIT_MAX_PCT`] of the build's pool-worker time. Set from the 2026-11-05
+//!   `flight::intern` convoy and the 1% uncovered budget; re-pick from the first ten gate
+//!   builds.
 //!
 //! A check that saw nothing to judge (no pool worker switched, no sample was taken or none off
 //! the CPU, no wait span) could not run, never a pass: a build profiled with the sampler off
@@ -64,6 +68,12 @@ pub const SAMPLES_IN_SPANS_MIN_PCT: f64 = 99.0;
 /// in percent of the process's.
 pub const CPU_DIFF_MAX_PCT: f64 = 5.0;
 
+/// The most of the build's pool-worker time (its workers times its wall time, as
+/// `workers_covered` counts it) one named lock's waits may sum to, in percent. Set from the
+/// 2026-11-05 `flight::intern` convoy (60 threads behind one lock) and the 1% uncovered
+/// budget; re-pick from the first ten gate builds' `lock_waits`.
+pub const LOCK_WAIT_MAX_PCT: f64 = 2.0;
+
 /// How far two clock readings that should agree may differ: a span's start and its parent's,
 /// a sample's time and its span's ends.
 pub const CLOCK_SLACK_NS: i64 = 10_000;
@@ -93,11 +103,12 @@ pub enum CheckName {
     SlowDeterministic,
     MergedRowsMatch,
     MergesExact,
+    LockWaits,
 }
 
 impl CheckName {
     /// Every check, in the order a verdict says them.
-    pub const ALL: [CheckName; 11] = [
+    pub const ALL: [CheckName; 12] = [
         CheckName::WorkersCovered,
         CheckName::BlocksInWaits,
         CheckName::WaitsSayWhat,
@@ -109,6 +120,7 @@ impl CheckName {
         CheckName::SlowDeterministic,
         CheckName::MergedRowsMatch,
         CheckName::MergesExact,
+        CheckName::LockWaits,
     ];
 
     pub fn name(self) -> &'static str {
@@ -124,6 +136,7 @@ impl CheckName {
             CheckName::SlowDeterministic => "slow_deterministic",
             CheckName::MergedRowsMatch => "merged_rows_match",
             CheckName::MergesExact => "merges_exact",
+            CheckName::LockWaits => "lock_waits",
         }
     }
 }
@@ -294,20 +307,21 @@ impl From<SqlError> for GateError {
     }
 }
 
-/// The build a verdict is of: its `builds` row's window and process.
+/// The build a verdict is of (and `blaze debug locks`'s, [`crate::locks::load`]): its `builds`
+/// row's window and process.
 #[derive(Clone, Debug)]
-struct Build {
-    build: u64,
-    t0: i64,
-    t1: i64,
-    process: Option<u32>,
-    tree: Option<String>,
-    blaze: Option<String>,
+pub(crate) struct Build {
+    pub(crate) build: u64,
+    pub(crate) t0: i64,
+    pub(crate) t1: i64,
+    pub(crate) process: Option<u32>,
+    pub(crate) tree: Option<String>,
+    pub(crate) blaze: Option<String>,
 }
 
 impl Build {
     /// ` AND process = P`, or nothing when the build's row names no process.
-    fn of(&self) -> String {
+    pub(crate) fn of(&self) -> String {
         // alloc: a condition, once a verdict
         self.process.map_or(String::new(), |it| format!(" AND process = {it}"))
     }
@@ -333,9 +347,18 @@ impl Build {
         )
     }
 
+    /// The build's events (and the views over them, `lock_waits` and `stalls`): its own, and
+    /// its process's of no build in its window, as [`Build::spans`] takes spans.
+    pub(crate) fn events(&self) -> String {
+        let Build { build, t0, t1, .. } = *self;
+        let of = self.of();
+        // alloc: a condition, once a check
+        format!("(build_id = {build} OR (build_id IS NULL AND t_ns >= {t0} AND t_ns < {t1}{of}))")
+    }
+
     /// The pool workers of the build: the threads that ran or idled jobs in its window, as
     /// `uncovered_per_worker` finds them.
-    fn workers(&self) -> String {
+    pub(crate) fn workers(&self) -> String {
         let Build { t0, t1, .. } = *self;
         let of = self.of();
         // alloc: a query's part, once a check
@@ -384,7 +407,7 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
 }
 
 /// The build's `builds` row: the last ended one, or `asked`'s.
-fn build(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Build, GateError> {
+pub(crate) fn build(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Build, GateError> {
     let which = match asked {
         // alloc: a query, once a verdict
         Some(build) => format!("build_id = {build}"),
@@ -422,6 +445,7 @@ type Judge = fn(&Build, &[Vec<RecordBatch>]) -> Result<Check, String>;
 fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
     let Build { build, t0, t1, .. } = *it;
     let (spans, folded, workers, of) = (it.spans(), it.folded(), it.workers(), it.of());
+    let events = it.events();
     let mut args = Map::new();
     args.insert("build".into(), Value::from(build));
     let uncovered = views::find("uncovered_per_worker").and_then(|it| views::render(it, &args));
@@ -546,6 +570,17 @@ fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
                  (SELECT CAST(count(self_cpu_ns) AS BIGINT) FROM spans WHERE {spans}) AS counted"
             )],
             cpu_matches_process as Judge,
+        ),
+        (
+            CheckName::LockWaits,
+            vec![format!(
+                "SELECT CAST(lock AS VARCHAR) AS lock, CAST(sum(wait_ns) AS DOUBLE) AS wait_ns, \
+                 CAST(count(*) AS BIGINT) AS waits, \
+                 CAST((SELECT count(*) FROM {workers} AS w) AS DOUBLE) * {} AS worker_ns \
+                 FROM lock_waits WHERE {events} GROUP BY lock ORDER BY wait_ns DESC, lock",
+                t1 - t0
+            )],
+            lock_waits as Judge,
         ),
     ]
 }
@@ -695,6 +730,59 @@ fn samples_in_spans(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, St
         // alloc: a line, once a check
         format!("{no_row} name a span with no row (folded, or lost): counted as tied"),
     ];
+    Ok(Check::new(name, outcome, said).with(detail))
+}
+
+fn lock_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+    let rows = &answers[0];
+    let (locks, waited, waits, worker) =
+        (strings(rows, 0)?, f64s(rows, 1)?, i64s(rows, 2)?, f64s(rows, 3)?);
+    let name = CheckName::LockWaits;
+    // No lock waited for is a pass, unlike the checks that saw nothing to judge: a lock that is
+    // never contended records no row (its fast path records nothing), so a build with no
+    // contention has no rows and is exactly the clean case. A blaze older than the named locks
+    // writes none either, and passes for the same reason: it has nothing this check weighs.
+    let Some(&worker_ns) = worker.first() else {
+        // alloc: a check's line, once a check
+        return Ok(Check::new(name, Outcome::Passed, "no named lock was waited for".to_owned()));
+    };
+    if worker_ns <= 0.0 {
+        return Ok(Check::unchecked(
+            name,
+            format_args!(
+                "{} named locks were waited for, and the build has no pool worker's switches to weigh their waits against",
+                locks.len()
+            ),
+        ));
+    }
+    let pct = |i: usize| 100.0 * waited[i] / worker_ns;
+    // alloc: a check's offenders, once a check
+    let over: Vec<usize> = (0..locks.len()).filter(|&i| pct(i) > LOCK_WAIT_MAX_PCT).collect();
+    let detail = over
+        .iter()
+        .take(SHOWN_MAX)
+        .map(|&i| {
+            // alloc: a failure's line, once a failure
+            format!(
+                "lock {} was waited for {:.3} s over {} waits, {:.2}% of the pool workers' time: `blaze debug locks --build N` says where and what to use instead",
+                locks[i],
+                waited[i] / 1e9,
+                waits[i],
+                pct(i)
+            )
+        })
+        // alloc: a check's lines, once a check
+        .collect();
+    let outcome = if over.is_empty() { Outcome::Passed } else { Outcome::Failed };
+    // alloc: a check's line, once a check
+    let said = format!(
+        "{} of {} named locks waited for over {LOCK_WAIT_MAX_PCT}% of the pool workers' {:.2} s; the worst, {}, {:.2}%",
+        over.len(),
+        locks.len(),
+        worker_ns / 1e9,
+        locks[0],
+        pct(0)
+    );
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
@@ -1107,7 +1195,7 @@ fn first_line(text: &str) -> String {
 }
 
 /// Column `at` of every batch, as the `BIGINT` the gate's SQL casts it to; null as 0.
-fn i64s(batches: &[RecordBatch], at: usize) -> Result<Vec<i64>, String> {
+pub(crate) fn i64s(batches: &[RecordBatch], at: usize) -> Result<Vec<i64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
@@ -1119,7 +1207,7 @@ fn i64s(batches: &[RecordBatch], at: usize) -> Result<Vec<i64>, String> {
     Ok(out)
 }
 
-fn f64s(batches: &[RecordBatch], at: usize) -> Result<Vec<f64>, String> {
+pub(crate) fn f64s(batches: &[RecordBatch], at: usize) -> Result<Vec<f64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
@@ -1131,7 +1219,7 @@ fn f64s(batches: &[RecordBatch], at: usize) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 
-fn strings(batches: &[RecordBatch], at: usize) -> Result<Vec<String>, String> {
+pub(crate) fn strings(batches: &[RecordBatch], at: usize) -> Result<Vec<String>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
@@ -1271,7 +1359,7 @@ mod tests {
 
     /// The checks a fixture can make fail; `slow_deterministic` and `merges_exact` test blaze's
     /// own code over any history, so no file can make them fail (history.rs tests the merge).
-    const FIXTURED: [CheckName; 9] = [
+    const FIXTURED: [CheckName; 10] = [
         CheckName::WorkersCovered,
         CheckName::BlocksInWaits,
         CheckName::WaitsSayWhat,
@@ -1281,6 +1369,7 @@ mod tests {
         CheckName::SelfCpuInDuration,
         CheckName::CpuMatchesProcess,
         CheckName::MergedRowsMatch,
+        CheckName::LockWaits,
     ];
 
     fn fixtures() -> PathBuf {

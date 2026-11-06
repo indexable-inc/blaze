@@ -17,7 +17,7 @@ use std::{
 
 use blaze_format::FormatError;
 use hegel::{TestCase, generators as gs};
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use super::{
     AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
@@ -41,16 +41,16 @@ use super::{
 pub struct TestDb {
     storage: Storage,
     /// `(query, key, view)` of every run.
-    log: Mutex<Vec<(&'static str, u32, u32)>>,
-    shared: Mutex<HashMap<u32, (u64, Reads)>>,
+    log: Lock<Vec<(&'static str, u32, u32)>>,
+    shared: Lock<HashMap<u32, (u64, Reads)>>,
     gate: Barrier,
     armed: [AtomicBool; 2],
     drops: Arc<AtomicUsize>,
     probe: AtomicU64,
-    cells: Mutex<Vec<Id>>,
+    cells: Lock<Vec<Id>>,
     graph: Vec<GNode>,
     /// The dependency values of each graph node's last run.
-    snapshots: Mutex<HashMap<usize, Vec<u64>>>,
+    snapshots: Lock<HashMap<usize, Vec<u64>>>,
 }
 
 impl TestDb {
@@ -61,15 +61,15 @@ impl TestDb {
     fn made(hook: Option<Hook>, graph: Vec<GNode>) -> TestDb {
         TestDb {
             storage: Storage::new(hook),
-            log: Mutex::new(Vec::new()),
-            shared: Mutex::new(HashMap::new()),
+            log: Lock::new("query.test.db.log", Vec::new()),
+            shared: Lock::new("query.test.db.shared", HashMap::new()),
             gate: Barrier::new(2),
             armed: [AtomicBool::new(false), AtomicBool::new(false)],
             drops: Arc::new(AtomicUsize::new(0)),
             probe: AtomicU64::new(u64::MAX),
-            cells: Mutex::new(Vec::new()),
+            cells: Lock::new("query.test.db.cells", Vec::new()),
             graph,
-            snapshots: Mutex::new(HashMap::new()),
+            snapshots: Lock::new("query.test.db.snapshots", HashMap::new()),
         }
     }
 
@@ -446,8 +446,8 @@ fn apart(db: &TestDb, cell: Cell) -> Cell {
     }
 }
 
-fn recorded() -> (Arc<Mutex<Vec<String>>>, Hook) {
-    let events = Arc::new(Mutex::new(Vec::new()));
+fn recorded() -> (Arc<Lock<Vec<String>>>, Hook) {
+    let events = Arc::new(Lock::new("query.test.db.events", Vec::new()));
     let seen = Arc::clone(&events);
     let hook: Hook = Box::new(move |_: &Storage, event: Event| {
         seen.lock().push(format!("{:?}", event.kind));
@@ -1173,7 +1173,7 @@ fn function_row<F: Function>(storage: &Storage, id: Id) -> Option<(&Header, u32)
 
 /// What [`ProbeHead`] saw of its member's row mid-cycle after view 1: its word, and whether the
 /// claim-free walk proved it.
-static PROBED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+static PROBED: Lock<Vec<(u32, bool)>> = Lock::new("query.test.db.probed", Vec::new());
 
 query!(
     ProbeHead,
@@ -1953,7 +1953,7 @@ query!(
 
 /// Every query's counts taken since a test last asked for its own ([`counts_of`]): a take is
 /// process-wide, so tests that read counts take into here, and each reads only its queries'.
-static TAKEN: Mutex<Vec<(&'static str, Counts)>> = Mutex::new(Vec::new());
+static TAKEN: Lock<Vec<(&'static str, Counts)>> = Lock::new("query.test.db.taken", Vec::new());
 
 /// What query `query` did since the last time a test asked for it: counts added, marks the
 /// most.
@@ -2470,7 +2470,7 @@ fn dropping_the_storage_frees_every_value() {
 
 #[test]
 fn events_reach_the_hook() {
-    let events = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Lock::new("query.test.db.events", Vec::new()));
     let seen = Arc::clone(&events);
     let hook: Hook =
         Box::new(move |_: &Storage, event: Event| seen.lock().push(format!("{:?}", event.kind)));

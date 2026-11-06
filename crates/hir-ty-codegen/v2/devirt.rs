@@ -33,7 +33,7 @@ use hir_ty_mir::mir::{
     MirBody, TerminatorKind,
     devirt::{self, DevirtWorld, Held, Object, ObjectKey, Target, World},
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{Hashes as _, HirFrontend, HirInstance, HirStatic, Kind, RootKind, build::Build, refs};
@@ -203,8 +203,13 @@ pub(crate) fn code(code: blaze_items::CodeHash, read: &[[u8; 32]]) -> blaze_item
 }
 
 /// What a build's front end knows of the program it walks, for its world.
-#[derive(Default)]
-pub(crate) struct State(Mutex<Program>);
+pub(crate) struct State(Lock<Program>);
+
+impl Default for State {
+    fn default() -> State {
+        State(Lock::new("codegen.devirt.program", Program::default()))
+    }
+}
 
 #[derive(Default)]
 struct Program {

@@ -11,7 +11,7 @@ use blaze_codegen::{Arch, CompiledFunction, InstanceKey};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::Tier;
-use parking_lot::{Condvar, Mutex};
+use blaze_core::lock::{Lock, Signal};
 
 use super::flight::{Addresses, Counting, session};
 use super::{compiled, function, id, key};
@@ -25,8 +25,8 @@ use crate::{
 
 /// The last answer, kept in place: sending allocates nothing.
 struct Last {
-    answer: Mutex<(u32, Kind, [u8; READY_LEN], usize)>,
-    arrived: Condvar,
+    answer: Lock<(u32, Kind, [u8; READY_LEN], usize)>,
+    arrived: Signal,
 }
 
 #[derive(Clone)]
@@ -51,8 +51,8 @@ impl Answers for Kept {
 impl Kept {
     fn new() -> Kept {
         Kept(Arc::new(Last {
-            answer: Mutex::new((0, Kind(0), [0; READY_LEN], 0)),
-            arrived: Condvar::new(),
+            answer: Lock::new("lazy.test.last.answer", (0, Kind(0), [0; READY_LEN], 0)),
+            arrived: Signal::new("lazy.test.last.answered"),
         }))
     }
 

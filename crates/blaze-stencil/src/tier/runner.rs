@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard, Signal};
 
 use super::{Cells, Driver, Policy, Promote, Recompile, Tier};
 
@@ -70,11 +70,11 @@ struct Shared<M, R> {
     recompile: R,
     period: Duration,
     /// Held for a round or to record an outcome, never across a recompile.
-    state: Mutex<State>,
+    state: Lock<State>,
     /// Workers wait on it for the queue.
-    work: Condvar,
+    work: Signal,
     /// The reading thread waits on it for its period, or the close.
-    tick: Condvar,
+    tick: Signal,
 }
 
 /// One run's tiering.
@@ -83,7 +83,8 @@ pub struct Runner<M: Cells + Send + Sync + 'static, R: Recompile> {
     threads: Vec<JoinHandle<()>>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+#[track_caller]
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 
@@ -109,7 +110,7 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
             memory,
             recompile,
             period: config.period,
-            state: Mutex::new(State {
+            state: Lock::new("stencil.tier.state", State {
                 driver: Driver::new(functions, policy),
                 queue: VecDeque::new(),
                 closing: false,
@@ -118,8 +119,8 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
                 promotions: 0,
                 landed: 0,
             }),
-            work: Condvar::new(),
-            tick: Condvar::new(),
+            work: Signal::new("stencil.tier.work_queued"),
+            tick: Signal::new("stencil.tier.tick_or_close"),
         });
         let mut runner = Runner { shared, threads: Vec::with_capacity(workers as usize + 1) };
         let reader = Arc::clone(&runner.shared);

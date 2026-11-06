@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 # Where objects and the side index live: blaze's content-addressed store, keyed by BLAKE3.
 blaze-cas.workspace = true
 blaze-format.workspace = true
@@ -22,7 +23,6 @@ blaze-sha256.workspace = true
 crossbeam-channel.workspace = true
 papaya.workspace = true
 # The lock on one download's meter (`downloads`), held for a field update.
-parking_lot.workspace = true
 # A partial download's lock (`fetcher::Part`), let go of as it drops.
 stdx.workspace = true
 serde = { workspace = true, features = ["derive"] }

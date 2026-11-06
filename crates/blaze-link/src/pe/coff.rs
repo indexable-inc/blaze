@@ -15,7 +15,7 @@
 //! An import library read whole parses its members and groups the imports by DLL on every
 //! thread; walking the member headers stays one pass, in member order.
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
@@ -112,7 +112,7 @@ fn text(bytes: &[u8]) -> Result<Cow<'_, str>, String> {
 /// library being read.
 #[derive(Clone, Copy)]
 enum Dlls<'a> {
-    Read(&'a Mutex<Descriptors>),
+    Read(&'a Lock<Descriptors>),
     Library(&'a Descriptors),
 }
 

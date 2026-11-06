@@ -26,11 +26,11 @@
 
 use super::DbInterner;
 use base_db::{Crate, Db, Nonce};
+use blaze_core::lock::Lock;
 use blaze_hash::FixedState;
 use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use blaze_query::db::View;
 use blaze_reclaim::Horizon;
-use parking_lot::Mutex;
 use rustc_type_ir::search_graph::{GlobalCache, Sharing};
 use std::{
     cell::Cell,
@@ -123,9 +123,9 @@ struct Shared<'p, K, S, T> {
     /// the cache, the swap, the retired one's grace and the limbo's binary search. Every new
     /// interner of every worker takes it, so nothing slow runs under it: the value is made, the
     /// reclaim slots scanned ([`Horizon::now`]) and the passed generations dropped outside.
-    /// Taken through [`blaze_graph::wait::lock`]: a contended one blocks the thread (an OS
-    /// wait in `parking_lot`, not a fiber's park) inside a `wait` span naming [`LOCK`].
-    slots: Mutex<Slots<'p, Generation<K, S, T>>>,
+    /// A contended one blocks the thread (an OS wait, not a fiber's park) inside the lock's
+    /// own `wait` span, which names it [`LOCK`].
+    slots: Lock<Slots<'p, Generation<K, S, T>>>,
 }
 
 /// A table's way into its pool: the cache it makes generations from, and the limbo holding
@@ -149,8 +149,8 @@ fn pool<G>() -> Pool<G> {
 /// once it has let go of the lock: more than the one it retires, so the limbo drains.
 const PASSED: usize = 64;
 
-/// What a wait for a table's lock is said to wait on.
-const LOCK: &str = "the trait solver's cache table";
+/// The name of a table's lock: what a wait for it, and the profile, call it.
+const LOCK: &str = "ty.solver_cache.slots";
 
 /// Checks, in a debug build, that a holder of a table's lock scanned no reclaim slot since it
 /// took the lock and the count was `scans`: T4 (v2-selfbuild2.md) was that scan, once per
@@ -255,7 +255,7 @@ where
             // alloc: setup, once per table and process.
             generations: (0..len).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
             pool,
-            slots: Mutex::new(Slots {
+            slots: Lock::new(LOCK, Slots {
                 cache: pool.cache(),
                 limbo: Limbo::new(pool)
                     .unwrap_or_else(|error| panic!("the trait solver's cache: {error}")),
@@ -399,7 +399,7 @@ where
         };
         let generation =
             Generation { key, state, referenced: AtomicBool::new(true), value: T::default() };
-        let mut slots = blaze_graph::wait::lock(&self.slots, LOCK);
+        let mut slots = self.slots.lock();
         let scans = blaze_reclaim::scans();
         let made = slots.cache.alloc(generation).into_raw();
         if let Err(won) = self.generations[at].compare_exchange(
@@ -452,7 +452,7 @@ where
     /// new one, which costs only the solves again.
     fn retire(&self, gone: impl Fn(&K) -> bool) -> usize {
         let mut retired = 0;
-        let mut slots = blaze_graph::wait::lock(&self.slots, LOCK);
+        let mut slots = self.slots.lock();
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
             let Some(held) = NonNull::new(slot.load(Ordering::Acquire)) else { continue };
             // SAFETY: a slot changes only under the lock, held here (`replace` swaps under it),
@@ -476,7 +476,7 @@ where
         loop {
             let horizon = Horizon::now();
             let passed =
-                blaze_graph::wait::lock(&self.slots, LOCK).limbo.take_passed::<PASSED>(horizon);
+                self.slots.lock().limbo.take_passed::<PASSED>(horizon);
             if passed.is_empty() {
                 break;
             }
@@ -677,9 +677,8 @@ mod tests {
         thread,
     };
 
-    use parking_lot::Mutex;
-
     use base_db::{Crate, Nonce};
+    use blaze_core::lock::Lock;
     use blaze_query::db::{FromId, Id};
 
     use super::{EMPTY, Key, SOLVED_BLOCK, Scope, Shared, Solved, pool};
@@ -687,7 +686,20 @@ mod tests {
     type Goals = HashMap<u32, u32>;
 
     /// A shared value: the goals of one key and state.
-    type SharedGoals = Mutex<Goals>;
+    struct SharedGoals(Lock<Goals>);
+
+    impl Default for SharedGoals {
+        fn default() -> SharedGoals {
+            SharedGoals(Lock::new("test.ty.solver_cache.goals", Goals::new()))
+        }
+    }
+
+    impl std::ops::Deref for SharedGoals {
+        type Target = Lock<Goals>;
+        fn deref(&self) -> &Lock<Goals> {
+            &self.0
+        }
+    }
 
     fn key() -> Solved {
         Solved::new()

@@ -79,7 +79,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 use stdx::file_lock::Locked;
 
@@ -470,25 +470,25 @@ pub(crate) struct Mapping {
     fixed: std::ptr::NonNull<u8>,
     /// The kept names' log's bytes ever written, taken under the kept table's lock: a name is
     /// kept only the first time a thread asks for it, never on a thread's hot path.
-    log: Mutex<u64>,
+    log: Lock<u64>,
     /// One writer of the site records at a time.
-    sites: Mutex<()>,
+    sites: Lock<()>,
     /// The build each build record holds, 0 for none.
-    builds: Mutex<[u64; BUILD_SLOTS]>,
+    builds: Lock<[u64; BUILD_SLOTS]>,
     /// The stores' part, `RINGS_AT..FILE_BYTES`, mapped shared and never unmapped.
     stores: std::ptr::NonNull<u8>,
     /// Stores handed to rings.
-    given: Mutex<usize>,
+    given: Lock<usize>,
     /// Its nonce ([`H_NONCE`]).
     nonce: u64,
     /// One flush marks at a time ([`mark_flush`]).
-    marking: Mutex<()>,
+    marking: Lock<()>,
 }
 
 // SAFETY: `fixed` and `stores` point into shared mappings that are never unmapped; a store is
 // handed to one ring and written through atomics only; every write through `fixed`
 // is either to an atomic word (`Mapping::word`) or to bytes of a log, a site record or a build
-// record under the `Mutex` that keeps that part to one writer, and no thread of this process
+// record under the `Lock` that keeps that part to one writer, and no thread of this process
 // reads those bytes (only a postmortem, in another process, after this one died).
 unsafe impl Send for Mapping {}
 // SAFETY: as for `Send`.
@@ -554,13 +554,13 @@ impl Mapping {
                 path,
                 file,
                 fixed,
-                log: Mutex::new(0),
-                sites: Mutex::new(()),
-                builds: Mutex::new([0; BUILD_SLOTS]),
+                log: Lock::unrecorded("profile.postmortem.kept_log", 0),
+                sites: Lock::unrecorded("profile.postmortem.sites", ()),
+                builds: Lock::unrecorded("profile.postmortem.builds", [0; BUILD_SLOTS]),
                 stores,
-                given: Mutex::new(0),
+                given: Lock::unrecorded("profile.postmortem.given", 0),
                 nonce: nonce(pid),
-                marking: Mutex::new(()),
+                marking: Lock::unrecorded("profile.postmortem.marking", ()),
             };
             mapping.header(pid, blaze, process, counting_copies);
             Ok(mapping)
@@ -911,7 +911,7 @@ mod sys {
 static MAPPING: OnceLock<Mapping> = OnceLock::new();
 /// What failed to be kept since the history last asked ([`failed`]): a store not made, a build
 /// past [`BUILD_SLOTS`].
-static FAILED: Mutex<Option<PostmortemError>> = Mutex::new(None);
+static FAILED: Lock<Option<PostmortemError>> = Lock::unrecorded("profile.postmortem.failed", None);
 
 fn failing(error: PostmortemError) {
     let mut failed = lock(&FAILED);
@@ -1174,10 +1174,10 @@ pub struct Recovered {
     _session: Session,
 }
 
-static RECOVERING: Mutex<()> = Mutex::new(());
+static RECOVERING: Lock<()> = Lock::unrecorded("profile.postmortem.recovering", ());
 
 /// A postmortem's hold on [`super::RECOVERED`]: the names it gave are let go as it drops.
-struct Session(#[allow(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
+struct Session(#[allow(dead_code, reason = "held for its drop")] LockGuard<'static, ()>);
 
 impl Session {
     fn begin() -> Session {

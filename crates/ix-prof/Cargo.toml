@@ -23,7 +23,7 @@ sampler = []
 layer = ["dep:tracing-subscriber"]
 # `/debug/pprof/*` and `/debug/pprof/live` on a loopback port. Its accept loop waits through
 # blaze-core's one deadline wait (rule deadline-waits).
-http = ["dep:blaze-core"]
+http = []
 # `ix_prof::explore`: the WebTransport server https://ix.dev/explore connects to on 127.0.0.1, for
 # any program with an `explore::Source` (the blaze daemon's is blaze-explore's).
 explore = [
@@ -41,7 +41,8 @@ arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
-blaze-core = { workspace = true, optional = true }
+# Named locks (blaze_core::lock) and the one deadline wait.
+blaze-core.workspace = true
 # The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true
@@ -50,7 +51,6 @@ flate2 = { workspace = true, features = ["rust_backend"] }
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
 gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
-parking_lot.workspace = true
 regex.workspace = true
 rustc-demangle.workspace = true
 serde_json.workspace = true

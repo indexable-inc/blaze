@@ -16,7 +16,7 @@ use blaze_graph::{
     sched::{self, Event, Wait},
     topology::Topology,
 };
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 fn key(n: u32) -> Key {
     let mut key = [0u8; 32];
@@ -89,7 +89,7 @@ pub fn jobs_run_on_the_thread_that_waits_for_them() {
 pub fn a_job_waiting_on_an_event_frees_the_one_worker() {
     let pool = pool();
     let seen = Arc::new(AtomicUsize::new(usize::MAX));
-    let order = Arc::new(Mutex::new(Vec::new()));
+    let order = Arc::new(Lock::new("graph.test.driven.order", Vec::new()));
     pool.scope(|scope| {
         let (pool, seen, order) = (Arc::clone(&pool), Arc::clone(&seen), Arc::clone(&order));
         scope.submit(
@@ -130,7 +130,7 @@ pub fn a_job_waiting_on_an_event_frees_the_one_worker() {
 pub fn a_wait_that_would_close_a_cycle_is_refused() {
     let pool = pool();
     let (a, b) = (key(1), key(2));
-    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = Arc::new(Lock::new("graph.test.driven.outcomes", Vec::new()));
     pool.scope(|scope| {
         let (pool, outcomes) = (Arc::clone(&pool), Arc::clone(&outcomes));
         scope.submit(
@@ -247,7 +247,7 @@ pub const ASKS: u32 = 1000;
 /// began, so each holds its key before it asks the other's.
 struct Meeting {
     runs: AtomicUsize,
-    event: Mutex<Option<Event>>,
+    event: Lock<Option<Event>>,
 }
 
 impl Meeting {
@@ -295,7 +295,7 @@ fn ask_until_done(
 /// gets 1. What each job came to.
 pub fn asked_again_at_once(pool: &Pool) -> [Result<(u64, u32), u32>; 2] {
     let flights = Flights::<u64>::new();
-    let meeting = Meeting { runs: AtomicUsize::new(0), event: Mutex::new(None) };
+    let meeting = Meeting { runs: AtomicUsize::new(0), event: Lock::new("graph.test.driven.event", None) };
     let (a, b) = (key(11), key(12));
     let (mut x, mut y) = (None, None);
     pool.scope(|scope| {

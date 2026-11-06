@@ -10,7 +10,7 @@ use std::error::Error;
 use std::str::FromStr;
 use std::{fmt, mem, ops};
 
-use parking_lot::Mutex;
+use blaze_core::lock::{Lock, LockGuard};
 
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 use blaze_hash::{FixedState, HashMap, HashSet};
@@ -1235,11 +1235,18 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
 /// The mapping from [`UniqueCrateData`] to their [`Crate`] input, and what each crate's content
 /// ID was last made from. Read and written only by the setters, on `&mut` of the database
 /// ([`CrateGraphBuilder::set_in_db`] locks it once for the whole graph); no query reads it.
-#[derive(Debug, Default)]
-pub struct CratesMap(Mutex<Crates>);
+#[derive(Debug)]
+pub struct CratesMap(Lock<Crates>);
+
+impl Default for CratesMap {
+    fn default() -> CratesMap {
+        CratesMap(Lock::new("db.crates_map", Crates::default()))
+    }
+}
 
 impl CratesMap {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, Crates> {
+    #[track_caller]
+    fn lock(&self) -> LockGuard<'_, Crates> {
         self.0.lock()
     }
 }

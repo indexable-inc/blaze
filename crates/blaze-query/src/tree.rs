@@ -67,9 +67,14 @@ impl Tree for blaze_vfs::Reader {
 
 /// A tree in memory, for tests and for what-ifs built without the VFS. Its roots are content
 /// IDs of the sorted list of paths, modes and file IDs (not the VFS's Merkle IDs).
-#[derive(Default)]
 pub struct MemTree {
     roots: ShortLock<FxMap<ContentId, Arc<MemRoot>>>,
+}
+
+impl Default for MemTree {
+    fn default() -> MemTree {
+        MemTree { roots: ShortLock::new("query.tree.mem_roots", FxMap::default()) }
+    }
 }
 
 // BTreeMap: hashed in path order into the root's ID.

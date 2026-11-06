@@ -4,16 +4,16 @@
 
 use std::ops::{Deref, DerefMut};
 
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 
 /// `lock` held: dropped while its thread unwinds from a panic that started under it, it puts
 /// back `T::default()`.
 pub(crate) struct Reset<'a, T: Default> {
-    guard: MutexGuard<'a, T>,
+    guard: LockGuard<'a, T>,
     panicking: bool,
 }
 
-pub(crate) fn lock<T: Default>(lock: &Mutex<T>) -> Reset<'_, T> {
+pub(crate) fn lock<T: Default>(lock: &Lock<T>) -> Reset<'_, T> {
     Reset { guard: lock.lock(), panicking: std::thread::panicking() }
 }
 

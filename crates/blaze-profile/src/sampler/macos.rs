@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::{Lock, LockGuard};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
@@ -87,7 +87,7 @@ impl Thread {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
     mutex.lock()
 }
 

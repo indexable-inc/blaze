@@ -34,8 +34,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     in Wasmtime; Cranelift never generates native code. Skill: `compiler-correctness`.
 11. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
     alloc: <why>` on its line. Skill: `runtime-code`.
-12. **standard-structures**: One standard structure per need (parking_lot locks, papaya and blaze_hash
-    maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
+12. **standard-structures**: One standard structure per need (named `blaze_core::lock` locks, papaya and
+    blaze_hash maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.

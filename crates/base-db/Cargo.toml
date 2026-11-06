@@ -13,11 +13,11 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-hash.workspace = true
 crossbeam-queue.workspace = true
 la-arena.workspace = true
 blaze-query.workspace = true
-parking_lot.workspace = true
 hashbrown.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true

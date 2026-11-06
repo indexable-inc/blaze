@@ -7,6 +7,7 @@ use std::{collections::BTreeSet, marker::PhantomData, sync::Arc};
 
 use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
+use blaze_core::lock::Lock;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
@@ -19,7 +20,6 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_expand::fixture;
-use parking_lot::Mutex;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 use std::alloc::Global;
 
@@ -139,9 +139,14 @@ fn functions(db: &Db, krate: Crate) -> HashMap<String, FunctionId, Global> {
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
-#[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
+    images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory { images: Lock::new("test.ty.goal_store.memory", HashMap::default()) }
+    }
 }
 
 impl Memory {
@@ -176,15 +181,20 @@ impl ImageStore for Memory {
 /// so [`Back`] can read a stable form back; every read but an interned one is [`KNOB`] (or none,
 /// when not `expressible`).
 struct TestFacts {
-    defs: Mutex<HashMap<ContentId, Vec<u32>, Global>>,
+    defs: Lock<HashMap<ContentId, Vec<u32>, Global>>,
     knob: Knob,
     expressible: bool,
-    names: Mutex<Vec<&'static str>>,
+    names: Lock<Vec<&'static str>>,
 }
 
 impl TestFacts {
     fn new(knob: Knob, expressible: bool) -> TestFacts {
-        TestFacts { defs: Mutex::default(), knob, expressible, names: Mutex::default() }
+        TestFacts {
+            defs: Lock::new("test.ty.goal_store.defs", Default::default()),
+            knob,
+            expressible,
+            names: Lock::new("test.ty.goal_store.names", Default::default()),
+        }
     }
 }
 

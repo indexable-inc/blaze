@@ -161,6 +161,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::held_across_wait",
             "blaze::thread_local_in_waiting_fn",
             "blaze::lock_across_query",
+            "blaze::lock_held_across_slow",
             "blaze::blocking_on_pool",
             "blaze::unnamed_wait",
             "blaze::shared_collection_lock",

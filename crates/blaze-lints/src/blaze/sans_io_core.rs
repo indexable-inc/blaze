@@ -315,7 +315,7 @@ fn step_name(db: &Db, step: Resolved<'_>) -> String {
 }
 
 /// `f` as `Type::name` (its impl's type, or its trait), or its name for a free function.
-fn fn_name(db: &Db, f: FunctionId) -> String {
+pub(super) fn fn_name(db: &Db, f: FunctionId) -> String {
     let name = FunctionSignature::of(db, f).name.as_str();
     if let Some(adt) = facts::impl_adt(db, f) {
         return format!("{}::{name}", adt.name(db).as_str());
@@ -327,7 +327,7 @@ fn fn_name(db: &Db, f: FunctionId) -> String {
 }
 
 /// `f`'s full path, its crate and modules first: how a finding names the root.
-fn root_path(db: &Db, f: FunctionId) -> String {
+pub(super) fn root_path(db: &Db, f: FunctionId) -> String {
     format!("{}::{}", module_path(db, hir::Function::from(f).module(db)), fn_name(db, f))
 }
 

@@ -248,7 +248,7 @@ fn build_of(
 #[test]
 fn builds_reaching_each_others_functions_both_end_and_compile_each_once() {
     let flights = Flights::new();
-    let compiled = parking_lot::Mutex::new(Vec::new());
+    let compiled = blaze_core::lock::Lock::new("test.codegen.flight.compiled", Vec::new());
     let barrier = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
         for order in [[1u8, 2, 3], [3, 2, 1]] {

@@ -1,5 +1,5 @@
-//! The lints of waits (`held_across_wait`, `lock_across_query`, `blocking_on_pool`,
-//! `unnamed_wait`) over fixtures of their own: a stand-in `blaze_graph` whose
+//! The lints of waits (`held_across_wait`, `lock_across_query`, `lock_held_across_slow`,
+//! `blocking_on_pool`, `unnamed_wait`) over fixtures of their own: a stand-in `blaze_graph` whose
 //! `sched::stack::Yielder::suspend` parks the fiber, an engine whose query (`variance` →
 //! `fetch` → `get_or_run` → `suspend`) reaches it, a `std` with the thread-locals, locks, channels and IO they look for, and a `main`
 //! that says what it expects. A line of `main` marked `//~ held_across_wait` has that lint's
@@ -10,6 +10,7 @@ use crate::tests::lint;
 mod blocking;
 mod held;
 mod lock;
+mod slow;
 mod unnamed;
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, drop, deref, fn, unsize, coerce_unsized, dispatch_from_dyn, send, sync, option, result, builtin_impls, iterator\n";
@@ -270,12 +271,19 @@ pub mod wait {
 "#;
 
 /// Every lint of these tests, by name after `blaze::`.
-const LINTS: &[&str] =
-    &["held_across_wait", "lock_across_query", "blocking_on_pool", "unnamed_wait"];
+const LINTS: &[&str] = &[
+    "held_across_wait",
+    "lock_across_query",
+    "lock_held_across_slow",
+    "blocking_on_pool",
+    "unnamed_wait",
+];
 
 /// The lint a message is of.
 fn lint_of(message: &str) -> Option<&'static str> {
-    if message.contains("tied to this thread") {
+    if message.contains("a lock is held only for a field update: rule standard-structures") {
+        Some("lock_held_across_slow")
+    } else if message.contains("tied to this thread") {
         Some("held_across_wait")
     } else if message.contains("held across the query `") {
         Some("lock_across_query")

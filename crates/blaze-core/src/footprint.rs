@@ -13,7 +13,7 @@
 use std::{io, sync::Once, time::Duration};
 
 use blaze_mem::{Slab, Tag as MemTag};
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use crate::lock::{Lock, LockGuard, Signal};
 
 /// How often the footprint is read: a process faulting pages in as fast as it can gets tens of
 /// megabytes past its limit at most before it is killed.
@@ -36,14 +36,14 @@ struct Entry {
 /// out, nothing signals its pid.
 struct Sampler {
     /// Made with the first watch.
-    entries: Mutex<Option<Slab<Entry>>>,
-    wake: Condvar,
+    entries: Lock<Option<Slab<Entry>>>,
+    wake: Signal,
 }
 
-static SAMPLER: Sampler = Sampler { entries: Mutex::new(None), wake: Condvar::new() };
+static SAMPLER: Sampler = Sampler { entries: Lock::new("core.footprint.entries", None), wake: Signal::new("core.footprint.wake") };
 static STARTED: Once = Once::new();
 
-fn entries() -> MutexGuard<'static, Option<Slab<Entry>>> {
+fn entries() -> LockGuard<'static, Option<Slab<Entry>>> {
     SAMPLER.entries.lock()
 }
 

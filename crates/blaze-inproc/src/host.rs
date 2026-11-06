@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use blaze_core::{Command, Sandbox};
-use parking_lot::Mutex;
+use blaze_core::lock::{Lock, LockGuard};
 
 use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
@@ -110,13 +110,13 @@ struct Waiting {
 
 /// The launches whose start hook has not connected yet. Locked only to add, take or drop one
 /// entry; nothing is called with it held.
-type Table = Arc<Mutex<HashMap<[u8; 16], Waiting>>>;
+type Table = Arc<Lock<HashMap<[u8; 16], Waiting>>>;
 
 pub struct Host {
     address: String,
     waiting: Table,
     /// The executables written, by path: the key and the file as written.
-    written: Mutex<HashMap<PathBuf, ([u8; 32], Identity)>>,
+    written: Lock<HashMap<PathBuf, ([u8; 32], Identity)>>,
     temporaries: AtomicU64,
 }
 
@@ -124,13 +124,19 @@ impl Host {
     /// A host listening in `dir` (made if missing, reachable by this user only).
     pub fn new(dir: &Path) -> Result<Host, Error> {
         let (listener, address) = sys::Listener::bind(dir)?;
-        let waiting: Table = Arc::default();
+        // alloc: once per host
+        let waiting: Table = Arc::new(Lock::new("inproc.host.waiting", HashMap::new()));
         let table = Arc::clone(&waiting);
         std::thread::Builder::new()
             .name("blaze-inproc host".to_owned())
             .spawn(move || accept(&listener, &table))
             .map_err(|it| Error::new(format!("starting the host's thread: {it}")))?;
-        Ok(Host { address, waiting, written: Mutex::default(), temporaries: AtomicU64::new(0) })
+        Ok(Host {
+            address,
+            waiting,
+            written: Lock::new("inproc.host.written", HashMap::new()),
+            temporaries: AtomicU64::new(0),
+        })
     }
 
     /// Puts `executable` at its path from `memory`: nothing when this host wrote the same key
@@ -260,7 +266,7 @@ impl Host {
         Ok((command, Pending { token, wait, waiting: Arc::clone(&self.waiting) }))
     }
 
-    fn table(&self) -> parking_lot::MutexGuard<'_, HashMap<[u8; 16], Waiting>> {
+    fn table(&self) -> LockGuard<'_, HashMap<[u8; 16], Waiting>> {
         self.waiting.lock()
     }
 }
@@ -479,12 +485,12 @@ const START: Duration = Duration::from_secs(60);
 /// session on (to whoever answers the process's asks: `blaze-lazy`'s runner).
 pub struct Program {
     host: Arc<Host>,
-    memory: Arc<Mutex<CodeMemory>>,
+    memory: Arc<Lock<CodeMemory>>,
     /// Changed only with `memory` locked ([`Program::relaid`]), so a launch, which reads it
     /// with `memory` locked, writes the file of the memory it maps.
-    image: Mutex<Image>,
+    image: Lock<Image>,
     sessions: crossbeam_channel::Sender<Result<Session, Error>>,
-    starts: Arc<Mutex<Starts>>,
+    starts: Arc<Lock<Starts>>,
 }
 
 /// The executable of a [`Program`], as [`Executable`] names it, for any path.
@@ -519,11 +525,17 @@ impl Program {
     /// names.
     pub fn new(
         host: Arc<Host>,
-        memory: Arc<Mutex<CodeMemory>>,
+        memory: Arc<Lock<CodeMemory>>,
         image: Image,
         sessions: crossbeam_channel::Sender<Result<Session, Error>>,
     ) -> Program {
-        Program { host, memory, image: Mutex::new(image), sessions, starts: Arc::default() }
+        Program {
+            host,
+            memory,
+            image: Lock::new("inproc.program.image", image),
+            sessions,
+            starts: Arc::new(Lock::new("inproc.program.starts", Starts::default())), // alloc: once per program
+        }
     }
 
     /// The executable is now `image`: `memory`, which the caller holds locked, was committed
@@ -540,7 +552,7 @@ impl Program {
         Ok(())
     }
 
-    pub fn memory(&self) -> &Arc<Mutex<CodeMemory>> {
+    pub fn memory(&self) -> &Arc<Lock<CodeMemory>> {
         &self.memory
     }
 
@@ -669,11 +681,11 @@ impl Program {
     }
 }
 
-fn lock_starts(starts: &Mutex<Starts>) -> parking_lot::MutexGuard<'_, Starts> {
+fn lock_starts(starts: &Lock<Starts>) -> LockGuard<'_, Starts> {
     starts.lock()
 }
 
-fn lock(memory: &Mutex<CodeMemory>) -> parking_lot::MutexGuard<'_, CodeMemory> {
+fn lock(memory: &Lock<CodeMemory>) -> LockGuard<'_, CodeMemory> {
     memory.lock()
 }
 

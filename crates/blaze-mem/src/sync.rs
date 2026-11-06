@@ -5,6 +5,10 @@
 //! from within an allocation.
 
 #[cfg(not(blaze_check))]
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core: blaze-mem is a dependency of blaze-core, and the allocator's lock is std's"
+)]
 pub(crate) use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic};
 
 #[cfg(blaze_check)]

@@ -13,7 +13,7 @@ use blaze_inproc::CodeMemory;
 use blaze_inproc::frame::Kind;
 use blaze_items::ItemKey;
 use blaze_stencil::tier::{self, CALLS, Policy, Tier};
-use parking_lot::{Condvar, Mutex};
+use blaze_core::lock::{Lock, Signal};
 use std::alloc::Global;
 
 use super::{Rng, compiled, function, key, policy};
@@ -27,11 +27,20 @@ use crate::{
 };
 
 /// The answers a runner sent, by client and sequence number, and the stops it asked for.
-#[derive(Default)]
 pub(crate) struct Mailbox {
-    answers: Mutex<HashMap<(u32, u32), (Kind, Vec<u8>), Global>>,
-    arrived: Condvar,
-    stops: Mutex<Vec<(Option<(InstanceKey, ItemKey)>, String)>>,
+    answers: Lock<HashMap<(u32, u32), (Kind, Vec<u8>), Global>>,
+    arrived: Signal,
+    stops: Lock<Vec<(Option<(InstanceKey, ItemKey)>, String)>>,
+}
+
+impl Default for Mailbox {
+    fn default() -> Mailbox {
+        Mailbox {
+            answers: Lock::new("lazy.test.mailbox.answers", HashMap::default()),
+            arrived: Signal::new("lazy.test.mailbox.answered"),
+            stops: Lock::new("lazy.test.mailbox.stops", Vec::new()),
+        }
+    }
 }
 
 impl Mailbox {
@@ -75,14 +84,26 @@ impl Answers for Mail {
 }
 
 /// Compiles slowly enough that asks overlap, and records every compile.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Counting {
-    pub(crate) seen: Arc<Mutex<Vec<InstanceKey>>>,
+    pub(crate) seen: Arc<Lock<Vec<InstanceKey>>>,
     pub(crate) fail: Vec<InstanceKey>,
     pub(crate) panic: Vec<InstanceKey>,
     pub(crate) delay: Duration,
     /// What its probe finds compiled already; one also in `panic` panics the probe.
     pub(crate) hits: Vec<InstanceKey>,
+}
+
+impl Default for Counting {
+    fn default() -> Counting {
+        Counting {
+            seen: Arc::new(Lock::new("lazy.test.counting.seen", Vec::new())),
+            fail: Vec::new(),
+            panic: Vec::new(),
+            delay: Duration::ZERO,
+            hits: Vec::new(),
+        }
+    }
 }
 
 impl Compiler for Counting {
@@ -342,10 +363,16 @@ fn idle_workers_compile_the_rest_and_close_reports_what_failed_unasked() {
 }
 
 /// Compiles at tier 0, and records every tier-up; with `fail`, a tier-up fails.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Tiers {
-    ups: Arc<Mutex<Vec<(InstanceKey, Tier)>>>,
+    ups: Arc<Lock<Vec<(InstanceKey, Tier)>>>,
     fail: bool,
+}
+
+impl Default for Tiers {
+    fn default() -> Tiers {
+        Tiers { ups: Arc::new(Lock::new("lazy.test.tiers.ups", Vec::new())), fail: false }
+    }
 }
 
 impl Compiler for Tiers {

@@ -274,7 +274,18 @@ impl Tasks {
             })
             // alloc: the look's downloads, a handful
             .collect();
-        let look = Look { workers, threads, downloads: &downloads, stage: "", memory, expanders: &[], expansion_threads: 0 };
+        // The daemon's stall line lives in the daemon (its loop watchdog); a profile's reader
+        // finds its stalls as `blaze::stall` events instead.
+        let look = Look {
+            workers,
+            threads,
+            downloads: &downloads,
+            stage: "",
+            stall: None,
+            memory,
+            expanders: &[],
+            expansion_threads: 0,
+        };
         self.fold.look(&look)
     }
 }

@@ -47,6 +47,7 @@ pub struct Now {            // one build, as of `at_ms` after it began
     pub at_ms: u64,
     pub phase: Phase,       // Starting | Fetching | Resolving | Planning | Compiling | Linking | Testing | Finishing | Running
     pub stage: String,      // what the daemon says the stage waits on: `waits for its pinned native inputs, 1 of 1 layouts left`
+    pub stall: Option<String>, // the daemon's top stall in its wait-for graph, in one line, while one lasts
     pub tally: Tally,       // tasks waiting, ready, running, done, failed, total
     pub workers: u32,       // the pool's workers; idle = workers - busy.len()
     pub busy: Vec<Busy>,    // each busy worker: its thread, its task, its innermost span
@@ -97,6 +98,15 @@ at most `MOST_TASKS` (2^22) of them. It owns no thread, socket or clock, and bui
 - **Progress.** `quiet_ms` restarts when a task settles, a download gets a byte, or the caller
   says a span closed since its last look. A view says *stalled* only when no worker is busy and
   no download moves; with a busy worker it says *slow* and names that worker's span.
+- **Lock stalls.** `stall` is the daemon's, not the fold's: its loop watchdog (the stop's guard,
+  `serve::stop`) looks at the wait-for graph of named locks, signals and kernel waits
+  (docs/v2/plan/design/named-locks.md) at each of its looks, and once a wait is older than
+  `STALL_THRESHOLD` (2 s, far under the loop's own 60 s report and 120 s bound) puts the top
+  deadlock or convoy's line there (`convoy: 61 behind thread 7 on lock flight.intern (oldest
+  2400 ms); the head is running`) and says each new one once as a `blaze::stall` event (`kind`,
+  `line`, `head`, `waiters`, `threads`, `oldest_ns`). The board shows it as a red row under the
+  warning in the full and inline forms and at the end of the compact line, which `blaze status`
+  prints; schema 44.
 
 Readers, all of the same `Now`:
 

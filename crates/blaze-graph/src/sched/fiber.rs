@@ -43,7 +43,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::{Mutex, MutexGuard};
+use blaze_core::lock::LockGuard;
 
 use super::{
     CoreId, Cores, CounterId, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
@@ -283,7 +283,7 @@ pub(super) fn dispatch(domain: &mut Domain, mine: Option<(u32, u32)>) -> Option<
 /// ever taken the other way round.
 struct Locked<'a, W: Work> {
     global: Guard<'a>,
-    state: MutexGuard<'a, State<W>>,
+    state: LockGuard<'a, State<W>>,
     member: u32,
 }
 
@@ -322,7 +322,11 @@ struct Shared<W: Work> {
     sched: Scheduler,
     /// This driver's number in the [`World`].
     member: u32,
-    state: Mutex<State<W>>,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a driver's own state, taken after its scheduler's lock, never across a call into work"
+    )]
+    state: blaze_core::lock::Lock<State<W>>,
     cores: Arc<[CoreSlot]>,
     config: Config,
     start: Instant,
@@ -1195,11 +1199,12 @@ impl<W: Work> Driver<W> {
             failed: None,
         };
         // alloc: the driver's shared state, once per driver
+        #[expect(clippy::disallowed_types, reason = "makes `Shared::state`, which allows it")]
         let shared = Arc::new(Shared {
             work,
             sched,
             member,
-            state: Mutex::new(state),
+            state: blaze_core::lock::Lock::new("sched.fiber.driver", state),
             cores: slots,
             config,
             start: Instant::now(),

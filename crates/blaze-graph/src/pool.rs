@@ -519,7 +519,7 @@ unsafe impl Send for List {}
 impl Inject {
     fn new() -> Inject {
         let list = List { head: ptr::null_mut(), tail: ptr::null_mut() };
-        Inject { len: AtomicUsize::new(0), list: Lock::new(list) }
+        Inject { len: AtomicUsize::new(0), list: Lock::new("graph.pool.inject", list) }
     }
 
     /// Jobs queued, as last seen: for placing a job, not for deciding there is none.
@@ -542,7 +542,7 @@ impl Inject {
         // SAFETY: the job's header lives until it has run, and from here until a worker takes
         // it back out this queue is the one place that names it.
         unsafe { (*at).next.store(ptr::null_mut(), Ordering::Relaxed) };
-        let mut list = self.list.lock_said("a group's job queue");
+        let mut list = self.list.lock();
         match NonNull::new(list.tail) {
             // SAFETY: the tail is a job of this list, alive until it is taken out, under this
             // lock.
@@ -558,7 +558,7 @@ impl Inject {
         if self.is_empty() {
             return None;
         }
-        let mut list = self.list.lock_said("a group's job queue");
+        let mut list = self.list.lock();
         let head = NonNull::new(list.head)?;
         // SAFETY: as in `push`: the head is a job of this list, under its lock.
         list.head = unsafe { head.as_ref() }.next.load(Ordering::Relaxed);
@@ -575,7 +575,7 @@ impl Inject {
             return;
         }
         let (head, tail, count) = {
-            let mut list = self.list.lock_said("a group's job queue");
+            let mut list = self.list.lock();
             let taken = (list.head, list.tail);
             list.head = ptr::null_mut();
             list.tail = ptr::null_mut();
@@ -583,7 +583,7 @@ impl Inject {
             (taken.0, taken.1, count)
         };
         let Some(head) = NonNull::new(head) else { return };
-        let mut list = to.list.lock_said("a group's job queue");
+        let mut list = to.list.lock();
         match NonNull::new(list.tail) {
             // SAFETY: as in `push`: the tail is a job of `to`'s list, under its lock.
             Some(old) => unsafe { old.as_ref() }.next.store(head.as_ptr(), Ordering::Relaxed),
@@ -600,7 +600,7 @@ impl Inject {
         }
         let mut taken: [Option<NonNull<Header>>; BATCH] = [None; BATCH];
         {
-            let mut list = self.list.lock_said("a group's job queue");
+            let mut list = self.list.lock();
             let mut count = 0;
             for slot in &mut taken {
                 let Some(head) = NonNull::new(list.head) else { break };
@@ -953,7 +953,7 @@ impl Pool {
             idle: Idle(AtomicU64::new(0)),
             stop: AtomicBool::new(false),
             mixed,
-            stray: Lock::new(None),
+            stray: Lock::new("graph.pool.stray_panic", None),
             #[cfg(not(blaze_check))]
             sched: crate::sched::Scheduler::new(64),
             #[cfg(not(blaze_check))]
@@ -1349,7 +1349,7 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
 // dyn: `radix::Workers`'s signature: a sort's pass, one call per job
 fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
     // dyn: a panic's payload, as `catch_unwind` gives it
-    let failed: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let failed: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.pool.scope_panic", None);
     scope_in(shared, |scope| {
         for at in 0..jobs {
             scope.submit(
@@ -1357,7 +1357,7 @@ fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
                 move || job(at),
                 |it| {
                     if let Err(panic) = it {
-                        failed.lock_said("a scope's first panic").get_or_insert(panic);
+                        failed.lock().get_or_insert(panic);
                     }
                 },
             );
@@ -1680,7 +1680,7 @@ impl Drop for Pool {
                 panic!("{unstopped}");
             }
         }
-        if let Some(panic) = self.shared.stray.lock_said("the pool's stray panic").take()
+        if let Some(panic) = self.shared.stray.lock().take()
             && !thread::panicking()
         {
             resume_unwind(panic);
@@ -2204,7 +2204,7 @@ impl Local {
     /// `job` catches its own panic and gives it to `done`; only `done`'s comes here.
     fn run(&self, runner: &mut Runner<'_>, job: Job) {
         if let Some(panic) = runner.run(job) {
-            self.shared.stray.lock_said("the pool's stray panic").get_or_insert(panic);
+            self.shared.stray.lock().get_or_insert(panic);
         }
     }
 
@@ -2724,7 +2724,7 @@ mod tests {
     use blaze_alloc_count::measure;
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::{bounded, unbounded};
-    use parking_lot::Mutex;
+    use blaze_core::lock::Lock;
 
     use super::{
         Class, Group, Header, Job, Pending, Placed, Pool, STALL_AFTER, STOP_BOUND, Slot, StopClock,
@@ -3000,7 +3000,7 @@ mod tests {
     #[test]
     fn a_scope_borrows_and_waits_for_its_jobs() {
         let pool = Pool::new(&groups_of(2, 2), false).unwrap();
-        let sums = Mutex::new(Vec::new());
+        let sums = Lock::new("graph.test.pool.sums", Vec::new());
         let numbers: Vec<u64> = (0..100).collect();
         let total = pool.scope(|scope| {
             for chunk in numbers.chunks(10) {
@@ -3886,7 +3886,7 @@ mod tests {
             }
             assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(0));
             let (first, second) = (key(6_000 + 2 * round), key(6_001 + 2 * round));
-            let order = Arc::new(Mutex::new(Vec::new()));
+            let order = Arc::new(Lock::new("graph.test.pool.order", Vec::new()));
             let parked = |count: usize| {
                 until("the jobs to park", || pool.shared.parked.load(Ordering::SeqCst) == count)
             };
@@ -4181,7 +4181,7 @@ mod tests {
     /// but `a` runs after at most three of it.
     #[test]
     fn the_lifo_slot_runs_the_job_just_given_but_never_starves_the_deque() {
-        fn chain(pool: &Arc<Pool>, log: Arc<Mutex<Vec<String>>>, n: u32) {
+        fn chain(pool: &Arc<Pool>, log: Arc<Lock<Vec<String>>>, n: u32) {
             log.lock().push(format!("b{n}"));
             if n < 20 {
                 let next = Arc::clone(pool);
@@ -4189,7 +4189,7 @@ mod tests {
             }
         }
         let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Lock::new("graph.test.pool.log", Vec::new()));
         {
             let (inner, log) = (Arc::clone(&pool), Arc::clone(&log));
             pool.submit(
@@ -4783,7 +4783,7 @@ mod model {
             idle: Idle(AtomicU64::new(0)),
             stop: AtomicBool::new(false),
             mixed: false,
-            stray: Lock::new(None),
+            stray: Lock::new("graph.pool.stray_panic", None),
             parked: AtomicUsize::new(0),
             critical: AtomicUsize::new(0),
         });

@@ -32,7 +32,7 @@ const MAX_STEP: usize = 64 << 20;
 /// process costs nothing measurable.
 #[expect(
     clippy::disallowed_types,
-    reason = "a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; taken only as a region of the reserved pool grows, which a grower that waits needs done anyway"
+    reason = "below blaze-core: blaze-mem is a dependency of blaze-core; a cold lock inside the allocator (brief-locks.md's exception): parking_lot's parking table would allocate from within an allocation; taken only as a region of the reserved pool grows, which a grower that waits needs done anyway"
 )]
 static RESERVED_GROWTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

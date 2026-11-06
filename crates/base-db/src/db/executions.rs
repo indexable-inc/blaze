@@ -2,7 +2,7 @@
 //! made then reports every execution here, and the build prints what [`take`] and [`order`]
 //! say after each request.
 
-use parking_lot::Mutex;
+use blaze_core::lock::Lock;
 
 use blaze_hash::HashMap;
 use blaze_query::db::{Database as _, Event, EventKind};
@@ -14,8 +14,8 @@ use super::Db;
 const ORDER_KEPT: usize = 300;
 
 /// By ingredient index ([`blaze_query::db::Storage::ingredient_name`] names one).
-static RAN: Mutex<Option<HashMap<u32, u32, Global>>> = Mutex::new(None);
-static ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new()); // alloc: empty until traced
+static RAN: Lock<Option<HashMap<u32, u32, Global>>> = Lock::new("db.trace.ran", None);
+static ORDER: Lock<Vec<u32>> = Lock::new("db.trace.order", Vec::new()); // alloc: empty until traced
 
 /// Whether a database made now counts its executions.
 pub(super) fn traced() -> bool {

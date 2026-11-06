@@ -4,11 +4,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base_db::all_crates;
+use blaze_core::lock::Lock;
 use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
 };
 use hir_expand::fixture;
-use parking_lot::Mutex;
 
 use crate::InferenceResult;
 
@@ -24,14 +24,23 @@ pub mod area {
 "#;
 
 /// The values the spans named `infer_query` were given, as (field, value).
-#[derive(Default)]
 struct Seen {
     next: AtomicU64,
-    infer: Mutex<Vec<u64>>,
-    values: Mutex<Vec<(String, String)>>,
+    infer: Lock<Vec<u64>>,
+    values: Lock<Vec<(String, String)>>,
 }
 
-struct Values<'a>(&'a Mutex<Vec<(String, String)>>);
+impl Default for Seen {
+    fn default() -> Seen {
+        Seen {
+            next: AtomicU64::new(0),
+            infer: Lock::new("test.ty.span_names.infer", Vec::new()),
+            values: Lock::new("test.ty.span_names.values", Vec::new()),
+        }
+    }
+}
+
+struct Values<'a>(&'a Lock<Vec<(String, String)>>);
 
 impl tracing::field::Visit for Values<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {

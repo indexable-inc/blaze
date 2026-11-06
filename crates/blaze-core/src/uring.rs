@@ -2811,7 +2811,7 @@ mod tests {
         let mut driver = Uring::new(dir("uring-pressure")).unwrap();
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
-        driver.poll(&mut out, Duration::from_millis(20));
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(20)));
         if let Some(Done::Failed(IoError(why))) = out.first().map(|it| &it.done) {
             assert!(why.contains("pressure"), "the failure names the pressure file: {why}");
             assert_eq!(driver.in_flight(), 0);
