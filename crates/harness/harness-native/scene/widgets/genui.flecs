@@ -512,7 +512,7 @@ hn {
         caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
     }
     hint : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_hint
       TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
     }
   }
@@ -539,7 +539,7 @@ hn {
     // field's first line is the hint's.
     hint : ui.Words {
       Overlay
-      Fill: $tone_chat_muted
+      Fill: $tone_hint
       Pose: {dx: 9, dy: 6, shrink: 0, fade: 0, cut: 0}
       TextStyle: {size: $size_gen_control, line: 19, role: 0, bold: 0}
     }
@@ -584,7 +584,7 @@ hn {
           caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
       }
       hint : ui.Line {
-        Fill: $tone_chat_muted
+        Fill: $tone_hint
         TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
       }
     }

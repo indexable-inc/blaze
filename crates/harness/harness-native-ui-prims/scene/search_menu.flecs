@@ -27,7 +27,8 @@ ui {
       Fill: $tone_ink_1
       Size: {w: {kind: Fixed, value: $menu_caret_w, min: 0, max: 0}, h: {kind: Fixed, value: $line_menu, min: 0, max: 0}}
     }
-    hint : ui.Lead, Muted {
+    hint : ui.Lead {
+      Fill: $tone_hint
       Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
       TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
     }

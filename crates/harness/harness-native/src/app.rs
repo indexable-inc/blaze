@@ -1846,6 +1846,13 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(sid) = a.strip_prefix("chat:send:").and_then(|s| s.parse().ok()) {
+                // The composer's send button (scene/widgets/chat.flecs hn.ChatSendReady).
+                self.tree_focus = false;
+                self.chat_send_draft(sid);
+            } else if let Some(sid) = a.strip_prefix("chat:stop:").and_then(|s| s.parse().ok()) {
+                // Its stop while the agent works (hn.ChatStop): as Escape.
+                self.link.chat_interrupt(sid);
             } else if let Some(rest) = a.strip_prefix("chat:pick:") {
                 self.chat_pick_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:set:") {
@@ -2444,7 +2451,8 @@ mod tests {
             "hn.StepFail", "hn.StepNote", "hn.StepGrid",
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
-            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.chat_status.working", "hn.chat_status.ended",
+            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatPickInk.rest", "hn.ChatPickInk.hot",
+            "hn.ChatContext", "hn.ChatSend", "hn.ChatSendReady", "hn.ChatStop",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",

@@ -267,12 +267,14 @@ ui {
     Cursor: {shape: Text}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $textarea_max_h}}
-    // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start).
+    // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start),
+    // in the hint's own ink (tone_hint), well under the words' so it never reads as typed text.
     hint_at : ui.Row {
       Background
       Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
       Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
-      hint : ui.Words, Faint {
+      hint : ui.Words {
+        Fill: $tone_hint
         TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       }
     }

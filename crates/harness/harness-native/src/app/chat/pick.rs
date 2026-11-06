@@ -1,8 +1,8 @@
-//! Den's model and effort picker under a chat's composer (scene/widgets/chat.flecs `hn.ChatPick*`), and its context meter.
+//! Den's model and effort picker in a chat's composer bar (scene/widgets/chat.flecs `hn.ChatPick`), and its context meter.
 //!
-//! The status line shows the model's name, the effort's word and a chevron, each its own control with no plate whose ink
-//! eases toward the strong ink under the pointer. A press opens the menu above it: the models (the name), the efforts
-//! (the word) or both (the chevron), the current row ticked. A pick sends `Request::SetModel` (link.rs `chat_choose`);
+//! The bar's leading edge shows one quiet control, "Opus · Medium" and a small chevron, on a wash under the pointer, its
+//! words easing toward the ink. A press opens the menu above it: the models and the efforts (Command-/ the models alone,
+//! Shift-Command-/ with nothing to step to the efforts alone), the current rows ticked. A pick sends `Request::SetModel` (link.rs `chat_choose`);
 //! the daemon has the agent switch (claude's `set_model` and `apply_flag_settings` control requests, codex's next
 //! `turn/start`) and logs the choice, so a resumed chat keeps it. A chat whose own log has no `models` event (one from
 //! before chats listed them, or one whose agent is not running) picks from the list its agent kind last gave the daemon
@@ -10,7 +10,7 @@
 //! agent of its kind has listed, or for a model with no efforts, that part of the menu says why in a short line. A press
 //! anywhere else, or Escape, closes it.
 //!
-//! The models' menu (and the chevron's) is a searchable menu (search_menu.flecs `ui.SearchMenu`,
+//! The menu (unless it is the efforts alone) is a searchable menu (search_menu.flecs `ui.SearchMenu`,
 //! harness_native_ui_view::search): typing while it is open filters it, the first match highlighted, Return picks. It
 //! offers every agent kind's models, the chat's own first, under each kind's head with its maker's mark. One of the
 //! chat's own switches it as above; another kind's cannot (a chat's agent is one process for its life: Claude's
@@ -18,8 +18,9 @@
 //! the same directory (`chat:spawn:`), which replaces this one when nothing was sent in it yet. Every pick is remembered
 //! ([`App::remember_choice`]): cmd+N starts on the last agent, model and effort.
 //!
-//! After them, the context meter: a ring filling as the conversation fills its model's window, and the percentage (den's:
-//! muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer, its popover (context.rs).
+//! At the bar's trailing edge, before the send button, the context meter: a small ring filling as the conversation fills
+//! its model's window (den's: muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer,
+//! its popover (context.rs) says how full, with the percentage, and with what.
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
@@ -50,15 +51,6 @@ impl Pick {
             _ => None,
         }
     }
-
-    /// The control that opens it (a part of the status line's `pick`).
-    fn trigger(self) -> &'static str {
-        match self {
-            Self::Model => "model",
-            Self::Effort => "effort",
-            Self::All => "more",
-        }
-    }
 }
 
 /// The models chat `t` (of agent kind `kind`) picks from: those its own log listed, else those its kind last listed to
@@ -71,9 +63,9 @@ fn models_of<'a>(t: &'a Transcript, kind: &str, kept: &'a BTreeMap<String, Vec<M
     kept.get(kind).map_or(&[], Vec::as_slice)
 }
 
-/// Whose mark the model's control shows, as an `hn.Kind` child: Claude's for Anthropic's models, OpenAI's (`codex`) for
-/// GPT and the o-series, else the agent kind's own (`agent`: a Cursor chat's `auto`), from the model's id and the model
-/// it runs as (`cur`), else the status line's `model`.
+/// Whose mark a model's row in the menu shows, as an `hn.Kind` child: Claude's for Anthropic's models, OpenAI's
+/// (`codex`) for GPT and the o-series, else the agent kind's own (`agent`: a Cursor chat's `auto`), from the model's id
+/// and the model it runs as (`cur`), else `model`.
 fn maker(cur: Option<&ModelChoice>, model: &str, agent: &str) -> &'static str {
     let names = cur.map_or([model, ""], |c| [c.id.as_str(), c.model.as_str()]);
     let is = |pre: &[&str]| names.iter().any(|n| pre.iter().any(|p| n.to_ascii_lowercase().starts_with(p)));
@@ -134,7 +126,7 @@ fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
     Rgba { r: m(a.r, b.r), g: m(a.g, b.g), b: m(a.b, b.b), a: m(a.a, b.a) }
 }
 
-/// The Fill of scene prefab `path` (`hn.ChatPickInk.word`); the scene always has it.
+/// The Fill of scene prefab `path` (`hn.ChatPickInk.rest`); the scene always has it.
 fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
@@ -146,11 +138,11 @@ fn set_fill(v: View<'_>, f: Fill) {
 }
 
 impl App {
-    /// The status line's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, running `model` at
-    /// `effort` as the status line has them), and its menu while `open`.
+    /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, running `model` at
+    /// `effort` as the pane has them), and its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
-        &self, status: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, model: &str,
+        &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, model: &str,
         effort: &str,
     ) {
         let w = self.world.world_ref();
@@ -159,46 +151,25 @@ impl App {
         let cur = current(t, models);
         let name = cur.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(model);
         let context = t.context.as_ref().filter(|c| c.window > 0);
-        let Some(pick) = status.part("pick") else { return };
-        let mut parts: Vec<(&str, &str)> = Vec::with_capacity(4); // alloc: four parts at most, once a frame per chat
-        if !name.is_empty() {
-            parts.push(("model", "hn.ChatPick"));
-            if !effort.is_empty() {
-                parts.push(("effort", "hn.ChatPickWord"));
-            }
-            parts.push(("more", "hn.ChatPickMore"));
-        }
-        if context.is_some() {
-            parts.push(("context", "hn.ChatContext"));
-        }
-        let (ink, word) = (fill_of(w, "hn.ChatPickInk.name"), fill_of(w, "hn.ChatPickInk.word"));
-        // Under the pointer, each eases to the name's ink at full strength.
-        let hot = Fill { dark: Rgba { a: 1.0, ..ink.dark }, light: Rgba { a: 1.0, ..ink.light } };
-        let effort_shown = effort_word(effort);
-        view::for_each_of(pick, parts.iter().map(|&(k, p)| (k, p, k)), |v, k, _| match k {
-            "model" => {
-                control(v, &format!("chat:pick:{sid}:model"), "label", Some(name), ink, hot);
-                if let Some(i) = v.part("icon") {
-                    crate::look::kind_mark(w, i.entity(), maker(cur, model, if t.agent.is_empty() { kind } else { &t.agent }));
-                }
-            }
-            "effort" => control(v, &format!("chat:pick:{sid}:effort"), "label", Some(&effort_shown), word, hot),
-            "more" => control(v, &format!("chat:pick:{sid}:all"), "icon", None, word, hot),
-            _ => {
-                if let Some(c) = context {
-                    meter(v, (c.used, c.window), ink);
-                }
+        let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
+        let (rest, hot) = (fill_of(w, "hn.ChatPickInk.rest"), fill_of(w, "hn.ChatPickInk.hot"));
+        // "Opus · Medium": the model, and its effort when known.
+        let words = if effort.is_empty() { name.to_owned() } else { format!("{name} \u{b7} {}", effort_word(effort)) };
+        let shown = (!name.is_empty()).then_some(("model", "hn.ChatPick", ()));
+        view::for_each_of(pick, shown, |v, (), _| control(v, &format!("chat:pick:{sid}:all"), &words, rest, hot));
+        view::for_each_of(meter_slot, context.map(|_| ("context", "hn.ChatContext", ())), |v, (), _| {
+            if let Some(c) = context {
+                meter(v, (c.used, c.window), hot);
             }
         });
-        // Under the pointer, the meter's popover (context.rs); never over the open menu.
-        if let Some(pop) = status.part("pop") {
+        // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
+        if let Some(pop) = bar.part("pop") {
             let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-            super::context::fill_context_pop(pop, pick.part("context"), context, agent, open.is_some());
+            super::context::fill_context_pop(pop, meter_slot.part("context"), context, agent, open.is_some());
         }
-        // Open, the menu floats above what opened it, its leading edge on that control's (the whole picker for the
-        // chevron's menu of both, so it lines up with the model's name; the chevron when the effort's word is not there).
-        let trigger = open.and_then(|p| if p == Pick::All { Some(pick) } else { pick.part(p.trigger()).or_else(|| pick.part("more")) });
-        let Some(menu) = status.part("menu") else { return };
+        // Open, the menu floats above the control, its leading edge on the control's.
+        let trigger = open.and_then(|_| pick.part("model"));
+        let Some(menu) = bar.part("menu") else { return };
         // The efforts alone are a plain menu; the models (and both) a searchable one.
         let plate = match open {
             Some(Pick::Effort) => Some(("plate", "ui.Menu")),
@@ -440,32 +411,25 @@ impl App {
     }
 }
 
-/// One of the picker's controls: its action, its words (or its glyph) in `rest` eased toward `hot` by its hover spring.
-fn control(v: View<'_>, action: &str, part: &str, words: Option<&str>, rest: Fill, hot: Fill) {
+/// The picker's control: its action, its words in `rest` eased toward `hot` by its hover spring.
+fn control(v: View<'_>, action: &str, words: &str, rest: Fill, hot: Fill) {
     v.action(action);
     let e = v.entity();
     if !e.has(HoverAmt::id()) {
         e.set(HoverAmt::default());
     }
     let k = e.try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
-    let Some(p) = v.part(part) else { return };
-    if let Some(s) = words {
-        p.text(s);
-    }
+    let Some(p) = v.part("label") else { return };
+    p.text(words);
     set_fill(p, Fill { dark: mix(rest.dark, hot.dark, k), light: mix(rest.light, hot.light, k) });
 }
 
-/// The context meter for `(used, window)` tokens: the ring's arc and the percentage in their tone, the track in `ink`
-/// faintly.
+/// The context meter for `(used, window)` tokens: the ring's arc in its tone, the track in `ink` faintly. The number is
+/// the popover's (context.rs).
 fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     let w = v.entity().world();
     let f = used as f64 / window as f64;
-    let pct = (f * 100.0).round().min(100.0) as u64;
     let tone = fill_of(w, if f >= FULL { "hn.ChatContextTone.full" } else if f >= WARN { "hn.ChatContextTone.warn" } else { "hn.ChatContextTone.ok" });
-    if let Some(p) = v.part("pct") {
-        p.text(&format!("{pct}%"));
-        set_fill(p, tone);
-    }
     let Some(ring) = v.part("ring") else { return };
     if let Some(track) = ring.part("track") {
         let s = Stroke { dark: Rgba { a: TRACK_ALPHA, ..ink.dark }, light: Rgba { a: TRACK_ALPHA, ..ink.light } };
