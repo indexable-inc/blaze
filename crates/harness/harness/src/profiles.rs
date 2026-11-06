@@ -27,58 +27,19 @@ pub struct Ctx<'a> {
 
 pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 
-const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
-description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
-process and task tables). Use it for everything. To run another agent, use agents.spawn in ts (never a built-in \
-sub-agent or collaboration tool), so it appears in the harness tree. \
-Each task has a typed call that returns data and that the person sees as what it did: read a file with await \
-Bun.file(p).text(); find text with await rg('fn main', {path, type: 'rust', context: 2}); files by name with await \
-glob('src/**/*.rs') ({stat: true, sort: 'size'} for sizes); a folder with await ls(dir); disk use with await du(dir); \
-history with gitLog(); a build, lint or test with await cargo.check(args) (build, test, clippy; follow(cmd) for any \
-other), which the person watches live and which returns you a digest of its errors, not its log. The shell \
-($`cmd`, sh) is for running programs (git, bun, make, servers); a command that only reads files or the tree is refused. \
-Andrew's Gmail is `gmail.*` in ts (his logged-in browser, Gmail's own web endpoints): \
-`const t = await gmail.search('is:unread', { limit: 20 })` gives a Table of threads {id, subject, from, date, snippet, \
-labels, unread}; `await gmail.read(t[0])` gives {subject, messages} with each message's from, to, date, plain `text` and \
-attachments; gmail.messages(query), gmail.labels() and gmail.attachment(threadId, msgId, partId) (a saved path) too. To \
-show mail, draw the rows as Tiles whose onclick calls gmail.read and shows that thread below. \
-Writing: `await gmail.send({ to: 'a@b.com', subject: 'Hi', body: 'text', attachments: ['/path/f.pdf'] })`; \
-`const [m] = await gmail.messages('from:bob newer_than:2d'); await gmail.reply(m, 'Thanks!', { all: true })`; \
-`await gmail.forward(m, 'c@d.com', 'FYI')`; `await gmail.archive(t.filter(x => !x.unread))`. Send, reply, forward, \
-archive, trash and label ask Andrew first and throw if he declines, so call them directly (no separate confirm step); \
-gmail.draft(spec) saves without asking, for him to review, and gmail.markRead(rows) needs no OK. \
-The person sees every ts cell as it runs, drawn in the chat: its steps in plain words (searches, commands, files read \
-and written, agents started) and its result, with tables drawn as tables and command output as output. So never repeat \
-that in your reply: no markdown table or list restating results you just fetched, no pasted output. Refer to it \
-(\"the third result\", \"the build output above\"), then say what it means and what to do next. \
-To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5 markup \
-(start it with <script> or an element) using Column, Row, Text (tone: ink muted strong error accent success warning), \
-Markdown, Code, Table (rows of records; query, onselect), Badge, Stat (label, value, note), Card (title), Divider and Spacer; runes only \
-($state, $derived, $effect, $props), and the person sees it drawn under the cell. \
-For charts use <Chart kind=\"bar|stacked|line|area|scatter|pie|donut\" data={[...]} or series={[{name, data}]} \
-labels={[...]} unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand. For drawings, \
-SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect, Circle, Line, \
-Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint, series1..series8), never \
-colours. For input use Button (label, value, onclick), Toggle, Checkbox, Slider, NumberField, Input, TextArea, Select, Choice and \
-Radio (options), ColorPicker (\"#rrggbb\" or tone swatches; it sends #rrggbb), bound to $state with bind:value (Slider, \
-NumberField, Input, TextArea, Toggle), bind:checked (Checkbox) or bind:selected (Select, Choice, Radio, ColorPicker); \
-DropZone (ondrop gets the dropped files' paths); what the person does runs the cell's handlers and redraws it. Layout: Grid (columns), Wrap, Scroll, Split (bind:ratio), Stack (align) with Layer (anchor); folding and floating: \
-Tabs (tabs, bind:selected; pick the body with {#if}), Disclosure (title) in an Accordion, Popover, Menu (items; context opens it on a right press), \
-Dialog and Sheet (bind:open on each) and Toast; status, pictures and files: Progress, Loading, Skeleton, Icon (kind: a file \
-kind), Image (src: a file path), Chip, Tile (onclick), FileRef (path), File (a listing row: name, size, modified) and \
-CellRef (task=\"t3\": another cell of yours, live); Kip, the app's mascot, in a mood (mood: wave happy celebrate \
-thinking working oops sleepy idle, a few in turn as \"thinking then celebrate\"; size 20 to 160) for a greeting or an \
-outcome, sparingly. Video plays a file or http(s) URL (muted, with controls; autoplay loop, \
-bind:currentTime, bind:paused): <Video id=\"clip\" src=\"~/Movies/a.mp4\" autoplay loop />. Shader runs a Slang \
-fragment shader every frame, `float4 main(ShaderInput in)` between its tags (in.uv, in.pixel, in.resolution, in.time, \
-in.pointer, in.hovered, in.u.<uniform>; texture(name, uv)); uniforms and textures take values or '@id' of an element \
-in the cell (a Slider's live value, a Video's frames): <Shader aspect=\"16:9\" textures={{ clip: '@clip' }} \
-uniforms={{ gain: '@gain' }}>float4 main(ShaderInput in) { return texture(clip, in.uv) * in.u.gain; }</Shader>. \
-Every element also takes width, height (and min/max), grow, padX, padY, a sprung pose (x, y, scale, rotate, opacity), z, \
-hover={{scale: 1.05}}, enter and exit (or Svelte's in:, out:, transition: fly fade scale slide, and animate:flip), and \
-onpointerdown/move/up, ondrag, onwheel, onhover, onkeydown, onfocus, onblur. \
-To ask the person and wait for the answer, await ask(text, {options, \
-default}). An element or prop not listed is an error naming it and its line.";
+/// The note every agent gets on top of its own system prompt (claude's `--append-system-prompt`, codex's
+/// `developer_instructions`, cursor's MCP server instructions): one file per topic under `system_note/`, joined in
+/// this order with a blank line between them.
+const SYSTEM_NOTE_PARTS: &[&str] = &[
+    include_str!("system_note/tools.md"),   // the one tool, ts, and its typed calls
+    include_str!("system_note/gmail.md"),   // gmail.* in ts
+    include_str!("system_note/output.md"),  // the person already sees every cell: don't restate it
+    include_str!("system_note/ui.md"),      // cells as Svelte 5 UI: the element vocabulary
+    include_str!("system_note/replies.md"), // how replies to Andrew read
+];
+
+static SYSTEM_NOTE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SYSTEM_NOTE_PARTS.iter().map(|part| part.trim()).collect::<Vec<_>>().join("\n\n"));
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -179,7 +140,7 @@ fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
         "--no-chrome",
         "--dangerously-skip-permissions",       // yolo: nothing ever prompts
         "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#, // flag settings apply despite --setting-sources ""
-        "--append-system-prompt", SYSTEM_NOTE,
+        "--append-system-prompt", SYSTEM_NOTE.as_str(),
     ];
     let mut env = common_env(ctx);
     for (k, v) in [
@@ -242,7 +203,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), "project_doc_max_bytes=0".into(), // no AGENTS.md from the repo (global one is out via CODEX_HOME)
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
-        "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE)),
+        "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE.as_str())),
     ];
     if ctx.chat {
         // `codex app-server` (chat/codex.rs) has no bypass flag: the same yolo as config (thread/start repeats it).
@@ -330,7 +291,7 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
         "HARNESS_SESSION": "${env:HARNESS_SESSION}",
         "HARNESS_SOCK": "${env:HARNESS_SOCK}",
         "HARNESS_CWD": "${env:HARNESS_CWD}",
-        "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE,
+        "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE.as_str(),
     });
     let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": env } } });
     let mcp = serde_json::to_vec_pretty(&mcp)?;
