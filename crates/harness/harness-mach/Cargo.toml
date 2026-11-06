@@ -1,0 +1,12 @@
+[package]
+name = "harness-mach"
+description = "Mach messages between the harness browser host and the app: a bootstrap service, messages of bytes plus port rights, IOSurfaces as ports, a receive port drained on the main dispatch queue"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "allow"

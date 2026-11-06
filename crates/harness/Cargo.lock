@@ -222,6 +222,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cef"
+version = "156.3.0+156.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "630eba7cb50b3cc5ee13ece8c922f36f72ace8a1db8e81b6f694b98c5cf373b1"
+dependencies = [
+ "cef-dll-sys",
+ "libloading",
+ "objc2",
+ "windows-sys",
+]
+
+[[package]]
+name = "cef-dll-sys"
+version = "156.3.0+156.0.15"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +377,21 @@ name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crossterm"
@@ -824,6 +858,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-browser"
+version = "0.1.0"
+dependencies = [
+ "cef",
+ "crossbeam-channel",
+ "harness-mach",
+ "harness-proto",
+ "hegeltest",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-io-surface",
+ "objc2-metal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-chat"
 version = "0.1.0"
 dependencies = [
@@ -836,6 +888,10 @@ name = "harness-ghostty-config"
 version = "0.1.0"
 
 [[package]]
+name = "harness-mach"
+version = "0.1.0"
+
+[[package]]
 name = "harness-native"
 version = "0.1.0"
 dependencies = [
@@ -844,12 +900,14 @@ dependencies = [
  "dispatch2",
  "harfrust",
  "harness-ghostty-config",
+ "harness-mach",
  "harness-native-api",
  "harness-native-ecs",
  "harness-native-flecs",
  "harness-native-model",
  "harness-native-render",
  "harness-native-scroll-physics",
+ "harness-native-ui-browser-api",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
  "harness-native-ui-inline",
@@ -966,6 +1024,7 @@ dependencies = [
  "bytemuck",
  "dispatch2",
  "harfrust",
+ "harness-mach",
  "harness-native-api",
  "harness-native-blaze",
  "harness-native-flecs",
@@ -1011,6 +1070,14 @@ dependencies = [
 [[package]]
 name = "harness-native-scroll-physics"
 version = "0.1.0"
+
+[[package]]
+name = "harness-native-ui-browser-api"
+version = "0.1.0"
+dependencies = [
+ "harness-native-flecs",
+ "hyperion-api-layouts",
+]
 
 [[package]]
 name = "harness-native-ui-draw"
@@ -1126,6 +1193,7 @@ name = "harness-native-ui-prims"
 version = "0.1.0"
 dependencies = [
  "harness-native-flecs",
+ "harness-native-ui-browser-api",
  "harness-native-ui-draw-api",
  "harness-native-ui-input-api",
  "harness-native-ui-layout",
@@ -1666,6 +1734,16 @@ version = "0.2.1"
 source = "git+https://github.com/uzaaft/libghostty-rs?rev=575ed6b8ceb79ffaf247ecf7e34333876b0d5be4#575ed6b8ceb79ffaf247ecf7e34333876b0d5be4"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2117,8 +2195,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.13.2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -2133,6 +2213,7 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]

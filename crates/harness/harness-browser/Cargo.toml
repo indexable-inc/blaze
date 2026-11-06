@@ -1,0 +1,31 @@
+[package]
+name = "harness-browser"
+description = "The harness's embedded browser host: CEF's browser process and every helper in one binary; off-screen views drawn by the app over Mach, driven by the kernel over a Unix socket (README.md)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "harness-browser"
+path = "src/main.rs"
+
+[dependencies]
+cef = { version = "=156.3.0", default-features = false, features = ["sandbox"] }
+harness-proto = { path = "../harness-proto" }
+harness-mach = { path = "../harness-mach" }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+# Property tests and the DSTs (slots.rs, cdp_ids.rs): Hegel, imported as `hegel` (blaze's vendor/hegeltest).
+hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+
+[lints.rust]
+unsafe_code = "allow"

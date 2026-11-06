@@ -1,5 +1,7 @@
-// Gmail through Gmail's own web client: a hidden mail.google.com tab in the browser on CDP (Dia), whose requests
-// carry the logged-in session. No public Gmail API, no OAuth.
+// Gmail through Gmail's own web client: a mail.google.com page in the harness browser (embedded Chromium, cdp.ts),
+// whose requests carry the session the person signed in to once in the browser pane (cmd+shift+B). No public Gmail API,
+// no OAuth. `gmail.via({ cdp })` (or HARNESS_GMAIL_CDP) points these helpers, and only them, at another browser's
+// DevTools endpoint instead: an explicit choice, never made on its own and never tried when the harness browser fails.
 //
 // How it works. The web client talks JSON arrays ("pt=ji") to /sync/u/<n>/i/<op>:
 //   bv  "bulk view": a search; the request is the query plus paging, the reply the matching threads with a
@@ -23,7 +25,7 @@
 // endpoint and what was missing.
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { browser, type Page } from "../cdp.ts";
+import { external, newPage, type Page } from "../cdp.ts";
 import { table, type Table } from "../table.ts";
 import { effect, oneLine } from "../effects.ts";
 import { canConfirm, confirm } from "../host.ts";
@@ -128,7 +130,7 @@ function touch(p: Page) {
 }
 
 async function alive(p: Page): Promise<boolean> {
-  if (p.browser.closed) return false;
+  if (p.closed) return false;
   return p.evaluate(() => typeof (window as unknown as Win).__blazeGmailHdrs === "object").catch(() => false);
 }
 
@@ -150,14 +152,35 @@ async function gmailPage(): Promise<Page> {
   }
 }
 
+/** Where the gmail helpers' page lives: the harness browser (null), or the DevTools endpoint gmail.via chose. */
+let via: string | null | undefined;
+const endpoint = (): string | null => via !== undefined ? via : process.env.HARNESS_GMAIL_CDP || null;
+
+/**
+ * Point the gmail helpers at the DevTools endpoint `cdp` (`"http://127.0.0.1:9222"`: a browser started with
+ * `--remote-debugging-port`, where the person is signed in to Gmail) for the rest of this kernel's life; `cdp: null` sends
+ * them back to the harness browser. Only gmail.* use it; nothing else does, and nothing switches to it on a failure.
+ */
+function via_(opts: { cdp: string | null }): void {
+  if (opts.cdp !== null && !/^https?:\/\/[^/\s]+\/?$/.test(opts.cdp))
+    throw new GmailError(`gmail.via: cdp must be a DevTools endpoint like "http://127.0.0.1:9222" (or null for the harness browser), got ${JSON.stringify(opts.cdp)}`);
+  via = opts.cdp === null ? null : opts.cdp.replace(/\/$/, "");
+  const old = shared;
+  shared = undefined;
+  old?.then((p) => p.close(), () => {});
+}
+
 async function openPage(): Promise<Page> {
-  const p = await (await browser()).newHiddenPage();
+  const at_ = endpoint();
+  const p = at_ === null ? await newPage() : await (await external(at_)).newPage();
   try {
     await p.send("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
     await p.goto(`${ORIGIN}/mail/u/${ACCOUNT}/#inbox`, 45_000);
     const at = new URL(await p.url());
     if (at.host !== "mail.google.com" || !at.pathname.startsWith("/mail/"))
-      throw new GmailError(`Gmail is not logged in in the browser on CDP: mail.google.com/mail/u/${ACCOUNT}/ redirected to ${at.host}${at.pathname}. Sign in to Gmail in Dia and retry.`);
+      throw new GmailError(at_ === null
+        ? `Gmail is not signed in in the harness browser: mail.google.com/mail/u/${ACCOUNT}/ redirected to ${at.host}${at.pathname}. Open mail.google.com in the browser pane (cmd+shift+B), sign in to Google, and retry. If Google refuses to sign in there, gmail.via({ cdp: "http://127.0.0.1:9222" }) uses a browser started with --remote-debugging-port instead.`
+        : `Gmail is not signed in in the browser at ${at_} (gmail.via / HARNESS_GMAIL_CDP): mail.google.com/mail/u/${ACCOUNT}/ redirected to ${at.host}${at.pathname}. Sign in to Gmail there and retry, or gmail.via({ cdp: null }) for the harness browser.`);
     // Gmail's first /sync/ request carries the headers we reuse; it makes one while booting. If it hasn't after a
     // few seconds, ask it for a search, which always goes to the server.
     const deadline = Date.now() + 20_000;
@@ -932,4 +955,4 @@ function markRead(targets: Target | Target[], read = true) {
     () => relabel("markRead", "", targets, read ? [] : ["^u"], read ? ["^u"] : [], false), change);
 }
 
-export const gmail = { search, messages, read, labels, attachment, send, draft, deleteDraft, reply, forward, archive, trash, label, markRead };
+export const gmail = { search, messages, read, labels, attachment, send, draft, deleteDraft, reply, forward, archive, trash, label, markRead, via: via_ };

@@ -29,6 +29,9 @@ ctx {
   Archive {}
   // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
   Chat {}
+  // A harness browser view has the keyboard (the pane, or a card clicked into: BrowserFocus, src/app/browser.rs): keys
+  // no binding here takes go to the page.
+  Browser {}
 }
 
 // ---- actions ----
@@ -80,6 +83,8 @@ act {
     MenuItem: {bar: "Edit", title: "Emoji & Symbols", sep: 1} }
 
   ToggleSidebar { MenuItem: {bar: "View", title: "Toggle Sidebar"} }
+  // The browser pane on the right (hn.WebPane, src/app/browser.rs), on the view it last showed.
+  ToggleWeb { MenuItem: {bar: "View", title: "Toggle Browser"} }
   Palette { MenuItem: {bar: "View", title: "Command Palette"} }
   prefab Zoom
   ZoomIn : act.Zoom { ZoomStep: {step: 1}
@@ -172,6 +177,12 @@ act {
   ChatWordErase : act.Edit { EditOp: {op: "word_erase"} }
   ChatWordDelete : act.Edit { EditOp: {op: "word_delete"} }
   ChatLineErase : act.Edit { EditOp: {op: "line_erase"} }
+
+  // The focused browser view (ctx.Browser): the address field, history, reload.
+  WebFocusUrl {}
+  WebBack {}
+  WebForward {}
+  WebReload {}
 }
 
 // ---- bindings ----
@@ -210,6 +221,8 @@ key {
 
   sidebar { Keybind: {key: "s", cmd: 1}
     (Does, act.ToggleSidebar) }
+  web { Keybind: {key: "b", cmd: 1, shift: 1}
+    (Does, act.ToggleWeb) }
   palette { Keybind: {key: "k", cmd: 1}
     (Does, act.Palette) }
   zoom_in { Keybind: {key: "=", cmd: 1}
@@ -415,4 +428,11 @@ key {
   chat_word_erase { Keybind: {key: "backspace", opt: 1}; (Does, act.ChatWordErase); (When, ctx.Chat) }
   chat_word_delete { Keybind: {key: "delete", opt: 1}; (Does, act.ChatWordDelete); (When, ctx.Chat) }
   chat_line_erase { Keybind: {key: "backspace", cmd: 1}; (Does, act.ChatLineErase); (When, ctx.Chat) }
+
+  // The focused browser view: Safari's keys. cmd+[ and cmd+] go back and forward in its history here, over the
+  // global previous and next object.
+  web_url { Keybind: {key: "l", cmd: 1}; (Does, act.WebFocusUrl); (When, ctx.Browser) }
+  web_back { Keybind: {key: "[", cmd: 1}; (Does, act.WebBack); (When, ctx.Browser) }
+  web_forward { Keybind: {key: "]", cmd: 1}; (Does, act.WebForward); (When, ctx.Browser) }
+  web_reload { Keybind: {key: "r", cmd: 1}; (Does, act.WebReload); (When, ctx.Browser) }
 }

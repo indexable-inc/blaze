@@ -33,14 +33,16 @@ export const ELEMENT_NAMES = [
   'Kip',
   // Moving pictures: a video file or URL with its controls, and the agent's own Slang fragment shader (shader.ts), on the GPU.
   'Video', 'Shader',
+  // A page of the harness browser (embedded Chromium), live: a view an agent opened (`view={page.view}`) or a URL the app opens.
+  'Browser',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
 const known = new Set<string>(ELEMENT_NAMES);
 export const isKnownElement = (name: string): name is ElementName => known.has(name);
 
-/** Den's elements the harness app does not draw (yet): naming one is this error, never a blank or a ReferenceError. */
-export const NOT_DRAWN: ReadonlySet<string> = new Set(['Browser']);
+/** Den's elements the harness app does not draw (yet): naming one is this error, never a blank or a ReferenceError. None now. */
+export const NOT_DRAWN: ReadonlySet<string> = new Set<string>();
 export const notDrawnError = (name: string, where?: string): TypeError =>
   new TypeError(`<${name}> is not drawn by the harness app${where ? ` (${where})` : ''}: the elements are ${ELEMENT_NAMES.join(', ')}`);
 
@@ -137,6 +139,8 @@ export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Video: ['src', 'poster', 'autoplay', 'loop', 'muted', 'controls', 'width', 'height', 'aspect', 'fit', 'id', 'paused', 'currentTime', 'ontimeupdate', 'onended', 'onplay', 'onpause'],
   // `sourceLine` is compile.ts's (the cell line the source between the tags starts on), for the lines of a compile error.
   Shader: ['source', 'src', 'width', 'height', 'aspect', 'uniforms', 'textures', 'animate', 'id', 'sourceLine', 'children'],
+  // One of the two: a view of the harness browser (cdp.ts Page.view), or an http(s) URL the app opens a view at.
+  Browser: ['view', 'src'],
 };
 /** Props the kernel sets itself, never listed as what an element takes. */
 const INTERNAL: ReadonlySet<string> = new Set(['sourceLine']);
@@ -469,6 +473,11 @@ const id: Rule = ID_RULE;
 const aspect: Rule = v => aspectOf(v) !== undefined ? undefined : `a width over a height: "16:9", "16/9" or a number (16 / 9), from 0.01 to 100`;
 const uniforms: Rule = v => { const u = uniformsOf(v); return typeof u === 'string' ? u : undefined; };
 const textures: Rule = v => texturesProblem(v);
+/** A Browser's view: the harness browser's id for it, as a Page's `view` says it (decimal digits). */
+export const viewOf = (v: unknown): string | undefined =>
+  typeof v === 'string' && /^\d{1,20}$/.test(v.trim()) ? v.trim() : typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? String(v) : undefined;
+const view: Rule = v => viewOf(v) !== undefined ? undefined : `a view of the harness browser, as a page names it: view={page.view} (from browser.open(url) or withHiddenPage)`;
+const webUrl: Rule = v => typeof v === 'string' && /^https?:\/\/\S+$/i.test(v.trim()) ? undefined : `an http(s) URL, src="https://example.com"`;
 
 /** The problem with a Select's, Choice's or Radio's `options`, or the options as the app reads them. */
 export function optionsOf(value: unknown): WireOption[] | string {
@@ -664,13 +673,14 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
     source: v => typeof v === 'string' ? undefined : 'Slang source (a string): float4 main(ShaderInput in) { ... }', src: file,
     width: positive, height: positive, aspect, uniforms, textures, animate: flag, id, sourceLine: whole(1, Number.MAX_SAFE_INTEGER, 'a line'),
   },
+  Browser: { view, src: webUrl },
 };
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */
 export const WIRED: ReadonlySet<string> = new Set([
   'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio', 'ColorPicker', 'DropZone',
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split', 'Tabs', 'Accordion', 'Disclosure', 'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
-  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'File', 'CellRef', 'Kip', 'Video', 'Shader',
+  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'File', 'CellRef', 'Kip', 'Video', 'Shader', 'Browser',
 ]);
 
 /** Two values the same as JSON says them (a tab's value against the selected one). */
@@ -947,6 +957,21 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       break;
     case 'Shader':
       return shaderWire(props, where);
+    case 'Browser': {
+      // A view (live, drawn from the host's frames) or a URL (the app opens a view of its own at it): exactly one.
+      if (given('view') === given('src')) {
+        throw fail(given('view') ? 'has both a view and a src' : 'has no view and no src',
+          'view={page.view} draws a page an agent opened (browser.open(url)), src="https://…" opens one at that URL');
+      }
+      if (given('view')) {
+        const v = viewOf(props.view);
+        if (v === undefined) throw fail(`has view ${JSON.stringify(props.view).slice(0, 40)}`, 'view={page.view}, the id a harness browser page gives');
+        out.view = v;
+      } else {
+        out.src = String(props.src).trim();
+      }
+      break;
+    }
     default:
       throw new Error(`elementWire: <${element}> is not one of the elements sent exactly (WIRED)`);
   }

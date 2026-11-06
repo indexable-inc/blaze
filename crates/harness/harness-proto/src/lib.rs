@@ -14,8 +14,12 @@
 //! - [`migrate`]: the one-time conversion of a chat log from the NDJSON of before [`SCHEMA`] 1, as a sans-IO step list the
 //!   daemon performs at start, proven by an exhaustive crash test.
 //!
+//! - [`browser`]: the embedded browser host's messages (harness-browser): its socket's for the kernel, its Mach
+//!   channel's for the app.
+//!
 //! The kernel mirrors these types once, in `mcp/src/wire.ts`, and `mcp/src/wire.test.ts` round-trips this crate's
 //! fixtures (`fixtures/`, written by this crate's `fixtures_are_current` test) through it byte for byte.
+pub mod browser;
 pub mod cbor;
 pub mod event;
 #[cfg(test)]

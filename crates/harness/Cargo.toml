@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["harness", "harness-chat", "harness-proto", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]
+members = ["harness", "harness-browser", "harness-chat", "harness-mach", "harness-proto", "harness-ghostty-config", "harness-native*", "harness-video", "harness-vt"]
+
+# cef-rs's sys crate with its build script replaced: the pinned CEF from scripts/cef.py's cache, no download, no cmake
+# (harness-browser/README.md).
+[patch.crates-io]
+cef-dll-sys = { path = "vendor/cef-dll-sys" }
