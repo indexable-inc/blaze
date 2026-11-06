@@ -55,8 +55,8 @@ hn {
           }
         }
         // The controls (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to say): the
-        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and the send button
-        // (hn.ChatSend, hn.ChatSendReady with words to send, hn.ChatStop while the agent works) at the trailing one.
+        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and, while the agent works, its
+        // breathing ring (hn.ChatWorking) at the trailing one. No buttons: Return sends, Escape stops.
         bar : ui.Row {
           Cursor: {shape: Arrow}
           Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
@@ -175,54 +175,20 @@ hn {
     full { Fill: $tone_failed }
   }
 
-  // The send button at the bar's trailing edge (src/app/chat.rs keeps one of the three in `bar.act`): a circle with an
-  // arrow up, quiet with nothing to send (hn.ChatSend), solid in the words' ink once there is (hn.ChatSendReady), the
-  // composer's one strong action; while the agent works, the stop (hn.ChatStop) in its place.
-  prefab ChatSendBase : ui.Row {
-    Pressable
-    Action: {name: ""}
-    Cursor: {shape: Arrow}
-    Shape: {radius: $chat_send / 2, n: 4, border: 0, feather: 0}
-    PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
+  // While the agent works, a ring at the bar's trailing edge breathing gently in the bar's muted ink (src/app/chat.rs
+  // keeps it in `bar.act`): the composer's one sign of work, and not a button: Return sends and Escape stops. With the
+  // agent idle the slot is empty, so the window rests and the composer keeps its room.
+  prefab ChatWorking : ui.Row {
+    Tooltip: {text: "Working  esc to stop"}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Fixed, value: $chat_send, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
-  }
-  prefab ChatSend : hn.ChatSendBase {
-    Tooltip: {text: "Send  ↩"}
-    Fill: $tone_chat_send_idle
-    arrow : ui.Node {
-      Fill: $tone_clear
-      Stroke: {dark: $tone_chat_faint.dark, light: $tone_chat_faint.light}
-      Vector: {d: "M6 10 L6 2.5 M2.5 6 L6 2.5 L9.5 6", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_send_stroke}
-      Size: {w: {kind: Fixed, value: $chat_send_glyph, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_glyph, min: 0, max: 0}}
-    }
-  }
-  prefab ChatSendReady : hn.ChatSend {
-    Fill: $tone_chat_send
-    arrow : ui.Node {
-      Stroke: {dark: $tone_chat_send_glyph.dark, light: $tone_chat_send_glyph.light}
-    }
-  }
-  // The stop is quiet, since it is seldom pressed (Escape interrupts too): no plate, a thin ring chat_stop_ring across
-  // round a small square, both in the bar's muted ink, brightening to the words' ink under the pointer (src/app/chat.rs
-  // `stop_look` mixes hn.ChatControlInk's by the hover spring). The ring breathes, gently, while the agent works: the
-  // composer's one sign of work, and with the agent done it is gone, so the window rests.
-  prefab ChatStop : hn.ChatSendBase {
-    Tooltip: {text: "Stop  esc"}
-    Fill: $tone_clear
+    Size: {w: {kind: Fixed, value: $chat_working, min: 0, max: 0}, h: {kind: Fixed, value: $chat_working, min: 0, max: 0}}
     ring : ui.Node {
       Overlay
       Fill: $tone_clear
       Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
       Vector: {d: "M10 1 A9 9 0 1 1 10 19 A9 9 0 1 1 10 1", view_x: 0, view_y: 0, view_w: 20, view_h: 20,
-        inset_l: $chat_stop_inset, inset_t: $chat_stop_inset, inset_r: $chat_stop_inset, inset_b: $chat_stop_inset,
-        stroke_w: $chat_stop_stroke * 20 / $chat_stop_ring}
-      Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_stop_breath}
-    }
-    square : ui.Node {
-      Fill: $tone_chat_muted
-      Shape: {radius: $chat_stop_radius, n: 4, border: 0, feather: 0}
-      Size: {w: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}, h: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}}
+        inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_working_stroke * 20 / $chat_working}
+      Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_working_breath}
     }
   }
 

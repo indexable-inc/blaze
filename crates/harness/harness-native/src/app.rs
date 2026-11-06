@@ -1920,13 +1920,6 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
-            } else if let Some(sid) = a.strip_prefix("chat:send:").and_then(|s| s.parse().ok()) {
-                // The composer's send button (scene/widgets/chat.flecs hn.ChatSendReady).
-                self.tree_focus = false;
-                self.chat_send_draft(sid);
-            } else if let Some(sid) = a.strip_prefix("chat:stop:").and_then(|s| s.parse().ok()) {
-                // Its stop while the agent works (hn.ChatStop): as Escape.
-                self.link.chat_interrupt(sid);
             } else if let Some(rest) = a.strip_prefix("chat:pick:") {
                 self.chat_pick_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:set:") {
@@ -2555,7 +2548,7 @@ mod tests {
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
             "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
-            "hn.ChatContext", "hn.ChatSend", "hn.ChatSendReady", "hn.ChatStop",
+            "hn.ChatContext", "hn.ChatWorking",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekHead", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
             "hn.PeekImage", "hn.PeekPage",
