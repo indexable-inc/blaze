@@ -1,0 +1,26 @@
+module hn.tree
+
+// The sidebar tree's parts (scene/widgets/rows.flecs builds its rows of them), Notion's sidebar: a title and a few muted
+// words trailing it, nothing else. Type and ink from the tokens (00-tokens.flecs: size_row, weight_tree, tone_row_*);
+// each row sets only what its state changes (its ink, its weight, its breath). Prefabs only, leaves only (no children),
+// so an instance in a template is the part itself.
+
+// A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.
+prefab Head : ui.Lead {
+  Fill: $tone_row
+  TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+}
+
+// A run's command under its session: 12, in the quieter run ink, cut with an ellipsis like a title.
+prefab Cmd : ui.Lead {
+  Fill: $tone_row_run
+  TextStyle: {size: $size_run, line: 15, role: 0, bold: 0, weight: $weight_tree}
+}
+
+// The words trailing a row (how long ago, how long it took, how it went wrong; the shortcut on hover): 11 in the faint
+// row ink, never giving way to the title.
+prefab Trail : ui.Line {
+  Fill: $tone_row_meta
+  LayoutPriority: {value: 1}
+  TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+}

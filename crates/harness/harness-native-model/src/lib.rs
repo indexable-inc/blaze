@@ -9,8 +9,8 @@
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
 //! - A run goes under its session, else under the session that owns its REPL (the daemon's `owner`), else on the device.
 //!   One whose session or owner the daemon no longer lists is an [`Orphan`].
-//! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
-//!   [`Collapsed`] on a node hides all its children (every run group starts so).
+//! - [`Expanded`] on a session or run shows all its children in the tree; without it (every node starts so) only the
+//!   running ones (and the selected one) show, so finished runs fold away on their own.
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
 //!   ended or left the tree, an [`Orphan`] run, a finished run on the device [`ArchiveAfter`] it ended, and a finished
@@ -143,13 +143,9 @@ pub struct Ended {
     pub ms: u64,
 }
 
-/// On a session or the device: the tree shows all its runs, not only the last [`KEEP_RUNS`].
+/// On a session or run: the tree shows all its children. Without it only the running ones and the selected one show.
 #[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Unfolded;
-
-/// On a node: the tree shows none of its children.
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Collapsed;
+pub struct Expanded;
 
 /// On an object: the user killed it with cmd+W (or the palette's or menu's Kill). It leaves the tree for the sidebar's
 /// Archive, where it stays selectable; an object that ended on its own stays in the tree.
@@ -175,7 +171,7 @@ pub struct Past;
 pub struct Orphan;
 
 /// On a session: its program wrote output lately (the daemon's `busy`; a daemon that does not say counts as busy), so
-/// its running dot breathes. A live shell sitting at its prompt is not busy, and draws nothing.
+/// its tree row's title breathes. A live shell sitting at its prompt is not busy, and draws nothing.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Busy;
 
@@ -223,9 +219,6 @@ pub struct History {
     pub loading: bool,
     pub exhausted: bool,
 }
-
-/// Finished runs a parent shows while folded (running ones always show).
-pub const KEEP_RUNS: usize = 3;
 
 /// When it was made (ms since the epoch): the tree's order among siblings.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -398,8 +391,7 @@ pub fn register(world: &World) {
     world.component::<Run>().writable();
     world.component::<StageNo>().writable();
     world.component::<Ended>().writable();
-    world.component::<Unfolded>();
-    world.component::<Collapsed>();
+    world.component::<Expanded>();
     world.component::<Archived>();
     world.component::<Closed>();
     world.component::<Pinned>();
@@ -991,18 +983,16 @@ pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
     out
 }
 
-/// A row of the sidebar's tree.
+/// A row of the sidebar's tree: a session, run or stage at its depth under the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Row {
-    /// A session, run or stage at its depth under the device.
-    Obj { e: u64, depth: usize },
-    /// `parent`'s folded runs: how many are hidden, or (`unfolded`) the row that folds them again.
-    More { parent: u64, hidden: usize, depth: usize, unfolded: bool },
+pub struct Row {
+    pub e: u64,
+    pub depth: usize,
 }
 
-/// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index). A parent
-/// without [`Unfolded`] shows its running runs and its last [`KEEP_RUNS`] ones (and the selected one), the rest behind
-/// one [`Row::More`]; a run's stages show while it runs or while it (or one of its stages) is selected.
+/// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index). The device's
+/// sessions always show; under a session or run, an [`Expanded`] one shows all its children and any other only those
+/// still running and the selected one (and its parent), so what finished folds away and the tree lists what is live.
 #[must_use]
 pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
     struct Walk<'a> {
@@ -1013,47 +1003,29 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
         out: Vec<Row>,
     }
     impl Walk<'_> {
-        fn is_run(&self, id: u64) -> bool {
-            self.w.entity_from_id(id).has(Run::id())
-        }
-        fn is_running(&self, id: u64) -> bool {
-            self.w.entity_from_id(id).target(Status::id(), 0).is_some_and(|t| *t.id() == self.running)
-        }
-        fn picked(&self, id: u64) -> bool {
-            self.sel == Some(id) || self.sel_parent == Some(id)
+        fn live(&self, c: EntityView<'_>) -> bool {
+            let id = *c.id();
+            self.sel == Some(id)
+                || self.sel_parent == Some(id)
+                || c.target(Status::id(), 0).is_some_and(|t| *t.id() == self.running)
         }
         fn walk(&mut self, e: EntityView<'_>, depth: usize) {
-            let mut kids: Vec<(u64, u64, u64)> = Vec::new();
+            let all = depth == 0 || e.has(Expanded::id());
+            let mut kids: Vec<(u64, u64)> = Vec::new();
             for c in live_kids(e) {
+                if !all && !self.live(c) {
+                    continue;
+                }
                 let key = match c.try_cloned::<&StageNo>() {
                     Some(s) => u64::from(s.k),
                     None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
                 };
-                kids.push((key, *c.id(), 0));
+                kids.push((key, *c.id()));
             }
             kids.sort_unstable();
-            let runs: Vec<u64> = kids.iter().map(|k| k.1).filter(|&id| self.is_run(id)).collect();
-            let unfolded = e.has(Unfolded::id());
-            let cut = runs.len().saturating_sub(KEEP_RUNS);
-            let hidden: std::collections::HashSet<u64> =
-                if unfolded { Default::default() } else { runs[..cut].iter().copied().filter(|&r| !self.is_running(r) && !self.picked(r)).collect() };
-            let mut more = !hidden.is_empty() || (unfolded && cut > 0);
-            for (_, k, _) in kids {
-                if more && self.is_run(k) {
-                    more = false;
-                    self.out.push(Row::More { parent: *e.id(), hidden: if unfolded { cut } else { hidden.len() }, depth, unfolded });
-                }
-                if hidden.contains(&k) {
-                    continue;
-                }
-                self.out.push(Row::Obj { e: k, depth });
-                if ke_collapsed(self.w, k) {
-                    continue;
-                }
-                if !self.is_run(k) || self.is_running(k) || self.picked(k) {
-                    let ke = self.w.entity_from_id(k);
-                    self.walk(ke, depth + 1);
-                }
+            for (_, k) in kids {
+                self.out.push(Row { e: k, depth });
+                self.walk(self.w.entity_from_id(k), depth + 1);
             }
         }
     }
@@ -1114,27 +1086,13 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
     *world.lookup(ARCHIVE).id()
 }
 
-fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {
-    w.entity_from_id(e).has(Collapsed::id())
-}
-
-/// Collapse or expand `e`'s children.
-pub fn toggle_collapse(world: WorldRef<'_>, e: u64) {
+/// Expand `e` (all its children show in the tree) or fold it back (only the running ones do).
+pub fn set_expanded(world: WorldRef<'_>, e: u64, open: bool) {
     let e = world.entity_from_id(e);
-    if e.has(Collapsed::id()) {
-        e.remove(Collapsed::id());
-    } else {
-        e.add(Collapsed::id());
-    }
-}
-
-/// Fold or unfold `parent`'s runs.
-pub fn toggle_fold(world: WorldRef<'_>, parent: u64) {
-    let e = world.entity_from_id(parent);
-    if e.has(Unfolded::id()) {
-        e.remove(Unfolded::id());
-    } else {
-        e.add(Unfolded::id());
+    if open {
+        e.add(Expanded::id());
+    } else if e.has(Expanded::id()) {
+        e.remove(Expanded::id());
     }
 }
 

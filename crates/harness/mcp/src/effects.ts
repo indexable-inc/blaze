@@ -22,10 +22,11 @@
 // slices, and anything a native addon does. The harness's own requests to harnessd are not effects either.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { currentTask, type Task } from "./tasks.ts";
-import { shown, type Shown, type ShownKind } from "./shown.ts";
+import { brief, shown, type Shown, type ShownKind } from "./shown.ts";
 
-/** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow, cargo.*). */
-export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql";
+/** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow,
+ *  cargo.*); `wait`: waiting for another cell (wait), its value the value that cell gave. */
+export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql" | "wait";
 
 /** One step, as it is posted (the raw result is kept on the side, for telling a cell's value apart from its steps'). */
 export type Effect = {
@@ -105,7 +106,8 @@ export async function effect<T>(
     s.end(a.ok ?? true, a.detail ?? "", r, a.show, a.kind);
     return r;
   } catch (err) {
-    s.end(false, err instanceof Error ? err.message : String(err));
+    // Its detail is what the person reads: one plain sentence (the model gets the whole error from the cell).
+    s.end(false, brief(err));
     throw err;
   }
 }
@@ -200,7 +202,7 @@ function fsStep(real: Fn, kind: EffectKind, doing: string, done: string, size: (
     const s = step(kind, `${doing} ${p}`, `${done} ${p}`, p);
     if (!s) return real(...a);
     const finish = (r: unknown) => { const n = size(a, r); s.end(true, n == null ? "" : bytes(n)); return r; };
-    const fail = (e: unknown) => { s.end(false, e instanceof Error ? e.message : String(e)); throw e; };
+    const fail = (e: unknown) => { s.end(false, brief(e)); throw e; };
     try {
       const r = quiet(() => real(...a));
       return r instanceof Promise ? r.then(finish, fail) : finish(r);

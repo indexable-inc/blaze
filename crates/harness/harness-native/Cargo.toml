@@ -25,6 +25,7 @@ harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
 harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-input = { path = "../harness-native-ui-input" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 harness-native-ui-motion = { path = "../harness-native-ui-motion" }
 harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
 harness-native-ui-state-api = { path = "../harness-native-ui-state-api" }

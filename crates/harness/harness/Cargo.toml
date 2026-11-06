@@ -20,6 +20,8 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
+# o200k_base, what a chat's context popover counts the parts an agent does not split with (chat/context.rs).
+tiktoken-rs = "0.12.1"
 harness-vt = { path = "../harness-vt" }
 harness-chat = { path = "../harness-chat" }
 harness-proto = { path = "../harness-proto", features = ["tokio"] }

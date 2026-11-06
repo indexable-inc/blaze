@@ -14,7 +14,8 @@
 //! `models` event), `set_model` (answered with the model it resolved to), and `apply_flag_settings` with `effortLevel`
 //! (answered with success even for a level it ignores, so it is followed by `get_settings` and the effort its effective
 //! settings read is what the `session` event says, an `error` when it is not the one asked for).
-use harness_proto::event::{Body, Kind, ModelChoice};
+use super::context;
+use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -46,8 +47,9 @@ pub struct Claude {
     model: String,
     /// The `--model` its launch passed, if any.
     launched: Option<String>,
-    /// The context the last main-loop assistant message of the turn filled (its usage's input, cache and output tokens).
-    filled: Option<u64>,
+    /// The context the last main-loop assistant message of the turn filled (its usage's input, cache and output tokens),
+    /// and that usage's split.
+    filled: Option<(u64, ContextCall)>,
     /// Control requests of ours not answered yet, by request id.
     asked: HashMap<String, Asked>,
     /// Lines to write back ([`super::Adapter::replies`]).
@@ -63,6 +65,9 @@ enum Asked {
     Effort(String),
     /// `get_settings` after asking for this effort.
     ReadEffort(String),
+    /// `get_context_usage` after a turn that filled `used` of `window`, its last call `last`: the `context` event waits
+    /// for its parts.
+    ContextUsage { used: u64, window: u64, last: ContextCall },
 }
 
 impl Claude {
@@ -142,6 +147,14 @@ impl Claude {
                     vec![Body::Error { text: format!("claude took effort {l} (apply_flag_settings) but its settings say it runs with {now}") }]
                 }
             },
+            (Asked::ContextUsage { used, window, last }, None) => {
+                vec![Body::Context(ContextUse { used, window, last: Some(last), parts: context::claude_parts(a) })]
+            }
+            // The meter still has the turn's exact figures; only the popover's parts are missing, and the error says so.
+            (Asked::ContextUsage { used, window, last }, Some(e)) => vec![
+                Body::Error { text: format!("claude refused get_context_usage, so this turn's context has no parts: {e}") },
+                Body::Context(ContextUse { used, window, last: Some(last), parts: Vec::new() }),
+            ],
         }
     }
 
@@ -191,8 +204,8 @@ impl Claude {
         let id = v["message"]["id"].as_str().unwrap_or("").to_owned();
         let u = &v["message"]["usage"];
         if v["parent_tool_use_id"].is_null() && u.is_object() {
-            let n = |k: &str| u[k].as_u64().unwrap_or(0);
-            self.filled = Some(n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens") + n("output_tokens"));
+            let c = context::claude_call(u, None);
+            self.filled = Some((c.input + c.cache_read + c.cache_write + c.output, c));
         }
         let mut out = Vec::new();
         for b in v["message"]["content"].as_array().into_iter().flatten() {
@@ -277,8 +290,12 @@ impl Claude {
             let why = v["errors"].as_array().and_then(|e| e.first()).and_then(Value::as_str).unwrap_or("the turn failed");
             out.push(Body::Error { text: why.to_owned() });
         }
-        if let Some(used) = self.filled.take() {
-            out.push(Body::Context { used, window: window(v, &self.model) });
+        // The `context` event comes with claude's answer to get_context_usage (its parts), a moment after the turn's end.
+        if let Some((used, last)) = self.filled.take() {
+            let last = ContextCall { thinking: v["usage"]["output_tokens_details"]["thinking_tokens"].as_u64(), ..last };
+            let ask = json!({"subtype": "get_context_usage", "detail": "full"});
+            let line = self.ask(ask, Asked::ContextUsage { used, window: window(v, &self.model), last });
+            self.out.push(line);
         }
         out.push(Body::TurnEnd {
             ok,

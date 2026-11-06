@@ -28,20 +28,21 @@ pub struct Ctx<'a> {
 pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 
 /// The note every agent gets on top of its own system prompt (claude's `--append-system-prompt`, codex's
-/// `developer_instructions`, cursor's MCP server instructions): one file per topic under `system_note/`, joined in
-/// this order with a blank line between them.
-const SYSTEM_NOTE_PARTS: &[&str] = &[
-    include_str!("system_note/tools.md"),   // the one tool, ts, and its typed calls
-    include_str!("system_note/gmail.md"),   // gmail.* in ts
-    include_str!("system_note/output.md"),  // the person already sees every cell: don't restate it
-    include_str!("system_note/ui.md"),      // cells as Svelte 5 UI: the element vocabulary
-    include_str!("system_note/replies.md"), // how replies to Andrew read
-    include_str!("system_note/prose.md"),   // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
-    include_str!("system_note/github.md"),  // GitHub: one GraphQL query, not a loop of REST calls
+/// `developer_instructions`, cursor's MCP server instructions): one file per topic under `system_note/`, each with its
+/// topic's name (what a chat's context popover names its row), joined in this order with a blank line between them.
+pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
+    ("tools", include_str!("system_note/tools.md")),     // the one tool, ts, and its typed calls
+    ("gmail", include_str!("system_note/gmail.md")),     // gmail.* in ts
+    ("output", include_str!("system_note/output.md")),   // the person already sees every cell: don't restate it
+    ("ui", include_str!("system_note/ui.md")),           // cells as Svelte 5 UI: the element vocabulary
+    ("replies", include_str!("system_note/replies.md")), // how replies to Andrew read
+    ("prose", include_str!("system_note/prose.md")),     // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
+    ("github", include_str!("system_note/github.md")),   // GitHub: one GraphQL query, not a loop of REST calls
 ];
 
-static SYSTEM_NOTE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| SYSTEM_NOTE_PARTS.iter().map(|part| part.trim()).collect::<Vec<_>>().join("\n\n"));
+static SYSTEM_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    SYSTEM_NOTE_PARTS.iter().map(|(_, part)| part.trim()).collect::<Vec<_>>().join("\n\n") // alloc: once per process
+});
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();

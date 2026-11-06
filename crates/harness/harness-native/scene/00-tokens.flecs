@@ -13,10 +13,11 @@ export const size_run = 12
 export const size_label = 11
 export const size_code = 11.5
 // Weights (CSS numbers): a row's name medium (the Archive's, the palette's, the picker's), a section label semibold; a
-// sidebar tree row's name regular, medium while selected.
+// sidebar tree row's title a touch over regular (Notion's sidebar reads that weight on its dark ground), medium while
+// selected.
 export const weight_row = 500
-export const weight_tree = 400
-export const weight_tree_on = 560
+export const weight_tree = 450
+export const weight_tree_on = 540
 export const weight_label = 600
 
 // The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
@@ -26,15 +27,15 @@ export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
 export const disclose_w = 18
-// The sidebar's tree, a source list (Finder's, Xcode's): a session row tree_row_h tall, a run tree_run_h, the fold
-// tree_more_h, packed (the air between rows is the pill's inset). Each row starts its chevron gutter (tree_gutter wide)
-// tree_pad in from its left edge plus indent_step a level, so a child's chevron sits under its parent's icon (gutter and
-// step are equal) and the icon column never moves; then its icon (tree_icon box), tree_gap, its name; tree_pad_r on the
-// right for the trailing shortcut and status mark. The chevron is a thin vector mark tree_chevron across (its ink about
-// 7.5 tall), always shown in tone_chevron where the row has rows under it: hover-only hid which rows fold.
-export const tree_row_h = 28
+// The sidebar's tree, Notion's sidebar: calm one-line rows, a title and a few muted words trailing it, no dots and no
+// marks. A session row tree_row_h tall, a run tree_run_h, packed (the air between rows is the pill's inset). Each row
+// starts its chevron gutter (tree_gutter wide) tree_pad in from its left edge plus indent_step a level, so a child's
+// chevron sits under its parent's title (gutter and step are equal) and the title column never moves; then its title,
+// tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
+// about 7.5 tall), shown in tone_chevron where the row has rows under it (folded, it holds what finished). tree_icon is
+// the Archive button's glyph box.
+export const tree_row_h = 30
 export const tree_run_h = 24
-export const tree_more_h = 22
 export const tree_gutter = 16
 export const tree_icon = 16
 export const tree_chevron = 9
@@ -46,9 +47,9 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
-// How a row stands (hn.Status): a dot status_size across, or a ring status_ring wide.
-export const status_size = 6
-export const status_ring = 1.25
+// A working row's title breathes (src/look.rs Breath) between full and breath_title_low: slow and shallow, a shimmer
+// rather than a blink, and only while its program or agent is at work, so an idle tree draws nothing.
+export const breath_title_low = 0.45
 // The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
 // in line with the depth-0 chevrons.
 export const group_h = 28
@@ -72,7 +73,7 @@ export const badge_pad = 5
 export const size_badge = 10
 export const line_badge = 12
 
-// Springs (omega rad/s, zeta): a running dot's breath (slow, critically damped, dimming to breath_floor), a disclosure
+// Springs (omega rad/s, zeta): a breath (slow, critically damped; a chat status dims to breath_floor), a disclosure
 // chevron's quarter turn, the selection pill sliding between rows, the sidebar folding (cmd+S) and the hover wash.
 export const breath_omega = 3.2
 export const breath_zeta = 1
@@ -275,15 +276,22 @@ export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0,
 export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
 export const tone_select: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
-// The tree's rows (hn.ObjRow, hn.RunRow): a name's ink at rest and selected; the hover wash, softer than the selection;
-// the selection while the tree has the keyboard (the accent's wash, so focus reads apart from a selection elsewhere); the
-// disclosure chevron; how a row stands: a live session's dot, an exited one's ring.
-export const tone_row: Fill = {dark: {1, 1, 1, 0.78}, light: {0, 0, 0, 0.76}}
-export const tone_row_on: Fill = {dark: {1, 1, 1, 0.94}, light: {0, 0, 0, 0.90}}
-export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.035}}
-export const tone_select_focus: Fill = {dark: {0.580, 0.600, 1.0, 0.24}, light: {0.369, 0.384, 0.902, 0.16}}
-export const tone_chevron: Fill = {dark: {1, 1, 1, 0.42}, light: {0, 0, 0, 0.40}}
-export const tone_status_ring: Fill = {dark: {1, 1, 1, 0.36}, light: {0, 0, 0, 0.34}}
+// The tree's rows (hn.ObjRow, hn.RunRow), in the chat's Notion palette (tone_chat_*: white at an alpha on the dark
+// ground, Notion's warm ink on the light one): a title's ink while live, selected, and once it ended (quieter, so what
+// is live reads first); a run's command; the trailing words (how long ago, how long it took) and, when it went wrong
+// (an exit code, killed, lost), those words in a softened red: the one colour, and only where it means something. The
+// hover wash, softer than the selection (tone_row_select, Notion's neutral pill); the selection while the tree has the
+// keyboard (a step brighter, still neutral: the accent stays for what is pressable); the disclosure chevron.
+export const tone_row: Fill = {dark: {1, 1, 1, 0.80}, light: {0.216, 0.208, 0.184, 0.86}}
+export const tone_row_on: Fill = {dark: {1, 1, 1, 0.94}, light: {0.216, 0.208, 0.184, 1}}
+export const tone_row_done: Fill = {dark: {1, 1, 1, 0.50}, light: {0.216, 0.208, 0.184, 0.55}}
+export const tone_row_run: Fill = {dark: {1, 1, 1, 0.56}, light: {0.216, 0.208, 0.184, 0.62}}
+export const tone_row_meta: Fill = {dark: {1, 1, 1, 0.30}, light: {0.216, 0.208, 0.184, 0.38}}
+export const tone_row_alarm: Fill = {dark: {1.0, 0.45, 0.43, 0.78}, light: {0.84, 0.22, 0.20, 0.82}}
+export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0.216, 0.208, 0.184, 0.04}}
+export const tone_row_select: Fill = {dark: {1, 1, 1, 0.07}, light: {0.216, 0.208, 0.184, 0.06}}
+export const tone_select_focus: Fill = {dark: {1, 1, 1, 0.10}, light: {0.216, 0.208, 0.184, 0.085}}
+export const tone_chevron: Fill = {dark: {1, 1, 1, 0.32}, light: {0.216, 0.208, 0.184, 0.38}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
@@ -309,8 +317,6 @@ export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
 export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
 export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
-// A live session's status dot on its tree row (hn.ObjRow): the running green.
-export const tone_status_running: Fill = $tone_running
 export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
 export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
@@ -406,6 +412,20 @@ export const chat_w = 672
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
 export const chat_fade_len = 28
+// A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
+// when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
+// chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what
+// came, chat_pace_min to chat_pace_max bytes of text (about characters) a second, never more than chat_pace_most
+// seconds behind.
+export const chat_follow_omega = 18
+export const chat_follow_zeta = 1
+export const chat_follow_far = 2000
+export const chat_glyph_dur = 0.18
+export const chat_glyph_rise = 2
+export const chat_pace_lag = 0.25
+export const chat_pace_min = 30
+export const chat_pace_max = 1400
+export const chat_pace_most = 2
 // Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
 // person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
 // its answer).
@@ -460,6 +480,24 @@ export const chat_foot_pad_t = 4
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets and gap, the status
 // line, the composer's own inset): the words grow to textarea_grow_share of the pane less it.
 export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_foot_gap + $chat_pick_h + 2 * $chat_input_pad_y
+// The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
+// a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
+// chat_ctx_gap apart: a head, the window as a bar chat_ctx_bar_h tall (chat_ctx_bar_r round, chat_ctx_bar_pad above
+// and below) holding a segment a part, then a row a part chat_ctx_row_h tall: a dot chat_ctx_dot across in its ink,
+// chat_ctx_dot_gap before its name, its tokens, its share of the window flush right in chat_ctx_share_w. A part's splits
+// sit under it with no dot, quieter. The foot (the last call's cache split, whose counts these are) at size_caption.
+export const chat_ctx_w = 296
+export const chat_ctx_pad = 10
+export const chat_ctx_gap = 0
+export const chat_ctx_bar_h = 4
+export const chat_ctx_bar_r = 2
+export const chat_ctx_bar_pad = 7
+export const chat_ctx_row_h = 20
+export const chat_ctx_dot = 7
+export const chat_ctx_dot_gap = 7
+export const chat_ctx_share_w = 36
+export const chat_ctx_foot_pad = 7
+export const chat_ctx_foot_gap = 2
 export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
 // one says more than a word (scene/widgets/chat_status.flecs: a thought's sparkle leads, a call's running dot trails),

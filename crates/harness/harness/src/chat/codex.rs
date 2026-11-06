@@ -22,7 +22,8 @@
 //! Codex asks the client too (server requests, each answered at once so a turn never hangs): approvals are approved
 //! (the profile already runs with approval policy never and no sandbox, the TUI's yolo), questions for the user get no
 //! answers, MCP elicitations are declined, and everything else is refused with a JSON-RPC error naming the method.
-use harness_proto::event::{Body, Kind, ModelChoice};
+use super::context;
+use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -95,8 +96,11 @@ pub struct Codex {
     /// on every `turn/start`.
     model: Option<String>,
     effort: Option<String>,
-    /// The context the thread fills and its model's window, from the last `thread/tokenUsage/updated`.
-    context: Option<(u64, u64)>,
+    /// The context the thread fills, its model's window and the last call's split, from the last
+    /// `thread/tokenUsage/updated`.
+    context: Option<(u64, u64, ContextCall)>,
+    /// The messages that went by, counted by harness: a `context` event's parts (codex splits nothing).
+    ledger: context::Ledger,
     /// The model and effort the thread runs with, as Codex last said (its thread start or resume, a settings update, a
     /// turn it took with a choice).
     runs: (String, Option<String>),
@@ -138,6 +142,7 @@ impl Codex {
             model: None,
             effort: None,
             context: None,
+            ledger: context::Ledger::default(),
             runs: (String::new(), None),
         }
     }
@@ -339,8 +344,9 @@ impl Codex {
             out.push(Body::Block { block, kind: o.kind, text: o.text });
         }
         out.extend(why);
-        if let Some((used, window)) = self.context.take() {
-            out.push(Body::Context { used, window });
+        // Its parts are the ledger's as of this place in the events (Adapter::events fills them).
+        if let Some((used, window, last)) = self.context.take() {
+            out.push(Body::Context(ContextUse { used, window, last: Some(last), parts: Vec::new() }));
         }
         let usage = usage(&self.total_before, &self.total);
         self.total_before = self.total.clone();
@@ -389,7 +395,10 @@ impl Codex {
                 self.open_item(&id, Kind::Thinking);
                 vec![]
             }
-            "contextCompaction" => vec![Body::Note { text: "Compacting the context".to_owned() }],
+            "contextCompaction" => {
+                self.ledger.compacted();
+                vec![Body::Note { text: "Compacting the context".to_owned() }]
+            }
             _ => self.call(item).into_iter().collect(),
         }
     }
@@ -467,7 +476,7 @@ impl Codex {
             "thread/tokenUsage/updated" => {
                 let u = &p["tokenUsage"];
                 if let Some(used) = u["last"]["totalTokens"].as_u64() {
-                    self.context = Some((used, u["modelContextWindow"].as_u64().unwrap_or(0)));
+                    self.context = Some((used, u["modelContextWindow"].as_u64().unwrap_or(0), context::codex_call(&u["last"])));
                 }
                 self.total = u["total"].clone();
                 if self.total_before.is_null() {
@@ -623,7 +632,7 @@ impl super::Adapter for Codex {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return vec![Body::Error { text: format!("codex app-server wrote a line that is not JSON: {line}") }];
         };
-        match (v.get("id"), v["method"].as_str()) {
+        let mut out = match (v.get("id"), v["method"].as_str()) {
             (Some(id), Some(method)) => self.server_request(id, method),
             (None, Some(method)) => self.notification(method, &v["params"]),
             (Some(id), None) => match id.as_u64() {
@@ -631,7 +640,15 @@ impl super::Adapter for Codex {
                 None => vec![],
             },
             (None, None) => vec![],
+        };
+        // The ledger sees each event in order, so a `context` event's parts are the messages before it.
+        for b in &mut out {
+            match b {
+                Body::Context(c) => c.parts = self.ledger.parts(c.used, "Codex's prompt and tools"),
+                b => self.ledger.see(b),
+            }
         }
+        out
     }
 
     fn replies(&mut self) -> Vec<String> {
@@ -643,6 +660,7 @@ impl super::Adapter for Codex {
             // The thread never started, so nothing would answer (the error said why); the turn ends when Codex exits.
             return Vec::new();
         }
+        self.ledger.user(text);
         self.queue.push_back(text.to_owned());
         self.pump();
         std::mem::take(&mut self.out)

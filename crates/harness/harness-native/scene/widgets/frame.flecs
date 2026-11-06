@@ -83,7 +83,7 @@ hn {
 
   // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
   // frame on every side so it hugs the row's content with air between neighbours, and matched by id so a new selection's
-  // pill springs from where the last one was drawn. The row picks the plate's Fill (tone_select, or tone_select_focus
+  // pill springs from where the last one was drawn. The row picks the plate's Fill (tone_row_select, or tone_select_focus
   // while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
@@ -101,8 +101,11 @@ hn {
   // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
   // bottom edges (the window's corners round it). Nothing sits over its top (no title); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
-  // a split is a second node.
+  // a split is a second node. Its panes lay out at the width it rests at (LaysAtRest: the sidebar's clip says where its fold
+  // goes, src/app.rs lay_chrome), so through a cmd+S fold the plate follows the spring while the panes keep one width: a
+  // terminal resizes once, words wrap once.
   prefab Main : ui.Row, Plate {
+    LaysAtRest
     Fill: $tone_term_ground
     Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
     Shape: {radius: 0, n: 4, border: 0, feather: 0}

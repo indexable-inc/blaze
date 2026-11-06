@@ -2,7 +2,7 @@
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
 use harness_native_ui_look_api::Fill;
-use harness_native_ui_spring_api::Spring;
+use harness_native_ui_spring_api::{Spring, Tune};
 
 /// A spring: stiffness as angular frequency (rad/s) and damping ratio.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -339,6 +339,88 @@ pub struct FillTween {
     pub t: Spring,
 }
 
+/// How text that arrives in bursts (a model's reply: a sentence at once, then nothing for a second) is shown: at an even
+/// pace about `lag` seconds behind what came, never slower than `min` units a second nor faster than `max` (so a whole
+/// reply that lands at once still reads as written), but never more than `most` seconds behind. [`Paced`] steps it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pace {
+    pub lag: f32,
+    pub min: f32,
+    pub max: f32,
+    pub most: f32,
+}
+
+/// How much of a growing text shows, on a [`Pace`]: sans IO, stepped by the frame's time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Paced {
+    shown: f32,
+}
+
+impl Paced {
+    /// `n` units shown, at rest (what was there before it began to grow).
+    #[must_use]
+    pub fn at(n: usize) -> Self {
+        Self { shown: n as f32 }
+    }
+
+    /// One frame `dt` seconds long in which `have` units have come: how many show now. A text that shrank shows what it
+    /// has; one caught up stays caught up.
+    pub fn step(&mut self, have: usize, pace: Pace, dt: f32) -> usize {
+        let have_f = have as f32;
+        if have_f <= self.shown {
+            self.shown = have_f;
+            return have;
+        }
+        let behind = have_f - self.shown;
+        let even = (behind / pace.lag.max(1e-3)).clamp(pace.min, pace.max.max(pace.min));
+        let rate = even.max(behind / pace.most.max(1e-3));
+        self.shown = (self.shown + rate * dt.max(0.0)).min(have_f);
+        self.shown as usize
+    }
+
+    /// Whether it shows all of `have`.
+    #[must_use]
+    pub fn caught_up(&self, have: usize) -> bool {
+        self.shown >= have as f32
+    }
+}
+
+/// A scroll kept at its content's end as the content grows (a transcript following its agent): it glides to the end on a
+/// spring instead of jumping there each time a line comes. Sans IO, stepped by the frame's time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Follow {
+    spring: Spring,
+}
+
+impl Follow {
+    /// At rest at `y`.
+    #[must_use]
+    pub fn at(y: f32) -> Self {
+        Self { spring: Spring::at(y) }
+    }
+
+    /// The scroll was moved by `by` under it (rows above it changed height): it follows on from there, as fast.
+    pub fn shift(&mut self, by: f32) {
+        self.spring.x += by;
+    }
+
+    /// One frame `dt` seconds long toward `end`: where the scroll is now, and whether it still moves. From rest, an end
+    /// more than `far` away (a pane opened on a long transcript) is landed on at once; mid-glide it never is.
+    pub fn step(&mut self, end: f32, tune: Tune, far: f32, dt: f32) -> (f32, bool) {
+        let resting = self.spring.v == 0.0;
+        if resting && (end - self.spring.x).abs() > far {
+            self.spring = Spring::at(end);
+        }
+        self.spring.step(end, tune, dt);
+        if self.spring.settled(end) || self.spring.x > end {
+            // At the end exactly (never past it: there is no content there), so the scroll rests on the pixel grid.
+            self.spring = Spring::at(end);
+            return (end, false);
+        }
+        (self.spring.x, true)
+    }
+}
+
 hyperion_api_layouts::api_layouts! {
     "MatchedGeometry" => alias MatchedGeometry,
     "Matched" => alias Matched,
@@ -364,6 +446,7 @@ hyperion_api_layouts::api_layouts! {
     "Shown" => alias Shown,
     "Target" => alias Target,
     "CopyFlash" => alias CopyFlash,
+    "Pace" => alias Pace,
 }
 
 /// Register the vocabulary before scenes and systems, retaining writable scene properties.
@@ -380,6 +463,7 @@ pub fn register(world: &World) {
     world.component::<Shown>();
     world.component::<Target>();
     world.component::<CopyFlash>();
+    world.component::<Pace>().writable();
     world.component::<MatchedGeometry>().writable();
     world.component::<Matched>();
     world.component::<Drawn>();
@@ -389,4 +473,27 @@ pub fn register(world: &World) {
     world.component::<SizeTween>();
     world.component::<PadTween>();
     world.component::<FillTween>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A paragraph landing in one burst shows over about `lag` seconds, never in one frame and never later than `most`;
+    /// a text that grows no further stays caught up.
+    #[test]
+    fn a_burst_shows_at_its_pace() {
+        let pace = Pace { lag: 0.25, min: 30.0, max: 1400.0, most: 2.0 };
+        let mut p = Paced::at(0);
+        let first = p.step(600, pace, 1.0 / 60.0);
+        assert!(first > 0 && first < 100, "{first}");
+        let frames = (0..200).take_while(|_| p.step(600, pace, 1.0 / 60.0) < 600).count();
+        assert!(frames < 120, "{frames}");
+        assert!(p.caught_up(600) && p.step(600, pace, 1.0 / 60.0) == 600);
+        // More than `max` a second can show in `most`: it goes faster than `max` (backlog over `most`) until it is not.
+        let mut big = Paced::at(0);
+        assert!(big.step(10_000, pace, 1.0 / 60.0) > (pace.max / 60.0) as usize);
+        let frames = (0..600).take_while(|_| big.step(10_000, pace, 1.0 / 60.0) < 10_000).count();
+        assert!(frames < 420, "{frames}");
+    }
 }

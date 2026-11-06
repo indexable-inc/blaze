@@ -35,6 +35,8 @@ function cell(v: unknown): [Cell, ColType] {
     case "string": return [clip(v, MAX_CELL), /^https?:\/\/\S+$/.test(v) ? "url" : "string"];
   }
   if (v instanceof Date) return [Number.isNaN(v.getTime()) ? null : v.toISOString(), "date"];
+  // An error in a cell says what went wrong in a sentence, not its class and stack.
+  if (v instanceof Error) return [clip(brief(v), MAX_CELL), "string"];
   // One line: a cell is drawn on one line, and a nested table prints its rows on lines of their own.
   return [clip(nuon(v).replace(/\s*\n\s*/g, " "), MAX_CELL), "nested"];
 }
@@ -62,13 +64,66 @@ function grid(t: Grid["t"], names: string[], items: unknown[][], budget: number)
   return { t, cols: names.map((name, i) => ({ name, type: unify(types[i]!) })), rows, total: items.length };
 }
 
-/** How the app shows `v`, in about `budget` bytes; a table of `kind` (what the step that gave it knows it is) says so. */
+/** An error as one plain sentence for a person ("No browser is connected"): its own `brief` when it has one, else the
+ *  first sentence of its message's first line, without the error's class name. The model still reads the whole stack. */
+export function brief(e: unknown): string {
+  const own = (e as { brief?: unknown } | null)?.brief;
+  if (typeof own === "string" && own.trim()) return own.trim();
+  const m = e instanceof Error ? e.message : String(e);
+  const line = m.split("\n").map((l) => l.trim()).find((l) => l) ?? "";
+  const plain = line.replace(/^[A-Z]\w*(Error|Exception|Unavailable)?:\s+/, "");
+  const end = plain.search(/\.\s/);
+  return clip((end > 0 ? plain.slice(0, end) : plain).replace(/\.$/, ""), 160);
+}
+
+/** A search result as any search gives it: a record with a string title and an http(s) url. */
+const isHit = (r: unknown): boolean =>
+  isRecord(r) && typeof r.title === "string" && typeof r.url === "string" && /^https?:\/\//.test(r.url);
+const isHits = (v: unknown): v is Record<string, unknown>[] => Array.isArray(v) && v.length > 0 && v.every(isHit);
+const hitsOrNone = (x: unknown) => isHits(x) || (Array.isArray(x) && x.length === 0);
+
+/** Search results grouped under what found them, flattened to one result table with a `query` column, or null:
+ *  records that each hold one list of results (`[{q, results}]`, the query their first string field), or a record of
+ *  result lists (`{web: [...], mail: [...]}`, the query its key). */
+function grouped(v: unknown): Record<string, unknown>[] | null {
+  let out: Record<string, unknown>[] = [];
+  if (Array.isArray(v) && v.length > 0 && v.every(isRecord)) {
+    for (const r of v as Record<string, unknown>[]) {
+      const lists = Object.entries(r).filter(([, x]) => hitsOrNone(x));
+      if (lists.length !== 1) return null;
+      const [key, hits] = lists[0]!;
+      const label = Object.entries(r).find(([k, x]) => k !== key && typeof x === "string")?.[1] ?? "";
+      for (const h of hits as Record<string, unknown>[]) out.push({ ...h, query: label });
+    }
+  } else if (isRecord(v)) {
+    const entries = Object.entries(v);
+    if (entries.length === 0 || !entries.every(([, x]) => hitsOrNone(x))) return null;
+    out = entries.flatMap(([k, x]) => (x as Record<string, unknown>[]).map((h) => ({ ...h, query: k })));
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** Promise.allSettled's results as what they settled to: each value, or its reason. */
+function settled(v: unknown[]): unknown[] | null {
+  const ok = v.length > 0 && v.every((r) => isRecord(r) && ((r.status === "fulfilled" && "value" in r) || (r.status === "rejected" && "reason" in r)));
+  return ok ? v.map((r) => { const s = r as { status: string; value?: unknown; reason?: unknown }; return s.status === "fulfilled" ? s.value : s.reason; }) : null;
+}
+
+/** How the app shows `v`, in about `budget` bytes; a table of `kind` (what the step that gave it knows it is) says so.
+ *  Search results are known by their shape wherever they come from (a list of {title, url}, or such lists grouped under
+ *  their queries), so the app draws them as results, never as a table with a JSON array in a cell; Promise.allSettled's
+ *  results show as what they settled to. */
 export function shown(v: unknown, budget = 64 << 10, kind?: ShownKind): Shown {
-  if (v instanceof Error) return { t: "error", message: v.message, stack: clip(v.stack ?? "", 8 << 10) };
+  if (v instanceof Error) return { t: "error", message: brief(v), stack: clip(v.stack ?? "", 8 << 10) };
   if (typeof v === "string") return { t: "text", v: clip(v, budget), total: v.length };
   if (v instanceof Map) v = Object.fromEntries(v);
   if (v instanceof Set) v = [...v];
   if (Array.isArray(v)) {
+    const s = settled(v);
+    if (s) return shown(s.length === 1 ? s[0] : s, budget, kind);
+    const g = kind ? null : grouped(v);
+    if (g) return shown(g, budget, "search");
+    if (!kind && isHits(v)) kind = "search";
     if (v.length > 0 && v.every(isRecord)) {
       const names: string[] = [];
       const known = new Set<string>();
@@ -78,7 +133,11 @@ export function shown(v: unknown, budget = 64 << 10, kind?: ShownKind): Shown {
     }
     return grid("list", ["value"], v.map((x) => [x]), budget);
   }
-  if (isRecord(v)) return grid("record", ["key", "value"], Object.entries(v), budget);
+  if (isRecord(v)) {
+    const g = kind ? null : grouped(v);
+    if (g) return shown(g, budget, "search");
+    return grid("record", ["key", "value"], Object.entries(v), budget);
+  }
   const [c, type] = cell(v);
   return { t: "scalar", type, v: c };
 }

@@ -1,0 +1,129 @@
+// The context meter's popover (src/app/chat/context.rs): while the pointer is on the meter (hn.ChatContext, chat.flecs)
+// or on the popover itself, a plate over it says what the context holds, part by part. Its lines are a keyed list the
+// host keeps (harness_native_ui_view::for_each_of): a head, the window as a bar with a segment a part, a row a part (its
+// splits under it, quieter), and a foot. Each line is a template; the host sets its props from the chat's last
+// `context` event (harness-proto ContextUse) and flecs re-runs only what reads a prop that changed. The look is all here:
+// the host passes words, numbers and an ink slot, never a colour or a size. Templates only: in flecs 4.2.0 a template
+// after a prefab in the same script aborts the load (flecs_ordered_entities_append), so the prefabs they sit in (the plate,
+// the bar) are in context_plate.flecs.
+using flecs.script
+
+@tree ChildOf
+hn {
+  // A part's ink, by its slot in the parts' order (`ink`): the dataviz palette's, as a chart's series take them
+  // (tone_series1 on); `rest` (what the agent's total holds past the parts it was split into) the menu's rule, quiet.
+  @tree ChildOf
+  template ChatContextInk {
+    prop ink: string = ""
+    Fill: match $ink { "s1": $tone_series1; "s2": $tone_series2; "s3": $tone_series3; "s4": $tone_series4; "s5": $tone_series5; "s6": $tone_series6; "s7": $tone_series7; "s8": $tone_series8; "rest": $tone_ink_4; _: $tone_clear }
+  }
+
+  // "Context", then how much of the window it fills (`used` of `window`, `pct`), muted at the end.
+  @tree ChildOf
+  template ChatContextHead {
+    prop used: string = ""
+    prop window: string = ""
+    prop pct: string = ""
+    (IsA, ui.Row)
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_row_h, min: 0, max: 0}}
+    title : ui.Line, Strong {
+      Text: {s: "Context"}
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 1}
+    }
+    spacer : ui.Spacer {}
+    total : ui.Line, Muted {
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+      if $window == "" {
+        Text: {s: "{used} tokens"}
+      } else {
+        Text: {s: "{used} of {window} · {pct}"}
+      }
+    }
+  }
+
+  // One part's segment: its share of the window (0 to 1), in its ink.
+  @tree ChildOf
+  template ChatContextSeg {
+    prop share: f64 = 0
+    prop ink: string = ""
+    (IsA, ui.Node)
+    hn.ChatContextInk: {ink: $ink}
+    Size: {w: {kind: Percent, value: $share, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
+  }
+
+  // A part: its dot in its ink, its name, then its tokens and its share of the window flush right. A split (`split`,
+  // one part of the part above it: a topic of the harness note, the user's words among the messages) has no dot and
+  // reads quieter. `≈` marks a number harness estimated (`estimate`), not the agent's own.
+  @tree ChildOf
+  template ChatContextRow {
+    prop name: string = ""
+    prop tokens: string = ""
+    prop share: string = ""
+    prop ink: string = ""
+    prop split: bool = false
+    prop estimate: bool = false
+    (IsA, ui.Row)
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_row_h, min: 0, max: 0}}
+    dot : ui.Node {
+      Shape: {radius: $chat_ctx_dot / 2, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $chat_ctx_dot, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_dot, min: 0, max: 0}}
+      hn.ChatContextInk: {ink: $ink}
+    }
+    lead : ui.Node {
+      Size: {w: {kind: Fixed, value: $chat_ctx_dot_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    name : ui.Lead {
+      Text: {s: $name}
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+      if $split {
+        Fill: $tone_ink_3
+      } else {
+        Fill: $tone_ink_1
+      }
+    }
+    spacer : ui.Spacer {}
+    tokens : ui.Line {
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+      if $estimate {
+        Text: {s: "≈ {tokens}"}
+      } else {
+        Text: {s: $tokens}
+      }
+      if $split {
+        Fill: $tone_ink_3
+      } else {
+        Fill: $tone_ink_2
+      }
+    }
+    share : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_ctx_share_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      words : ui.Line, Faint {
+        Text: {s: $share}
+        TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // The last call's split of its input (`cache`: read from the cache, written to it, neither, and its output and
+  // thinking), then whose numbers these are (`how`), in the caption size; either may be empty.
+  @tree ChildOf
+  template ChatContextFoot {
+    prop cache: string = ""
+    prop how: string = ""
+    (IsA, ui.Column)
+    Flex: {axis: Column, gap: $chat_ctx_foot_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_ctx_foot_pad, b: 0}
+    cache : ui.Line, Muted {
+      Text: {s: $cache}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+    how : ui.Words, Faint {
+      Text: {s: $how}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+}

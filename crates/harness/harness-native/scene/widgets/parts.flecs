@@ -1,21 +1,13 @@
-// Small parts the rows are built of: a status dot, a failure's badge, the device row, a disclosure, each kind's mark.
+// Small parts rows are built of: a pane row's status dot, a failure's badge, the sidebar's device row, a disclosure, each
+// kind's mark. The sidebar tree's own parts are hn.tree's (scene/widgets/tree.flecs).
 
 @tree ChildOf
 hn {
-  // A status dot: clear unless the host tints it (running breathes in the accent, lost is amber).
+  // A pane row's status dot (hn.PaneRow): clear unless the row tints it.
   prefab Dot : ui.Node {
     Fill: $tone_clear
     Size: {w: {kind: Fixed, value: $dot_size, min: 0, max: 0}, h: {kind: Fixed, value: $dot_size, min: 0, max: 0}}
     Shape: {radius: $dot_radius, n: 2, border: 0, feather: 0}
-  }
-
-  // How a tree row stands, as a mark rather than words: a dot `status_size` across in its Fill, or a hollow ring (its
-  // Edge, `status_ring` wide) with a clear Fill. The row sets which (hn.ObjRow, hn.RunRow).
-  prefab Status : ui.Node {
-    Fill: $tone_clear
-    Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
-    Size: {w: {kind: Fixed, value: $status_size, min: 0, max: 0}, h: {kind: Fixed, value: $status_size, min: 0, max: 0}}
-    Shape: {radius: $status_size, n: 2, border: $status_ring, feather: 0}
   }
 
   // A failure's badge: the exit code, small and red on a red wash. Clear, empty and unpadded otherwise.
@@ -32,8 +24,8 @@ hn {
   }
 
   // The group header over the tree, a source list's section: the device's name (11 semibold, faint), in line with the
-  // rows' chevrons; on its hover how many objects it holds (the host keeps the count shown while the daemon is offline,
-  // connecting or refused, when it says so instead), and a dot only while the daemon is not up.
+  // rows' chevrons; on its hover how many objects it holds (the host keeps the words shown while the daemon is offline,
+  // connecting or refused, when they say so instead). No light: the words are the state.
   prefab DeviceRow : ui.Row {
     Hoverable
     HoverLook: {dark: $tone_clear.dark, light: $tone_clear.light, pad: 0, radius: 0}
@@ -43,7 +35,6 @@ hn {
     name : ui.Lead, Faint {
       TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
     }
-    dot : hn.Dot {}
     spacer : ui.Spacer {}
     count : ui.Line, Faint {
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
@@ -65,7 +56,7 @@ hn {
     }
   }
 
-  // Each kind's mark, what its session shows on a tree row, an Archive row and a palette entry (src/look.rs `kind_mark`
+  // Each kind's mark, what its session shows on an Archive row, a picker entry and a palette entry (src/look.rs `kind_mark`
   // copies the kind's Mark or Icon and its Fill onto the row's glyph): Claude's starburst, OpenAI's blossom for Codex and
   // Cursor's cube as vector outlines (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
   prefab Kind {

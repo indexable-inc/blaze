@@ -11,7 +11,7 @@ hn {
     failed { Fill: $tone_failed }
     failed_wash { Fill: $tone_failed_wash }
     lost { Fill: $tone_lost }
-    // Rows: the selected row's pill, nothing, the accent (a running dot), the tertiary and quaternary inks.
+    // Rows: the selected row's pill, nothing, the accent, the tertiary and quaternary inks.
     selected { Fill: $tone_select }
     clear { Fill: $tone_clear }
     accent { Fill: $tone_accent }
@@ -47,15 +47,20 @@ hn {
     badge_on {
       Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
     }
-    // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the sidebar's fold (the selection
+    // Springs: a breath (how far it dims is each Breath's own `low`), a chevron's turn, the sidebar's fold (the selection
     // pill's is on hn.Selection).
-    breath {
-      Motion: {omega: $breath_omega, zeta: $breath_zeta}
-      Reveal: {alpha0: $breath_floor, dx: 0, dy: 0, scale0: 1}
-    }
+    breath { Motion: {omega: $breath_omega, zeta: $breath_zeta} }
     turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
     sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
     lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+    // A reply streaming in (src/app/chat.rs): the follow to its end, each glyph's arrival, the pace bursts show at. The
+    // follow's far is Size.w's value (it lands at once past it from rest).
+    chat_stream {
+      Motion: {omega: $chat_follow_omega, zeta: $chat_follow_zeta}
+      Size: {w: {kind: Fixed, value: $chat_follow_far, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      GlyphsArrive: {dur: $chat_glyph_dur, by: $chat_glyph_rise, ease: Out, born: 0}
+      Pace: {lag: $chat_pace_lag, min: $chat_pace_min, max: $chat_pace_max, most: $chat_pace_most}
+    }
     // Dragging the sidebar's edge (src/resize.rs): its range, latch, stretch, pulse rearm, grab band and the main card's
     // least; and the spring the window rides back on after an over-drag pulled it aside.
     side_drag {

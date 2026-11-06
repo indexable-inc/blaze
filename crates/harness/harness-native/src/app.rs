@@ -51,12 +51,16 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/frame.flecs", include_str!("../scene/widgets/frame.flecs")),
     ("scene/widgets/parts.flecs", include_str!("../scene/widgets/parts.flecs")),
     ("scene/widgets/row.flecs", include_str!("../scene/widgets/row.flecs")),
+    ("scene/widgets/tree.flecs", include_str!("../scene/widgets/tree.flecs")),
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
     ("scene/widgets/chat_status.flecs", include_str!("../scene/widgets/chat_status.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
+    ("scene/widgets/context_plate.flecs", include_str!("../scene/widgets/context_plate.flecs")),
+    ("scene/widgets/context.flecs", include_str!("../scene/widgets/context.flecs")),
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
+    ("scene/widgets/steps.flecs", include_str!("../scene/widgets/steps.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -252,7 +256,7 @@ pub struct App {
     pub title: String,
     /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
     chrome: Chrome,
-    chrome_laid: Option<(Chrome, f32, f32)>,
+    chrome_laid: Option<(Chrome, f32, f32, f32)>,
     /// The dark appearance (the window's effective NSAppearance; the scene's fills pick their dark or light half).
     pub dark: bool,
     /// The window's screen's EDR headroom (window.rs reads it every frame and when the screen changes; the shot sets it
@@ -770,7 +774,6 @@ impl App {
             }
         }
         let sel = self.selected();
-        let clear = tone(w, "clear");
         // The device row.
         let dev = w.lookup(model::LOCAL);
         let device = View::of(w.entity_from_id(self.ids.device));
@@ -779,14 +782,14 @@ impl App {
             .map(|d| d.host.as_str().to_owned())
             .unwrap_or_default();
         let link = dev.target(model::Link::id(), 0).map_or(0, |t| *t.id());
-        let (link_tone, link_word) = if link == *w.component_id::<model::Up>() {
-            (tone(w, "running"), format!("{}", rows.len()))
+        let link_word = if link == *w.component_id::<model::Up>() {
+            format!("{}", rows.len())
         } else if link == *w.component_id::<model::Down>() {
-            (tone(w, "failed"), "offline".to_owned())
+            "offline".to_owned()
         } else if link == *w.component_id::<model::Refused>() {
-            (tone(w, "failed"), "refused".to_owned())
+            "refused".to_owned()
         } else {
-            (tone(w, "lost"), "connecting".to_owned())
+            "connecting".to_owned()
         };
         if let Some(n) = device.part("name") {
             n.text(&host);
@@ -802,74 +805,55 @@ impl App {
         if note.entity().try_cloned::<&Size>().is_none_or(|s| s.h != h) {
             note.set(Size { w: Sizing::GROW, h });
         }
-        if let Some(d) = device.part("dot") {
-            // A light only while the daemon is not up.
-            set_if(d, if link == *w.component_id::<model::Up>() { clear } else { link_tone });
-        }
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> =
             rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
         let info: Vec<(String, &str, model::Row)> = model::rows(w)
             .into_iter()
-            .map(|r| match r {
-                model::Row::Obj { e, .. } if self.run_of(e).is_some() => {
-                    (format!("o{e}"), "hn.RunRow", r)
-                }
-                model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
-                model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
+            .map(|r| {
+                let prefab = if self.run_of(r.e).is_some() { "hn.RunRow" } else { "hn.ObjRow" };
+                (format!("o{}", r.e), prefab, r)
             })
             .collect();
         // Rows that left the list stay while they fold away.
         let info = self.fold.merge(info, w);
         let me = &*self;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         // Each row is a template instance (scene/widgets/rows.flecs): the row's facts as props, written only when one
-        // changed (View::props), and flecs re-runs only the parts that read it.
+        // changed (View::props), and flecs re-runs only the parts that read it. No dots and no marks: how a row stands is
+        // in its title's ink (`look`), its breath while it works (`busy`) and a few muted words trailing it (`meta`).
         view::for_each_of(tree, info, |row, r, new| {
             if new {
                 row.set(HoverAmt::default());
             }
-            let (e, depth) = match r {
-                model::Row::Obj { e, depth } => (e, depth),
-                model::Row::More { parent, hidden, depth, unfolded } => {
-                    row.props(
-                        "hn.MoreRow",
-                        &[
-                            ("obj", Prop::Uint(parent)),
-                            ("depth", Prop::Int(depth as i64)),
-                            ("hidden", Prop::Int(hidden as i64)),
-                            ("unfolded", Prop::Bool(unfolded)),
-                        ],
-                    );
-                    return;
-                }
-            };
+            let model::Row { e, depth } = r;
             let o = w.entity_from_id(e);
             let status = me.status_of(e);
-            let failed = status == "killed"
-                || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
-            // One line: the part is a ui.Line, cut with an ellipsis to the room its row leaves it when drawn.
-            let name = o
-                .try_cloned::<&model::Name>()
-                .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
-                .unwrap_or_default();
+            let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
+            let failed = status == "killed" || code.is_some();
+            let selected = sel == Some(e);
+            let look = if selected {
+                "on"
+            } else if status == "running" {
+                "rest"
+            } else {
+                "done"
+            };
             let common = [
                 ("obj", Prop::Uint(e)),
-                ("name", Prop::Str(&name)),
-                ("selected", Prop::Bool(sel == Some(e))),
+                ("selected", Prop::Bool(selected)),
                 ("depth", Prop::Int(depth as i64)),
                 ("kids", Prop::Bool(fold::has_kids(o))),
-                ("open", Prop::Bool(!o.has(model::Collapsed::id()))),
-                ("focus", Prop::Bool(sel == Some(e) && me.tree_focus && me.focused)),
+                ("open", Prop::Bool(o.has(model::Expanded::id()))),
+                ("focus", Prop::Bool(selected && me.tree_focus && me.focused)),
+                ("look", Prop::Str(look)),
             ];
             if me.run_of(e).is_some() {
-                // A run: a small dot tinted by how it went, breathing while it runs; how long it took (and how it failed)
-                // shown on hover, a failure's always.
-                let state = match status {
-                    "running" => "running",
-                    "lost" => "lost",
-                    _ if failed => "failed",
-                    _ => "faint",
-                };
+                // A run: its command, cut to what says what it does; breathing while it runs; how long it took (and how
+                // it failed) on hover, a failure's always.
+                let name = o.try_cloned::<&model::Name>().map(|n| short_cmd(n.s.as_str())).unwrap_or_default();
                 let meta = me.run_meta(e);
                 let keep = failed || matches!(status, "lost" | "pending" | "skipped");
                 row.props(
@@ -877,7 +861,9 @@ impl App {
                     &[
                         &common[..],
                         &[
-                            ("state", Prop::Str(state)),
+                            ("name", Prop::Str(&name)),
+                            ("busy", Prop::Bool(status == "running")),
+                            ("alarm", Prop::Bool(failed)),
                             ("meta", Prop::Str(&meta)),
                             ("keep", Prop::Bool(keep)),
                         ],
@@ -885,30 +871,38 @@ impl App {
                     .concat(),
                 );
             } else {
-                // A session: its kind's mark, its shortcut on hover, a failure's exit code as a small red badge.
+                // A session: its title, breathing while its agent works; trailing how it ended when that went wrong,
+                // else how long ago it started or ended, and its shortcut in that place on hover.
+                let name = o
+                    .try_cloned::<&model::Name>()
+                    .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
                 let hint = hint
                     .get(&e)
                     .filter(|&&i| i < 9)
                     .map(|i| me.hint(&format!("Select{}", i + 1)))
                     .unwrap_or_default();
-                // How it stands, as a mark (hn.Status): a dot while it runs, a ring once it exited, red when it failed
-                // or was killed, amber when lost; the words (with a failure's exit code) are the mark's tooltip.
-                let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
-                let (mark, why) = match (status, code) {
-                    ("killed", _) => ("failed", "Killed".to_owned()),
-                    (_, Some(c)) => ("failed", format!("Exited with code {c}")),
-                    ("running", _) => ("running", "Running".to_owned()),
-                    ("lost", _) => ("lost", "Lost (the daemon restarted under it)".to_owned()),
-                    ("exited", _) => ("exited", "Exited".to_owned()),
-                    _ => ("", String::new()),
+                // At work: its program wrote output lately (the daemon's busy), or its chat's agent is mid-turn.
+                let busy = status == "running"
+                    && (o.has(model::Busy::id())
+                        || o.try_cloned::<&model::Object>()
+                            .is_some_and(|ob| me.chats.borrow().get(&ob.id).is_some_and(|t| t.busy)));
+                let (meta, why) = match (status, code) {
+                    ("killed", _) => ("killed".to_owned(), "Killed".to_owned()),
+                    (_, Some(c)) => (format!("exit {c}"), format!("Exited with code {c}")),
+                    ("lost", _) => ("lost".to_owned(), "Lost (the daemon restarted under it)".to_owned()),
+                    ("running", _) => (ago(now.saturating_sub(model::when(o))), "Started".to_owned()),
+                    _ => (ago(now.saturating_sub(model::when(o))), "Ended".to_owned()),
                 };
                 row.props(
                     "hn.ObjRow",
                     &[
                         &common[..],
                         &[
-                            ("kind", Prop::Str(model::kind_name(o))),
-                            ("status", Prop::Str(mark)),
+                            ("name", Prop::Str(&name)),
+                            ("busy", Prop::Bool(busy)),
+                            ("alarm", Prop::Bool(failed || status == "lost")),
+                            ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
                         ],
@@ -1660,6 +1654,10 @@ impl App {
         if self.paint.get_mut().end_frame() {
             self.poke();
         }
+        // Words streaming in fade in glyph by glyph (GlyphsArrive): draw until the last has.
+        if self.paint.get_mut().arriving {
+            self.poke_why("glyphs arriving");
+        }
         // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
         // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
         if self.paint.get_mut().kip_wake == harness_native_render::kips::Wake::Lively {
@@ -1698,10 +1696,13 @@ impl App {
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
         let width = open * x;
-        if self.chrome_laid == Some((self.chrome, z, width)) {
+        // Where the fold is going: the main card lays its panes out at the width it has once the fold rests there
+        // (hn.Main is LaysAtRest), so a terminal resizes and words wrap once per cmd+S, not on every frame of the spring.
+        let rest = open * f32::from(u8::from(self.side_open));
+        if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
         }
-        self.chrome_laid = Some((self.chrome, z, width));
+        self.chrome_laid = Some((self.chrome, z, width, rest));
         let top = self.chrome.strip / z;
         // The sidebar keeps its open width (its rows never relayout mid-fold); its clip (hn.SideClip) takes the
         // spring's width and slides it left by the part folded away.
@@ -1714,6 +1715,7 @@ impl App {
                 size.w = Sizing::fixed(width);
                 clip.set(size);
                 clip.set(ScrollState { x: open - width, y: 0.0 });
+                clip.set(harness_native_ui_layout_api::RestSize { len: rest });
             }
         }
         // The strip is the window's safe-area inset: the sidebar and the main card pad themselves out of it
@@ -1767,8 +1769,8 @@ impl App {
         self.side_x.x.max(self.corner_x.x).clamp(0.0, 1.0)
     }
 
-    /// Whether a running dot breathes or a Kip in view breathes, blinks or springs (the window keeps drawing, at a calm
-    /// rate, while the app is otherwise idle).
+    /// Whether something breathes (a working row's title, a chat status) or a Kip in view breathes, blinks or springs (the
+    /// window keeps drawing, at a calm rate, while the app is otherwise idle).
     pub fn breathing(&self) -> bool {
         crate::look::breathing(self.world.world_ref())
             || matches!(self.paint.borrow().kip_wake, harness_native_render::kips::Wake::Calm(_))
@@ -1830,8 +1832,6 @@ impl App {
             {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, alt);
-            } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
-                model::toggle_fold(self.world.world_ref(), p);
             } else if a == "archive:open" {
                 self.open_archive();
             } else if a == "nav:back" {
@@ -1894,7 +1894,6 @@ impl App {
         let held = self.world.lookup(APP).target(Pressed::id(), 0).map(|t| *t.id());
         let painted = harness_native_ui_draw::painted(self.world.world_ref());
         let dark = self.dark;
-        let lo = crate::look::floor(self.world.world_ref(), "breath");
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -1902,8 +1901,8 @@ impl App {
             // Where the draw pass says it goes (moved by a transition, mid-slide on a MatchedGeometry), before its scale.
             let laid =
                 if p.w > 0.0 || p.h > 0.0 { Laid { x: p.x, y: p.y, w: p.w, h: p.h } } else { laid };
-            // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
-            p.alpha *= crate::look::alpha(w, e, lo);
+            // A breath dims and brightens; a hover-only part fades with its row's hover.
+            p.alpha *= crate::look::alpha(w, e);
             let is_term = e.has(TermNode::id());
             let scroller_part = e.has(harness_native_ui_layout_api::ScrollerPart::id());
             // Nothing is drawn that cannot be seen, a terminal's thousands of cells least of all.
@@ -2158,6 +2157,46 @@ fn set_side_width(side: EntityView<'_>, v: f32) {
     side.set(size);
 }
 
+/// How long ago, for a session's row, as short as it reads: `now`, `4m`, `3h`, `2d`, `5w`.
+fn ago(ms: u64) -> String {
+    let m = ms / 60_000;
+    match m {
+        0 => "now".to_owned(),
+        1..60 => format!("{m}m"),
+        60..1440 => format!("{}h", m / 60),
+        1440..10_080 => format!("{}d", m / 1440),
+        _ => format!("{}w", m / 10_080),
+    }
+}
+
+/// A run's command as its tree row shows it: its first line, without the `cd <dir> &&` and `VAR=value` before what it
+/// runs, the program by its name rather than its path (`/usr/bin/gh repo list` reads `gh repo list`), whitespace folded.
+/// The row cuts what is still too long with an ellipsis.
+fn short_cmd(cmd: &str) -> String {
+    let line = cmd.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let mut rest = line;
+    // Leading `cd <dir> &&` (or `;`) steps: where it runs is the pane's to say.
+    while let Some(after) = rest.strip_prefix("cd ") {
+        match after.find("&&").map(|i| (i, 2)).or_else(|| after.find(';').map(|i| (i, 1))) {
+            Some((i, n)) => rest = after[i + n..].trim_start(),
+            None => break,
+        }
+    }
+    let mut words = rest.split_whitespace().peekable();
+    // Leading environment assignments.
+    while words.peek().is_some_and(|w| {
+        w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()))
+    }) {
+        words.next();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    if let Some(prog) = words.next() {
+        out.push(if prog.starts_with('/') || prog.starts_with("./") { prog.rsplit('/').next().unwrap_or(prog) } else { prog });
+    }
+    out.extend(words);
+    if out.is_empty() { line.split_whitespace().collect::<Vec<_>>().join(" ") } else { out.join(" ") }
+}
+
 /// A duration for a run's row: `340ms`, `4.2s`, `38s`, `3m04s`, `2h05m`.
 fn fmt_dur(ms: u64) -> String {
     let s = ms / 1000;
@@ -2399,11 +2438,14 @@ mod tests {
             "ui.TableCellLink", "ui.TableCellMark", "ui.TableHead", "ui.TableField", "ui.TableFieldMd",
             "hn.ChatTableCell", "hn.ChatTableCellMd", "hn.ChatTableCellCode", "hn.ChatTableCellNum",
             "hn.ChatTableCellDim", "hn.ChatTableCellLink", "hn.ChatTableCellMark", "hn.ChatTableHead",
-            "hn.ChatTableField", "hn.ChatTableFieldMd", "hn.ChatTable", "hn.ChatResults", "hn.ChatResult",
-            "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep", "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput",
-            "hn.ChatOutputError", "hn.ChatCodeToggle", "ex.TableDemo",
+            "hn.ChatTableField", "hn.ChatTableFieldMd", "hn.ChatTable", "hn.ChatGrid", "hn.ChatOutput",
+            "hn.StepLine", "hn.StepLineFailed", "hn.StepHead", "hn.StepHeadFailed", "hn.StepPage", "hn.StepFile",
+            "hn.StepResults", "hn.StepResultsQuery", "hn.StepResult", "hn.StepText", "hn.StepCode", "hn.StepValue",
+            "hn.StepFail", "hn.StepNote", "hn.StepGrid",
+            "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
+            "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.chat_status.working", "hn.chat_status.ended",
-            "hn.chat_status.running", "hn.chat_status.no_result",
+            "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
             "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
@@ -2420,7 +2462,7 @@ mod tests {
         // (harness_native_render::inline).
         let w = world.world_ref();
         let module = w.try_lookup("flecs::core::Module").expect("flecs has no flecs.core.Module");
-        for m in ["ui::inline", "hn::chat_status"] {
+        for m in ["ui::inline", "hn::chat_status", "hn::tree"] {
             assert!(w.try_lookup(m).is_some_and(|e| e.has(module)), "{m} is not a module");
         }
         for e in ["look", "unknown", "Path", "FileRef", "Symbol", "Link"] {

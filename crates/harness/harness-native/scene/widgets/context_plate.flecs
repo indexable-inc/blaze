@@ -1,0 +1,26 @@
+// The context meter's popover's prefabs: its plate and the window's bar (the templates its lines are, in context.flecs,
+// sit in them). Prefabs only, apart from the templates: see context.flecs.
+@tree ChildOf
+hn {
+  // The plate: a ui.Menu (placed over what it is anchored to, out of the flow, its lift and motion), a column of lines.
+  // It is Hoverable (ui.MenuPlate), so the pointer moving onto it keeps it up.
+  prefab ChatContextPop : ui.Menu {
+    Flex: {axis: Column, gap: $chat_ctx_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_ctx_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_ctx_pad, r: $chat_ctx_pad, t: $chat_ctx_pad, b: $chat_ctx_pad}
+  }
+
+  // The window as a track; its segments (hn.ChatContextSeg, kept by the host) laid end to end from the leading edge.
+  prefab ChatContextBar : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_ctx_bar_pad, b: $chat_ctx_bar_pad}
+    track : ui.Row {
+      Fill: $tone_menu_rule
+      Shape: {radius: $chat_ctx_bar_r, n: 4, border: 0, feather: 0}
+      Clip
+      Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_bar_h, min: 0, max: 0}}
+    }
+  }
+}

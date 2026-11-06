@@ -19,12 +19,12 @@ use harness_native_ui_text_api::{
     BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
-use harness_native_ui_timeline_api::GlyphsIn;
+use harness_native_ui_timeline_api::{GlyphsArrive, GlyphsIn};
 
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::select;
 use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SurfaceInst};
-use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, SUBPX, Style, TypeLook};
+use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, Run, SUBPX, Shaped, Style, TypeLook};
 
 /// The atlas uploader a frame is drawn with: `(x, y, w, h, bytes)` into the glyph atlas.
 pub type Upload<'a> = dyn FnMut(u32, u32, u32, u32, &[u8]) + 'a;
@@ -39,11 +39,23 @@ struct Sheet {
     peak: Option<f32>,
 }
 
+/// What a text is shaped by: its text, size, line height, boldness, and its face's say (code, medium, inline markdown,
+/// tabular figures, as bits).
+type ShapeKey = (String, u32, u32, bool, u8);
+
+/// Shaped texts a painter keeps, and laid-out widths; past either it forgets that cache and starts again.
+const SHAPED_KEPT: usize = 4096;
+const LAYOUTS_KEPT: usize = 4096;
+
 /// The host's fonts, glyph atlas and layout cache, and the pictures it has decoded.
 pub struct Painter {
     pub fonts: Fonts,
     pub cache: GlyphCache,
-    layouts: HashMap<(String, u32, u32, bool, u8, u32), Rc<Layout>>,
+    /// Each text shaped once, for any width, by its text and how it is set ([`ShapeKey`]): a width it has not been broken
+    /// to yet (a resize, a fold's spring, a column growing) only breaks it again ([`Layout::wrap`]), never shapes it again.
+    shaped: HashMap<ShapeKey, Rc<Shaped>>,
+    /// Each text broken to a width, by its [`ShapeKey`] and the width's bits.
+    layouts: HashMap<(ShapeKey, u32), Rc<Layout>>,
     /// One-line widths [`Painter::width`] measured, by text and style: cheap entries, kept longer than layouts.
     widths: HashMap<(String, u32, bool, u8), f32>,
     sheets: HashMap<String, Rc<Sheet>>,
@@ -58,6 +70,10 @@ pub struct Painter {
     pub media: Option<PathBuf>,
     /// Each `Vector`'s path data read once (vector.rs), by its `d`.
     paths: HashMap<String, Rc<[crate::vector::Seg]>>,
+    /// When each `GlyphsArrive` node's glyphs came (arrive.rs).
+    arrivals: crate::arrive::Arrivals,
+    /// A glyph painted in the last frame is still fading in ([`Painter::end_frame`]): the host draws another.
+    pub arriving: bool,
 }
 
 /// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
@@ -259,6 +275,7 @@ impl Painter {
         Self {
             fonts: Fonts::new(look),
             cache: GlyphCache::new(ATLAS_SIZE),
+            shaped: HashMap::new(),
             layouts: HashMap::new(),
             widths: HashMap::new(),
             sheets: HashMap::new(),
@@ -266,6 +283,8 @@ impl Painter {
             kips: crate::kips::Kips::default(),
             kip_wake: crate::kips::Wake::None,
             paths: HashMap::new(),
+            arrivals: crate::arrive::Arrivals::default(),
+            arriving: false,
             highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
@@ -276,37 +295,60 @@ impl Painter {
         self.layout_as(text, style, width, false)
     }
 
-    /// [`Painter::layout`], of inline markdown when `md` (`MarkdownText`: the markers out, the faces they ask for in).
+    /// [`Painter::layout`], of inline markdown when `md` (`MarkdownText`: the markers out, the faces they ask for in). A text
+    /// is shaped once ([`Painter::shaped`]); a new width only breaks it again.
     pub fn layout_as(&mut self, text: &str, style: &TextStyle, width: f32, md: bool) -> Rc<Layout> {
         let st = set_of(style);
         let code = style.role == 9;
         let tabular = style.role == 10;
         let medium = !code && !st.bold && style.weight == 500;
-        let key = (
+        let key: ShapeKey = (
             text.to_owned(),
             st.size.to_bits(),
             st.line.to_bits(),
             st.bold,
             u8::from(code) | u8::from(medium) << 1 | u8::from(md) << 2 | u8::from(tabular) << 3,
-            width.to_bits(),
         );
-        if let Some(l) = self.layouts.get(&key) {
+        let at = (key, width.to_bits());
+        if let Some(l) = self.layouts.get(&at) {
             return l.clone();
         }
-        let lay = Rc::new(if md {
-            let m = crate::markdown::inline(text);
-            Layout::rich_with(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size), st, 0.0, width)
-        } else if code {
-            Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
+        let face = if code {
+            Some(Face::Code)
         } else if tabular {
-            Layout::in_face(&mut self.fonts, text, Face::Tabular, st, width)
+            Some(Face::Tabular)
         } else if medium {
-            Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
+            Some(Face::Medium)
         } else {
-            Layout::new(&mut self.fonts, text, st, width)
-        });
-        self.layouts.insert(key, lay.clone());
+            None
+        };
+        let shaped = self.shaped(&at.0, text, st, md, face);
+        let lay = Rc::new(Layout::wrap(&mut self.fonts, &shaped, width));
+        if self.layouts.len() >= LAYOUTS_KEPT {
+            self.layouts.clear();
+        }
+        self.layouts.insert(at, lay.clone());
         lay
+    }
+
+    /// `text` shaped as [`Painter::layout_as`] sets it (inline markdown's faces when `md`, else all of it in `face`, else the
+    /// text face), kept by `key`.
+    fn shaped(&mut self, key: &ShapeKey, text: &str, st: Style, md: bool, face: Option<Face>) -> Rc<Shaped> {
+        if let Some(s) = self.shaped.get(key) {
+            return s.clone();
+        }
+        let shaped = Rc::new(if md {
+            let m = crate::markdown::inline(text);
+            Shaped::new(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size), st, 0.0)
+        } else {
+            let runs: Vec<Run> = face.map(|face| Run { start: 0, end: text.encode_utf16().count(), face }).into_iter().collect();
+            Shaped::new(&mut self.fonts, text, &runs, &[], &[], st, 0.0)
+        });
+        if self.shaped.len() >= SHAPED_KEPT {
+            self.shaped.clear();
+        }
+        self.shaped.insert(key.clone(), shaped.clone());
+        shaped
     }
 
     /// How wide `text` runs on one line in `style` (inline markdown when `md`: its markers out), points; cached apart from
@@ -418,9 +460,7 @@ impl Painter {
     /// After a frame: an overflowed atlas is emptied (true: draw again, its glyphs are gone) and a big layout cache dropped.
     pub fn end_frame(&mut self) -> bool {
         self.kip_wake = self.kips.end_frame();
-        if self.layouts.len() > 4096 {
-            self.layouts.clear();
-        }
+        self.arriving = self.arrivals.end_frame();
         if self.cache.overflowed() {
             self.cache.clear();
             return true;
@@ -583,6 +623,8 @@ impl Painter {
                     None => None,
                 };
                 let arrive = e.try_cloned::<&GlyphsIn>();
+                // Words growing: each glyph fades in from the frame it came (GlyphsArrive), where it already lies.
+                let came = e.try_cloned::<&GlyphsArrive>().map(|g| (g, self.arrivals.note(e.id().0, total, time, &g)));
                 let mut look = |n: usize, g: &Glyph| {
                     if n >= limit {
                         return None;
@@ -598,6 +640,10 @@ impl Painter {
                         .or_else(|| link_ink.filter(|_| links.iter().any(|l| (l.0..l.1).contains(&g.idx))))
                         .unwrap_or(ink);
                     let (a, dy, heat) = arrive.map_or((1.0, 0.0, 0.0), |m| m.of(n, time));
+                    let (a, dy) = match came.as_ref().and_then(|(g, c)| c.of(n).map(|at| g.of(at, time))) {
+                        Some((fa, fdy)) => (a * fa, dy + fdy),
+                        None => (a, dy),
+                    };
                     let hot = arrive.map_or([0.0; 4], |m| rgba(m.hot));
                     let col = std::array::from_fn(|k| col[k] + (hot[k] - col[k]) * heat);
                     Some((col, p.alpha * a, dy))

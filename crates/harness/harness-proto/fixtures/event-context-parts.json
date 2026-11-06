@@ -1,0 +1,29 @@
+{
+  "ev": "context",
+  "last": {
+    "cache_read": 30000,
+    "cache_write": 1277,
+    "input": 2,
+    "output": 10,
+    "thinking": 0
+  },
+  "parts": [
+    {
+      "estimate": "",
+      "id": "system_prompt",
+      "name": "System prompt",
+      "of": "",
+      "tokens": 3796
+    },
+    {
+      "estimate": "o200k_base",
+      "id": "note.tools",
+      "name": "tools",
+      "of": "system_prompt",
+      "tokens": 240
+    }
+  ],
+  "ts": 4,
+  "used": 31289,
+  "window": 1000000
+}

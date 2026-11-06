@@ -7,12 +7,16 @@
 include widgets/frame
 include widgets/parts
 include widgets/row
+include widgets/tree
 include widgets/rows
 include widgets/panes
 include widgets/archive
 include widgets/chat_status
 include widgets/chat
+include widgets/context_plate
+include widgets/context
 include widgets/genui
+include widgets/steps
 include widgets/palette
 include widgets/picker
 include widgets/theme
