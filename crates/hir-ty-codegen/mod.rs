@@ -466,7 +466,7 @@ fn x86_lanewise(name: &str) -> Option<(Lanewise, Type)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OverflowOp {
+pub(crate) enum OverflowOp {
     Add,
     Sub,
     Mul,
@@ -477,6 +477,48 @@ enum OverflowOp {
     Shr,
     DivByZero,
     RemByZero,
+}
+
+impl OverflowOp {
+    /// The check an `Assert` of `msg` makes, when it is an arithmetic one: `Err` with the
+    /// operator of an overflow check core has no panic for. The one map of them, which the IR
+    /// builder compiles and the reference walk (`v2::refs`) lists.
+    pub(crate) fn of(msg: &AssertKind) -> Option<Result<Self, BinOp>> {
+        Some(Ok(match msg {
+            AssertKind::Overflow(BinOp::Add, ..) => OverflowOp::Add,
+            AssertKind::Overflow(BinOp::Sub, ..) => OverflowOp::Sub,
+            AssertKind::Overflow(BinOp::Mul, ..) => OverflowOp::Mul,
+            AssertKind::Overflow(BinOp::Div, ..) => OverflowOp::Div,
+            AssertKind::Overflow(BinOp::Rem, ..) => OverflowOp::Rem,
+            AssertKind::Overflow(BinOp::Shl, ..) => OverflowOp::Shl,
+            AssertKind::Overflow(BinOp::Shr, ..) => OverflowOp::Shr,
+            AssertKind::Overflow(op, ..) => return Some(Err(op.clone())),
+            AssertKind::OverflowNeg(_) => OverflowOp::Neg,
+            AssertKind::DivisionByZero(_) => OverflowOp::DivByZero,
+            AssertKind::RemainderByZero(_) => OverflowOp::RemByZero,
+            AssertKind::BoundsCheck { .. }
+            | AssertKind::MisalignedPointerDereference { .. }
+            | AssertKind::NullPointerDereference
+            | AssertKind::NullReferenceConstructed
+            | AssertKind::InvalidEnumConstruction(_) => return None,
+        }))
+    }
+
+    /// Core's `panic_const_*` a failed check of this calls (`FunctionCx::panic_if`).
+    pub(crate) fn panic(self) -> &'static str {
+        match self {
+            OverflowOp::Add => "panic_const_add_overflow",
+            OverflowOp::Sub => "panic_const_sub_overflow",
+            OverflowOp::Mul => "panic_const_mul_overflow",
+            OverflowOp::Div => "panic_const_div_overflow",
+            OverflowOp::Rem => "panic_const_rem_overflow",
+            OverflowOp::Neg => "panic_const_neg_overflow",
+            OverflowOp::Shl => "panic_const_shl_overflow",
+            OverflowOp::Shr => "panic_const_shr_overflow",
+            OverflowOp::DivByZero => "panic_const_div_by_zero",
+            OverflowOp::RemByZero => "panic_const_rem_by_zero",
+        }
+    }
 }
 
 /// How a value crosses a call boundary in rustc's Rust ABI.
@@ -3853,6 +3895,15 @@ const UNRESUMED: i64 = 0;
 const RETURNED: i64 = 1;
 const PANICKED: i64 = 2;
 const SUSPENDED: i64 = 3;
+
+/// The panics of an `async` body polled again after it ended, as rustc's coroutine transform
+/// has them: core's at the first path once it `RETURNED`, at the second once it `PANICKED`.
+/// The one list of them: [`FunctionCx::resumed_after_end`] calls them, and the reference walk
+/// (`v2::refs`) lists them for every `async` body, so the two cannot disagree.
+pub(crate) const RESUMED_AFTER_END: [&[&str]; 2] = [
+    &["panicking", "panic_const", "panic_const_async_fn_resumed"],
+    &["panicking", "panic_const", "panic_const_async_fn_resumed_panic"],
+];
 
 /// The local a body's caller gets the value of. An `async` body computes the value of its
 /// block in the return slot, and hands back a `Poll` of it.
@@ -9218,18 +9269,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// `panic_const_*`, or for a check of an arbitrary width `checked`, core's `panic` with
     /// the message naming it.
     fn panic_if(&mut self, cond: Value, op: OverflowOp, checked: Option<NarrowInt>) -> Result<()> {
-        let name = match op {
-            OverflowOp::Add => "panic_const_add_overflow",
-            OverflowOp::Sub => "panic_const_sub_overflow",
-            OverflowOp::Mul => "panic_const_mul_overflow",
-            OverflowOp::Div => "panic_const_div_overflow",
-            OverflowOp::Rem => "panic_const_rem_overflow",
-            OverflowOp::Neg => "panic_const_neg_overflow",
-            OverflowOp::Shl => "panic_const_shl_overflow",
-            OverflowOp::Shr => "panic_const_shr_overflow",
-            OverflowOp::DivByZero => "panic_const_div_by_zero",
-            OverflowOp::RemByZero => "panic_const_rem_by_zero",
-        };
+        let name = op.panic();
         let panic_block = self.builder.create_block();
         let ok_block = self.builder.create_block();
         self.builder.set_cold_block(panic_block);
@@ -9666,17 +9706,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             self.ub_check_panic_if(failed, name, &[source])?;
                             None
                         }
-                        AssertKind::Overflow(BinOp::Add, ..) => Some(OverflowOp::Add),
-                        AssertKind::Overflow(BinOp::Sub, ..) => Some(OverflowOp::Sub),
-                        AssertKind::Overflow(BinOp::Mul, ..) => Some(OverflowOp::Mul),
-                        AssertKind::Overflow(BinOp::Div, ..) => Some(OverflowOp::Div),
-                        AssertKind::Overflow(BinOp::Rem, ..) => Some(OverflowOp::Rem),
-                        AssertKind::Overflow(BinOp::Shl, ..) => Some(OverflowOp::Shl),
-                        AssertKind::Overflow(BinOp::Shr, ..) => Some(OverflowOp::Shr),
-                        AssertKind::Overflow(op, ..) => unsupported!("overflow check of {op:?}"),
-                        AssertKind::OverflowNeg(_) => Some(OverflowOp::Neg),
-                        AssertKind::DivisionByZero(_) => Some(OverflowOp::DivByZero),
-                        AssertKind::RemainderByZero(_) => Some(OverflowOp::RemByZero),
+                        AssertKind::Overflow(..)
+                        | AssertKind::OverflowNeg(_)
+                        | AssertKind::DivisionByZero(_)
+                        | AssertKind::RemainderByZero(_) => match OverflowOp::of(msg) {
+                            Some(Ok(op)) => Some(op),
+                            Some(Err(op)) => unsupported!("overflow check of {op:?}"),
+                            None => unsupported!("{msg:?}, which is no arithmetic check"),
+                        },
                     };
                     // A check of an arbitrary width names it in the panic.
                     let checked = match msg {
@@ -15486,14 +15523,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // rustc's panic here unwinds straight out (`UnwindAction::Continue`): it does not
         // poison the state, so a future polled after it returned says so on every poll.
         self.in_cleanup = true;
-        for (block, name) in [
-            (returned, "panic_const_async_fn_resumed"),
-            (panicked, "panic_const_async_fn_resumed_panic"),
-        ] {
+        for (block, path) in [returned, panicked].into_iter().zip(RESUMED_AFTER_END) {
             self.builder.set_cold_block(block);
             self.builder.switch_to_block(block);
             let location = self.caller_location()?;
-            self.call_panic(&["panicking", "panic_const", name], &[location])?;
+            self.call_panic(path, &[location])?;
             self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
         }
         self.in_cleanup = false;

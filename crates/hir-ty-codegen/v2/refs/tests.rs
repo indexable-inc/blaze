@@ -592,6 +592,66 @@ fn checks_list_their_panics() {
     );
 }
 
+const ASYNC: &str = r#"
+//- minicore: sized, future, pin, panic_location
+#![feature(lang_items)]
+pub mod panicking {
+    #[lang = "panic_bounds_check"]
+    #[track_caller]
+    pub fn panic_bounds_check(index: usize, len: usize) -> ! { loop {} }
+    pub mod panic_const {
+        #[track_caller] pub const fn panic_const_async_fn_resumed() -> ! { loop {} }
+        #[track_caller] pub const fn panic_const_async_fn_resumed_panic() -> ! { loop {} }
+    }
+}
+use core::{future::Future, pin::Pin, task::{Context, Poll}};
+pub async fn answer() -> u32 { 41 }
+pub fn poll_once<F: Future>(future: &mut F, cx: &mut Context<'_>) -> Poll<F::Output> {
+    Pin::new(future).poll(cx)
+}
+pub fn roots(cx: &mut Context<'_>) -> Poll<u32> {
+    let mut block = async { answer().await + 1 };
+    poll_once(&mut block, cx)
+}
+"#;
+
+/// An `async` body polled after it returned or panicked panics (`resumed_after_end`): the walk
+/// of each `async` body, the `async fn`'s and the block awaiting it, lists both panics, and
+/// [`reach`] checks the walk against what each body's IR asks for with every setting.
+#[test]
+fn an_async_body_lists_the_panics_of_a_poll_after_it_ended() {
+    let (db, reached) = reach_from(ASYNC, "roots");
+    let is_body = |instance: &HirInstance| {
+        matches!(&instance.0, Kind::Code(code, _) if matches!(code.def, InstanceDef::Coroutine(_)))
+    };
+    let bodies: Vec<&[Ref]> = reached
+        .iter()
+        .filter(|(instance, _)| is_body(instance))
+        .map(|(_, walk)| walk.as_slice())
+        .collect();
+    assert!(bodies.len() >= 2, "the `async fn`'s body and the block's: {reached:?}");
+    let named = |it: &Ref, name: &str| match it {
+        FrontRef::Function(callee) => callee
+            .function()
+            .is_some_and(|func| FunctionSignature::of(db, func).name.as_str() == name),
+        _ => false,
+    };
+    for walk in bodies {
+        for path in crate::RESUMED_AFTER_END {
+            let name = *path.last().expect("a panic's name");
+            assert!(
+                walk.iter().any(|it| named(it, name)),
+                "an `async` body's walk does not list `{name}`: {walk:?}"
+            );
+        }
+    }
+    assert_reached(
+        &db,
+        &reached,
+        &["panic_const_async_fn_resumed", "panic_const_async_fn_resumed_panic"],
+    );
+}
+
 const STATICS: &str = r#"
 //- minicore: sized
 #![feature(thread_local)]
