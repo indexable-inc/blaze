@@ -117,6 +117,22 @@ wrap_task! {
     }
 }
 
+wrap_task! {
+    pub struct Repaint {
+        view: u64,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            host::repaint(self.view);
+        }
+    }
+}
+
+pub fn repaint_task(view: u64) -> Task {
+    Repaint::new(view)
+}
+
 pub fn drain_task() -> Task {
     Drain::new()
 }

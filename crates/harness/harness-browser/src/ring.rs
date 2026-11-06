@@ -2,8 +2,7 @@
 //! from the IOSurface CEF hands `OnAcceleratedPaint`, plus a select box's popup kept in a texture of its own and blitted
 //! over the view at its rect, so the app sees one picture.
 //!
-//! The host writes only into a slot that is neither the one the app latched nor the newest it sent: with three slots
-//! one is always free, and the app never samples a slot being written.
+//! Which slot the host may write is the sans-IO core in slots.rs: never one the app latched or may still adopt.
 //!
 //! Lifetimes (the unsafe assumptions):
 //! - CEF's IOSurface (`AcceleratedPaintInfo::shared_texture_io_surface`) belongs to CEF's pool and is valid only during
@@ -25,7 +24,8 @@ use std::ffi::c_void;
 
 pub type Tex = Retained<ProtocolObject<dyn MTLTexture>>;
 
-pub const SLOTS: usize = 3;
+pub use crate::slots::SLOTS;
+use crate::slots::Slots;
 
 // ---------------------------------------------------------------- IOSurfaceCreate, by hand (four keys)
 
@@ -193,16 +193,12 @@ pub struct Slot {
     pub tex: Tex,
 }
 
-/// A view's ring: three slots of one size, one generation.
+/// A view's ring: three slots of one size, one generation, and which of them the host may write.
 pub struct Ring {
-    pub generation: u32,
     pub w: u32,
     pub h: u32,
     pub slots: Vec<Slot>,
-    /// The slot the app said it holds.
-    pub latched: Option<u8>,
-    /// The slot last sent.
-    pub newest: Option<u8>,
+    pub state: Slots,
 }
 
 impl Ring {
@@ -218,20 +214,8 @@ impl Ring {
             let tex = unsafe { gpu.wrap(surface.as_ptr(), w, h)? };
             slots.push(Slot { surface, tex });
         }
-        Ok(Self { generation, w, h, slots, latched: None, newest: None })
+        Ok(Self { w, h, slots, state: Slots::new(generation) })
     }
-
-    /// A slot to write: neither latched nor newest.
-    #[must_use]
-    pub fn free(&self) -> u8 {
-        free_slot(self.latched, self.newest)
-    }
-}
-
-/// The first of slots 0..3 that is neither `latched` nor `newest`: always one, since two exclusions leave a third.
-#[must_use]
-pub fn free_slot(latched: Option<u8>, newest: Option<u8>) -> u8 {
-    (0..SLOTS as u8).find(|s| Some(*s) != latched && Some(*s) != newest).expect("three slots, at most two excluded")
 }
 
 /// A select box's popup: where it is (view pixels) and its newest pixels.
@@ -268,20 +252,5 @@ impl Frames {
         let (fx, tx) = if x < 0 { (x.unsigned_abs(), 0) } else { (0, x as u32) };
         let (fy, ty) = if y < 0 { (y.unsigned_abs(), 0) } else { (0, y as u32) };
         Some(Copy { src: tex, from: (fx, fy), size: (w.saturating_sub(fx), h.saturating_sub(fy)), dst, to: (tx, ty) })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_free_slot_is_never_latched_or_newest() {
-        for l in [None, Some(0), Some(1), Some(2)] {
-            for n in [None, Some(0), Some(1), Some(2)] {
-                let s = free_slot(l, n);
-                assert!(Some(s) != l && Some(s) != n, "latched {l:?} newest {n:?} gave {s}");
-            }
-        }
     }
 }

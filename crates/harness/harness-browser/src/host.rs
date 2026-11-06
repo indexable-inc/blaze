@@ -8,6 +8,7 @@
 //! send), lets go, and then calls CEF.
 use crate::cdp_ids::{Asker, CdpIds, HostAsk, Incoming};
 use crate::ring::{Copy as Blit, Frames, Gpu, Ring, SLOTS};
+use crate::slots::After;
 use crate::{handlers, kernel, manage};
 use cef::*;
 use crossbeam_channel::{Receiver, Sender};
@@ -434,9 +435,14 @@ pub fn open(spec: OpenSpec) -> Result<u64, String> {
         Some(h.cdp.host_request(view, HostAsk::TargetInfo, "Target.getTargetInfo", serde_json::json!({})))
     })
     .flatten();
-    let Some(ask) = ask else {
+    let ask = match ask {
+        Some(Ok(ask)) => ask,
+        Some(Err(e)) => {
+            close(view, e.clone());
+            return Err(e);
+        }
         // Closed while it was being made (its OnBeforeClose already took the page).
-        return Err(format!("view {view} ({url}) closed while it was being opened"));
+        None => return Err(format!("view {view} ({url}) closed while it was being opened")),
     };
     if bhost.send_dev_tools_message(Some(ask.as_bytes())) != 1 {
         close(view, format!("CEF refused the Target.getTargetInfo that names view {view}'s page target"));
@@ -837,11 +843,11 @@ pub fn popup_size(view: u64, r: &Rect) {
 /// `surface` is CEF's pool's IOSurface, valid only during this call: every blit reading it completes before this
 /// returns (ring.rs's module doc).
 pub fn paint(view: u64, popup: bool, surface: *mut c_void, format: ColorType) {
-    with("a paint", |h| {
+    let after = with("a paint", |h| {
         let Host { pages, gpu, app, .. } = h;
-        let Some(p) = pages.get_mut(&view) else { return };
+        let Some(p) = pages.get_mut(&view) else { return After::Nothing };
         if !p.watched || app.is_none() {
-            return;
+            return After::Nothing;
         }
         let r = if format != ColorType::BGRA_8888 {
             Err(format!("view {view} painted in {format:?}; the ring takes only BGRA_8888"))
@@ -853,7 +859,10 @@ pub fn paint(view: u64, popup: bool, surface: *mut c_void, format: ColorType) {
             if popup { paint_popup(gpu, app, view, &mut p.frames, surface, w, hh) } else { paint_view(gpu, app, view, &mut p.frames, surface, w, hh) }
         };
         match r {
-            Ok(()) => p.frames.reported = false,
+            Ok(after) => {
+                p.frames.reported = false;
+                return after;
+            }
             Err(e) if !p.frames.reported => {
                 p.frames.reported = true;
                 eprintln!("harness-browser: {e}");
@@ -863,20 +872,30 @@ pub fn paint(view: u64, popup: bool, surface: *mut c_void, format: ColorType) {
             }
             Err(_) => {}
         }
+        After::Nothing
     });
-}
-
-fn send_frame(app: &mut Option<SendRight>, view: u64, f: &Frames) -> Result<(), String> {
-    let ring = f.ring.as_ref().expect("a frame is sent only with a ring");
-    let slot = ring.newest.expect("a frame is sent only after a blit");
-    match send_app(app, &AppDown::Frame { view, generation: ring.generation, slot, seq: f.seq }, &[]) {
-        // The app is not draining: this picture is skipped; the next one goes when it drains.
-        Ok(()) | Err(SendError::Full) => Ok(()),
-        Err(e) => Err(format!("sending view {view}'s frame {}: {e}", f.seq)),
+    if let Some(after) = after {
+        follow(view, after);
     }
 }
 
-fn paint_view(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames, surface: *mut c_void, w: u32, h: u32) -> Result<(), String> {
+/// How long a view waits to paint again after the app's queue was full.
+const FULL_RETRY_MS: i64 = 16;
+
+/// Send slot `slot`'s new picture, the `f.seq`th, and record it in the ring's core: what to do next.
+fn send_frame(app: &mut Option<SendRight>, view: u64, f: &mut Frames, slot: u8) -> Result<After, String> {
+    let seq = f.seq;
+    let ring = f.ring.as_mut().expect("a frame is sent only with a ring");
+    let generation = ring.state.generation();
+    match send_app(app, &AppDown::Frame { view, generation, slot, seq }, &[]) {
+        Ok(()) => Ok(ring.state.sent(slot, seq, true)),
+        // The app is not draining: this picture is skipped, and the view paints again shortly.
+        Err(SendError::Full) => Ok(ring.state.sent(slot, seq, false)),
+        Err(e) => Err(format!("sending view {view}'s frame {seq}: {e}")),
+    }
+}
+
+fn paint_view(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames, surface: *mut c_void, w: u32, h: u32) -> Result<After, String> {
     if f.ring.as_ref().is_none_or(|r| (r.w, r.h) != (w, h)) {
         f.ring = None;
         let generation = f.next_generation;
@@ -887,22 +906,22 @@ fn paint_view(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames,
         send_app(app, &AppDown::Ring { view, generation, w, h, slots: SLOTS as u8 }, &refs).map_err(|e| format!("sending view {view}'s ring {generation} ({w}x{h}): {e}"))?;
         f.ring = Some(ring);
     }
+    // No slot the app cannot sample: this paint is dropped, and the latch that frees one asks for it again.
+    let Some(slot) = f.ring.as_mut().expect("made above").state.claim() else { return Ok(After::Nothing) };
     // SAFETY: CEF's surface, live for this call; `src` is dropped at the end of this function, after the blit completed.
     let src = unsafe { gpu.wrap(surface, w, h) }.map_err(|e| format!("view {view}'s paint: {e}"))?;
     let ring = f.ring.as_ref().expect("made above");
-    let slot = ring.free();
     let dst = &ring.slots[slot as usize].tex;
     let mut copies = Vec::with_capacity(2); // alloc: per frame, two entries
     copies.push(Blit { src: &src, from: (0, 0), size: (w, h), dst, to: (0, 0) });
     copies.extend(f.popup_copy(dst));
     gpu.blit(&copies).map_err(|e| format!("view {view}: {e}"))?;
     drop(copies);
-    f.ring.as_mut().expect("made above").newest = Some(slot);
     f.seq += 1;
-    send_frame(app, view, f)
+    send_frame(app, view, f, slot)
 }
 
-fn paint_popup(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames, surface: *mut c_void, w: u32, h: u32) -> Result<(), String> {
+fn paint_popup(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames, surface: *mut c_void, w: u32, h: u32) -> Result<After, String> {
     if f.popup.tex.as_ref().is_none_or(|t| (t.width() as u32, t.height() as u32) != (w, h)) {
         f.popup.tex = Some(gpu.private(w, h).map_err(|e| format!("view {view}'s popup: {e}"))?);
     }
@@ -912,19 +931,41 @@ fn paint_popup(gpu: &Gpu, app: &mut Option<SendRight>, view: u64, f: &mut Frames
         let dst = f.popup.tex.as_ref().expect("made above");
         gpu.blit(&[Blit { src: &src, from: (0, 0), size: (w, h), dst, to: (0, 0) }]).map_err(|e| format!("view {view}'s popup: {e}"))?;
     }
-    // Put it over the newest picture, into a free slot; with no picture yet, the next view paint carries it.
-    let Some(ring) = f.ring.as_ref() else { return Ok(()) };
-    let Some(newest) = ring.newest else { return Ok(()) };
-    let slot = ring.free();
+    // Put it over the newest picture, into a writable slot (never the newest: slots.rs); with no picture yet, the
+    // next view paint carries it.
+    let Some(ring) = f.ring.as_mut() else { return Ok(After::Nothing) };
+    let Some(newest) = ring.state.newest() else { return Ok(After::Nothing) };
+    let Some(slot) = ring.state.claim() else { return Ok(After::Nothing) };
+    let ring = f.ring.as_ref().expect("checked above");
     let dst = &ring.slots[slot as usize].tex;
     let mut copies = Vec::with_capacity(2); // alloc: per popup frame, two entries
     copies.push(Blit { src: &ring.slots[newest as usize].tex, from: (0, 0), size: (ring.w, ring.h), dst, to: (0, 0) });
     copies.extend(f.popup_copy(dst));
     gpu.blit(&copies).map_err(|e| format!("view {view}: {e}"))?;
     drop(copies);
-    f.ring.as_mut().expect("checked above").newest = Some(slot);
     f.seq += 1;
-    send_frame(app, view, f)
+    send_frame(app, view, f, slot)
+}
+
+/// Do what the ring's core asked for view `view` (outside the host's borrow).
+fn follow(view: u64, after: After) {
+    match after {
+        After::Nothing => {}
+        After::Repaint => repaint(view),
+        After::RepaintLater => {
+            let mut t = handlers::repaint_task(view);
+            if post_delayed_task(ThreadId::UI, Some(&mut t), FULL_RETRY_MS) != 1 {
+                eprintln!("harness-browser: view {view}'s repaint after a full app queue could not be posted (the host is stopping)");
+            }
+        }
+    }
+}
+
+/// Ask view `view` to paint again (a dropped paint, or one the app's full queue refused).
+pub fn repaint(view: u64) {
+    if let Some(bh) = with("a repaint", |h| h.pages.get(&view).filter(|p| p.watched).and_then(|_| h.browser_host(view).ok())).flatten() {
+        bh.invalidate(PaintElementType::VIEW);
+    }
 }
 
 // ---------------------------------------------------------------- the app's view state (app_link.rs)
@@ -980,18 +1021,15 @@ pub fn resize(view: u64, w: u32, hh: u32, scale: f32) -> Result<(BrowserHost, bo
 
 /// The app latched a slot.
 pub fn latched(view: u64, generation: u32, slot: u8) -> Result<(), String> {
-    with("a latch", |h| {
+    let after = with("a latch", |h| {
         let p = h.pages.get_mut(&view).ok_or_else(|| format!("the app latched a slot of view {view}, which does not exist"))?;
-        if usize::from(slot) >= SLOTS {
-            return Err(format!("the app latched slot {slot} of view {view}; a ring has {SLOTS}"));
-        }
-        // A latch of an older generation is about surfaces already dropped here: nothing to hold.
-        if let Some(r) = p.frames.ring.as_mut().filter(|r| r.generation == generation) {
-            r.latched = Some(slot);
-        }
-        Ok(())
+        // With no ring (unwatched, or a new one not yet painted) the latch is about surfaces already dropped here.
+        let Some(r) = p.frames.ring.as_mut() else { return Ok(After::Nothing) };
+        r.state.latched(generation, slot).map_err(|e| format!("view {view}: {e}"))
     })
-    .unwrap_or_else(|| Err(format!("latching view {view}: the host is not running")))
+    .unwrap_or_else(|| Err(format!("latching view {view}: the host is not running")))?;
+    follow(view, after);
+    Ok(())
 }
 
 /// Send an error (or anything else) to the app from outside the borrow.

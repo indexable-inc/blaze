@@ -25,6 +25,7 @@ mod keys;
 mod manage;
 mod parent;
 mod ring;
+mod slots;
 
 use cef::*;
 use std::ffi::{CString, c_char, c_int, c_void};

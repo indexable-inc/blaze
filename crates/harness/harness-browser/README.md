@@ -83,7 +83,9 @@ KernelDown}`. CDP goes through the host:
   `Target.getTargetInfo` to the new browser over `CefBrowserHost::SendDevToolsMessage`.
 - `Cdp { view, message }` is passed to that browser's `SendDevToolsMessage`; the host renumbers ids per connection (a
   view two clients drive never mixes their answers), and a `CefDevToolsMessageObserver` on each view sends its answers
-  back to the connection that asked and its events to every connection attached to the view.
+  back to the connection that asked and its events to every connection attached to the view. A dropped connection's
+  ids stay taken until answered or the view closes, so a late answer never reaches a later request that reused its
+  id (`src/cdp_ids.rs`, and its DST in `src/cdp_ids/dst.rs`).
 - So the kernel's CDP client is the same flat-session client as before, over a different transport, with the page's own
   domains (Page, Runtime, Network, Input, DOM, Emulation, Fetch...). The browser-level `Target.createTarget` is gone: a
   page made that way would be a Chrome-style native window, not an off-screen view. `browser().newPage()` and
@@ -103,8 +105,13 @@ receive port. Frames:
    picture.
 4. The app wraps each slot's IOSurface in an `MTLTexture` once per ring (`newTextureWithDescriptor:iosurface:plane:`),
    draws the newest slot as the node's `Surface`, and says `AppUp::Latched { slot }`. The host writes only into a slot
-   that is neither the one the app latched nor the newest it sent, so with three slots one is always free, and the app
-   never samples a slot being written.
+   the app can neither be sampling nor come to sample: not the one it latched, not the newest picture, and not one an
+   outstanding frame names (sent, and not superseded by a later latch: the app adopts frames in the order sent, so its
+   latch of seq `s` frees every frame before `s`). When none is free the paint is dropped and the latch that frees one
+   asks for a repaint; a frame the app's full queue refused frees its slot and repaints 16 ms later. The rule is the
+   sans-IO core `src/slots.rs`, proven by its DST (a model of the app, FIFO queues, Full sends, resizes; safety at every
+   write and the newest picture shown once still), with the earlier "neither latched nor newest" rule as a planted bug
+   it catches: a frame in flight could name the slot it wrote.
 5. A view nobody watches still renders (agents screenshot over CDP), at 10 fps, with no blits.
 
 Input goes the other way, all in view points: `Pointer` (move, down, up, leave, wheel; buttons, click counts, CEF's

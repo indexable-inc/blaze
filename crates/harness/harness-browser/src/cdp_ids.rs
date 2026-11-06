@@ -38,11 +38,25 @@ pub enum Incoming {
 }
 
 /// The pending requests of every view.
-#[derive(Debug, Default)]
+///
+/// A request whose connection dropped stays here, its asker gone (`None`), until the browser answers it or its view
+/// closes: freeing its id at once would let a later request take it, and the late answer to the dropped one would go to
+/// that request's connection as if it were its own.
+#[derive(Debug)]
 pub struct CdpIds {
     next: i32,
-    /// host id -> (view, asker)
-    pending: BTreeMap<i32, (u64, Asker)>,
+    /// The largest id handed out (i32::MAX: CEF takes a C int; smaller in tests, so ids wrap).
+    max: i32,
+    /// host id -> (view, asker, or `None` once the asker's connection dropped)
+    pending: BTreeMap<i32, (u64, Option<Asker>)>,
+    #[cfg(test)]
+    plant_free_on_drop: bool,
+}
+
+impl Default for CdpIds {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Deserialize)]
@@ -54,19 +68,29 @@ struct Head {
 impl CdpIds {
     #[must_use]
     pub fn new() -> Self {
-        Self { next: 1, pending: BTreeMap::new() }
+        Self::with_ids(i32::MAX)
     }
 
-    /// A fresh host id: the next positive i32 not pending (CEF takes a C int). Bounded: at most `pending.len() + 1`
-    /// steps, and pending can never hold every i32.
-    fn alloc(&mut self) -> i32 {
-        loop {
+    fn with_ids(max: i32) -> Self {
+        Self {
+            next: 1,
+            max,
+            pending: BTreeMap::new(),
+            #[cfg(test)]
+            plant_free_on_drop: false,
+        }
+    }
+
+    /// A fresh host id: the next of 1..=max not pending. Bounded: at most `max` steps.
+    fn alloc(&mut self) -> Result<i32, String> {
+        for _ in 0..self.max {
             let id = self.next;
-            self.next = if self.next == i32::MAX { 1 } else { self.next + 1 };
+            self.next = if self.next >= self.max { 1 } else { self.next + 1 };
             if !self.pending.contains_key(&id) {
-                return id;
+                return Ok(id);
             }
         }
+        Err(format!("every DevTools request id (1..={}) is pending", self.max))
     }
 
     /// Renumber connection `conn`'s CDP message `message` for view `view`: the host id and the JSON text to send to the
@@ -87,22 +111,25 @@ impl CdpIds {
         if !obj.get("method").is_some_and(Value::is_string) {
             return Err(format!("connection {conn}'s CDP message {client_id} for view {view} has no string \"method\""));
         }
-        let id = self.alloc();
+        let id = self.alloc().map_err(|e| format!("connection {conn}'s CDP message {client_id} for view {view}: {e}"))?;
         obj.insert("id".into(), Value::from(id));
-        self.pending.insert(id, (view, Asker::Conn { conn, id: client_id }));
+        self.pending.insert(id, (view, Some(Asker::Conn { conn, id: client_id })));
         Ok((id, Value::Object(obj).to_string()))
     }
 
     /// Forget host request `id` (the browser refused it, so no answer will come): its asker.
     pub fn cancel(&mut self, id: i32) -> Option<Asker> {
-        self.pending.remove(&id).map(|(_, a)| a)
+        self.pending.remove(&id).and_then(|(_, a)| a)
     }
 
     /// The host's own request `method` (with `params`) for view `view`: the JSON text to send.
-    pub fn host_request(&mut self, view: u64, ask: HostAsk, method: &str, params: Value) -> String {
-        let id = self.alloc();
-        self.pending.insert(id, (view, Asker::Host(ask)));
-        serde_json::json!({ "id": id, "method": method, "params": params }).to_string()
+    ///
+    /// # Errors
+    /// Every id is pending, naming the view and method.
+    pub fn host_request(&mut self, view: u64, ask: HostAsk, method: &str, params: Value) -> Result<String, String> {
+        let id = self.alloc().map_err(|e| format!("the host's {method} for view {view}: {e}"))?;
+        self.pending.insert(id, (view, Some(Asker::Host(ask))));
+        Ok(serde_json::json!({ "id": id, "method": method, "params": params }).to_string())
     }
 
     /// Classify a message view `view`'s browser sent.
@@ -118,6 +145,8 @@ impl CdpIds {
             self.pending.insert(host_id, (owner, asker));
             return Err(format!("view {view}'s browser answered DevTools request {host_id}, which was sent to view {owner}"));
         }
+        // Its connection dropped: the id is free now, and nobody gets the answer.
+        let Some(asker) = asker else { return Ok(Incoming::Orphan { id }) };
         let mut value: Map<String, Value> = serde_json::from_slice(message).map_err(|e| format!("view {view}'s answer {host_id} is not a JSON object: {e}"))?;
         if let Asker::Conn { id: client_id, .. } = &asker {
             value.insert("id".into(), client_id.clone());
@@ -127,21 +156,35 @@ impl CdpIds {
     }
 
     /// Drop every request connection `conn` has pending (it went away).
+    /// Its requests' ids stay taken until each is answered or its view closes (the type's doc).
     pub fn forget_conn(&mut self, conn: u64) {
-        self.pending.retain(|_, (_, a)| !matches!(a, Asker::Conn { conn: c, .. } if *c == conn));
+        #[cfg(test)]
+        if self.plant_free_on_drop {
+            self.pending.retain(|_, (_, a)| !matches!(a, Some(Asker::Conn { conn: c, .. }) if *c == conn));
+            return;
+        }
+        for (_, a) in self.pending.values_mut() {
+            if matches!(a, Some(Asker::Conn { conn: c, .. }) if *c == conn) {
+                *a = None;
+            }
+        }
     }
 
     /// Drop every request pending on view `view` (it closed): the askers, for the driver to answer.
     pub fn forget_view(&mut self, view: u64) -> Vec<Asker> {
         let ids: Vec<i32> = self.pending.iter().filter(|(_, (v, _))| *v == view).map(|(id, _)| *id).collect(); // alloc: once per closed view
-        ids.into_iter().filter_map(|id| self.pending.remove(&id).map(|(_, a)| a)).collect()
+        ids.into_iter().filter_map(|id| self.pending.remove(&id).and_then(|(_, a)| a)).collect()
     }
 
-    #[must_use]
-    pub fn pending(&self) -> usize {
+    /// Requests pending, a dropped connection's among them.
+    #[cfg(test)]
+    fn pending(&self) -> usize {
         self.pending.len()
     }
 }
+
+#[cfg(test)]
+mod dst;
 
 #[cfg(test)]
 mod tests {
@@ -184,7 +227,7 @@ mod tests {
         c.forget_conn(9);
         let id = sent_id(&a);
         assert_eq!(c.incoming(3, format!(r#"{{"id":{id},"result":{{}}}}"#).as_bytes()).unwrap(), Incoming::Orphan { id });
-        let t = c.host_request(4, HostAsk::TargetInfo, "Target.getTargetInfo", serde_json::json!({}));
+        let t = c.host_request(4, HostAsk::TargetInfo, "Target.getTargetInfo", serde_json::json!({})).unwrap();
         assert_eq!(c.forget_view(4), vec![Asker::Host(HostAsk::TargetInfo)]);
         let id = sent_id(&t);
         assert_eq!(c.incoming(4, format!(r#"{{"id":{id}}}"#).as_bytes()).unwrap(), Incoming::Orphan { id });

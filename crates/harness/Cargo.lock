@@ -865,6 +865,7 @@ dependencies = [
  "crossbeam-channel",
  "harness-mach",
  "harness-proto",
+ "hegeltest",
  "libc",
  "objc2",
  "objc2-foundation",
