@@ -85,6 +85,42 @@ runs:
           echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         fi
         mkdir -p "$(grep -m1 '^BLAZE_CACHE=' "$GITHUB_ENV" | cut -d= -f2-)"
+    # TODO(stage 0 after 3732f60733): remove these two steps once .github/blaze-version names a
+    # release cut after 3732f60733 (the perf sampler, no signals). The pinned 0.20261105.4
+    # (built from e930296025) still has the signal sampler (68b022735f), which tgkills every span
+    # thread with SIGRTMIN+6 about every 20 ms; a relative-timeout wait restarts on each signal,
+    # so the serve loop never wakes and the watchdog reports LOOP_STALLED (run 42110597024). Its
+    # sampler::platform::check() leaves the sampler off when SIGRTMIN+6's action is not SIG_DFL,
+    # and SIG_IGN is inherited across fork and exec: every later step's bash sources BASH_ENV,
+    # so the daemon it starts inherits the ignored signal. Linux only: macOS has no RTMIN.
+    - name: SIGRTMIN+6 ignored (the pinned release's signal sampler off)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        env_file="$RUNNER_TEMP/blaze-sigrtmin6.sh"
+        echo "trap '' RTMIN+6" > "$env_file"
+        echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
+    # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
+    # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
+    - name: the release's daemon has its sampler off
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        log="$RUNNER_TEMP/blaze-sigcheck.log"
+        blaze serve > "$log" 2>&1 & serve=$!
+        for _ in $(seq 120); do
+          grep -q "no CPU samples" "$log" && break
+          kill -0 "$serve" 2>/dev/null || break
+          sleep 0.5
+        done
+        rtmin6=$(( $(kill -l RTMIN) + 6 ))
+        sigign=$(awk '/^SigIgn:/ { print $2 }' "/proc/$serve/status" 2>/dev/null || true)
+        echo "daemon $serve: SigIgn $sigign; SIGRTMIN+6 is $rtmin6 (bit $(( rtmin6 - 1 )))"
+        cat "$log"
+        blaze stop >/dev/null 2>&1 || kill "$serve" 2>/dev/null || true
+        wait "$serve" 2>/dev/null || true
+        [ -n "$sigign" ] && (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn ${sigign:-unread}): BASH_ENV's trap did not reach it"; exit 1; }
+        grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
     # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
