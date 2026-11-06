@@ -777,10 +777,15 @@ fn relocate(
         };
         let apply =
             reloc::of_kind(reloc.kind, output.format, output.arch, in_code).map_err(at_fail)?;
+        let p = linked + start + u64::from(reloc.at);
         let (s, g, tp, slid) = match resolved[row.target as usize] {
             Resolved::Own(offset) if reloc::got_kind(apply).is_none() => (linked + offset, 0, None, true),
             Resolved::Own(_) => return Err(at_fail("its own code or data reached through a GOT cell, which only the image's symbols have".into())),
-            Resolved::Zero if reloc::got_kind(apply).is_none() => (0, 0, None, false),
+            // A branch to a weak name nothing defines: the next instruction
+            // ([`crate::thunk::weak_branch`]).
+            Resolved::Zero if reloc::got_kind(apply).is_none() => {
+                (crate::thunk::weak_branch(apply, p).unwrap_or(0), 0, None, false)
+            }
             Resolved::Zero => return Err(at_fail("a weak name nothing defines, reached through a GOT cell, which only the image's symbols have".into())),
             Resolved::Counter(_) if !crate::counter::reaches(apply) => {
                 return Err(at_fail(
@@ -796,7 +801,7 @@ fn relocate(
             format: output.format,
             s,
             a: reloc.addend,
-            p: linked + start + u64::from(reloc.at),
+            p,
             g,
             m: 0,
             base: image.plan.base,
