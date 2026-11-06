@@ -545,19 +545,21 @@ pub struct Collapse {
     pub k: f32,
 }
 
-/// The length this node settles at along its parent's main axis while its `Size` there is moving (a fold's spring writes
-/// it each frame): layout gives the node its `Size`, and gives a `LaysAtRest` sibling's children the room they will have
-/// once this node rests. A sidebar folding on a spring says where it is going here.
+/// The length this node's neighbours lay out against while its `Size` along its parent's main axis moves (a fold's spring
+/// writes it each frame): layout gives the node its `Size`, and gives the children of every `LaysAtRest` node beside it
+/// (or under a sibling of it) the room they have when it is this long. A sidebar folding on a spring says here the width
+/// at which its fold leaves the card least room, so the card's words wrap at most once per fold.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct RestSize {
     pub len: f32,
 }
 
-/// Its flow children are laid out in the room it gets once its flow siblings rest at their `RestSize`, not in the room it
-/// has this frame: a card whose width follows a sibling's spring lays its content out once, at the width it settles at
-/// (its words wrap and its terminal resizes once, not every frame), while its own frame and its `Background` and `Overlay`
-/// children follow the spring. Its content starts at its leading edge; past its frame it is clipped by whatever clips it.
-/// A tag.
+/// Its flow children are laid out in the room it gets while every moving `RestSize` (a sibling's, or a sibling's of an
+/// ancestor) is at that length, not in the room it has this frame: a pane whose width follows the sidebar's spring lays its
+/// content out once per fold (its words wrap and its terminal resizes once, not every frame), while its own frame and its
+/// `Background` and `Overlay` children follow the spring. It places that content in the frame it has now by its own `Flex`
+/// (a centred column stays centred in the moving frame; a Start one rides its leading edge); past its frame it is clipped
+/// by whatever clips it. Put it on the node whose alignment should carry the content through the motion. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct LaysAtRest;
 

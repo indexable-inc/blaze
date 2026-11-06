@@ -8,7 +8,10 @@ hn {
   prefab ChatPane : hn.Pane {
     // The chat's own page (tone_chat_ground), over the main card's terminal ground.
     Fill: $tone_chat_ground
+    // The transcript and the foot lay their column out at one width per cmd+S fold (LaysAtRest) and centre it in the frame
+    // they have now, so it glides with the fold rather than being laid against one width and centred against another.
     list : ui.Scroll {
+      LaysAtRest
       Cursor: {shape: Text}
       ClipFade: {len: $chat_fade_len}
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
@@ -21,6 +24,7 @@ hn {
     // The foot is opaque, in the page's own ground: the transcript ends at its top (thinning out under it), and nothing
     // drawn behind the pane shows around the composer.
     foot : ui.Column {
+      LaysAtRest
       Fill: $tone_chat_ground
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
