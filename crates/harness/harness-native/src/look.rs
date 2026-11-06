@@ -327,8 +327,10 @@ pub const RUN_ICON: &str = "\u{EB8A}";
 pub const CHEVRON: &str = "\u{EAB6}";
 pub const ARCHIVE_ICON: &str = "\u{EA98}";
 /// The palette's commands, each a codicon like the rest of its icons (one stroke weight, one optical size, outlined): kill
-/// (cod-close), toggle the sidebar (cod-layout-sidebar-left) and zoom in and out (cod-zoom-in, cod-zoom-out).
+/// (cod-close), rename (cod-edit), toggle the sidebar (cod-layout-sidebar-left) and zoom in and out (cod-zoom-in,
+/// cod-zoom-out).
 pub const KILL_ICON: &str = "\u{EA76}";
+pub const RENAME_ICON: &str = "\u{EA73}";
 pub const SIDEBAR_ICON: &str = "\u{EBF3}";
 pub const ZOOM_IN_ICON: &str = "\u{EB81}";
 pub const ZOOM_OUT_ICON: &str = "\u{EB82}";

@@ -99,6 +99,8 @@ export class Obj {
   /** Sessions: kill the process; procs: SIGTERM the group, SIGKILL after 3s. */
   async kill(): Promise<this> { await this.send("kill"); return this; }
   async resize(cols: number, rows: number): Promise<this> { await this.send("resize", { cols, rows }); return this; }
+  /** Sessions: name it (the app shows it in place of its name; the daemon keeps it); "" gives it its automatic name again. */
+  async rename(title: string): Promise<this> { await this.send("rename", { title }); return this; }
 
   // ---- reading
   /** The rendered terminal screen (sessions). */

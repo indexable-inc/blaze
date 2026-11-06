@@ -231,6 +231,7 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
             }),
             "kill" => handle(Req::Kill { id: n }),
             "forget" => handle(Req::Forget { id: n }),
+            "rename" => handle(Req::Rename { id: n, title: a("title").context("rename needs args.title (\"\": its name taken away)")? }),
             "signal" => {
                 let pid = d.get(n)?.pid().ok_or_else(|| anyhow!("{id} has no pid"))?;
                 unsafe { libc::kill(pid as i32, sig_num(&args["sig"])?) };
@@ -242,7 +243,7 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
                 messages::sync_object(&id)?;
                 Ok(Reply::Ok)
             }
-            m => bail!("{id} ({}) has no method {m:?} (prompt input interrupt resize kill signal screen info sync forget)", kind_of(d, &id)),
+            m => bail!("{id} ({}) has no method {m:?} (prompt input interrupt resize kill signal screen info sync forget rename)", kind_of(d, &id)),
         },
         Some(Target::Run(r)) => match method {
             "stdin" => runs::handle(RunReq::RunStdin { id: r, data: a("data"), close: args["close"].as_bool().unwrap_or(false) }).map(Reply::Record),

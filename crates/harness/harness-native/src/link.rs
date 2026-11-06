@@ -663,6 +663,20 @@ impl Link {
         });
     }
 
+    /// Name session `id` `title` (empty: its automatic name again); the daemon keeps it, and its change feed brings the
+    /// row back with it.
+    pub fn rename(&self, id: u64, title: &str) {
+        let title = title.to_owned();
+        std::thread::spawn(move || {
+            let what = format!("rename {id} to {title:?}");
+            match request(Request::Rename { id, title }) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("harness-native: {what}: {e}"),
+                Err(e) => eprintln!("harness-native: {what}: {e}"),
+            }
+        });
+    }
+
     /// A new object of `kind` in `cwd`; `then` gets its id. `claude-tui` and `codex-tui` are the agent in its terminal
     /// UI (a PTY); plain `claude` and `codex` are chat sessions.
     pub fn spawn(

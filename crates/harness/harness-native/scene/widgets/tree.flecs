@@ -6,9 +6,12 @@ module hn.tree
 // so an instance in a template is the part itself.
 
 // A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.
+// Renamed in place (cmd+R, src/app/chat/rename.rs), the host sets its TextEdit's caret and selection; at rest nothing.
 prefab Head : ui.Lead {
   Fill: $tone_row
   TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+  TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
+    caret_dark: $tone_caret.dark, caret_light: $tone_caret.light}
 }
 
 // A run's command under its session: 12, in the quieter run ink, cut with an ellipsis like a title.
