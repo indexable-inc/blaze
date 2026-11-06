@@ -1279,22 +1279,10 @@ impl App {
                 (t.model.clone(), effort.to_owned())
             };
             self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
-            // The send button: the stop while the agent works (quiet, its ring breathing: the composer's one sign of work,
-            // so an idle chat lets the window rest), else the send, solid once there are words to send.
+            // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
             if let Some(act) = bar.part("act") {
-                let (key, prefab, action) = if t.busy && !ended {
-                    ("stop", "hn.ChatStop", format!("chat:stop:{sid}"))
-                } else if st.draft.text.trim().is_empty() {
-                    ("send", "hn.ChatSend", String::new())
-                } else {
-                    ("ready", "hn.ChatSendReady", format!("chat:send:{sid}"))
-                };
-                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| {
-                    v.action(&action);
-                    if key == "stop" {
-                        stop_look(v);
-                    }
-                });
+                let working = t.busy && !ended;
+                view::for_each_of(act, working.then_some(("working", "hn.ChatWorking", ())), |_, (), _| {});
             }
         }
     }
@@ -1555,7 +1543,7 @@ impl App {
         true
     }
 
-    /// Send chat `sid`'s draft (Return, or a press on the composer's send button: `chat:send:<sid>`), the draft emptied;
+    /// Send chat `sid`'s draft (Return), the draft emptied;
     /// nothing while it holds only blanks.
     pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
         let text = {
@@ -2501,24 +2489,6 @@ fn status_on(v: View<'_>, name: Option<&str>) -> String {
         _ => {}
     }
     s.try_cloned::<&Tooltip>().map(|t| t.text.as_str().to_owned()).unwrap_or_default()
-}
-
-/// The stop (hn.ChatStop): its ring and square in the bar's muted ink, brightening toward the words' ink by its hover
-/// spring (hn.ChatControlInk, as the picker's words). Written only on change.
-fn stop_look(v: View<'_>) {
-    use harness_native_ui_look_api::Stroke;
-    let ink = pick::ControlInk::of(v.entity().world()).now(v);
-    if let Some(r) = v.part("ring") {
-        let s = Stroke { dark: ink.dark, light: ink.light };
-        if r.entity().try_cloned::<&Stroke>() != Some(s) {
-            r.set(s);
-        }
-    }
-    if let Some(q) = v.part("square")
-        && q.entity().try_cloned::<&Fill>() != Some(ink)
-    {
-        q.set(ink);
-    }
 }
 
 /// Set node `v`'s tooltip to `s`, or take it away when `s` is empty (written only on change).

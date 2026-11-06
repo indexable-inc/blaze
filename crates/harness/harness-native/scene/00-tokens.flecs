@@ -550,10 +550,9 @@ export const chat_composer_lift_dy = 4
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
 // effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
 // its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
-// chat_ring_stroke, in a square chat_bar_h across that takes the pointer) and the send button (hn.ChatSend*: a circle
-// chat_send across, its arrow chat_send_glyph across, stroke chat_send_stroke). While the agent works the stop
-// (hn.ChatStop) takes its place, quiet: in the same chat_send square, a ring chat_stop_ring across (stroke
-// chat_stop_stroke) breathing down to chat_stop_breath round a square chat_stop_square across, chat_stop_radius round.
+// chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works, its sign
+// (hn.ChatWorking, not a button: Return sends, Escape stops) after the meter: a ring chat_working across (stroke
+// chat_working_stroke) breathing down to chat_working_breath.
 // The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
@@ -567,15 +566,9 @@ export const chat_pick_gap = 4
 export const chat_pick_chevron = 8
 export const chat_ring = 14
 export const chat_ring_stroke = 1.6
-export const chat_send = 28
-export const chat_send_glyph = 14
-export const chat_send_stroke = 1.8
-export const chat_stop_ring = 20
-export const chat_stop_inset = ($chat_send - $chat_stop_ring) / 2
-export const chat_stop_stroke = 1.2
-export const chat_stop_square = 7
-export const chat_stop_radius = 1.5
-export const chat_stop_breath = 0.45
+export const chat_working = 16
+export const chat_working_stroke = 1.2
+export const chat_working_breath = 0.45
 export const chat_effort_lead = 6
 export const chat_effort_h = 10
 export const chat_effort_bar_w = 2
@@ -643,13 +636,8 @@ export const tone_chat_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.1
 export const tone_chat_bubble: Fill = $tone_site_bg_4
 export const tone_chat_card: Fill = $tone_site_code_bg
 // The composer's card: a step lighter than the page in dark (white with a stronger hairline and the lift in light).
-// The send button: quiet (tone_chat_send_idle, its arrow faint) with nothing to send, then solid in the words' ink
-// with its arrow (and the stop's square) in the page's ground.
 export const tone_chat_composer: Fill = $tone_site_bg_3
 export const tone_chat_composer_edge: Fill = $tone_site_line
-export const tone_chat_send: Fill = {dark: {1, 1, 1, 0.9}, light: {0.216, 0.208, 0.184, 1}}
-export const tone_chat_send_idle: Fill = {dark: {1, 1, 1, 0.06}, light: {0.216, 0.208, 0.184, 0.06}}
-export const tone_chat_send_glyph: Fill = $tone_site_bg
 // Inline code amid the words, as the site sets it: the code face (the one monospace in prose) at chat_code_em of the
 // words, in the site's coral (--doc-code-ink) on its faint plate (--s-tint), chat_code_radius round.
 export const tone_chat_code: Fill = $tone_site_tint
