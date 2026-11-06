@@ -660,6 +660,9 @@ export const chat_code_radius = 5
 // request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
 // merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
 // pending amber).
+// A chip at rest has no plate (its icon in its state's ink says what it is), and a link's host after its words is quiet.
+export const tone_inline_rest: Fill = {dark: {0.922, 0.918, 0.902, 0}, light: {0.086, 0.086, 0.090, 0}}
+export const tone_inline_meta: Fill = $tone_ink_3
 export const tone_inline_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.11}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tone_inline_pressed: Fill = {dark: {0.922, 0.918, 0.902, 0.16}, light: {0.086, 0.086, 0.090, 0.15}}
 export const tone_inline_underline: Fill = {dark: {0.922, 0.918, 0.902, 0.42}, light: {0.086, 0.086, 0.090, 0.40}}
@@ -672,15 +675,20 @@ export const tone_gh_ci_failure: Fill = $tone_gh_closed
 export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: {0.604, 0.404, 0.0, 1}}
 // A chip's hover card (scene/widgets/peek.flecs hn.ChatPeek, src/app/chat/peek.rs): after the pointer rests on a chip
 // inline_peek_dwell seconds, a menu plate (ui.Menu: an overlay over its chip, its lift and motion) inline_peek_w wide,
-// inline_peek_pad in, its lines inline_peek_gap apart: a GitHub item's title, state and checks, author and lines changed,
-// then its description's first lines; a page's site, title, description and picture (inline_peek_image_h tall); a
-// file's first lines in the code face. It closes when the pointer leaves the chip and the card both.
+// inline_peek_pad in, its lines inline_peek_gap apart: a header row (an icon or favicon inline_peek_icon_w square, then
+// `owner/repo #n` or the site), the title flush left, then a GitHub item's state and checks, author and lines changed,
+// its description's first lines; a page's description and picture (inline_peek_image_h tall, only when it has one) and
+// its live view once a browser host has one (inline_peek_page_h); a file's first lines in the code face. It closes
+// when the pointer leaves the chip and the card both.
 export const inline_peek_dwell_s = 0.35
 export const inline_peek_w = 360
 export const inline_peek_pad = 12
 export const inline_peek_gap = 6
 export const inline_peek_image_h = 160
 export const inline_peek_radius = 8
+export const inline_peek_icon_w = 16
+export const inline_peek_icon_radius = 3
+export const inline_peek_page_h = 240
 export const inline_peek_badge_pad = 6
 export const inline_peek_lines_n = 8
 export const size_peek_title = 14

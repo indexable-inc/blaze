@@ -159,6 +159,9 @@ export const tone_icon_hover: Fill = $tone_ink_1
 // request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
 // merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
 // pending amber).
+// A chip at rest has no plate (its icon in its state's ink says what it is), and a link's host after its words is quiet.
+export const tone_inline_rest: Fill = {dark: {0.922, 0.918, 0.902, 0}, light: {0.086, 0.086, 0.090, 0}}
+export const tone_inline_meta: Fill = $tone_ink_3
 export const tone_inline_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.11}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tone_inline_pressed: Fill = {dark: {0.922, 0.918, 0.902, 0.16}, light: {0.086, 0.086, 0.090, 0.15}}
 export const tone_inline_underline: Fill = {dark: {0.922, 0.918, 0.902, 0.42}, light: {0.086, 0.086, 0.090, 0.40}}

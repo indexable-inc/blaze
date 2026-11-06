@@ -8,12 +8,17 @@
 //!   popover) opens against an anchor laid over the chip, until the pointer leaves the chip and the card both. A pull
 //!   request or issue shows its title, state, checks, author, lines changed and description's start (the batched
 //!   `github_status` answer); a web link its OpenGraph card (`page_peek`, the daemon fetches and keeps it) with a
-//!   [`PageView`] seam where an embedded browser's live view can go; a path its first lines.
+//!   [`PageView`] seam on the card for an embedded browser's live view; a path its first lines. Every card is a header
+//!   row (the thing's icon, or a page's favicon, and where it is: `owner/repo #n`, the site), the title flush left, then
+//!   what there is; a line with nothing to show is left out, never laid out empty.
 //! - Live state: every `<PR>` and `<Issue>` in a shown chat is asked after in one `github_status` request when the chat
 //!   is focused (past the daemon's cache), when its words name new ones, and every [`REASK`] seconds while it shows; the
 //!   answers become `InlineLive` entities under `ui.inline.live` with `(InlineState, <state child>)` and
 //!   `(InlineMark, <mark>)`, which pick the chip's icon, ink and CI mark. A failed fetch leaves the chip in its unknown
 //!   state with the error, naming the repository and number, as its card's words and in the log.
+//! - Links: every `<Link>` in a shown chat (a link to a pull request or issue is that component already, harness-native-
+//!   ui-inline's `from_url`) has its page's card asked for once (`page_peek`, its favicon with it), at most
+//!   [`PAGES_MAX`] a chat, so its chip shows the favicon at rest (`InlineLive.picture`), the globe without one.
 use super::*;
 use harness_native_render::inline as vocab;
 use harness_native_render::markdown::{CHIP_INSET_EM, Inline};
@@ -29,6 +34,8 @@ use std::collections::BTreeMap;
 const REASK: f32 = 60.0;
 /// The most of a file a path's card reads.
 const FILE_PEEK_BYTES: u64 = 16 << 10;
+/// The most links of one chat whose pages (favicons) are asked for.
+const PAGES_MAX: usize = 64;
 
 /// A chip under the pointer: the words' node, which of its components, the tag, and its rectangle (window points).
 #[derive(Clone, Debug, PartialEq)]
@@ -49,18 +56,30 @@ pub(super) struct Peek {
     /// pane had the keyboard then.
     rev: Option<(u64, usize)>,
     refs: Vec<GhRef>,
+    urls: Vec<String>,
     asked: Option<f32>,
     focused: bool,
     /// A path's first lines, by target, read once.
     files: BTreeMap<String, String>,
 }
 
-/// The app's side of live components: each GitHub ref's key in the scene's vocabulary, and the link's answers' revision
-/// last written to the world.
+/// The app's side of live components: each GitHub ref's and each link's page's key in the scene's vocabulary, and the
+/// link's answers' revision last written to the world.
 #[derive(Default)]
 pub(crate) struct Live {
     keys: BTreeMap<GhRef, String>,
+    pages: BTreeMap<String, String>,
     rev: u64,
+}
+
+/// A tag's web page and its live key, for a component the scene keeps by the `page` feed (a link).
+fn page_ref(w: WorldRef<'_>, tag: &Tag) -> Option<(String, String)> {
+    let (feed, key) = vocab::keyed(w, tag)?;
+    if feed != "page" {
+        return None;
+    }
+    let url = vocab::target(w, tag, "/", "/").ok().filter(|u| u.starts_with("https://") || u.starts_with("http://"))?;
+    Some((url, key))
 }
 
 /// A tag's GitHub ref and its live key, for a component the scene keeps by a `github.*` feed.
@@ -180,6 +199,7 @@ impl App {
         if p.rev != Some((t.rev, rows.len())) {
             p.rev = Some((t.rev, rows.len()));
             let mut refs: Vec<GhRef> = Vec::new(); // alloc: this chat's refs, kept with its state
+            let mut urls: Vec<String> = Vec::new(); // alloc: this chat's links, kept with its state
             let mut live = self.peek_live.borrow_mut();
             for (_, r) in rows {
                 for (_, src, md) in texts(r) {
@@ -192,12 +212,22 @@ impl App {
                             if !refs.contains(&gh) {
                                 refs.push(gh);
                             }
+                        } else if let Some((url, key)) = page_ref(w, &tag.tag)
+                            && urls.len() < PAGES_MAX
+                            && !urls.contains(&url)
+                        {
+                            live.pages.insert(url.clone(), key);
+                            urls.push(url);
                         }
                     }
                 }
             }
             new = refs.iter().any(|r| !p.refs.contains(r));
             p.refs = refs;
+            // Each page once (the link keeps what it was told): its chip's favicon, its card ready for a hover.
+            let asks: Vec<&str> = urls.iter().map(String::as_str).collect(); // alloc: this pass's links, borrowed
+            self.link.pages(&asks);
+            p.urls = urls;
         }
         let fresh = focused && !p.focused;
         p.focused = focused;
@@ -231,7 +261,7 @@ impl App {
                 None => w.entity().child_of(*root.id()),
             };
             let tip = if it.error.is_empty() { it.title.clone() } else { it.error.clone() };
-            let l = InlineLive { key: key.as_str().into(), tip: tip.as_str().into() };
+            let l = InlineLive { key: key.as_str().into(), tip: tip.as_str().into(), picture: "".into() };
             if e.try_cloned::<&InlineLive>() != Some(l.clone()) {
                 e.set(l);
             }
@@ -248,6 +278,19 @@ impl App {
                     None if cur.is_some() => _ = e.remove((rel, flecs::Wildcard::ID)),
                     _ => {}
                 }
+            }
+        }
+        // Each link's page: its title (or error) to say, its favicon to show in its icon's place.
+        for (url, page) in &peeks.pages {
+            let Some(key) = live.pages.get(url) else { continue };
+            let e = match have.get(key) {
+                Some(e) => *e,
+                None => w.entity().child_of(*root.id()),
+            };
+            let tip = if page.error.is_empty() { page.title.as_str() } else { page.error.as_str() };
+            let l = InlineLive { key: key.as_str().into(), tip: tip.into(), picture: page.icon.as_str().into() };
+            if e.try_cloned::<&InlineLive>() != Some(l.clone()) {
+                e.set(l);
             }
         }
         moving(&w);
@@ -303,11 +346,13 @@ impl App {
         found
     }
 
-    /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file it names.
+    /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file it names. A link's card
+    /// carries its page's [`PageView`] (the live view's seam), and its live view line only once a browser host made one.
     fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag) {
         let w = self.world.world_ref();
         let dark = self.chat_dark();
         let mut lines: Vec<(&'static str, &'static str, Line)> = Vec::new(); // alloc: a handful of lines, while it is up
+        let mut page_view = None;
         if let Some((r, _)) = gh_ref(w, tag) {
             let item = self.link.peeks().gh.get(&r).cloned();
             gh_lines(w, tag, &r, item.as_ref(), dark, &mut lines);
@@ -322,30 +367,52 @@ impl App {
                 Ok(url) if url.starts_with("https://") || url.starts_with("http://") => {
                     self.link.page(&url);
                     let page = self.link.peeks().pages.get(&url).cloned();
-                    page_lines(&url, page.as_ref(), &mut lines);
+                    let (globe, _) = vocab::icon(w, tag, dark);
+                    let view = card.entity().try_cloned::<&PageView>().filter(|v| v.url.as_str() == url);
+                    page_lines(&url, page.as_ref(), &globe, view.as_ref(), &mut lines);
+                    page_view = Some(view.unwrap_or(PageView { url: url.as_str().into(), key: 0, ready: false }));
                 }
                 Ok(target) => {
-                    let text = st.peek.files.entry(target.clone()).or_insert_with(|| first_lines(&target, crate::look::width(w, "inline_peek_lines") as usize));
+                    let text = st
+                        .peek
+                        .files
+                        .entry(target.clone())
+                        .or_insert_with(|| first_lines(&target, crate::look::width(w, "inline_peek_lines") as usize));
                     let path = target.split_once(':').filter(|(n, _)| n.parse::<u32>().is_ok()).map_or(target.as_str(), |(_, p)| p);
-                    lines.push(("path", "hn.PeekMeta", Line::Words(path.to_owned())));
+                    let (glyph, _) = vocab::icon(w, tag, dark);
+                    lines.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink: None, name: path.to_owned() }));
                     lines.push(("code", "hn.PeekCode", Line::Words(text.clone())));
                 }
                 Err(why) => lines.push(("why", "hn.PeekMeta", Line::Words(why))),
             }
         }
+        // The live view's seam, on the card: a link's page; nothing on any other card.
+        match page_view {
+            Some(v) => set_if(card, v),
+            None if card.entity().has(PageView::id()) => _ = card.entity().remove(PageView::id()),
+            None => {}
+        }
         view::for_each_of(card, lines.iter().map(|(k, p, l)| (*k, *p, l)), |v, l, _| match l {
-            Line::Words(s) => {
+            Line::Words(s) | Line::Title(s) => {
                 v.text(s);
             }
-            Line::Head { glyph, ink, title } => {
+            Line::Site { glyph, ink, name } => {
                 if let Some(i) = v.part("icon") {
                     set_if(i, Icon { glyph: glyph.as_str().into() });
                     if let Some(f) = ink {
                         set_if(i, *f);
                     }
                 }
-                if let Some(t) = v.part("title") {
-                    t.text(title);
+                if let Some(n) = v.part("name") {
+                    n.text(name);
+                }
+            }
+            Line::Favicon { picture, name } => {
+                if let Some(i) = v.part("icon") {
+                    set_if(i, Picture { handle: picture.as_str().into() });
+                }
+                if let Some(n) = v.part("name") {
+                    n.text(name);
                 }
             }
             Line::State { label, ink, mark, checks } => {
@@ -365,12 +432,7 @@ impl App {
                 }
             }
             Line::Image(path) => set_if(v, Picture { handle: path.as_str().into() }),
-            Line::Page(url) => {
-                let had = v.entity().try_cloned::<&PageView>().unwrap_or_default();
-                if had.url.as_str() != url.as_str() {
-                    v.set(PageView { url: url.as_str().into(), key: 0, ready: false });
-                }
-            }
+            Line::Page(key) => set_if(v, harness_native_ui_text_api::Surface { key: *key, cover: 1 }),
         });
     }
 }
@@ -378,10 +440,16 @@ impl App {
 /// One line of a card.
 enum Line {
     Words(String),
-    Head { glyph: String, ink: Option<Fill>, title: String },
+    /// The title, strong, flush left.
+    Title(String),
+    /// The header row: an icon in an ink (a pull request's state's; None: the look's) and where the thing is.
+    Site { glyph: String, ink: Option<Fill>, name: String },
+    /// The header row of a page with a favicon (a local picture) and its site.
+    Favicon { picture: String, name: String },
     State { label: String, ink: Fill, mark: Option<(String, Fill)>, checks: String },
     Image(String),
-    Page(String),
+    /// The live view of the page, by its Media key (only once a browser host made one).
+    Page(u64),
 }
 
 /// `v`'s `c`, set only when it differs.
@@ -391,8 +459,8 @@ fn set_if<T: harness_native_flecs::prelude::ComponentId + Clone + PartialEq>(v: 
     }
 }
 
-/// A GitHub item's card: its head (icon in its state's ink, title), its state and checks, who and how much, its
-/// description's start. Before an answer: asking; after a failure: the error, naming it.
+/// A GitHub item's card: a header of its icon in its state's ink and `owner/repo #n`, its title, its state and checks,
+/// who and how much, its description's start. Before an answer: asking; after a failure: the error, naming it.
 fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bool, out: &mut Vec<(&'static str, &'static str, Line)>) {
     let (glyph, _) = vocab::icon(w, tag, dark);
     let component = match r.kind {
@@ -400,17 +468,18 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
         GhKind::Issue => "Issue",
     };
     let fill_of = |path: &str| w.try_lookup(path).and_then(|e| e.try_cloned::<&Fill>());
-    let name = format!("{}#{}", r.repo, r.n);
+    let name = format!("{} #{}", r.repo, r.n);
     let Some(it) = it.filter(|it| it.error.is_empty()) else {
         let ink = fill_of(&format!("{}::{component}::unknown", vocab::MODULE));
-        out.push(("head", "hn.PeekHead", Line::Head { glyph, ink, title: name }));
+        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }));
         let why = it.map_or_else(|| "Asking GitHub…".to_owned(), |it| it.error.clone());
         out.push(("why", "hn.PeekMeta", Line::Words(why)));
         return;
     };
     let state = it.state.map(state_name);
     let ink = state.and_then(|s| fill_of(&format!("{}::{component}::{s}", vocab::MODULE)));
-    out.push(("head", "hn.PeekHead", Line::Head { glyph, ink, title: it.title.clone() }));
+    out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }));
+    out.push(("title", "hn.PeekTitle", Line::Title(it.title.clone())));
     if let (Some(s), Some(ink)) = (it.state, ink) {
         let label = match s {
             GhState::Open => "Open",
@@ -419,9 +488,10 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
             GhState::Closed => "Closed",
             GhState::NotPlanned => "Not planned",
         };
+        // The card's mark is the check, the cross or the dot (the mark's `card` child); the chip's is a dot.
         let mark = it.ci.and_then(|c| {
             let e = w.try_lookup(&format!("{}::marks::{}", vocab::MODULE, ci_name(c)))?;
-            let g = e.try_cloned::<&harness_native_ui_text_api::InlineRef>()?.glyph.as_str().to_owned();
+            let g = e.lookup_child("card")?.try_cloned::<&harness_native_ui_text_api::InlineRef>()?.glyph.as_str().to_owned();
             Some((g, e.try_cloned::<&Fill>()?))
         });
         let checks = match it.ci {
@@ -433,37 +503,50 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
         };
         out.push(("state", "hn.PeekState", Line::State { label: label.to_owned(), ink, mark, checks: checks.to_owned() }));
     }
-    let mut meta = name.clone();
+    let mut meta = Vec::new(); // alloc: a line's parts, while it is up
     if !it.author.is_empty() {
-        meta.push_str(&format!(" · {}", it.author));
+        meta.push(it.author.clone());
     }
     if r.kind == GhKind::Pr {
-        meta.push_str(&format!(" · +{} \u{2212}{}", it.additions, it.deletions));
+        meta.push(format!("+{} \u{2212}{}", it.additions, it.deletions));
     }
-    out.push(("meta", "hn.PeekMeta", Line::Words(meta)));
+    if !meta.is_empty() {
+        out.push(("meta", "hn.PeekMeta", Line::Words(meta.join(" · "))));
+    }
     let body = first_text_lines(&it.body, 5);
     if !body.is_empty() {
         out.push(("body", "hn.PeekBody", Line::Words(body)));
     }
 }
 
-/// A page's card: its site, title, description and picture, then the live view's seam; asking, or its error.
-fn page_lines(url: &str, page: Option<&PageMeta>, out: &mut Vec<(&'static str, &'static str, Line)>) {
+/// A page's card: a header of its favicon (else `globe`) and its site, its title flush left, its description, its
+/// picture only when it has one, its live view only when a browser host made one; asking, or its error.
+fn page_lines(url: &str, page: Option<&PageMeta>, globe: &str, view: Option<&PageView>, out: &mut Vec<(&'static str, &'static str, Line)>) {
+    let host = harness_native_ui_inline::host(url).to_owned();
     let Some(p) = page.filter(|p| p.error.is_empty()) else {
-        out.push(("site", "hn.PeekMeta", Line::Words(url.to_owned())));
+        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph: globe.to_owned(), ink: None, name: host }));
+        out.push(("title", "hn.PeekTitle", Line::Title(harness_native_ui_inline::bare(url).to_owned())));
         let why = page.map_or_else(|| "Fetching the page…".to_owned(), |p| p.error.clone());
-        out.push(("why", "hn.PeekBody", Line::Words(why)));
+        out.push(("why", "hn.PeekMeta", Line::Words(why)));
         return;
     };
-    out.push(("site", "hn.PeekMeta", Line::Words(if p.site.is_empty() { url.to_owned() } else { p.site.clone() })));
-    out.push(("title", "hn.PeekHead", Line::Head { glyph: String::new(), ink: None, title: if p.title.is_empty() { url.to_owned() } else { p.title.clone() } }));
+    let site = if p.site.is_empty() { host } else { p.site.clone() };
+    if p.icon.is_empty() {
+        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph: globe.to_owned(), ink: None, name: site }));
+    } else {
+        out.push(("site", "hn.PeekSite", Line::Favicon { picture: p.icon.clone(), name: site }));
+    }
+    let title = if p.title.is_empty() { harness_native_ui_inline::bare(url).to_owned() } else { p.title.clone() };
+    out.push(("title", "hn.PeekTitle", Line::Title(title)));
     if !p.description.is_empty() {
         out.push(("body", "hn.PeekBody", Line::Words(p.description.clone())));
     }
     if !p.image.is_empty() {
         out.push(("image", "hn.PeekImage", Line::Image(p.image.clone())));
     }
-    out.push(("page", "hn.PeekPage", Line::Page(url.to_owned())));
+    if let Some(v) = view.filter(|v| v.ready) {
+        out.push(("page", "hn.PeekPage", Line::Page(v.key)));
+    }
 }
 
 /// The first `n` lines with words of a description (markdown's heading marks off).
