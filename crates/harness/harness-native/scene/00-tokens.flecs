@@ -378,6 +378,13 @@ export const copy_row_in = 0.11
 // Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
+// A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height
+// (less what the pane shows around it), then scrolls; a caret out of view glides back textarea_caret_margin points inside
+// the edges on the textarea_glide spring.
+export const textarea_grow_share = 0.85
+export const textarea_caret_margin = 6
+export const textarea_glide_omega = 22
+export const textarea_glide_zeta = 1
 // How far a text area's placeholder starts after its caret (which stands at the words' start), as a macOS field's does.
 export const textarea_hint_inset = 4
 // ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
@@ -426,26 +433,39 @@ export const chat_input_radius = 12
 // chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
 // chat_ring_stroke, chat_context_gap from its percentage. The model's name leads with its maker's mark (Claude's,
 // OpenAI's, Cursor's) chat_pick_mark across, chat_pick_mark_gap before the name. The picker's menu is a ui.Menu (the
-// menu_* tokens).
-export const size_chat_status = 12.5
-export const line_chat_status = 16
-export const chat_pick_h = 20
-export const chat_pick_gap = 6
-export const chat_pick_chevron = 10
-export const chat_pick_mark = 14
+// menu_* tokens). The agent's state at its end is an icon (scene/widgets/chat_status.flecs) chat_status_icon across. The
+// foot keeps tight: the input and the status line chat_foot_gap apart, chat_foot_pad_b under it, the status line's parts
+// chat_status_gap apart.
+export const size_chat_status = 12
+export const line_chat_status = 15
+export const chat_pick_h = 18
+export const chat_pick_gap = 5
+export const chat_pick_chevron = 8
+export const chat_pick_mark = 12
 export const chat_pick_mark_gap = 5
-export const chat_ring = 12
+export const chat_ring = 10
 export const chat_ring_stroke = 2
-export const chat_context_gap = 5
+export const chat_context_gap = 4
 export const chat_context_lead = 4
+export const chat_status_icon = 11
+export const chat_status_gap = 6
+export const chat_foot_gap = 4
+export const chat_foot_pad_b = 9
+// The foot's inset above the composer.
+export const chat_foot_pad_t = 4
+// What the chat pane shows around the composer's words besides the transcript (the foot's insets and gap, the status
+// line, the composer's own inset): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_foot_gap + $chat_pick_h + 2 * $chat_input_pad_y
 export const chat_row_estimate = 44
-// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, no icon. Its height, its
-// lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
+// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
+// one says more than a word (scene/widgets/chat_status.flecs: a thought's sparkle leads, a call's running dot trails),
+// chat_line_status across. Its height, its lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
 // table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_chat_guide, chat_guide_w wide)
 // at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
 export const chat_tool_h = 24
 export const chat_line_pad = 4
 export const chat_line_chevron = 10
+export const chat_line_status = 12
 export const chat_guide_x = 8
 export const chat_guide_w = 1
 export const chat_line_inset = 22
@@ -458,9 +478,25 @@ export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
 export const chat_view_code = 20
 export const chat_view_code_hang = $chat_view_code + 2
-export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
-export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
-export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}
+// The chat's own palette, Notion's dark (and its light page): the chat is a document, not a terminal, so it does not take
+// the Ghostty theme's ground or inks (those stay the terminal's and the sidebar's). A near-black neutral page with no
+// blue or warm cast; depth from a few close steps of lightness, never from colour; text in three inks (words, quiet,
+// faint); hairlines at a few percent of white; the one accent (Notion's blue) only on what is pressable and on the
+// caret's selection, nowhere else. Drawn in the window's appearance (chat.rs `chat_dark`).
+export const tone_chat_ground: Fill = {dark: {0.098, 0.098, 0.098, 1}, light: {1, 1, 1, 1}}
+export const tone_chat_ink: Fill = {dark: {1, 1, 1, 0.84}, light: {0.216, 0.208, 0.184, 1}}
+export const tone_chat_muted: Fill = {dark: {1, 1, 1, 0.46}, light: {0.216, 0.208, 0.184, 0.58}}
+export const tone_chat_faint: Fill = {dark: {1, 1, 1, 0.26}, light: {0.216, 0.208, 0.184, 0.32}}
+export const tone_chat_line: Fill = {dark: {1, 1, 1, 0.075}, light: {0.216, 0.208, 0.184, 0.10}}
+export const tone_chat_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.137, 0.514, 0.886, 1}}
+export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.055}, light: {0.216, 0.208, 0.184, 0.045}}
+export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.03}, light: {0.216, 0.208, 0.184, 0.028}}
+export const tone_chat_input: Fill = {dark: {0.129, 0.129, 0.129, 1}, light: {1, 1, 1, 1}}
+export const tone_chat_input_edge: Fill = {dark: {1, 1, 1, 0.09}, light: {0.216, 0.208, 0.184, 0.14}}
+// Inline code amid the words: the UI face on a faint plate (no monospace in prose), in the words' own ink.
+export const tone_chat_code: Fill = {dark: {1, 1, 1, 0.07}, light: {0.216, 0.208, 0.184, 0.06}}
+// A text caret: plain white on the dark page (near-black on the light one), no accent: colour that says nothing.
+export const tone_caret: Fill = {dark: {1, 1, 1, 0.92}, light: {0.10, 0.10, 0.10, 0.92}}
 // A cell's own UI in the chat (scene/widgets/genui.flecs, src/app/chat/genui.rs): the space between its elements, and
 // a Stat's value, set large.
 export const gen_gap = 8
@@ -609,17 +645,9 @@ code_ink {
   variable { builtin { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.812, 0.133, 0.180, 1}} } }
 }
 
-// Kip in the app's chrome (the ui.Mascot primitive's `Kip`, kip.flecs): how tall he stands where he shows, and where.
-// An empty chat: kip_greet points tall, his feet kip_greet_lift above the composer's middle. While the agent works he
-// perches on the composer's top edge, kip_perch tall, kip_perch_in in from its right; a turn's end shows happy (or oops
-// on an error) for kip_outcome_secs, its last kip_outcome_fade fading. No chats: kip_empty tall over the empty pane's
-// note. The Archive with nothing in it: kip_archive tall over its note.
-export const kip_greet = 60
-export const kip_greet_lift = 18
-export const kip_perch = 24
-export const kip_perch_in = 30
-export const kip_outcome_secs = 2.6
-export const kip_outcome_fade = 0.4
+// Kip in the app's chrome (the ui.Mascot primitive's `Kip`, kip.flecs): how tall he stands where he shows. Never in a
+// chat (no avatar there). No chats: kip_empty tall over the empty pane's note. The Archive with nothing in it:
+// kip_archive tall over its note.
 export const kip_empty = 72
 export const kip_archive = 44
 

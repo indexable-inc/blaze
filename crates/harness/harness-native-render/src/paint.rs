@@ -292,7 +292,7 @@ impl Painter {
         }
         let lay = Rc::new(if md {
             let m = crate::markdown::inline(text);
-            Layout::rich(&mut self.fonts, &m.text, &m.runs, &[], st, 0.0, width)
+            Layout::rich(&mut self.fonts, &m.text, &m.runs, &m.holes(st.size), st, 0.0, width)
         } else if code {
             Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
         } else if tabular {
@@ -329,7 +329,12 @@ impl Painter {
     fn layout_md_cut(&mut self, src: &str, style: &TextStyle, room: f32) -> (Rc<Layout>, crate::markdown::Inline) {
         let mut m = crate::markdown::inline(src);
         let st = set_of(style);
-        let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| Layout::rich(fonts, text, runs, &[], st, 0.0, 1.0e5);
+        let holes = m.holes(st.size);
+        let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| {
+            let n = text.encode_utf16().count();
+            let holes: Vec<crate::text::Hole> = holes.iter().copied().filter(|h| h.end <= n).collect();
+            Layout::rich(fonts, text, runs, &holes, st, 0.0, 1.0e5)
+        };
         let full = rich(&mut self.fonts, &m.text, &m.runs);
         if full.lines.iter().map(|l| l.width).fold(0.0, f32::max) <= room {
             return (Rc::new(full), m);
@@ -352,6 +357,10 @@ impl Painter {
         m.links.retain_mut(|l| {
             l.1 = l.1.min(keep);
             l.0 < l.1
+        });
+        m.tags.retain_mut(|t| {
+            t.end = t.end.min(keep);
+            t.start < t.end
         });
         m.text = cut;
         (Rc::new(lay), m)
@@ -650,6 +659,37 @@ impl Painter {
                             let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                             let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
+                        }
+                    }
+                    // Inline components on the same chip: one plate from the icon's hole to the end of the label, the
+                    // icon drawn in the hole in the look's ink (quiet: the label carries the meaning).
+                    let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
+                    if !tags.is_empty() {
+                        let (icon_ink, ref_shape) = crate::inline::look(e.world(), dark);
+                        let icon_style = TextStyle {
+                            size: size * crate::markdown::REF_ICON_SIZE_EM,
+                            line: set_of(&style).line,
+                            ..TextStyle::default()
+                        };
+                        for t in tags {
+                            let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
+                            let rects = spans_of(&lay, t.start, t.end);
+                            let last = rects.len().saturating_sub(1);
+                            for (k, r) in rects.iter().enumerate() {
+                                let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                                let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
+                                let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
+                                d.panel(panel_from(chip, [0.0; 4], ref_shape, rect, p.alpha));
+                            }
+                            // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
+                            let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
+                            let glyph = crate::inline::glyph(e.world(), &t.tag);
+                            let icon = self.layout(&glyph, &icon_style, 1.0e5);
+                            let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                            let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
+                            let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
+                            let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
+                            emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
                         }
                     }
                 }
@@ -1124,7 +1164,8 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
             let l = &lay.lines[li];
             (x, l.top, l.height)
         };
-        let w = (2.0 * sc).round().max(1.0) / sc;
+        // 1.5 points, whole device pixels (3 on a Retina display): crisp, never a smear between two.
+        let w = (1.5 * sc).round().max(1.0) / sc;
         let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
         let on = if t.blink { caret_blink(time - t.since) } else { 1.0 };
         if on > 0.004 {
@@ -1137,16 +1178,23 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
 pub const BLINK_PAUSE: f32 = 0.5;
 pub const BLINK_PERIOD: f32 = 1.2;
 
-/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then a smooth fade in and out
-/// every [`BLINK_PERIOD`].
+/// How long a blink's turn on or off takes, seconds: short, so the caret reads as on or off, not as pulsing.
+pub const BLINK_FADE: f32 = 0.08;
+
+/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then every [`BLINK_PERIOD`]
+/// on for half of it and off for the other half, each turn a [`BLINK_FADE`] ease (macOS's caret, softened by a frame).
 #[must_use]
 pub fn caret_blink(since: f32) -> f32 {
     let t = since - BLINK_PAUSE;
     if t <= 0.0 {
         return 1.0;
     }
-    let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
-    let k = (v + 0.5).clamp(0.0, 1.0);
+    let half = BLINK_PERIOD * 0.5;
+    let phase = t % BLINK_PERIOD;
+    // Off from `half`, back on from the period's end: the distance into each turn, as a share of its fade.
+    let k = if phase < half { 1.0 - ((phase - half + BLINK_FADE) / BLINK_FADE).clamp(0.0, 1.0) } else {
+        ((phase - BLINK_PERIOD + BLINK_FADE) / BLINK_FADE).clamp(0.0, 1.0)
+    };
     k * k * (3.0 - 2.0 * k)
 }
 

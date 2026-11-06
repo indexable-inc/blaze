@@ -18,6 +18,17 @@ pub struct MarkdownText {
     pub link_light: harness_native_ui_look_api::Rgba,
 }
 
+/// One inline component of inline markdown (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar): an entity
+/// of the `ui.inline` module per name (`ui.inline.Path`), drawn as a chip of its `Icon` and its label. `target` names the
+/// prop that says where a press goes (`loc`, `href`) and `line` the prop with a line in it (empty: none); with `file_icon`
+/// the icon is the target's file kind's (harness-native-ui-inline's files.rs), not the entity's own `Icon`.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct InlineRef {
+    pub target: ScriptString,
+    pub line: ScriptString,
+    pub file_icon: bool,
+}
+
 /// Where a truncated line loses its words for the ellipsis.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -121,14 +132,6 @@ pub struct KipStand {
     pub y: f32,
     pub dx: f32,
     pub dy: f32,
-}
-
-/// How long a `Kip` shown for a moment (a turn's outcome on the composer) stays, `secs`, the last `fade` of them fading
-/// out. Read from a scene prefab by its host; nothing draws it.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct KipLinger {
-    pub secs: f32,
-    pub fade: f32,
 }
 
 /// A block caret after the last glyph a node's words show (a `Pose.cut` types them on), in `ink`, from `at` to `until`
@@ -242,6 +245,7 @@ pub struct VectorText {
 hyperion_api_layouts::api_layouts! {
     "Text" => alias Text,
     "MarkdownText" => alias MarkdownText,
+    "InlineRef" => alias InlineRef,
     "OneLine" => alias OneLine,
     "Icon" => alias Icon,
     "Mark" => alias Mark,
@@ -252,7 +256,6 @@ hyperion_api_layouts::api_layouts! {
     "BlazeMark" => alias BlazeMark,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
-    "KipLinger" => alias KipLinger,
     "Caret" => alias Caret,
     "TextEdit" => alias TextEdit,
     "Highlight" => alias Highlight,
@@ -269,6 +272,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Text>().writable();
     world.component::<MarkdownText>().writable();
+    world.component::<InlineRef>().writable();
     world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();
@@ -279,7 +283,6 @@ pub fn register(world: &World) {
     world.component::<BlazeMark>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
-    world.component::<KipLinger>().writable();
     world.component::<Caret>().writable();
     world.component::<TextEdit>().writable();
     world.component::<Highlight>().writable();

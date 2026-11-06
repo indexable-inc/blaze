@@ -280,7 +280,7 @@ ui {
       Cursor: {shape: Text}
       TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+        caret_dark: $tone_ink_1.dark, caret_light: $tone_ink_1.light}
     }
   }
 

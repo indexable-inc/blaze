@@ -1,0 +1,40 @@
+// Inline components: the vocabulary of chips an agent writes in its words, `<Path loc="/Volumes/Projects/blaze">blaze</Path>`
+// (harness-native-ui-inline is the tag grammar; this module is what each name means). One entity per name: its icon
+// (`Icon`, or the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
+// the one with a line in it (`line`). A chip is the label in the UI face, medium, after its icon, on the plate the text's
+// MarkdownText gives code (`chip`), so each host tints both alike. A new component is an entity here; nothing in Rust
+// lists them. Depends on the primitives (prims.flecs: MarkdownText's chips) and the tokens.
+module ui.inline
+
+@tree ChildOf
+// What every chip shares: its icon's ink (quiet: the label carries the meaning) and its corners.
+look {
+  Fill: $tone_ink_3
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+}
+
+// A file or a folder: its kind's icon; a press opens it (at `line`), an Option-press shows it in the Finder.
+Path {
+  InlineRef: {target: "loc", line: "line", file_icon: true}
+}
+// A cell's FileRef, by the same name and props as in a ts cell's UI.
+FileRef {
+  InlineRef: {target: "path", line: "line", file_icon: true}
+}
+// A symbol in code (a type, a function): a press opens the file it is in, at its line.
+Symbol {
+  // cod-symbol-method
+  Icon: {glyph: ""}
+  InlineRef: {target: "loc", line: "line", file_icon: false}
+}
+// A web page: a press opens it in the browser.
+Link {
+  // cod-link
+  Icon: {glyph: ""}
+  InlineRef: {target: "href", line: "", file_icon: false}
+}
+// A tag with no entity here, or whose target is not a place: a warning icon, the error as its tooltip, no press.
+unknown {
+  // cod-warning
+  Icon: {glyph: ""}
+}

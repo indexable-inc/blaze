@@ -16,7 +16,7 @@ ex {
       text : ui.Words {
         Text: {s: "A text area wraps its words at its width and grows with them, a few lines tall at most, then scrolls."}
         TextEdit: {caret: 24, anchor: 2, mark_lo: 0, mark_hi: 0, focused: true,
-          caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
+          caret_dark: $tone_ink_1.dark, caret_light: $tone_ink_1.light}
       }
     }
   }

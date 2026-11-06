@@ -54,6 +54,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
+    ("scene/widgets/chat_status.flecs", include_str!("../scene/widgets/chat_status.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
@@ -2284,7 +2285,7 @@ mod tests {
         });
         assert!(bad.is_empty(), "{}", bad.join("\n"));
         // A scroll carries ui.Scroller's parts (from its second base) and its settings; the terminal's too.
-        for prefab in ["hn.Tree", "hn.Terminal", "ui.TextArea"] {
+        for prefab in ["hn.Tree", "hn.Terminal", "ui.TextArea", "ui.field.GrowingTextArea"] {
             let v = View::root(world.world_ref(), prefab);
             for part in ["track_y", "knob_y", "track_x", "knob_x"] {
                 let p = v.part(part).unwrap_or_else(|| panic!("{prefab} has no scroller part {part}"));
@@ -2303,6 +2304,8 @@ mod tests {
             "hn.ChatTableField", "hn.ChatTableFieldMd", "hn.ChatTable", "hn.ChatResults", "hn.ChatResult",
             "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep", "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput",
             "hn.ChatOutputError", "hn.ChatCodeToggle", "ex.TableDemo",
+            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.chat_status.working", "hn.chat_status.ended",
+            "hn.chat_status.running", "hn.chat_status.no_result",
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
             "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
@@ -2315,5 +2318,16 @@ mod tests {
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())
         .collect();
         assert!(missing.is_empty(), "prefabs the code names but no scene has: {missing:?}");
+        // The scene's modules are modules, and the inline vocabulary has what the painter and a press read
+        // (harness_native_render::inline).
+        let w = world.world_ref();
+        let module = w.try_lookup("flecs::core::Module").expect("flecs has no flecs.core.Module");
+        for m in ["ui::inline", "hn::chat_status"] {
+            assert!(w.try_lookup(m).is_some_and(|e| e.has(module)), "{m} is not a module");
+        }
+        for e in ["look", "unknown", "Path", "FileRef", "Symbol", "Link"] {
+            let path = format!("{}::{e}", harness_native_render::inline::MODULE);
+            assert!(w.try_lookup(&path).is_some(), "the scene has no {path}");
+        }
     }
 }

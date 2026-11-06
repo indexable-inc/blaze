@@ -2,8 +2,10 @@
 //! faces they asked for as runs: `**bold**` / `__bold__`, `*italic*` / `_italic_`, `***both***`, `` `code` `` (and
 //! ``` ``code with ` in it`` ```), `[words](url)` as its words (in the link ink), `\*` as a plain star. Blocks (fences,
 //! lists, quotes) are the host's rows, not this; [`table`] reads a GitHub table's lines into its cells for the host's
-//! table row. Ranges are UTF-16 units of the plain text, as layouts count.
-use crate::text::{Face, Run};
+//! table row. Inline components (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar) become their label
+//! after a hole the painter draws the component's icon in, on a chip. Ranges are UTF-16 units of the plain text, as
+//! layouts count.
+use crate::text::{Face, Hole, Run};
 
 /// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip) and the links (their
 /// words' range and where they go).
@@ -13,7 +15,34 @@ pub struct Inline {
     pub runs: Vec<Run>,
     pub code: Vec<(usize, usize)>,
     pub links: Vec<(usize, usize, String)>,
+    /// The inline components: each one's range (its icon's hole first, then its label) and its tag.
+    pub tags: Vec<InlineTag>,
 }
+
+/// One inline component in the words: `start` is its icon's hole (one unit, [`crate::text::HOLE`]), its label runs to
+/// `end`. The painter draws its chip and icon from the scene's `ui.inline.<name>`; a press opens its target there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineTag {
+    pub start: usize,
+    pub end: usize,
+    pub tag: harness_native_ui_inline::Tag,
+}
+
+impl Inline {
+    /// The holes the components' icons stand in, for words set at `size`: [`REF_ICON_EM`] wide, as tall as the words.
+    #[must_use]
+    pub fn holes(&self, size: f32) -> Vec<Hole> {
+        self.tags
+            .iter()
+            .map(|t| Hole { start: t.start, end: t.start + 1, width: size * REF_ICON_EM, ascent: 0.0, descent: 0.0, pad: 0.0 })
+            .collect()
+    }
+}
+
+/// An inline component's icon hole, in ems of its words: the icon ([`REF_ICON_SIZE_EM`]) and the room before its label.
+pub const REF_ICON_EM: f32 = 1.3;
+/// Its icon's size, in ems of the words.
+pub const REF_ICON_SIZE_EM: f32 = 0.9;
 
 /// An inline code span's chip, in ems of its text's size: the plate reaches `CHIP_INSET_EM` past the span's glyphs each
 /// side, and keeps `CHIP_GAP_EM` clear of a neighbour that is not white space (a word space is gap enough on its own). The
@@ -22,10 +51,6 @@ pub const CHIP_INSET_EM: f32 = 0.3;
 pub const CHIP_GAP_EM: f32 = 0.15;
 /// The chip's corners, points.
 pub const CHIP_RADIUS: f32 = 3.0;
-/// Inline code's size, in ems of its words'. A monospace reads larger than Inter at the same size though its x-height is
-/// lower (Berkeley Mono's is 0.95 of Inter's): its letters are wider (an `a` is 0.60 em against Inter's 0.56), so matching
-/// x-heights would make it larger still. At 0.9 em it reads at the words' size, as GitHub and MDN set it.
-pub const INLINE_CODE_EM: f32 = 0.9;
 
 /// The room (points) the typesetter leaves before and after the code span `lo..hi` of `units` (UTF-16) set at `size`: kerned
 /// in after the unit before it and after its last unit. None before a span that starts the text (no unit to kern; its
@@ -126,6 +151,23 @@ pub fn inline(src: &str) -> Inline {
                 }
                 i += n;
             }
+            '<' if chars.get(i + 1).is_some_and(char::is_ascii_uppercase) => match harness_native_ui_inline::tag(&chars, i) {
+                // An inline component: a hole for its icon, then its label (plain words), all in the chip's face.
+                Some((tag, next)) => {
+                    let start = at;
+                    push(&mut out, &mut at, crate::text::HOLE);
+                    for ch in tag.label.chars() {
+                        push(&mut out, &mut at, ch);
+                    }
+                    out.runs.push(Run { start, end: at, face: Face::InlineRef });
+                    out.tags.push(InlineTag { start, end: at, tag });
+                    i = next;
+                }
+                None => {
+                    push(&mut out, &mut at, c);
+                    i += 1;
+                }
+            },
             '[' => {
                 // [words](url): the words, the url dropped.
                 let close = chars[i + 1..].iter().position(|&t| t == ']').map(|k| i + 1 + k);
@@ -179,7 +221,9 @@ pub fn inline(src: &str) -> Inline {
         };
         // Cut around the code spans inside it.
         let mut from = a;
-        for &(cs, ce) in out.code.iter().filter(|(cs, ce)| *ce > a && *cs < b) {
+        let mut chips: Vec<(usize, usize)> = out.code.iter().copied().chain(out.tags.iter().map(|t| (t.start, t.end))).collect();
+        chips.sort_unstable();
+        for &(cs, ce) in chips.iter().filter(|(cs, ce)| *ce > a && *cs < b) {
             if cs > from {
                 out.runs.push(Run { start: from, end: cs, face });
             }

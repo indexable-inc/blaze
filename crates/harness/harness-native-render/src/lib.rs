@@ -8,6 +8,7 @@ pub mod draw;
 pub mod gpu;
 pub mod highlight;
 pub mod icons;
+pub mod inline;
 pub mod kip;
 pub mod kips;
 pub mod markdown;

@@ -12,6 +12,9 @@ pub use harness_native_ui_layout::{Estimate, Measure, typeset};
 pub const SCENES: &[(&str, &str)] = &[
     ("06-prims", include_str!("../scene/prims.flecs")),
     ("07-kip", include_str!("../scene/kip.flecs")),
+    ("08-field", include_str!("../scene/field.flecs")),
+    // The `ui.inline` module: inline components' vocabulary (harness-native-ui-inline is its grammar).
+    ("08-inline", include_str!("../scene/inline.flecs")),
 ];
 
 /// The gallery scene: one of each primitive. Loaded by the gallery test and by a dev command, never by the app's scene.
