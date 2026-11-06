@@ -1,4 +1,5 @@
-//! Live pictures for the generative UI's `Shader` and `Video` elements: what a `Surface` node shows. One [`Media`] per
+//! Live pictures for the generative UI's `Shader` and `Video` elements and the embedded browser's views (browser.rs):
+//! what a `Surface` node shows. One [`Media`] per
 //! `Renderer`, shared with the app as `Rc<RefCell<Media>>` (`Renderer::media`). Each frame the app lists what it wants as
 //! [`Spec`]s in `Draw::media`; `Renderer::render` hands them to [`Media::prepare`] before it encodes, then binds
 //! [`Media::texture`] for each Surface it draws.
@@ -10,6 +11,7 @@
 //! Threading: everything here runs on the thread that calls `prepare`, the main thread in the app and in the offscreen
 //! shot. AVPlayer and AVPlayerItem are main-thread-only in objc2 (`MainThreadOnly`), so a video asked for off the main
 //! thread is refused in words; shaders work on any one thread.
+pub mod browser;
 pub mod shader;
 pub mod video;
 
@@ -34,6 +36,13 @@ const PUMP_MAX: usize = 64;
 pub enum Spec {
     Shader(ShaderSpec),
     Video(VideoSpec),
+    Browser(BrowserSpec),
+}
+
+/// A harness browser view something on screen shows this frame (its Surface key is [`browser::key`]): keeps its ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserSpec {
+    pub view: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +122,7 @@ pub struct VideoState {
 pub struct Media {
     shaders: shader::Shaders,
     videos: video::Videos,
+    browsers: browser::Browsers,
     /// This frame's number (one per `prepare`), and the last frame whose window pass has finished on the GPU: a picture
     /// or video frame last drawn at a serial at or below `done` may be written over or let go.
     serial: u64,
@@ -125,6 +135,7 @@ impl Media {
         Self {
             shaders: shader::Shaders::new(dev),
             videos: video::Videos::new(dev),
+            browsers: browser::Browsers::new(dev),
             serial: 0,
             done: Arc::default(),
         }
@@ -141,14 +152,14 @@ impl Media {
             .iter()
             .filter_map(|s| match s {
                 Spec::Shader(s) => Some(s),
-                Spec::Video(_) => None,
+                Spec::Video(_) | Spec::Browser(_) => None,
             })
             .collect();
         let videos: Vec<&VideoSpec> = specs
             .iter()
             .filter_map(|s| match s {
                 Spec::Video(v) => Some(v),
-                Spec::Shader(_) => None,
+                Spec::Shader(_) | Spec::Browser(_) => None,
             })
             .collect();
         // A video a visible shader samples pulls frames even when its own element is out of sight (a texture-only player).
@@ -163,13 +174,59 @@ impl Media {
             .collect();
         self.videos.prepare(&videos, &sampled, now, done);
         self.shaders.prepare(&shaders, &self.videos, now, done);
+        let browsers: Vec<&BrowserSpec> = specs
+            .iter()
+            .filter_map(|s| match s {
+                Spec::Browser(b) => Some(b),
+                Spec::Shader(_) | Spec::Video(_) => None,
+            })
+            .collect();
+        self.browsers.prepare(&browsers, now, done);
+    }
+
+    /// A browser view's frames now go to `surfaces` (`AppDown::Ring`'s ports, in slot order). The error names the view
+    /// and what was wrong with the ring.
+    pub fn browser_ring(
+        &mut self,
+        view: u64,
+        generation: u32,
+        w: u32,
+        h: u32,
+        surfaces: Vec<harness_mach::iosurface::Surface>,
+    ) -> Result<(), String> {
+        self.browsers.ring(view, generation, w, h, surfaces)
+    }
+
+    /// A browser view's newest picture is in `slot` (`AppDown::Frame`); a stale generation is dropped.
+    pub fn browser_frame(&mut self, view: u64, generation: u32, slot: u8, seq: u64) -> Result<(), String> {
+        self.browsers.frame(view, generation, slot, seq)
+    }
+
+    /// The host closed a browser view: let its ring go.
+    pub fn browser_forget(&mut self, view: u64) {
+        self.browsers.forget(view);
+    }
+
+    /// Where Media reports each browser view's latch (the app sends `AppUp::Latched`).
+    pub fn set_browser_latch(&mut self, sink: browser::LatchSink) {
+        self.browsers.set_latch(sink);
+    }
+
+    /// Whether a browser view has a picture to show yet.
+    #[must_use]
+    pub fn browser_showing(&self, view: u64) -> bool {
+        self.browsers.showing(view)
     }
 
     /// What a Surface samples now for `key` (a finished frame only) and its size in texels. Marks it drawn by this frame,
     /// so it is not written over or let go until this frame's pass has finished.
     #[must_use]
     pub fn texture(&self, key: u64) -> Option<(&Tex, [u32; 2])> {
-        let t = self.shaders.front(key, self.serial).or_else(|| self.videos.front(key, self.serial))?;
+        let t = self
+            .shaders
+            .front(key, self.serial)
+            .or_else(|| self.videos.front(key, self.serial))
+            .or_else(|| self.browsers.front(key, self.serial))?;
         Some((t, [t.width() as u32, t.height() as u32]))
     }
 
@@ -200,7 +257,7 @@ impl Media {
     /// draw again next frame.
     #[must_use]
     pub fn moving(&self) -> bool {
-        self.shaders.moving() || self.videos.moving()
+        self.shaders.moving() || self.videos.moving() || self.browsers.moving()
     }
 
     /// Let the main run loop handle what is waiting on it (AVFoundation posts its players' status, time and first frames

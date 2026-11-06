@@ -728,7 +728,8 @@ pub(super) fn resolved(live: &Live, e: u64) -> Option<(Vec<[f32; 4]>, Vec<Input>
 impl App {
     /// The host's Media (the renderer's), which the cells' Shaders and Videos are drawn by.
     pub fn set_media(&mut self, media: Rc<RefCell<Media>>) {
-        self.genui.get_mut().surf.media = Some(media);
+        self.genui.get_mut().surf.media = Some(media.clone());
+        self.browser_media(media);
     }
 
     /// A press on a Shader or a Video (app.rs `actions`, `media:<what>:<entity>`): `play` plays or pauses a video

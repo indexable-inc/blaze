@@ -29,6 +29,7 @@ harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 harness-native-ui-motion = { path = "../harness-native-ui-motion" }
 harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
 harness-native-ui-state-api = { path = "../harness-native-ui-state-api" }
+harness-native-ui-browser-api = { path = "../harness-native-ui-browser-api" }
 harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
 harness-native-ui-prims = { path = "../harness-native-ui-prims" }
@@ -61,6 +62,8 @@ objc2-core-graphics = "0.3"
 objc2-core-foundation = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
+# The embedded browser's link to its host (src/app/browser.rs).
+harness-mach = { path = "../harness-mach" }
 
 [lints.rust]
 unsafe_code = "allow"

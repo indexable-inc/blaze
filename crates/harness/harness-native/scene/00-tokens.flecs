@@ -799,3 +799,19 @@ export const gen_settle_zeta = 1
 export const gen_drag_slop = 3
 export const gen_shape_omega = 22
 export const gen_shape_zeta = 1
+
+// ---- the embedded browser ---------------------------------------------------------------------------------------------
+// The harness browser's views (src/app/browser.rs; crates/harness/harness-browser). A chat card (hn.GenBrowser) shows the
+// page at gen_browser_aspect (width over height, 16:10) above its title and address, a gen_browser_load hairline in
+// tone_browser_load along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
+// web_pane_w wide, opening and folding on the sidebar's spring; its toolbar is web_toolbar_h tall with the address in a
+// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h.
+export const gen_browser_aspect = 1.6
+export const gen_browser_load = 2
+export const tone_browser_load: Fill = $tone_accent
+export const web_pane_w = 520
+export const web_toolbar_h = 40
+export const web_url_h = 26
+export const web_menu_w = 240
+export const web_popup_w = 360
+export const web_popup_h = 480

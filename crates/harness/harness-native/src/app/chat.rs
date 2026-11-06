@@ -589,6 +589,7 @@ fn empty_value(v: &Value) -> bool {
             "text" => blank("v"),
             "error" => blank("stack") && blank("message"),
             "scalar" => false,
+            "browser" => v["view"].as_u64().is_none_or(|n| n == 0),
             _ => true,
         },
     }
@@ -2190,7 +2191,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         Row::Ui { v, cell, block, code } => {
             genui::fill_in(row, v, cell, ctx.cells, ctx.ui, ctx.playing, measure);
             // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
-            if let Some(b) = row.part("code_at").and_then(|z| z.part("code")) {
+            if let Some(b) = row.part("code_at").and_then(|z| z.part("code")).filter(|_| !block.is_empty()) {
                 b.action(&format!("chat:open:{}", code_key(block)));
                 tooltip(b, if *code { "Hide code" } else { "Show code" });
                 if let Some(i) = b.part("icon") {

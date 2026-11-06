@@ -774,10 +774,12 @@ impl Daemon {
                 for s in self.sessions.lock().values() {
                     s.kill();
                 }
+                crate::browser::stop();
                 let _ = std::fs::remove_file(paths::sock());
                 std::process::exit(0);
             }
             Req::Runs(r) => Reply::Record(runs::handle(r)?),
+            Req::Browser => crate::browser::request()?,
             Req::UiEvent { cell, handler, value } => {
                 FEEDS.lock().deliver(crate::ui_feed::UiEv { cell, handler, value }).map_err(anyhow::Error::msg)?;
                 Reply::Ok

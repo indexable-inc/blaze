@@ -16,7 +16,11 @@ needs no OK.
 
 ## The calls
 
-gmail.* works through Andrew's logged-in Dia (CDP :9222), via Gmail's own web endpoints.
+gmail.* works through the harness browser's profile (embedded Chromium the daemon runs), via Gmail's own web
+endpoints. Andrew signs in to Google once in the browser pane (cmd+shift+B); until then each call fails saying so.
+
+- via({ cdp: 'http://127.0.0.1:9222' }) points gmail.* (only them, for this kernel's life) at another browser's
+  DevTools endpoint instead, as HARNESS_GMAIL_CDP does; via({ cdp: null }) goes back. Never chosen on its own.
 
 - search(query, { limit? = 25 (max 100), page? = 0 }): Promise<Table<{ id: 'thread-f:…'; subject; from; fromEmail;
   date: Date; snippet; labels: string[]; unread; messages: number }>> — Gmail search syntax ('is:unread',

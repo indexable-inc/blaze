@@ -59,6 +59,12 @@ const HANDLERS: &[(&str, Handler)] = &[
         a.chat_edit(&op);
     }),
     ("ToggleSidebar", |a, _, _| a.toggle_sidebar()),
+    // The browser pane (src/app/browser.rs).
+    ("ToggleWeb", |a, _, _| a.toggle_web()),
+    ("WebFocusUrl", |a, _, _| a.web_focus_url()),
+    ("WebBack", |a, _, _| a.web_nav(harness_proto::browser::Nav::Back)),
+    ("WebForward", |a, _, _| a.web_nav(harness_proto::browser::Nav::Forward)),
+    ("WebReload", |a, _, _| a.web_nav(harness_proto::browser::Nav::Reload)),
     // cmd+K: the palette, or closed again (over the picker, the palette takes its place).
     ("Palette", |a, _, _| {
         a.palette = if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Commands) {
@@ -231,6 +237,8 @@ impl App {
             &[keys::PICKER]
         } else if self.palette.is_some() {
             &[keys::PALETTE]
+        } else if self.browser_focused() {
+            &[keys::BROWSER]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
         } else if self.genui_editing() {

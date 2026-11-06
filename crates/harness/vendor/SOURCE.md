@@ -23,3 +23,12 @@
 - Added for den: `hyperion-flecs-c/wasm-libc` (headers and libc.c, the C library calls flecs makes, for wasm32 only),
   `hyperion-flecs-c/csrc/layout.c` (C struct sizes for the binding check) and the Rust allocator in
   `hyperion-flecs-c/src/lib.rs`.
+
+# cef-dll-sys (the embedded browser's CEF bindings)
+
+- Copied from tauri-apps/cef-rs (`sys/`, the `dev` branch at version `156.3.0+156.0.15`, fetched 2026-11-06), licence
+  Apache-2.0 OR MIT (LICENSE-APACHE, LICENSE-MIT beside it): `src/bindings/aarch64_apple_darwin.rs` unchanged (bindgen's
+  output for CEF 156.0.15's C API). Dropped: every other target's bindings, `wrapper.h`, the download and cmake build.
+- `build.rs` is ours: it reads the pinned CEF `scripts/cef.py` fetched and verified, and compiles only
+  `libcef_dll/wrapper/libcef_dll_dylib.cc` with `cc` (crates/harness/harness-browser/README.md). `src/lib.rs` is cut to the
+  bindings, `FRAMEWORK_PATH` and `get_cef_dir`. `[patch.crates-io]` in the workspace makes the `cef` crate use it.

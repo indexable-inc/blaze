@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 mod archive;
+mod browser;
 mod chat;
 mod fold;
 mod keys;
@@ -61,6 +62,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/context.flecs", include_str!("../scene/widgets/context.flecs")),
     ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/steps.flecs", include_str!("../scene/widgets/steps.flecs")),
+    ("scene/widgets/web.flecs", include_str!("../scene/widgets/web.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -284,6 +286,8 @@ pub struct App {
     stats: stats::Stats,
     /// The user's Ghostty config, live: the terminal's themes, font size and padding (src/app/ghostty.rs).
     look: ghostty::Look,
+    /// The embedded browser: its link to the host, the pane, the views' input (app/browser.rs).
+    browser: browser::Browser,
 }
 
 /// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
@@ -341,6 +345,7 @@ fn scene_world() -> Result<World, String> {
     crate::pane::register(&world);
     crate::look::register(&world);
     archive::register(&world);
+    browser::register(&world);
     stats::register(&world);
     crate::keys::register(&world);
     view::register(&world);
@@ -438,6 +443,7 @@ impl App {
             model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
         let look = ghostty::Look::new(wake.clone());
+        let browser_wake = wake.clone();
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
@@ -464,6 +470,10 @@ impl App {
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         root.child("hn.Seam");
         let main = root.child("hn.Main");
+        // The browser pane on the right (scene/widgets/web.flecs): its clip folds, the pane inside keeps its width.
+        let web_clip = root.child("hn.WebClip");
+        let web_pane = web_clip.child("hn.WebPane").id();
+        let web_clip = web_clip.id();
         let bar = View::root(w, "hn.TitleBar");
         let ids = Ids {
             tree: tree.id(),
@@ -538,6 +548,7 @@ impl App {
             keys_gen: 0,
             stats: stats::Stats::default(),
             look,
+            browser: browser::Browser::new(browser_wake, web_clip, web_pane),
         };
         app.apply_ghostty();
         app.load_keys()?;
@@ -1595,6 +1606,7 @@ impl App {
         self.step_sidebar(dt);
         self.step_side_drag(dt);
         self.lay_chrome(z);
+        self.browser_frame_start(dt);
         self.step_fold();
         self.step_tree_scroll(dt);
         self.step_chat_scroll();
@@ -1651,6 +1663,8 @@ impl App {
         self.emit(&mut d, scale, upload);
         // The cells' Shaders and Videos: what Media should render and play, now that the paint says which are visible.
         self.step_media(&mut d, dt, scale);
+        // The browser views on screen: kept, watched, and the pane's sized (app/browser.rs).
+        self.browser_frame_end(&mut d, scale);
         if self.paint.get_mut().end_frame() {
             self.poke();
         }
@@ -1864,6 +1878,9 @@ impl App {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
                 self.genui_action(ev);
+            } else if let Some(w) = a.strip_prefix("web:") {
+                // The browser pane's toolbar and menu, a chat card's press (app/browser.rs).
+                self.web_action(w);
             } else if let Some(m) = a.strip_prefix("media:") {
                 // A press on a cell's Shader or Video (chat/genui/surface.rs): play, mute, resume.
                 self.media_action(m);
@@ -2461,7 +2478,8 @@ mod tests {
             "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
             "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
             "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
-            "hn.GenTone.series1", "hn.GenTone.series8",
+            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.WebClip", "hn.WebPane",
+            "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

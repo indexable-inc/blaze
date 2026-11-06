@@ -40,5 +40,6 @@ swiftui_gallery : ui.Column {
     animate : ex.AnimateDemo {}
     menu : ex.MenuDemo {}
     search_menu : ex.SearchMenuDemo {}
+    browser : ex.BrowserDemo {}
   }
 }

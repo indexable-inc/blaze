@@ -700,6 +700,11 @@ impl App {
             self.side_drag_move();
             return;
         }
+        // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
+        if self.browser_pointer_move(m) {
+            self.poke();
+            return;
+        }
         if self.chat_pointer_drag() {
             return;
         }
@@ -750,6 +755,10 @@ impl App {
         if self.palette.is_some() {
             return;
         }
+        // A press on a live browser page focuses it and goes there; one elsewhere takes the keyboard from it.
+        if self.browser_pointer_down(b, clicks, m) {
+            return;
+        }
         // A press on a scroll's overlay scroller is the scroller's (ui.Scroller: the UI layer drags or pages it), not the
         // pane's, its transcript's or its terminal's.
         if self.world.lookup(APP).target(Hovered::id(), 0).is_some_and(|h| h.has(ScrollerPart::id())) {
@@ -798,6 +807,10 @@ impl App {
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
+        }
+        if self.browser_pointer_up(b, m) {
+            self.poke();
+            return;
         }
         if b == Button::Left && self.chat_pointer_up() {
             return;
@@ -890,6 +903,9 @@ impl App {
 
     /// Command-A: everything in the focused terminal, history and screen.
     pub(super) fn select_all(&mut self) {
+        if self.palette.is_none() && self.browser_select_all() {
+            return;
+        }
         if self.chat_select_all() {
             return;
         }
@@ -1002,6 +1018,10 @@ impl App {
 
     /// A key no binding took: the palette's query, the Archive's search, the chat's input, else the focused terminal.
     fn key_unbound(&mut self, k: &term::KeyIn<'_>) {
+        // A browser view with the keyboard (or the pane's address field) takes every key ctx.Browser left.
+        if self.palette.is_none() && self.browser_key(k) {
+            return;
+        }
         if k.action != KeyAction::Release {
             if self.palette.is_some() {
                 self.palette_type(k.text);
@@ -1049,6 +1069,9 @@ impl App {
 
     /// Text an input method, the emoji picker or dictation committed: sent as typed to the focused terminal.
     pub fn commit_text(&mut self, text: &str) {
+        if self.palette.is_none() && self.browser_commit(text) {
+            return;
+        }
         self.set_marked(None);
         if let Some(p) = self.palette.as_mut() {
             if p.mode == super::Mode::Commands {
@@ -1066,6 +1089,9 @@ impl App {
 
     /// An input method's uncommitted text on the focused terminal (None: none).
     pub fn set_marked(&mut self, text: Option<String>) {
+        if self.palette.is_none() && self.browser_set_marked(text.as_deref()) {
+            return;
+        }
         if self.chat_set_marked(text.as_deref()) {
             return;
         }
@@ -1083,6 +1109,9 @@ impl App {
     }
 
     pub fn marked(&self) -> Option<String> {
+        if let Some(m) = self.browser_marked().filter(|_| self.palette.is_none()) {
+            return m;
+        }
         if let Some(m) = self.chat_marked() {
             return m;
         }
@@ -1097,6 +1126,9 @@ impl App {
     /// Where typed text goes (window points): the cell after the focused terminal's cursor and any marked text, for the
     /// input method's candidate window.
     pub fn caret_rect(&mut self) -> Option<[f32; 4]> {
+        if let Some(r) = self.browser_caret_rect().filter(|_| self.palette.is_none()) {
+            return r;
+        }
         if let Some(r) = self.chat_caret_rect() {
             return r;
         }
@@ -1117,6 +1149,10 @@ impl App {
     /// What Command-C puts on the pasteboard: the focused chat's selection, else the focused terminal's (None: nothing
     /// selected, so it does nothing). What it took pulses (`CopyFlash`, harness-native-render select.rs).
     pub fn copy(&mut self) -> Option<String> {
+        // A browser view with the keyboard copies onto the pasteboard itself.
+        if self.palette.is_none() && self.browser_copy() {
+            return None;
+        }
         if let Some(c) = self.chat_copy() {
             let (text, what) = c?;
             self.chat_flash(&what);
@@ -1137,6 +1173,9 @@ impl App {
     /// selected; a terminal's or a transcript's selection is read-only, so it stays).
     pub fn cut(&mut self) -> Option<String> {
         self.poke();
+        if self.palette.is_none() && self.browser_cut() {
+            return None;
+        }
         self.chat_cut()
     }
 
@@ -1151,6 +1190,9 @@ impl App {
     /// Text pasted (Command-V) into whatever has the keyboard: the palette's query (its first line), the Archive's search,
     /// the focused chat's input, else the focused terminal (bracketed when its program asked).
     pub fn paste(&mut self, text: &str) {
+        if self.palette.is_none() && self.browser_paste(text) {
+            return;
+        }
         if self.palette.is_some() {
             if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
                 p.query.push_str(text.lines().next().unwrap_or(""));

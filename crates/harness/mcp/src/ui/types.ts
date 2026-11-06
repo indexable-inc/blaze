@@ -301,6 +301,13 @@ export interface ShaderProps extends CommonProps {
   uniforms?: Readonly<Record<string, UniformValue>>; textures?: Readonly<Record<string, FileSource>>; animate?: boolean; id?: string;
 }
 
+/**
+ * A page of the harness browser (embedded Chromium the daemon runs), live: `view` is a page an agent opened (`page.view` of
+ * `browser.open(url)` or `withHiddenPage`), `src` an http(s) URL the app opens a view at; exactly one of them. Pressing it opens
+ * the view in the browser pane (cmd+shift+B).
+ */
+export interface BrowserProps extends CommonProps { view?: string; src?: string }
+
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
   Column: ColumnProps; Row: RowProps; Text: TextProps; Markdown: MarkdownProps; Code: CodeProps; Table: TableProps;
@@ -312,6 +319,7 @@ export interface ElementProps {
   Accordion: AccordionProps; Disclosure: DisclosureProps; Popover: PopoverProps; Menu: MenuProps; Dialog: DialogProps; Sheet: SheetProps;
   Toast: ToastProps; Progress: ProgressProps; Loading: LoadingProps; Skeleton: SkeletonProps; Icon: IconProps; Image: ImageProps;
   Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps; File: FileProps; CellRef: CellRefProps; Kip: KipProps; Video: VideoProps; Shader: ShaderProps;
+  Browser: BrowserProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */

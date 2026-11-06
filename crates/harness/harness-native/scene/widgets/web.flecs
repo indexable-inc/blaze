@@ -1,0 +1,93 @@
+// The browser pane (src/app/browser.rs; crates/harness/harness-browser's README, "In the app"): a harness browser view
+// beside the main card on the right, shown and hidden with cmd+shift+B, a card pressed in the chat opening it on that
+// card's view. Its state is data on `hn.web` (WebState: the view it shows, whether it is open, its width); the host
+// springs its clip toward that width on the sidebar's spring and lays the pane out at its full width inside, so the page
+// never relayouts mid-fold (the left sidebar's way, hn.SideClip).
+
+@tree ChildOf
+hn {
+  // What the pane shows and whether it is open. `width` 0 is web_pane_w.
+  web {
+    WebState: {view: 0, open: false, width: 0}
+  }
+
+  // The fold: a clip as wide as the spring leaves the pane (0 shut), its hairline seam on the main card's side, over the
+  // pane laid out at its full width from the clip's left edge.
+  prefab WebClip : ui.Row {
+    Clip
+    Fill: $tone_term_ground
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    seam : hn.Seam {}
+  }
+
+  // The address: the page's url, or what is typed while it is edited (a press, or cmd+L; Return goes, Escape puts the
+  // page's back). The host sets `text` and the field's look.
+  prefab WebUrl : ui.Row {
+    Pressable
+    Action: {name: "web:url"}
+    Cursor: {shape: Text}
+    Fill: $tone_wash
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    AlignSelf: {align: Center}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $web_url_h, min: 0, max: 0}}
+    Padding: {l: 10, r: 10, t: 0, b: 0}
+    text : ui.LineMiddle {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
+    }
+  }
+
+  // A toolbar button: borderless, its glyph set by the host.
+  prefab WebButton : ui.IconButton {
+    AlignSelf: {align: Center}
+    icon : ui.Symbol {}
+  }
+
+  // The pane: its toolbar (back, forward, reload, the address, extensions, close) under the title-bar strip, the loading
+  // hairline, then the page filling the rest. `menu` holds the extensions menu while it is open, floating under its
+  // button.
+  prefab WebPane : ui.Column {
+    Size: {w: {kind: Fixed, value: $web_pane_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    SafeAreaPadding: {l: false, r: false, t: true, b: false}
+    bar : ui.Row {
+      Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $web_toolbar_h, min: 0, max: 0}}
+      Padding: {l: 8, r: 8, t: 0, b: 0}
+      back : hn.WebButton { Action: {name: "web:back"}; Tooltip: {text: "Back"} }
+      forward : hn.WebButton { Action: {name: "web:forward"}; Tooltip: {text: "Forward"} }
+      reload : hn.WebButton { Action: {name: "web:reload"}; Tooltip: {text: "Reload"} }
+      url : hn.WebUrl {}
+      ext : hn.WebButton { Action: {name: "web:extensions"}; Tooltip: {text: "Extensions"} }
+      close : hn.WebButton { Action: {name: "web:close"}; Tooltip: {text: "Close"} }
+    }
+    load : ui.Node {
+      Fill: $tone_browser_load
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_browser_load, min: 0, max: 0}}
+    }
+    page : ui.Browser {
+      Shape: {radius: 0, n: 4, border: 0, feather: 0}
+      pic { Shape: {radius: 0, n: 4, border: 0, feather: 0} }
+    }
+    menu : ui.Node {}
+  }
+
+  // The extensions menu: under its button, web_menu_w wide. Its rows are the profile's extensions (a press shows one's
+  // action popup), then "Manage extensions…" and "Chrome Web Store…".
+  prefab WebMenu : ui.Menu {
+    Side: {edge: Bottom, dx: 0, dy: $menu_gap}
+    Size: {w: {kind: Fixed, value: $web_menu_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // An extension's action popup (a view of its own, owner `popup:<view>`): floating under the toolbar, its page's size.
+  prefab WebPopup : ui.Overlay {
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    Shape: {radius: $menu_radius, n: 4, border: 1, feather: 0}
+    Lift: {blur: $menu_lift_blur, alpha: $menu_lift_alpha, dy: $menu_lift_dy}
+    page : ui.Browser {
+      Size: {w: {kind: Fixed, value: $web_popup_w, min: 0, max: 0}, h: {kind: Fixed, value: $web_popup_h, min: 0, max: 0}}
+    }
+  }
+}

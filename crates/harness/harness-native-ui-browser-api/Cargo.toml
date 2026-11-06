@@ -1,0 +1,11 @@
+[package]
+name = "harness-native-ui-browser-api"
+description = "The embedded browser's view components: which harness browser view a node shows, and whether it has the keys"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }
