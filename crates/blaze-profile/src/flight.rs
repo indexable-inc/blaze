@@ -2856,6 +2856,14 @@ thread_local! {
     static TEXT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// The innermost span this thread is inside now, `None` for none or a thread with no ring yet:
+/// atomics only, it neither allocates nor claims a ring, so an allocator hook may call it.
+#[inline]
+pub fn innermost_span_id() -> Option<u64> {
+    let ring = MINE.try_with(Cell::get).ok().flatten()?;
+    Some(ring.innermost()).filter(|&id| id != 0)
+}
+
 #[inline]
 pub(crate) fn ring() -> Option<&'static Ring> {
     match MINE.with(Cell::get) {
@@ -3299,8 +3307,13 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     let pending = slot.pending.swap(0, Ordering::Relaxed);
     made_by.free(slot, id);
     let now = clock::ticks();
-    // The allocations as their count plus one, so 0 is "not counted".
-    let (allocs, bytes) = allocated().map_or((0, 0), |now| {
+    let ring = ring()?;
+    // Closed by another thread than made it: its own ring, but leased again since, is another
+    // thread's too.
+    let moved = ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease;
+    // The allocations as their count plus one, so 0 is "not counted". This thread's counters
+    // say nothing of a span opened on another, so a moved span records none.
+    let (allocs, bytes) = allocated().filter(|_| !moved).map_or((0, 0), |now| {
         let count = now.count.saturating_sub(opened.alloc.count).min(ALLOCS_MAX - 1);
         (count + 1, now.bytes.saturating_sub(opened.alloc.bytes))
     });
@@ -3309,11 +3322,7 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
         | u64::from(opened.depth.min((1 << DEPTH_BITS) - 1)) << (62 - SITE_BITS - DEPTH_BITS)
         | (ring_of(id) as u64) << ALLOCS_BITS
         | allocs;
-    let ring = ring()?;
     let cost = cost_from(ring);
-    // Closed by another thread than made it: its own ring, but leased again since, is another
-    // thread's too.
-    let moved = ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease;
     let ticks = now.wrapping_sub(opened.start);
     // Its self CPU: what the stretches it was open across gave it, and the ticks of this one,
     // which its row holds as a share of its duration for the reader to give this stretch's
