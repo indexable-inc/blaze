@@ -157,6 +157,23 @@ pub struct CopyLook {
     pub row_in: f32,
 }
 
+/// The text caret's one look (`ui.caret` in prims.flecs; den's CaretLook, shaders/den.slang's caret): a bar `w` points
+/// wide (whole device pixels), `h` of the font's size tall about its line's middle, corners `radius` round. A jump farther
+/// than its own height sweeps from where it was into where it is over `glide` seconds on an ease-out cubic (Ghostty's
+/// cursor_sweep), the sweep's tail at half the bar's ink. It stays solid `hold` seconds after it last moved, then blinks
+/// once every `blink` seconds, on for the first half, each turn eased over `fade` of the cycle. Drawn in the field's own
+/// caret ink (`TextEdit`), by the shader (harness.slang, panel kind 4), so the blink costs no paint pass.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaretLook {
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
+    pub glide: f32,
+    pub hold: f32,
+    pub blink: f32,
+    pub fade: f32,
+}
+
 /// A band across the node's width that joins two other nodes' heights, as a merge view joins a chunk in one pane to the same
 /// chunk in the next: its left end spans the height of `(RibbonFrom, a)`, its right end that of `(RibbonTo, b)`, and its edges
 /// ease between them. Drawn in the node's Fill, cut to the clip it sits in. An end shorter than `min` (a side with no lines
@@ -282,6 +299,7 @@ hyperion_api_layouts::api_layouts! {
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
     "CopyLook" => alias CopyLook,
+    "CaretLook" => alias CaretLook,
     "Scheme" => alias Scheme,
     "MascotLook" => alias MascotLook,
     "MascotMotion" => alias MascotMotion,
@@ -307,6 +325,7 @@ pub fn register(world: &World) {
     world.component::<HoverLook>().writable();
     world.component::<HoverInk>().writable();
     world.component::<CopyLook>().writable();
+    world.component::<CaretLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();
     world.component::<MascotLook>().writable();

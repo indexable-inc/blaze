@@ -1267,8 +1267,8 @@ impl App {
                 (t.model.clone(), effort.to_owned())
             };
             self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
-            // The send button: the stop while the agent works (breathing, the composer's one sign of work, so an idle chat
-            // lets the window rest), else the send, solid once there are words to send.
+            // The send button: the stop while the agent works (quiet, its ring breathing: the composer's one sign of work,
+            // so an idle chat lets the window rest), else the send, solid once there are words to send.
             if let Some(act) = bar.part("act") {
                 let (key, prefab, action) = if t.busy && !ended {
                     ("stop", "hn.ChatStop", format!("chat:stop:{sid}"))
@@ -1277,7 +1277,12 @@ impl App {
                 } else {
                     ("ready", "hn.ChatSendReady", format!("chat:send:{sid}"))
                 };
-                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| { v.action(&action); });
+                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| {
+                    v.action(&action);
+                    if key == "stop" {
+                        stop_look(v);
+                    }
+                });
             }
         }
     }
@@ -2427,26 +2432,49 @@ fn room(p: View<'_>, part: &str, gone: bool) {
     p.set(look.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default());
 }
 
-/// Show chat status `name` (`hn.chat_status.<name>`, scene/widgets/chat_status.flecs) on icon node `v`: its glyph, its
-/// tone and, for one that breathes, the running dot's breath (src/look.rs) while it shows, so nothing moves once the agent
+/// Show chat status `name` (`hn.chat_status.<name>`, scene/widgets/chat_status.flecs) on icon node `v`: its glyph (or
+/// its drawing, a Vector in its Stroke), its tone and, for one that breathes, the running dot's breath (src/look.rs) while it shows, so nothing moves once the agent
 /// is done; `None` shows nothing. Returns its words (the tooltip of whatever shows it), empty for none. Written only on
 /// change. The scene is compiled in, so a status it lacks is a bug.
 fn status_on(v: View<'_>, name: Option<&str>) -> String {
     use crate::look::Breath;
+    use harness_native_ui_look_api::Stroke;
+    use harness_native_ui_text_api::{Icon, Vector};
     let e = v.entity();
     let Some(name) = name else {
         v.icon("");
         if e.has(Breath::id()) {
             e.remove(Breath::id());
         }
+        if e.has(Vector::id()) {
+            e.remove(Vector::id());
+        }
         return String::new();
     };
     let s = view::prefab(e.world(), &format!("hn.chat_status.{name}"))
         .unwrap_or_else(|| panic!("the scene has no hn.chat_status.{name} (scene/widgets/chat_status.flecs)"));
-    let glyph = s
-        .try_cloned::<&harness_native_ui_text_api::Icon>()
-        .unwrap_or_else(|| panic!("hn.chat_status.{name} has no Icon"));
-    v.icon(glyph.glyph.as_str());
+    // Its glyph, or its drawing (a Vector in its Stroke: the draw pass paints an Icon first, so the Icon goes).
+    match (s.try_cloned::<&Icon>(), s.try_cloned::<&Vector>()) {
+        (_, Some(vec)) => {
+            if e.has(Icon::id()) {
+                e.remove(Icon::id());
+            }
+            let stroke = s.try_cloned::<&Stroke>().unwrap_or_else(|| panic!("hn.chat_status.{name} has a Vector but no Stroke"));
+            if e.try_cloned::<&Stroke>() != Some(stroke) {
+                v.set(stroke);
+            }
+            if e.try_cloned::<&Vector>().as_ref() != Some(&vec) {
+                v.set(vec);
+            }
+        }
+        (Some(glyph), None) => {
+            if e.has(Vector::id()) {
+                e.remove(Vector::id());
+            }
+            v.icon(glyph.glyph.as_str());
+        }
+        (None, None) => panic!("hn.chat_status.{name} has neither an Icon nor a Vector"),
+    }
     let fill = s.try_cloned::<&Fill>().unwrap_or_else(|| panic!("hn.chat_status.{name} has no Fill"));
     if e.try_cloned::<&Fill>() != Some(fill) {
         v.set(fill);
@@ -2461,6 +2489,24 @@ fn status_on(v: View<'_>, name: Option<&str>) -> String {
         _ => {}
     }
     s.try_cloned::<&Tooltip>().map(|t| t.text.as_str().to_owned()).unwrap_or_default()
+}
+
+/// The stop (hn.ChatStop): its ring and square in the bar's muted ink, brightening toward the words' ink by its hover
+/// spring (hn.ChatControlInk, as the picker's words). Written only on change.
+fn stop_look(v: View<'_>) {
+    use harness_native_ui_look_api::Stroke;
+    let ink = pick::ControlInk::of(v.entity().world()).now(v);
+    if let Some(r) = v.part("ring") {
+        let s = Stroke { dark: ink.dark, light: ink.light };
+        if r.entity().try_cloned::<&Stroke>() != Some(s) {
+            r.set(s);
+        }
+    }
+    if let Some(q) = v.part("square")
+        && q.entity().try_cloned::<&Fill>() != Some(ink)
+    {
+        q.set(ink);
+    }
 }
 
 /// Set node `v`'s tooltip to `s`, or take it away when `s` is empty (written only on change).
