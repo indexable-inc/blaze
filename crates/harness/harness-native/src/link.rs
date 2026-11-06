@@ -198,22 +198,19 @@ fn runs(limit: usize, before: Option<u64>, q: Option<String>) -> std::io::Result
         .map(|v| v["runs"].as_array().cloned().unwrap_or_default()))
 }
 
-/// The `harness` binary to start the daemon with: `$HARNESS_BIN`, else this workspace's `target/release/harness` (or
-/// debug), else `harness` on PATH.
-fn harness_bin() -> Option<PathBuf> {
+/// The `harness` binary to start the daemon with: `$HARNESS_BIN`, else the `harness` next to this app's own binary
+/// (one build makes both, so the app never starts a daemon from another build).
+fn harness_bin() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("HARNESS_BIN") {
-        return Some(p.into());
+        return Ok(p.into());
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    for p in ["target/release/harness", "target/debug/harness"] {
-        let p = root.join(p);
-        if p.is_file() {
-            return Some(p);
-        }
+    let exe = std::env::current_exe().map_err(|e| format!("harness-native: locating its own binary: {e}"))?;
+    let bin = exe.with_file_name("harness");
+    if bin.is_file() {
+        Ok(bin)
+    } else {
+        Err(format!("no harness binary next to {}: build it with this app (cargo build -p harness -p harness-native) or set HARNESS_BIN", exe.display()))
     }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path).map(|d| d.join("harness")).find(|p| p.is_file())
-    })
 }
 
 /// Connect, or start the daemon and wait for its socket (100 tries 50 ms apart, as the CLI does).
@@ -221,9 +218,7 @@ pub fn ensure_daemon() -> Result<(), String> {
     if UnixStream::connect(sock()).is_ok() {
         return Ok(());
     }
-    let bin = harness_bin().ok_or(
-        "no harness binary: build it (cargo build -p harness --release) or set HARNESS_BIN",
-    )?;
+    let bin = harness_bin()?;
     std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
