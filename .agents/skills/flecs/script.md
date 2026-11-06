@@ -151,7 +151,8 @@ template Button {
   Quote the name (`"try"`). `prefab`, `struct`, `enum`, `parent` and `this` do work as names.
 - An entity used in an expression (`x?[Tag]`, `x[C]`) must exist before the script runs: a plain `Tag {}` earlier in
   the same file is "unresolved reference". Types declared with `struct`/`enum`/`map` in the same file are fine.
-- Several statements on one line need `;` (`with Tag { a {}; b {} }`).
+- Several statements on one line need `;` (`with Tag { a {}; b {} }`), components too: `x : P { A: {v: 1}; B: {v: 2} }`
+  (without the `;`, "missing ; or newline"). One component a line reads best.
 - A component written in a scope without a value (`Pos`) default-constructs it.
 - A script that fails leaves the entities it already made; templates' resources stay until their instances go.
 

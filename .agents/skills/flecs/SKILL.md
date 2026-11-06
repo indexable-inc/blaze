@@ -38,6 +38,13 @@ docs. Use the 4.2 language and avoid what `script.md` marks **4.2**.
   own value. By default `OnInstantiate` copies: on 4.2 it is called `Copy`; before 4.2, and on the site, it was
   `Override`. Exclusive relationships replace, so `(Status, Discussing)` on an instance replaces the prefab's
   `(Status, Draft)`.
+- **Split a value where instances differ.** A component written in script sets every member (members left out are 0),
+  so one component mixing per-instance members with shared ones makes every instance restate all of them. Give each
+  concern its own component so the prefab holds the defaults and an instance writes only what differs (harness-video's
+  sounds: `Sound {voice}`, `Onset {at}`, `Lasts`, `Pitch`, `Gain`, `Pan` on the `sound.*` prefabs, `src/sound.flecs`;
+  `ding : sound.Bell { Onset: {at: 2.0} }` takes the rest from the prefab). Ship shared prefabs once, in a script the
+  host loads before every scene, never copied into each scene. Reach for a template only when its body computes from
+  its props.
 - **Relationships, not strings, for links.** `(DependsOn, x)`: an unknown target fails the script at once.
 - **Traits before first use.** Declare a trait right after the type, before any entity uses it. Symmetric,
   PairIsTag and Final abort if added late.

@@ -4,13 +4,20 @@ Renders a video from a flecs scene, on the harness app's own stack: the `ui.*` p
 and the shared Metal renderer and paint pass (`harness-native-render`). Frame `i` is drawn at `i / fps` seconds of a
 fixed clock (never the wall clock), so the same scene gives the same pixels every run, and any frame can be drawn alone.
 
-    cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4   # the video
-    cargo run --release -p harness-video -- harness-video/scene/launch.flecs still.png 6.0      # one frame
-    cargo run --release -p harness-video -- harness-video/scene/launch.flecs frames/ 0.5        # a frame each 0.5 s
-    cargo run --release -p harness-video -- harness-video/scene/launch.flecs sound.wav          # the soundtrack alone
+    blaze run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4   # the video
+    blaze run --release -p harness-video -- harness-video/scene/launch.flecs still.png 6.0      # one frame
+    blaze run --release -p harness-video -- harness-video/scene/launch.flecs frames/ 0.5        # a frame each 0.5 s
+    blaze run --release -p harness-video -- harness-video/scene/launch.flecs sound.wav          # the soundtrack alone
 
-The mp4 is H.264 High, yuv420p, BT.709, `+faststart` (what X/Twitter, Slack and browsers play), encoded by `ffmpeg`
-from PATH, with the soundtrack as AAC.
+The mp4 is a YouTube HDR master, made natively with no ffmpeg (`src/encode.rs`): H.265 Main 10 encoded by VideoToolbox
+on the media engine (hardware required; there is no software path), constant quality 0.85, 4:2:0 10-bit, HDR10 (PQ over
+BT.2020, the mastering display P3-D65 at 1000 nits as SEI), a half-second GOP, tagged `hvc1`, written by AVAssetWriter
+with the moov first, and the soundtrack lossless: Apple Lossless (ALAC), 24-bit stereo at 48 kHz (YouTube re-encodes
+the audio anyway, so the master keeps all of it; Apple's AAC encoder also tops out at 320 kb/s for 48 kHz stereo). No frame is copied: `src/hdr.rs` writes each frame's Y and
+CbCr straight into the encoder's own IOSurface-backed pixel buffer, mapped into Metal by CoreVideo. The renderer draws
+extended range (sRGB-encoded half floats; 1.0 is SDR white), and `src/hdr.rs` puts SDR white at 203 nits (BT.2408), so the UI looks as
+it does in SDR and only what is drawn brighter than white (the fire, white-hot letters) goes past it. Stills and frame
+sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 points at scale 8: 7680 x 4320, 60 fps.
 
 ## A scene
 
@@ -27,6 +34,14 @@ from PATH, with the soundtrack as AAC.
   indexable-inc/anim): its letters drop in from the top of the frame at `start`, the fire catches, and from `exit` the
   letters burn into embers. Its soundtrack (the landings climbing to A major, the physically modelled fire, the burn) is
   synthesised offline from the same times and is the video's sound; a scene without a `BlazeMark` is silent.
+- Sound is data, one component per concern: `Sound: {voice}` (`Bell`, `Mallet`, `Bass`, `Click`, `Thud`, `Whoosh`,
+  `Fire`), `Onset: {at}`, `Lasts: {dur}`, `Pitch: {hz}`, `Gain: {amp}`, `Pan: {pos, sweep}` (-1 the frame's left edge,
+  1 its right; `sweep` moves it). `src/sound.flecs` (loaded before every scene) has a `sound.*` prefab per voice with its
+  defaults, so an instance sets only its onset and what differs:
+  `ding : sound.Bell {` then `Onset: {at: 2.0}` and `Pitch: {hz: 1760}` on their own lines, `}`. They mix in the same room as
+  the mark's score, and every voice, the mark's included, is placed binaurally (a spherical head: the delay around it
+  and its shadow on the far ear), so on headphones a sound comes from where it is on screen; on speakers it is an
+  ordinary stereo mix.
 - Words: `GlyphsIn: {at, per, dur, by, ease}` brings them in glyph by glyph (each rises and fades, `per` seconds after
   the one before); `Highlight: {file}` colours them by their grammar (tree-sitter; shell so far) in the `code_ink.*`
   tokens; `Caret: {at, until, blink, ink}` puts a block caret after the last glyph shown (pair it with a `Pose.cut`
