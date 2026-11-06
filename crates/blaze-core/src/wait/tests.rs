@@ -667,10 +667,13 @@ fn run_parks(plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
         let parked = parking::park(&word, &sim, "a simulated park", deadline, &clock, plant);
         let end = now.get();
         let fired = sim.fired.borrow().first().copied();
+        // The token as the park began: `token` itself is set again below, for the next park,
+        // while `said` is still used.
+        let began_with = token;
         let said = |what: &str| {
             format!(
                 "park {n} (began {start:?}, deadline {deadline:?}, unpark {unpark:?}, a token \
-                 waiting {token}) said {parked:?} at {end:?}: {what}"
+                 waiting {began_with}) said {parked:?} at {end:?}: {what}"
             )
         };
         match &parked {
