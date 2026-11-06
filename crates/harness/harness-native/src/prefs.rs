@@ -4,7 +4,8 @@
 //!
 //! Keys: `selected` (the session the main pane showed last), `sidebar_width`, `closed` (objects cmd+W'd, by key: `s14`,
 //! `r12`; the older `archived` and `trashed` session ids are read once in its place), `pinned` (objects kept in the
-//! tree) and `new_kind` (the kind last started from the cmd+N picker, highlighted when it opens next).
+//! tree), `new_kind` (the kind last started from the File > New… picker, highlighted when it opens next) and `chat_kind`
+//! (the agent kind a chat was last started with, what cmd+N starts).
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 

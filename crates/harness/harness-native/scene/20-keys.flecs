@@ -24,7 +24,7 @@ ctx {
   Terminal {}
   Tree {}
   Palette {}
-  // The new-object picker (cmd+N) while it is open.
+  // The new-object picker (File > New…) while it is open.
   Picker {}
   Archive {}
   // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
@@ -40,8 +40,11 @@ act {
   Quit { Selector: {sel: "terminate:"}
     MenuItem: {bar: "harness", title: "Quit harness", sep: 1} }
 
-  // The picker (cmd+N): a row for each act.Spawn below with a `title`, in this order (the one picked last is highlighted
-  // when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
+  // cmd+N: a chat at once, no picker, of the agent kind a chat was last started with (native.json `chat_kind`, else
+  // `new_kind` when that is an agent, else Claude); its model is changed afterwards from the chat's own model control.
+  NewChat { MenuItem: {bar: "File", title: "New Chat"} }
+  // The picker (File > New…, unbound): a row for each act.Spawn below with a `title`, in this order (the one picked last
+  // is highlighted when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
   Picker { MenuItem: {bar: "File", title: "New…"} }
   // A new object of `kind` in the selected object's directory (else home); `title` names it in the picker (none: not
   // in the picker). The palette offers every one, by its menu title.
@@ -177,8 +180,8 @@ key {
   quit { Keybind: {key: "q", cmd: 1}
     (Does, act.Quit) }
 
-  pick_new { Keybind: {key: "n", cmd: 1}
-    (Does, act.Picker) }
+  new_chat { Keybind: {key: "n", cmd: 1}
+    (Does, act.NewChat) }
   new_shell { Keybind: {key: "n", cmd: 1, shift: 1}
     (Does, act.SpawnShell) }
   new_claude { Keybind: {key: "t", cmd: 1}

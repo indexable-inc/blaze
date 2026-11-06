@@ -81,7 +81,10 @@ enum Do {
     Zoom(i32),
 }
 
-/// What the overlay over the window is: the command palette (cmd+K) or the new-object picker (cmd+N). One overlay at a
+/// The agent kinds cmd+N may start (Claude and Codex in the chat pane, Cursor in its terminal).
+const CHAT_KINDS: [&str; 3] = ["claude", "codex", "cursor"];
+
+/// What the overlay over the window is: the command palette (cmd+K) or the new-object picker (File > New…). One overlay at a
 /// time; both are a card on the scrim (scene/widgets/palette.flecs), share its keys' actions and take the pointer and the
 /// keyboard from the panes while open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1425,7 +1428,7 @@ impl App {
         self.palette.as_ref().is_some_and(|p| p.mode == Mode::New)
     }
 
-    /// Open the new-object picker (cmd+N), the kind picked last highlighted (native.json `new_kind`), its pill landing
+    /// Open the new-object picker (File > New…), the kind picked last highlighted (native.json `new_kind`), its pill landing
     /// there rather than sliding from where it was last drawn.
     pub fn open_picker(&mut self) {
         let last = crate::prefs::get("new_kind").and_then(|v| v.as_str().map(str::to_owned));
@@ -1437,13 +1440,28 @@ impl App {
         self.poke();
     }
 
-    /// An object of `kind` is being made by an act.Spawn: from the picker, the choice is kept for its next opening (not
-    /// from an offscreen shot); any overlay open closes.
+    /// An object of `kind` is being made by an act.Spawn or cmd+N: from the picker, the choice is kept for its next
+    /// opening; a chat agent's kind, from anywhere, is what cmd+N starts next ([`Self::chat_kind`]) (neither from an
+    /// offscreen shot); any overlay open closes.
     fn spawning(&mut self, kind: &str) {
         if self.picking() && self.persist {
             crate::prefs::set("new_kind", serde_json::json!(kind));
         }
+        if CHAT_KINDS.contains(&kind) && self.persist {
+            crate::prefs::set("chat_kind", serde_json::json!(kind));
+        }
         self.palette = None;
+    }
+
+    /// The agent kind cmd+N starts a chat of: the one a chat was last started with (native.json `chat_kind`), else the
+    /// picker's last pick when that is an agent (`new_kind`), else Claude.
+    fn chat_kind(&self) -> String {
+        let pref = |k: &str| crate::prefs::get(k).and_then(|v| v.as_str().map(str::to_owned));
+        pref("chat_kind")
+            .into_iter()
+            .chain(pref("new_kind"))
+            .find(|k| CHAT_KINDS.contains(&k.as_str()))
+            .unwrap_or_else(|| "claude".to_owned())
     }
 
     /// Move the overlay's highlight by `by` rows: the palette's stops at its ends, the picker's few rows go round.

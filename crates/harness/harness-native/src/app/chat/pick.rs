@@ -63,6 +63,26 @@ fn models_of<'a>(t: &'a Transcript, kind: &str, kept: &'a BTreeMap<String, Vec<M
     kept.get(kind).map_or(&[], Vec::as_slice)
 }
 
+/// Whose mark the model's control shows, as an `hn.Kind` child: Claude's for Anthropic's models, OpenAI's (`codex`) for
+/// GPT and the o-series, else the agent kind's own (`agent`: a Cursor chat's `auto`), from the model's id and the model
+/// it runs as (`cur`), else the status line's `model`.
+fn maker(cur: Option<&ModelChoice>, model: &str, agent: &str) -> &'static str {
+    let names = cur.map_or([model, ""], |c| [c.id.as_str(), c.model.as_str()]);
+    let is = |pre: &[&str]| names.iter().any(|n| pre.iter().any(|p| n.to_ascii_lowercase().starts_with(p)));
+    if is(&["claude", "opus", "sonnet", "haiku", "fable"]) {
+        "claude"
+    } else if is(&["gpt", "o1", "o3", "o4", "codex"]) {
+        "codex"
+    } else {
+        match agent {
+            "claude" => "claude",
+            "codex" => "codex",
+            "cursor" => "cursor",
+            _ => "other",
+        }
+    }
+}
+
 /// The model the chat runs, among `models`: what it runs as, else what was last chosen.
 fn current<'a>(t: &Transcript, models: &'a [ModelChoice]) -> Option<&'a ModelChoice> {
     let by = |m: &str| if m.is_empty() { None } else { models.iter().find(|c| c.is(m)) };
@@ -148,7 +168,12 @@ impl App {
         let hot = Fill { dark: Rgba { a: 1.0, ..ink.dark }, light: Rgba { a: 1.0, ..ink.light } };
         let effort_shown = effort_word(effort);
         view::for_each_of(pick, parts.iter().map(|&(k, p)| (k, p, k)), |v, k, _| match k {
-            "model" => control(v, &format!("chat:pick:{sid}:model"), "label", Some(name), ink, hot),
+            "model" => {
+                control(v, &format!("chat:pick:{sid}:model"), "label", Some(name), ink, hot);
+                if let Some(i) = v.part("icon") {
+                    crate::look::kind_mark(w, i.entity(), maker(cur, model, if t.agent.is_empty() { kind } else { &t.agent }));
+                }
+            }
             "effort" => control(v, &format!("chat:pick:{sid}:effort"), "label", Some(&effort_shown), word, hot),
             "more" => control(v, &format!("chat:pick:{sid}:all"), "icon", None, word, hot),
             _ => {
