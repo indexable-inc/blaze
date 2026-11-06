@@ -165,3 +165,17 @@ sign in". Google may refuse sign-in in embedded browsers; if it does, that error
   (downloads land in `~/Downloads` with no prompt), permission prompts (camera, notifications: refused, named in
   `cef.log`).
 - Fixtures for the new messages in `harness-proto/fixtures/` (the kernel's wire test round-trips only schema 1's).
+
+## Implementation notes
+
+- `src/main.rs` splits the helper (`--type=`: its own `cef_sandbox_initialize`, the framework at `../../..`,
+  `cef_execute_process`) from the browser process (the framework at `../Frameworks`, the `app_class` NSApplication,
+  `cef_initialize`, the message loop).
+- `src/host.rs` owns all state on the UI thread. Other threads `post` a command: a crossbeam channel plus one CEF task
+  per command. No CEF call is made while the host is borrowed, because CEF calls back synchronously.
+- `src/cdp_ids.rs` and `src/keys.rs` are sans-IO cores with unit tests. `src/ring.rs` holds the Metal blits and the
+  IOSurface lifetime rules.
+- A view the kernel opens renders at scale 1 until the app sends `Resize`. An extension's action popup opens at
+  400x600 points.
+- `--load-extension` is passed together with `--disable-features=DisableLoadExtensionCommandLineSwitch`, which
+  Chromium 137+ needs before it honours the switch.
