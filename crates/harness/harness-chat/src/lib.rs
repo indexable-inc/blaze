@@ -181,6 +181,20 @@ impl Transcript {
         }
     }
 
+    /// The model and effort chat was spawned on (cmd+N's remembered choice), as its choice until its log says one: what
+    /// its picker shows from its first frame, before its agent is up to say what it runs (Claude names its model only in
+    /// its `init`, and its log has no `choice` for a launch's `--model`). A `choice` in the log replaces it; a `session`
+    /// event leaves it, as it leaves any choice.
+    pub fn start_on(&mut self, model: Option<&str>, effort: Option<&str>) {
+        self.rev = self.rev.wrapping_add(1);
+        if let Some(m) = model.filter(|m| self.chosen_model.is_empty() && !m.is_empty()) {
+            m.clone_into(&mut self.chosen_model);
+        }
+        if let Some(e) = effort.filter(|e| self.chosen_effort.is_empty() && !e.is_empty()) {
+            e.clone_into(&mut self.chosen_effort);
+        }
+    }
+
     /// Bytes of a chat attach stream: its whole event frames are applied, a part frame waits for the rest. A frame that
     /// is not an event (a schema bug, never a torn write: the socket carries whole frames) is skipped, and reported.
     pub fn feed(&mut self, bytes: &[u8]) {

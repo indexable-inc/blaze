@@ -260,6 +260,9 @@ pub struct ChatState {
     rows_open: HashMap<String, usize>,
     /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
     pick: Option<pick::Pick>,
+    /// The model and effort a spawn asked it to start on ([`App::chat_started_on`]): seeded into its transcript at every
+    /// attach, since an attach replays the log from nothing and a Claude chat's log names neither until its agent is up.
+    started: Option<(Option<String>, Option<String>)>,
     pick_nav: pick::PickNav,
     /// The composer's scroll once its words outgrow it: wheels on AppKit's physics, the caret kept in view.
     input_scroll: view::field::FieldScroll,
@@ -335,6 +338,7 @@ impl Default for ChatState {
             rows_open: HashMap::new(),
             pick: None,
             pick_nav: pick::PickNav::default(),
+            started: None,
             input_scroll: view::field::FieldScroll::default(),
             stream: HashMap::new(),
             cut: HashMap::new(),
@@ -1080,6 +1084,17 @@ impl App {
         Some((p, e, self.session_of(e)?))
     }
 
+    /// Chat `sid` was spawned on `model` at `effort` (cmd+N's remembered choice, or a pick of another kind's model): its
+    /// choice from now, so the frame that first shows it already names them ([`Transcript::start_on`]), and again at each
+    /// attach. Neither given (a deep link's session, a plain spawn): nothing to seed.
+    pub(in crate::app) fn chat_started_on(&self, sid: u64, model: Option<&str>, effort: Option<&str>) {
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+        self.chat.borrow_mut().entry(sid).or_default().started = Some((model.map(str::to_owned), effort.map(str::to_owned)));
+        self.chats.borrow_mut().entry(sid).or_default().start_on(model, effort);
+    }
+
     /// Fill a chat pane from its session's transcript: attach for its events, its rows in view, its input and status.
     pub(super) fn fill_chat_pane(&self, pane: u64, e: u64) {
         let Some(sid) = self.session_of(e) else { return };
@@ -1107,7 +1122,12 @@ impl App {
                 st.stream.clear();
                 st.cut.clear();
                 st.row_born.clear();
-                self.chats.borrow_mut().remove(&sid);
+                let mut chats = self.chats.borrow_mut();
+                chats.remove(&sid);
+                if let Some((m, e)) = &st.started {
+                    chats.entry(sid).or_default().start_on(m.as_deref(), e.as_deref());
+                }
+                drop(chats);
                 self.link.attach(sid, 80, 24, true);
             }
         }
@@ -1269,16 +1289,11 @@ impl App {
         }
         if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
             let o = w.entity_from_id(e);
-            // The model and the effort it runs with, as den's picker (chat/pick.rs): the transcript's when its `session`
-            // event (or a choice) said them, else the daemon's listing; the model alone when the effort is unknown.
+            // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
+            // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
-            let (model, effort) = if t.model.is_empty() {
-                (listed.s.as_str().to_owned(), listed.effort.as_str().to_owned())
-            } else {
-                let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
-                (t.model.clone(), effort.to_owned())
-            };
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
+            let listed = (listed.s.as_str(), listed.effort.as_str());
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, listed);
             // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
             if let Some(act) = bar.part("act") {
                 let working = t.busy && !ended;
