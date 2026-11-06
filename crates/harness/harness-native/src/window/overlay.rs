@@ -19,7 +19,7 @@ use crate::app::Float;
 use crate::gpu::{self, Dest};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSResponder, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
@@ -27,7 +27,7 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
-use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
 

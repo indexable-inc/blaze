@@ -47,8 +47,8 @@ impl App {
     /// do (the picker's menus, a cell's popovers and menus; a cell's dialog stays, as a sheet would). Whether any closed.
     pub fn close_floats(&mut self) -> bool {
         let pick = self.chat_pick_close();
-        let gen = self.genui_blur();
-        pick || gen
+        let genui = self.genui_blur();
+        pick || genui
     }
 }
 
