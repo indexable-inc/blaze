@@ -1,8 +1,10 @@
 //! The transcript's tool calls as a reader takes them in, derived from the reduced items (never stored): a run of calls
 //! with no words of the agent's between them is one [`Run`], summed up in plain words ("Read 2 files, ran 1 shell
-//! command") the way Claude Code's terminal does; and which calls open by default ([`Grouped::default_open`]): only the
-//! transcript's last item when it is a shell call that went well (a failure is one folded line). Fold state a person set lives in the app, by call id;
-//! this is only the default it starts from. Agent-neutral: Claude's, Codex's and the harness REPL's calls alike.
+//! command") the way Claude Code's terminal does. The words come from each step's own outcome: a step that went well
+//! counts as what it did, one that failed as what it could not do ("Searched once, couldn't fetch 1 page"), so a cell
+//! whose search worked and whose fetch failed never reads as a failed search; each failure carries one plain sentence
+//! ([`Call::why`]). Every call starts folded; fold state a person set lives in the app, by call id. Agent-neutral:
+//! Claude's, Codex's and the harness REPL's calls alike.
 use crate::{Detail, Item, Transcript};
 use serde_json::Value;
 
@@ -22,31 +24,53 @@ pub enum Act {
     Fetch,
     Query,
     Spawn,
+    /// Waiting for an earlier cell (the REPL's wait): bookkeeping, said only when it is all a run did.
+    Wait,
     /// A harness REPL cell that stepped nowhere outside the REPL.
     Cell,
     Other,
 }
 
 impl Act {
+    /// Its verb (past and plain) and what it counts (one, many).
+    fn parts(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Act::Shell => ("ran", "run", "shell command", "shell commands"),
+            Act::Read => ("read", "read", "file", "files"),
+            Act::Edit => ("edited", "edit", "file", "files"),
+            Act::Write => ("wrote", "write", "file", "files"),
+            Act::Delete => ("deleted", "delete", "file", "files"),
+            Act::Search => ("searched", "search", "", ""),
+            Act::List => ("listed", "list", "folder", "folders"),
+            Act::Build => ("ran", "run", "build", "builds"),
+            Act::Fetch => ("fetched", "fetch", "page", "pages"),
+            Act::Query => ("ran", "run", "query", "queries"),
+            Act::Spawn => ("started", "start", "session", "sessions"),
+            Act::Wait => ("waited for", "wait for", "cell", "cells"),
+            Act::Cell => ("ran", "run", "cell", "cells"),
+            Act::Other => ("used", "use", "tool", "tools"),
+        }
+    }
+
     /// `n` of this act in words, lower case: "ran 3 shell commands", "searched once".
     #[must_use]
     pub fn words(self, n: usize) -> String {
-        let s = |one: &str, many: &str| if n == 1 { one.to_owned() } else { many.to_owned() };
+        let (past, _, one, many) = self.parts();
         match self {
-            Act::Shell => format!("ran {n} shell {}", s("command", "commands")),
-            Act::Read => format!("read {n} {}", s("file", "files")),
-            Act::Edit => format!("edited {n} {}", s("file", "files")),
-            Act::Write => format!("wrote {n} {}", s("file", "files")),
-            Act::Delete => format!("deleted {n} {}", s("file", "files")),
             Act::Search if n == 1 => "searched once".to_owned(),
             Act::Search => format!("searched {n} times"),
-            Act::List => format!("listed {n} {}", s("folder", "folders")),
-            Act::Build => format!("ran {n} {}", s("build", "builds")),
-            Act::Fetch => format!("fetched {n} {}", s("page", "pages")),
-            Act::Query => format!("ran {n} {}", s("query", "queries")),
-            Act::Spawn => format!("started {n} {}", s("session", "sessions")),
-            Act::Cell => format!("ran {n} {}", s("cell", "cells")),
-            Act::Other => format!("used {n} {}", s("tool", "tools")),
+            _ => format!("{past} {n} {}", if n == 1 { one } else { many }),
+        }
+    }
+
+    /// `n` of this act that failed, in words, lower case: "couldn't fetch 1 page", "couldn't search".
+    #[must_use]
+    pub fn failed_words(self, n: usize) -> String {
+        let (_, base, one, many) = self.parts();
+        match self {
+            Act::Search if n == 1 => "couldn't search".to_owned(),
+            Act::Search => format!("couldn't search {n} times"),
+            _ => format!("couldn't {base} {n} {}", if n == 1 { one } else { many }),
         }
     }
 
@@ -64,12 +88,14 @@ impl Act {
             "build" => Act::Build,
             "sql" => Act::Query,
             "spawn" => Act::Spawn,
+            "wait" => Act::Wait,
             _ => Act::Other,
         }
     }
 
     /// A plain tool call's act by its name: Claude Code's tools, Codex's items (harness/src/chat/codex.rs).
-    fn of_tool(name: &str) -> Act {
+    #[must_use]
+    pub fn of_tool(name: &str) -> Act {
         match name.to_ascii_lowercase().as_str() {
             "bash" | "shell" | "local_shell" | "exec_command" | "bashoutput" => Act::Shell,
             "read" | "notebookread" | "view" => Act::Read,
@@ -77,14 +103,14 @@ impl Act {
             "write" => Act::Write,
             "grep" | "glob" | "ls" | "websearch" | "web_search" | "toolsearch" => Act::Search,
             "webfetch" | "fetch" => Act::Fetch,
+            "task" | "agent" => Act::Spawn,
             _ => Act::Other,
         }
     }
 }
 
-/// Acts in words, counted by kind in the order each kind first came, capitalised: "Read 3 files, searched 2 times".
-#[must_use]
-pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
+/// Acts counted by kind in the order each kind first came: `(act, n)`.
+fn counted(acts: impl IntoIterator<Item = Act>) -> Vec<(Act, usize)> {
     let mut counts: Vec<(Act, usize)> = Vec::new();
     for a in acts {
         match counts.iter_mut().find(|(k, _)| *k == a) {
@@ -92,18 +118,61 @@ pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
             None => counts.push((a, 1)),
         }
     }
-    let s = counts.iter().map(|(a, n)| a.words(*n)).collect::<Vec<_>>().join(", ");
+    counts
+}
+
+fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
+
+/// Acts in words, counted by kind in the order each kind first came, capitalised: "Read 3 files, searched 2 times".
+#[must_use]
+pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
+    told(acts, [])
+}
+
+/// What went well and what failed, in words: the acts that went well counted by kind, then those that failed ("Searched
+/// once, couldn't fetch 1 page"), capitalised. Waiting for a cell is left out when anything else was done.
+#[must_use]
+pub fn told(ok: impl IntoIterator<Item = Act>, failed: impl IntoIterator<Item = Act>) -> String {
+    let (ok, failed) = (counted(ok), counted(failed));
+    let busy = ok.iter().chain(&failed).any(|(a, _)| *a != Act::Wait);
+    let keep = |(a, _): &&(Act, usize)| !busy || *a != Act::Wait;
+    let words: Vec<String> =
+        ok.iter().filter(keep).map(|(a, n)| a.words(*n)).chain(failed.iter().filter(keep).map(|(a, n)| a.failed_words(*n))).collect();
+    capitalised(&words.join(", "))
+}
+
+/// One plain sentence for a failure (for the person: the model reads the whole error elsewhere): its first line, its
+/// first sentence, no trailing stop, at most [`WHY_CHARS`] characters; a command's "exit 2" as words.
+#[must_use]
+pub fn plain(s: &str) -> String {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if let Some(code) = line.strip_prefix("exit ").filter(|c| c.parse::<i64>().is_ok()) {
+        return format!("Exited with code {code}");
+    }
+    let one = line.find(". ").map_or(line, |i| &line[..i]).trim_end_matches('.');
+    match one.char_indices().nth(WHY_CHARS) {
+        Some((i, _)) => format!("{}\u{2026}", &one[..i]),
+        None => one.to_owned(),
+    }
+}
+
+/// The most characters a failure's sentence keeps.
+pub const WHY_CHARS: usize = 140;
 
 /// One tool call as the grouping sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
     /// The call's block id: the key its fold state is kept by.
     pub block: String,
-    /// What it did, one act per step (a call that edited three files is three edits).
+    /// What it did, one act per step that went well or still runs (a call that edited three files is three edits).
     pub acts: Vec<Act>,
+    /// What it could not do: one act per step that failed (a cell that threw with no step of its own: one Cell).
+    pub fails: Vec<Act>,
+    /// Each failure in one plain sentence ([`plain`]), in order.
+    pub why: Vec<String>,
     /// It failed: an error result, a cell that threw, a step that failed (a command's non-zero exit).
     pub failed: bool,
     /// Still running.
@@ -117,7 +186,13 @@ impl Call {
     /// A shell call: a command (Claude's Bash, Codex's shell) or a cell that ran one.
     #[must_use]
     pub fn shell(&self) -> bool {
-        self.acts.contains(&Act::Shell)
+        self.acts.contains(&Act::Shell) || self.fails.contains(&Act::Shell)
+    }
+
+    /// What it did, in words ([`told`]).
+    #[must_use]
+    pub fn summary(&self) -> String {
+        told(self.acts.iter().copied(), self.fails.iter().copied())
     }
 }
 
@@ -136,23 +211,51 @@ fn draws(ui: &Value) -> bool {
 pub fn call(t: &Transcript, i: usize) -> Option<Call> {
     let Item::Tool { block, name, input, result, done, .. } = t.items.get(i)? else { return None };
     let detail: Option<&Detail> = t.details.get(block);
-    let acts = match detail {
-        Some(d) if d.effects.is_empty() => vec![Act::Cell],
-        Some(d) => d.effects.iter().map(|e| Act::of_effect(&e.kind)).collect(),
-        // A Codex patch names every file it changed.
-        None if name == "apply_patch" => {
-            let n = input["paths"].as_array().map_or(1, |p| p.len().max(1));
-            vec![Act::Edit; n]
+    let (mut acts, mut fails, mut why) = (Vec::new(), Vec::new(), Vec::new());
+    match detail {
+        Some(d) => {
+            for e in &d.effects {
+                let a = Act::of_effect(&e.kind);
+                if e.status == "error" {
+                    fails.push(a);
+                    why.push(plain(&e.detail));
+                } else {
+                    acts.push(a);
+                }
+            }
+            if d.status == "error" {
+                // A cell that threw: its own error, said once (a step's failure it rethrew is said already).
+                let msg = plain(d.value["message"].as_str().unwrap_or(""));
+                if !msg.is_empty() && !why.contains(&msg) {
+                    why.push(msg);
+                }
+                if fails.is_empty() {
+                    fails.push(Act::Cell);
+                }
+            } else if d.effects.is_empty() {
+                acts.push(Act::Cell);
+            }
         }
-        None => vec![Act::of_tool(name)],
-    };
-    let failed = result.as_ref().is_some_and(|r| r.error)
-        || detail.is_some_and(|d| d.status == "error" || d.effects.iter().any(|e| e.status == "error"));
+        None => {
+            // A Codex patch names every file it changed.
+            let n = if name == "apply_patch" { input["paths"].as_array().map_or(1, |p| p.len().max(1)) } else { 1 };
+            let a = Act::of_tool(name);
+            match result {
+                Some(r) if r.error => {
+                    fails.extend(std::iter::repeat_n(a, n));
+                    why.push(plain(&r.text));
+                }
+                _ => acts.extend(std::iter::repeat_n(a, n)),
+            }
+        }
+    }
+    why.retain(|w| !w.is_empty());
+    let failed = !fails.is_empty();
     let running = match detail {
         Some(d) => d.status == "running",
         None => result.is_none() && (!done || t.busy),
     };
-    Some(Call { block: block.clone(), acts, failed, running, draws: detail.is_some_and(|d| draws(&d.ui)) })
+    Some(Call { block: block.clone(), acts, fails, why, failed, running, draws: detail.is_some_and(|d| draws(&d.ui)) })
 }
 
 /// Calls in a row, with what came between them that is not the agent's words (its reasoning, a text block not yet
@@ -172,16 +275,29 @@ impl Run {
         format!("run:{}", self.calls.first().map_or("", |(_, c)| c.block.as_str()))
     }
 
-    /// What its calls did, in words, in the order each kind first came: "Read 2 files, ran 1 shell command".
+    /// What its calls did, in words, in the order each kind first came: "Read 2 files, ran 1 shell command"; what failed
+    /// after, as what could not be done ([`told`]).
     #[must_use]
     pub fn summary(&self) -> String {
-        summary(self.calls.iter().flat_map(|(_, c)| c.acts.iter().copied()))
+        told(self.calls.iter().flat_map(|(_, c)| c.acts.iter().copied()), self.calls.iter().flat_map(|(_, c)| c.fails.iter().copied()))
     }
 
     /// How many of its calls failed.
     #[must_use]
     pub fn failed(&self) -> usize {
         self.calls.iter().filter(|(_, c)| c.failed).count()
+    }
+
+    /// Its failures, one plain sentence each, in order, each said once.
+    #[must_use]
+    pub fn why(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for w in self.calls.iter().flat_map(|(_, c)| &c.why) {
+            if !out.contains(w) {
+                out.push(w.clone());
+            }
+        }
+        out
     }
 
     /// One of its calls is still running.
@@ -198,13 +314,10 @@ pub enum Piece {
     Run(Run),
 }
 
-/// The transcript's items as pieces, and which item is last.
+/// The transcript's items as pieces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grouped {
     pub pieces: Vec<Piece>,
-    /// The transcript's last item that shows (a turn's end and empty blocks show nothing): a shell call there stays open
-    /// while the turn runs and once it ended, until something comes after it.
-    pub last: Option<usize>,
 }
 
 /// An item that draws nothing (a block not yet written to, reasoning with no words) or only reasoning: it neither ends a
@@ -214,14 +327,6 @@ fn quiet(it: &Item) -> bool {
         Item::Text { text, .. } => text.trim().is_empty(),
         Item::Thinking { .. } => true,
         _ => false,
-    }
-}
-
-fn shows(it: &Item) -> bool {
-    match it {
-        Item::TurnEnd { .. } => false,
-        Item::Text { text, .. } | Item::Thinking { text, .. } => !text.trim().is_empty(),
-        _ => true,
     }
 }
 
@@ -267,16 +372,7 @@ impl Grouped {
             }
         }
         flush(&mut pending, &mut calls, &mut pieces);
-        let last = t.items.iter().rposition(shows);
-        Grouped { pieces, last }
-    }
-
-    /// Whether call `c` (item `i`) is open before anyone folds or opens it: when it is a shell call that went well and the
-    /// transcript's last item. Everything else starts folded, a failure too (one line in the failed tone that opens on a
-    /// press); a run starts folded, its failed and open calls showing under it.
-    #[must_use]
-    pub fn default_open(&self, i: usize, c: &Call) -> bool {
-        !c.failed && c.shell() && self.last == Some(i)
+        Grouped { pieces }
     }
 }
 
@@ -304,14 +400,14 @@ mod tests {
         g.pieces.iter().filter_map(|p| if let Piece::Run(r) = p { Some(r) } else { None }).collect()
     }
 
-    /// Calls with only reasoning between them are one run, summed up in words by kind in the order each came; prose ends
-    /// a run; a lone call is no run; a failed call stays folded and its run counts it; the last shell call opens.
+    /// Calls with only reasoning between them are one run, summed up in words by kind in the order each came, what
+    /// failed said as what could not be done; prose ends a run; a lone call is no run.
     #[test]
-    fn runs_group_and_default_open() {
+    fn runs_group_and_say_what_failed() {
         let mut lines = vec![serde_json::json!({"ev": "user", "text": "go"})];
         lines.extend(tool("a", "Read", serde_json::json!({"file_path": "x"}), "x", false));
         lines.push(serde_json::json!({"ev": "block", "block": "th", "kind": "thinking", "text": "hmm"}));
-        lines.extend(tool("b", "Bash", serde_json::json!({"command": "false"}), "", true));
+        lines.extend(tool("b", "Bash", serde_json::json!({"command": "false"}), "boom. more", true));
         lines.extend(tool("c", "Read", serde_json::json!({"file_path": "y"}), "y", false));
         lines.push(serde_json::json!({"ev": "block", "block": "m", "kind": "text", "text": "Now searching."}));
         lines.extend(tool("d", "Grep", serde_json::json!({"pattern": "p"}), "", false));
@@ -323,33 +419,20 @@ mod tests {
         let g = Grouped::of(&t);
         let rs = runs(&g);
         assert_eq!(rs.len(), 2);
-        assert_eq!(rs[0].summary(), "Read 2 files, ran 1 shell command");
+        assert_eq!(rs[0].summary(), "Read 2 files, couldn't run 1 shell command");
+        assert_eq!(rs[0].why(), ["boom"]);
         assert_eq!(rs[0].items, [1, 2, 3, 4], "the reasoning between its calls is inside it");
         assert_eq!(rs[0].failed(), 1);
         assert_eq!(rs[0].key(), "run:a");
         assert_eq!(rs[1].summary(), "Edited 2 files, ran 1 shell command");
         // The lone Grep between two prose blocks is an item of its own.
         assert!(g.pieces.contains(&Piece::Item(6)));
-        let open: Vec<&str> = rs
-            .iter()
-            .flat_map(|r| &r.calls)
-            .filter(|(i, c)| g.default_open(*i, c))
-            .map(|(_, c)| c.block.as_str())
-            .collect();
-        assert_eq!(open, ["f"], "the last shell call; the failed one stays folded");
-
-        // Something after the last shell call: it folds.
-        let mut more = lines.clone();
-        more.push(serde_json::json!({"ev": "user", "text": "thanks"}));
-        let t = transcript(&more);
-        let g = Grouped::of(&t);
-        let (i, f) = runs(&g)[1].calls[1].clone();
-        assert!(!g.default_open(i, &f));
     }
 
-    /// A harness REPL cell counts its steps; one that draws a view stands alone, between runs, and never folds into one.
+    /// A harness REPL cell counts its steps by how each went; one that draws a view stands alone, between runs, and
+    /// never folds into one; a wait is said only when it is all that was done.
     #[test]
-    fn cells_count_steps_and_views_stand_alone() {
+    fn cells_count_steps_by_outcome_and_views_stand_alone() {
         let cell = |id: &str, effects: serde_json::Value, ui: serde_json::Value| {
             let mut v = tool(id, "ts", serde_json::json!({"code": "x"}), "", false).to_vec();
             v.push(serde_json::json!({"ev": "tool_detail", "block": id, "status": "done", "ms": 3, "code": "x",
@@ -365,15 +448,25 @@ mod tests {
         lines.extend(cell("b", serde_json::json!([exec(1)]), serde_json::Value::Null));
         lines.extend(cell("v", serde_json::json!([]), serde_json::json!({"type": "Text", "props": {}, "children": []})));
         lines.extend(cell("c", serde_json::json!([]), serde_json::Value::Null));
-        lines.extend(cell("d", serde_json::json!([{"kind": "search", "done": "Searched", "status": "ok"}]), serde_json::Value::Null));
+        lines.extend(cell(
+            "d",
+            serde_json::json!([
+                {"kind": "search", "done": "Searched", "status": "ok"},
+                {"kind": "net", "done": "Fetched localhost", "status": "error", "detail": "No browser is connected"},
+                {"kind": "wait", "done": "Waited", "status": "ok"}
+            ]),
+            serde_json::Value::Null,
+        ));
         let t = transcript(&lines);
         let g = Grouped::of(&t);
         let rs = runs(&g);
         assert_eq!(rs.len(), 2);
-        assert_eq!(rs[0].summary(), "Ran 3 shell commands");
-        assert_eq!(rs[0].failed(), 1);
+        assert_eq!(rs[0].summary(), "Ran 2 shell commands, couldn't run 1 shell command");
+        assert_eq!(rs[0].why(), ["Exited with code 1"]);
         assert!(g.pieces.contains(&Piece::Item(3)), "the view stands alone");
-        assert_eq!(rs[1].summary(), "Ran 1 cell, searched once");
+        assert_eq!(rs[1].summary(), "Ran 1 cell, searched once, couldn't fetch 1 page");
+        assert_eq!(rs[1].why(), ["No browser is connected"]);
+        assert_eq!(told([Act::Wait], []), "Waited for 1 cell");
     }
 
     /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands.

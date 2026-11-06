@@ -12,7 +12,7 @@ import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
 import { req, daemonPresent, listen } from "./daemon.ts";
 import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
-import { shown } from "./shown.ts";
+import { brief, shown } from "./shown.ts";
 import { stripCell } from "./ui/compile.ts";
 import { count, dispatch, installUi, isElement, show, uiError } from "./ui/index.ts";
 
@@ -27,8 +27,8 @@ export function body(t: Task) {
   const finished = t.status !== "running";
   // A value that is one of its steps' results (a cell ending in `await googleSearch(...)`) is shown once, under the step.
   const value = !finished || t.value === undefined || t.ui !== undefined || rawsOf(t).includes(t.value) ? null
-    // An error's stack as the model got it (the harness frames below the cell cut).
-    : t.status === "error" ? { t: "error" as const, message: t.value instanceof Error ? t.value.message : String(t.value), stack: t.result }
+    // An error: one plain sentence for the person (`message`), its stack as the model got it (the harness frames below the cell cut).
+    : t.status === "error" ? { t: "error" as const, message: brief(t.value), stack: t.result }
     : shown(t.value);
   return {
     op: "repl_task" as const, repl: REPL_ID, id: t.id, call: t.call, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,

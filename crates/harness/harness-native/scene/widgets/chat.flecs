@@ -262,7 +262,7 @@ hn {
   // on one line, with no plate or border; an icon only where a status reads clearer as one (scene/widgets/chat_status.flecs:
   // a thought's sparkle, a call's running dot), its word in the line's tooltip. Under the pointer a soft wash and a small
   // chevron after its words (right folded, down open; src/app/chat.rs `line` turns it); pressed, it opens what it folds;
-  // how long it took is its tooltip. A failure says so once: its words in the failed tone (a run's, its count).
+  // how long it took is its tooltip. A failure says so once, as a small mark in the failed tone, never its words in red.
   // Its words are spaced by the room after each (text draws at its node's leading edge), not the row's gap, so an argument
   // with nothing to say (src/app/chat.rs `line` folds it to nothing) leaves no gap behind.
   prefab ChatLineLook : ui.Row {
@@ -339,7 +339,7 @@ hn {
   }
 
   // A tool call folded to its line (an agent's own tool: its name and main argument; a harness REPL cell: what it did in
-  // words, never its code). Folded is how every call starts, a failed one too: its one red line opens on a press.
+  // words, never its code). Folded is how every call starts, a failed one too, and opens only on a press.
   prefab ChatTool : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -347,10 +347,10 @@ hn {
     guide : hn.ChatGuideOff {}
     head : hn.ChatLine {}
   }
-  // Failed: its words in the failed tone.
+  // Failed: the same muted words; its detail (a dot, src/app/chat.rs item_rows) in the failed tone, the one coloured mark.
   prefab ChatToolFailed : hn.ChatTool {
     head : hn.ChatLine {
-      words : ui.Line { Fill: $tone_failed }
+      detail : ui.Line { Fill: $tone_failed }
     }
   }
 
@@ -382,32 +382,14 @@ hn {
   }
   prefab ChatToolOpenFailed : hn.ChatToolOpen {
     head : hn.ChatLine {
-      words : ui.Line { Fill: $tone_failed }
-    }
-  }
-
-  // A harness REPL cell (src/app/chat.rs card_rows) and a run of calls with no words between them ("Read 2 files, ran 1
-  // shell command", rows_nested): the same line. A run with failures says how many in its detail, the one red thing on
-  // it, and lists each failed call under it as its own red line. A run's calls sit in from it by $chat_nest, on its guide.
-  prefab ChatCard : hn.ChatTool {}
-  prefab ChatCardFailed : hn.ChatToolFailed {}
-  prefab ChatRun : hn.ChatTool {}
-  prefab ChatRunFailed : hn.ChatTool {
-    head : hn.ChatLine {
       detail : ui.Line { Fill: $tone_failed }
     }
   }
+
+  // An agent tool call or reasoning inside an opened run sits in from the run's line by $chat_nest, on its guide. Runs
+  // and harness cells are hn.StepLine (widgets/steps.flecs).
   prefab ChatNest : ui.Node {
     Padding: {l: $chat_nest, r: 0, t: 0, b: 0}
-  }
-
-  // One step of an opened cell that took several: the same line, not pressable, under the cell's words.
-  prefab ChatStep : hn.ChatLineLook {
-    Padding: {l: $chat_line_inset, r: 8, t: 0, b: 0}
-    guide : hn.ChatGuide {}
-  }
-  prefab ChatStepFailed : hn.ChatStep {
-    words : ui.Line { Fill: $tone_failed }
   }
 
   // The chat's look of a ui.Table (harness_native_ui_view::table with look "hn.ChatTable"): the ui.Table* cells in the
@@ -461,23 +443,6 @@ hn {
     }
   }
 
-  // Search results a cell gave (the kernel tags them `kind: "search"`): a ui.ResultList, not a table.
-  prefab ChatResult : ui.Result {
-    host : ui.Line { Fill: $tone_chat_muted }
-    snippet : ui.Words { Fill: $tone_chat_ink }
-  }
-  prefab ChatResults : ui.Column {
-    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: $chat_line_inset, r: 0, t: 4, b: 8}
-    guide : hn.ChatGuide {}
-    list : ui.ResultList {}
-    foot : ui.Line, Faint {
-      Padding: {l: 0, r: 0, t: 4, b: 0}
-      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-    }
-  }
-
   // A table, record or list a cell gave, as a ui.Table on the card's plate (src/app/chat.rs fill_grid), and a foot saying
   // how many rows there are when not all show.
   prefab ChatGrid : ui.Column {
@@ -501,8 +466,7 @@ hn {
     }
   }
 
-  // Text a cell printed or returned (a command's output, a string), in the code face on the card's plate; an error's
-  // stack in the failed tone.
+  // Text a cell printed (a command's output), in the code face on the card's plate.
   prefab ChatOutput : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -521,36 +485,6 @@ hn {
       }
     }
   }
-  prefab ChatOutputError : hn.ChatOutput {
-    card : ui.Column {
-      text : ui.Words { Fill: $tone_failed }
-    }
-  }
-
-  // "Show code" under an opened cell: quiet words under its words; pressed, the cell's code (a hn.ChatCode row) shows.
-  prefab ChatCodeToggle : ui.Column {
-    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: $chat_line_inset - $chat_line_pad, r: 0, t: 0, b: 2}
-    guide : hn.ChatGuide {}
-    head : ui.Row {
-      Pressable
-      Action: {name: ""}
-      Cursor: {shape: Arrow}
-      Fill: $tone_clear
-      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-      PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
-      Padding: {l: $chat_line_pad, r: 6, t: 0, b: 0}
-      words : ui.Line {
-        Fill: $tone_chat_muted
-        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-      }
-    }
-  }
-
   // The agent's reasoning, folded to one line: a sparkle (hn.chat_status.thinking, breathing while it thinks; thought,
   // still once done), its word the tooltip; pressed, it opens to its words.
   prefab ChatThinking : ui.Column {

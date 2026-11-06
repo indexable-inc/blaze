@@ -152,6 +152,18 @@ pub(super) fn fill(
     fill_in(row, ui, cell, None, live, playing, measure);
 }
 
+/// The glyph of the kind of file at `path` and that kind's colour, as a FileRef draws them (for a step's file chip,
+/// steps.rs).
+pub(super) fn file_icon(world: WorldRef<'_>, path: &str) -> (String, Option<Fill>) {
+    let kind = media::kind_of(path);
+    (media::kind_glyph(kind).to_string(), media::fill_of(world, &format!("hn.GenFileKind.{kind}")))
+}
+
+/// Set `v`'s Fill to `f` when it has one and it differs.
+pub(super) fn filled(v: View<'_>, f: Option<Fill>) {
+    media::filled(v, f);
+}
+
 /// [`fill`], with the chat's cells by tool call (`cells`: its transcript's `details`), which a CellRef shows.
 pub(super) fn fill_in(
     row: View<'_>,
