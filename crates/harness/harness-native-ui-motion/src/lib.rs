@@ -8,7 +8,7 @@
 //! (`ScrollerState`), and its parts' fade.
 use std::collections::HashMap;
 
-use harness_native_api::{Clock, moving, settle};
+use harness_native_api::{Clock, moving, reduced, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
     Collapse, Flex, FlexAxis, NoScroller, Padding, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, Size, Sizing,
@@ -130,10 +130,13 @@ fn scrolled(e: EntityView<'_>) -> (f32, f32) {
 
 /// One frame of a matched id's springs toward `to` (content space); whether it still moves. A slide retargets from where
 /// it is drawn and how fast it goes. From rest (not moving last frame), a move of more than `jump` of its heights lands
-/// at once; mid-slide it never does. With no tune, on its first frame or when `land` (the view was rescaled under it:
-/// its node moved because the room did, not because the selection did) it lands.
+/// at once; mid-slide it never does. Its height is the taller of where it is and where it goes: a node that is still
+/// unfolding (a new row growing in from nothing, its pill with it) is not hundreds of its own heights away. With no
+/// tune, on its first frame or when `land` (the view was rescaled under it: its node moved because the room did, not
+/// because the selection did; or the system's Reduce Motion is on) it lands.
 fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, land: bool, dt: f32) -> bool {
-    let rows = |a: f32, b: f32| ((a - b).abs() / to.h.max(1.0)).floor();
+    let unit = to.h.max(st.h.x).max(1.0);
+    let rows = |a: f32, b: f32| ((a - b).abs() / unit).floor();
     let far = jump > 0.0 && !st.moving && (rows(to.y, st.y.x) > jump || rows(to.x, st.x.x) > jump);
     let still = match tune.filter(|_| st.started && !far && !land) {
         Some(tune) => {
@@ -270,6 +273,7 @@ pub fn install(world: WorldRef<'_>) {
         let (w, dt) = (it.world(), it.delta_time());
         let room = w.try_get::<&Viewport>(|v| (v.w, v.h)).unwrap_or((0.0, 0.0));
         let now = w.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+        let still_motion = reduced(w);
         // Per id, its newest live node and that node's Laid (None: made this frame, layout has not reached it yet).
         let mut by: HashMap<String, (u64, Option<Laid>, f32)> = HashMap::new();
         w.new_query::<&MatchedGeometry>().each_entity(|e, m| {
@@ -296,7 +300,7 @@ pub fn install(world: WorldRef<'_>) {
                 None => continue,
             };
             (st.gx, st.gy, st.gw, st.gh) = (to.x, to.y, to.w, to.h);
-            let land = rescaled(&mut st, room, now);
+            let land = rescaled(&mut st, room, now) || still_motion;
             still |= chase(&mut st, to, tune_of(w, o, "matched"), jump, land, dt);
             st.owner = owner;
             holder.set(st);
@@ -515,6 +519,18 @@ mod tests {
         }
         chase(&mut st, row(0.0), tune, 3.0, false, 1.0 / 60.0);
         assert!(!st.moving && st.y.x == 0.0);
+    }
+
+    /// A new row two rows down, still unfolding (laid next to nothing tall): its pill slides there from rest instead of
+    /// counting the move in the new row's sliver of a height and landing at once, and grows with it.
+    #[test]
+    fn matched_slides_into_a_row_that_unfolds() {
+        let tune = Some(Tune { omega: 26.0, zeta: 1.0 });
+        let mut st = Matched::default();
+        chase(&mut st, Laid { x: 0.0, y: 0.0, w: 200.0, h: 24.0 }, tune, 3.0, false, 1.0 / 60.0);
+        let sliver = Laid { x: 0.0, y: 60.0, w: 200.0, h: 0.5 };
+        assert!(chase(&mut st, sliver, tune, 3.0, false, 1.0 / 60.0));
+        assert!(st.moving && st.y.x > 0.0 && st.y.x < 60.0, "{}", st.y.x);
     }
 
     /// A zoom (the room changes) lands a slide on its node at once, mid-slide too, and through every layout pass of that

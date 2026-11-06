@@ -628,6 +628,16 @@ define_class!(
             self.sync_chrome();
         }
 
+        /// The system's display options changed (Accessibility, Display): Reduce Motion may have gone on or off.
+        #[unsafe(method(motionChanged:))]
+        fn motion_changed(&self, _note: &NSNotification) {
+            let on = reduce_motion();
+            with(|st| {
+                st.app.set_reduce_motion(on);
+                st.link.setPaused(false);
+            });
+        }
+
         /// The window moved to another screen, or a screen changed: the next frame reads its headroom (`screen_headroom`).
         #[unsafe(method(screenChanged:))]
         fn screen_changed(&self, _note: &NSNotification) {
@@ -1174,6 +1184,11 @@ fn play(pulses: &[crate::haptic::Haptic]) {
 }
 
 /// Whether `view` is drawn in the dark appearance.
+/// Whether the system's Reduce Motion is on (NSWorkspace's `accessibilityDisplayShouldReduceMotion`).
+fn reduce_motion() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
 fn is_dark(view: &NSView) -> bool {
     // SAFETY: the appearance names are valid static strings.
     let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
@@ -1411,7 +1426,21 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     );
     effect.addSubview(&view);
     window.setContentView(Some(&effect));
-    with(|st| st.app.dark = is_dark(&view));
+    with(|st| {
+        st.app.dark = is_dark(&view);
+        st.app.set_reduce_motion(reduce_motion());
+    });
+    // Reduce Motion going on or off is posted on the workspace's own notification centre.
+    // SAFETY: the view outlives the workspace's notifications (it lives until the app quits); the selector takes one
+    // NSNotification, and the name is a valid static string.
+    unsafe {
+        objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter().addObserver_selector_name_object(
+            &view,
+            sel!(motionChanged:),
+            Some(objc2_app_kit::NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification),
+            None,
+        );
+    }
     // The view hears the window's key changes (focus for the cursor).
     let center = objc2_foundation::NSNotificationCenter::defaultCenter();
     // SAFETY: the view outlives the window's notifications (both live until the app quits); the selectors take one

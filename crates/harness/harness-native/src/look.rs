@@ -75,6 +75,15 @@ pub struct SideDrag {
     pub keep: f32,
 }
 
+/// How a sidebar row's content comes in as the row folds in (and goes as it folds away), on the row's one fold spring
+/// (src/app/fold.rs): its words show only once the row has `lead` of its height (0 to 1), easing in over the rest, and
+/// settle down `rise` points into place as they do.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct FoldIn {
+    pub lead: f32,
+    pub rise: f32,
+}
+
 /// How held a [`PressGive`] control is (0 to 1, on its spring).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct PressAmt {
@@ -83,6 +92,7 @@ pub struct PressAmt {
 
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
+    world.component::<FoldIn>().writable();
     world.component::<PressAmt>();
     // The row templates (scene/widgets/rows.flecs) set these.
     world.component::<Breath>().writable();
@@ -135,6 +145,11 @@ pub fn pace(w: WorldRef<'_>, name: &str) -> Pace {
 /// The sidebar drag's numbers (`hn.Theme.side_drag`).
 pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
     role(w, "side_drag").try_cloned::<&SideDrag>().unwrap_or_else(|| panic!("hn.Theme.side_drag has no SideDrag"))
+}
+
+/// How a sidebar row's content folds in and away (`hn.Theme.tree_fold`).
+pub fn fold_in(w: WorldRef<'_>) -> FoldIn {
+    role(w, "tree_fold").try_cloned::<&FoldIn>().unwrap_or_else(|| panic!("hn.Theme.tree_fold has no FoldIn"))
 }
 
 /// A role's padding (`badge_on`).
@@ -211,7 +226,10 @@ pub fn install(w: WorldRef<'_>) {
     let turn = tune(w, "turn");
     w.system_named::<(&Disclose, &mut Fold)>("Turn").each_iter(move |it, _row, (d, f)| {
         let w = it.world();
-        if settle(&mut f.0, f32::from(u8::from(d.open)), turn, it.delta_time()) {
+        let to = f32::from(u8::from(d.open));
+        if harness_native_api::reduced(it.world()) {
+            f.0 = Spring::at(to);
+        } else if settle(&mut f.0, to, turn, it.delta_time()) {
             moving(&w);
         }
     });

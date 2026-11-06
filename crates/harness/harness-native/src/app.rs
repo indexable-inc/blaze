@@ -566,6 +566,15 @@ impl App {
         ZOOMS[self.zoom]
     }
 
+    /// The system's Reduce Motion (src/window.rs reads it from AppKit): kept as the world's `ReduceMotion`, which the
+    /// sidebar's springs and matched slides read to land at once.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        if self.world.try_get::<&harness_native_api::ReduceMotion>(|r| r.on) != Some(on) {
+            self.world.set(harness_native_api::ReduceMotion { on });
+            self.poke_why("reduce motion");
+        }
+    }
+
     /// Something changed: draw a few frames (the line that asked is the reason F3's overlay shows).
     #[track_caller]
     pub fn poke(&mut self) {
@@ -913,7 +922,7 @@ impl App {
         });
         self.fold.animate(
             self.world.entity_from_id(self.ids.tree),
-            crate::look::tune(self.world.world_ref(), "tree_fold"),
+            crate::look::fold_in(self.world.world_ref()),
         );
         self.sync_panes();
         self.sync_title();
@@ -1595,7 +1604,7 @@ impl App {
         self.step_sidebar(dt);
         self.step_side_drag(dt);
         self.lay_chrome(z);
-        self.step_fold();
+        self.step_fold(dt);
         self.step_tree_scroll(dt);
         self.step_chat_scroll();
         let w = self.world.world_ref();

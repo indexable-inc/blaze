@@ -73,26 +73,37 @@ export const badge_pad = 5
 export const size_badge = 10
 export const line_badge = 12
 
-// Springs (omega rad/s, zeta): a breath (slow, critically damped; a chat status dims to breath_floor), a disclosure
-// chevron's quarter turn, the selection pill sliding between rows, the sidebar folding (cmd+S) and the hover wash.
+// Springs (omega rad/s, zeta): a breath (slow, critically damped; a chat status dims to breath_floor), the sidebar
+// folding (cmd+S).
 export const breath_omega = 3.2
 export const breath_zeta = 1
 export const breath_floor = 0.3
-export const turn_omega = 30
-export const turn_zeta = 0.78
-export const pill_omega = 32
-export const pill_zeta = 0.86
-// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
-export const pill_jump_rows = 3
 export const sidebar_omega = 24
-// The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade.
-export const tree_glide_omega = 22
-export const tree_fold_omega = 26
-export const tree_fold_zeta = 1
-export const tree_glide_zeta = 1
+export const sidebar_zeta = 1
+// The sidebar tree's one spring family: what moves in it together lands together, critically damped (no overshoot,
+// no ring) on tree_omega. A row folding in or away (a new chat's row growing in, a finished run folding off), the
+// selection pill sliding between rows (and growing with a row that opens under it), the scroll gliding to the
+// selection and a disclosure chevron's quarter turn all ride it; Reduce Motion lands each at once.
+export const tree_omega = 26
+export const tree_zeta = 1
+export const turn_omega = $tree_omega
+export const turn_zeta = $tree_zeta
+export const pill_omega = $tree_omega
+export const pill_zeta = $tree_zeta
+export const tree_fold_omega = $tree_omega
+export const tree_fold_zeta = $tree_zeta
+export const tree_glide_omega = $tree_omega
+export const tree_glide_zeta = $tree_zeta
+// A folding row's words: they show only once the row has tree_fold_lead of its height, easing in over the rest as
+// they settle tree_fold_rise points down into place (and go the same way back, before the row closes).
+export const tree_fold_lead = 0.45
+export const tree_fold_rise = 4
+// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on): far enough
+// that a new chat's row at the foot of a screenful glides, a cmd+9 across a long tree lands.
+export const pill_jump_rows = 8
+// The tree's scroll: the margin the glide to the selected row leaves inside an edge, the edge fade.
 export const tree_reveal_margin = 8
 export const tree_fade_len = 22
-export const sidebar_zeta = 1
 // Dragging the sidebar's edge (den's feel, src/resize.rs): its width stays between side_min and side_max; dragged left
 // past half of side_min by side_latch more it latches closed (folding away on the sidebar spring), and dragged back
 // out past half of side_min by side_latch it latches open again, so it never flickers at the boundary. Past side_max

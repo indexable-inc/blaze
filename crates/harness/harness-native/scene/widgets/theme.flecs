@@ -67,8 +67,11 @@ hn {
       SideDrag: {min: $side_min, max: $side_max, latch: $side_latch, give: $side_give, soft: $side_soft, rearm: $side_rearm, grab: $side_grab, reach: $side_reach, keep: $side_keep}
     }
     window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
-    // A tree row folding in or away (its height and opacity).
-    tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
+    // A tree row folding in or away: its height on the spring, its words in once there is room (src/app/fold.rs).
+    tree_fold {
+      Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta}
+      FoldIn: {lead: $tree_fold_lead, rise: $tree_fold_rise}
+    }
     // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it). Its knob
     // is the ui.Scroll's overlay scroller (prims.flecs ui.Scroller); its edge fade is hn.Tree's ClipFade.
     tree_scroll {

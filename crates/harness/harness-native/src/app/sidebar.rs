@@ -1,6 +1,6 @@
 //! The sidebar's tree scroll: `hn.Tree` is a `ui.Scroll` driven by AppKit's scroll physics (harness-native-scroll-physics,
 //! den's copy of a default `NSScrollView`'s animator and momentum; its edge fade is the scroll's `ClipFade`), and the
-//! selected row kept in view (on a spring) whichever way it was selected. Its knob is the ui.Scroll's overlay scroller
+//! selected row kept in view (on the sidebar's spring, at once under Reduce Motion) whichever way it was selected. Its knob is the ui.Scroll's overlay scroller
 //! (prims.flecs `ui.Scroller`): the UI layer draws and drives it, and a drag or page on it is adopted here as the origin.
 use super::*;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, SurfaceConfig, Vec2};
@@ -151,7 +151,7 @@ impl App {
         let mut origin = self.tree.y;
         if let Some((mut s, goal)) = self.tree.glide.take() {
             let tune = crate::look::tune(w, "tree_scroll");
-            let moving = harness_native_api::settle(&mut s, goal, tune, dt);
+            let moving = !harness_native_api::reduced(w) && harness_native_api::settle(&mut s, goal, tune, dt);
             origin = if moving { s.x } else { goal };
             self.tree.rev += 1;
             if moving {

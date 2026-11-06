@@ -44,8 +44,23 @@ pub struct Fold(pub Spring);
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Folded;
 
+/// The system's Reduce Motion (singleton; System Settings, Accessibility, Display): while `on`, what would glide or fold
+/// on a spring lands at once (a matched-geometry slide such as the selection pill, the sidebar's rows folding and its
+/// chevrons turning, the tree's glide to the selection). The host keeps it in step with AppKit's
+/// `accessibilityDisplayShouldReduceMotion` (src/window.rs).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReduceMotion {
+    pub on: bool,
+}
+
+/// Whether the world is under Reduce Motion.
+pub fn reduced(w: WorldRef<'_>) -> bool {
+    w.try_get::<&ReduceMotion>(|r| r.on).unwrap_or(false)
+}
+
 hyperion_api_layouts::api_layouts! {
     "Clock" => alias Clock,
+    "ReduceMotion" => alias ReduceMotion,
     "HoverAmt" => alias HoverAmt,
     "Fold" => alias Fold,
     "Folded" => alias Folded,
@@ -58,6 +73,7 @@ hyperion_api_layouts::api_layouts! {
 /// Register every component of [`API_LAYOUTS`] (the host, before any module resolves them).
 pub fn register(world: &World) {
     world.component::<Clock>();
+    world.component::<ReduceMotion>();
     world.component::<HoverAmt>();
     world.component::<Fold>();
     world.component::<Folded>();
