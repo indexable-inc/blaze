@@ -14,4 +14,9 @@
 - Left out: `.git`, `.github`, `.config`, `b3sum/`, `capi/`, `c2sp/`, `supercop/`, `docs/`,
   `media/`, `host-lab-reports/`, the rest of `tools/` and the repository's notes.
 
-No changes: every kept file is upstream's at that commit (`diff -r` against cargo's checkout).
+One change: `build.rs` names the static libraries it builds `blake3_servil_*_assembly`, where
+upstream names them `blake3_*_assembly`, the names official BLAKE3's build script gives its own.
+Both crates are linked into blaze on x86-64, and a linker that finds each `-l` once by name for
+the whole program would take one crate's `libblake3_avx512_assembly.a` for both. Their symbols
+are prefixed apart already (`blake3_servil_*`). Every other kept file is upstream's at that
+commit (`diff -r` against cargo's checkout).
