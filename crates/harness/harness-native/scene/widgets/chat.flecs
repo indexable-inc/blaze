@@ -1,6 +1,6 @@
 // The chat pane (src/app/chat.rs): a chat session's transcript over its agent's structured events, drawn as a chat, not
-// a terminal. The transcript is a ui.LazyList (only the rows in view exist, each as tall as its words); the input a
-// ui.field.GrowingTextArea on a soft plate at the foot, a quiet status line under it.
+// a terminal. The transcript is a ui.LazyList (only the rows in view exist, each as tall as its words); at the foot the
+// composer, one card: a ui.field.GrowingTextArea over a bar of controls (model and effort, context, send or stop).
 
 @tree ChildOf
 hn {
@@ -18,118 +18,112 @@ hn {
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
       }
     }
-    // The foot is opaque, in the card's own ground: the transcript ends at its top (thinning out under it), and nothing
-    // drawn behind the pane shows under the input or its status line.
+    // The foot is opaque, in the page's own ground: the transcript ends at its top (thinning out under it), and nothing
+    // drawn behind the pane shows around the composer.
     foot : ui.Column {
       Fill: $tone_chat_ground
-      Flex: {axis: Column, gap: $chat_foot_gap, align: Center, justify: Start, wrap: false}
+      Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
-      input : ui.Row {
-        Fill: $tone_chat_input
-        Edge: {dark: $tone_chat_input_edge.dark, light: $tone_chat_input_edge.light}
-        Shape: {radius: $chat_input_radius, n: 4, border: 1, feather: 0}
+      // The composer: one card, the words over a bar of controls, as wide as the transcript's column. A press anywhere
+      // on it that no control takes gives the words the keys.
+      card : ui.Column {
+        Fill: $tone_chat_composer
+        Edge: {dark: $tone_chat_composer_edge.dark, light: $tone_chat_composer_edge.light}
+        Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
+        Lift: {blur: $chat_composer_lift_blur, alpha: $chat_composer_lift_alpha, dy: $chat_composer_lift_dy}
         Cursor: {shape: Text}
         Pressable
         Action: {name: "chat:focus"}
-        Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+        Flex: {axis: Column, gap: $chat_composer_gap, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: $chat_input_pad_y, b: $chat_input_pad_y}
-        // Grows with its words to most of the pane, then scrolls (src/app/chat.rs steps its FieldScroll).
-        area : ui.field.GrowingTextArea {
-          GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
+        Padding: {l: $chat_composer_pad, r: $chat_composer_pad, t: $chat_composer_pad_t, b: $chat_composer_pad}
+        entry : ui.Row {
+          Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
+          // Grows with its words to most of the pane, then scrolls (src/app/chat.rs steps its FieldScroll).
+          area : ui.field.GrowingTextArea {
+            GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
+          }
         }
-      }
-      status : ui.Row {
-        Flex: {axis: Row, gap: $chat_status_gap, align: Center, justify: Start, wrap: false}
-        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: 0, b: 0}
-        // The model, the effort and the context meter (src/app/chat/pick.rs fills it: hn.ChatPick, hn.ChatPickWord,
-        // hn.ChatPickMore, hn.ChatContext, each only while it has something to say).
-        pick : ui.Row {
-          Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Start, wrap: false}
-          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        }
-        spacer : ui.Spacer {}
-        // The agent's state as an icon (scene/widgets/chat_status.flecs: working, ended), its words its tooltip; it takes
-        // the pointer so the tooltip shows.
-        state : ui.Symbol {
-          Hoverable
+        // The controls (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to say): the
+        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and the send button
+        // (hn.ChatSend, hn.ChatSendReady with words to send, hn.ChatStop while the agent works) at the trailing one.
+        bar : ui.Row {
           Cursor: {shape: Arrow}
-          Icon: {glyph: ""}
-          Fill: $tone_chat_muted
-          Size: {w: {kind: Fixed, value: $chat_status_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_status_icon, min: 0, max: 0}}
-        }
-        // The picker's menu while it is open (a ui.Menu): out of the row's flow, its plate placed above what opened it.
-        menu : ui.Node {
-          Overlay
-        }
-        // The context meter's popover while the pointer is on the meter or on it (src/app/chat/context.rs).
-        pop : ui.Node {
-          Overlay
+          Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+          pick : ui.Row {
+            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
+          spacer : ui.Spacer {}
+          meter : ui.Row {
+            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
+          act : ui.Row {
+            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
+          // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
+          menu : ui.Node {
+            Overlay
+          }
+          // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
+          pop : ui.Node {
+            Overlay
+          }
         }
       }
     }
   }
 
-  // Den's model and effort picker under the composer (src/app/chat/pick.rs): the model's name in the ink, the effort's
-  // word and a chevron muted, each its own control with no plate, its ink easing to the strong ink under the pointer
-  // (pick.rs mixes hn.ChatPickInk's by the hover spring). The name opens the models, the word the efforts, the chevron
-  // both; Command-/ opens the models and Shift-Command-/ steps the effort (scene/20-keys.flecs).
-  prefab ChatPickBase : ui.Row {
+  // Den's model and effort picker, in the composer's bar (src/app/chat/pick.rs): one quiet control, "Opus · Medium" (the
+  // model alone when its effort is unknown) and a small chevron, muted, on a soft wash under the pointer, its words
+  // easing to the ink (pick.rs mixes hn.ChatPickInk's by the hover spring). No maker's mark here: the marks lead the
+  // menu's groups. A press opens the models and the efforts in one searchable menu above it; Command-/ opens the models
+  // and Shift-Command-/ steps the effort (scene/20-keys.flecs).
+  prefab ChatPick : ui.Row {
     Pressable
     Action: {name: ""}
     Cursor: {shape: Arrow}
+    Tooltip: {text: "Model and effort  ⌘/"}
     Fill: $tone_clear
-    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
-  }
-  // The model's control leads with its maker's mark (pick.rs `maker`: hn.Kind's claude, codex or cursor mark in its
-  // tone), then the name.
-  prefab ChatPick : hn.ChatPickBase {
-    Tooltip: {text: "Select model  ⌘/"}
-    Flex: {axis: Row, gap: $chat_pick_mark_gap, align: Center, justify: Center, wrap: false}
-    icon : ui.Icon {
-      Size: {w: {kind: Fixed, value: $chat_pick_mark, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_mark, min: 0, max: 0}}
-    }
-    label : ui.Line {
-      Fill: $tone_chat_ink
-      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
-    }
-  }
-  prefab ChatPickWord : hn.ChatPickBase {
-    Tooltip: {text: "Effort  ⇧⌘/"}
+    Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
     label : ui.Line {
       Fill: $tone_chat_muted
-      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+      TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
     }
-  }
-  prefab ChatPickMore : hn.ChatPickBase {
-    Tooltip: {text: "Model and effort"}
-    icon : ui.Symbol {
+    chevron : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_chat_muted
+      Fill: $tone_chat_faint
       Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
     }
   }
-  // The picker's inks at rest (the name's, the effort's and the chevron's); under the pointer each eases to `name` at
-  // full strength.
+  // The picker's words' inks: at rest, and under the pointer (eased between by its hover spring).
   prefab ChatPickInk {
-    name { Fill: $tone_chat_ink }
-    word { Fill: $tone_chat_muted }
+    rest { Fill: $tone_chat_muted }
+    hot { Fill: $tone_chat_ink }
   }
-  // Its menu is a ui.Menu (prims.flecs) above what opened it: a head over each part when it shows both (the chevron's),
-  // the current row ticked, a model's line about it muted at the end; where nothing can be chosen, a ui.MenuNote says
-  // why.
-  // The context meter (den's): a ring filling as the conversation fills its model's window, and the percentage; muted,
-  // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer, hn.ChatContextPop
-  // (widgets/context.flecs) says what fills it.
+  // Its menu is a ui.SearchMenu (search_menu.flecs) above it: each agent kind's models under its head with its maker's
+  // mark, then the efforts under theirs, the current rows ticked, a model's line about it muted at the end; where nothing
+  // can be chosen, a ui.MenuNote says why. Shift-Command-/ with no effort to step to opens the efforts alone (a ui.Menu).
+
+  // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
+  // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
+  // hn.ChatContextPop (widgets/context.flecs) says how full (the percentage at its head) and with what.
   prefab ChatContext : ui.Row {
     Hoverable
     Cursor: {shape: Arrow}
-    Flex: {axis: Row, gap: $chat_context_gap, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
-    Padding: {l: $chat_context_lead, r: 0, t: 0, b: 0}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
     ring : ui.ZStack {
       Size: {w: {kind: Fixed, value: $chat_ring, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ring, min: 0, max: 0}}
       track : ui.Node {
@@ -145,15 +139,51 @@ hn {
         Vector: {d: "M6 1 A5 5 0 0 1 6.5 1.03", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
       }
     }
-    pct : ui.Line {
-      Fill: $tone_chat_muted
-      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
-    }
   }
   prefab ChatContextTone {
     ok { Fill: $tone_chat_muted }
     warn { Fill: $tone_lost }
     full { Fill: $tone_failed }
+  }
+
+  // The send button at the bar's trailing edge (src/app/chat.rs keeps one of the three in `bar.act`): a circle with an
+  // arrow up, quiet with nothing to send (hn.ChatSend), solid in the words' ink once there is (hn.ChatSendReady); while
+  // the agent works, the stop (hn.ChatStop) in its place, a small square, breathing gently: the composer's one sign that
+  // the agent is at work (Escape interrupts too).
+  prefab ChatSendBase : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Shape: {radius: $chat_send / 2, n: 4, border: 0, feather: 0}
+    PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_send, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send, min: 0, max: 0}}
+  }
+  prefab ChatSend : hn.ChatSendBase {
+    Tooltip: {text: "Send  ↩"}
+    Fill: $tone_chat_send_idle
+    arrow : ui.Node {
+      Fill: $tone_clear
+      Stroke: {dark: $tone_chat_faint.dark, light: $tone_chat_faint.light}
+      Vector: {d: "M6 10 L6 2.5 M2.5 6 L6 2.5 L9.5 6", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_send_stroke}
+      Size: {w: {kind: Fixed, value: $chat_send_glyph, min: 0, max: 0}, h: {kind: Fixed, value: $chat_send_glyph, min: 0, max: 0}}
+    }
+  }
+  prefab ChatSendReady : hn.ChatSend {
+    Fill: $tone_chat_send
+    arrow : ui.Node {
+      Stroke: {dark: $tone_chat_send_glyph.dark, light: $tone_chat_send_glyph.light}
+    }
+  }
+  prefab ChatStop : hn.ChatSendBase {
+    Tooltip: {text: "Stop  esc"}
+    Fill: $tone_chat_send
+    Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_stop_breath}
+    square : ui.Node {
+      Fill: $tone_chat_send_glyph
+      Shape: {radius: $chat_stop_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}, h: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}}
+    }
   }
 
   // What the person sent: their words in a bubble at the trailing edge, as wide as they are up to $chat_bubble_max_w,
