@@ -968,13 +968,14 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
     out
 }
 
-/// Words node `e` laid out as the painter draws it (at the width layout gave it), and where it is (window points).
+/// Words node `e` laid out as the painter draws it (its lines broken at its `wrap_width`), and where it is (window points).
 fn words_layout(paint: &mut Painter, e: EntityView<'_>) -> Option<(Rc<Layout>, Laid)> {
     let text = e.try_cloned::<&Text>()?;
     let laid = e.try_cloned::<&Laid>()?;
     let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
     let md = e.has(MarkdownText::id());
-    Some((paint.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md), laid))
+    let at = harness_native_ui_node_api::wrap_width(e, laid.w);
+    Some((paint.layout_as(text.s.as_str(), &style, at.max(1.0) + 0.5, md), laid))
 }
 
 /// Where editable words node `e` shows its caret (window points, x, y, width, height), for the input method's candidate
