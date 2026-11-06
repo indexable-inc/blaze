@@ -632,6 +632,22 @@ fn a_proc_macro_package_tests_build() {
     }
 }
 
+/// `#![no_std]` proc-macro crates of every edition, an attribute macro among them (as
+/// multiversion_no_op's), and one that declares its own `extern crate std`, each built as a
+/// wasm module and expanded: the glue blaze appends to a macro crate's root names std only
+/// through its own `extern crate std as __blaze_std`, so a crate whose extern prelude has no
+/// `std`, or that already declares one, builds.
+#[test]
+fn a_no_std_proc_macro_expands() {
+    let case = Case::new("a_no_std_proc_macro_expands");
+    let out = case.ok_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        said.contains("test every_no_std_macro_expands ... ok"),
+        "`every_no_std_macro_expands` did not pass:\n{said}"
+    );
+}
+
 /// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): a function whose
 /// `ensures` is wrong for one input gets a generated Hegel test that fails, naming the function
 /// and the clause, with the shrunk case as a test to paste; a contract that holds passes, and
