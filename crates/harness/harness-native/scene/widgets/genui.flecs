@@ -1451,3 +1451,42 @@ hn {
     GenFeel: {settle_rate: $gen_settle_rate, settle_zeta: $gen_settle_zeta, drag_slop: $gen_drag_slop, shape_omega: $gen_shape_omega, shape_zeta: $gen_shape_zeta}
   }
 }
+
+// A harness browser view in a cell (src/app/chat/genui.rs `Browser`, `<Browser view={page.view} />` or
+// `<Browser src="https://…" />`; a step's shown value {t: "browser"} draws one too, chat.rs value_rows): the compact card.
+// The page live at gen_browser_aspect (`page`, a ui.Browser src/app/browser.rs fills), a loading hairline along its foot
+// while the page loads, its title and address under it. A press opens its view in the browser pane.
+@tree ChildOf
+hn {
+  prefab GenBrowser : ui.Column {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_gen_media
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    page : ui.Browser {
+      Fill: $tone_clear
+      Aspect: {ratio: $gen_browser_aspect}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    load : ui.Node {
+      Fill: $tone_browser_load
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_browser_load, min: 0, max: 0}}
+    }
+    meta : ui.Column {
+      Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 6, b: 8}
+      title : ui.Line {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0, weight: 500}
+      }
+      url : ui.LineMiddle {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
+      }
+    }
+  }
+}

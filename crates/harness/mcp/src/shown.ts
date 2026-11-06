@@ -17,7 +17,16 @@ export type Shown =
   | Grid
   | { t: "scalar"; type: ColType; v: Cell }
   | { t: "text"; v: string; total: number }
-  | { t: "error"; message: string; stack: string };
+  | { t: "error"; message: string; stack: string }
+  /** A page of the harness browser (cdp.ts `Page`): the app draws it as a live card of view `view` (the genui Browser
+   *  element, compact), its title and host under it; pressing it opens the view in the browser pane. */
+  | { t: "browser"; view: string; url: string; title: string };
+
+/** A value that says how it is shown: `[SHOWN]()` gives its Shown (a browser Page gives its card). */
+export const SHOWN: unique symbol = Symbol.for("harness.shown");
+type ShowsItself = { [SHOWN](): Shown };
+const showsItself = (v: unknown): v is ShowsItself =>
+  typeof v === "object" && v !== null && typeof (v as Partial<ShowsItself>)[SHOWN] === "function";
 
 export const MAX_ROWS = 500;
 const MAX_CELL = 400;
@@ -114,6 +123,7 @@ function settled(v: unknown[]): unknown[] | null {
  *  their queries), so the app draws them as results, never as a table with a JSON array in a cell; Promise.allSettled's
  *  results show as what they settled to. */
 export function shown(v: unknown, budget = 64 << 10, kind?: ShownKind): Shown {
+  if (showsItself(v)) return v[SHOWN]();
   if (v instanceof Error) return { t: "error", message: brief(v), stack: clip(v.stack ?? "", 8 << 10) };
   if (typeof v === "string") return { t: "text", v: clip(v, budget), total: v.length };
   if (v instanceof Map) v = Object.fromEntries(v);

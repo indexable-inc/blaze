@@ -91,6 +91,7 @@ pub const PALETTE: &str = "ctx::Palette";
 pub const PICKER: &str = "ctx::Picker";
 pub const ARCHIVE: &str = "ctx::Archive";
 pub const CHAT: &str = "ctx::Chat";
+pub const BROWSER: &str = "ctx::Browser";
 
 /// Keys pressed together, as a binding names them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

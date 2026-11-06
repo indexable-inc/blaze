@@ -1,0 +1,19 @@
+[package]
+name = "cef-dll-sys"
+description = "cef-rs's sys crate (tauri-apps/cef-rs 156.3.0), its build script replaced: the pinned CEF from harness's cache, the loader stubs compiled with cc, no download, no cmake"
+# The version cef 156.3.0+156.0.15 asks for, so `[patch.crates-io]` takes this copy.
+version = "156.3.0+156.0.15"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+links = "cef_dll_wrapper"
+publish = false
+
+[lib]
+doctest = false
+
+[features]
+dox = []
+sandbox = []
+
+[build-dependencies]
+cc = "1.2.8"

@@ -51,7 +51,7 @@ export function split(buf: Uint8Array): { t: number; payload: Uint8Array; size: 
 /** A request: the `op` and its fields (msg.rs `Request`; repl_task and spawn_object carry open records). */
 export type Request =
   | { op: "list"; all?: boolean; chats?: boolean }
-  | { op: "info" | "last" | "watch" | "shutdown" }
+  | { op: "info" | "last" | "watch" | "shutdown" | "browser" }
   | { op: "spawn"; kind: string; args?: string[]; parent?: number | null; cwd?: string | null; prompt?: string | null; name?: string | null; cols?: number | null; rows?: number | null; mode?: string | null; model?: string; effort?: string }
   | { op: "attach"; id: number; cols?: number | null; rows?: number | null; events?: boolean }
   | { op: "send"; id: number; text: string; raw?: boolean; submit?: boolean | null }
@@ -96,6 +96,8 @@ export type Reply =
   | { reply: "last"; id: number | null }
   | { reply: "screen"; text: string; info: SessionInfo }
   | { reply: "attached"; info: SessionInfo }
+  /** `browser`: the harness browser host's pid, its socket for the kernel (cdp.ts) and the Mach service the app looks up. */
+  | { reply: "browser"; pid: number; sock: string; service: string }
   | ({ reply: "record" } & Record<string, unknown>);
 
 /** The daemon's message. */

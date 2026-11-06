@@ -67,6 +67,10 @@ pub(super) fn config(
 impl App {
     /// A scroll: over the sidebar's tree it scrolls the tree, else it goes to the terminal under the pointer.
     pub fn scroll_wheel(&mut self, ev: Wheel, m: KeyMods) {
+        // Over a live browser page: the page scrolls (app/browser.rs).
+        if self.browser_wheel(&ev, m) {
+            return;
+        }
         let z = self.zoom();
         if self.over_tree() {
             let t = self.tree.clock.elapsed().as_secs_f64();
