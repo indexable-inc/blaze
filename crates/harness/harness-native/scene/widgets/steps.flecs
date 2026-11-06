@@ -1,0 +1,248 @@
+// A turn's steps (src/app/chat/steps.rs): what an agent's harness cells did, folded to one quiet line per run of calls,
+// and opened, only what they gave: a page as its host, a file as its chip, search results as titled links per query, a
+// command's output, a failure as one plain sentence. Never ids, statuses, timestamps or raw code; how long a step took
+// is its line's tooltip. Each output kind is its own prefab here; Rust picks one per row (steps::Out::prefab) and fills
+// its parts by name.
+
+@tree ChildOf
+hn {
+  // What kind of step a line is, as data: each kind's glyph, read by name (steps.rs `glyph`; a missing kind panics).
+  prefab StepKind {
+    // a shell command (cod-terminal)
+    exec { Icon: {glyph: ""} }
+    // a file read (cod-file)
+    read { Icon: {glyph: ""} }
+    // a file edited (cod-edit)
+    edit { Icon: {glyph: ""} }
+    // a file written (cod-new-file)
+    write { Icon: {glyph: ""} }
+    // a file deleted (cod-trash)
+    delete { Icon: {glyph: ""} }
+    // a web or code search (cod-search)
+    search { Icon: {glyph: ""} }
+    // a listing (cod-list-unordered)
+    list { Icon: {glyph: ""} }
+    // a build, check or test (cod-package)
+    build { Icon: {glyph: ""} }
+    // a page fetched (cod-globe)
+    net { Icon: {glyph: ""} }
+    // a query (cod-database)
+    sql { Icon: {glyph: ""} }
+    // an agent or task started (cod-rocket)
+    spawn { Icon: {glyph: ""} }
+    // waiting on an earlier cell (cod-history)
+    wait { Icon: {glyph: ""} }
+    // a cell that did nothing more particular (cod-play)
+    cell { Icon: {glyph: ""} }
+    // an agent's own tool (cod-tools)
+    tool { Icon: {glyph: ""} }
+  }
+
+  // A step's line: its kind's icon and its words, muted, at the body size, on one line.
+  prefab StepLook : ui.Row {
+    Flex: {axis: Row, gap: $chat_line_word_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
+    AlignSelf: {align: Start}
+    Padding: {l: $chat_line_pad, r: $chat_line_pad, t: 0, b: 0}
+    icon : ui.Symbol {
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}}
+    }
+    words : ui.Lead {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+  }
+
+  // A failure's mark: a small dot in the failed tone after the words, the one coloured thing; what failed is its tooltip.
+  prefab StepMark : ui.Node {
+    Fill: $tone_failed
+    Shape: {radius: 2.5, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Fixed, value: 5, min: 0, max: 0}, h: {kind: Fixed, value: 5, min: 0, max: 0}}
+    Cursor: {shape: Arrow}
+  }
+
+  // The chevron shown while its line is hovered (right folded, down open).
+  prefab StepChevron : ui.Symbol {
+    Fill: $tone_term_muted
+    HoverShow: {row: 0, keep: false}
+    Size: {w: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}}
+  }
+
+  // A line that opens what it folds: a soft wash hugging its icon and words under the pointer, never a full-width plate.
+  prefab StepPress : hn.StepLook {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  }
+
+  // A run's or a cell's one line ("Searched 3 times, fetched 4 pages"), folded until pressed. Failed: the same words (they
+  // say what could not be done) and a small mark.
+  prefab StepLine : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 1, b: 1}
+    guide : hn.ChatGuideOff {}
+    head : hn.StepPress {
+      chevron : hn.StepChevron {}
+    }
+  }
+  prefab StepLineFailed : hn.StepLine {
+    head : hn.StepPress {
+      mark : hn.StepMark {}
+      chevron : hn.StepChevron {}
+    }
+  }
+
+  // What an opened line shows sits in from it, on its guide.
+  prefab StepOut : ui.Column {
+    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_line_inset, r: 0, t: 1, b: 1}
+    guide : hn.ChatGuide {}
+  }
+
+  // A step with nothing more to show than what it did ("Ran ls"); failed, why in plain words after a mark.
+  prefab StepHead : hn.StepOut {
+    line : hn.StepLook {}
+  }
+  prefab StepHeadFailed : hn.StepOut {
+    line : hn.StepLook {
+      mark : hn.StepMark {}
+      why : ui.Lead {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // A page fetched: its host as a link, its path quiet after it.
+  prefab StepPage : hn.StepOut {
+    line : hn.StepLook {
+      link : ui.Lead {
+        Pressable
+        Action: {name: ""}
+        Cursor: {shape: Hand}
+        Fill: $tone_accent
+        TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+      }
+      path : ui.Lead {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // A file read, written or deleted: its chip (pressed, it opens in its app).
+  prefab StepFile : hn.StepOut {
+    line : hn.StepLook {
+      chip : hn.GenFileRef {
+        Pressable
+        Action: {name: ""}
+      }
+    }
+  }
+
+  // One search result: its page's title as a link, its host quiet under it.
+  prefab StepResult : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    title : ui.Lead {
+      Pressable
+      Action: {name: ""}
+      Cursor: {shape: Hand}
+      Fill: $tone_accent
+      TextStyle: {size: $size_body, line: 18, role: 0, bold: 0}
+    }
+    host : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A search's results (the first few), and how many more there were.
+  prefab StepResults : hn.StepOut {
+    list : ui.ResultList {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    }
+    foot : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  // One query's results among several: the query quiet over them.
+  prefab StepResultsQuery : hn.StepOut {
+    Padding: {l: $chat_line_inset, r: 0, t: 4, b: 2}
+    query : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+    list : ui.ResultList {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+    }
+    foot : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A short answer (a string, a number), in the UI face.
+  prefab StepText : hn.StepOut {
+    text : ui.Words {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+    }
+  }
+
+  // A command's output (its digest), in the code face on the card's plate: the one place steps use it.
+  prefab StepCode : hn.ChatOutput {}
+
+  // Any other value: a short preview on one line; pressed, the whole of it (a hn.StepGrid row under it).
+  prefab StepValue : hn.StepOut {
+    head : ui.Row {
+      Flex: {axis: Row, gap: $chat_line_word_gap, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
+      AlignSelf: {align: Start}
+      Padding: {l: $chat_line_pad, r: $chat_line_pad, t: 0, b: 0}
+      Pressable
+      Action: {name: ""}
+      Cursor: {shape: Arrow}
+      Fill: $tone_clear
+      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+      words : ui.Lead {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+      }
+      chevron : hn.StepChevron {}
+    }
+  }
+
+  // A value opened whole: the chat's table on its plate.
+  prefab StepGrid : hn.ChatGrid {}
+
+  // What failed, as one plain sentence after a small mark ("No browser is connected").
+  prefab StepFail : hn.StepOut {
+    line : ui.Row {
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $chat_line_pad, r: 0, t: 2, b: 2}
+      mark : hn.StepMark {}
+      why : ui.Words {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_body, line: 18, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // A quiet aside (more steps than shown).
+  prefab StepNote : hn.StepOut {
+    text : ui.Line, Faint {
+      Padding: {l: $chat_line_pad, r: 0, t: 0, b: 0}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+}

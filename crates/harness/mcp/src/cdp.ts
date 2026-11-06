@@ -118,7 +118,8 @@ export class Page {
   close() { return this.browser.send("Target.closeTarget", { targetId: this.targetId }).catch(() => {}); }
 }
 
-export class CdpUnavailable extends Error { override name = "CdpUnavailable"; }
+/** No browser to drive. Its message tells the model how to start one; `brief` is what the app says (shown.ts `brief`). */
+export class CdpUnavailable extends Error { override name = "CdpUnavailable"; readonly brief = "No browser is connected"; }
 
 let shared: Promise<Browser> | undefined;
 /** One cached connection per process; reconnects if the browser dropped it. If nothing is listening,

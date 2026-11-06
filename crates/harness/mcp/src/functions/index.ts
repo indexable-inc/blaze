@@ -5,7 +5,9 @@ import { withHiddenPage } from "../cdp.ts";
 import { table, Table, LazyTable, col, lit, tableDocs } from "../table.ts";
 import { gitLog } from "../git-log.ts";
 import { nuon } from "../nuon.ts";
-import { tasks, task, taskValue, wait } from "../tasks.ts";
+import { tasks, task, taskValue, wait as waitTask } from "../tasks.ts";
+import { effect } from "../effects.ts";
+import { brief } from "../shown.ts";
 import { agents } from "../agents.ts";
 import { sql } from "../sql.ts";
 import { spawn, obj, objects, tree } from "../obj.ts";
@@ -16,6 +18,16 @@ import { pmap } from "../pmap.ts";
 import { image } from "../image.ts";
 import { vfs } from "../vfs.ts";
 import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo } from "../proc.ts";
+
+/** `wait` as a step of the cell that waits (effects.ts kind `wait`): the step shows the awaited cell's own value (or its
+ *  error), so the app draws that cell's output, never the task's record (id, status, timestamps); the cell still returns
+ *  the record to the model. */
+const wait = (id: string | number, timeoutMs?: number) =>
+  effect("wait", "Waiting for an earlier cell", "Waited for an earlier cell", String(id), () => waitTask(id, timeoutMs), (v) => ({
+    ok: v.status !== "error",
+    detail: v.status === "running" ? "still running" : v.status === "error" ? brief(taskValue(id)) : "",
+    show: v.status === "running" ? undefined : taskValue(id),
+  }));
 
 export const functions = { rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
 
