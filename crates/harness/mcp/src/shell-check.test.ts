@@ -121,6 +121,10 @@ test("gh's GitHub reads and curl are refused with github.* and fetch; gh's write
   for (const [line, call] of cases) expect(await typed(line), line).toBe(call);
   expect(await refusal('gh pr list')).toContain('github.* in ts');
   expect(await refusal('curl https://x.dev')).toContain('HTTP is fetch in ts');
+  expect(await typed('open https://google.com')).toBe("await browser.open('https://google.com')");
+  expect(await typed('open -a Dia https://x.dev/a')).toBe("await browser.open('https://x.dev/a')");
+  expect(await refusal('open https://google.com')).toContain('harness browser');
+  expect(await refusal('open .')).toBeUndefined();
   for (const runs of ['gh pr create --fill', 'gh pr merge 3 --squash', 'gh run view 5 --log', 'gh auth status', "gh api user # why: checking gh's own auth"]) {
     expect(await refusal(runs), runs).toBeUndefined();
   }
