@@ -20,7 +20,8 @@ pub struct Inline {
 }
 
 /// One inline component in the words: `start` is its icon's hole (one unit, [`crate::text::HOLE`]), its label runs to
-/// `end`. The painter draws its chip and icon from the scene's `ui.inline.<name>`; a press opens its target there.
+/// `end`. The painter draws its chip and icon from the scene's `ui.inline.<name>`; a press opens its target there. A tag
+/// whose form has a mark (`tag.mark`) ends in a second hole, `end - 1`, the mark its live state picks is drawn in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineTag {
     pub start: usize,
@@ -28,13 +29,23 @@ pub struct InlineTag {
     pub tag: harness_native_ui_inline::Tag,
 }
 
+impl InlineTag {
+    /// The mark's hole, when it has one.
+    #[must_use]
+    pub fn mark(&self) -> Option<usize> {
+        self.tag.mark.then(|| self.end - 1)
+    }
+}
+
 impl Inline {
-    /// The holes the components' icons stand in, for words set at `size`: [`REF_ICON_EM`] wide, as tall as the words.
+    /// The holes the components' icons stand in, for words set at `size`: [`REF_ICON_EM`] wide, as tall as the words; and
+    /// after a label with a mark, [`MARK_EM`] wide.
     #[must_use]
     pub fn holes(&self, size: f32) -> Vec<Hole> {
+        let hole = |at: usize, em: f32| Hole { start: at, end: at + 1, width: size * em, ascent: 0.0, descent: 0.0, pad: 0.0 };
         self.tags
             .iter()
-            .map(|t| Hole { start: t.start, end: t.start + 1, width: size * REF_ICON_EM, ascent: 0.0, descent: 0.0, pad: 0.0 })
+            .flat_map(|t| std::iter::once(hole(t.start, REF_ICON_EM)).chain(t.mark().map(|m| hole(m, MARK_EM))))
             .collect()
     }
 }
@@ -43,6 +54,10 @@ impl Inline {
 pub const REF_ICON_EM: f32 = 1.3;
 /// Its icon's size, in ems of the words.
 pub const REF_ICON_SIZE_EM: f32 = 0.9;
+/// The mark's hole after a label (a pull request's CI check): the room before it and the mark ([`MARK_SIZE_EM`]).
+pub const MARK_EM: f32 = 1.05;
+/// The mark's size, in ems of the words.
+pub const MARK_SIZE_EM: f32 = 0.72;
 
 /// An inline code span's chip, in ems of its text's size: the plate reaches `CHIP_INSET_EM` past the span's glyphs each
 /// side, and keeps `CHIP_GAP_EM` clear of a neighbour that is not white space (a word space is gap enough on its own). The
@@ -158,6 +173,9 @@ pub fn inline(src: &str) -> Inline {
                     push(&mut out, &mut at, crate::text::HOLE);
                     for ch in tag.label.chars() {
                         push(&mut out, &mut at, ch);
+                    }
+                    if tag.mark {
+                        push(&mut out, &mut at, crate::text::HOLE);
                     }
                     out.runs.push(Run { start, end: at, face: Face::InlineRef });
                     out.tags.push(InlineTag { start, end: at, tag });

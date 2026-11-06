@@ -6,6 +6,8 @@
 //! What decides, first to last:
 //! 1. A drag in progress: the sidebar's edge (column resize, one-way folded or at its widest; src/app/side_drag.rs), a terminal selection (I-beam),
 //!    a press reported to a terminal's program (arrow), a press on a node (the shape it went down with).
+//!    Before the press on a node: an inline chip in the focused chat's words (`<Link>`, `<Path>`, `<PR>`, `<Issue>`;
+//!    src/app/chat/peek.rs), the pointing hand, macOS's shape for a link, hovered or held.
 //! 2. The sidebar's draggable edge zone, or the window's left edge while it is folded (the same test a press uses,
 //!    `on_side_edge`).
 //! 3. The topmost hit node under the pointer: its `Cursor`, or its nearest ancestor's, said on the primitives and prefabs in
@@ -27,6 +29,10 @@ impl App {
             return (self.side_edge_pointer(), "drag: sidebar edge");
         }
         if let Some(s) = self.term_drag_pointer() {
+            return s;
+        }
+        // An inline chip in a chat's words (a link, a path, a pull request): the pointing hand, pressed or not.
+        if let Some(s) = self.chip_pointer() {
             return s;
         }
         let scene = self.world.try_get::<&PointerShape>(|s| *s).unwrap_or_default();

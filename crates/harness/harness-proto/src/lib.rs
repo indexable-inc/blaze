@@ -28,6 +28,7 @@ pub mod frame;
 pub mod log;
 pub mod migrate;
 pub mod msg;
+pub mod peek;
 
 /// The schema's version: in every connection's hello and in every chat log's [`log::MAGIC`]. A change to any type here
 /// that an older reader would decode differently bumps it (and the log magic with it, which makes the daemon convert old

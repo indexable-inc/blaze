@@ -37,7 +37,7 @@ pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
     ("output", include_str!("system_note/output.md")),   // the person already sees every cell: don't restate it
     ("ui", include_str!("system_note/ui.md")),           // cells as Svelte 5 UI: read the ui skill first
     ("replies", include_str!("system_note/replies.md")), // how replies to Andrew read
-    ("prose", include_str!("system_note/prose.md")),     // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
+    ("prose", include_str!("system_note/prose.md")),     // prose, not monospace; inline components (<Path>, <Symbol>, <Link>, <PR>, <Issue>)
 ];
 
 /// What one agent launch is told: [`SYSTEM_NOTE_PARTS`], then the index of the skills its session offers (its last

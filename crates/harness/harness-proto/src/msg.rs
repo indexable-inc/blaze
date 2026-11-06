@@ -185,6 +185,18 @@ pub enum Request {
     /// where it listens. Answered by [`Reply::Browser`] once the host is ready, or an error naming what failed (its app
     /// bundle missing, CEF failing to start), never a stand-in browser.
     Browser,
+    /// The state of the pull requests and issues a chat's words name (the app's chips, harness-proto's peek.rs): one
+    /// batched GitHub query for all of them, as `gh` is signed in. Answered from a short-lived cache unless `fresh` (the
+    /// chat was just focused). At most [`crate::peek::REFS_MAX`] refs; each comes back as a [`crate::peek::GhItem`],
+    /// with an error naming it when it could not be read.
+    GithubStatus {
+        refs: Vec<crate::peek::GhRef>,
+        #[serde(default)]
+        fresh: bool,
+    },
+    /// A web page's card for a hover (`url`, http or https): its OpenGraph title, description, site and image, fetched
+    /// once and kept.
+    PagePeek { url: String },
     /// Shell runs with every pipeline stage's output stored (crates/harness/harness/src/runs.rs).
     #[serde(untagged)]
     Runs(RunReq),
@@ -292,6 +304,10 @@ pub enum Reply {
     /// `browser`: the host's pid, its socket for the kernel (`$HARNESS_HOME/browser/host.sock`) and the Mach service the
     /// app looks up (crate::browser).
     Browser { pid: u32, sock: String, service: String },
+    /// `github_status`: one item a ref asked, in its order.
+    Github { items: Vec<crate::peek::GhItem> },
+    /// `page_peek`.
+    Page { page: crate::peek::PageMeta },
     /// A run's or an object's answer, an open record whose shape runs.rs and object.rs define.
     Record(Value),
 }
