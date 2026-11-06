@@ -1,22 +1,27 @@
 module hn.chat_status
 
 // The chat's statuses as icons (src/app/chat.rs `status_on` reads them by name and panics on a missing one): each its
-// glyph (a codicon from the bundled Symbols Nerd Font), its tone, its words (the tooltip of whatever shows it, so the word
-// stays discoverable) and, when it carries a Breath, the running dot's breath (src/look.rs) while it shows. The breath is
-// the one motion: it lasts only while the agent works, so with nothing at work the window goes idle. Each is a prefab, so
-// no query (the breath's, the tooltip's) ever matches the vocabulary itself, only the nodes chat.rs copies it onto.
-// Colour only where it means something (a failure's red); the rest in the chat's muted and faint inks.
+// glyph (a codicon from the bundled Symbols Nerd Font) or its drawing (a Vector in its Stroke, crisp at any size), its
+// tone, its words (the tooltip of whatever shows it, so the word stays discoverable) and, when it carries a Breath, the
+// running dot's breath (src/look.rs) while it shows. The breath is the one motion: it lasts only while the agent works,
+// so with nothing at work the window goes idle. Each is a prefab, so no query (the breath's, the tooltip's) ever matches
+// the vocabulary itself, only the nodes chat.rs copies it onto. Colour only where it means something (a failure's red);
+// the rest in the chat's muted and faint inks.
 
-// The agent's reasoning: a sparkle, breathing while it still thinks, still once it is done.
+// The agent's reasoning: a thin ring, the hollow sibling of a running call's dot, breathing on the same breath while it
+// still thinks, still once it is done. Its line is the codicons' weight (chat_think_stroke) and it sits a little inside
+// its box (radius 4 of 12), so it weighs what the step glyphs beside it do.
 prefab thinking {
-  Icon: {glyph: ""}
-  Fill: $tone_chat_muted
+  Fill: $tone_clear
+  Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+  Vector: {d: "M6 2 A4 4 0 1 1 6 10 A4 4 0 1 1 6 2", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_think_stroke}
   Tooltip: {text: "Thinking…"}
   Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_floor}
 }
 prefab thought {
-  Icon: {glyph: ""}
-  Fill: $tone_chat_muted
+  Fill: $tone_clear
+  Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+  Vector: {d: "M6 2 A4 4 0 1 1 6 10 A4 4 0 1 1 6 2", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_think_stroke}
   Tooltip: {text: "Thought"}
 }
 

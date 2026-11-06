@@ -74,6 +74,10 @@ pub struct Painter {
     arrivals: crate::arrive::Arrivals,
     /// A glyph painted in the last frame is still fading in ([`Painter::end_frame`]): the host draws another.
     pub arriving: bool,
+    /// Each focused caret's sweep (caret.rs), by its text node.
+    carets: crate::caret::Carets,
+    /// A caret painted in the last frame is still sweeping ([`Painter::end_frame`]): the host draws another.
+    pub gliding: bool,
 }
 
 /// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
@@ -285,6 +289,8 @@ impl Painter {
             paths: HashMap::new(),
             arrivals: crate::arrive::Arrivals::default(),
             arriving: false,
+            carets: crate::caret::Carets::default(),
+            gliding: false,
             highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
@@ -461,6 +467,7 @@ impl Painter {
     pub fn end_frame(&mut self) -> bool {
         self.kip_wake = self.kips.end_frame();
         self.arriving = self.arrivals.end_frame();
+        self.gliding = self.carets.end_frame();
         if self.cache.overflowed() {
             self.cache.clear();
             return true;
@@ -745,7 +752,8 @@ impl Painter {
                     }
                 }
                 if let Some(t) = edit {
-                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha, time);
+                    let look = crate::caret::look(e.world());
+                    emit_edit(d, &mut self.carets, (e.id().0, &look), &lay, &t, laid, &style, dark, sc, p.alpha, time);
                 }
                 if let Some(c) =
                     e.try_cloned::<&Caret>().filter(|c| (c.at..c.until).contains(&time))
@@ -1199,9 +1207,14 @@ fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
     out
 }
 
-/// A `TextEdit`'s marked text's underline and caret bar over its words' layout (its selection is drawn under the words).
+/// A `TextEdit`'s marked text's underline and caret over its words' layout (its selection is drawn under the words). The
+/// caret is den's (caret.rs, `ui.caret`'s look): a bar centred on the caret's place, swept when it jumps, its blink the
+/// shader's from when it last moved (`TextEdit::since`), node `node`'s glide kept in `carets`.
 #[allow(clippy::too_many_arguments)]
-fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32, time: f32) {
+fn emit_edit(
+    d: &mut Draw, carets: &mut crate::caret::Carets, (node, look): (u64, &harness_native_ui_look_api::CaretLook), lay: &Layout,
+    t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32, time: f32,
+) {
     let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
     let snap = |v: f32| (v * sc).round() / sc;
     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
@@ -1213,25 +1226,35 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
         }
     }
     if t.focused && lo == hi {
-        let line = set_of(style).line;
-        let (x, top, h) = if lay.lines.is_empty() {
-            (0.0, 0.0, line)
+        let set = set_of(style);
+        let (x, top, line) = if lay.lines.is_empty() {
+            (0.0, 0.0, set.line)
         } else {
             let (x, li) = lay.caret(t.caret as usize);
             let l = &lay.lines[li];
             (x, l.top, l.height)
         };
-        // 1.5 points, whole device pixels (3 on a Retina display): crisp, never a smear between two.
-        let w = (1.5 * sc).round().max(1.0) / sc;
-        let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
-        let on = if t.blink { caret_blink(time - t.since) } else { 1.0 };
-        if on > 0.004 {
-            d.panel(panel_from(ink, [0.0; 4], square, rect, alpha * on));
-        }
+        // Whole device pixels wide (3 on a Retina display at 1.5 points) and on the pixel grid at rest: crisp, never a
+        // smear between two; `h` of the font's size about its line's middle, as den's.
+        let w = (look.w * sc).round().max(1.0) / sc;
+        let h = snap(set.size * look.h).min(line);
+        let rest = [snap(laid.x + x - w * 0.5) - laid.x, snap(laid.y + top + (line - h) * 0.5) - laid.y, w, h];
+        let bar = crate::caret::Bar {
+            rest,
+            at: (laid.x, laid.y),
+            // The bar and its sweep stay in the text's box (the caret's width past either side, for one at an edge).
+            clip: [laid.x - w, laid.y, laid.w + 2.0 * w, laid.h.max(lay.height())],
+            ink,
+            alpha,
+            moved: t.since,
+            blink: t.blink,
+        };
+        d.panel(carets.panel(node, &bar, look, time));
     }
 }
 
-/// Seconds a caret stays solid after it moved, and a whole blink's period (the terminal's cursor and a text area's caret).
+/// Seconds the terminal's cursor stays solid after it moved, and a whole blink's period (a text field's caret is
+/// caret.rs's, its timings `ui.caret`'s).
 pub const BLINK_PAUSE: f32 = 0.5;
 pub const BLINK_PERIOD: f32 = 1.2;
 

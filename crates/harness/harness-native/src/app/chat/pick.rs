@@ -1,7 +1,8 @@
 //! Den's model and effort picker in a chat's composer bar (scene/widgets/chat.flecs `hn.ChatPick`), and its context meter.
 //!
-//! The bar's leading edge shows one quiet control, "Opus · Medium" and a small chevron, on a wash under the pointer, its
-//! words easing toward the ink. A press opens the menu above it: the models and the efforts (Command-/ the models alone,
+//! The bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
+//! model takes, those up to the effort lit; the effort's name its tooltip) and a small chevron, on a wash under the
+//! pointer, its words and lit bars easing toward the ink. A press opens the menu above it: the models and the efforts (Command-/ the models alone,
 //! Shift-Command-/ with nothing to step to the efforts alone), the current rows ticked. A pick sends `Request::SetModel` (link.rs `chat_choose`);
 //! the daemon has the agent switch (claude's `set_model` and `apply_flag_settings` control requests, codex's next
 //! `turn/start`) and logs the choice, so a resumed chat keeps it. A chat whose own log has no `models` event (one from
@@ -126,7 +127,7 @@ fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
     Rgba { r: m(a.r, b.r), g: m(a.g, b.g), b: m(a.b, b.b), a: m(a.a, b.a) }
 }
 
-/// The Fill of scene prefab `path` (`hn.ChatPickInk.rest`); the scene always has it.
+/// The Fill of scene prefab `path` (`hn.ChatControlInk.rest`); the scene always has it.
 fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
@@ -135,6 +136,41 @@ fn set_fill(v: View<'_>, f: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(f) {
         v.set(f);
     }
+}
+
+/// The composer bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
+pub(super) struct ControlInk {
+    pub rest: Fill,
+    pub hot: Fill,
+    pub off: Fill,
+}
+
+impl ControlInk {
+    pub(super) fn of(w: WorldRef<'_>) -> Self {
+        Self {
+            rest: fill_of(w, "hn.ChatControlInk.rest"),
+            hot: fill_of(w, "hn.ChatControlInk.hot"),
+            off: fill_of(w, "hn.ChatControlInk.off"),
+        }
+    }
+
+    /// The ink of control `v` now: at rest eased toward hot by its hover spring (which starts with it).
+    pub(super) fn now(&self, v: View<'_>) -> Fill {
+        let e = v.entity();
+        if !e.has(HoverAmt::id()) {
+            e.set(HoverAmt::default());
+        }
+        let k = e.try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+        Fill { dark: mix(self.rest.dark, self.hot.dark, k), light: mix(self.rest.light, self.hot.light, k) }
+    }
+}
+
+/// Where `effort` stands among the efforts `model` takes (lowest first): its place and how many there are; None when
+/// the model is unknown or does not list it (the control then says it in words).
+fn level(model: Option<&ModelChoice>, effort: &str) -> Option<(usize, usize)> {
+    let m = model?;
+    let at = m.efforts.iter().position(|e| e.as_str() == effort)?;
+    Some((at, m.efforts.len()))
 }
 
 impl App {
@@ -152,14 +188,24 @@ impl App {
         let name = cur.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(model);
         let context = t.context.as_ref().filter(|c| c.window > 0);
         let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
-        let (rest, hot) = (fill_of(w, "hn.ChatPickInk.rest"), fill_of(w, "hn.ChatPickInk.hot"));
-        // "Opus · Medium": the model, and its effort when known.
-        let words = if effort.is_empty() { name.to_owned() } else { format!("{name} \u{b7} {}", effort_word(effort)) };
+        let ink = ControlInk::of(w);
+        // The model's name and its effort's level; an effort with no place among its model's said in words
+        // ("Opus · Medium"), and the model alone when the effort is unknown. The effort's name is the tooltip either way.
+        let level = level(cur, effort);
+        let words = match level {
+            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(effort)),
+            _ => name.to_owned(),
+        };
+        let tip = if effort.is_empty() {
+            "Model and effort  \u{2318}/".to_owned()
+        } else {
+            format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(effort))
+        };
         let shown = (!name.is_empty()).then_some(("model", "hn.ChatPick", ()));
-        view::for_each_of(pick, shown, |v, (), _| control(v, &format!("chat:pick:{sid}:all"), &words, rest, hot));
+        view::for_each_of(pick, shown, |v, (), _| control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink));
         view::for_each_of(meter_slot, context.map(|_| ("context", "hn.ChatContext", ())), |v, (), _| {
             if let Some(c) = context {
-                meter(v, (c.used, c.window), hot);
+                meter(v, (c.used, c.window), ink.hot);
             }
         });
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
@@ -411,17 +457,51 @@ impl App {
     }
 }
 
-/// The picker's control: its action, its words in `rest` eased toward `hot` by its hover spring.
-fn control(v: View<'_>, action: &str, words: &str, rest: Fill, hot: Fill) {
+/// The picker's control: its action, its tooltip, its words and its effort's level (`level`: the effort's place among
+/// how many), in the rest ink eased toward the hot one by its hover spring, a level's unlit bars faint.
+fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usize, usize)>, ink: &ControlInk) {
     v.action(action);
-    let e = v.entity();
-    if !e.has(HoverAmt::id()) {
-        e.set(HoverAmt::default());
+    if v.entity().try_cloned::<&Tooltip>().is_none_or(|t| t.text.as_str() != tip) {
+        v.set(Tooltip { text: tip.into() });
     }
-    let k = e.try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
-    let Some(p) = v.part("label") else { return };
-    p.text(words);
-    set_fill(p, Fill { dark: mix(rest.dark, hot.dark, k), light: mix(rest.light, hot.light, k) });
+    let now = ink.now(v);
+    if let Some(p) = v.part("label") {
+        p.text(words);
+        set_fill(p, now);
+    }
+    if let Some(m) = v.part("effort") {
+        effort_meter(m, level, now, ink.off);
+    }
+}
+
+/// The effort's level meter (hn.ChatEffort): a bar (hn.ChatEffortBar) per effort of `n`, their heights rising evenly
+/// from the bar's least to its height, those up to `at` in `lit`, the rest in `off`; with no level, no bars and no room.
+fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill) {
+    let w = m.entity().world();
+    let bar = view::prefab(w, "hn.ChatEffortBar")
+        .and_then(|b| b.try_cloned::<&Size>())
+        .unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Size on hn.ChatEffortBar"));
+    let (tall, short) = (bar.h.value, bar.h.min);
+    let (at, n) = level.unwrap_or((0, 0));
+    view::for_each_of(m, (0..n).map(|i| (i.to_string(), "hn.ChatEffortBar", i)), |b, i, _| {
+        let share = if n > 1 { i as f32 / (n - 1) as f32 } else { 1.0 };
+        let size = Size { w: bar.w, h: Sizing::fixed(short + (tall - short) * share) };
+        if b.entity().try_cloned::<&Size>() != Some(size) {
+            b.set(size);
+        }
+        set_fill(b, if i <= at { lit } else { off });
+    });
+    // Its room after the name and before the chevron only while it shows.
+    let pad = if level.is_some() {
+        view::prefab(w, "hn.ChatEffort")
+            .and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>())
+            .unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Padding on hn.ChatEffort"))
+    } else {
+        harness_native_ui_layout_api::Padding::default()
+    };
+    if m.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
+        m.set(pad);
+    }
 }
 
 /// The context meter for `(used, window)` tokens: the ring's arc in its tone, the track in `ink` faintly. The number is

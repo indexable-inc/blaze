@@ -80,11 +80,29 @@ hn {
     }
   }
 
-  // Den's model and effort picker, in the composer's bar (src/app/chat/pick.rs): one quiet control, "Opus · Medium" (the
-  // model alone when its effort is unknown) and a small chevron, muted, on a soft wash under the pointer, its words
-  // easing to the ink (pick.rs mixes hn.ChatPickInk's by the hover spring). No maker's mark here: the marks lead the
-  // menu's groups. A press opens the models and the efforts in one searchable menu above it; Command-/ opens the models
-  // and Shift-Command-/ steps the effort (scene/20-keys.flecs).
+  // An effort as a level, den's signal-strength meter: one bar for each effort its model takes, rising left to right from
+  // chat_effort_floor of the meter's height to all of it, bottoms aligned; those up to the effort lit in the control's ink,
+  // the rest faint (pick.rs keeps the bars, hn.ChatEffortBar: its height the tallest, its least the shortest). Plates,
+  // not a glyph: crisp at any zoom.
+  // It stands chat_effort_lead after the name and chat_pick_gap before the chevron (padding, not the control's gap: with
+  // no level to show it takes no room, pick.rs folding the padding too).
+  prefab ChatEffort : ui.Row {
+    Flex: {axis: Row, gap: $chat_effort_gap, align: End, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_effort_h, min: 0, max: 0}}
+    Padding: {l: $chat_effort_lead - $chat_pick_gap, r: $chat_pick_gap, t: 0, b: 0}
+  }
+  prefab ChatEffortBar : ui.Node {
+    Fill: $tone_chat_faint
+    Shape: {radius: $chat_effort_bar_radius, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Fixed, value: $chat_effort_bar_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_effort_h, min: $chat_effort_h * $chat_effort_floor, max: 0}}
+  }
+  // Den's model and effort picker, in the composer's bar (src/app/chat/pick.rs): one quiet control, the model's name, its
+  // effort as a level meter (hn.ChatEffort) and a small chevron, muted, on a soft wash under the pointer, its words and
+  // lit bars easing to the ink (pick.rs mixes hn.ChatControlInk's by the hover spring). The effort's name is the
+  // control's tooltip and the menu's; an effort its model does not list (so no level to light) shows as words after the
+  // name instead ("Opus · Medium"). No maker's mark here: the marks lead the menu's groups. A press opens the models and
+  // the efforts in one searchable menu above it; Command-/ opens the models and Shift-Command-/ steps the effort
+  // (scene/20-keys.flecs).
   prefab ChatPick : ui.Row {
     Pressable
     Action: {name: ""}
@@ -94,23 +112,27 @@ hn {
     Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
     HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
     PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-    Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Center, wrap: false}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
     Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
     label : ui.Line {
       Fill: $tone_chat_muted
+      Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
       TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
     }
+    effort : hn.ChatEffort {}
     chevron : ui.Symbol {
       Icon: {glyph: ""}
       Fill: $tone_chat_faint
       Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
     }
   }
-  // The picker's words' inks: at rest, and under the pointer (eased between by its hover spring).
-  prefab ChatPickInk {
+  // The bar's quiet controls' inks (the picker's words and lit bars, the stop's ring and square): at rest, under the
+  // pointer (eased between by each control's hover spring), and a level's unlit bars.
+  prefab ChatControlInk {
     rest { Fill: $tone_chat_muted }
     hot { Fill: $tone_chat_ink }
+    off { Fill: $tone_chat_faint }
   }
   // Its menu is a ui.SearchMenu (search_menu.flecs) above it: each agent kind's models under its head with its maker's
   // mark, then the efforts under theirs, the current rows ticked, a model's line about it muted at the end; where nothing
@@ -147,9 +169,8 @@ hn {
   }
 
   // The send button at the bar's trailing edge (src/app/chat.rs keeps one of the three in `bar.act`): a circle with an
-  // arrow up, quiet with nothing to send (hn.ChatSend), solid in the words' ink once there is (hn.ChatSendReady); while
-  // the agent works, the stop (hn.ChatStop) in its place, a small square, breathing gently: the composer's one sign that
-  // the agent is at work (Escape interrupts too).
+  // arrow up, quiet with nothing to send (hn.ChatSend), solid in the words' ink once there is (hn.ChatSendReady), the
+  // composer's one strong action; while the agent works, the stop (hn.ChatStop) in its place.
   prefab ChatSendBase : ui.Row {
     Pressable
     Action: {name: ""}
@@ -175,12 +196,24 @@ hn {
       Stroke: {dark: $tone_chat_send_glyph.dark, light: $tone_chat_send_glyph.light}
     }
   }
+  // The stop is quiet, since it is seldom pressed (Escape interrupts too): no plate, a thin ring chat_stop_ring across
+  // round a small square, both in the bar's muted ink, brightening to the words' ink under the pointer (src/app/chat.rs
+  // `stop_look` mixes hn.ChatControlInk's by the hover spring). The ring breathes, gently, while the agent works: the
+  // composer's one sign of work, and with the agent done it is gone, so the window rests.
   prefab ChatStop : hn.ChatSendBase {
     Tooltip: {text: "Stop  esc"}
-    Fill: $tone_chat_send
-    Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_stop_breath}
+    Fill: $tone_clear
+    ring : ui.Node {
+      Overlay
+      Fill: $tone_clear
+      Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+      Vector: {d: "M10 1 A9 9 0 1 1 10 19 A9 9 0 1 1 10 1", view_x: 0, view_y: 0, view_w: 20, view_h: 20,
+        inset_l: $chat_stop_inset, inset_t: $chat_stop_inset, inset_r: $chat_stop_inset, inset_b: $chat_stop_inset,
+        stroke_w: $chat_stop_stroke * 20 / $chat_stop_ring}
+      Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_stop_breath}
+    }
     square : ui.Node {
-      Fill: $tone_chat_send_glyph
+      Fill: $tone_chat_muted
       Shape: {radius: $chat_stop_radius, n: 4, border: 0, feather: 0}
       Size: {w: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}, h: {kind: Fixed, value: $chat_stop_square, min: 0, max: 0}}
     }
@@ -290,7 +323,7 @@ hn {
   // One line for every tool call, run of calls, step and thought (src/app/chat.rs fill_row), Claude Code's calm: its
   // words, its argument in the code face, a quiet detail ("exit 1", "2 failed"), all in the muted ink at the body size,
   // on one line, with no plate or border; an icon only where a status reads clearer as one (scene/widgets/chat_status.flecs:
-  // a thought's sparkle, a call's running dot), its word in the line's tooltip. Under the pointer a soft wash and a small
+  // a thought's ring, a call's running dot), its word in the line's tooltip. Under the pointer a soft wash and a small
   // chevron after its words (right folded, down open; src/app/chat.rs `line` turns it); pressed, it opens what it folds;
   // how long it took is its tooltip. A failure says so once, as a small mark in the failed tone, never its words in red.
   // Its words are spaced by the room after each (text draws at its node's leading edge), not the row's gap, so an argument
@@ -299,7 +332,7 @@ hn {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
     Padding: {l: $chat_line_pad, r: 8, t: 0, b: 0}
-    // A status icon leading its words (a thought's sparkle: scene/widgets/chat_status.flecs), its words the line's
+    // A status icon leading its words (a thought's ring: scene/widgets/chat_status.flecs), its words the line's
     // tooltip; src/app/chat.rs `status_on` folds it to nothing on a line without one.
     glyph : ui.Symbol {
       Icon: {glyph: ""}
@@ -515,7 +548,7 @@ hn {
       }
     }
   }
-  // The agent's reasoning, folded to one line: a sparkle (hn.chat_status.thinking, breathing while it thinks; thought,
+  // The agent's reasoning, folded to one line: a thin ring (hn.chat_status.thinking, breathing while it thinks; thought,
   // still once done), its word the tooltip; pressed, it opens to its words.
   prefab ChatThinking : ui.Column {
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
