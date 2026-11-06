@@ -11,7 +11,7 @@ hn {
     failed { Fill: $tone_failed }
     failed_wash { Fill: $tone_failed_wash }
     lost { Fill: $tone_lost }
-    // Rows: the selected row's pill, nothing, the accent (a running dot), the tertiary and quaternary inks.
+    // Rows: the selected row's pill, nothing, the accent, the tertiary and quaternary inks.
     selected { Fill: $tone_select }
     clear { Fill: $tone_clear }
     accent { Fill: $tone_accent }
@@ -47,12 +47,9 @@ hn {
     badge_on {
       Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
     }
-    // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the sidebar's fold (the selection
+    // Springs: a breath (how far it dims is each Breath's own `low`), a chevron's turn, the sidebar's fold (the selection
     // pill's is on hn.Selection).
-    breath {
-      Motion: {omega: $breath_omega, zeta: $breath_zeta}
-      Reveal: {alpha0: $breath_floor, dx: 0, dy: 0, scale0: 1}
-    }
+    breath { Motion: {omega: $breath_omega, zeta: $breath_zeta} }
     turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
     sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
     lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }

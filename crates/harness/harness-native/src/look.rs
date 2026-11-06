@@ -1,24 +1,26 @@
 //! harness-native's look: the small moving parts of the sidebar on den's spring system, and the per-kind icons and tones.
 //!
 //! Every value (colours, sizes, spring tunes) is in the scene (scene/00-tokens.flecs, scene/10-harness.flecs); this file
-//! reads prefabs by name and keeps only runtime state: a running dot's breath, a part shown while its row is hovered, a
-//! disclosure chevron's turn,.
+//! reads prefabs by name and keeps only runtime state: a breath (a working row's title, a chat status), a part shown
+//! while its row is hovered (or only while it is not), a disclosure chevron's turn.
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Fold, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
 use harness_native_ui_input_api::Pressed;
 use harness_native_ui_look_api::{Fill, HoverLook, Inks, PressGive, Rgba};
-use harness_native_ui_motion_api::{Motion, Pace, Pose, Reveal};
+use harness_native_ui_motion_api::{Motion, Pace, Pose};
 use harness_native_ui_text_api::{Icon, Mark};
 use harness_native_ui_timeline_api::GlyphsArrive;
 use harness_native_ui_view as view;
 
-/// A running status dot's breath: a spring chasing 0 and 1 in turn (`up` its current target).
+/// A breath, what is at work (a working session's title, a chat's thinking icon): a spring chasing 0 and 1 in turn (`up`
+/// its current target), the node's opacity going between full and `low` with it. Each user says how far it dims.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Breath {
     pub spring: Spring,
     pub up: bool,
+    pub low: f32,
 }
 
 /// What waits a moment before it shows (den's PendingLook): unseen for `delay` seconds after it first shows, then faded in
@@ -38,12 +40,14 @@ pub struct Sweep {
     pub low: f32,
 }
 
-/// A part shown only while row `row` is hovered (its opacity the row's hover spring), or always when `keep`. Row 0: the
-/// part's nearest ancestor with a row's hover look (what a scene template writes: it cannot name its instance's id).
+/// A part shown only while row `row` is hovered (its opacity the row's hover spring), or with `away` only while it is not
+/// (what a hover-only part takes the place of), or always when `keep`. Row 0: the part's nearest ancestor with a row's
+/// hover look (what a scene template writes: it cannot name its instance's id).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct HoverShow {
     pub row: u64,
     pub keep: bool,
+    pub away: bool,
 }
 
 /// A disclosure chevron: whether what it discloses is open. Its turn (0 closed, 1 open: a quarter turn) is the `Fold`
@@ -105,14 +109,6 @@ pub fn tune(w: WorldRef<'_>, name: &str) -> Tune {
         .try_cloned::<&Motion>()
         .unwrap_or_else(|| panic!("hn.Theme.{name} has no Motion"));
     Tune { omega: m.omega, zeta: m.zeta }
-}
-
-/// A role's `Reveal` alpha0 (`breath`: how far a breath dims).
-pub fn floor(w: WorldRef<'_>, name: &str) -> f32 {
-    role(w, name)
-        .try_cloned::<&Reveal>()
-        .unwrap_or_else(|| panic!("hn.Theme.{name} has no Reveal"))
-        .alpha0
 }
 
 /// A role's fixed width (`indent`).
@@ -221,10 +217,11 @@ pub fn install(w: WorldRef<'_>) {
     });
 }
 
-/// How much of a node's own opacity its look leaves: a breath's dimming, a hover-only part's fade.
-pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>, lo: f32) -> f32 {
+/// How much of a node's own opacity its look leaves: a breath's dimming, a hover-only (or hover-away) part's fade.
+pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>) -> f32 {
     let mut a = 1.0;
     if let Some(b) = e.try_cloned::<&Breath>() {
+        let lo = b.low.clamp(0.0, 1.0);
         a *= lo + (1.0 - lo) * b.spring.x.clamp(0.0, 1.0);
     }
     if let Some(h) = e.try_cloned::<&HoverShow>().filter(|h| !h.keep) {
@@ -236,7 +233,8 @@ pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>, lo: f32) -> f32 {
         } else {
             w.entity_from_id(h.row).try_cloned::<&HoverAmt>()
         };
-        a *= amt.map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+        let hovered = amt.map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+        a *= if h.away { 1.0 - hovered } else { hovered };
     }
     a
 }
@@ -249,8 +247,8 @@ pub fn turn(e: EntityView<'_>) -> Option<f32> {
 
 /// Mark `part` shown only while `row` is hovered, unless `keep`.
 pub fn hover_show(part: EntityView<'_>, row: u64, keep: bool) {
-    let want = HoverShow { row, keep };
-    if part.try_cloned::<&HoverShow>().is_none_or(|h| h.row != row || h.keep != keep) {
+    let want = HoverShow { row, keep, away: false };
+    if part.try_cloned::<&HoverShow>().is_none_or(|h| h.row != row || h.keep != keep || h.away) {
         part.set(want);
     }
 }
@@ -265,10 +263,11 @@ pub fn disclose(part: EntityView<'_>, open: bool) {
     }
 }
 
-/// Whether anything breathes (the window then keeps drawing, at a calm rate).
+/// Whether anything breathes (the window then keeps drawing, at a calm rate). A breath of `low` 1 dims nothing (a row
+/// template's breath at rest: a re-run cannot remove it), so it does not count.
 pub fn breathing(w: WorldRef<'_>) -> bool {
     let mut any = false;
-    w.new_query::<&Breath>().each_entity(|_, _| any = true);
+    w.new_query::<&Breath>().each_entity(|_, b| any |= b.low < 1.0);
     any
 }
 

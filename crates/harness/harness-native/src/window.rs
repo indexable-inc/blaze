@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const INITIAL: (f64, f64) = (1180.0, 760.0);
-/// Frame rates: while anything moves, and while only a running dot breathes.
+/// Frame rates: while anything moves, and while only a breath moves.
 const LIVE: CAFrameRateRange = CAFrameRateRange { minimum: 60.0, maximum: 120.0, preferred: 120.0 };
 const CALM: CAFrameRateRange = CAFrameRateRange { minimum: 20.0, maximum: 30.0, preferred: 30.0 };
 /// From the zoom button's right edge to the title's first ink, as Ghostty's title bar sets it (measured on Tahoe).
@@ -56,7 +56,7 @@ struct State {
     /// The traffic lights' opacity as last set (they fade with the sidebar's fold).
     lights: f32,
     tip: String,
-    /// Drawing at the calm rate: only a running dot's breath moves.
+    /// Drawing at the calm rate: only a breath moves.
     calm: bool,
     /// The keys' load the menu bar was made from (made again when the user's keys.flecs changes).
     menu_gen: u64,
