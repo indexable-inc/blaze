@@ -859,13 +859,13 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                 out.push((key.clone(), Row::Run { key, words, failed, running, open }));
                 for &n in &run.items {
                     let call = run.calls.iter().find(|(i, _)| *i == n).map(|(_, c)| c);
-                    let shows = open
+                    let visible = open
                         || call.is_some_and(|c| c.failed || fold.get(&c.block).copied().unwrap_or_else(|| opens(t, &g, n, c)));
                     // A call kept for its result shows folded, its own line over its table, so the table never reads as the
                     // line above it's (a failed call's).
                     let result = call.and_then(|c| t.details.get(&c.block)).and_then(result_value).is_some();
                     let from = out.len();
-                    if shows || result {
+                    if visible || result {
                         item_rows(t, &g, n, shows, &mut out);
                     }
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
@@ -1836,7 +1836,7 @@ impl App {
         if let Some((a, b)) = st.sel.filter(|(a, b)| a != b) {
             let chats = self.chats.borrow();
             let empty = Transcript::default();
-            let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.fold);
+            let rows = rows(chats.get(&sid).unwrap_or(&empty), Shows::of(st));
             let text = transcript_text(&rows, a.min(b), a.max(b));
             return Some((!text.is_empty()).then_some((text, Copied::Transcript)));
         }
@@ -1847,7 +1847,7 @@ impl App {
         // A table row: the one under the pointer, else the first one opened, as a markdown table of its header and it.
         let chats = self.chats.borrow();
         let empty = Transcript::default();
-        let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.fold);
+        let rows = rows(chats.get(&sid).unwrap_or(&empty), Shows::of(st));
         let at = |key: &str, r: usize| {
             let t = rows.iter().find(|(k, _)| k == key).and_then(|(_, row)| row_table(row))?;
             (r < t.rows.len()).then(|| (t.row_markdown(r), Copied::TableRow(key.to_owned(), r)))
