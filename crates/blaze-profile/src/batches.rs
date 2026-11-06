@@ -20,8 +20,8 @@ use std::alloc::Global;
 
 use crate::{
     flight::{
-        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Read, SpanRow,
-        SwitchRow, ThreadNow, WaitedOn,
+        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Plot, Read,
+        SpanRow, SwitchRow, ThreadNow, WaitedOn,
     },
     sampler::Sample,
     schema::{self, Table},
@@ -217,9 +217,13 @@ fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, Arrow
 pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = counters.len();
     let mut names = Dict::new();
-    let name_keys = UInt32Array::from_iter_values(
-        counters.iter().map(|it| names.key(it.plot as u64, || it.plot.name())),
-    );
+    let name_keys = UInt32Array::from_iter_values(counters.iter().map(|it| match it.plot {
+        // A named counter's own name: `?` when it was let go before this read.
+        Plot::Named => names.key(1 << 32 | u64::from(it.named), || {
+            flight::name(it.named).unwrap_or_else(|| "?".into())
+        }),
+        plot => names.key(plot as u64, || plot.name()),
+    }));
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(counters.iter().map(|it| build_id(it.build)))),
@@ -615,6 +619,32 @@ mod tests {
         );
         let plotted = counters.column(schema::COUNTERS.column("value").unwrap());
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
+    }
+
+    /// A named counter is a `counters` row whose `name` is its own, kept once a process.
+    #[test]
+    fn a_named_counter_is_a_counters_row_of_its_name() {
+        crate::install();
+        std::thread::spawn(|| {
+            flight::plot_named("owner bytes: batches test", 41);
+            flight::plot_named("owner bytes: batches test", 42);
+        })
+        .join()
+        .unwrap();
+        let mut read = Read::default();
+        flight::window(Duration::from_secs(600), &mut read);
+        let process = Process { pid: 7, name: "blaze test", commit: None };
+        let batch = counters(&read.counters, process).unwrap();
+        let plot = batch.column(schema::COUNTERS.column("name").unwrap()).as_dictionary::<UInt32Type>();
+        let names = plot.values().as_string::<i32>();
+        let values = batch.column(schema::COUNTERS.column("value").unwrap());
+        let values = values.as_primitive::<arrow_array::types::Float64Type>();
+        let mut ours: Vec<f64> = (0..batch.num_rows())
+            .filter(|it| names.value(plot.keys().value(*it) as usize) == "owner bytes: batches test")
+            .map(|it| values.value(it))
+            .collect();
+        ours.sort_by(f64::total_cmp);
+        assert_eq!(ours, [41.0, 42.0]);
     }
 
     /// Names given on many threads at once, each thread in its own table and ring, written as

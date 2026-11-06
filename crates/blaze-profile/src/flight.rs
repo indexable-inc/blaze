@@ -748,10 +748,13 @@ pub enum Plot {
     ProfileNamesLinked,
     /// Names lost: a text cut, a thread with no ring, a `Debug` that names while it is named.
     ProfileNamesLost,
+    /// A counter no other plot names, its name in its row ([`plot_named`],
+    /// [`CounterRow::named`]): its `counters.name` is that name.
+    Named,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 29] = [
+    pub const ALL: [Plot; 30] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -781,6 +784,7 @@ impl Plot {
         Plot::ProfileNamesGiven,
         Plot::ProfileNamesLinked,
         Plot::ProfileNamesLost,
+        Plot::Named,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -814,12 +818,27 @@ impl Plot {
             Plot::ProfileNamesGiven => "profile names given",
             Plot::ProfileNamesLinked => "profile names linked",
             Plot::ProfileNamesLost => "profile names lost",
+            Plot::Named => "named",
         }
     }
 
     pub fn of(at: u64) -> Option<Plot> {
         Plot::ALL.get(usize::try_from(at).ok()?).copied()
     }
+}
+
+/// Notes `value` of the counter named `name` now, in this thread's ring: a counter no
+/// [`Plot`] names (a memory owner's bytes, say), its row's `plot` the name. The name is kept
+/// once for the life of the process, as [`crate::span::Name::kept`] keeps one, so after a
+/// thread's first use it costs a thread-local lookup.
+#[inline]
+pub fn plot_named(name: &'static str, value: u64) {
+    let Some(ring) = ring() else { return };
+    let token = crate::span::Value::word(crate::span::Name::kept(name));
+    // A kept token's row sym: the class and its number (names::Local::row_syms).
+    let sym = if token == 0 { 0 } else { u64::from(KEPT_SYM | (token & !KEPT_TOKEN) as u32) };
+    let build = u64::from(BUILD.with(Cell::get));
+    ring.put([clock::ticks(), value, 0, 0, KIND_PLOT << 62 | Plot::Named as u64, 0, build, sym]);
 }
 
 /// Notes `value` of `which` now, in this thread's ring.
@@ -3835,6 +3854,8 @@ pub struct CounterRow {
     pub value: u64,
     /// The fiber and job a [`fiber_stack`] counter is of; `None` for every other plot.
     pub fiber: Option<(u32, u64)>,
+    /// The name of a [`Plot::Named`] counter ([`plot_named`]); 0 for every other plot.
+    pub named: Sym,
 }
 
 /// A row of the schema's `switches` table: a [`switched`] row, on the thread it happened on.
@@ -4453,6 +4474,7 @@ fn decode(
                     t_ns,
                     value,
                     fiber,
+                    named: 0,
                 }),
             );
         }
@@ -4464,6 +4486,7 @@ fn decode(
                 t_ns: scale.mono(row[0]),
                 value: row[1],
                 fiber: None,
+                named: if plot == Plot::Named { sym(row[7]) } else { 0 },
             });
         }
         KIND_MARK => {
