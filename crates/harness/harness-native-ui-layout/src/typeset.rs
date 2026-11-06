@@ -85,14 +85,16 @@ pub fn wanted(world: WorldRef<'_>) -> Vec<Wanted> {
     let mut out = Vec::new();
     world.new_query::<(&Text, &Intrinsic)>().each_entity(|e, (t, now)| {
         let pad = e.try_cloned::<&Padding>().map_or(0.0, |p| p.l + p.r);
+        let one = e.has(OneLine::id()) || e.has(Truncate::id());
         out.push(Wanted {
             id: *e.id(),
-            text: t.s.as_str().to_owned(),
+            // A one-line node is measured as it draws: its first line only (`harness_native_ui_text_api::one_line`).
+            text: if one { harness_native_ui_text_api::one_line(t.s.as_str()).into_owned() } else { t.s.as_str().to_owned() },
             style: e.try_cloned::<&TextStyle>().unwrap_or_default(),
             at: e.try_cloned::<&Laid>().filter(|l| l.w > 0.0).map(|l| (l.w - pad).max(0.0)),
             now: *now,
             truncate: e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail)),
-            one_line: e.has(OneLine::id()) || e.has(Truncate::id()),
+            one_line: one,
             markdown: e.has(MarkdownText::id()),
         });
     });

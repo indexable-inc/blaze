@@ -520,14 +520,16 @@ impl Painter {
                 // Whether the words were cut to fit (their glyphs are then not the text's).
                 let mut elided = false;
                 let lay = if let (Some(_), Some(_)) = (truncate, md) {
-                    // Inline markdown on one line (a table's cell): cut at its end, its faces kept.
-                    let (lay, m) = self.layout_md_cut(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                    // Inline markdown on one line (a table's cell): its first line (`one_line`), cut at its
+                    // end, its faces kept.
+                    let (lay, m) = self.layout_md_cut(&harness_native_ui_text_api::one_line(text.s.as_str()), &style, laid.w.max(1.0) + 0.5);
                     shown_md = Some(m);
                     lay
                 } else if let Some(mode) = truncate {
-                    // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
+                    // One line, never wrapped: its first line (`one_line`, as layout measured it), cut with an
+                    // ellipsis (at its end, middle or start) to the width layout gave it.
                     let room = laid.w.max(1.0) + 0.5;
-                    let cut = typeset::elide(text.s.as_str(), mode, room, |t| {
+                    let cut = typeset::elide(&harness_native_ui_text_api::one_line(text.s.as_str()), mode, room, |t| {
                         self.layout(t, &style, 1.0e5)
                             .lines
                             .iter()
