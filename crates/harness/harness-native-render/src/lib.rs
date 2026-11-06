@@ -6,6 +6,7 @@
 pub mod arrive;
 pub mod atlas;
 pub mod boxdraw;
+pub mod caret;
 pub mod draw;
 pub mod gpu;
 pub mod hdr;

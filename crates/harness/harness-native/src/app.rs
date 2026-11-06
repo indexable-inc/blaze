@@ -1686,6 +1686,10 @@ impl App {
         if self.paint.get_mut().arriving {
             self.poke_why("glyphs arriving");
         }
+        // A caret that jumped sweeps into its place (harness-native-render caret.rs): draw until it has.
+        if self.paint.get_mut().gliding {
+            self.poke_why("caret glide");
+        }
         // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
         // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
         if self.paint.get_mut().kip_wake == harness_native_render::kips::Wake::Lively {
@@ -2481,7 +2485,8 @@ mod tests {
             "hn.StepFail", "hn.StepNote", "hn.StepGrid",
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
-            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatPickInk.rest", "hn.ChatPickInk.hot",
+            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
+            "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
             "hn.ChatContext", "hn.ChatSend", "hn.ChatSendReady", "hn.ChatStop",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",

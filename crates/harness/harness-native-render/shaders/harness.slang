@@ -121,13 +121,12 @@ float sd_quad(float2 p, float2 v0, float2 v1, float2 v2, float2 v3)
 
 // The caret's blink, `t` seconds after it last moved: solid for `hold` seconds, then a cycle of `period` seconds (the os
 // text field's), on for half, its edges a short eased fade (`fade`, a share of the cycle) rather than a cut. 1 shown,
-// 0 hidden. `hold` and `period` come from the scene's CaretLook (the caret panel's shape.z and fx.y).
-float caret_blink(float t, float hold, float period)
+// 0 hidden. `hold`, `period` and `fade` come from the scene's CaretLook (the caret panel's shape.z, fx.y and shape.w).
+float caret_blink(float t, float hold, float period, float fade)
 {
     if (t < hold)
         return 1.0;
     float ph = frac((t - hold) / period);
-    float fade = 0.09;
     float off = smoothstep(0.5 - fade, 0.5, ph) * (1.0 - smoothstep(1.0 - fade, 1.0, ph));
     return 1.0 - off;
 }
@@ -261,13 +260,14 @@ float4 panel_shade(PanelV v, ConstantBuffer<Frame> frame, PanelInst p)
         // Caret: a thin bar at rest in edge_l, blinking from fx2.w, when it last moved, so it is solid while typed
         // with; over a sweep from where it was (edge_d, none when its width is 0) that shrinks into it over
         // shape.y seconds (CaretLook::glide) with an ease-out cubic, as Ghostty's cursor_sweep. fx2.z is when the sweep
-        // began; shape.x is the bar's corner radius, shape.z how long it stays solid after it moved, fx.y the blink's cycle.
+        // began; shape.x is the bar's corner radius, shape.z how long it stays solid after it moved, fx.y the blink's cycle,
+        // shape.w the share of it each turn of the blink eases over.
         float2 pt = p.rect.xy + half_size + v.local;
         float4 to = p.edge_l;
         float4 from = p.edge_d;
         float2 hb = to.zw * 0.5;
         float db = sd_squircle(pt - (to.xy + to.zw * 0.5), hb, min(p.shape.x, hb.x), 2.0);
-        float bar = saturate(0.5 - db / aa) * caret_blink(max(frame.time - p.fx2.w, 0.0), p.shape.z, p.fx.y);
+        float bar = saturate(0.5 - db / aa) * caret_blink(max(frame.time - p.fx2.w, 0.0), p.shape.z, p.fx.y, p.shape.w);
         float trail = 0.0;
         float prog = (frame.time - p.fx2.z) / p.shape.y;
         if (from.z > 0.0 && prog < 1.0)

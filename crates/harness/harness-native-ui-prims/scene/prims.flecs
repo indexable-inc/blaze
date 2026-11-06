@@ -544,6 +544,11 @@ ui {
     Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
     CopyLook: {secs: $copy_secs, rise: $copy_rise, grow: $copy_grow, light: $copy_light, stagger: $copy_stagger, row_in: $copy_row_in}
   }
+  // The text caret's one look (harness-native-render caret.rs, harness.slang's caret): every field, text area and the
+  // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.
+  prefab caret {
+    CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
+  }
   spring {
     // The springs the generic motion falls back on when a node has no Motion of its own.
     prefab transition {

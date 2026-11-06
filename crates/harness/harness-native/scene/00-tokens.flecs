@@ -390,6 +390,18 @@ export const copy_grow = 0.025
 export const copy_light = 0.12
 export const copy_stagger = 0.04
 export const copy_row_in = 0.11
+// The text caret (prims.flecs ui.caret, den's CaretLook): a bar caret_w wide (whole device pixels), caret_h of the
+// font's size tall about its line's middle, caret_radius round. A jump farther than its height sweeps from where it was
+// over caret_glide seconds on an ease-out cubic, its tail at half the bar's ink; after it last moved it stays solid
+// caret_hold seconds, then blinks once every caret_blink seconds (on for the first half), each turn eased over caret_fade
+// of the cycle. Its ink is tone_caret (white on the dark page).
+export const caret_w = 1.5
+export const caret_h = 1.25
+export const caret_radius = 0.75
+export const caret_glide = 0.2
+export const caret_hold = 0.5
+export const caret_blink = 1.06
+export const caret_fade = 0.09
 // Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
@@ -470,12 +482,16 @@ export const chat_composer_lift_blur = 22
 export const chat_composer_lift_alpha = 0.22
 export const chat_composer_lift_dy = 4
 // The bar (foot.card.bar), chat_bar_h tall, its controls chat_bar_gap apart: on the left den's model and effort picker
-// as one quiet control (hn.ChatPick, src/app/chat/pick.rs: "Opus · Medium" and a small chevron, chat_pick_h tall,
-// chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the words, a wash under the pointer);
-// on the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke chat_ring_stroke, in a square
-// chat_bar_h across that takes the pointer) and the send button (hn.ChatSend*: a circle chat_send across, its arrow
-// chat_send_glyph across, stroke chat_send_stroke; hn.ChatStop's square chat_stop_square across, chat_stop_radius
-// round, while the agent works, breathing down to chat_stop_breath). The picker's menu is a ui.SearchMenu (menu_*).
+// as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
+// chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
+// wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
+// effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
+// its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
+// chat_ring_stroke, in a square chat_bar_h across that takes the pointer) and the send button (hn.ChatSend*: a circle
+// chat_send across, its arrow chat_send_glyph across, stroke chat_send_stroke). While the agent works the stop
+// (hn.ChatStop) takes its place, quiet: in the same chat_send square, a ring chat_stop_ring across (stroke
+// chat_stop_stroke) breathing down to chat_stop_breath round a square chat_stop_square across, chat_stop_radius round.
+// The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
 export const size_chat_pick = 12.5
@@ -491,9 +507,18 @@ export const chat_ring_stroke = 1.6
 export const chat_send = 28
 export const chat_send_glyph = 14
 export const chat_send_stroke = 1.8
-export const chat_stop_square = 9
-export const chat_stop_radius = 2
-export const chat_stop_breath = 0.62
+export const chat_stop_ring = 20
+export const chat_stop_inset = ($chat_send - $chat_stop_ring) / 2
+export const chat_stop_stroke = 1.2
+export const chat_stop_square = 7
+export const chat_stop_radius = 1.5
+export const chat_stop_breath = 0.45
+export const chat_effort_lead = 6
+export const chat_effort_h = 10
+export const chat_effort_bar_w = 2
+export const chat_effort_gap = 1.5
+export const chat_effort_bar_radius = 1
+export const chat_effort_floor = 0.3
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets
 // and gap, the bar): the words grow to textarea_grow_share of the pane less it.
 export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad + $chat_composer_gap + $chat_bar_h
@@ -517,7 +542,7 @@ export const chat_ctx_foot_pad = 7
 export const chat_ctx_foot_gap = 2
 export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
-// one says more than a word (scene/widgets/chat_status.flecs: a thought's sparkle leads, a call's running dot trails),
+// one says more than a word (scene/widgets/chat_status.flecs: a thought's ring leads, a call's running dot trails),
 // chat_line_status across. Its height, its lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
 // table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_chat_guide, chat_guide_w wide)
 // at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
@@ -525,6 +550,8 @@ export const chat_tool_h = 24
 export const chat_line_pad = 4
 export const chat_line_chevron = 10
 export const chat_line_status = 12
+// A thought's ring (hn.chat_status.thinking and thought): its line as heavy as the codicons' at chat_line_status.
+export const chat_think_stroke = 1.2
 export const chat_guide_x = 8
 export const chat_guide_w = 1
 export const chat_line_inset = 22
