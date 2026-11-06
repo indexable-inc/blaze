@@ -1,19 +1,25 @@
 // The sidebar's rows as templates (flecs script reactivity): the host sets an instance's props (src/app.rs sync_view,
 // harness_native_ui_view::View::props) and flecs re-runs only the parts that read a prop that changed. Every tree row
 // implements hn.Row (scene/widgets/row.flecs); each kind adds its own props. Parts the host animates (a chevron's Fold, a row's HoverAmt) keep
-// their runtime state across a re-run: a re-run sets components, it does not remake entities.
+// their runtime state across a re-run: a re-run sets components, it does not remake entities, nor remove a component an
+// arm set before (so where a part's look depends on a prop, every arm sets it).
+//
+// Notion's sidebar: calm one-line rows, no dots and no marks. How a row stands is in its title's ink (`look`: "on" while
+// selected, "rest" while live, "done" once it ended), its title breathing slowly while it works (`busy`), and a few muted
+// words trailing it (`meta`), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
 using flecs.script
 
 @tree ChildOf
 hn {
-  // A session, a source-list row: its chevron gutter at its depth (hn.Hang), its kind's mark in the kind's colour
-  // (hn.Kind), its name on one line (13 regular, medium while selected), and trailing its shortcut on hover and how it
-  // stands as a small mark (`status`: a dot while running, a hollow ring once it exited, red when it failed or was killed,
-  // amber when lost; `why` its tooltip). `focus`: the selection while the tree has the keyboard, its pill in the accent.
+  // A session: its chevron gutter at its depth (hn.Hang; folded, only its running runs show under it), its title on one
+  // line, and trailing how long ago it started or ended, or how it went wrong (`why` its tooltip). On hover its shortcut
+  // (`hint`) takes the trailing words' place. `focus`: the selection while the tree has the keyboard.
   @tree ChildOf
   template ObjRow : Row {
-    prop kind: string = "shell"
-    prop status: string = ""
+    prop look: string = "rest"
+    prop busy: bool = false
+    prop alarm: bool = false
+    prop meta: string = ""
     prop why: string = ""
     prop hint: string = ""
     prop focus: bool = false
@@ -22,48 +28,51 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
-    glyph : ui.Symbol {
-      Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
-      // The kind's prefab holds its look: a vector Mark (Claude, Codex, Cursor) or a Nerd Font Icon (a shell).
-      const k = match $kind { "claude": hn.Kind.claude; "codex": hn.Kind.codex; "cursor": hn.Kind.cursor; "shell": hn.Kind.shell; _: hn.Kind.other }
-      Fill: k[Fill]
-      if k?[Mark] {
-        Mark: k[Mark]
-      } else {
-        Icon: k[Icon]
-      }
-    }
-    name : ui.Lead {
+    name : hn.tree.Head {
       Text: {s: $name}
-      if $selected {
+      if $look == "on" {
         Fill: $tone_row_on
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree_on}
       } else {
-        Fill: $tone_row
+        if $look == "done" {
+          Fill: $tone_row_done
+        } else {
+          Fill: $tone_row
+        }
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
+      }
+      // A breath of low 1 does not dim: the way a re-run stops one (it cannot remove it).
+      if $busy {
+        Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_title_low}
+      } else {
+        Breath: {spring: {x: 1, v: 0}, up: false, low: 1}
       }
     }
     spacer : ui.Spacer {}
-    // Room goes by priority: the hover-only shortcut gives way first, then the name (ui.Lead, -1); the status never does.
-    meta : ui.Line, Faint {
-      LayoutPriority: {value: -2}
-      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-      Text: {s: $hint}
-      HoverShow: {row: 0, keep: false}
-    }
-    state : hn.Status {
-      LayoutPriority: {value: 1}
+    meta : hn.tree.Trail {
+      Text: {s: $meta}
       Tooltip: {text: $why}
-      Fill: match $status { "running": $tone_status_running; "failed": $tone_failed; "lost": $tone_lost; _: $tone_clear }
-      if $status == "exited" {
-        Edge: {dark: $tone_status_ring.dark, light: $tone_status_ring.light}
+      if $alarm {
+        Fill: $tone_row_alarm
       } else {
-        Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+        Fill: $tone_row_meta
       }
-      if $status == "" {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $status_size, min: 0, max: 0}}
+      // Gone while hovered when the shortcut shows in its place.
+      if $hint == "" {
+        HoverShow: {row: 0, keep: true, away: false}
       } else {
-        Size: {w: {kind: Fixed, value: $status_size, min: 0, max: 0}, h: {kind: Fixed, value: $status_size, min: 0, max: 0}}
+        HoverShow: {row: 0, keep: false, away: true}
+      }
+    }
+    // The shortcut (cmd+1 to 9), on hover only, where the trailing words were: a layer over the row (out of its flow),
+    // its words at the row's right inset.
+    keys : ui.Row {
+      Overlay
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Padding: {l: 0, r: $tree_pad_r, t: 0, b: 0}
+      hint : hn.tree.Trail {
+        Text: {s: $hint}
+        HoverShow: {row: 0, keep: false, away: false}
       }
     }
     if $selected {
@@ -72,20 +81,22 @@ hn {
           if $focus {
             Fill: $tone_select_focus
           } else {
-            Fill: $tone_select
+            Fill: $tone_row_select
           }
         }
       }
     }
   }
 
-  // A shell run (or one of its pipeline stages) under its session, on the session rows' grid: a small dot in the icon
-  // column tinted by how it went (`state`: running breathes in the accent, lost, failed, else faint), its command (12
-  // regular, secondary), and trailing how long it took (`meta`; on hover, or always when `keep`: a failure, lost, pending,
-  // skipped).
+  // A shell run (or one of its pipeline stages) under its session, on the session rows' grid: its command, shortened
+  // (src/app.rs short_cmd) in the quieter run ink, breathing while it runs (`busy`), and trailing how long it took
+  // (`meta`; on hover, or always when `keep`: a failure, lost, pending, skipped; red when `alarm`). A folded session
+  // shows only its running runs, so a finished one folds away on its own.
   @tree ChildOf
   template RunRow : Row {
-    prop state: string = ""
+    prop look: string = "rest"
+    prop busy: bool = false
+    prop alarm: bool = false
     prop meta: string = ""
     prop keep: bool = false
     prop focus: bool = false
@@ -94,32 +105,32 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
-    glyph : ui.Node {
-      Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
-      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-      dot : hn.Status {
-        Fill: match $state { "running": $tone_accent; "lost": $tone_lost; "failed": $tone_failed; _: $tone_ink_4 }
-        if $state == "running" {
-          Breath: {spring: {x: 1, v: 0}, up: false}
-        }
-      }
-    }
-    name : ui.Lead {
-      TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+    name : hn.tree.Cmd {
       Text: {s: $name}
-      if $selected {
+      if $look == "on" {
         Fill: $tone_row_on
       } else {
-        Fill: $tone_ink_3
+        if $look == "done" {
+          Fill: $tone_row_done
+        } else {
+          Fill: $tone_row_run
+        }
+      }
+      if $busy {
+        Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_title_low}
+      } else {
+        Breath: {spring: {x: 1, v: 0}, up: false, low: 1}
       }
     }
     spacer : ui.Spacer {}
-    // Room goes as on a session row: how long it took gives way first, then the command (ui.Lead, -1).
-    meta : ui.Line, Faint {
-      LayoutPriority: {value: -2}
-      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    meta : hn.tree.Trail {
       Text: {s: $meta}
-      HoverShow: {row: 0, keep: $keep}
+      if $alarm {
+        Fill: $tone_row_alarm
+      } else {
+        Fill: $tone_row_meta
+      }
+      HoverShow: {row: 0, keep: $keep, away: false}
     }
     if $selected {
       pill : hn.Selection {
@@ -127,33 +138,9 @@ hn {
           if $focus {
             Fill: $tone_select_focus
           } else {
-            Fill: $tone_select
+            Fill: $tone_row_select
           }
         }
-      }
-    }
-  }
-
-  // The fold of a session's older runs (`obj` the session): a quiet "Show 5 more" (or "Show fewer"), lined up with the
-  // runs' commands.
-  @tree ChildOf
-  template MoreRow : Row {
-    prop hidden: i32 = 0
-    prop unfolded: bool = false
-    (IsA, hn.TreeRowLook)
-    Action: {name: "fold:{obj}"}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_more_h, min: 0, max: 0}}
-    Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
-    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
-    glyph : ui.Node {
-      Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-    }
-    name : ui.Lead, Faint {
-      TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
-      if $unfolded {
-        Text: {s: "Show fewer"}
-      } else {
-        Text: {s: "Show {hidden} more"}
       }
     }
   }
@@ -172,7 +159,7 @@ hn {
     }
     icon : ui.Symbol {
       Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
-      Icon: {glyph: ""}
+      Icon: {glyph: ""}
       HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
       Bump: {spring: {x: 0, v: 0}}
     }

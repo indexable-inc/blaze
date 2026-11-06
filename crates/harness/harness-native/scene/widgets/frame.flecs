@@ -83,7 +83,7 @@ hn {
 
   // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
   // frame on every side so it hugs the row's content with air between neighbours, and matched by id so a new selection's
-  // pill springs from where the last one was drawn. The row picks the plate's Fill (tone_select, or tone_select_focus
+  // pill springs from where the last one was drawn. The row picks the plate's Fill (tone_row_select, or tone_select_focus
   // while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
