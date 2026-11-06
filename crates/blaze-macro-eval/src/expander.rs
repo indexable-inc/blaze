@@ -30,9 +30,9 @@
 //!
 //! A crate's wasm module ([`load_wasm`]) runs each expansion in a fresh instance given the
 //! statics the session's calls before it left, and says which it changed, as the evaluator
-//! does (`wasm.rs`); a static left holding an address of the heap stops the expansion, naming
-//! the static. Its expansions and its verdict are kept apart from the evaluator's, under the
-//! module's id.
+//! does (`wasm.rs`); once a static holds an address of the heap, the session's earlier calls
+//! run again in order in that instance before the next, as on the evaluator. Its expansions
+//! and its verdict are kept apart from the evaluator's, under the module's id.
 //!
 //! A call is kept and found under the state it started from too: none for a call whose
 //! session's calls before it left nothing, else a digest of the statics they left, by item key
@@ -608,6 +608,8 @@ fn start_digest(db: &Db, statics: &[(StaticId, Vec<u8>)]) -> Option<ContentId> {
 #[derive(PartialEq)]
 struct Kept {
     function: FunctionId,
+    /// The macro's place in its crate's `__blaze_proc_macros` list ([`Expansion::index`]).
+    index: u32,
     attr: bool,
     inputs: Vec<tt::TopSubtree>,
     sites: [span::Span; 3],
@@ -838,6 +840,7 @@ impl Evaluated {
     fn kept(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Kept {
         Kept {
             function: self.function,
+            index: self.index,
             attr: self.kind == ProcMacroKind::Attr,
             inputs: self.inputs(call),
             sites: [call.def_site, call.call_site, call.mixed_site],
@@ -979,6 +982,7 @@ impl Evaluated {
             .zip(&streams)
             .map(|(it, inputs)| Expansion {
                 function: it.function,
+                index: it.index,
                 attr: it.attr,
                 inputs,
                 sites: it.sites,
@@ -1005,15 +1009,9 @@ impl Evaluated {
                 &expansions,
                 &mut spent,
             ),
-            Engine::Wasm(module) => module.run(
-                db,
-                call.env,
-                self.index,
-                &expansions,
-                preset,
-                call.current_dir,
-                &mut spent,
-            ),
+            Engine::Wasm(module) => {
+                module.run(db, call.env, &expansions, preset, call.current_dir, &mut spent)
+            }
         };
         run::ran_on(span, &spent, &ran);
         // An expansion that stopped (a budget, a refused call) names what it expanded and where,

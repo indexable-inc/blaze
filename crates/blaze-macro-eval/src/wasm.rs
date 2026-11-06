@@ -7,13 +7,15 @@
 //!
 //! A module is compiled once a daemon, through the daemon's [`Modules`], and its machine code
 //! kept in the daemon's own store, from where alone it is loaded again ([`code`]). Each
-//! expansion runs in a fresh instance, given the state the calls before it left: the statics
-//! of the macro's crates its code can write, which the link lists in the module ([`statics`]),
-//! are written after the instance's `_initialize` and before its macro runs, and what the macro
+//! run is a fresh instance, given the state the calls before it left: the statics of the
+//! macro's crates its code can write, which the link lists in the module ([`statics`]), are
+//! written after the instance's `_initialize` and before its macro runs, and what the macro
 //! changed of them is what it left ([`Ran::statics`]), as the evaluator says it. A static left
-//! holding an address of the heap, which a fresh instance has not, stops the expansion naming
-//! the static. An instance runs on an expansion thread, never on a fiber, and the job asking
-//! for it answers what it asks of the database ([`thread`]).
+//! holding an address of the heap is said to hold one, as the evaluator says it: a fresh
+//! instance has no such heap, so the session's earlier calls are then given with each next
+//! one, and the run makes the heap again by running them in order in its instance first
+//! ([`Library::run`]). An instance runs on an expansion thread, never on a fiber, and the job
+//! asking for it answers what it asks of the database ([`thread`]).
 //!
 //! Every way a module can't be loaded or run is an error naming the macro ([`LoadError`],
 //! [`Stop`]); nothing runs it on the evaluator instead.
@@ -250,52 +252,53 @@ impl Library {
             .finish()
     }
 
-    /// Runs the macro at `index` (of `run::functions`) on the one expansion of `expansions`,
-    /// with the calling crate's `env`, from the statics `preset` (what the calls before it
-    /// left, as [`Ran::statics`] said each), in the working directory `cwd` (the call's, which
-    /// the module's glue enters). An instance can't be given what calls before it
-    /// left on its heap, so there are no earlier calls to run again; given some, it stops.
+    /// Runs `expansions` in order in one fresh instance, each the macro at its
+    /// [`Expansion::index`], with the calling crate's `env`, from the statics `preset` (what the
+    /// calls before them left, as [`Ran::statics`] said each), in the working directory `cwd`
+    /// (the call's, which the module's glue enters): what the last gave, and what all of them
+    /// did. The ones before the last are the session's earlier calls, run again for the state
+    /// they leave on the heap, as on the evaluator ([`run::run`](crate::run::run)).
     pub(crate) fn run(
         &self,
         db: &Db,
         env: &Env,
-        index: u32,
         expansions: &[Expansion<'_>],
         preset: &[(StaticId, Vec<u8>)],
         cwd: &str,
         spent: &mut Spent,
     ) -> Result<Ran, Stop> {
         spent.evaluated = false;
-        let [expansion] = expansions else {
-            // alloc: error path
-            return Err(Stop(format!(
-                "was given {} calls to run in one instance of its wasm module, which runs each in a \
-                 fresh one",
-                expansions.len()
-            )));
-        };
-        let given = Given {
-            inputs: expansion.inputs,
-            sites: expansion.sites,
-            edition: expansion.edition,
-            forced_keywords: expansion.forced_keywords,
-        };
-        self.expand(db, env, index, &given, preset, cwd, spent)
+        // alloc: once per run, what each of its calls is given
+        let calls: Vec<(u32, Given<'_>)> = expansions
+            .iter()
+            .map(|it| {
+                let given = Given {
+                    inputs: it.inputs,
+                    sites: it.sites,
+                    edition: it.edition,
+                    forced_keywords: it.forced_keywords,
+                };
+                (it.index, given)
+            })
+            .collect();
+        self.expand(db, env, &calls, preset, cwd, spent)
     }
 
-    /// Runs the macro at `index` on `given` in a fresh instance from the statics `preset`, on
-    /// an expansion thread ([`thread`]), what it asks of the database answered from `db` on
-    /// this one.
+    /// Runs `calls` (each a macro's index and what it is given) in order in one fresh instance
+    /// from the statics `preset`, on an expansion thread ([`thread`]), what they ask of the
+    /// database answered from `db` on this one: what the last gave, and what all of them did.
     fn expand(
         &self,
         db: &Db,
         env: &Env,
-        index: u32,
-        given: &Given<'_>,
+        calls: &[(u32, Given<'_>)],
         preset: &[(StaticId, Vec<u8>)],
         cwd: &str,
         spent: &mut Spent,
     ) -> Result<Ran, Stop> {
+        let Some((_, last)) = calls.last() else {
+            return Err(Stop("was given nothing to expand".to_owned())); // alloc: error path
+        };
         let statics = &*self.statics;
         if !statics.resolved {
             return Err(Stop(format!(
@@ -304,7 +307,7 @@ impl Library {
                 statics::SECTION
             )));
         }
-        // alloc: once per expansion, where the state it is given is written
+        // alloc: once per run, where the state it is given is written
         let mut writes = Vec::with_capacity(preset.len());
         for (id, bytes) in preset {
             let Some(places) = statics.places(*id, bytes) else {
@@ -325,27 +328,35 @@ impl Library {
             memory_len: 0,
             started: false,
         };
-        let mut server = Server::new(given.sites, given.edition, given.forced_keywords);
-        // alloc: once per expansion, its input's bytes
-        let mut input = Vec::new();
-        server.input(given.inputs, &mut input);
+        // alloc: once per run, each call's server and input bytes, given to the expansion's thread
+        let mut runs: Vec<host::Call> = calls
+            .iter()
+            .map(|(index, given)| {
+                let mut server = Server::new(given.sites, given.edition, given.forced_keywords);
+                let mut input = Vec::new(); // alloc: as above
+                server.input(given.inputs, &mut input);
+                host::Call { index: *index, server, input }
+            })
+            .collect();
+        // The run's server until its first call's takes its place ([`host::expand`]).
+        let server = Server::new(last.sites, last.edition, last.forced_keywords);
         // clone: a handle of the module's code, given to the expansion's thread
         let pre = self.pre.clone();
-        // clone: the calling crate's variables, given to the expansion's thread once per expansion
+        // clone: the calling crate's variables, given to the expansion's thread once per run
         let env = env.clone();
-        // alloc: the call's directory, given to the expansion's thread once per expansion
+        // alloc: the call's directory, given to the expansion's thread once per run
         let cwd = cwd.to_owned();
         let (ran, used, watch) =
             thread::run(db, move |link: &thread::Link<(Result<Ran, Stop>, host::Used, Watch)>| {
                 let mut cx = Cx::new(link, server, Os::wasm_in(&env, &cwd));
-                let (output, used) = host::expand(&pre, &mut cx, index, &input, &mut watch);
+                let (output, used) = host::expand(&pre, &mut cx, &mut runs, &mut watch);
                 let Cx { server, os, .. } = cx;
                 let ran = output.map(|output| Ran {
                     output,
                     asked: server.asked,
                     tracked: server.tracked,
                     emitted: server.emitted,
-                    // alloc: once per expansion, what it read, given to the key
+                    // alloc: once per run, what its calls read, given to the key
                     seen: os.seen().map(|(seen, what)| (seen, what.to_owned())).collect(),
                     unkeyable: os.unkeyable().map(str::to_owned),
                     statics: Vec::new(),
@@ -356,19 +367,19 @@ impl Library {
         spent.peak_bytes = used.peak_bytes;
         spent.over = used.over;
         let mut ran = ran?;
-        ran.statics = self.left(&watch)?;
+        ran.statics = self.left(&watch);
         Ok(ran)
     }
 
-    /// The statics `watch` saw the macro change, each with its bytes as it left them. One left
-    /// holding an address of the heap stops: a next instance has no such heap, and giving it
-    /// the calls before again in one instance is not done yet.
-    fn left(&self, watch: &Watch) -> Result<Vec<(StaticId, Vec<u8>, bool)>, Stop> {
+    /// The statics `watch` saw the run change, each with its bytes as the run left them and
+    /// whether they hold an address of the instance's heap, which a next instance has only
+    /// when the calls that made it run again in it first ([`Library::run`]).
+    fn left(&self, watch: &Watch) -> Vec<(StaticId, Vec<u8>, bool)> {
         let statics = &*self.statics;
-        // alloc: once per expansion, what it left (nothing for most)
+        // alloc: once per run, what it left (nothing for most)
         let mut left = Vec::new();
         if !watch.started {
-            return Ok(left);
+            return left;
         }
         for (at, watched) in statics.watched.iter().enumerate() {
             let span = statics.span(at);
@@ -376,17 +387,9 @@ impl Library {
             if before == after {
                 continue;
             }
-            if statics.holds_heap_address(at, after, watch.memory_len) {
-                // alloc: error path
-                return Err(Stop(format!(
-                    "left an address of its heap in the static `{}`, which no next call's fresh \
-                     instance has: carrying it needs the calls before run again in one instance, \
-                     which the wasm host does not do yet",
-                    watched.path
-                )));
-            }
-            left.push((watched.id, after.to_vec(), false)); // alloc: as above
+            let holds = statics.holds_heap_address(at, after, watch.memory_len);
+            left.push((watched.id, after.to_vec(), holds)); // alloc: as above
         }
-        Ok(left)
+        left
     }
 }

@@ -1,5 +1,6 @@
-//! One expansion in a fresh instance of a macro's module: its input written to the module's
-//! memory, its macro run, and each request its `proc_macro` client makes answered by
+//! One run in a fresh instance of a macro's module: its calls in order (the session's earlier
+//! calls run again for the state they leave, then the one expanded), each one's input written
+//! to the module's memory, its macro run, and each request its `proc_macro` client makes answered by
 //! [`Server::dispatch`] through the bridge's shims ([`abi::BRIDGE_SHIMS`]); the WASI calls of
 //! its std by `blaze_wasi` over the sandbox's [`wasi`].
 //!
@@ -268,21 +269,33 @@ pub(crate) struct Watch {
     pub(crate) started: bool,
 }
 
-/// What one expansion used: the fuel, its memory at its largest, and the budget it ran past.
+/// One call of a run ([`expand`]): the macro at `index` of the module's list, on `input` (what
+/// `server`'s [`Server::input`] wrote), its requests answered by `server`, as rustc gives each
+/// expansion its own handles.
+pub(crate) struct Call {
+    pub(crate) index: u32,
+    pub(crate) server: Server,
+    pub(crate) input: Vec<u8>,
+}
+
+/// What one run used: the fuel of all its calls, its memory at its largest, and the budget it
+/// ran past.
 pub(crate) struct Used {
     pub(crate) fuel: u64,
     pub(crate) peak_bytes: u64,
     pub(crate) over: Option<Over>,
 }
 
-/// Runs macro `index` of the module `pre` instantiates on `input` (what [`Server::input`]
-/// wrote), its requests answered from `cx`: what it gave, or why it stopped. On an expansion
-/// thread only ([`super::thread::run`]).
+/// Runs `calls` in order in one instance of the module `pre`, each with [`FUEL`] of its own,
+/// their requests answered from `cx` (whose server is each call's while it runs, and the last
+/// one's after): what the last gave, or why the run stopped. The calls before the last are run
+/// for the state they leave; what they give is not used, and one that stops (a panic aborts the
+/// instance the calls after it would run in) stops the run, naming it. On an expansion thread
+/// only ([`super::thread::run`]).
 pub(crate) fn expand(
     pre: &InstancePre<Host>,
     cx: &mut Cx<'_>,
-    index: u32,
-    input: &[u8],
+    calls: &mut [Call],
     watch: &mut Watch,
 ) -> (Result<Result<Stream, String>, Stop>, Used) {
     // The pointer is valid until the store drops at this function's end (`with`'s SAFETY).
@@ -290,7 +303,8 @@ pub(crate) fn expand(
     let host = Host { cx: Some(pointer), memory: None, limits: Limits::default(), requests: 0 };
     let mut store = Store::new(pre.module().engine(), host);
     store.limiter(|host| &mut host.limits);
-    let ran = run(&mut store, pre, index, input, watch);
+    let mut fuel = 0;
+    let ran = run(&mut store, pre, calls, watch, &mut fuel);
     let watched = match store.data().memory {
         Some(memory) if watch.started => {
             watch.memory_len = memory.data_size(&store);
@@ -298,20 +312,10 @@ pub(crate) fn expand(
         }
         _ => Ok(()),
     };
-    // The engine counts fuel (`engine.rs`), so the store always says what is left.
-    let left = store.get_fuel();
     let limits = &store.data().limits;
-    let mut spent = Used { fuel: 0, peak_bytes: limits.peak as u64, over: None };
+    let mut spent = Used { fuel, peak_bytes: limits.peak as u64, over: None };
     let over_memory = limits.over;
     drop(store);
-    let left = match left {
-        Ok(left) => left,
-        // alloc: error path
-        Err(e) => {
-            return (Err(Stop(format!("ran on an engine that counts no fuel: {e:#}"))), spent);
-        }
-    };
-    spent.fuel = FUEL.saturating_sub(left);
     if let Err(error) = watched {
         // alloc: error path
         return (Err(Stop(format!("left its state where it can't be read: {error:#}"))), spent);
@@ -321,17 +325,39 @@ pub(crate) fn expand(
             Some(bytes) => cx.server.output(&bytes),
             None => Err(Stop("returned without giving an output".to_owned())), // alloc: error path
         },
-        Err(error) => {
+        Err((at, error)) => {
             let trap = error.downcast_ref::<Trap>().copied();
             spent.over = match (trap, over_memory) {
                 (Some(Trap::OutOfFuel), _) => Some(Over::Steps),
                 (_, true) => Some(Over::Memory),
                 _ => None,
             };
-            stopped_by(cx, &error, trap, spent.over)
+            let stopped = stopped_by(cx, &error, trap, spent.over);
+            match at + 1 < calls.len() {
+                true => Err(earlier(at, calls.len() - 1, stopped)),
+                false => stopped,
+            }
         }
     };
     (result, spent)
+}
+
+/// Why a run stopped at its call `at`, one of the `of` calls of the session before the one
+/// expanded, which it runs again for the state they leave: what stopped that call, or the panic
+/// it gave, which aborts the instance the calls after it would run in.
+fn earlier(at: usize, of: usize, stopped: Result<Result<Stream, String>, Stop>) -> Stop {
+    let why = match stopped {
+        // alloc: error path
+        Ok(Err(panic)) => format!("panicked ({panic}), which aborts its wasm instance"),
+        Ok(Ok(_)) => "stopped after it gave its output".to_owned(), // alloc: error path
+        Err(Stop(why)) => why,
+    };
+    // alloc: error path
+    Stop(format!(
+        "could not run again call {} of the {of} its session made before this one, which leave \
+         the state it runs from: that call {why}",
+        at + 1
+    ))
 }
 
 /// What an instance that ended in `error` gave: the stop a shim kept, the panic its hook gave
@@ -410,57 +436,102 @@ fn read(
     })
 }
 
-/// The instance's part of [`expand`].
+/// Runs `f` on the run's [`Cx`] between two calls into the module.
+#[allow(unsafe_code)]
+fn between(store: &mut Store<Host>, f: impl FnOnce(&mut Cx<'_>)) {
+    if let Some(mut cx) = store.data().cx {
+        // SAFETY: as `with`'s: the pointer is from the `&mut Cx` `expand` holds for as long as
+        // the store lives, and no module code runs while `store` is borrowed here, so no shim
+        // holds another reference to the `Cx`.
+        f(unsafe { cx.as_mut() });
+    }
+}
+
+/// The instance's part of [`expand`]: the fuel each call spent added to `fuel`, and on an
+/// error the call it stopped at (the last for the instance's making, which is no earlier
+/// call's doing).
 fn run(
     store: &mut Store<Host>,
     pre: &InstancePre<Host>,
-    index: u32,
-    input: &[u8],
+    calls: &mut [Call],
     watch: &mut Watch,
-) -> wasmtime::Result<()> {
-    store.set_fuel(FUEL)?;
+    fuel: &mut u64,
+) -> Result<(), (usize, wasmtime::Error)> {
+    let last = calls.len().saturating_sub(1);
+    let first = |error| (last, error);
+    if calls.is_empty() {
+        return Err(first(wasmtime::Error::msg("a run of no calls")));
+    }
+    store.set_fuel(FUEL).map_err(first)?;
     let instantiating = tracing::info_span!(target: "blaze", "macro instantiate").entered();
-    let instance = pre.instantiate(&mut *store)?;
+    let instance = pre.instantiate(&mut *store).map_err(first)?;
     let Some(memory) = instance.get_memory(&mut *store, abi::MEMORY) else {
-        return Err(wasmtime::Error::msg("the module has no memory export"));
+        return Err(first(wasmtime::Error::msg("the module has no memory export")));
     };
     store.data_mut().memory = Some(memory);
     // Required (`abi::EXPORTS`, checked before instantiating): a reactor's constructors and
     // wasi-libc's start-up run there, and skipping them would expand with them unrun.
-    let init: TypedFunc<(), ()> = instance.get_typed_func(&mut *store, abi::INITIALIZE)?;
-    init.call(&mut *store, ())?;
+    let init: TypedFunc<(), ()> =
+        instance.get_typed_func(&mut *store, abi::INITIALIZE).map_err(first)?;
+    init.call(&mut *store, ()).map_err(first)?;
     drop(instantiating);
-    // The state the calls before it left, over what `_initialize` made: then what the macro
-    // changes of it.
+    // The state the calls before it left, over what `_initialize` made: then what the calls
+    // change of it.
     for (at, bytes) in &watch.writes {
-        memory.write(&mut *store, *at as usize, bytes)?;
+        memory.write(&mut *store, *at as usize, bytes).map_err(|e| first(e.into()))?;
     }
-    read(store, memory, &watch.statics, &mut watch.before)?;
+    read(store, memory, &watch.statics, &mut watch.before).map_err(first)?;
     watch.started = true;
-    let alloc: TypedFunc<u32, u32> = instance.get_typed_func(&mut *store, abi::ALLOC)?;
+    let alloc: TypedFunc<u32, u32> =
+        instance.get_typed_func(&mut *store, abi::ALLOC).map_err(first)?;
     let expand: TypedFunc<(u32, u32, u32), u32> =
-        instance.get_typed_func(&mut *store, abi::EXPAND)?;
-    let Ok(len) = u32::try_from(input.len()) else {
-        return Err(wasmtime::Error::msg("its input is more than a 32-bit memory holds"));
-    };
-    let at = alloc.call(&mut *store, len)?;
-    memory.write(&mut *store, at as usize, input)?;
-    // What the macro spent in its module, and how often it asked the server: fuel over the
-    // requests is the module's own work, the rest the bridge's.
-    let running = tracing::info_span!(target: "blaze", "macro wasm run", fuel = tracing::field::Empty, requests = tracing::field::Empty).entered();
-    let called = expand.call(&mut *store, (index, at, len));
-    let left = store.get_fuel().unwrap_or(0);
-    running.record("fuel", FUEL.saturating_sub(left));
-    running.record("requests", store.data().requests);
-    drop(running);
-    match called? {
-        0 => Ok(()),
-        1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),
-        status if status & abi::STATUS == abi::UNENTERED => {
-            Err(wasmtime::Error::new(Unentered { errno: status >> 8 }))
+        instance.get_typed_func(&mut *store, abi::EXPAND).map_err(first)?;
+    for (at, call) in calls.iter_mut().enumerate() {
+        let failed = |error| (at, error);
+        between(store, |cx| {
+            std::mem::swap(&mut cx.server, &mut call.server);
+            cx.output = None;
+        });
+        if at > 0 {
+            store.set_fuel(FUEL).map_err(failed)?;
         }
-        status => Err(wasmtime::Error::msg(format!(
-            "the module returned status {status}, which the ABI has not"
-        ))),
+        store.data_mut().requests = 0;
+        let index = call.index;
+        let Ok(len) = u32::try_from(call.input.len()) else {
+            return Err(failed(wasmtime::Error::msg(
+                "its input is more than a 32-bit memory holds",
+            )));
+        };
+        let input = alloc.call(&mut *store, len).map_err(failed)?;
+        memory.write(&mut *store, input as usize, &call.input).map_err(|e| failed(e.into()))?;
+        // What the macro spent in its module, and how often it asked the server: fuel over the
+        // requests is the module's own work, the rest the bridge's.
+        let running = tracing::info_span!(target: "blaze", "macro wasm run", fuel = tracing::field::Empty, requests = tracing::field::Empty).entered();
+        let called = expand.call(&mut *store, (index, input, len));
+        // The engine counts fuel (`engine.rs`), so the store always says what is left.
+        let left = store.get_fuel().map_err(|e| {
+            failed(wasmtime::Error::msg(format!("ran on an engine that counts no fuel: {e:#}")))
+        })?;
+        *fuel += FUEL.saturating_sub(left);
+        running.record("fuel", FUEL.saturating_sub(left));
+        running.record("requests", store.data().requests);
+        drop(running);
+        match called.map_err(failed)? {
+            0 => {}
+            1 => {
+                return Err(failed(wasmtime::Error::msg(format!(
+                    "the module has no macro at index {index}"
+                ))));
+            }
+            status if status & abi::STATUS == abi::UNENTERED => {
+                return Err(failed(wasmtime::Error::new(Unentered { errno: status >> 8 })));
+            }
+            status => {
+                return Err(failed(wasmtime::Error::msg(format!(
+                    "the module returned status {status}, which the ABI has not"
+                ))));
+            }
+        }
     }
+    Ok(())
 }

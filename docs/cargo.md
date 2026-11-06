@@ -903,9 +903,12 @@ rustc: the link lists each static of the macro's crates its code can write in th
 `blaze.statics` section, and the host writes what the calls before left into each fresh
 instance before the macro runs, then reads back what it changed (`src/wasm/statics.rs`). A
 module without that section is refused at load. A static left holding an address of the heap
-stops the expansion with an error naming the static, since a fresh instance has no such heap.
-A call is kept and found under the state it started from, and only when it left that state as
-it was.
+(a lazily built table, a cache behind a pointer: logos's, `proc-macro-crate`'s) can't be given
+to a fresh instance, which has no such heap; from then on the calling crate's earlier calls of
+the macro run again, in order, in the next call's instance before it, as they ran in one
+process under rustc, and as the evaluator runs them. A call is kept and found under the state
+it started from, and only when it left that state as it was; one after the earlier calls run
+again is never kept.
 
 Each expansion is kept in the store (`crates/proc-macro-api/src/kept.rs`) by the macro's
 library, its name, input and attribute tokens, the crate's variables, its directory and the
