@@ -568,3 +568,53 @@ fn replay_one_seed() {
         Err(why) => panic!("seed {seed}, {bug:?}: {why}\nplan {plan:?}"),
     }
 }
+
+/// A name a long span took as it opened, written as a link when it closes on another thread
+/// some hundreds of generations of its ring later, reads back while the reader was told the
+/// span held it ([`Streams::hold`], once a read), and is forgotten when it was not: the cause
+/// removed, the effect gone (the memattrib lane's empty `function` of 25 to 70 s tasks,
+/// 2026-11-05).
+#[test]
+fn a_name_a_long_span_holds_reads_back_past_retain_generations() {
+    for told in [true, false] {
+        let ring = |cap| ModelRing {
+            rows: Vec::new(), // alloc: a test's ring
+            cap,
+            head: 0,
+            generation: 0,
+            lost: 0,
+        };
+        let mut rings = [ring(1 << 16), ring(1 << 16)];
+        let (mut a, mut b) = (Local::with_limits(1, 0, 4, 3), Local::with_limits(2, 0, 4, 3));
+        let mut reader = Streams::default();
+        let function = a.intern("app::long_task", &mut Writer(&mut rings[0]));
+        for k in 0..800u64 {
+            let text = format!("unit {k}");
+            let token = a.intern(&text, &mut Writer(&mut rings[0]));
+            let mut words = [token];
+            a.row_syms(&mut words, &mut Writer(&mut rings[0]));
+            if k % 16 == 0 {
+                for ring in 1..=2 {
+                    reader.catch_up(ring, &mut Rings(&rings));
+                }
+                let held: &[Token] = if told { &[function] } else { &[] };
+                reader.hold(held, &mut Rings(&rings));
+            }
+        }
+        assert!(a.generation() > 3 * RETAIN as u32, "ring 1 went round its readers' generations");
+        // The span closes on thread b: its function is a link in b's ring.
+        let mut words = [function];
+        b.row_syms(&mut words, &mut Writer(&mut rings[1]));
+        let at = rings[1].head;
+        Writer(&mut rings[1]).put([words[0], 0, 0, 0, 0, 0, 0, 0]);
+        for ring in 1..=2 {
+            reader.catch_up(ring, &mut Rings(&rings));
+        }
+        reader.hold(&[], &mut Rings(&rings));
+        let got = reader.resolve(2, at, words[0] as u32, &mut Rings(&rings));
+        match told {
+            true => assert_eq!(got.as_deref(), Some("app::long_task")),
+            false => assert_eq!(got, None, "with no hold the name is past RETAIN: forgotten"),
+        }
+    }
+}

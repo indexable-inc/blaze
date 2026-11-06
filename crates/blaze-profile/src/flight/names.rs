@@ -430,6 +430,11 @@ pub struct Streams {
     /// Rows read here, reused.
     scratch: Vec<(u64, [u64; WORDS])>,
     plant: Plant,
+    /// Texts of names open spans hold ([`Streams::hold`]), and the read they were last held at:
+    /// a span open past [`RETAIN`] generations of its ring still reads its names as it closes.
+    held: HashMap<Token, (Arc<str>, u64), Global>,
+    /// Reads [`Streams::hold`] was told of.
+    reads: u64,
     /// Ids no definition held resolves: written over unread, of a generation let go, or after
     /// rows the reader missed.
     pub forgotten: u64,
@@ -546,10 +551,12 @@ impl Streams {
         let Some(stream) = self.rings.get(usize::from(ring)) else { return Found::Forgotten };
         let held = stream.gens.iter().rev().find(|it| it.generation == generation);
         match held.and_then(|it| it.defs.get(usize::from(index))).and_then(Option::as_ref) {
-            // clone: a refcount
-            Some(Def::Text(text)) => Found::Text(text.clone()),
+            Some(Def::Text(text)) => Found::Text(Arc::clone(text)),
             // A token is a text's: a link to a link is not one a writer writes.
-            _ => Found::Forgotten,
+            Some(Def::Link(_)) | None => match self.held.get(&token) {
+                Some((text, _)) => Found::Text(Arc::clone(text)),
+                None => Found::Forgotten,
+            },
         }
     }
 
@@ -570,9 +577,31 @@ impl Streams {
         }
     }
 
+    /// Keeps the text of each of `tokens`, the names the spans open now hold, while a read
+    /// still resolves it, until the read after the last that was told of it: a name a long span
+    /// took when it opened is written as a link when it closes, maybe hundreds of generations
+    /// later, and reads back from here. Called once a read, before its rows are resolved.
+    pub fn hold(&mut self, tokens: &[Token], source: &mut impl Source) {
+        self.reads += 1;
+        let reads = self.reads;
+        for &token in tokens {
+            if let Some(it) = self.held.get_mut(&token) {
+                it.1 = reads;
+                continue;
+            }
+            if let Some(text) = self.text(token, source) {
+                // alloc: a name an open span holds, kept while it does
+                self.held.insert(token, (text, reads));
+            }
+        }
+        // Kept through the next read: a span that closed since this one wrote its row then.
+        self.held.retain(|_, it| it.1 + 1 >= reads);
+    }
+
     /// Forgets every ring, as a reader that starts again.
     pub fn clear(&mut self) {
         self.rings.clear();
+        self.held.clear();
     }
 }
 

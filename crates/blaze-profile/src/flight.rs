@@ -2630,6 +2630,26 @@ impl Ring {
         self.taken[at / 64].fetch_and(!(1 << (at % 64)), Ordering::Release);
     }
 
+    /// The ring names (not kept ones) the spans open in its slots hold now, into `into`: what
+    /// a reader keeps the text of while they do ([`names::Streams::hold`]). A word of a typed
+    /// column that only looks like a token keeps the text of the name it would be, harmless.
+    fn held_tokens(&self, into: &mut Vec<Token>) {
+        for (word, bits) in self.taken.iter().enumerate() {
+            let mut bits = bits.load(Ordering::Acquire);
+            while bits != 0 {
+                let at = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let Some(slot) = self.slot(at) else { continue };
+                for it in [&slot.krate, &slot.function, &slot.unit].into_iter().chain(&slot.typed) {
+                    let token = it.load(Ordering::Relaxed);
+                    if names::parts(token).is_some() {
+                        into.push(token);
+                    }
+                }
+            }
+        }
+    }
+
     /// What the slot of span `id` holds, while `id` is in it.
     fn opened(&self, id: u64) -> Option<Opened> {
         let slot = self.slot_of(id)?;
@@ -4117,6 +4137,14 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
     let counting_copies = FRAME_COPIED.get().is_some();
     // The readers' names, for the whole read: no thread that records takes it.
     let mut reader = reader();
+    // The names open spans hold, kept while they do: a span that closes in a later read
+    // writes them as links, maybe past RETAIN generations of their ring.
+    // alloc: a read's held names, once a read
+    let mut held = Vec::new();
+    for ring in &rings {
+        ring.held_tokens(&mut held);
+    }
+    reader.streams.hold(&held, &mut Rings);
     for ring in rings {
         lost += ring.lost.load(Ordering::Relaxed);
         scratch.clear();
