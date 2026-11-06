@@ -16,7 +16,8 @@ use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
 use hir_expand::fixture;
-use hir_ty::db::HirDatabase;
+use hir_ty::{db::HirDatabase, next_solver::TyKind};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use std::alloc::Global;
 
 use super::{Walking, walk};
@@ -362,6 +363,77 @@ fn a_dyn_fn_call_lists_the_closure_vtable() {
     assert!(count(&reached, |def| matches!(def, InstanceDef::Closure(_))) >= 2, "{reached:?}");
     assert!(count(&reached, |def| *def == InstanceDef::CallOnceShim) >= 1, "{reached:?}");
     assert!(count(&reached, |def| *def == InstanceDef::DropGlue) >= 1, "{reached:?}");
+}
+
+const REIFIED_TRAIT_FN: &str = r#"
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn, fn, eq
+pub trait Tr {
+    fn f(x: u32) -> bool;
+    fn g(x: u32) -> bool { x == 4 }
+}
+pub struct A;
+pub struct B;
+impl Tr for A {
+    fn f(x: u32) -> bool { x == 3 }
+    fn g(x: u32) -> bool { x == 5 }
+}
+impl Tr for B { fn f(x: u32) -> bool { x == 7 } }
+pub fn take(f: &dyn Fn(u32) -> bool) -> bool { f(3) }
+pub fn go<C: Tr>() -> bool {
+    let p: fn(u32) -> bool = C::f;
+    let q: fn(u32) -> bool = C::g;
+    take(&C::f) && take(&C::g) && p(3) && q(4)
+}
+pub fn roots() -> bool { go::<A>() && go::<B>() }
+"#;
+
+/// A trait's associated fn named through a type parameter (`&C::f` as a `&dyn Fn`, `C::f` as
+/// a `fn` pointer, harfrust's `&Ctx::is_actionable`) runs the impl's fn its monomorphized
+/// arguments select, or the trait's default where the impl has none, never the trait's
+/// declaration: the `Fn`-vtable shim is of the resolved fn, as rustc's shim calls what
+/// `Instance::resolve` gives. Of the declaration, the shim was keyed by a function with no
+/// body ("`Fn` `...::is_actionable` has no body to compile") or, for a default the impl
+/// overrides, by the default's code.
+#[test]
+fn a_trait_fn_reified_through_a_type_parameter_runs_the_impls_fn() {
+    let (db, reached) = reach_from(REIFIED_TRAIT_FN, "roots");
+    let krate = fixture::test_crate(db);
+    let impls = hir_def::test_items::impls(db, krate);
+    let owner = |func: FunctionId| match func.loc(db).container {
+        hir_def::ItemContainerId::ImplId(it) if it == impls[0] => "A",
+        hir_def::ItemContainerId::ImplId(it) if it == impls[1] => "B",
+        hir_def::ItemContainerId::TraitId(_) => "Tr",
+        _ => "",
+    };
+    let named = |func: FunctionId| {
+        format!("{}::{}", owner(func), FunctionSignature::of(db, func).name.as_str())
+    };
+    let mut shims = Vec::new();
+    let mut fns = Vec::new();
+    for (instance, _) in &reached {
+        let Kind::Code(code, _) = &instance.0 else { continue };
+        match code.def {
+            InstanceDef::ReifyShim { receiver } => {
+                let ty = code.args.as_ref().type_at(0);
+                let TyKind::FnDef(def, _) = ty.kind() else {
+                    panic!("a reify shim of {ty:?}, not of a fn item");
+                };
+                let hir_def::CallableDefId::FunctionId(func) = def.0 else {
+                    panic!("a reify shim of a constructor, {ty:?}");
+                };
+                assert!(receiver, "a `fn` pointer to a plain fn needs no shim: {}", named(func));
+                shims.push(named(func));
+            }
+            InstanceDef::Fn(func) => fns.push(named(func)),
+            _ => (),
+        }
+    }
+    shims.sort();
+    assert_eq!(shims, ["A::f", "A::g", "B::f", "Tr::g"], "the `Fn`-vtable shims' callees");
+    for wanted in ["A::f", "A::g", "B::f", "Tr::g"] {
+        assert!(fns.iter().any(|it| it == wanted), "`{wanted}` is not reached: {fns:?}");
+    }
+    assert!(!fns.iter().any(|it| it == "Tr::f"), "the trait's declaration is reached: {fns:?}");
 }
 
 const DERIVED: &str = r#"
@@ -831,7 +903,7 @@ pub fn root() -> u32 {
 /// type, with none left in it.
 #[test]
 fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
-    use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
+    use rustc_type_ir::TypeVisitableExt as _;
     let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {

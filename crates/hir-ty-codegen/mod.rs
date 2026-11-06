@@ -10887,11 +10887,55 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.cg.callee(closure, parent_args, self.env, &sig)
     }
 
-    /// The `ReifyShim` of a fn item or fn pointer type.
+    /// The `ReifyShim` of a fn item or fn pointer type, of the item the call resolves to
+    /// ([`Self::resolved_fn_item`]).
     fn reified(&mut self, ty: Ty<'db>, receiver: bool) -> Result<FuncId> {
+        let ty = self.resolved_fn_item(ty)?;
         let sig = self.reify_signature(ty, receiver)?.1;
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         self.cg.callee(InstanceDef::ReifyShim { receiver }, args, self.env, &sig)
+    }
+
+    /// The fn item type of the function a call of the fn item `ty` runs: for a trait method
+    /// named through its trait (`<C as Tr>::f`, monomorphized), the method of the impl its
+    /// arguments select, or the trait's default body where the impl has none, as rustc's
+    /// shims call what `Instance::resolve` gives. A `ReifyShim` is keyed and compiled as the
+    /// function it calls (v2's code identity, `frontend::code_of`, reads the item its type
+    /// names), so a shim of the trait's declaration would be one of a function with no body,
+    /// and one of a default body the impl overrides would be keyed by the wrong code. Every
+    /// other type, and a call whose callee is not a plain function (`dyn`'s vtable slot, a
+    /// builtin derive, the compiler's `Clone` or `FnPtr`, an `async` block's `poll`), is `ty`
+    /// itself: the shim's body resolves those as any call does (`call_direct`).
+    fn resolved_fn_item(&self, ty: Ty<'db>) -> Result<Ty<'db>> {
+        let TyKind::FnDef(def, generic_args) = ty.kind() else {
+            return Ok(ty);
+        };
+        let CallableDefId::FunctionId(func) = def.0 else {
+            return Ok(ty);
+        };
+        let generic_args = generic_args.skip_binder();
+        let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func) {
+            return Ok(ty);
+        }
+        let callee =
+            dispatch::callee(&self.infcx, self.env, func, generic_args).map_err(|why| {
+                CodegenError::Refused(no_impl_method(db, func, generic_args, why))
+            })?;
+        Ok(match callee {
+            dispatch::Callee::Fn(callee, callee_args)
+                if callee != func || callee_args != generic_args =>
+            {
+                let def = CallableDefId::FunctionId(callee).into();
+                Ty::new_fn_def(self.interner, def, callee_args)
+            }
+            dispatch::Callee::Fn(..)
+            | dispatch::Callee::Poll(..)
+            | dispatch::Callee::Virtual
+            | dispatch::Callee::Derived(..)
+            | dispatch::Callee::CloneBuiltin(_)
+            | dispatch::Callee::FnPtr(_) => ty,
+        })
     }
 
     /// What a `ReifyShim` is called with and how.
