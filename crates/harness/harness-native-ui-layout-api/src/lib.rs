@@ -546,20 +546,22 @@ pub struct Collapse {
 }
 
 /// The length this node's neighbours lay out against while its `Size` along its parent's main axis moves (a fold's spring
-/// writes it each frame): layout gives the node its `Size`, and gives the children of every `LaysAtRest` node beside it
-/// (or under a sibling of it) the room they have when it is this long. A sidebar folding on a spring says here the width
-/// at which its fold leaves the card least room, so the card's words wrap at most once per fold.
+/// writes it each frame): layout gives the node its `Size`, every words node beside it (or under a sibling of it) the width
+/// it has when it is this long to break its lines at (node-api `WrapAt`), and the children of every `LaysAtRest` node there
+/// the room they have then. A sidebar folding on a spring says here the width at which its fold leaves the card least room,
+/// so the card's boxes follow the spring while its words wrap at most once per fold.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct RestSize {
     pub len: f32,
 }
 
 /// Its flow children are laid out in the room it gets while every moving `RestSize` (a sibling's, or a sibling's of an
-/// ancestor) is at that length, not in the room it has this frame: a pane whose width follows the sidebar's spring lays its
-/// content out once per fold (its words wrap and its terminal resizes once, not every frame), while its own frame and its
-/// `Background` and `Overlay` children follow the spring. It places that content in the frame it has now by its own `Flex`
-/// (a centred column stays centred in the moving frame; a Start one rides its leading edge); past its frame it is clipped
-/// by whatever clips it. Put it on the node whose alignment should carry the content through the motion. A tag.
+/// ancestor) is at that length, not in the room it has this frame, for content that cannot follow a moving box: a terminal
+/// pane's grid resizes once per fold, not every frame, while the pane's frame and its `Background` and `Overlay` children
+/// follow the spring. Words need none of it (they break at their rest width on their own, `WrapAt`, while their boxes,
+/// plates and controls follow the frame), so a view of words and fields leaves it off. It places that content in the
+/// frame it has now by its own `Flex` (a Start one rides its leading edge); past its frame it is clipped by whatever clips
+/// it. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct LaysAtRest;
 

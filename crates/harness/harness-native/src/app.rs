@@ -1724,9 +1724,10 @@ impl App {
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
         let width = open * x;
-        // What the panes' LaysAtRest nodes lay out against while the fold moves: the open width, where the card is
-        // narrowest, so their content never overflows the moving frame, and a terminal resizes and words wrap once per
-        // cmd+S, not on every frame of the spring: opening, on its first frame; folding, once the spring rests closed.
+        // What the card's words (WrapAt) and its panes' LaysAtRest nodes lay out against while the fold moves: the open
+        // width, where the card is narrowest, so nothing overflows the moving boxes, and words wrap and a terminal resizes
+        // once per cmd+S, not on every frame of the spring: opening, on its first frame; folding, once the spring rests
+        // closed. Every box (the composer's plate, its controls, the column) follows the spring.
         let rest = if self.side_x.settled(0.0) { 0.0 } else { open };
         if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
