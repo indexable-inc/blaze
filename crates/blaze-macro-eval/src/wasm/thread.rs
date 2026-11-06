@@ -213,7 +213,7 @@ static THREADS: Lock<Threads> =
 /// The expansion threads alive now, idle ones included: the proc-macro lane's width the build
 /// view shows (`proc macros 3 of 32 expanding`).
 pub fn alive() -> usize {
-    wait::lock(&THREADS, THREADS_NAME).started
+    THREADS.lock().started
 }
 
 /// The most expansion threads kept: twice the process's workers, so every worker's job can

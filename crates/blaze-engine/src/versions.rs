@@ -346,7 +346,7 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let bounds = Bounds { most: MOST, https_only: true };
     let mut body = Vec::new(); // alloc: the asset, handed to the caller
     let mut shown = Shown::new(name);
-    let answer: Response = Retry::default().run(|| {
+    let answer: anyhow::Result<Response> = Retry::default().run(|| {
         body.clear();
         let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
             if offset != body.len() as u64 {

@@ -31,7 +31,7 @@ use tokio::{
 };
 
 use super::{
-    Kind, OpError, Source, Stop, Tick,
+    CoreWasm, Kind, OpError, Source, Stop, Tick,
     cert::{Cert, CertError, Rotation},
     frame,
     link::{self, Origins, Token},
