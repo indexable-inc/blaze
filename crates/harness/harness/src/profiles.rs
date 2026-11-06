@@ -28,20 +28,34 @@ pub struct Ctx<'a> {
 pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 
 /// The note every agent gets on top of its own system prompt (claude's `--append-system-prompt`, codex's
-/// `developer_instructions`, cursor's MCP server instructions): one file per topic under `system_note/`, joined in
-/// this order with a blank line between them.
+/// `developer_instructions`, cursor's MCP server instructions): the always-on topics, one file per topic under
+/// `system_note/`, joined in this order with a blank line between them, then the skills index ([`Note`]). A topic only
+/// some tasks need is a skill (skills.rs), not a part here.
 const SYSTEM_NOTE_PARTS: &[&str] = &[
     include_str!("system_note/tools.md"),   // the one tool, ts, and its typed calls
-    include_str!("system_note/gmail.md"),   // gmail.* in ts
     include_str!("system_note/output.md"),  // the person already sees every cell: don't restate it
-    include_str!("system_note/ui.md"),      // cells as Svelte 5 UI: the element vocabulary
+    include_str!("system_note/ui.md"),      // cells as Svelte 5 UI: read the ui skill first
     include_str!("system_note/replies.md"), // how replies to Andrew read
     include_str!("system_note/prose.md"),   // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
-    include_str!("system_note/github.md"),  // GitHub: one GraphQL query, not a loop of REST calls
 ];
 
-static SYSTEM_NOTE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| SYSTEM_NOTE_PARTS.iter().map(|part| part.trim()).collect::<Vec<_>>().join("\n\n"));
+/// What one agent launch is told: [`SYSTEM_NOTE_PARTS`], then the index of the skills its session offers (its last
+/// part, [`crate::skills::Skills::index`]), and those skills, which its kernel serves (`HARNESS_SKILLS`, [`kernel_env`]).
+/// Built per launch: project skills depend on the session's directory, and an edited skill shows at the next launch
+/// without a rebuild.
+struct Note {
+    text: String,
+    skills: crate::skills::Skills,
+}
+
+impl Note {
+    fn of(ctx: &Ctx) -> anyhow::Result<Note> {
+        let skills = crate::skills::Skills::discover(std::path::Path::new(ctx.cwd))?;
+        let index = skills.index();
+        let text = SYSTEM_NOTE_PARTS.iter().map(|part| part.trim()).chain([index.as_str()]).collect::<Vec<_>>().join("\n\n");
+        Ok(Note { text, skills })
+    }
+}
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -49,6 +63,13 @@ fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     env.insert("HARNESS_SOCK".into(), ctx.sock.display().to_string());
     env.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
     env.insert("HOME".into(), std::env::var("HOME").unwrap_or_default());
+    env
+}
+
+/// The kernel's environment: [`mcp_env`] plus the skills it serves.
+fn kernel_env(ctx: &Ctx, note: &Note) -> BTreeMap<String, String> {
+    let mut env = mcp_env(ctx);
+    env.insert("HARNESS_SKILLS".into(), note.skills.env());
     env
 }
 
@@ -75,9 +96,9 @@ fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
 
 pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut l = match kind {
-        "claude" => claude(ctx)?,
-        "codex" => codex(ctx)?,
-        "cursor" => cursor(ctx)?,
+        "claude" => claude(ctx, &Note::of(ctx)?)?,
+        "codex" => codex(ctx, &Note::of(ctx)?)?,
+        "cursor" => cursor(ctx, &Note::of(ctx)?)?,
         "shell" => Launch {
             program: login_shell(),
             args: vec!["-l".into()],
@@ -123,7 +144,7 @@ fn claude_effort(user_args: &[String]) -> (String, bool) {
     (user.unwrap_or_else(|| CLAUDE_EFFORT.to_owned()), true)
 }
 
-fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
+fn claude(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
     let mut out: Vec<String> = Vec::new();
     if ctx.chat {
         out.extend(crate::chat::claude::ARGS.iter().map(|a| (*a).to_owned()));
@@ -132,7 +153,7 @@ fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
     if pass {
         out.extend(["--effort".to_owned(), effort.clone()]);
     }
-    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": mcp_env(ctx) } } });
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": kernel_env(ctx, note) } } });
     let args = [
         "--strict-mcp-config", "--mcp-config", &mcp.to_string(),
         "--tools", "",                          // no built-in tools (Bash, Read, Edit, WebFetch, ...)
@@ -142,7 +163,7 @@ fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
         "--no-chrome",
         "--dangerously-skip-permissions",       // yolo: nothing ever prompts
         "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#, // flag settings apply despite --setting-sources ""
-        "--append-system-prompt", SYSTEM_NOTE.as_str(),
+        "--append-system-prompt", note.text.as_str(),
     ];
     let mut env = common_env(ctx);
     for (k, v) in [
@@ -175,7 +196,7 @@ const CODEX_DISABLE: &[&str] = &[
     "sleep_tool", "tool_suggest", "view_image", "hooks", "goals", "shell_snapshot",
 ];
 
-fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
+fn codex(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
     // A private CODEX_HOME keeps the user's config.toml, AGENTS.md, MCP servers, skills and plugins out;
     // only auth is shared (symlinked).
     let home = paths::home().join("codex-home");
@@ -193,7 +214,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
     if !existing.contains(&header) {
         std::fs::write(&config, format!("{existing}\n{header}\ntrust_level = \"trusted\"\n"))?;
     }
-    let env_table = mcp_env(ctx).iter().map(|(k, v)| format!("{k}={}", toml_str(v))).collect::<Vec<_>>().join(",");
+    let env_table = kernel_env(ctx, note).iter().map(|(k, v)| format!("{k}={}", toml_str(v))).collect::<Vec<_>>().join(",");
     let args_list = mcp_args()?.iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
     let mut args: Vec<String> = vec![
         "-c".into(), format!("mcp_servers.harness.command={}", toml_str("bun")),
@@ -205,7 +226,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), "project_doc_max_bytes=0".into(), // no AGENTS.md from the repo (global one is out via CODEX_HOME)
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
-        "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE.as_str())),
+        "-c".into(), format!("developer_instructions={}", toml_str(&note.text)),
     ];
     if ctx.chat {
         // `codex app-server` (chat/codex.rs) has no bypass flag: the same yolo as config (thread/start repeats it).
@@ -268,7 +289,7 @@ fn codex_catalog(home: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
 /// the server requires alongside `mcp`.
 const CURSOR_TOOLS: &str = "mcp_tool_call,get_mcp_tools_tool_call";
 
-fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
+fn cursor(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
     // cursor-agent reads mcp.json, plugins, skills and cli-config.json from `homedir()/.cursor`, so it
     // runs with a private HOME. Auth lives in the macOS login keychain, found via $HOME/Library/Keychains.
     let real_home = PathBuf::from(std::env::var("HOME")?);
@@ -286,14 +307,16 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
     // Only the harness MCP server. The note goes in as MCP server instructions: cursor has no
     // user-settable system prompt, and user rules come from the account, not disk.
     // The file is shared by every cursor session, so per-session values are `${env:...}` references that
-    // cursor fills from its own environment (MCP servers don't inherit it otherwise).
+    // cursor fills from its own environment (MCP servers don't inherit it otherwise): the note and the skills too, since
+    // project skills depend on the session's directory.
     let env = json!({
         "HOME": real_home.display().to_string(),
         "PATH": std::env::var("PATH").unwrap_or_default(),
         "HARNESS_SESSION": "${env:HARNESS_SESSION}",
         "HARNESS_SOCK": "${env:HARNESS_SOCK}",
         "HARNESS_CWD": "${env:HARNESS_CWD}",
-        "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE.as_str(),
+        "HARNESS_MCP_INSTRUCTIONS": "${env:HARNESS_MCP_INSTRUCTIONS}",
+        "HARNESS_SKILLS": "${env:HARNESS_SKILLS}",
     });
     let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": env } } });
     let mcp = serde_json::to_vec_pretty(&mcp)?;
@@ -355,6 +378,8 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut env = common_env(ctx);
     env.insert("HOME".into(), home.display().to_string());
     env.insert("HARNESS_CWD".into(), ctx.cwd.into());
+    env.insert("HARNESS_MCP_INSTRUCTIONS".into(), note.text.clone());
+    env.insert("HARNESS_SKILLS".into(), note.skills.env());
     let program = which("cursor-agent").unwrap_or_else(|| real_home.join(".local/bin/cursor-agent").display().to_string());
     Ok(Launch { program, args, env, effort: None })
 }

@@ -22,6 +22,8 @@ pub enum Act {
     Fetch,
     Query,
     Spawn,
+    /// A skill's instructions loaded (the REPL's skill(name)).
+    Skill,
     /// A harness REPL cell that stepped nowhere outside the REPL.
     Cell,
     Other,
@@ -45,6 +47,7 @@ impl Act {
             Act::Fetch => format!("fetched {n} {}", s("page", "pages")),
             Act::Query => format!("ran {n} {}", s("query", "queries")),
             Act::Spawn => format!("started {n} {}", s("session", "sessions")),
+            Act::Skill => format!("read {n} {}", s("skill", "skills")),
             Act::Cell => format!("ran {n} {}", s("cell", "cells")),
             Act::Other => format!("used {n} {}", s("tool", "tools")),
         }
@@ -64,6 +67,7 @@ impl Act {
             "build" => Act::Build,
             "sql" => Act::Query,
             "spawn" => Act::Spawn,
+            "skill" => Act::Skill,
             _ => Act::Other,
         }
     }
@@ -379,7 +383,7 @@ mod tests {
     /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands.
     #[test]
     fn typed_calls_sum_up_in_words() {
-        let kinds = ["read", "read", "search", "read", "list", "search", "build"];
-        assert_eq!(summary(kinds.map(Act::of_effect)), "Read 3 files, searched 2 times, listed 1 folder, ran 1 build");
+        let kinds = ["skill", "read", "read", "search", "read", "list", "search", "build"];
+        assert_eq!(summary(kinds.map(Act::of_effect)), "Read 1 skill, read 3 files, searched 2 times, listed 1 folder, ran 1 build");
     }
 }

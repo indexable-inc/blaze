@@ -5,7 +5,7 @@
 // running cell's effect log (Task.effects). Two kinds of exit point append to it:
 //
 // - The typed calls, each with its own words: rg, glob, ls, du, gitLog, follow and cargo.*, vfs, image, googleSearch, sh,
-//   spawn, sql (`step`/`effect` at their entry).
+//   spawn, sql, skill (`step`/`effect` at their entry).
 // - Thin wrappers over the globals a cell reaches the world through, with generic words: fetch, Bun.write, the reads of
 //   Bun.file (text, json, bytes, arrayBuffer), Bun.spawn and Bun.spawnSync (installed once, globally, by `install`), and
 //   the node:fs and node:fs/promises a cell imports (the REPL hands cells `fsFor(spec)` in place of the builtin).
@@ -24,8 +24,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { currentTask, type Task } from "./tasks.ts";
 import { shown, type Shown, type ShownKind } from "./shown.ts";
 
-/** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow, cargo.*). */
-export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql";
+/** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow, cargo.*);
+ *  `skill`: a skill's instructions loaded (skills.ts), drawn as a quiet step and counted apart from file reads. */
+export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql" | "skill";
 
 /** One step, as it is posted (the raw result is kept on the side, for telling a cell's value apart from its steps'). */
 export type Effect = {
