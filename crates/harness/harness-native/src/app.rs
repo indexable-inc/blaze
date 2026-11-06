@@ -81,6 +81,13 @@ enum Do {
     Zoom(i32),
 }
 
+/// A model and effort remembered for an agent kind (cmd+N's).
+#[derive(Clone, Debug, Default)]
+struct Choice {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// The agent kinds cmd+N may start (Claude and Codex in the chat pane, Cursor in its terminal).
 const CHAT_KINDS: [&str; 3] = ["claude", "codex", "cursor"];
 
@@ -220,6 +227,12 @@ pub struct App {
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
     spawned: Arc<Mutex<Option<u64>>>,
+    /// Why cmd+N could not start on the remembered model, shown on the new chat's models menu once it is selected.
+    refuse_spawned: Option<String>,
+    /// What cmd+N starts on: the agent kind last used, and by kind the model and effort last chosen (native.json
+    /// `chat_kind` and `chat_choice` when the app persists; an offscreen shot keeps them here alone).
+    last_kind: Option<String>,
+    choices: std::collections::BTreeMap<String, Choice>,
     /// The session selected when the app last ran (~/.harness/native.json), selected once the daemon's first list is in.
     restore: Option<Option<u64>>,
     /// What was last written to native.json.
@@ -482,6 +495,9 @@ impl App {
             pressed: Vec::new(),
             tried: HashMap::new(),
             spawned: Arc::default(),
+            refuse_spawned: None,
+            last_kind: None,
+            choices: std::collections::BTreeMap::new(),
             restore: Some(crate::prefs::get("selected").and_then(|v| v.as_u64())),
             saved: None,
             // The older `archived` (or `trashed`) session ids, read once (the next save writes `closed` and drops them).
@@ -705,13 +721,21 @@ impl App {
             model::select(w, first);
         }
         // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
+        let mut refused = None;
         let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
         if let Some(sid) = pending {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
+                if let Some(why) = self.refuse_spawned.take() {
+                    refused = Some((sid, why));
+                }
             }
         }
+        if let Some((sid, why)) = refused {
+            self.chat_pick_refuse(sid, why);
+        }
+        let w = self.world.world_ref();
         if self.pending_archive && self.restore.is_none() {
             self.pending_archive = false;
             model::select(w, Some(model::archive_view(w)));
@@ -1447,21 +1471,79 @@ impl App {
         if self.picking() && self.persist {
             crate::prefs::set("new_kind", serde_json::json!(kind));
         }
-        if CHAT_KINDS.contains(&kind) && self.persist {
-            crate::prefs::set("chat_kind", serde_json::json!(kind));
+        if CHAT_KINDS.contains(&kind) {
+            self.last_kind = Some(kind.to_owned());
+            if self.persist {
+                crate::prefs::set("chat_kind", serde_json::json!(kind));
+            }
         }
         self.palette = None;
     }
 
-    /// The agent kind cmd+N starts a chat of: the one a chat was last started with (native.json `chat_kind`), else the
-    /// picker's last pick when that is an agent (`new_kind`), else Claude.
+    /// The person chose `model` at `effort` for an agent of `kind` (in any chat, or by starting one): what cmd+N starts
+    /// on next. An effort without a model keeps the model remembered.
+    pub(in crate::app) fn remember_choice(&mut self, kind: &str, model: Option<&str>, effort: Option<&str>) {
+        let mut c = self.choice_of(kind);
+        if let Some(m) = model {
+            c = Choice { model: Some(m.to_owned()), effort: None };
+        }
+        c.effort = effort.map(str::to_owned).or(c.effort);
+        self.last_kind = Some(kind.to_owned());
+        if self.persist {
+            crate::prefs::set("chat_kind", serde_json::json!(kind));
+            let mut all = crate::prefs::get("chat_choice").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+            all.insert(kind.to_owned(), serde_json::json!({"model": c.model, "effort": c.effort}));
+            crate::prefs::set("chat_choice", serde_json::Value::Object(all));
+        }
+        self.choices.insert(kind.to_owned(), c);
+    }
+
+    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`).
+    fn choice_of(&self, kind: &str) -> Choice {
+        self.choices.get(kind).cloned().unwrap_or_else(|| {
+            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned()).unwrap_or_default();
+            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
+            Choice { model: s("model"), effort: s("effort") }
+        })
+    }
+
+    /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
+    /// last pick when that is an agent (`new_kind`), else Claude.
     fn chat_kind(&self) -> String {
         let pref = |k: &str| crate::prefs::get(k).and_then(|v| v.as_str().map(str::to_owned));
-        pref("chat_kind")
+        self.last_kind
+            .clone()
             .into_iter()
+            .chain(pref("chat_kind"))
             .chain(pref("new_kind"))
             .find(|k| CHAT_KINDS.contains(&k.as_str()))
             .unwrap_or_else(|| "claude".to_owned())
+    }
+
+    /// cmd+N: a chat of the last agent kind on its last model and effort ([`Self::remember_choice`]). A remembered model
+    /// (or effort) its kind no longer lists is not started on: the chat starts as its agent does by default, its models'
+    /// menu open with an error naming what is gone.
+    pub(in crate::app) fn new_chat(&mut self) {
+        let kind = self.chat_kind();
+        let c = self.choice_of(&kind);
+        let kept = self.link.agent_models();
+        let listed = kept.get(&kind);
+        let entry = c.model.as_deref().and_then(|m| listed.map(|l| l.iter().find(|x| x.is(m))));
+        let why = match (&c.model, entry, &c.effort) {
+            (Some(m), Some(None), _) => Some(format!("{m}, the model last used, is no longer offered by {}. Pick one.", chat::kind_title(&kind))),
+            (Some(m), Some(Some(x)), Some(e)) if !x.efforts.contains(e) => {
+                Some(format!("{m} no longer takes effort {e}, the effort last used. Pick a model."))
+            }
+            _ => None,
+        };
+        self.spawning(&kind);
+        match why {
+            Some(why) => {
+                self.refuse_spawned = Some(why);
+                self.spawn_on(&kind, None, None, self.selected_cwd());
+            }
+            None => self.spawn_on(&kind, c.model, c.effort, self.selected_cwd()),
+        }
     }
 
     /// Move the overlay's highlight by `by` rows: the palette's stops at its ends, the picker's few rows go round.
@@ -1762,6 +1844,8 @@ impl App {
                 self.chat_pick_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:set:") {
                 self.chat_pick_set(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:spawn:") {
+                self.chat_pick_spawn(rest);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
@@ -1979,15 +2063,24 @@ impl App {
     }
 
     fn spawn(&mut self, kind: &str) {
-        let cwd = self
-            .selected()
+        self.spawn_on(kind, None, None, self.selected_cwd());
+    }
+
+    /// The selected object's directory.
+    fn selected_cwd(&self) -> Option<String> {
+        self.selected()
             .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>())
             .map(|c| c.s.as_str().to_owned())
             .filter(|c| !c.is_empty())
-            .or_else(|| std::env::var("HOME").ok());
+    }
+
+    /// A new object of `kind` in `cwd` (else home), its agent started on `model` at `effort` when given; selected once
+    /// the list has it.
+    fn spawn_on(&mut self, kind: &str, model: Option<String>, effort: Option<String>, cwd: Option<String>) {
+        let cwd = cwd.or_else(|| std::env::var("HOME").ok());
         let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();
-        self.link.spawn(kind, cwd, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
+        self.link.spawn(kind, cwd, model, effort, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
     }
 
     fn kill(&mut self) {

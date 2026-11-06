@@ -38,11 +38,7 @@ const HANDLERS: &[(&str, Handler)] = &[
         a.spawn(&kind);
     }),
     // cmd+N: a chat of the last-used agent kind, at once.
-    ("NewChat", |a, _, _| {
-        let kind = a.chat_kind();
-        a.spawning(&kind);
-        a.spawn(&kind);
-    }),
+    ("NewChat", |a, _, _| a.new_chat()),
     // File > New…: the new-object picker, or closed again.
     ("Picker", |a, _, _| {
         if a.picking() {

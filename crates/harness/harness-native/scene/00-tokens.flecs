@@ -212,6 +212,10 @@ export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
 export const menu_trail_gap = 20
 export const menu_head_h = 20
 export const menu_sep_pad = 5
+// A searchable menu (search_menu.flecs ui.SearchMenu): a marked item's mark menu_mark across before its label, the
+// filter's caret menu_caret_w wide.
+export const menu_mark = 13
+export const menu_caret_w = 1.5
 export const size_menu = 13
 export const line_menu = 16
 export const size_menu_head = 11

@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
                     cols: Some(cols),
                     rows: Some(rows),
                     mode: None,
+                    model: None,
+                    effort: None,
                 })
                 .await?;
             let Reply::Spawned { id } = r else { bail!("harnessd answered spawn with {r:?}") };

@@ -10,13 +10,21 @@
 //! agent of its kind has listed, or for a model with no efforts, that part of the menu says why in a short line. A press
 //! anywhere else, or Escape, closes it.
 //!
+//! The models' menu (and the chevron's) is a searchable menu (search_menu.flecs `ui.SearchMenu`,
+//! harness_native_ui_view::search): typing while it is open filters it, the first match highlighted, Return picks. It
+//! offers every agent kind's models, the chat's own first, under each kind's head with its maker's mark. One of the
+//! chat's own switches it as above; another kind's cannot (a chat's agent is one process for its life: Claude's
+//! stream-json or Codex's app-server, each with its own conversation), so it starts a chat of that kind on that model in
+//! the same directory (`chat:spawn:`), which replaces this one when nothing was sent in it yet. Every pick is remembered
+//! ([`App::remember_choice`]): cmd+N starts on the last agent, model and effort.
+//!
 //! After them, the context meter: a ring filling as the conversation fills its model's window, and the percentage (den's:
 //! muted, the warning tone from [`WARN`], the failed tone from [`FULL`]), its tooltip the tokens.
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
 use harness_proto::event::ModelChoice;
-use harness_native_ui_view::menu;
+use harness_native_ui_view::search::{self, Edit, Entry};
 use std::collections::BTreeMap;
 
 /// The share of the window from which the meter shows in the warning tone, and from which in the failed tone (den's).
@@ -186,12 +194,20 @@ impl App {
         // chevron's menu of both, so it lines up with the model's name; the chevron when the effort's word is not there).
         let trigger = open.and_then(|p| if p == Pick::All { Some(pick) } else { pick.part(p.trigger()).or_else(|| pick.part("more")) });
         let Some(menu) = status.part("menu") else { return };
-        view::for_each_of(menu, trigger.map(|_| ("plate", "ui.Menu", ())), |_, (), _| {});
-        if let (Some(plate), Some(trigger), Some(page)) = (menu.part("plate"), trigger, open) {
+        // The efforts alone are a plain menu; the models (and both) a searchable one.
+        let plate = match open {
+            Some(Pick::Effort) => Some(("plate", "ui.Menu")),
+            Some(_) => Some(("search", "ui.SearchMenu")),
+            None => None,
+        };
+        view::for_each_of(menu, plate.filter(|_| trigger.is_some()).map(|(k, p)| (k, p, ())), |_, (), _| {});
+        let plate = plate.and_then(|(k, _)| menu.part(k));
+        if let (Some(plate), Some(trigger), Some(page)) = (plate, trigger, open) {
             plate.anchored(trigger.id());
             let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
             let hovered = w.entity_named(APP).target(Hovered::id(), 0);
-            menu_rows(plate, sid, models, kind, cur, page, name, effort, hovered, nav);
+            let ctx = MenuCtx { sid, own: models, kind, kept: &kept, cur, name, effort };
+            menu_rows(w, plate, &ctx, page, hovered, nav);
         }
     }
 
@@ -223,14 +239,77 @@ impl App {
     pub(in crate::app) fn chat_pick_set(&mut self, rest: &str) {
         let Some((sid, rest)) = rest.split_once(':') else { return };
         let Ok(sid) = sid.parse::<u64>() else { return };
-        match rest.split_once(':') {
-            Some(("model", m)) => self.link.chat_choose(sid, Some(m.to_owned()), None),
-            Some(("effort", e)) => self.link.chat_choose(sid, None, Some(e.to_owned())),
+        let (model, effort) = match rest.split_once(':') {
+            Some(("model", m)) => (Some(m.to_owned()), None),
+            Some(("effort", e)) => (None, Some(e.to_owned())),
             _ => return,
-        }
+        };
+        self.link.chat_choose(sid, model.clone(), effort.clone());
+        self.remember_chat_choice(sid, model, effort);
         if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
             st.pick = None;
         }
+        self.poke();
+    }
+
+    /// A pick of another agent kind's model (`chat:spawn:<sid>:<kind>:<model>`): a chat of that kind on that model in
+    /// chat `sid`'s directory, selected once it exists; chat `sid` is archived in its place when nothing was sent in it.
+    pub(in crate::app) fn chat_pick_spawn(&mut self, rest: &str) {
+        let mut it = rest.splitn(3, ':');
+        let (Some(sid), Some(kind), Some(m)) = (it.next().and_then(|s| s.parse::<u64>().ok()), it.next(), it.next()) else { return };
+        let (kind, m) = (kind.to_owned(), m.to_owned());
+        self.chat_pick_close();
+        let e = self.entity_of(sid);
+        let cwd = e
+            .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>())
+            .map(|c| c.s.as_str().to_owned())
+            .filter(|c| !c.is_empty());
+        let fresh = self.chats.borrow().get(&sid).is_none_or(|t| !t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })));
+        self.remember_choice(&kind, Some(&m), None);
+        self.spawning(&kind);
+        self.spawn_on(&kind, Some(m), None, cwd);
+        if fresh && let Some(e) = e {
+            self.link.kill(sid);
+            self.archive_object(e);
+        }
+    }
+
+    /// Chat `sid` now runs `model` (or keeps its own) at `effort` (or keeps its own), as the person chose: remembered
+    /// for cmd+N under its agent kind. A new model without an effort starts at its own default.
+    fn remember_chat_choice(&mut self, sid: u64, model: Option<String>, effort: Option<String>) {
+        let (kind, model, effort) = {
+            let chats = self.chats.borrow();
+            let Some(t) = chats.get(&sid) else { return };
+            let kept = self.link.agent_models();
+            let kind = match self.entity_of(sid) {
+                Some(e) if t.agent.is_empty() => model::kind_name(self.world.world_ref().entity_from_id(e)).to_owned(),
+                _ => t.agent.clone(),
+            };
+            let cur = current(t, models_of(t, &kind, &kept)).map(|c| c.id.clone());
+            let same = model.is_none() || model == cur;
+            let effort = effort.or_else(|| Some(t.effort.clone()).filter(|e| same && !e.is_empty()));
+            (kind, model.or(cur), effort)
+        };
+        self.remember_choice(&kind, model.as_deref(), effort.as_deref());
+    }
+
+    /// Type into chat `sid`'s open searchable menu (the models', or both): whether it took the text.
+    pub(in crate::app) fn chat_pick_type(&mut self, sid: u64, e: Edit<'_>) -> bool {
+        let mut states = self.chat.borrow_mut();
+        let Some(st) = states.get_mut(&sid).filter(|st| matches!(st.pick, Some(Pick::Model | Pick::All))) else { return false };
+        st.pick_nav.search.edit(e);
+        drop(states);
+        self.poke();
+        true
+    }
+
+    /// Open chat `sid`'s models with `why` at their top (cmd+N's remembered model is no longer offered).
+    pub(in crate::app) fn chat_pick_refuse(&mut self, sid: u64, why: String) {
+        let mut states = self.chat.borrow_mut();
+        let st = states.entry(sid).or_default();
+        st.pick = Some(Pick::Model);
+        st.pick_nav = PickNav { error: Some(why), ..PickNav::default() };
+        drop(states);
         self.poke();
     }
 
@@ -253,10 +332,10 @@ impl App {
             return;
         }
         let w = self.world.world_ref();
-        let menu = view::prefab(w, "ui.Menu");
+        let menus = [view::prefab(w, "ui.Menu"), view::prefab(w, "ui.SearchMenu")];
         let ours = |n: EntityView<'_>| {
-            n.try_cloned::<&Action>().is_some_and(|a| a.name.as_str().starts_with("chat:pick:") || a.name.as_str().starts_with("chat:set:"))
-                || menu.is_some_and(|m| n.owns((flecs::IsA::ID, *m.id())))
+            n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:"].iter().any(|p| a.name.as_str().starts_with(p)))
+                || menus.iter().flatten().any(|m| n.owns((flecs::IsA::ID, *m.id())))
         };
         let hovered = w.entity_named(APP).target(Hovered::id(), 0);
         let inside = hovered.is_some_and(|h| std::iter::successors(Some(h), |n| n.parent()).take(64).any(ours));
@@ -284,7 +363,8 @@ impl App {
         };
         match next {
             Some(e) => {
-                self.link.chat_choose(sid, None, Some(e));
+                self.link.chat_choose(sid, None, Some(e.clone()));
+                self.remember_chat_choice(sid, None, Some(e));
                 self.poke();
             }
             None => self.chat_pick_toggle(sid, Pick::Effort),
@@ -296,21 +376,37 @@ impl App {
     pub(in crate::app) fn chat_pick_nav(&mut self, sid: u64, op: &str) -> bool {
         let mut states = self.chat.borrow_mut();
         let Some(st) = states.get_mut(&sid).filter(|st| st.pick.is_some()) else { return false };
+        let searching = st.pick != Some(Pick::Effort);
         let n = &mut st.pick_nav;
+        let edit = match op {
+            "backspace" => Some(Edit::Erase),
+            "word_erase" => Some(Edit::EraseWord),
+            "line_erase" => Some(Edit::Clear),
+            _ => None,
+        };
+        if let Some(e) = edit {
+            if searching {
+                n.search.edit(e);
+            }
+            drop(states);
+            self.poke();
+            return true;
+        }
         match op {
             "up" | "down" => {
                 let picks = &n.picks;
-                n.nav.step(op == "down", picks.len(), |i| picks[i].is_some());
+                n.search.nav.step(op == "down", picks.len(), |i| picks[i].is_some());
                 drop(states);
                 self.poke();
                 true
             }
             "send" | "submit" => {
-                let pick = n.nav.hot.and_then(|i| n.picks.get(i).cloned().flatten());
+                let pick = n.search.nav.hot.and_then(|i| n.picks.get(i).cloned().flatten());
                 drop(states);
-                match pick.as_deref().and_then(|a| a.strip_prefix("chat:set:")) {
-                    Some(rest) => self.chat_pick_set(rest),
-                    None => {
+                match pick.as_deref() {
+                    Some(a) if a.starts_with("chat:set:") => self.chat_pick_set(&a["chat:set:".len()..]),
+                    Some(a) if a.starts_with("chat:spawn:") => self.chat_pick_spawn(&a["chat:spawn:".len()..]),
+                    _ => {
                         self.chat_pick_close();
                     }
                 }
@@ -321,9 +417,14 @@ impl App {
     }
 
     /// For an offscreen shot (shot.rs `HARNESS_NATIVE_SHOT_CHAT_MENU`): chat `sid`'s menu `page` open.
+    /// `page` may carry a query typed into it after a colon (`model:son`).
     pub fn shot_chat_pick(&mut self, sid: u64, page: &str) {
+        let (page, query) = page.split_once(':').unwrap_or((page, ""));
         if let Some(p) = Pick::parse(page) {
-            self.chat.borrow_mut().entry(sid).or_default().pick = Some(p);
+            let mut states = self.chat.borrow_mut();
+            let st = states.entry(sid).or_default();
+            st.pick = Some(p);
+            st.pick_nav.search.edit(Edit::Type(query));
         }
     }
 }
@@ -380,113 +481,167 @@ fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     }
 }
 
-/// The open menu's highlight (the pointer's and the arrow keys', harness_native_ui_view::menu) and what each of its
-/// rows picks (None for a head, a separator or a note), as last drawn: what Return picks.
+/// The open menu's query and highlight (the pointer's and the arrow keys', harness_native_ui_view::search), what each of
+/// its rows picks (None for a head, a separator or a note) as last drawn (what Return picks), and an error to show at
+/// its top.
 #[derive(Default)]
 pub struct PickNav {
-    nav: menu::Nav,
+    search: search::Search,
     picks: Vec<Option<String>>,
+    error: Option<String>,
 }
 
-/// A row of the picker's menu.
-enum Row {
-    Head(&'static str),
-    Sep,
-    Choice { label: String, about: String, on: bool, action: String },
-    /// Why nothing can be chosen here, in a short line.
-    Note(String),
+/// A choice in the picker's menu.
+struct Choice {
+    label: String,
+    about: String,
+    on: bool,
+    action: String,
+    /// Its maker's mark (an `hn.Kind` child); empty for an effort.
+    mark: &'static str,
 }
 
-/// The open menu's rows on its plate (prims.flecs ui.Menu's parts): `models` (`page` Model), the efforts of the current
-/// model (Effort), or both under heads (All); what cannot be chosen says why instead. The highlight goes where the
-/// pointer (on `hovered`) or the keys put it (`nav`).
-#[allow(clippy::too_many_arguments)]
-fn menu_rows(
-    plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur: Option<&ModelChoice>, page: Pick, name: &str,
-    effort: &str, hovered: Option<EntityView<'_>>, nav: &mut PickNav,
-) {
-    let mut rows: Vec<Row> = Vec::with_capacity(models.len() + 12); // alloc: the open menu's rows, once a frame
-    if models.is_empty() {
-        let agent = match kind {
-            "codex" => "Codex",
-            "claude" | "" => "Claude",
-            other => other,
-        };
-        rows.push(Row::Note(format!("Model list arrives when a {agent} chat starts.")));
-    } else {
-        if page != Pick::Effort {
-            if page == Pick::All {
-                rows.push(Row::Head("Model"));
+/// What the menu is built from: chat `sid`'s own models (`own`, of agent kind `kind`), every kind's kept lists, the
+/// model it runs (`cur`, named `name`) and its `effort`.
+struct MenuCtx<'a> {
+    sid: u64,
+    own: &'a [ModelChoice],
+    kind: &'a str,
+    kept: &'a BTreeMap<String, Vec<ModelChoice>>,
+    cur: Option<&'a ModelChoice>,
+    name: &'a str,
+    effort: &'a str,
+}
+
+/// An agent kind's name, as a head and in a note.
+pub(in crate::app) fn kind_title(kind: &str) -> &str {
+    match kind {
+        "claude" | "" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        other => other,
+    }
+}
+
+/// The open menu's rows on its plate (the efforts' `ui.Menu`, else a `ui.SearchMenu`'s `items` under its filter): the
+/// models of every kind under their heads, the chat's own first (`page` Model), the current model's efforts (Effort), or
+/// both (All), filtered by what is typed; what cannot be chosen says why instead. The highlight goes where the pointer
+/// (on `hovered`) or the keys put it (`nav`).
+fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hovered: Option<EntityView<'_>>, nav: &mut PickNav) {
+    let mut rows: Vec<Entry<Choice>> = Vec::with_capacity(c.own.len() + 24); // alloc: the open menu's rows, once a frame
+    if page != Pick::Effort {
+        let others = c.kept.iter().filter(|(k, _)| k.as_str() != c.kind).map(|(k, m)| (k.as_str(), m.as_slice()));
+        for (kind, models) in std::iter::once((c.kind, c.own)).chain(others) {
+            if !rows.is_empty() {
+                rows.push(Entry::Sep);
             }
-            rows.extend(models.iter().map(|c| Row::Choice {
-                label: if c.name.is_empty() { c.id.clone() } else { c.name.clone() },
-                about: c.about.clone(),
-                on: cur.is_some_and(|x| x.id == c.id),
-                action: format!("chat:set:{sid}:model:{}", c.id),
+            rows.push(Entry::Head(kind_title(kind).to_owned()));
+            if models.is_empty() {
+                rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(kind))));
+                continue;
+            }
+            let own = kind == c.kind;
+            rows.extend(models.iter().map(|m| {
+                let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
+                Entry::Item {
+                    text: format!("{label} {} {} {}", m.id, m.about, kind_title(kind)),
+                    data: Choice {
+                        label,
+                        about: m.about.clone(),
+                        on: own && c.cur.is_some_and(|x| x.id == m.id),
+                        action: if own {
+                            format!("chat:set:{}:model:{}", c.sid, m.id)
+                        } else {
+                            format!("chat:spawn:{}:{kind}:{}", c.sid, m.id)
+                        },
+                        mark: maker(Some(m), "", kind),
+                    },
+                }
             }));
         }
-        if page == Pick::All {
-            rows.push(Row::Sep);
-            rows.push(Row::Head("Effort"));
-        }
-        if page != Pick::Model {
-            match cur {
-                Some(c) if !c.efforts.is_empty() => rows.extend(c.efforts.iter().map(|e| Row::Choice {
+    }
+    if page == Pick::All {
+        rows.push(Entry::Sep);
+        rows.push(Entry::Head("Effort".to_owned()));
+    }
+    if page != Pick::Model {
+        match c.cur {
+            Some(m) if !m.efforts.is_empty() => rows.extend(m.efforts.iter().map(|e| Entry::Item {
+                text: format!("{} effort", effort_word(e)),
+                data: Choice {
                     label: effort_word(e),
                     about: String::new(),
-                    on: e == effort,
-                    action: format!("chat:set:{sid}:effort:{e}"),
-                })),
-                Some(_) => rows.push(Row::Note(format!("{name} has no effort levels."))),
-                None => rows.push(Row::Note(format!("{name} is not in the model list, so its efforts are unknown."))),
-            }
+                    on: e == c.effort,
+                    action: format!("chat:set:{}:effort:{e}", c.sid),
+                    mark: "",
+                },
+            })),
+            Some(_) => rows.push(Entry::Note(format!("{} has no effort levels.", c.name))),
+            None if c.own.is_empty() => rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.kind)))),
+            None => rows.push(Entry::Note(format!("{} is not in the model list, so its efforts are unknown.", c.name))),
         }
     }
+    let searching = page != Pick::Effort;
+    let rows = if searching { search::filter(&nav.search.query, rows) } else { rows };
+    // An error leads (cmd+N's remembered model no longer offered), until something is typed.
+    let rows: Vec<Entry<Choice>> = match nav.error.as_ref().filter(|_| nav.search.query.is_empty()) {
+        Some(e) => std::iter::once(Entry::Note(e.clone())).chain(rows).collect(),
+        None => rows,
+    };
     nav.picks.clear();
     nav.picks.extend(rows.iter().map(|r| match r {
-        Row::Choice { action, .. } => Some(action.clone()),
+        Entry::Item { data, .. } => Some(data.action.clone()),
         _ => None,
     }));
-    // The row the pointer is on (one of the plate's children, or inside one), if it can be chosen.
-    let plate_id = plate.id();
+    let picks = &nav.picks;
+    nav.search.first(picks.len(), |i| picks[i].is_some());
+    let items = if searching {
+        search::show(plate, &nav.search.query, "Search models");
+        plate.part("items").unwrap_or(plate)
+    } else {
+        plate
+    };
+    // The row the pointer is on (one of the items' children, or inside one), if it can be chosen.
+    let items_id = items.id();
     let under = hovered
-        .and_then(|h| std::iter::successors(Some(h), |n| n.parent()).take(16).find(|n| n.parent().is_some_and(|p| p.id() == plate_id)))
+        .and_then(|h| std::iter::successors(Some(h), |n| n.parent()).take(16).find(|n| n.parent().is_some_and(|p| p.id() == items_id)))
         .and_then(|row| row.name().strip_prefix('r').and_then(|i| i.parse::<usize>().ok()))
         .filter(|&i| nav.picks.get(i).is_some_and(Option::is_some));
-    nav.nav.pointer(under);
-    let hot = nav.nav.hot;
+    nav.search.nav.pointer(under);
+    let hot = nav.search.nav.hot;
     let keyed = rows.iter().enumerate().map(|(i, r)| {
         let prefab = match r {
-            Row::Head(_) => "ui.MenuHead",
-            Row::Sep => "ui.MenuSep",
-            Row::Choice { on: true, .. } => "ui.MenuItemOn",
-            Row::Choice { .. } => "ui.MenuItem",
-            Row::Note(_) => "ui.MenuNote",
+            Entry::Head(_) => "ui.MenuHead",
+            Entry::Sep => "ui.MenuSep",
+            Entry::Item { data: Choice { on: true, mark: "", .. }, .. } => "ui.MenuItemOn",
+            Entry::Item { data: Choice { mark: "", .. }, .. } => "ui.MenuItem",
+            Entry::Item { data: Choice { on: true, .. }, .. } => "ui.MenuItemMarkedOn",
+            Entry::Item { .. } => "ui.MenuItemMarked",
+            Entry::Note(_) => "ui.MenuNote",
         };
         (format!("r{i}"), prefab, (i, r))
     });
-    view::for_each_of(plate, keyed, |v, (i, r), _| match r {
-        Row::Head(s) => {
+    view::for_each_of(items, keyed, |v, (i, r), _| match r {
+        Entry::Head(s) | Entry::Note(s) => {
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
         }
-        Row::Note(s) => {
+        Entry::Item { data: c, .. } => {
+            harness_native_ui_view::menu::light(v.entity(), hot == Some(i));
+            v.action(&c.action);
             if let Some(l) = v.part("label") {
-                l.text(s);
-            }
-        }
-        Row::Choice { label, about, action, .. } => {
-            menu::light(v.entity(), hot == Some(i));
-            v.action(action);
-            if let Some(l) = v.part("label") {
-                l.text(label);
+                l.text(&c.label);
             }
             if let Some(a) = v.part("about") {
-                a.text(about);
+                a.text(&c.about);
+            }
+            if !c.mark.is_empty()
+                && let Some(icon) = v.part("lead").and_then(|l| l.part("icon"))
+            {
+                crate::look::kind_mark(w, icon.entity(), c.mark);
             }
         }
-        Row::Sep => {}
+        Entry::Sep => {}
     });
 }
-

@@ -479,6 +479,11 @@ ui {
     gutter : ui.Node {
       Size: {w: {kind: Fixed, value: $menu_gutter_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // Empty here; ui.MenuItemMarked (search_menu.flecs) puts a mark in it before the label.
+    lead : ui.Row {
+      Flex: {axis: Row, gap: $menu_gutter_gap, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
     label : ui.Line, Strong {
       FixedSize: {h: true, v: false}
       TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}

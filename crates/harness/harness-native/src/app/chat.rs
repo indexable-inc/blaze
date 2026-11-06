@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 mod genui;
 mod pick;
+pub(in crate::app) use pick::kind_title;
 
 pub(super) use genui::Live as GenLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
@@ -1617,6 +1618,12 @@ impl App {
     /// Text typed (a key no binding took), committed by an input method or pasted, into the focused chat's input.
     /// Whether a chat took it.
     pub(super) fn chat_type(&mut self, text: &str) -> bool {
+        // An open searchable menu (the models') has the keys: what is typed filters it.
+        if let Some((_, _, sid)) = self.focused_chat()
+            && self.chat_pick_type(sid, harness_native_ui_view::search::Edit::Type(text))
+        {
+            return true;
+        }
         // A pasteboard's line ends (CRLF from Windows text, a lone CR from old Mac text) as the input's newlines.
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let typed: String = text.chars().filter(|c| *c == '\n' || *c == '\t' || (!c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))).collect();

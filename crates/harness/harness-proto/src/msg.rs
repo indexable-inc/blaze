@@ -94,6 +94,13 @@ pub enum Request {
         /// `chat` (Claude's and Codex's default) or `tui` (a PTY).
         #[serde(default)]
         mode: Option<String>,
+        /// The model the agent starts on (a [`crate::event::ModelChoice::id`] its kind listed) and its reasoning effort:
+        /// passed to the agent's launch, so it runs with them from its first turn. A model or effort its kind's list
+        /// does not have is refused, naming it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     /// Hold the connection as session `id`'s stream. `events`: a chat session's events as [`crate::frame::T_EVENT`]
     /// frames (the app) instead of the conversation as text (the terminal client).

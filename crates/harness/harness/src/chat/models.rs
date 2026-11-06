@@ -98,6 +98,30 @@ pub fn restore() {
 }
 
 /// Every kind's list, as the daemon keeps it.
+/// Whether kind `kind` can start on `model` at `effort` (a spawn's): each named must be in the list it last gave (the
+/// model by [`ModelChoice::is`], the effort among that model's). A kind that never listed (Cursor) passes its model to
+/// the agent unchecked, which refuses it itself; an effort needs the model's entry to be known.
+///
+/// # Errors
+/// Naming the model or effort and what the list has instead.
+pub fn check(kind: &str, model: Option<&str>, effort: Option<&str>) -> anyhow::Result<()> {
+    let all = snapshot();
+    let Some(list) = all.get(kind) else {
+        anyhow::ensure!(effort.is_none(), "{kind} has listed no models, so effort {effort:?} is not known to be one it takes");
+        return Ok(());
+    };
+    let ids = || list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ");
+    let entry = match model {
+        Some(m) => Some(list.iter().find(|c| c.is(m)).ok_or_else(|| anyhow::anyhow!("{kind} does not offer model {m:?} (it lists {})", ids()))?),
+        None => None,
+    };
+    if let Some(e) = effort {
+        let Some(c) = entry else { anyhow::bail!("effort {e:?} for {kind} names no model, so it is not known to take it") };
+        anyhow::ensure!(c.efforts.iter().any(|x| x == e), "{kind}'s {} takes efforts {:?}, not {e:?}", c.id, c.efforts);
+    }
+    Ok(())
+}
+
 pub fn snapshot() -> Arc<ByKind> {
     CACHE.lock().snapshot()
 }

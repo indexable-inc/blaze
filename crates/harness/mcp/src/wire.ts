@@ -52,7 +52,7 @@ export function split(buf: Uint8Array): { t: number; payload: Uint8Array; size: 
 export type Request =
   | { op: "list"; all?: boolean; chats?: boolean }
   | { op: "info" | "last" | "watch" | "shutdown" }
-  | { op: "spawn"; kind: string; args?: string[]; parent?: number | null; cwd?: string | null; prompt?: string | null; name?: string | null; cols?: number | null; rows?: number | null; mode?: string | null }
+  | { op: "spawn"; kind: string; args?: string[]; parent?: number | null; cwd?: string | null; prompt?: string | null; name?: string | null; cols?: number | null; rows?: number | null; mode?: string | null; model?: string; effort?: string }
   | { op: "attach"; id: number; cols?: number | null; rows?: number | null; events?: boolean }
   | { op: "send"; id: number; text: string; raw?: boolean; submit?: boolean | null }
   | { op: "set_model"; id: number; model?: string | null; effort?: string | null }
