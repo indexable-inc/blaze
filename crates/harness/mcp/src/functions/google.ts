@@ -13,7 +13,7 @@ export type SearchResult = {
   snippet: string;
 };
 
-/** Search Google in a hidden tab of the browser on CDP :9222 (Dia) and return the organic results. */
+/** Search Google in a page of the harness browser (embedded Chromium, cdp.ts) and return the organic results. */
 export function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<Table<SearchResult>> {
   const q = JSON.stringify(oneLine(query, 60));
   return effect("search", `Searching Google for ${q}`, `Searched Google for ${q}`, query, () => search(query, opts), (r) => ({
@@ -27,7 +27,7 @@ async function search(query: string, opts: { limit?: number; hl?: string }): Pro
     await page.goto(`https://www.google.com/search?${new URLSearchParams({ q: query, hl })}`);
     await page.waitForSelector("#search a h3, #rso a h3", 8_000);
     const current = await page.url();
-    if (new URL(current).pathname.startsWith("/sorry")) throw new Error(`Google served a CAPTCHA (${current}); solve it once in Dia and retry`);
+    if (new URL(current).pathname.startsWith("/sorry")) throw new Error(`Google served a CAPTCHA (${current}); solve it once in the harness browser pane (cmd+shift+B) and retry`);
     const raw = (await page.evaluate(() => {
       const out: { title: string; href: string; cite: string; snippet: string }[] = [];
       const seen = new Set<string>();
@@ -53,7 +53,7 @@ async function search(query: string, opts: { limit?: number; hl?: string }): Pro
   });
 }
 
-/** Fetch each /goto link from inside the Google page (Dia's cookies and UA) and read the 302 Location via CDP Network events. */
+/** Fetch each /goto link from inside the Google page (the harness browser's cookies and UA) and read the 302 Location via CDP Network events. */
 async function resolveInPage(page: Page, hrefs: string[]): Promise<Map<string, string>> {
   const targets = hrefs.filter((h) => new URL(h).hostname.endsWith("google.com"));
   const found = new Map<string, string>();
@@ -61,8 +61,8 @@ async function resolveInPage(page: Page, hrefs: string[]): Promise<Map<string, s
   await page.send("Network.enable");
   const urlById = new Map<string, string>();
   const offs = [
-    page.browser.on("Network.requestWillBeSent", page.sessionId, (e) => urlById.set(e.requestId, e.request.url)),
-    page.browser.on("Network.responseReceivedExtraInfo", page.sessionId, (e) => {
+    page.on("Network.requestWillBeSent", (e) => urlById.set(e.requestId, e.request.url)),
+    page.on("Network.responseReceivedExtraInfo", (e) => {
       const url = urlById.get(e.requestId);
       const loc = e.headers?.location ?? e.headers?.Location;
       if (url && loc && e.statusCode >= 300 && e.statusCode < 400) found.set(url, loc);

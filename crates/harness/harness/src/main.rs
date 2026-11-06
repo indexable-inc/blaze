@@ -1,4 +1,5 @@
 mod archive;
+mod browser;
 mod chat;
 mod client;
 mod db;

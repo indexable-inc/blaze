@@ -17,7 +17,7 @@
 // records nothing.
 //
 // What is not recorded, so a card never claims it is complete: node:child_process, Bun.$, sockets and WebSockets
-// (Bun.connect, the CDP websocket behind withHiddenPage), node:fs's callback forms and its other functions (stat,
+// (Bun.connect, the harness browser's socket behind withHiddenPage; a cell's page.goto and browser.open are steps), node:fs's callback forms and its other functions (stat,
 // readdir, streams), fs calls made by packages a cell imports (they get the real builtin), Bun.file's stream() and
 // slices, and anything a native addon does. The harness's own requests to harnessd are not effects either.
 import { AsyncLocalStorage } from "node:async_hooks";

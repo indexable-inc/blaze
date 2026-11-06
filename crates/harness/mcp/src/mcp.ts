@@ -61,7 +61,7 @@ server.registerTool(
   },
 );
 
-// Functions that need the person (e.g. "start Dia with remote debugging") ask through MCP elicitation.
+// Functions that need the person (e.g. gmail.send asking before it sends) ask through MCP elicitation.
 // Clients without it get confirm() === false, and the function's error text reaches the model instead.
 setConfirm(async (message) => {
   if (!server.server.getClientCapabilities()?.elicitation) return false;
