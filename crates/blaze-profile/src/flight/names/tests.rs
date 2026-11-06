@@ -224,6 +224,8 @@ struct Record {
     ring: u16,
     /// The generation of the writer's table as it wrote the row.
     generation: u32,
+    /// The row's index in its ring.
+    at: u64,
     read: bool,
 }
 
@@ -242,6 +244,8 @@ struct Seen {
     forgotten: u64,
     skipped: u64,
     lossy: bool,
+    /// The rows each drain found written over before it read them: ring, from, to.
+    missed: Vec<(u16, u64, u64)>,
 }
 
 struct Run<'p> {
@@ -352,6 +356,7 @@ impl<'p> Run<'p> {
         let local = &mut self.locals[table];
         local.row_syms(words, &mut Writer(&mut self.rings[ring]));
         let rid = self.records.len() as u64;
+        let at = self.rings[ring].head;
         let mut row = [0; WORDS];
         row[..words.len()].copy_from_slice(words);
         row[3] = rid;
@@ -362,6 +367,7 @@ impl<'p> Run<'p> {
             texts: picked.into_iter().map(|it| it.1).collect(),
             ring: ring as u16 + 1,
             generation: local.generation(),
+            at,
             read: false,
         });
         self.seen.records += 1;
@@ -408,6 +414,9 @@ impl<'p> Run<'p> {
             let (oldest, head) = (self.rings[at].oldest(), self.rings[at].head);
             let first = self.cursor[at].max(oldest);
             self.seen.skipped += first - self.cursor[at];
+            if first > self.cursor[at] {
+                self.seen.missed.push((at as u16 + 1, self.cursor[at], first));
+            }
             for i in first..head {
                 let row = *self.rings[at].row(i).expect("a row the ring holds");
                 if is_names_row(&row) {
@@ -480,12 +489,12 @@ fn run(plan: &Plan, bug: Bug) -> Result<Seen, String> {
     if lost != 0 {
         return Err(format!("{lost} names lost: a row's links did not fit its generation"));
     }
-    let unread = run.records.iter().filter(|it| !it.read).count() as u64;
-    if unread != run.seen.skipped {
-        return Err(format!(
-            "{unread} records never read, {} counted as skipped",
-            run.seen.skipped
-        ));
+    // Every record not read was in rows a drain found written over, and counted there.
+    let missed = |it: &Record| {
+        run.seen.missed.iter().any(|&(ring, from, to)| ring == it.ring && (from..to).contains(&it.at))
+    };
+    if let Some(rid) = run.records.iter().position(|it| !it.read && !missed(it)) {
+        return Err(format!("record {rid} was never read, and no drain counted it skipped"));
     }
     Ok(run.seen)
 }

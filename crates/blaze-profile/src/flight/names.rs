@@ -646,7 +646,8 @@ impl Stream {
                 self.finish();
             }
             NAME_MORE_ROW => {
-                let part = tag >> 20;
+                // The part's bits only: the tag's top bits are the row's kind.
+                let part = tag >> 20 & 0xffff;
                 match &mut self.building {
                     Some(building) if building.index == index && building.next == part => {
                         building.next += 1;
