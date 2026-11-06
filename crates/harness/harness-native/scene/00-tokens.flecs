@@ -424,12 +424,16 @@ export const chat_input_radius = 12
 // The status line under the composer (hn.ChatPane's foot.status): its words, and den's model and effort picker in it
 // (hn.ChatPick, src/app/chat/pick.rs): each word its own control chat_pick_h tall, chat_pick_gap apart, the chevron
 // chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
-// chat_ring_stroke, chat_context_gap from its percentage. The picker's menu is a ui.Menu (the menu_* tokens).
+// chat_ring_stroke, chat_context_gap from its percentage. The model's name leads with its maker's mark (Claude's,
+// OpenAI's, Cursor's) chat_pick_mark across, chat_pick_mark_gap before the name. The picker's menu is a ui.Menu (the
+// menu_* tokens).
 export const size_chat_status = 12.5
 export const line_chat_status = 16
 export const chat_pick_h = 20
 export const chat_pick_gap = 6
 export const chat_pick_chevron = 10
+export const chat_pick_mark = 14
+export const chat_pick_mark_gap = 5
 export const chat_ring = 12
 export const chat_ring_stroke = 2
 export const chat_context_gap = 5

@@ -75,8 +75,14 @@ hn {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
   }
+  // The model's control leads with its maker's mark (pick.rs `maker`: hn.Kind's claude, codex or cursor mark in its
+  // tone), then the name.
   prefab ChatPick : hn.ChatPickBase {
     Tooltip: {text: "Select model  ⌘/"}
+    Flex: {axis: Row, gap: $chat_pick_mark_gap, align: Center, justify: Center, wrap: false}
+    icon : ui.Icon {
+      Size: {w: {kind: Fixed, value: $chat_pick_mark, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_mark, min: 0, max: 0}}
+    }
     label : ui.Line {
       Fill: $tone_term_ink
       TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
