@@ -29,7 +29,7 @@ use blaze_protocol::now::{self, Memory, Now, Worker};
 
 use crate::{
     Error,
-    live::{self, CounterRow, Decoder, EdgeRow, OpenRow, SpanRow, TaskRow},
+    live::{self, CounterRow, Decoder, EdgeRow, OpenRow, SpanRow, Stream, TaskRow},
     tasks::Tasks,
     wire::{self, Frames, Hello, HEAD, Live, LiveHead, Refusal},
 };
@@ -126,15 +126,16 @@ enum Table {
     Edges,
 }
 
-/// One session with the daemon: what it said, folded.
+/// One session with the daemon: what it said, folded. Its IPC is read through `S`, the driver's
+/// decoder ([`crate::ipc`]).
 #[derive(Debug)]
-pub struct Session {
+pub struct Session<S> {
     pub(crate) hello: Option<Hello>,
-    open: Decoder,
-    spans: Decoder,
-    counters: Decoder,
-    tasks_in: Decoder,
-    edges_in: Decoder,
+    open: Decoder<S>,
+    spans: Decoder<S>,
+    counters: Decoder<S>,
+    tasks_in: Decoder<S>,
+    edges_in: Decoder<S>,
     frames: Frames,
     // Scratch, reused frame to frame.
     frame: Vec<u8>,
@@ -160,8 +161,8 @@ pub struct Session {
     pub(crate) answer: Option<AnswerSeen>,
 }
 
-impl Default for Session {
-    fn default() -> Session {
+impl<S: Stream> Default for Session<S> {
+    fn default() -> Session<S> {
         Session::new()
     }
 }
@@ -202,8 +203,8 @@ pub(crate) fn elapsed(now: i64, since: i64) -> u64 {
     u64::try_from(i128::from(now) - i128::from(since)).unwrap_or(0)
 }
 
-impl Session {
-    pub fn new() -> Session {
+impl<S: Stream> Session<S> {
+    pub fn new() -> Session<S> {
         Session {
             hello: None,
             open: Decoder::new("open"),
@@ -346,11 +347,11 @@ impl Session {
                 self.refusal = Some(refusal);
                 Ok(())
             }
-            Live::Rows(head) => self.rows(head),
+            Live::Rows(head) => self.rows(&head),
         }
     }
 
-    fn rows(&mut self, head: LiveHead<'_>) -> Result<(), Error> {
+    fn rows(&mut self, head: &LiveHead<'_>) -> Result<(), Error> {
         let table = match head.table.as_str() {
             "open" => Table::Open,
             "spans" => Table::Spans,
@@ -577,7 +578,7 @@ impl Session {
         };
         // alloc: once an answer, the message its errors name
         let message = format!("answer to `{}`", answer.op);
-        let batches = live::whole(answer.ipc, &message)?;
+        let batches = live::whole::<S>(answer.ipc, &message)?;
         let got: u64 = batches.iter().map(|it| it.num_rows() as u64).sum();
         if let Some(rows) = answer.rows
             && rows != got
@@ -637,7 +638,7 @@ impl Session {
         // alloc: once a look, a worker each
         let mut threads = Vec::new();
         for (key, thread) in &self.threads {
-            if !Session::worker(layered, thread) {
+            if !Self::worker(layered, thread) {
                 continue;
             }
             workers = workers.saturating_add(1);
@@ -677,7 +678,7 @@ impl Session {
         // alloc: once a view, at most a thread each
         let mut internal = Vec::new();
         for (key, thread) in &self.threads {
-            let worker = Session::worker(layered, thread);
+            let worker = Self::worker(layered, thread);
             workers += u64::from(worker);
             let Some(outer) = thread.open.first() else { continue };
             if worker && layered && worker_span(outer) {

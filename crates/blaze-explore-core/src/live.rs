@@ -5,8 +5,12 @@
 //! session, zstd-compressed with delta dictionaries: the schema and each name go once, and a
 //! frame's bytes are the next whole messages. When a stream's dictionaries reach their cap, the
 //! next frame with rows starts with the end-of-stream marker [`END`] and then a new stream, its
-//! schema and dictionaries again. [`Decoder`] follows that: it keeps the `StreamDecoder` across
+//! schema and dictionaries again. [`Decoder`] follows that: it keeps the IPC stream across
 //! frames and, at [`END`] at a frame's start, ends the old stream and begins a new one.
+//!
+//! The IPC itself is read through [`Stream`], a type parameter the driver picks (arrow-ipc's
+//! `StreamDecoder`, in [`crate::ipc`]): that decoder seeds its maps from OS randomness, which a
+//! core may not reach.
 //!
 //! Columns are found by name, so a table that gains a column, or a generic source whose ids are
 //! narrower, still reads: every id column widens to `u64` exactly, and a required column that
@@ -23,8 +27,7 @@ use arrow_array::{
     types::{Float64Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::Buffer;
-use arrow_ipc::reader::StreamDecoder;
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use blaze_protocol::now::State;
 
 use crate::{Error, column};
@@ -37,11 +40,25 @@ pub const END: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
 /// takes at least this, which bounds a frame's steps.
 const MESSAGE_MIN: usize = 8;
 
-/// One table's long-lived IPC stream, the page's side.
+/// One Arrow IPC stream read message by message: what the core needs of an IPC decoder. The
+/// driver supplies it ([`crate::ipc`] implements it for arrow-ipc's `StreamDecoder`), so the
+/// decoder's own effects (its maps' `RandomState`) are the driver's, never the core's.
+pub trait Stream: Sized {
+    /// A stream with nothing read yet.
+    fn begin() -> Self;
+    /// The next batch from the front of `buffer`, the bytes it took cut off; `None` when the
+    /// bytes held no batch (a schema, a dictionary, the end-of-stream marker, or part of a
+    /// message).
+    fn decode(&mut self, buffer: &mut Buffer) -> Result<Option<RecordBatch>, ArrowError>;
+    /// An error unless what was read so far ends at a message's end.
+    fn finish(&mut self) -> Result<(), ArrowError>;
+}
+
+/// One table's long-lived IPC stream, the page's side, read through `S`.
 #[derive(Debug)]
-pub struct Decoder {
+pub struct Decoder<S> {
     table: String,
-    stream: Option<StreamDecoder>,
+    stream: Option<S>,
     /// A frame failed mid-stream: the stream's dictionaries are gone, so nothing reads until
     /// the daemon begins a new stream ([`END`]) or the page subscribes again.
     broken: bool,
@@ -49,8 +66,8 @@ pub struct Decoder {
     streams: u64,
 }
 
-impl Decoder {
-    pub fn new(table: &str) -> Decoder {
+impl<S: Stream> Decoder<S> {
+    pub fn new(table: &str) -> Decoder<S> {
         // alloc: once a table a session
         Decoder { table: table.to_owned(), stream: None, broken: false, streams: 0 }
     }
@@ -109,7 +126,7 @@ impl Decoder {
         if self.stream.is_none() {
             self.streams += 1;
         }
-        let stream = self.stream.get_or_insert_with(StreamDecoder::new);
+        let stream = self.stream.get_or_insert_with(S::begin);
         match messages(stream, rest, into) {
             Ok(()) => Ok(()),
             Err(why) => {
@@ -123,7 +140,7 @@ impl Decoder {
 }
 
 /// `bytes`, whole messages, through `stream` into `into`, ending at a message's end.
-fn messages(stream: &mut StreamDecoder, bytes: &[u8], into: &mut Vec<RecordBatch>) -> Result<(), String> {
+fn messages<S: Stream>(stream: &mut S, bytes: &[u8], into: &mut Vec<RecordBatch>) -> Result<(), String> {
     // alloc: a frame's bytes, copied 8-aligned for the decoder, once a frame
     let mut buffer = Buffer::from_slice_ref(bytes);
     // Each step yields a batch, taking at least a message, or takes the rest and yields none.
@@ -156,11 +173,12 @@ fn messages(stream: &mut StreamDecoder, bytes: &[u8], into: &mut Vec<RecordBatch
     stream.finish().map_err(|why| why.to_string())
 }
 
-/// The batches of one whole IPC stream: an answer's table. `message` names it in errors.
-pub fn whole(ipc: &[u8], message: &str) -> Result<Vec<RecordBatch>, Error> {
+/// The batches of one whole IPC stream, read through `S`: an answer's table. `message` names it
+/// in errors.
+pub fn whole<S: Stream>(ipc: &[u8], message: &str) -> Result<Vec<RecordBatch>, Error> {
     // alloc: an answer's batches, once an answer
     let mut batches = Vec::new();
-    let mut stream = StreamDecoder::new();
+    let mut stream = S::begin();
     messages(&mut stream, ipc, &mut batches).map_err(|why| Error::new(message, "the IPC", why))?;
     Ok(batches)
 }

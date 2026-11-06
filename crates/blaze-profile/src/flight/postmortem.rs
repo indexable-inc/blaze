@@ -684,7 +684,7 @@ impl Mapping {
     /// and takes it again for any pushed meanwhile whose pusher found it held. Bounded: each
     /// round writes a name pushed after the round before let go, by a thread that then tried
     /// the lock and failed, so it ends once the pushers stop.
-    fn drain_names(&self, base: usize, at: &NameLog, mut head: MutexGuard<'_, u64>) {
+    fn drain_names<'a>(&self, base: usize, at: &'a NameLog, mut head: MutexGuard<'a, u64>) {
         loop {
             while let Some((sym, name)) = at.pending.pop() {
                 self.write_name(base, &mut head, sym, &name);

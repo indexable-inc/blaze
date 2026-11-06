@@ -218,7 +218,7 @@ pub fn tasks_schema() -> Schema {
     let layer = |name: &str, nullable: bool| {
         Field::new(name, DataType::Utf8, nullable)
             // alloc: a schema's metadata, once a session
-            .with_metadata([(LAYER_KEY.to_owned(), LAYER.to_owned())].into_iter().collect())
+            .with_metadata(std::collections::HashMap::from([(LAYER_KEY.to_owned(), LAYER.to_owned())]))
     };
     Schema::new(vec![
         Field::new("process", DataType::UInt64, false),
@@ -355,7 +355,7 @@ struct Out<'a> {
 }
 
 impl Builder {
-    fn push(&mut self, row: Out<'_>) {
+    fn push(&mut self, row: &Out<'_>) {
         self.task.append_value(row.task);
         self.kind.append_value(row.kind);
         self.name.append_value(row.name);
@@ -431,7 +431,7 @@ impl Feed {
                 };
                 for (&id, row) in changed {
                     let start = row.running_ns.unwrap_or(row.said_ns);
-                    self.builder.push(Out {
+                    self.builder.push(&Out {
                         task: id,
                         kind: row.kind,
                         name: &row.name,
@@ -500,7 +500,7 @@ impl Feed {
                 continue;
             }
             (sent.done, sent.total) = (done, total);
-            self.builder.push(Out {
+            self.builder.push(&Out {
                 task: id,
                 kind: DOWNLOAD,
                 name: &sent.what,
@@ -521,7 +521,7 @@ impl Feed {
                 return true;
             }
             sent.end_ns = Some(at_ns);
-            builder.push(Out {
+            builder.push(&Out {
                 task: id,
                 kind: DOWNLOAD,
                 name: &sent.what,
