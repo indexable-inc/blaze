@@ -3,19 +3,13 @@
 // host keeps (harness_native_ui_view::for_each_of): a head, the window as a bar with a segment a part, a row a part (its
 // splits under it, quieter), and a foot. Each line is a template; the host sets its props from the chat's last
 // `context` event (harness-proto ContextUse) and flecs re-runs only what reads a prop that changed. The look is all here:
-// the host passes words, numbers and an ink slot, never a colour or a size. Templates only, after the prefabs they use.
+// the host passes words, numbers and an ink slot, never a colour or a size. Templates only: in flecs 4.2.0 a template
+// after a prefab in the same script aborts the load (flecs_ordered_entities_append), so the prefabs they sit in (the plate,
+// the bar) are in context_plate.flecs.
 using flecs.script
 
 @tree ChildOf
 hn {
-  // The plate: a ui.Menu (placed over what it is anchored to, out of the flow, its lift and motion), a column of lines.
-  // It is Hoverable (ui.MenuPlate), so the pointer moving onto it keeps it up.
-  prefab ChatContextPop : ui.Menu {
-    Flex: {axis: Column, gap: $chat_ctx_gap, align: Stretch, justify: Start, wrap: false}
-    Size: {w: {kind: Fixed, value: $chat_ctx_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: $chat_ctx_pad, r: $chat_ctx_pad, t: $chat_ctx_pad, b: $chat_ctx_pad}
-  }
-
   // A part's ink, by its slot in the parts' order (`ink`): the dataviz palette's, as a chart's series take them
   // (tone_series1 on); `rest` (what the agent's total holds past the parts it was split into) the menu's rule, quiet.
   @tree ChildOf
@@ -48,19 +42,6 @@ hn {
     }
   }
 
-  // The window as a track; its segments (hn.ChatContextSeg, kept by the host) laid end to end from the leading edge.
-  prefab ChatContextBar : ui.Column {
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: $chat_ctx_bar_pad, b: $chat_ctx_bar_pad}
-    track : ui.Row {
-      Fill: $tone_menu_rule
-      Shape: {radius: $chat_ctx_bar_r, n: 4, border: 0, feather: 0}
-      Clip
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_bar_h, min: 0, max: 0}}
-    }
-  }
   // One part's segment: its share of the window (0 to 1), in its ink.
   @tree ChildOf
   template ChatContextSeg {
