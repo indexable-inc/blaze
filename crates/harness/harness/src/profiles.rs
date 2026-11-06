@@ -37,6 +37,7 @@ pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
     ("ui", include_str!("system_note/ui.md")),           // cells as Svelte 5 UI: the element vocabulary
     ("replies", include_str!("system_note/replies.md")), // how replies to Andrew read
     ("prose", include_str!("system_note/prose.md")),     // prose, not monospace; inline components (<Path>, <Symbol>, <Link>)
+    ("github", include_str!("system_note/github.md")),   // GitHub: one GraphQL query, not a loop of REST calls
 ];
 
 static SYSTEM_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
