@@ -29,6 +29,19 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `scripts/zig` | fetches the pinned zig through Nix |
 | `scripts/harness` | builds and runs the `harness` binary from this checkout |
 | `mcp/` | the Bun/TypeScript kernel the daemon runs (`mcp/src/mcp.ts`; `bun install` in `mcp/`), with its smoke scripts in `mcp/scripts/` |
+| `mcp/skills/` | harness's skills: one topic's instructions each (`<name>.md` with `name` and `description` front matter); the agent's note carries only their index, `await skill('name')` in ts loads one (`harness/src/skills.rs`, `mcp/src/skills.ts`) |
+| `harness/src/system_note/` | the always-on part of every agent's note, one file per topic (`harness/src/profiles.rs`) |
+
+## Skills
+
+An agent's system note carries what every turn needs (`harness/src/system_note/`) and ends with an index of skills,
+one line each (name and description), generated from the skill files at each launch. The full text of a skill loads
+on demand: `await skill('github')` in ts returns it and the person sees a quiet "Read skill github" step; `skills()`
+lists them. Skills come from `mcp/skills/` (harness's own), `$HARNESS_HOME/skills` (the user's) and the session's git
+root's `.agents/skills` and `.claude/skills` (the project's), a later source overriding an earlier one by name. A
+skill is `<name>.md` or `<name>/SKILL.md`, the Claude Code and Codex format; a broken one stops the launch with an
+error naming its file. The daemon passes the list to the kernel as `HARNESS_SKILLS`, so the index and what `skill()`
+serves are one list, for claude, codex and cursor alike. A topic only some tasks need goes in a skill, not the note.
 
 The daemon finds the TypeScript kernel at `$HARNESS_ROOT/src/mcp.ts`, by default `crates/harness/mcp`
 in the checkout it was built from. UI work: the `flecs-ui` skill (`.agents/skills/flecs-ui`).

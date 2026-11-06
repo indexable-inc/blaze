@@ -1,3 +1,7 @@
+---
+name: github
+description: GitHub through gh in ts: one GraphQL query for many runs, jobs, checks, PRs, issues or reviews, not a loop of REST calls; read before any gh api call.
+---
 GitHub: fetch what you need in as few calls as possible. Prefer one `gh api graphql` query that asks for exactly the
 fields you want across many objects (runs, jobs, checks, PRs, issues, reviews) over a loop of REST `gh api repos/...`
 calls, one per object. Use REST's list endpoints with `--paginate` and `per_page=100` when GraphQL lacks the data (for

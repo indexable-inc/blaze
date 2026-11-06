@@ -10,6 +10,7 @@ mod paths;
 mod profiles;
 mod queries;
 mod runs;
+mod skills;
 mod ui_feed;
 
 use anyhow::{Result, bail};
