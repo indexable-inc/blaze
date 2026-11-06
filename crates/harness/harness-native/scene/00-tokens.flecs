@@ -406,6 +406,20 @@ export const chat_w = 672
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
 export const chat_fade_len = 28
+// A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
+// when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
+// chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what
+// came, chat_pace_min to chat_pace_max bytes of text (about characters) a second, never more than chat_pace_most
+// seconds behind.
+export const chat_follow_omega = 18
+export const chat_follow_zeta = 1
+export const chat_follow_far = 2000
+export const chat_glyph_dur = 0.18
+export const chat_glyph_rise = 2
+export const chat_pace_lag = 0.25
+export const chat_pace_min = 30
+export const chat_pace_max = 1400
+export const chat_pace_most = 2
 // Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
 // person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
 // its answer).

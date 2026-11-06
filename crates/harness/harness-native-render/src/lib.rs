@@ -3,6 +3,7 @@
 //! drawable or into a texture read back), `text` is den's shaper and glyph atlas, `icons` and `slug` the vector marks, `kip` den's mascot's Metal pass,
 //! `hdr` the EDR headroom and tone-map every picture past white shares,
 //! and `paint` walks the draw pass's painted nodes (`harness_native_ui_draw::painted`) into a `Draw`.
+pub mod arrive;
 pub mod atlas;
 pub mod boxdraw;
 pub mod draw;

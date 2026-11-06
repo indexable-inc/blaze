@@ -22,9 +22,10 @@
 //! On top of flex, SwiftUI's layout vocabulary: `Background`/`Overlay` children take their parent's frame out of the flow;
 //! a `Grid` sizes columns by their widest cell; `GridColumns` makes adaptive columns; `Lazy` stands for rows that do not
 //! exist yet and says which are in view (`range`); a Row aligned on `FirstBaseline`/`LastBaseline` lines up its text;
-//! `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's `SafeAreaInset` (a
-//! second pass, once the first has said where the node is); a `GrowLimit` caps a growing height at a share of its pane's
-//! (`grow_limits`, a second height pass once the first has said how tall the pane is).
+//! `LaysAtRest` lays a node's children in the room it gets once its siblings rest at their `RestSize` (a card beside a
+//! folding sidebar); `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's
+//! `SafeAreaInset` (a second pass, once the first has said where the node is); a `GrowLimit` caps a growing height at a
+//! share of its pane's (`grow_limits`, a second height pass once the first has said how tall the pane is).
 use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, Side, SizeKind, Sizing};
 use harness_native_ui_node_api::Laid;
 
@@ -106,6 +107,13 @@ pub struct Item {
     pub safe_pad: [bool; 4],
     /// Its `GrowLimit` (`grow_limits` writes the cap it gives into `size[1].max`).
     pub limit: Option<LimitSpec>,
+    /// Its `RestSize`: the length it settles at along its parent's main axis.
+    pub rest: Option<f32>,
+    /// `LaysAtRest`: its flow children are laid in `rest_room` where its parent set one.
+    pub at_rest: bool,
+    /// The room it gets on each axis once its flow siblings rest (`assign` sets it on a `LaysAtRest` node each pass; None:
+    /// the room it has).
+    pub rest_room: [Option<f32>; 2],
     pub children: Vec<usize>,
     pub nat: [f32; 2],
     /// How far a parent's shortfall may shrink it on each axis.
@@ -508,7 +516,9 @@ fn assign(items: &mut [Item], i: usize, a: usize, size: f32) {
         return;
     }
     let it = &items[i];
-    let inner = (size - it.pads(a)).max(0.0);
+    // A `LaysAtRest` node lays its flow children in the room it will have at rest; its own frame (and its layered
+    // children, above) is the room it has now.
+    let inner = (it.rest_room[a].unwrap_or(size) - it.pads(a)).max(0.0);
     if it.fits {
         if a == 0 {
             let k = kids.iter().position(|&c| items[c].nat[0] <= inner + 0.5).unwrap_or(kids.len() - 1);
@@ -562,10 +572,19 @@ fn assign(items: &mut [Item], i: usize, a: usize, size: f32) {
         }
         return;
     }
-    let sizes: Vec<f32> = if it.main(a) && !(it.wrapping() && a == 0) {
-        distribute(items, i, &kids, a, inner)
+    let main = it.main(a) && !(it.wrapping() && a == 0);
+    let (align, z, grow) = (it.flex.align, it.flex.axis == FlexAxis::Z, !(it.wrapping() && a == 1));
+    let sizes: Vec<f32> = if main {
+        let sizes = distribute(items, i, &kids, a, inner);
+        let at_rest = rest_sizes(items, i, &kids, a, inner);
+        for (j, &c) in kids.iter().enumerate() {
+            items[c].rest_room[a] = at_rest.as_ref().filter(|_| items[c].at_rest).map(|r| r[j]);
+        }
+        sizes
     } else {
-        let (align, z, grow) = (it.flex.align, it.flex.axis == FlexAxis::Z, !(it.wrapping() && a == 1));
+        for &c in &kids {
+            items[c].rest_room[a] = None;
+        }
         kids.iter().map(|&c| across_size(&items[c], a, inner, align, !z, grow)).collect()
     };
     for (&c, s) in kids.iter().zip(sizes) {
@@ -637,6 +656,31 @@ fn grid_assign(items: &mut [Item], i: usize, g: &GridSpec, a: usize, inner: f32)
             }
         }
     }
+}
+
+/// Main-axis sizes of `kids` once every one with a `RestSize` rests there ([`distribute`] with those as fixed lengths),
+/// when one of them `LaysAtRest` and one is not at rest; None when the room they have now is the room at rest.
+fn rest_sizes(items: &mut [Item], i: usize, kids: &[usize], a: usize, inner: f32) -> Option<Vec<f32>> {
+    if !kids.iter().any(|&c| items[c].at_rest) {
+        return None;
+    }
+    let moving: Vec<(usize, f32)> = kids
+        .iter()
+        .filter_map(|&c| items[c].rest.map(|r| (c, r)))
+        .filter(|&(c, r)| items[c].size[a].kind != SizeKind::Fixed || (items[c].size[a].value - r).abs() > 0.01)
+        .collect();
+    if moving.is_empty() {
+        return None;
+    }
+    let held: Vec<(usize, Sizing)> = moving.iter().map(|&(c, _)| (c, items[c].size[a])).collect();
+    for &(c, r) in &moving {
+        items[c].size[a] = Sizing::fixed(r);
+    }
+    let sizes = distribute(items, i, kids, a, inner);
+    for (c, s) in held {
+        items[c].size[a] = s;
+    }
+    Some(sizes)
 }
 
 /// Main-axis sizes of `kids` (the flow children of `i`): bases, then free room to Grow by weight, or a deficit shrunk off
@@ -1008,6 +1052,23 @@ mod tests {
     /// A text leaf `w` wide and `h` tall whose first and last baselines are `b0` and `b1` from its top.
     fn text(w: f32, h: f32, b0: f32, b1: f32) -> Item {
         Item { intrinsic: [w, h], baseline: [b0, b1], ..Item::default() }
+    }
+
+    /// A sidebar folding away (its spring leaving it 100 wide, resting at 0) beside a `LaysAtRest` card: the card's frame takes
+    /// what the spring leaves it, its content the room it will have once the sidebar rests, so its words are not laid out at
+    /// an in-between width. At rest the two are the same.
+    #[test]
+    fn a_card_lays_its_content_out_at_the_width_it_rests_at() {
+        let side = |w: f32| Item { rest: Some(0.0), ..item([Sizing::fixed(w), Sizing::fixed(10.0)], vec![]) };
+        let card = Item { at_rest: true, ..item([Sizing::GROW, Sizing::fixed(10.0)], vec![3]) };
+        let content = item([Sizing::GROW, Sizing::fixed(10.0)], vec![]);
+        let mut items = vec![row(0.0, Align::Start, vec![1, 2]), side(100.0), card, content];
+        solve(&mut items, 0, [1000.0, 500.0]);
+        assert_eq!((items[2].out.x, items[2].out.w), (100.0, 900.0));
+        assert_eq!((items[3].out.x, items[3].out.w), (100.0, 1000.0));
+        items[1] = side(0.0);
+        solve(&mut items, 0, [1000.0, 500.0]);
+        assert_eq!((items[2].out.w, items[3].out.w), (1000.0, 1000.0));
     }
 
     /// A row of a fixed box, a spacer and a fixed box, 8 apart in 200 points: the spacer takes what is left.

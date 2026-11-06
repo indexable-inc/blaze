@@ -6,7 +6,8 @@
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
 //! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
 use super::*;
-use harness_native_ui_motion_api::CopyFlash;
+use harness_native_ui_motion_api::{CopyFlash, Follow, Paced};
+use harness_native_ui_timeline_api::GlyphsArrive;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
 use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
@@ -224,7 +225,26 @@ pub struct ChatState {
     pick_nav: pick::PickNav,
     /// The composer's scroll once its words outgrow it: wheels on AppKit's physics, the caret kept in view.
     input_scroll: view::field::FieldScroll,
+    /// The agent's words as they show (hn.Theme.chat_stream): each text block's pace through the bursts it comes in, by
+    /// block; how much of each block not yet all shown shows ([`settled_len`], then its pace); and when each row of a
+    /// block that streamed in here was first laid out (its glyphs fade in from then on, [`GlyphsArrive`]).
+    stream: HashMap<String, Stream>,
+    cut: HashMap<String, usize>,
+    row_born: HashMap<String, f32>,
+    /// Kept at the bottom on a spring while it sticks; the pane clock's time it was last stepped.
+    follow: Follow,
+    stepped: f64,
 }
+
+/// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
+/// glyphs fade in) or was there when it attached (history: shown whole, at rest).
+struct Stream {
+    paced: Paced,
+    live: bool,
+}
+
+/// Seconds after an attach during which the blocks that come are the log replayed (history), not words being written.
+const REPLAY_SECS: f32 = 0.5;
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
 /// table in transcript row `.0` (its key).
@@ -276,6 +296,11 @@ impl Default for ChatState {
             pick: None,
             pick_nav: pick::PickNav::default(),
             input_scroll: view::field::FieldScroll::default(),
+            stream: HashMap::new(),
+            cut: HashMap::new(),
+            row_born: HashMap::new(),
+            follow: Follow::default(),
+            stepped: 0.0,
         }
     }
 }
@@ -755,11 +780,16 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
 }
 
 /// Item `n`'s rows, keyed `i{n}.{k}` so a row keeps its key as it streams and as runs form around it.
-fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>, out: &mut Vec<(String, Row)>) {
+/// A text block shows as far as its cut says ([`Shows`]), as words still coming.
+fn item_rows(t: &Transcript, g: &Grouped, n: usize, shows: Shows<'_>, out: &mut Vec<(String, Row)>) {
+    let fold = shows.fold;
     let mut part = Vec::new();
     match &t.items[n] {
         Item::User { text } => part.push(Row::User(text.clone())),
-        Item::Text { text, done, .. } => blocks(text, !done, &mut part),
+        Item::Text { block, text, done } => match shows.cut.get(block) {
+            Some(&k) => blocks(&text[..k.min(text.len())], true, &mut part),
+            None => blocks(text, !done, &mut part),
+        },
         Item::Thinking { block, text, done } => {
             if !text.trim().is_empty() || !done {
                 let open = fold.get(block).copied().unwrap_or(false);
@@ -813,13 +843,14 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
 /// A folded run shows its line ("Ran 2 cells · 2 failed"), its failed calls as one folded line each, its open calls (the
 /// last shell call, one the person opened), and the rest that returned a result ([`result_value`]: a table is the answer, not plumbing) folded, their line over their
 /// table, in call order; an opened one, every call and the reasoning between them, each folded as it is.
-fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Row)>, HashSet<String>) {
+fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet<String>) {
+    let fold = shows.fold;
     let g = Grouped::of(t);
     let mut out = Vec::new();
     let mut nested = HashSet::new();
     for piece in &g.pieces {
         match piece {
-            Piece::Item(n) => item_rows(t, &g, *n, fold, &mut out),
+            Piece::Item(n) => item_rows(t, &g, *n, shows, &mut out),
             Piece::Run(run) => {
                 let key = run.key();
                 let open = fold.get(&key).copied().unwrap_or(false);
@@ -835,7 +866,7 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
                     let result = call.and_then(|c| t.details.get(&c.block)).and_then(result_value).is_some();
                     let from = out.len();
                     if shows || result {
-                        item_rows(t, &g, n, fold, &mut out);
+                        item_rows(t, &g, n, shows, &mut out);
                     }
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
@@ -846,8 +877,59 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
 }
 
 /// The transcript as rows.
-fn rows(t: &Transcript, fold: &HashMap<String, bool>) -> Vec<(String, Row)> {
-    rows_nested(t, fold).0
+fn rows(t: &Transcript, shows: Shows<'_>) -> Vec<(String, Row)> {
+    rows_nested(t, shows).0
+}
+
+/// What decides how the transcript shows besides itself: the folds the person set, and how far each text block still
+/// streaming shows (byte offset, by block; a block not in it shows whole).
+#[derive(Clone, Copy)]
+struct Shows<'a> {
+    fold: &'a HashMap<String, bool>,
+    cut: &'a HashMap<String, usize>,
+}
+
+impl<'a> Shows<'a> {
+    fn of(st: &'a ChatState) -> Self {
+        Self { fold: &st.fold, cut: &st.cut }
+    }
+}
+
+/// How much of a text block still streaming in can show without what shows changing as more comes (byte offset): up to
+/// its last whitespace (a word still coming would hop to the next line as it grows), short of an inline code span or a
+/// bold run not closed yet (its markers would show, then vanish and restyle it), and short of a last line that is only a
+/// block's opening so far (a list's `-`, a heading's `#`, a fence: the line would change kind). Done, all of it.
+fn settled_len(text: &str, done: bool) -> usize {
+    if done {
+        return text.len();
+    }
+    let mut end = text.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+    // The line still being written: held back while it only opens a block.
+    let line = text[..end].rfind('\n').map_or(0, |i| i + 1);
+    let head = text[line..end].trim_start();
+    let fence = |l: &str| l.starts_with("```") || l.starts_with("~~~");
+    let marker = |w: &str| {
+        matches!(w, "-" | "*" | "+" | ">" | "|")
+            || w.chars().all(|c| c == '#')
+            || w.strip_suffix(['.', ')']).is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+    };
+    if fence(head) || (!head.is_empty() && head.split_whitespace().all(marker)) {
+        end = line;
+    }
+    // Inside an open fence the words are code: no inline markers to balance.
+    if text[..end].lines().filter(|l| fence(l.trim_start())).count() % 2 == 1 {
+        return end;
+    }
+    let para = text[..end].rfind("\n\n").map_or(0, |i| i + 2);
+    let tail = &text[para..end];
+    if tail.matches('`').count() % 2 == 1 {
+        end = para + tail.rfind('`').unwrap_or(0);
+    }
+    let tail = &text[para..end];
+    if tail.matches("**").count() % 2 == 1 {
+        end = para + tail.rfind("**").unwrap_or(0);
+    }
+    end
 }
 
 /// Whether row key `key` (a call's block, a run's `run:` key, a thinking's block, a card's `block#code`) shows open now:
@@ -1155,6 +1237,10 @@ impl App {
             if due {
                 st.tried = Some(self.time);
                 st.ours = true;
+                // The log replays from the start: what comes first is history again.
+                st.stream.clear();
+                st.cut.clear();
+                st.row_born.clear();
                 self.chats.borrow_mut().remove(&sid);
                 self.link.attach(sid, 80, 24, true);
             }
@@ -1172,7 +1258,27 @@ impl App {
         let chats = self.chats.borrow();
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
-        let (rows, nested) = rows_nested(t, &st.fold);
+        let (rows, nested) = rows_nested(t, Shows::of(st));
+        // The rows of blocks that streamed in while this pane watched: their glyphs fade in as they come, from when the row
+        // was first laid out (a row first painted long after, scrolled back to, shows at rest).
+        let came = crate::look::arrive(w, "chat_stream");
+        let mut arrives: HashMap<&str, GlyphsArrive> = HashMap::new(); // alloc: the frame's live rows, read by fresh_rows
+        for (key, _) in &rows {
+            let item = key.strip_prefix('i').and_then(|k| k.split_once('.')).and_then(|(n, _)| n.parse::<usize>().ok());
+            let live = item.and_then(|n| t.items.get(n)).is_some_and(|it| {
+                matches!(it, Item::Text { block, .. } if st.stream.get(block).is_some_and(|s| s.live))
+            });
+            if live {
+                let born = match st.row_born.get(key) {
+                    Some(&b) => b,
+                    None => {
+                        st.row_born.insert(key.clone(), self.time); // alloc: one key per streamed row, kept with the pane
+                        self.time
+                    }
+                };
+                arrives.insert(key.as_str(), GlyphsArrive { born, ..came });
+            }
+        }
         // A run's rows sit in from its line by `chat_nest` (each row's own padding, from its prefab, plus that).
         let nest_by = view::prefab(w, "hn.ChatNest").and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()).map_or(0.0, |p| p.l);
         if let Some(list) = pv.part("list")
@@ -1220,9 +1326,15 @@ impl App {
                     let whole = sel.is_some_and(|(lo, hi)| takes_whole(lo, hi, i));
                     select_all_words(row.entity(), whole);
                 }
+                let arrive = arrives.get(rows[i].0.as_str()).copied();
                 for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
                     let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
                     let e = node.entity();
+                    match arrive {
+                        Some(a) if e.try_cloned::<&GlyphsArrive>() != Some(a) => _ = e.set(a),
+                        None if e.has(GlyphsArrive::id()) => _ = e.remove(GlyphsArrive::id()),
+                        _ => {}
+                    }
                     let range = sel.and_then(|(lo, hi)| covered(lo, hi, i, k, units(&shown(src, *md))));
                     match range.filter(|(a, b)| a < b) {
                         Some((a, b)) => {
@@ -1331,14 +1443,29 @@ impl App {
                 st.stick = false;
                 st.rev += 1;
             }
+            let t = st.clock.elapsed().as_secs_f64();
+            // A frame's step, capped so a pane first shown (or a stall) does not leap.
+            let dt = ((t - st.stepped) as f32).clamp(0.0, 0.1);
+            st.stepped = t;
+            if self.pace_chat(sid, st, dt) {
+                moving = true;
+            }
             let max = (st.content - l.h).max(0.0);
             let mut origin = st.y;
             let busy = st.engine.needs_frame();
             if st.stick && !busy {
-                if (st.y - max).abs() > 0.5 {
-                    origin = max;
+                // Following the agent: the end glides in on a spring as rows grow under it (rows above it that changed
+                // height moved it as far), instead of the view jumping a line at a time.
+                st.follow.shift(st.shift);
+                // While the log replays (a pane just opened) it lands on the end: the history was there, not written now.
+                let replay = st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
+                let far = if replay { 0.0 } else { crate::look::width(w, "chat_stream") };
+                let (y, going) = st.follow.step(max, crate::look::tune(w, "chat_stream"), far, dt);
+                if (y - st.y).abs() > 0.01 {
+                    origin = y;
                     st.rev += 1;
                 }
+                moving |= going;
             } else if st.shift.abs() > 0.01 && !busy {
                 origin = (st.y + st.shift).clamp(0.0, max);
                 st.rev += 1;
@@ -1347,7 +1474,6 @@ impl App {
                 st.rev += 1;
             }
             st.shift = 0.0;
-            let t = st.clock.elapsed().as_secs_f64();
             st.engine.configure(sidebar::config(
                 l.w,
                 l.h,
@@ -1365,6 +1491,10 @@ impl App {
                 st.stick = true;
             }
             st.y = y;
+            if !st.stick || st.engine.needs_frame() {
+                // The reader's scroll has it: a follow begins where they leave it.
+                st.follow = Follow::at(y);
+            }
             if list.entity().try_cloned::<&ScrollState>().is_none_or(|s| (s.y - y).abs() > 0.001) {
                 // Following the agent at the bottom moves it quietly; a scroll of the reader's shows the scroller.
                 if st.stick && !st.engine.needs_frame() {
@@ -1393,6 +1523,40 @@ impl App {
         // A press off the picker's open menu closes it.
         self.step_chat_pick();
         self.step_genui_common();
+    }
+
+    /// Step session `sid`'s text blocks' pace a frame `dt` seconds long: each shows as far as it can without changing
+    /// ([`settled_len`]), reached at its pace (hn.Theme.chat_stream's `Pace`), so a burst of words reads in evenly instead
+    /// of landing as a paragraph in one frame. A block first seen just after an attach is the log replayed: whole at once.
+    /// Whether one still has words to show (another frame is wanted).
+    fn pace_chat(&self, sid: u64, st: &mut ChatState, dt: f32) -> bool {
+        let pace = crate::look::pace(self.world.world_ref(), "chat_stream");
+        let chats = self.chats.borrow();
+        let Some(t) = chats.get(&sid) else { return false };
+        let replay = st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
+        let mut behind = false;
+        for item in &t.items {
+            let Item::Text { block, text, done } = item else { continue };
+            let have = settled_len(text, *done);
+            if !st.stream.contains_key(block) {
+                let s = Stream { paced: Paced::at(if replay { have } else { 0 }), live: !replay };
+                st.stream.insert(block.clone(), s); // alloc: one entry per text block, kept with the pane
+            }
+            let Some(s) = st.stream.get_mut(block) else { continue };
+            let mut k = s.paced.step(have, pace, dt);
+            while !text.is_char_boundary(k) {
+                k -= 1;
+            }
+            behind |= !s.paced.caught_up(have);
+            if k >= text.len() {
+                st.cut.remove(block);
+            } else if let Some(c) = st.cut.get_mut(block) {
+                *c = k;
+            } else {
+                st.cut.insert(block.clone(), k); // alloc: one key per block still streaming
+            }
+        }
+        behind
     }
 
     /// Step every chat pane's composer scroll a frame (harness_native_ui_view::field): its caret's line from the last
@@ -2047,8 +2211,8 @@ impl App {
         let chats = self.chats.borrow();
         let empty = Transcript::default();
         let states = self.chat.borrow();
-        let fold = states.get(&sid).map(|s| s.fold.clone()).unwrap_or_default();
-        rows(chats.get(&sid).unwrap_or(&empty), &fold)
+        let none = ChatState::default();
+        rows(chats.get(&sid).unwrap_or(&empty), Shows::of(states.get(&sid).unwrap_or(&none)))
     }
 }
 
@@ -2515,6 +2679,24 @@ fn tooltip(v: View<'_>, s: &str) {
 mod tests {
     use super::*;
 
+    /// What of a block still streaming may show: whole words, never a bold run or code span still open, never a line that
+    /// so far only opens a list item, a heading or a fence; all of it once done.
+    #[test]
+    fn streaming_words_show_only_what_more_cannot_change() {
+        fn at(t: &str) -> &str {
+            &t[..settled_len(t, false)]
+        }
+        assert_eq!(at("The quick bro"), "The quick ");
+        assert_eq!(at("see **the bo"), "see ");
+        assert_eq!(at("see **the** bo"), "see **the** ");
+        assert_eq!(at("run `cargo te"), "run ");
+        assert_eq!(at("Done.\n\n- "), "Done.\n\n");
+        assert_eq!(at("Done.\n12. "), "Done.\n");
+        assert_eq!(at("Done.\n```rus"), "Done.\n");
+        assert_eq!(at("```\nlet a = **b "), "```\nlet a = **b ");
+        assert_eq!(settled_len("half a wo", true), 9);
+    }
+
     /// In a folded run, a call's table (the answer the person asked for) shows under the run's line without opening it; a
     /// failed call is one folded line, its run says how many failed; a cell that drew is its view, no line over it.
     #[test]
@@ -2546,7 +2728,8 @@ mod tests {
         for l in &lines {
             t.apply(&harness_proto::event::Event::from_json(l).unwrap());
         }
-        let (rows, nested) = rows_nested(&t, &HashMap::new());
+        let (fold, cut) = (HashMap::new(), HashMap::new());
+        let (rows, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut });
         let kinds: Vec<(&str, &str)> = rows.iter().map(|(k, r)| (k.as_str(), r.prefab())).collect();
         assert_eq!(kinds[1].1, "hn.ChatRunFailed", "{kinds:?}");
         assert!(matches!(&rows[1].1, Row::Run { words, failed: 1, .. } if words.ends_with('\u{00B7}')), "{kinds:?}");
@@ -2565,7 +2748,8 @@ mod tests {
         assert_eq!(rows.len(), 7, "user, run, failure, table's call, table, view, prose: {kinds:?}");
         // Its code button shows the cell's code under the view.
         let code = HashMap::from([(code_key("d"), true)]);
-        let shown = super::rows(&t, &code);
+        let cut = HashMap::new();
+        let shown = super::rows(&t, Shows { fold: &code, cut: &cut });
         assert!(matches!(&shown[6].1, Row::Code { lang, .. } if lang == "ts"), "{:?}", shown.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
     }
 

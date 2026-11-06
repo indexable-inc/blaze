@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
     AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, GrowLimit, Intrinsic, Lazy,
-    LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
+    LaysAtRest, LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, RestSize, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
     ScrollerPart, ScrollerState, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
 };
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed};
@@ -75,6 +75,8 @@ fn read(e: EntityView<'_>) -> Item {
         safe: [safe.l, safe.r, safe.t, safe.b],
         safe_pad: [safe_pad.l, safe_pad.r, safe_pad.t, safe_pad.b],
         limit: e.try_cloned::<&GrowLimit>().map(|g| LimitSpec { share: g.share, keep: g.keep, max: size.h.max }),
+        rest: e.try_cloned::<&RestSize>().map(|r| r.len),
+        at_rest: e.has(LaysAtRest::id()),
         ..Item::default()
     }
 }
@@ -234,7 +236,8 @@ fn extras(it: &Item) -> Vec<u64> {
         f(it.guide[0]),
         f(it.guide[1]),
         f(it.priority),
-        u64::from(it.fixed[0]) | u64::from(it.fixed[1]) << 1 | u64::from(it.grid_row) << 2 | u64::from(it.fits) << 3 | u64::from(it.clip) << 4 | u64::from(it.scrolls) << 5,
+        u64::from(it.fixed[0]) | u64::from(it.fixed[1]) << 1 | u64::from(it.grid_row) << 2 | u64::from(it.fits) << 3 | u64::from(it.clip) << 4 | u64::from(it.scrolls) << 5 | u64::from(it.at_rest) << 6,
+        it.rest.map_or(u64::MAX, f),
         it.role as u64,
         f(it.baseline[0]),
         f(it.baseline[1]),

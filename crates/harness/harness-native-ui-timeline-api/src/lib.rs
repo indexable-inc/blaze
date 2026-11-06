@@ -158,9 +158,32 @@ pub struct Pan {
     pub sweep: f32,
 }
 
+/// A node's words fading in as they grow (a reply streaming in): each glyph that was not there the frame before rises `by`
+/// points into place and fades in over `dur` seconds on `ease`, from the frame it came. The paint pass keeps when each came
+/// (by node), so the host only sets the longer text; glyphs already placed never move. A node first painted within `dur`
+/// of `born` (frame-clock seconds: when its words began) fades its first glyphs in too; one first painted later (scrolled
+/// back into view) shows them at once.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GlyphsArrive {
+    pub dur: f32,
+    pub by: f32,
+    pub ease: Ease,
+    pub born: f32,
+}
+
+impl GlyphsArrive {
+    /// A glyph that came at `came`: its opacity and how far it still sits below its place (points) at frame time `time`.
+    #[must_use]
+    pub fn of(&self, came: f32, time: f32) -> (f32, f32) {
+        let t = (time - came) / self.dur.max(1e-6);
+        (self.ease.at(t), self.by * (1.0 - self.ease.at(t)))
+    }
+}
+
 hyperion_api_layouts::api_layouts! {
     "Cue" => alias Cue,
     "GlyphsIn" => alias GlyphsIn,
+    "GlyphsArrive" => alias GlyphsArrive,
     "Sound" => alias Sound,
     "Onset" => alias Onset,
     "Lasts" => alias Lasts,
@@ -175,6 +198,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Cue>().writable();
     world.component::<GlyphsIn>().writable();
+    world.component::<GlyphsArrive>().writable();
     world.component::<Sound>().writable();
     world.component::<Onset>().writable();
     world.component::<Lasts>().writable();

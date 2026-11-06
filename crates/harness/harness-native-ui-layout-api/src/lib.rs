@@ -545,7 +545,25 @@ pub struct Collapse {
     pub k: f32,
 }
 
+/// The length this node settles at along its parent's main axis while its `Size` there is moving (a fold's spring writes
+/// it each frame): layout gives the node its `Size`, and gives a `LaysAtRest` sibling's children the room they will have
+/// once this node rests. A sidebar folding on a spring says where it is going here.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct RestSize {
+    pub len: f32,
+}
+
+/// Its flow children are laid out in the room it gets once its flow siblings rest at their `RestSize`, not in the room it
+/// has this frame: a card whose width follows a sibling's spring lays its content out once, at the width it settles at
+/// (its words wrap and its terminal resizes once, not every frame), while its own frame and its `Background` and `Overlay`
+/// children follow the spring. Its content starts at its leading edge; past its frame it is clipped by whatever clips it.
+/// A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct LaysAtRest;
+
 hyperion_api_layouts::api_layouts! {
+    "RestSize" => alias RestSize,
+    "LaysAtRest" => alias LaysAtRest,
     "AlignSelf" => alias AlignSelf,
     "AlignmentGuide" => alias AlignmentGuide,
     "LayoutPriority" => alias LayoutPriority,
@@ -607,6 +625,8 @@ pub fn register(world: &World) {
     world.component::<Viewport>().writable();
     world.component::<ShrinkFirst>().writable();
     world.component::<Collapse>().writable();
+    world.component::<RestSize>().writable();
+    world.component::<LaysAtRest>().writable();
     world.component::<ScrollState>().writable();
     world.component::<ScrollExtent>().writable();
     world.component::<ScrollFed>().writable();
