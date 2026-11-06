@@ -8,6 +8,8 @@
 // ones while it runs are coalesced to one per POST_MS; all go out in order, and its end goes at once. A cell that draws UI
 // (Svelte 5 markup, ui/) carries its tree as `ui`; each change to it after the end is posted again, also one per POST_MS.
 import * as acorn from "acorn";
+import { resolve as resolvePath } from "node:path";
+import { packages, parseSpec } from "./packages.ts";
 import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
 import { req, daemonPresent, listen } from "./daemon.ts";
@@ -82,8 +84,38 @@ function patternNames(p: Node, out: string[] = []): string[] {
   return out;
 }
 
+/** Every `import(x)` expression, at any depth, becomes `__import(x)`, so a dynamic import resolves the way a static one
+ *  does (packages.ts), not from this file's folder. */
+function dynamicImports(js: string): string {
+  const ast = acorn.parse(js, { ecmaVersion: "latest", sourceType: "module", allowAwaitOutsideFunction: true }) as Node;
+  const starts: number[] = [];
+  const walk = (n: unknown) => {
+    if (Array.isArray(n)) { for (const c of n) walk(c); return; }
+    if (typeof n !== "object" || n === null || typeof (n as Node).type !== "string") return;
+    const node = n as Node;
+    if (node.type === "ImportExpression") starts.push(node.start);
+    for (const k of Object.keys(node)) if (k !== "type" && k !== "start" && k !== "end") walk(node[k]);
+  };
+  walk(ast);
+  let out = js;
+  // `import` is six characters at the expression's start; edits go from the end so earlier offsets hold.
+  for (const s of starts.sort((a, b) => b - a)) out = out.slice(0, s) + "__import" + out.slice(s + 6);
+  return out;
+}
+
+/** What a cell's `import` gets: node:fs with its steps (effects.ts), a path relative to the cell's working directory,
+ *  an npm package from the shared, pinned cache (packages.ts), or the builtin. */
+export async function importFor(spec: string): Promise<unknown> {
+  const fs = await fsFor(spec);
+  if (fs) return fs;
+  if (spec.startsWith("./") || spec.startsWith("../")) return import(resolvePath(process.cwd(), spec));
+  const p = parseSpec(spec);
+  return p ? packages().import(spec, p) : import(spec);
+}
+
 /** Rewrite top-level declarations into assignments on the persistent scope; return the last expression. */
-export function rewrite(js: string): { body: string; names: string[] } {
+export function rewrite(source: string): { body: string; names: string[] } {
+  const js = dynamicImports(source);
   const ast = acorn.parse(js, { ecmaVersion: "latest", sourceType: "module", allowAwaitOutsideFunction: true }) as Node;
   const src = (n: Node) => js.slice(n.start, n.end);
   const names: string[] = [];
@@ -128,8 +160,8 @@ export class Repl {
   readonly scope: Record<string, unknown>;
 
   constructor(globals: Record<string, unknown>) {
-    // __import: a cell's `import` (node:fs comes back with its reads and writes recorded as steps, effects.ts).
-    this.scope = { ...globals, __import: async (spec: string) => (await fsFor(spec)) ?? import(spec) };
+    // __import: a cell's `import`, static or dynamic (importFor).
+    this.scope = { ...globals, __import: importFor };
     installUi(this.scope);
     installCapture();
     installEffects();
