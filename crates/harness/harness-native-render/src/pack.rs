@@ -22,6 +22,10 @@ pub struct Frame {
     /// Outline glyphs (`OutlineLook`): x emboldening in ems a side, y coverage gamma dark, z light, w the emboldening's
     /// limit in device pixels.
     pub slug: [f32; 4],
+    /// x, y: the view point the target's top-left corner shows (0 for the window). A windowed overlay's own window shows
+    /// only its part of the view: `view` is then its size and `place` its corner, and the instances stay in the view's
+    /// points. z, w unused.
+    pub place: [f32; 4],
 }
 
 #[repr(C)]

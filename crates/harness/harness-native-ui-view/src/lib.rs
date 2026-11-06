@@ -267,6 +267,31 @@ pub fn leave(v: View<'_>) {
     }
 }
 
+/// Whether the pointer is crossing from `anchor` to the `plate` that floats by it: in the band between their facing edges,
+/// across both their widths (or heights, for a plate at a side). A hover card open on its anchor stays open while the
+/// pointer travels the gap onto it, as a submenu's does; nothing is hovered there, and the pointer is on neither. False
+/// when they touch or overlap (no gap to cross), or either has no place yet.
+pub fn bridged(anchor: EntityView<'_>, plate: EntityView<'_>) -> bool {
+    use harness_native_ui_input_api::PointerState;
+    use harness_native_ui_node_api::Laid;
+    let (Some(a), Some(p)) = (anchor.try_cloned::<&Laid>(), plate.try_cloned::<&Laid>()) else { return false };
+    let Some(at) = anchor.world().try_get::<&PointerState>(|s| [s.x, s.y]) else { return false };
+    let span = |a0: f32, a1: f32, p0: f32, p1: f32, v: f32| v >= a0.min(p0) && v <= a1.max(p1);
+    let gap = |a0: f32, a1: f32, p0: f32, p1: f32, v: f32| {
+        if p1 <= a0 {
+            v >= p1 && v <= a0
+        } else if p0 >= a1 {
+            v >= a1 && v <= p0
+        } else {
+            false
+        }
+    };
+    let (ax1, ay1, px1, py1) = (a.x + a.w, a.y + a.h, p.x + p.w, p.y + p.h);
+    let vertical = gap(a.y, ay1, p.y, py1, at[1]) && span(a.x, ax1, p.x, px1, at[0]);
+    let sideways = gap(a.x, ax1, p.x, px1, at[0]) && span(a.y, ay1, p.y, py1, at[1]);
+    vertical || sideways
+}
+
 /// Keep a `Lazy` container's rows to the ones in view (SwiftUI's `LazyVStack { ForEach }`): `count` rows in all, row `i`
 /// named `key(i)`. Rows whose index is in the `LazyRange` layout wrote are kept by key; a row that scrolled out is
 /// recycled for one that scrolled in (renamed, re-indexed, `update` told it is fresh) and the rest are deleted. `update`

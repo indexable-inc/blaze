@@ -181,8 +181,11 @@ ui {
   }
 
   // A floating node placed against `(AnchoredTo, node)` on its Side, flipped and clamped to stay on screen: menus, tips,
-  // hover cards, toasts, sheets. It draws in the Overlay layer, above the base.
+  // hover cards. It draws in the Overlay layer, above the base, in a window of its own (`Windowed`): it may reach past
+  // the main window's edge and is kept on the screen, as NSPopover is. What stays in the window (a toast, a sheet, a
+  // dialog over its pane) is not a ui.Overlay.
   prefab Overlay : ui.Column, Plate {
+    Windowed
     Layer: {level: Overlay}
     Side: {edge: Bottom, dx: 0, dy: 4}
     Padding: {l: 8, r: 8, t: 8, b: 8}
@@ -450,8 +453,11 @@ ui {
     Size: {w: {kind: Fit, value: 0, min: $menu_min_w, max: $menu_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $menu_pad, r: $menu_pad, t: $menu_pad, b: $menu_pad}
   }
+  // In a window of its own (`Windowed`), as NSMenu is: past the main window's edge when it must be, kept on the screen,
+  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place).
   prefab Menu : ui.MenuPlate {
     Placed
+    Windowed
     Layer: {level: Overlay}
     Side: {edge: Top, dx: 0, dy: $menu_gap}
     Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}

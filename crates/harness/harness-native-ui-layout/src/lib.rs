@@ -2,7 +2,7 @@
 //! Node), gathers its subtree into the pure solver ([`solve`]), and writes `Laid` back where it changed; a root whose inputs
 //! are what they were when it was last solved is left as it is. It keeps nothing else: text sizes come from the `Intrinsic`
 //! component the host's typesetter writes ([`typeset`]), the room from the `Viewport` singleton. Overlays (`(AnchoredTo, node)`) are laid out as roots and placed against the anchor's `Laid` of the last
-//! frame (one frame of lag while the anchor moves). Every scroll gets its content's `ScrollExtent`, and its overlay
+//! frame (one frame of lag while the anchor moves), kept in the viewport, or a `Windowed` one on the `Screen`. Every scroll gets its content's `ScrollExtent`, and its overlay
 //! scroller's parts (`ScrollerPart`) are placed over it from that, its `ScrollState` and its `ScrollerState`
 //! ([`harness_native_ui_layout_api::scroller_axis`]).
 use std::collections::HashMap;
@@ -11,9 +11,9 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{
     AlignSelf, AlignmentGuide, AnchoredTo, Aspect, Background, Centre, Collapse, FixedSize, Flex, FlexAxis, Grid, GridColumn, GridColumns, GridRow, GrowLimit, Intrinsic, Lazy,
     LaysAtRest, LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, RestSize, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
-    ScrollerPart, ScrollerState, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
+    ScrollerPart, ScrollerState, Screen, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
 };
-use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed, WrapAt};
+use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed, Windowed, WrapAt};
 use harness_native_ui_text_api::Text;
 
 pub mod solve;
@@ -273,7 +273,15 @@ pub fn install(world: WorldRef<'_>) {
             return;
         }
         let w = it.world();
-        let room = w.try_get::<&Viewport>(|v| [v.w, v.h]).unwrap_or([0.0; 2]);
+        let view = w.try_get::<&Viewport>(|v| [v.w, v.h]).unwrap_or([0.0; 2]);
+        // A windowed overlay is laid out in, placed against and kept on the screen (its own window reaches past the main
+        // one's edge); everything else in the viewport. A world with no screen has the viewport for one (Screen's doc).
+        let area = if e.has(Windowed::id()) {
+            w.try_get::<&Screen>(|s| [s.x, s.y, s.w, s.h]).unwrap_or([0.0, 0.0, view[0], view[1]])
+        } else {
+            [0.0, 0.0, view[0], view[1]]
+        };
+        let room = [area[2], area[3]];
         let mut items = Vec::new();
         let mut ghosts = Vec::new();
         let mut bars = Vec::new();
@@ -285,7 +293,8 @@ pub fn install(world: WorldRef<'_>) {
             items[root].size = [Sizing::fixed(l.w), Sizing::fixed(l.h)];
         }
         let side = anchor.map(|a| (a, e.try_cloned::<&Side>().unwrap_or_default()));
-        let key = mix(inputs(&items, room, given, side), bars.iter().flat_map(Bar::words));
+        let corner = [area[0], area[1]].map(|v| u64::from(v.to_bits()));
+        let key = mix(mix(inputs(&items, room, given, side), corner), bars.iter().flat_map(Bar::words));
         if solved.get(&*e.id()) == Some(&key) {
             return;
         }
@@ -299,7 +308,7 @@ pub fn install(world: WorldRef<'_>) {
         }
         if let Some((anchor, side)) = side {
             let size = [items[root].out.w, items[root].out.h];
-            let at = anchored(anchor, size, side, room);
+            let at = anchored(anchor, size, side, area);
             shift(&mut items, root, at[0], at[1]);
         }
         // A stand-in moves its node with the flow; the node keeps its own size (its own root lays its children out in it).

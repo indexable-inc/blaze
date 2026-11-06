@@ -5,7 +5,7 @@
 //! the PNG clips past white, so `HARNESS_NATIVE_SHOT_PFM=<path>` also writes the frame as it is, float RGB (a PFM of the
 //! extended sRGB-encoded, premultiplied values) and logs its brightest value.
 use crate::app::App;
-use crate::gpu::{Dest, Renderer};
+use crate::gpu::{Dest, Pass, Renderer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,8 @@ pub fn run(path: &str) -> Result<(), String> {
         Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
+    // The canvas is the screen: a windowed overlay is kept on it, as the window keeps one on its screen.
+    app.set_screen([0.0, 0.0, w, h]);
     app.set_gpu_clock(renderer.gpu_clock());
     app.set_media(renderer.media());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
@@ -264,8 +266,9 @@ pub fn run(path: &str) -> Result<(), String> {
             // As the window's every frame does: Media builds and steps between the frames a shot keeps.
             renderer.media().borrow_mut().prepare(&draw.media);
         }
+        let floats = floats_in_place(&mut app, &draw);
         if seq.as_ref().is_some_and(|v| t >= v[0] && t <= v[1]) {
-            renderer.render(&draw, Dest::Texture(tex.clone()));
+            render(&mut renderer, &draw, &floats, &tex);
             let px = renderer.read(&tex);
             write_png(
                 &format!("{path}-{:05}.png", (t * 1000.0).round() as u32),
@@ -277,12 +280,12 @@ pub fn run(path: &str) -> Result<(), String> {
             eprintln!("harness-native: seq t={t:.3} {} shift={:.2}", app.probe(), app.window_shift());
         }
         if t >= secs {
-            renderer.render(&draw, Dest::Texture(tex.clone()));
+            render(&mut renderer, &draw, &floats, &tex);
             break;
         }
         // F3's overlay shown: every frame goes to the GPU, so its GPU time is a real one.
         if app.stats_shown() {
-            renderer.render(&draw, Dest::Texture(tex.clone()));
+            render(&mut renderer, &draw, &floats, &tex);
         }
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -301,6 +304,28 @@ pub fn run(path: &str) -> Result<(), String> {
         eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));
     }
     Ok(())
+}
+
+/// The frame's windowed overlays (src/app/floats.rs) as a shot shows them: each draw over the whole canvas (the main
+/// frame's view, from its corner), so its picture lands where its window would put it. The system shadow a window casts
+/// is not drawn here.
+fn floats_in_place(app: &mut App, main: &crate::draw::Draw) -> Vec<crate::draw::Draw> {
+    app.take_floats()
+        .into_iter()
+        .map(|mut f| {
+            f.draw.frame.view = main.frame.view;
+            f.draw.frame.place = [0.0; 4];
+            f.draw
+        })
+        .collect() // alloc: the frame's open overlays, none or one or two
+}
+
+/// The window's draw into `tex`, then each windowed overlay's over it, in one command buffer.
+fn render(renderer: &mut Renderer, draw: &crate::draw::Draw, floats: &[crate::draw::Draw], tex: &crate::gpu::Tex) {
+    let mut passes = Vec::with_capacity(1 + floats.len()); // alloc: a pass per picture, a shot's frame
+    passes.push(Pass { draw, dest: Dest::Texture(tex.clone()), over: false });
+    passes.extend(floats.iter().map(|f| Pass { draw: f, dest: Dest::Texture(tex.clone()), over: true }));
+    renderer.render_passes(&passes);
 }
 
 /// The frame's floats (RGBA, rows top first) as a PFM: `PF`, little-endian (scale -1), RGB, rows bottom first. Logs the
