@@ -1,14 +1,19 @@
 //! Folding the sidebar's tree: a folded node (every node starts so) shows only its running children and the selected
 //! one, so a run that finishes folds away on its own; each row's disclosure chevron (left of its icon, Finder's) expands
 //! it to all of them or folds it back, as does a double click on a session's row, Left and Right while the tree has the
-//! keyboard, and Option on any of them for every sibling at once. Rows come and go on a spring (their height and
-//! opacity; the rows under them slide), and what is expanded is kept in native.json (`folds`, by stable key: `false`
-//! for expanded, as it was saved before).
+//! keyboard, and Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
+//! `tree_fold` tune of the sidebar's one spring family): a row that comes grows in from no height, pushing the rows under
+//! it down, and its words fade in and settle into place once there is room for them; one that goes lets its words go
+//! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill and glides to the
+//! row as it opens. Under Reduce Motion rows come and go at once. What is expanded is kept in native.json (`folds`, by
+//! stable key: `false` for expanded, as it was saved before).
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use harness_native_ui_motion_api::{Motion, Reveal, Shown, Target};
-use harness_native_ui_node_api::Clip;
+use crate::look::FoldIn;
+use harness_native_api::reduced;
+use harness_native_ui_layout_api::Background;
+use harness_native_ui_motion_api::Pose;
 
 /// A tree row as the view lists it: its key, its prefab and the model's row.
 pub type Listed = (String, &'static str, model::Row);
@@ -26,10 +31,55 @@ pub struct TreeFold {
     entering: HashSet<String>,
 }
 
-/// A row's height at rest, kept while it folds in or away (its `Size.h` follows its `Shown` spring).
+/// A tree row folding in or away: its height at rest (`h`), and its spring from 0 (folded, no height) to 1 (open)
+/// toward `target`. While it moves the row is `h` times the spring tall, and its parts (all but its selection pill) are
+/// posed by [`content_share`]; open again, it goes back to its own height and the component goes.
 #[derive(Component, Clone, Copy, Debug, Default)]
-pub struct RowRest {
+pub struct RowFold {
     pub h: f32,
+    pub spring: Spring,
+    pub target: f32,
+}
+
+/// How much of a folding row's content shows when the row has `x` of its height: none until it has `lead` of it, then
+/// eased in (smoothstep) as the rest opens, so words never squeeze into a sliver or fade against the height; going away
+/// the same curve runs back, the words gone before the row closes.
+fn content_share(x: f32, lead: f32) -> f32 {
+    let t = ((x - lead) / (1.0 - lead).max(1e-3)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Pose a folding row as its spring has it: its height, and its parts faded and lifted by what of them shows.
+fn shape(row: EntityView<'_>, f: RowFold, look: FoldIn) {
+    let x = f.spring.x.clamp(0.0, 1.0);
+    if let Some(mut s) = row.try_cloned::<&Size>() {
+        let h = f.h * x;
+        if (s.h.value - h).abs() > 0.01 {
+            s.h = Sizing::fixed(h);
+            row.set(s);
+        }
+    }
+    let a = content_share(x, look.lead);
+    let pose = Pose { dx: 0.0, dy: -look.rise * (1.0 - a), shrink: 0.0, fade: 1.0 - a, cut: 0.0 };
+    for part in harness_native_ui_node_api::children(row) {
+        if !part.has(Background::id()) && part.try_cloned::<&Pose>() != Some(pose) {
+            part.set(pose);
+        }
+    }
+}
+
+/// A row that has opened: its own height and its parts at rest.
+fn rest(row: EntityView<'_>, f: RowFold) {
+    row.remove(RowFold::id());
+    if let Some(mut s) = row.try_cloned::<&Size>() {
+        s.h = Sizing::fixed(f.h);
+        row.set(s);
+    }
+    for part in harness_native_ui_node_api::children(row) {
+        if part.has(Pose::id()) {
+            part.remove(Pose::id());
+        }
+    }
 }
 
 /// An object whose saved fold (native.json `folds`) was applied.
@@ -38,11 +88,15 @@ pub struct FoldRead;
 
 impl TreeFold {
     /// The rows to show: the model's `now`, with the rows that left it still in place (after the row they came after)
-    /// until they have folded away. Rows of objects that are gone leave at once.
+    /// until they have folded away. Rows of objects that are gone leave at once, and under Reduce Motion every row comes
+    /// and goes at once.
     pub fn merge(&mut self, now: Vec<Listed>, w: WorldRef<'_>) -> Vec<Listed> {
         let keys: HashSet<&str> = now.iter().map(|r| r.0.as_str()).collect();
-        let first = self.prev.is_empty();
-        self.entering = if first {
+        let still = reduced(w);
+        if still {
+            self.leaving.clear();
+        }
+        self.entering = if self.prev.is_empty() || still {
             HashSet::new()
         } else {
             let old: HashSet<&str> = self.prev.iter().map(|r| r.0.as_str()).collect();
@@ -52,7 +106,7 @@ impl TreeFold {
             w.entity_from_id(r.e).is_alive() && !w.entity_from_id(r.e).has(model::Archived::id())
         };
         for r in &self.prev {
-            if !keys.contains(r.0.as_str()) && !self.done.contains(&r.0) && alive(&r.2) {
+            if !still && !keys.contains(r.0.as_str()) && !self.done.contains(&r.0) && alive(&r.2) {
                 self.leaving.entry(r.0.clone()).or_insert_with(|| r.clone());
             }
         }
@@ -76,68 +130,56 @@ impl TreeFold {
     }
 
     /// Start each row's spring: one that came unfolds in from nothing, one that is leaving folds away, one that came
-    /// back while leaving unfolds again from where it was.
-    pub fn animate(&self, tree: EntityView<'_>, tune: Tune) {
+    /// back while leaving unfolds again from where it was. A row that starts folding is shaped at once, before this
+    /// frame's layout: a new row is laid out at no height from its first frame, so the rows under it never drop a whole
+    /// row and come back.
+    pub fn animate(&self, tree: EntityView<'_>, look: FoldIn) {
         for c in harness_native_ui_node_api::children(tree) {
             let name = c.name();
             let leaving = self.leaving.contains_key(name.as_str());
             let entering = self.entering.contains(name.as_str());
-            if !leaving && !entering && !c.has(RowRest::id()) {
+            let had = c.try_cloned::<&RowFold>();
+            if !leaving && !entering && had.is_none() {
                 continue;
             }
-            if !c.has(RowRest::id()) {
-                let h = c.try_cloned::<&Size>().map_or(28.0, |s| s.h.value);
-                c.set(RowRest { h });
-                c.set(Motion { omega: tune.omega, zeta: tune.zeta });
-                c.set(Reveal { alpha0: 0.0, dx: 0.0, dy: 0.0, scale0: 1.0 });
-                c.set(Shown {
+            let target = if leaving { 0.0 } else { 1.0 };
+            let f = match had {
+                Some(f) if f.target == target => continue,
+                Some(f) => RowFold { target, ..f },
+                None => RowFold {
+                    h: c.try_cloned::<&Size>().map_or(28.0, |s| s.h.value),
                     spring: Spring::at(if entering { 0.0 } else { 1.0 }),
-                    started: true,
-                });
-                c.add(Clip::id());
-            }
-            let want = if leaving { 0.0 } else { 1.0 };
-            if c.try_cloned::<&Target>().is_none_or(|t| t.0 != want) {
-                c.set(Target(want));
-            }
+                    target,
+                },
+            };
+            shape(c, f, look);
+            c.set(f);
         }
     }
 }
 
 impl App {
-    /// Each folding row's height follows its spring; one that has unfolded settles back to its own height, one that
-    /// has folded away is dropped from the next list.
-    pub(super) fn step_fold(&mut self) {
-        let tree = self.world.entity_from_id(self.ids.tree);
+    /// Step each folding row's spring and shape it; one that has unfolded goes back to its own height, one that has
+    /// folded away is dropped from the next list. Under Reduce Motion each lands where it is going.
+    pub(super) fn step_fold(&mut self, dt: f32) {
+        let w = self.world.world_ref();
+        let tree = w.entity_from_id(self.ids.tree);
+        let (tune, look, still) = (crate::look::tune(w, "tree_fold"), crate::look::fold_in(w), reduced(w));
         let mut done = Vec::new();
         let mut moving = false;
         for c in harness_native_ui_node_api::children(tree) {
-            let Some(rest) = c.try_cloned::<&RowRest>() else { continue };
-            let x = c.try_cloned::<&Shown>().map_or(1.0, |s| s.spring.x);
-            let target = c.try_cloned::<&Target>().map_or(1.0, |t| t.0);
-            let settled = c.try_cloned::<&Shown>().is_none_or(|s| s.spring.settled(target));
-            let h = rest.h * x.clamp(0.0, 1.0);
-            if let Some(mut s) = c.try_cloned::<&Size>()
-                && (s.h.value - h).abs() > 0.01
-            {
-                s.h = Sizing::fixed(if settled && target > 0.5 { rest.h } else { h });
-                c.set(s);
-            }
-            if settled && target > 0.5 {
-                c.remove(RowRest::id());
-                c.remove(Motion::id());
-                c.remove(Shown::id());
-                c.remove(Target::id());
-                c.remove(Reveal::id());
-                c.remove(Clip::id());
-                if let Some(mut s) = c.try_cloned::<&Size>() {
-                    s.h = Sizing::fixed(rest.h);
-                    c.set(s);
-                }
-            } else if settled {
-                done.push(c.name());
-            } else {
+            let Some(mut f) = c.try_cloned::<&RowFold>() else { continue };
+            if !still && settle(&mut f.spring, f.target, tune, dt) {
+                shape(c, f, look);
+                c.set(f);
                 moving = true;
+            } else if f.target > 0.5 {
+                rest(c, f);
+            } else {
+                f.spring = Spring::at(0.0);
+                shape(c, f, look);
+                c.set(f);
+                done.push(c.name());
             }
         }
         if !done.is_empty() || moving {
