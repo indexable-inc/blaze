@@ -37,7 +37,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, SpanRow, Sym, names::Token},
+    flight::{self, SpanRow, names::Token},
     schema::{self, Type},
 };
 

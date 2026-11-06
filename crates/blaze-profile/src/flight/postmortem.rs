@@ -74,7 +74,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         OnceLock,
-        atomic::{AtomicU64, Ordering, fence},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -1560,7 +1560,7 @@ impl Found {
 
     /// One ring's store of the dead process, by its place in the mapping: its number, its head,
     /// its owners and its bytes.
-    fn dead_ring(&self, ring: usize) -> Result<(u16, u64, Vec<Owner>, Vec<u8>), PostmortemError> {
+    fn dead_ring(&self, ring: usize) -> Result<(u16, u64, Vec<Owner>, &[u8]), PostmortemError> {
         let store = self.bytes(
             RINGS_AT + ring * STORE_BYTES,
             std::mem::size_of::<Store>(),

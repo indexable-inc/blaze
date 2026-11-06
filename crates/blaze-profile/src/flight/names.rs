@@ -522,7 +522,7 @@ impl Streams {
     fn lookup(&self, ring: u16, at: u64, sym: u32) -> Found {
         let Some(stream) = self.rings.get(usize::from(ring)) else { return Found::Forgotten };
         let (low, index) = (sym >> 12 & 0xff, usize::from((sym & 0xfff) as u16));
-        let gen = if self.plant == Plant::NoWindow {
+        let held = if self.plant == Plant::NoWindow {
             stream.gens.iter().rev().find(|it| it.generation & 0xff == low)
         } else {
             // The generation the row is in, then the one of its window with the sym's low byte.
@@ -533,7 +533,7 @@ impl Streams {
                 stream.gens.iter().rev().find(|it| it.generation == generation)
             })
         };
-        match gen.and_then(|it| it.defs.get(index)).and_then(Option::as_ref) {
+        match held.and_then(|it| it.defs.get(index)).and_then(Option::as_ref) {
             // clone: a refcount
             Some(Def::Text(text)) => Found::Text(text.clone()),
             Some(Def::Link(token)) => Found::Link(*token),
@@ -544,8 +544,8 @@ impl Streams {
     fn of_token(&self, token: Token) -> Found {
         let Some((ring, generation, index)) = parts(token) else { return Found::Forgotten };
         let Some(stream) = self.rings.get(usize::from(ring)) else { return Found::Forgotten };
-        let gen = stream.gens.iter().rev().find(|it| it.generation == generation);
-        match gen.and_then(|it| it.defs.get(usize::from(index))).and_then(Option::as_ref) {
+        let held = stream.gens.iter().rev().find(|it| it.generation == generation);
+        match held.and_then(|it| it.defs.get(usize::from(index))).and_then(Option::as_ref) {
             // clone: a refcount
             Some(Def::Text(text)) => Found::Text(text.clone()),
             // A token is a text's: a link to a link is not one a writer writes.
@@ -559,8 +559,8 @@ impl Streams {
     pub fn hot_text(&self, key: u32) -> Option<Arc<str>> {
         let stream = self.rings.get((key >> 20) as usize)?;
         let (low, index) = (key >> 12 & 0xff, (key & 0xfff) as usize);
-        let gen = stream.gens.iter().rev().find(|it| it.generation & 0xff == low)?;
-        match gen.defs.get(index)?.as_ref()? {
+        let held = stream.gens.iter().rev().find(|it| it.generation & 0xff == low)?;
+        match held.defs.get(index)?.as_ref()? {
             // clone: a refcount
             Def::Text(text) => Some(text.clone()),
             Def::Link(token) => match self.of_token(*token) {
@@ -583,10 +583,10 @@ impl Stream {
         if to <= self.to {
             return;
         }
-        if let Some(gen) = self.gens.last_mut()
-            && gen.to == self.to
+        if let Some(held) = self.gens.last_mut()
+            && held.to == self.to
         {
-            gen.to = to;
+            held.to = to;
         }
         self.to = to;
     }
@@ -603,8 +603,8 @@ impl Stream {
                     self.gens.remove(0);
                 }
                 // alloc: a generation's definitions, a reader's, kept RETAIN generations a ring
-                let gen = Gen { generation: row[0] as u32, from: i, to: i + 1, defs: Vec::new() };
-                self.gens.push(gen);
+                let held = Gen { generation: row[0] as u32, from: i, to: i + 1, defs: Vec::new() };
+                self.gens.push(held);
                 self.to = i + 1;
                 return;
             }
@@ -653,12 +653,12 @@ impl Stream {
     /// start was missed.
     fn define(&mut self, index: u16, def: Def) {
         let to = self.to;
-        let Some(gen) = self.gens.last_mut().filter(|it| it.to == to) else { return };
+        let Some(held) = self.gens.last_mut().filter(|it| it.to == to) else { return };
         let at = usize::from(index);
-        if gen.defs.len() <= at {
-            gen.defs.resize(at + 1, None);
+        if held.defs.len() <= at {
+            held.defs.resize(at + 1, None);
         }
-        gen.defs[at] = Some(def);
+        held.defs[at] = Some(def);
     }
 }
 
