@@ -4,11 +4,12 @@
 //!
 //! One system, `UiPaint`, walks every root `Node` tree (a node whose parent is not a Node), root by root, stamping the
 //! frame number the host set in the [`Paint`] singleton before `progress`; [`painted`] sorts roots by layer, `Z` and id.
+use harness_native_api::HoverAmt;
 use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{Paint, PaintKind, Painted};
 use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
 use harness_native_ui_layout_api::{Background, Overlay, ScrollExtent, ScrollState, ScrollerPart};
-use harness_native_ui_motion_api::{Drawn, Pose, Reveal, Shown};
+use harness_native_ui_motion_api::{Drawn, HoverPose, Pose, PoseAxis, Posed, Posing, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, ClipFade, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
 use harness_native_ui_text_api::{BlazeMark, Icon, Kip, Mark, Picture, Surface, Text, Vector};
 
@@ -46,7 +47,7 @@ struct Stack {
 /// Create the draw systems in the module scope; deleting that scope removes them before unloading.
 pub fn install(world: WorldRef<'_>) {
     // Last, from this pass's Laid and Drawn (layout and motion `writes` them; flecs merges them first).
-    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).reads(Pose::id()).each_iter(|it, row, _| {
+    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).reads(Pose::id()).reads(Posing::id()).each_iter(|it, row, _| {
         let e = it.entity(row);
         if e.parent().is_some_and(|p| p.has(Node::id())) {
             return;
@@ -84,12 +85,44 @@ impl Affine {
 /// Reveal's and faded by the Pose's, and its move and scale about the middle of `r` (its rectangle).
 fn shown(e: EntityView<'_>, r: Cut) -> (f32, Affine) {
     let (alpha, affine) = revealed(e, r);
-    let Some(p) = e.try_cloned::<&Pose>() else { return (alpha, affine) };
-    // Its Pose after its Reveal: scaled about its middle, then moved.
-    let sc = 1.0 - p.shrink;
+    let (alpha, affine) = match e.try_cloned::<&Pose>() {
+        // Its Pose after its Reveal: scaled about its middle, then moved.
+        Some(p) => {
+            let sc = 1.0 - p.shrink;
+            let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+            let pose = Affine { s: sc, tx: cx - cx * sc + p.dx, ty: cy - cy * sc + p.dy };
+            (alpha * (1.0 - p.fade).clamp(0.0, 1.0), pose.then(affine))
+        }
+        None => (alpha, affine),
+    };
+    // Its own sprung pose (Posed) after that, the same way.
+    let Some(p) = posed(e) else { return (alpha, affine) };
+    let sc = p.scale.max(0.0);
     let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-    let pose = Affine { s: sc, tx: cx - cx * sc + p.dx, ty: cy - cy * sc + p.dy };
-    (alpha * (1.0 - p.fade).clamp(0.0, 1.0), pose.then(affine))
+    let pose = Affine { s: sc, tx: cx - cx * sc + p.x, ty: cy - cy * sc + p.y };
+    (alpha * p.opacity.clamp(0.0, 1.0), pose.then(affine))
+}
+
+/// Where a `Posed` node's springs have it this frame (its `Posed` before they start), mixed toward its `HoverPose` by how
+/// hovered it is.
+fn posed(e: EntityView<'_>) -> Option<Posed> {
+    let to = e.try_cloned::<&Posed>()?;
+    let now = e.try_cloned::<&Posing>().map_or(to, |s| s.now(to));
+    Some(match e.try_cloned::<&HoverPose>() {
+        Some(h) => h.mix(now, e.try_cloned::<&HoverAmt>().map_or(0.0, |a| a.spring.x.clamp(0.0, 1.0))),
+        None => now,
+    })
+}
+
+/// The part of `seen` (a node's rectangle as drawn) a `Posed` node unfolded to less than whole keeps: its share along its
+/// axis, from its top or leading edge.
+fn unfolded(e: EntityView<'_>, seen: Cut) -> Option<Cut> {
+    let p = posed(e).filter(|p| p.share < 1.0)?;
+    let k = p.share.clamp(0.0, 1.0);
+    Some(match p.axis {
+        PoseAxis::Y => Cut { h: seen.h * k, ..seen },
+        PoseAxis::X => Cut { w: seen.w * k, ..seen },
+    })
 }
 
 /// The Reveal half of [`shown`].
@@ -151,6 +184,11 @@ fn walk(
         Some(PaintKind::Plate)
     } else {
         None
+    };
+    // Unfolding (a slide in or out): it and all in it are cut to the share of it shown so far.
+    let clip = match unfolded(e, Cut { x: vx, y: vy, w: frame.w * mine.s, h: frame.h * mine.s }) {
+        Some(u) => Some(u.within(clip)),
+        None => clip,
     };
     if let Some(kind) = kind {
         let c = clip.unwrap_or(Cut { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });

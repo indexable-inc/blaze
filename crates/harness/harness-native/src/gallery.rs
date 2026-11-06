@@ -48,6 +48,35 @@ pub fn genui_tree() -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("HARNESS_NATIVE_GENUI {path}: {e}"))
 }
 
+/// The cells a CellRef in the gallery's tree shows, when `HARNESS_NATIVE_GENUI_CELLS` names a JSON file of them: an
+/// object by tool call id, each `{cell, status, ui, logs, value}` as a transcript's `tool_detail` has them. Read once.
+pub fn genui_cells() -> Result<Option<&'static std::collections::HashMap<String, harness_native_model::chat::Detail>>, String> {
+    static CELLS: std::sync::OnceLock<Result<Option<std::collections::HashMap<String, harness_native_model::chat::Detail>>, String>> = std::sync::OnceLock::new();
+    let read = || -> Result<Option<_>, String> {
+        let Ok(path) = std::env::var("HARNESS_NATIVE_GENUI_CELLS") else { return Ok(None) };
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("HARNESS_NATIVE_GENUI_CELLS {path}: {e}"))?;
+        let all: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("HARNESS_NATIVE_GENUI_CELLS {path}: {e}"))?;
+        let serde_json::Value::Object(m) = all else { return Err(format!("HARNESS_NATIVE_GENUI_CELLS {path}: not an object of cells by call")) };
+        let word = |d: &serde_json::Value, k: &str| d[k].as_str().unwrap_or("").to_owned();
+        Ok(Some(
+            m.iter()
+                .map(|(call, d)| {
+                    let detail = harness_native_model::chat::Detail {
+                        cell: word(d, "cell"),
+                        status: word(d, "status"),
+                        logs: word(d, "logs"),
+                        ui: std::sync::Arc::new(d["ui"].clone()),
+                        value: std::sync::Arc::new(d["value"].clone()),
+                        ..Default::default()
+                    };
+                    (call.clone(), detail)
+                })
+                .collect(),
+        ))
+    };
+    CELLS.get_or_init(read).as_ref().map(Option::as_ref).map_err(Clone::clone)
+}
+
 /// Load the examples (or, `prims`, the primitives gallery) and make them the only thing drawn; `strip` is the title-bar strip
 /// (points) to inset.
 pub fn load(app: &App, strip: f32, prims: bool) -> Result<(), String> {
@@ -140,7 +169,7 @@ fn table_rows(w: WorldRef<'_>) {
             .collect(),
         head: true,
     };
-    let opts = Opts { look: "ui.Table", shown: data.rows.len(), action: None, open: Some(2) };
+    let opts = Opts { look: "ui.Table", shown: data.rows.len(), action: None, open: Some(2), ..Opts::default() };
     view::table(View::of(grid), &data, opts, &mut |s, st, _| Estimate.width(0, s, st));
 }
 

@@ -81,6 +81,16 @@ pub struct Pressed;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Focused;
 
+/// The part of a node that takes the pointer, in points from its laid top left (a canvas shape's bounds, where the shape
+/// is laid over its whole canvas). Without it the whole laid rectangle does.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct HitBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 /// A node that can be carried or dragged by a press-and-move.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Draggable;
@@ -124,6 +134,7 @@ hyperion_api_layouts::api_layouts! {
     "Pressed" => alias Pressed,
     "Focused" => alias Focused,
     "Draggable" => alias Draggable,
+    "HitBox" => alias HitBox,
     "Action" => alias Action,
     "Activated" => alias Activated,
     "Editable" => alias Editable,
@@ -141,6 +152,7 @@ hyperion_api_layouts::api_layouts! {
 pub fn register(world: &World) {
     world.component::<Hoverable>().writable();
     world.component::<Focusable>().writable();
+    world.component::<HitBox>().writable();
     world.component::<Pressable>().with(Hoverable::id()).with(Focusable::id()).writable();
     // A node that says how the pointer looks over it takes the pointer: the input pass hit-tests it.
     world.component::<Cursor>().with(Hoverable::id()).writable();

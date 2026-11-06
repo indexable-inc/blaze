@@ -15,7 +15,9 @@ export const ELEMENT_NAMES = [
   // Charts, and drawing: shapes in a Canvas's own coordinates, in the scene's inks (draw.ts maps SVG onto these).
   'Chart', 'Canvas', 'Group', 'Path', 'Rect', 'Circle', 'Line', 'Polyline',
   // Controls: what the person presses, drags, types and picks; each sends its event back by handler id (index.ts `dispatch`).
-  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio',
+  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio', 'ColorPicker',
+  // A plate Finder files are dropped on: it sends their absolute paths.
+  'DropZone',
   // Layout: equal columns, children over one another (a Layer pinned in a Stack), a flow that wraps, a window that scrolls, two panes.
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split',
   // Folding and tabs: the cell picks what shows under the tab row with {#if}; an Accordion keeps one Disclosure open.
@@ -24,8 +26,9 @@ export const ELEMENT_NAMES = [
   'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
   // Status: a bar, a spinner with quiet words, grey lines where text is on its way.
   'Progress', 'Loading', 'Skeleton',
-  // Pictures, chips and files: a file kind or symbol, a picture on disk, a pill, a column pressed as a whole, a file chip that opens.
-  'Icon', 'Image', 'Chip', 'Tile', 'FileRef',
+  // Pictures, chips and files: a file kind or symbol, a picture on disk, a pill, a column pressed as a whole, a file chip that opens,
+  // a row of a listing (a chip when it names a path), and another cell of this lane shown inline.
+  'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'File', 'CellRef',
   // The agent as the app shows it: Kip, the voxel mascot, live in a mood or a short run of them.
   'Kip',
   // Moving pictures: a video file or URL with its controls, and the agent's own Slang fragment shader (shader.ts), on the GPU.
@@ -45,37 +48,53 @@ export const notDrawnError = (name: string, where?: string): TypeError =>
 export const SHAPES: ReadonlySet<string> = new Set(['Path', 'Rect', 'Circle', 'Line', 'Polyline']);
 export const DRAWING: ReadonlySet<string> = new Set(['Group', ...SHAPES]);
 
-/** What every shape takes besides its geometry. */
-const SHAPE_PROPS = ['fill', 'stroke', 'strokeWidth', 'fillOpacity', 'strokeOpacity', 'transform', 'tip'] as const;
+/** What every shape takes besides its geometry: its paint, and a press that sends its `value`. */
+const SHAPE_PROPS = ['fill', 'stroke', 'strokeWidth', 'fillOpacity', 'strokeOpacity', 'transform', 'value', 'onclick', 'tip'] as const;
 
 /**
- * The props each element reads (types.ts says what each is), its events as Svelte writes them (`onselect`), and `children` when
- * markup between its tags means something. A prop not here is an error naming the element and what it takes: Svelte would
- * pass it on and nothing would read it, so `<Code code={src} />` would draw an empty plate.
+ * The props every element takes besides its own (types.ts `CommonProps`), each sent only when given (`commonWire`): its size and
+ * padding, its pose (moved, scaled about its middle, turned, faded; sprung by the app), what is over what, how it comes and goes,
+ * how it looks under the pointer, and the pointer, key and focus handlers. An element that reads one as its own keeps its own
+ * meaning: an Image's, a Chart's, a Scroll's and a Canvas's width and height, a Rect's and a Canvas Text's x and y (geometry), a
+ * Layer's x and y (its offset from its anchor). The drawing's shapes and Groups take no size or padding: their geometry is their size.
  */
-export const PROPS: Record<ElementName, readonly string[]> = {
+const SIZE_PROPS = ['width', 'height', 'minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'grow', 'padX', 'padY'] as const;
+const POSE_PROPS = ['x', 'y', 'scale', 'rotate', 'opacity'] as const;
+const MOTION_PROPS = ['z', 'flip', 'enter', 'exit', 'hover'] as const;
+/** The pointer, key and focus events every element hears, as Svelte writes them (`onpointerdown`); the wire's are `onPointerdown`. */
+export const COMMON_EVENTS = ['onpointerdown', 'onpointermove', 'onpointerup', 'ondrag', 'onwheel', 'onhover', 'onkeydown', 'onfocus', 'onblur'] as const;
+const PAGE_COMMON: readonly string[] = [...SIZE_PROPS, ...POSE_PROPS, ...MOTION_PROPS, ...COMMON_EVENTS, 'tip'];
+const DRAW_COMMON: readonly string[] = [...POSE_PROPS, ...MOTION_PROPS, ...COMMON_EVENTS, 'tip'];
+
+/**
+ * The props each element reads of its own (types.ts says what each is), its events as Svelte writes them (`onselect`), and `children`
+ * when markup between its tags means something. `PROPS` adds the common ones. A prop in neither is an error naming the element and
+ * what it takes: Svelte would pass it on and nothing would read it, so `<Code code={src} />` would draw an empty plate.
+ */
+export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Column: ['gap', 'pad', 'tip', 'children'],
   Row: ['gap', 'pad', 'tip', 'children'],
-  // x, y, anchor, size and fill are a Text's inside a Canvas (or <svg>) only (compile.ts says so at the line).
-  Text: ['text', 'tone', 'bold', 'x', 'y', 'anchor', 'size', 'fill', 'tip', 'children'],
+  // anchor, size, fill, value and onclick are a Text's inside a Canvas (or <svg>) only (compile.ts says so at the line); its x and y
+  // are its point there, and its pose elsewhere.
+  Text: ['text', 'tone', 'bold', 'x', 'y', 'anchor', 'size', 'fill', 'value', 'onclick', 'tip', 'children'],
   Markdown: ['text', 'tip', 'children'],
   Code: ['text', 'lang', 'tip', 'children'],
-  Table: ['columns', 'rows', 'tip'],
+  Table: ['columns', 'rows', 'query', 'onselect', 'onopen', 'tip'],
   Badge: ['text', 'tone', 'tip', 'children'],
   Stat: ['label', 'value', 'note', 'tone', 'tip'],
   Card: ['title', 'gap', 'pad', 'tip', 'children'],
   Divider: ['tip'],
   Spacer: ['size', 'tip'],
   Chart: ['kind', 'data', 'labels', 'series', 'height', 'unit', 'center', 'caption', 'hole', 'pop', 'sep', 'fillOpacity', 'tone', 'legend', 'onselect', 'tip'],
-  Canvas: ['view', 'width', 'height', 'tip', 'children'],
-  Group: ['transform', 'opacity', 'tip', 'children'],
+  Canvas: ['view', 'width', 'height', 'value', 'onclick', 'tip', 'children'],
+  Group: ['transform', 'opacity', 'value', 'onclick', 'tip', 'children'],
   Path: ['d', 'fillRule', ...SHAPE_PROPS],
   Rect: ['x', 'y', 'width', 'height', 'radius', ...SHAPE_PROPS],
   Circle: ['cx', 'cy', 'r', 'rx', 'ry', ...SHAPE_PROPS],
   Line: ['x1', 'y1', 'x2', 'y2', ...SHAPE_PROPS],
   Polyline: ['points', 'closed', ...SHAPE_PROPS],
-  // The controls take exactly what the app reads of them (CONTROLS below says what goes on the wire), so no tip.
-  Button: ['label', 'tone', 'disabled', 'onclick', 'children'],
+  // The controls take exactly what the app reads of them (`elementWire` says what goes on the wire), and the common props.
+  Button: ['label', 'tone', 'value', 'disabled', 'onclick', 'children'],
   // `id` is what a Shader's '@id' uniform names: it reads the control's live value.
   Toggle: ['value', 'label', 'disabled', 'id', 'onchange'],
   Checkbox: ['checked', 'label', 'disabled', 'id', 'onchange'],
@@ -86,29 +105,34 @@ export const PROPS: Record<ElementName, readonly string[]> = {
   Select: ['options', 'selected', 'placeholder', 'disabled', 'onchange'],
   Choice: ['options', 'selected', 'disabled', 'onchange'],
   Radio: ['options', 'selected', 'row', 'disabled', 'onchange'],
-  // Layout, folding, floating, status and pictures: each takes exactly what the app reads of it (`elementWire` says what goes), so no tip.
+  ColorPicker: ['options', 'selected', 'label', 'disabled', 'onchange'],
+  DropZone: ['label', 'ondrop'],
+  // Layout, folding, floating, status and pictures: each takes exactly what the app reads of it (`elementWire` says what goes).
   Grid: ['columns', 'fit', 'gap', 'pad', 'children'],
-  Stack: ['children'],
-  Layer: ['anchor', 'x', 'y', 'z', 'children'],
+  Stack: ['align', 'children'],
+  Layer: ['anchor', 'x', 'y', 'z', 'value', 'onclick', 'children'],
   Wrap: ['gap', 'children'],
   Scroll: ['height', 'horizontal', 'children'],
   Split: ['ratio', 'vertical', 'onchange', 'children'],
   Tabs: ['tabs', 'selected', 'onchange', 'children'],
   Accordion: ['children'],
   Disclosure: ['title', 'open', 'ontoggle', 'children'],
-  Popover: ['placement', 'open', 'ontoggle', 'children'],
-  Menu: ['items', 'open', 'onselect', 'ontoggle', 'children'],
+  Popover: ['placement', 'align', 'trigger', 'open', 'ontoggle', 'children'],
+  Menu: ['items', 'context', 'open', 'onselect', 'ontoggle', 'children'],
   Dialog: ['title', 'open', 'dismissable', 'onclose', 'children'],
   Sheet: ['title', 'open', 'dismissable', 'onclose', 'children'],
   Toast: ['text', 'tone', 'duration', 'ondismiss', 'children'],
   Progress: ['value', 'max', 'label'],
   Loading: ['label', 'children'],
   Skeleton: ['lines'],
-  Icon: ['name'],
+  Icon: ['name', 'kind'],
   Image: ['src', 'width', 'height', 'fit', 'alt', 'id'],
   Chip: ['label', 'selected', 'value', 'onclick', 'children'],
   Tile: ['gap', 'pad', 'value', 'onclick', 'children'],
-  FileRef: ['path', 'line'],
+  FileRef: ['path', 'line', 'name', 'kind', 'onclick'],
+  // A listing's row; given a path it is the FileRef chip of that file (tree.ts), and takes what a FileRef takes.
+  File: ['name', 'kind', 'size', 'modified', 'value', 'onclick', 'path', 'line'],
+  CellRef: ['task', 'title'],
   Kip: ['mood', 'size'],
   Video: ['src', 'poster', 'autoplay', 'loop', 'muted', 'controls', 'width', 'height', 'aspect', 'fit', 'id', 'paused', 'currentTime', 'ontimeupdate', 'onended', 'onplay', 'onpause'],
   // `sourceLine` is compile.ts's (the cell line the source between the tags starts on), for the lines of a compile error.
@@ -116,8 +140,16 @@ export const PROPS: Record<ElementName, readonly string[]> = {
 };
 /** Props the kernel sets itself, never listed as what an element takes. */
 const INTERNAL: ReadonlySet<string> = new Set(['sourceLine']);
-/** The props only a Text inside a Canvas reads. */
-export const CANVAS_TEXT_PROPS: ReadonlySet<string> = new Set(['x', 'y', 'anchor', 'size', 'fill']);
+/** The elements of a drawing that take no size or padding of the common props: their geometry is their size. */
+const DRAWN_ONLY: ReadonlySet<string> = new Set(['Group', 'Path', 'Rect', 'Circle', 'Line', 'Polyline']);
+/** The props each element reads: its own, then the common ones it does not read as its own. */
+export const PROPS: Record<ElementName, readonly string[]> = { ...OWN_PROPS };
+for (const element of ELEMENT_NAMES) {
+  const own = OWN_PROPS[element];
+  PROPS[element] = [...own, ...(DRAWN_ONLY.has(element) ? DRAW_COMMON : PAGE_COMMON).filter(name => !own.includes(name))];
+}
+/** The props only a Text inside a Canvas reads (its x and y are its point there, and its pose elsewhere). */
+export const CANVAS_TEXT_PROPS: ReadonlySet<string> = new Set(['anchor', 'size', 'fill', 'value', 'onclick']);
 
 export type Tone = 'ink' | 'muted' | 'strong' | 'error' | 'accent' | 'success' | 'warning';
 /** Every tone, as a record so the type and this list cannot drift apart. */
@@ -172,6 +204,35 @@ export const PLACEMENTS = ['top', 'bottom', 'left', 'right'] as const;
 export const IMAGE_FITS = ['contain', 'cover'] as const;
 /** The tones a Button takes: its plate is plain when none is said. */
 export const BUTTON_TONES = ['accent', 'error', 'success', 'warning', 'muted'] as const;
+/** Where a Popover's float lines up with its trigger, and what opens it. */
+export const POPOVER_ALIGNS = ['start', 'center'] as const;
+export const POPOVER_TRIGGERS = ['click', 'hover'] as const;
+/**
+ * The file kinds an Icon, a FileRef and a File take as `kind` (harness-native media.rs `KINDS`, each drawn as its glyph in the file
+ * palette), and the short ways of saying one that media.rs `kind_named` reads as it.
+ */
+export const FILE_KINDS = [
+  'rust', 'typescript', 'tsx', 'javascript', 'json', 'toml', 'yaml', 'markdown', 'nix', 'shell', 'python', 'go', 'html', 'css', 'image',
+  'lock', 'git', 'folder', 'folder_open', 'text',
+] as const;
+const FILE_KIND_ALIASES = [
+  'rs', 'ts', 'js', 'jsx', 'mjs', 'md', 'yml', 'sh', 'bash', 'zsh', 'py', 'package', 'picture', 'photo', 'png', 'jpg', 'svg', 'dir',
+  'directory', 'folder-open', 'file', 'generic', 'doc', 'txt',
+] as const;
+const isFileKind = (v: unknown): boolean => typeof v === 'string' && ([...FILE_KINDS, ...FILE_KIND_ALIASES] as readonly string[]).includes(v.toLowerCase());
+/** The most swatches a ColorPicker shows. */
+export const MAX_SWATCHES = 24;
+/** A colour as a ColorPicker sends it: `#rrggbb`. */
+const HEX = /^#[0-9a-fA-F]{6}$/;
+/** The transitions the app springs (Svelte's names: `transition:fly`, `in:fade`, ...), and a transition's fields. */
+export const TRANSITIONS = ['fly', 'fade', 'scale', 'slide'] as const;
+const TRANSITION_KEYS = ['kind', 'x', 'y', 'start', 'opacity', 'axis', 'ms', 'delay'];
+/** The attribute compile.ts gives an element for the transition it plays as it goes; the renderer keeps it off the wire (svelte.ts). */
+export const OUTRO = '__outro';
+/** What `hover` takes: the pose and paint under the pointer. */
+const HOVER_KEYS = ['x', 'y', 'scale', 'rotate', 'opacity', 'fill', 'stroke', 'tone'];
+/** The most a `scale` is: eight times its size. */
+export const MAX_SCALE = 8;
 
 const said = (v: unknown): string => typeof v === 'string' || (typeof v === 'object' && v !== null) ? JSON.stringify(v) : String(v);
 /** `name=value` as markup would say it: `fill="#fff"`, `width={-2}`. */
@@ -224,7 +285,7 @@ export function tableError(columns: unknown, rows: unknown, where?: string): Typ
  */
 export const BINDABLE: Partial<Record<string, readonly string[]>> = {
   Input: ['value'], Slider: ['value'], Toggle: ['value'], NumberField: ['value'], TextArea: ['value'], Checkbox: ['checked'],
-  Choice: ['selected'], Radio: ['selected'], Select: ['selected'],
+  Choice: ['selected'], Radio: ['selected'], Select: ['selected'], ColorPicker: ['selected'],
   Split: ['ratio'], Tabs: ['selected'], Disclosure: ['open'], Popover: ['open'], Menu: ['open'], Dialog: ['open'], Sheet: ['open'],
   Video: ['currentTime', 'paused'],
 };
@@ -236,7 +297,7 @@ export const BINDABLE: Partial<Record<string, readonly string[]>> = {
  */
 export const BIND_ALIAS: Partial<Record<string, Readonly<Record<string, string>>>> = {
   Toggle: { checked: 'value' }, Checkbox: { value: 'checked' }, Select: { value: 'selected' }, Choice: { value: 'selected' },
-  Radio: { value: 'selected', group: 'selected' }, Tabs: { value: 'selected' },
+  Radio: { value: 'selected', group: 'selected' }, Tabs: { value: 'selected' }, ColorPicker: { value: 'selected' },
 };
 
 /** An event that writes a binding back (`prop`, the element's first binding when not said), and what it writes when not the event's value. */
@@ -277,9 +338,9 @@ export const WORDS_ONLY: ReadonlySet<string> = new Set(['Button', 'Chip', 'Loadi
 export const article = (word: string): string => /^[AEIOU]/.test(word) ? 'an' : 'a';
 const squash = (name: string) => name.toLowerCase().replace(/[-_:]/g, '');
 
-/** What an element takes, as an error says it: `a Code takes text, lang (its text is also its children)`. */
+/** What an element takes, as an error says it: `a Code takes text, lang (its text is also its children)`; the common props are not listed. */
 export function takes(element: ElementName): string {
-  const props = PROPS[element].filter(name => name !== 'children' && name !== 'tip' && !INTERNAL.has(name));
+  const props = OWN_PROPS[element].filter(name => name !== 'children' && name !== 'tip' && !INTERNAL.has(name));
   const list = props.length ? `takes ${props.join(', ')}` : 'takes only tip';
   const kids = !PROPS[element].includes('children') ? '' : TEXT_PROP[element] ? ` (its ${TEXT_PROP[element]} is also its children)` : ' (and children)';
   return `${article(element)} ${element} ${list}${kids}`;
@@ -289,7 +350,7 @@ export function takes(element: ElementName): string {
 export function unknownPropError(element: ElementName, name: string, value: unknown, where?: string): TypeError {
   const meant = PROPS[element].find(prop => squash(prop) === squash(name) || squash(prop) === squash(name.replace(/^stroke-?/, 'stroke')));
   const hint = name === 'children' ? `${article(element)} ${element} takes no children: ${takes(element)}`
-    : `${takes(element)}${meant ? `; did you mean ${meant}?` : ''}`;
+    : `${takes(element)}${meant ? `; did you mean ${meant}?` : ''}; it also takes the common props, ${PROPS[element].filter(prop => !OWN_PROPS[element].includes(prop)).join(', ')}`;
   // As the markup wrote it: text as text, a bare attribute bare, anything else (an expression, an event, a spread's value) as `{...}`.
   const shown = name === 'children' ? '' : value === true ? ` ${name}` : typeof value === 'string' && !/^on/.test(name) ? ` ${written(name, value)}` : ` ${name}={...}`;
   return new TypeError(`<${element}${shown}> has no prop ${JSON.stringify(name)}${at(where)}: ${hint}`);
@@ -423,8 +484,108 @@ export function optionsOf(value: unknown): WireOption[] | string {
 }
 const options: Rule = v => { const o = optionsOf(v); return typeof o === 'string' ? o : undefined; };
 
+/** A transition as the app springs it: every field said, with Svelte's defaults (svelte.ts `trans` maps Svelte's own params onto it). */
+export interface Transition { kind: typeof TRANSITIONS[number]; x: number; y: number; start: number; opacity: number; axis: 'x' | 'y'; ms: number; delay: number }
+const TRANSITION_SAID = `{kind, x, y, start, opacity, axis, ms, delay} with kind one of ${TRANSITIONS.join(', ')}: enter={{kind: 'fly', y: 8, ms: 200}}, or in:fly={{ y: 8 }}`;
+
+/** The problem with `value` as an `enter` or `exit`, or the transition with every field filled in. */
+export function transitionOf(value: unknown): Transition | string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return `a transition, ${TRANSITION_SAID}`;
+  const t = value as Record<string, unknown>;
+  const stray = Object.keys(t).find(key => !TRANSITION_KEYS.includes(key));
+  if (stray) return `a transition, which has no ${JSON.stringify(stray)}${stray === 'duration' ? ' (its length is ms)' : ''}: ${TRANSITION_SAID}`;
+  if (!(TRANSITIONS as readonly string[]).includes(t.kind as string)) return `a transition whose kind is one of ${TRANSITIONS.join(', ')}, not ${said(t.kind)}`;
+  const n = (key: string, otherwise: number, test: (n: number) => boolean, wants: string): number | string => {
+    if (t[key] === undefined || t[key] === null) return otherwise;
+    return numeric(t[key]) && test(asNumber(t[key])) ? asNumber(t[key]) : `a transition whose ${key} is ${wants}, not ${said(t[key])}`;
+  };
+  if (t.axis !== undefined && t.axis !== 'x' && t.axis !== 'y') return `a transition whose axis is x or y, not ${said(t.axis)}`;
+  const fields = {
+    x: n('x', 0, () => true, 'a number of points'), y: n('y', 0, () => true, 'a number of points'),
+    start: n('start', 0, v => v >= 0 && v <= MAX_SCALE, `a scale from 0 to ${MAX_SCALE}`), opacity: n('opacity', 0, v => v >= 0 && v <= 1, 'a number from 0 to 1'),
+    ms: n('ms', 400, v => v >= 0, 'milliseconds, 0 or more'), delay: n('delay', 0, v => v >= 0, 'milliseconds, 0 or more'),
+  };
+  const bad = Object.values(fields).find(v => typeof v === 'string');
+  if (typeof bad === 'string') return bad;
+  const f = fields as Record<keyof typeof fields, number>;
+  return { kind: t.kind as Transition['kind'], x: f.x, y: f.y, start: f.start, opacity: f.opacity, axis: t.axis === 'x' ? 'x' : 'y', ms: f.ms, delay: f.delay };
+}
+const transition: Rule = v => { const t = transitionOf(v); return typeof t === 'string' ? t : undefined; };
+
+/** The problem with `value` as a `hover`, or the hover as the app reads it (numbers as numbers). */
+export function hoverOf(value: unknown): Record<string, unknown> | string {
+  const wants = `how it looks under the pointer, {scale: 1.05, y: -2, fill: 'accent'} (of ${HOVER_KEYS.join(', ')})`;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return wants;
+  const o = value as Record<string, unknown>;
+  const stray = Object.keys(o).find(key => !HOVER_KEYS.includes(key));
+  if (stray) return `${wants}, which has no ${JSON.stringify(stray)}`;
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(o)) {
+    if (v === undefined || v === null) continue;
+    if (key === 'fill' || key === 'stroke') {
+      if (!isInk(v)) return `how it looks under the pointer, whose ${key} is an ink (${INKS_SAID}), not ${said(v)}`;
+      out[key] = v;
+    } else if (key === 'tone') {
+      if (!isTone(v)) return `how it looks under the pointer, whose tone is one of ${TONES.join(', ')}, not ${said(v)}`;
+      out[key] = v;
+    } else {
+      const ok = numeric(v) && (key === 'scale' ? asNumber(v) >= 0 && asNumber(v) <= MAX_SCALE : key === 'opacity' ? asNumber(v) >= 0 && asNumber(v) <= 1 : true);
+      if (!ok) return `how it looks under the pointer, whose ${key} is ${key === 'scale' ? `a number from 0 to ${MAX_SCALE}` : key === 'opacity' ? 'a number from 0 to 1' : 'a number'}, not ${said(v)}`;
+      out[key] = asNumber(v);
+    }
+  }
+  return out;
+}
+const hover: Rule = v => { const h = hoverOf(v); return typeof h === 'string' ? h : undefined; };
+
+const fileKind: Rule = v => isFileKind(v) ? undefined : `a file kind, one of ${FILE_KINDS.join(', ')} (or ${FILE_KIND_ALIASES.join(', ')})`;
+
+/** A colour a ColorPicker shows or sends: `#rrggbb`, or a tone (the app's ink of it); hex as lower case. Undefined when it is neither. */
+function colorOf(value: unknown): string | undefined {
+  if (typeof value === 'string' && HEX.test(value)) return value.toLowerCase();
+  return isTone(value) ? value : undefined;
+}
+const COLOR_SAID = `a colour, "#rrggbb" or a tone (${TONES.join(', ')})`;
+const color: Rule = v => colorOf(v) === undefined ? COLOR_SAID : undefined;
+/** The problem with a ColorPicker's `options`, or its swatches as the app reads them. */
+export function colorsOf(value: unknown): string[] | string {
+  if (!Array.isArray(value) || value.length === 0) return `a list of 1 to ${MAX_SWATCHES} colours, each "#rrggbb" or a tone: options={['#ff3b30', '#34c759', 'accent']}`;
+  if (value.length > MAX_SWATCHES) return `at most ${MAX_SWATCHES} colours (it has ${value.length}); its last well picks any other`;
+  const out: string[] = [];
+  for (const [i, v] of value.entries()) {
+    const c = colorOf(v);
+    if (c === undefined) return `a list of colours whose [${i}] is ${said(v)}, not ${COLOR_SAID}`;
+    out.push(c);
+  }
+  return out;
+}
+const colors: Rule = v => { const c = colorsOf(v); return typeof c === 'string' ? c : undefined; };
+
+/** A cell of this lane as `task` names it: `'t3'` or `3`. */
+export function taskOf(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return `t${value}`;
+  if (typeof value === 'string' && /^t?[1-9]\d*$/.test(value.trim())) return value.trim().startsWith('t') ? value.trim() : `t${value.trim()}`;
+  return undefined;
+}
+const task: Rule = v => taskOf(v) === undefined ? `a cell of this lane, as its reply names it: task="t3" or task={3}` : undefined;
+
+/** A File's `modified`: words as given, or a time (a Date, or milliseconds since the epoch as `ls()` gives) as `2026-11-05 14:03`. */
+export function modifiedOf(value: unknown): string {
+  if (typeof value === 'string') return value;
+  const date = value instanceof Date ? value : new Date(asNumber(value));
+  const two = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+const modified: Rule = v => typeof v === 'string' || (v instanceof Date && Number.isFinite(v.getTime())) || (typeof v === 'number' && Number.isFinite(v))
+  ? undefined : 'a time: words ("2 hours ago"), a Date, or milliseconds since the epoch (as ls() gives)';
+
 /** What each prop must be, on every element; a prop not here (and not in `ELEMENT_RULES`) is not checked beyond being one it reads. */
-const COMMON_RULES: Record<string, Rule> = { gap: size, pad: size, size, width: size, height: size, tip: words };
+const COMMON_RULES: Record<string, Rule> = {
+  gap: size, pad: size, size, width: size, height: size, minWidth: size, maxWidth: size, minHeight: size, maxHeight: size, grow: flag, padX: size, padY: size,
+  x: number, y: number, rotate: number, opacity: share, z: number,
+  scale: numeral(n => n >= 0 && n <= MAX_SCALE, `a number from 0 to ${MAX_SCALE} (1 is its own size)`),
+  flip: flag, enter: transition, exit: transition, hover, tip: words,
+};
 
 const SHAPE_RULES: Record<string, Rule> = {
   fill: ink, stroke: ink, strokeWidth: size, fillOpacity: share, strokeOpacity: share, transform: affine,
@@ -435,6 +596,7 @@ export const TEXT_ANCHORS = ['start', 'middle', 'end'] as const;
 /** What a prop must be on one element. */
 const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
   Text: { bold: flag, x: number, y: number, anchor: oneOf(TEXT_ANCHORS), fill: ink },
+  Table: { query: words },
   Chart: {
     kind: oneOf(CHART_KINDS), hole: share, pop: size, sep: size, fillOpacity: share, unit: words, center: words, caption: words, legend: flag,
     labels: v => Array.isArray(v) && v.every(l => typeof l === 'string' || typeof l === 'number') ? undefined : `a list of words, labels={['a', 'b']}`,
@@ -464,24 +626,32 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
   Select: { options, placeholder: label, disabled: flag },
   Choice: { options, disabled: flag },
   Radio: { options, row: flag, disabled: flag },
+  ColorPicker: { options: colors, selected: color, label, disabled: flag },
+  DropZone: { label },
   Grid: { columns: whole(1, MAX_COLUMNS, 'columns'), fit: numeral(n => n > 0, 'a number of points above 0 (the narrowest a column may be)') },
+  Stack: { align: oneOf(LAYER_ANCHORS) },
   Layer: { anchor: oneOf(LAYER_ANCHORS), x: number, y: number, z: number },
   Scroll: { height: numeral(n => n > 0 && n <= MAX_SCROLL, `a number of points above 0, at most ${MAX_SCROLL}`), horizontal: flag },
   Split: { ratio: numeral(n => n >= 0.05 && n <= 0.95, 'a share of the room from 0.05 to 0.95'), vertical: flag },
   Tabs: { tabs },
   Disclosure: { title: label, open: flag },
-  Popover: { placement: oneOf(PLACEMENTS), open: flag },
-  Menu: { items, open: flag },
+  Popover: { placement: oneOf(PLACEMENTS), align: oneOf(POPOVER_ALIGNS), trigger: oneOf(POPOVER_TRIGGERS), open: flag },
+  Menu: { items, context: flag, open: flag },
   Dialog: { title: label, open: flag, dismissable: flag },
   Sheet: { title: label, open: flag, dismissable: flag },
   Toast: { text, duration: numeral(n => n >= 0, 'milliseconds, 0 or more (0 stays until it is pressed)') },
   Progress: { value: number, max: positive, label },
   Loading: { label },
   Skeleton: { lines: whole(1, MAX_SKELETON, 'lines') },
-  Icon: { name: label },
+  Icon: { name: label, kind: fileKind },
   Image: { src: file, width: positive, height: positive, fit: oneOf(IMAGE_FITS), alt: label, id },
   Chip: { label, selected: flag },
-  FileRef: { path: file, line: whole(1, Number.MAX_SAFE_INTEGER, 'a line') },
+  FileRef: { path: file, line: whole(1, Number.MAX_SAFE_INTEGER, 'a line'), name: label, kind: fileKind },
+  File: {
+    name: label, kind: fileKind, size: numeral(n => Number.isInteger(n) && n >= 0, 'a whole number of bytes, 0 or more'), modified,
+    path: file, line: whole(1, Number.MAX_SAFE_INTEGER, 'a line'),
+  },
+  CellRef: { task, title: label },
   Kip: {
     mood: v => { const m = kipMoodOf(v); return typeof m === 'string' ? m : undefined; },
     size: numeral(n => n >= KIP_SIZE.min && n <= KIP_SIZE.max, `points from ${KIP_SIZE.min} to ${KIP_SIZE.max} (how tall Kip stands)`),
@@ -498,9 +668,9 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */
 export const WIRED: ReadonlySet<string> = new Set([
-  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio',
+  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio', 'ColorPicker', 'DropZone',
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split', 'Tabs', 'Accordion', 'Disclosure', 'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
-  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'Kip', 'Video', 'Shader',
+  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'File', 'CellRef', 'Kip', 'Video', 'Shader',
 ]);
 
 /** Two values the same as JSON says them (a tab's value against the selected one). */
@@ -509,8 +679,8 @@ const same = (a: unknown, b: unknown): boolean => a === b || JSON.stringify(a) =
 /**
  * An element's props as the app reads them (the harness app's genui.rs is written from this exact shape), once all are known:
  * defaults filled in, words that are numbers made numbers, options, tabs and rows as objects, an Image's or a FileRef's file as an
- * absolute path (tree.ts resolves it), and its handler ids as `onClick`, `onChange`, `onSubmit`, `onToggle`, `onSelect`, `onClose` and
- * `onDismiss`. Throws the error naming what is wrong (a Button with no label, a Slider whose min is not below its max, a Grid with both
+ * absolute path (tree.ts resolves it), and its handler ids as `onClick`, `onChange`, `onSubmit`, `onToggle`, `onSelect`, `onClose`,
+ * `onDismiss` and `onDrop`. The common props are not here: `commonWire` adds them after. Throws the error naming what is wrong (a Button with no label, a Slider whose min is not below its max, a Grid with both
  * columns and fit) at `where`.
  */
 export function elementWire(element: string, props: Record<string, unknown>, where?: string): Record<string, unknown> {
@@ -532,6 +702,8 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       if (words.length > MAX_LABEL) throw fail(`has a label of ${words.length} characters; a Button's is at most ${MAX_LABEL}`);
       out.label = words;
       put('tone', 'disabled', 'onClick');
+      // What a press sends; the app sends null when there is none.
+      if (props.value !== undefined && props.value !== null) out.value = props.value;
       break;
     }
     case 'Toggle':
@@ -585,6 +757,18 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       put('disabled', 'onChange');
       break;
     }
+    case 'ColorPicker': {
+      // The tone palette when it says no colours; the last well (the system colour panel) picks any other.
+      const list = given('options') ? colorsOf(props.options) : [...TONES];
+      if (typeof list === 'string') throw fail(`options are not ${list}`);
+      out.options = list;
+      out.selected = given('selected') ? colorOf(props.selected) ?? null : null;
+      put('label', 'disabled', 'onChange');
+      break;
+    }
+    case 'DropZone':
+      put('label', 'onDrop');
+      break;
     case 'Grid':
       if (given('columns') && given('fit')) throw fail('has both columns and fit', 'a Grid has columns={3} (that many equal columns) or fit={160} (as many as fit, each at least that wide), not both');
       if (given('fit')) out.fit = num('fit');
@@ -593,6 +777,8 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.pad = num('pad') ?? 0;
       break;
     case 'Stack':
+      put('align');
+      break;
     case 'Accordion':
       break;
     case 'Layer':
@@ -600,6 +786,8 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.x = num('x') ?? 0;
       out.y = num('y') ?? 0;
       out.z = num('z') ?? 0;
+      if (props.value !== undefined && props.value !== null) out.value = props.value;
+      put('onClick');
       break;
     case 'Wrap':
       out.gap = num('gap') ?? 8;
@@ -631,6 +819,8 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       break;
     case 'Popover':
       out.placement = given('placement') ? props.placement : 'bottom';
+      out.align = given('align') ? props.align : 'start';
+      out.trigger = given('trigger') ? props.trigger : 'click';
       out.open = yes('open', false);
       put('onToggle');
       break;
@@ -639,6 +829,7 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       const list = itemsOf(props.items);
       if (typeof list === 'string') throw fail(`items are not ${list}`);
       out.items = list;
+      out.context = yes('context', false);
       out.open = yes('open', false);
       put('onSelect', 'onToggle');
       break;
@@ -676,7 +867,9 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.lines = num('lines') ?? 3;
       break;
     case 'Icon':
-      out.name = needs('name', `say name="rust" (a file kind) or a symbol's name`);
+      if (!given('name') && !given('kind')) throw fail('has no name or kind', `say kind="rust" (a file kind, drawn as its glyph) or name="..." (a symbol's name or a file kind)`);
+      if (given('name')) out.name = String(props.name);
+      put('kind');
       break;
     case 'Image':
       if (!given('src')) throw fail('has no src', 'src="/abs/path/picture.png" (a file on disk; a relative path is from the working directory)');
@@ -706,6 +899,26 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       if (!given('path')) throw fail('has no path', 'path="/abs/path/file.rs" (a relative path is from the working directory)');
       out.path = props.path;
       if (given('line')) out.line = num('line');
+      if (given('name')) out.name = String(props.name);
+      put('kind', 'onClick');
+      break;
+    case 'File': {
+      // A File given a path went as a FileRef (tree.ts); this is a row of a listing. A trailing / names a folder.
+      const name = needs('name', 'say name="notes.md" (a trailing / is a folder, name="src/"), or path="/abs/file" for a chip that opens it');
+      if (name.length > MAX_LABEL) throw fail(`has a name of ${name.length} characters; a File's is at most ${MAX_LABEL}`);
+      out.name = name;
+      put('kind');
+      if (given('size')) out.size = num('size');
+      if (given('modified')) out.modified = modifiedOf(props.modified);
+      if (props.value !== undefined && props.value !== null) out.value = props.value;
+      put('onClick');
+      break;
+    }
+    case 'CellRef':
+      // tree.ts resolved the task to the tool call that ran it, or refused it.
+      out.task = props.task;
+      out.call = props.call;
+      if (given('title')) out.title = String(props.title);
       break;
     case 'Kip': {
       // Waves when no mood is said; the rules checked the words, so this reads them once more as the app does.
@@ -764,6 +977,37 @@ export function placeError(element: string, parent: string | undefined, where?: 
   if (element !== 'Layer' || parent === 'Stack') return undefined;
   const under = parent === undefined || parent.startsWith('#') ? 'at the top of the cell' : `in ${article(parent)} ${parent}`;
   return new TypeError(`<Layer> ${under}${at(where)}: a Layer is pinned inside a Stack, <Stack><Image .../><Layer anchor="top-right">...</Layer></Stack>`);
+}
+
+/** The events of more than one word, as the wire spells them (camel case: `ontimeupdate` is `onTimeUpdate`). */
+const EVENT_WORDS: Readonly<Record<string, string>> = { timeupdate: 'TimeUpdate' };
+
+/** The common props an element takes and does not read as its own, by their names on the wire (`onPointerdown` for `onpointerdown`). */
+const COMMON_WIRE = new Map<string, Array<[string, string]>>(ELEMENT_NAMES.map(element => [element,
+  PROPS[element].filter(name => !OWN_PROPS[element].includes(name) && PAGE_COMMON.includes(name))
+    .map(name => [name, /^on/.test(name) ? wireName(name.slice(2)) : name] as [string, string])]));
+
+/**
+ * The common props of an element (`PAGE_COMMON`) as the app reads them, put in `out` (its wire so far) when given: numbers as numbers,
+ * flags as flags, an `enter` or `exit` with every field filled in (`transitionOf`), a `hover` checked, and each handler as its id. Run
+ * on every element after `elementWire` or draw.ts `drawWire`, which leave them out or pass them as given. `props` are the element's as
+ * plain JSON; an error names `where`.
+ */
+export function commonWire(element: string, props: Record<string, unknown>, out: Record<string, unknown>, where?: string): Record<string, unknown> {
+  for (const [name, wire] of COMMON_WIRE.get(element) ?? []) {
+    const value = props[wire];
+    if (value === undefined || value === null) continue;
+    if (name === 'enter' || name === 'exit') {
+      const t = transitionOf(value);
+      if (typeof t === 'string') throw new TypeError(`${written(name, value)} on <${element}> is not ${t}${at(where)}`);
+      out[wire] = t;
+    } else if (name === 'hover') {
+      const h = hoverOf(value);
+      if (typeof h === 'string') throw new TypeError(`${written(name, value)} on <${element}> is not ${h}${at(where)}`);
+      out[wire] = h;
+    } else out[wire] = wireValue(element, name, value);
+  }
+  return out;
 }
 
 const ruleFor = (element: string, name: string): Rule | undefined => ELEMENT_RULES[element as ElementName]?.[name] ?? COMMON_RULES[name];
@@ -900,10 +1144,8 @@ export interface Attachment {
 /** The last handler id handed out, across every tree: a tree that replaces another never answers the old one's ids. */
 let handlerSeq = 0;
 
-/** The events of more than one word, as the wire spells them (camel case: `ontimeupdate` is `onTimeUpdate`). */
-const EVENT_WORDS: Readonly<Record<string, string>> = { timeupdate: 'TimeUpdate' };
 /** The prop the app knows an event by: `onclick={...}` (Svelte's `click` event) is `onClick` on the wire. */
-export const wireName = (type: string): string => `on${EVENT_WORDS[type] ?? `${type.slice(0, 1).toUpperCase()}${type.slice(1)}`}`;
+export function wireName(type: string): string { return `on${EVENT_WORDS[type] ?? `${type.slice(0, 1).toUpperCase()}${type.slice(1)}`}`; }
 
 export type Kind = 'element' | 'text' | 'comment' | 'fragment';
 

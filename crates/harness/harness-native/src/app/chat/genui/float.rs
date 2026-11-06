@@ -7,7 +7,8 @@
 //! (genui/control.rs) send that. A modal's transcript row is kept while the modal is open, in view or not (chat.rs).
 use super::*;
 use control::{Float, Toast, arm, handler, inert, sends};
-use harness_native_ui_layout_api::{Opens, Side, Viewport};
+use harness_native_ui_input_api::Hovered;
+use harness_native_ui_layout_api::{Align, Opens, Side, Viewport};
 use harness_native_ui_node_api::Clip;
 
 /// The pane a cell's row floats its dialogs and toasts over: the nearest node around it that clips (the transcript's
@@ -23,7 +24,7 @@ pub(super) fn pane_of(row: View<'_>) -> Laid {
 
 /// Whether any of node `e` shows through the clips around it, as laid out last frame (the draw pass's clips: up to a node
 /// lifted into a higher Layer, which nothing around it cuts). Not laid out yet counts as shown.
-fn in_view(e: EntityView<'_>) -> bool {
+pub(super) fn in_view(e: EntityView<'_>) -> bool {
     let Some(mut r) = e.try_cloned::<&Laid>() else { return true };
     let mut at = Some(e);
     while let Some(n) = at.filter(|n| n.has(harness_native_ui_node_api::Node::id())) {
@@ -61,46 +62,114 @@ fn over_pane(v: View<'_>, pane: Laid, shown: bool) {
     }
 }
 
+/// Whether the pointer is on `part` or anything in it (the app's `Hovered`, as last resolved).
+fn pointer_on(part: View<'_>) -> bool {
+    let w = part.entity().world();
+    let Some(h) = w.try_lookup(harness_native_api::APP).and_then(|app| app.target(Hovered::id(), 0)) else { return false };
+    std::iter::successors(Some(h), |n| n.parent()).take(64).any(|n| *n.id() == part.id())
+}
+
+/// A Popover or a Menu: its trigger inline (its first child; a press on it sends onToggle), and while it is open its plate
+/// floating by the trigger on the side `placement` says, at its start or centred on it (`align`). A popover whose `trigger`
+/// is `hover` is open while the pointer is on its trigger or its plate (den's: at once, both ways), telling its onToggle
+/// each change. A `context` menu's children are a region instead, which a right press opens it in, at the pointer, until a
+/// press elsewhere, a pick or Escape ([`Live`]'s context; control.rs `genui_context`).
 fn popover(v: View<'_>, node: &Value, menu: bool, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let cell = b.cell;
+    let id = v.id();
     let toggle = handler(node, "onToggle");
+    let hover = !menu && prop(node, "trigger").as_str() == Some("hover");
+    let context = menu && prop(node, "context") == &Value::Bool(true);
+    let said = prop(node, "open") == &Value::Bool(true);
+    let lead = if context { "region" } else { "trigger" };
+    let open = match b.live.as_deref_mut() {
+        Some(live) if hover => {
+            let on = [v.part("trigger"), v.part("float")].into_iter().flatten().any(pointer_on);
+            let was = live.hovering.insert(id, on).unwrap_or(said);
+            if was != on
+                && let Some(h) = &toggle
+            {
+                live.pending.push((cell.to_owned(), h.clone(), Value::Bool(on)));
+            }
+            on
+        }
+        Some(live) if context => live.context.contains_key(&id),
+        _ => said,
+    };
     // Open, its plate floats while its trigger is in view: one scrolled out of its Scroll (or the transcript) leaves no
     // plate hanging over what is there now; it comes back with the trigger, still open.
-    let open = prop(node, "open") == &Value::Bool(true);
-    let shows = open && v.part("trigger").is_none_or(|t| in_view(t.entity()));
+    let shows = open && v.part(lead).is_none_or(|t| in_view(t.entity()));
     let plate = if menu { "hn.GenMenuPlate" } else { "hn.GenFloat" };
-    let parts: &[(&str, &str)] = if shows { &[("trigger", "hn.GenTrigger"), ("float", plate)] } else { &[("trigger", "hn.GenTrigger")] };
+    let head = if context { ("region", "hn.GenRegion") } else { ("trigger", "hn.GenTrigger") };
+    let mut parts = vec![head]; // alloc: a float's two or three parts
+    if shows && context {
+        parts.push(("at", "hn.GenPoint"));
+    }
+    if shows {
+        parts.push(("float", plate));
+    }
     view::for_each_of(v, parts.iter().map(|(k, p)| (*k, *p, ())), |_, (), _| {});
-    let Some(trigger) = v.part("trigger") else { return };
-    let events: Vec<(String, Value)> = toggle.iter().map(|h| (h.clone(), Value::Bool(!open))).collect();
-    arm(trigger, (!events.is_empty()).then(|| sends(cell, &events)).as_deref());
-    b.next = Within::Trigger(events);
-    children(trigger, &kids[..kids.len().min(1)], depth + 1, b);
+    let Some(trigger) = v.part(lead) else { return };
+    if context {
+        // A right press in it opens the menu there; a left press is its children's.
+        if let Some(live) = b.live.as_deref_mut() {
+            live.regions.insert(trigger.id(), control::Region { cell: cell.to_owned(), menu: id, toggle: toggle.clone() });
+        }
+        children(trigger, kids, depth + 1, b);
+    } else {
+        // A hover popover opens without a press; a click one's trigger toggles it.
+        let events: Vec<(String, Value)> = toggle.iter().filter(|_| !hover).map(|h| (h.clone(), Value::Bool(!open))).collect();
+        arm(trigger, (!events.is_empty()).then(|| sends(cell, &events)).as_deref());
+        b.next = Within::Trigger(events);
+        children(trigger, &kids[..kids.len().min(1)], depth + 1, b);
+    }
     let Some(f) = v.part("float") else { return };
-    f.anchored(trigger.id());
     let gap = view::prefab(v.entity().world(), "hn.GenFloat").and_then(|p| p.try_cloned::<&Side>()).map_or(0.0, |s| s.dy);
-    let side = match prop(node, "placement").as_str() {
-        Some("top") => Side { edge: Opens::Top, dx: 0.0, dy: gap },
-        Some("left") => Side { edge: Opens::Left, dx: gap, dy: 0.0 },
-        Some("right") => Side { edge: Opens::Right, dx: gap, dy: 0.0 },
-        _ => Side { edge: Opens::Bottom, dx: 0.0, dy: gap },
+    let along = if prop(node, "align").as_str() == Some("center") { Align::Center } else { Align::Start };
+    let side = match (context, prop(node, "placement").as_str()) {
+        // At the pointer: its corner on the point the right press was, flipped up or slid to stay on screen.
+        (true, _) => Side { edge: Opens::Bottom, dx: 0.0, dy: 0.0, align: Align::Start },
+        (_, Some("top")) => Side { edge: Opens::Top, dx: 0.0, dy: gap, align: along },
+        (_, Some("left")) => Side { edge: Opens::Left, dx: gap, dy: 0.0, align: along },
+        (_, Some("right")) => Side { edge: Opens::Right, dx: gap, dy: 0.0, align: along },
+        _ => Side { edge: Opens::Bottom, dx: 0.0, dy: gap, align: along },
     };
+    match (context, v.part("at")) {
+        (true, Some(at)) => {
+            let off = b.live.as_deref().and_then(|l| l.context.get(&id).copied()).unwrap_or_default();
+            let r = trigger.entity().try_cloned::<&Laid>().unwrap_or_default();
+            let point = Laid { x: r.x + off[0], y: r.y + off[1], w: 0.0, h: 0.0 };
+            if at.entity().try_cloned::<&Laid>() != Some(point) {
+                at.set(point);
+            }
+            f.anchored(at.id());
+        }
+        _ => {
+            f.anchored(trigger.id());
+        }
+    }
     if f.entity().try_cloned::<&Side>() != Some(side) {
         f.set(side);
     }
     if menu {
-        rows(f, node, cell, toggle.as_deref());
+        rows(f, node, cell, toggle.as_deref(), context.then_some(id));
     } else {
         children(f, kids.get(1..).unwrap_or_default(), depth + 1, b);
     }
-    if let (Some(h), Some(live)) = (toggle, b.live.as_deref_mut()) {
-        live.floats.insert(v.id(), Float { cell: cell.to_owned(), close: vec![(h, Value::Bool(false))], modal: false });
+    // What a press off it or Escape closes (a hover popover closes as the pointer leaves).
+    if let Some(live) = b.live.as_deref_mut()
+        && !hover
+        && (toggle.is_some() || context)
+    {
+        let close = toggle.map(|h| (h, Value::Bool(false))).into_iter().collect();
+        live.floats.insert(id, Float { cell: cell.to_owned(), close, modal: false });
     }
 }
 
 /// A Menu's rows on its plate: a pick sends onSelect(value) and then onToggle(false) (the kernel closes it on a pick as
-/// well); a disabled row is faded and takes no press; a separator is a hairline.
-fn rows(f: View<'_>, node: &Value, cell: &str, toggle: Option<&str>) {
+/// well), and a context menu (`shut`, its element) shuts here; a disabled row is faded and takes no press; a separator is
+/// a hairline.
+fn rows(f: View<'_>, node: &Value, cell: &str, toggle: Option<&str>, shut: Option<u64>) {
     let items = props::items(node).unwrap_or_default();
     let pick = handler(node, "onSelect");
     let rows = items.iter().enumerate().map(|(i, it)| {
@@ -123,7 +192,11 @@ fn rows(f: View<'_>, node: &Value, cell: &str, toggle: Option<&str>) {
         let events: Vec<(String, Value)> =
             pick.iter().map(|p| (p.clone(), value.clone())).chain(toggle.map(|t| (t.to_owned(), Value::Bool(false)))).collect();
         let takes = !*disabled && pick.is_some();
-        arm(row, takes.then(|| sends(cell, &events)).as_deref());
+        let action = || match shut {
+            Some(el) => control::then(cell, &events, None, Some(el)),
+            None => sends(cell, &events),
+        };
+        arm(row, takes.then(action).as_deref());
         inert(row, *disabled);
     });
 }

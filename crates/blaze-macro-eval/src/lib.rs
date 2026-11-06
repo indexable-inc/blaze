@@ -35,7 +35,7 @@ mod wasm;
 mod wire;
 
 pub use expander::{Macros, load, load_wasm};
-pub use wasm::{GLUE_MODULE, Loads, Modules, wasm_glue};
+pub use wasm::{GLUE_MODULE, Loads, Modules, expansion_threads, wasm_glue};
 
 #[cfg(test)]
 #[global_allocator]

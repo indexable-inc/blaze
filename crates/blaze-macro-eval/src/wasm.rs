@@ -28,6 +28,7 @@ mod glue;
 mod host;
 mod statics;
 mod thread;
+pub use thread::alive as expansion_threads;
 // Wasmtime's embedder-provided TLS, where it uses `sys::custom` (the wasm seed).
 #[cfg(not(any(unix, windows)))]
 mod tls;

@@ -12,7 +12,7 @@ use crate::pane::TermNode;
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
 use crate::text::TypeLook;
 use harness_native_api::spring::{Spring, Tune};
-use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
+use harness_native_api::{APP, Clock, HoverAmt, HoverSteered, Lit, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model as model;
 use harness_native_render::paint::{Painter, panel_from};
@@ -185,6 +185,8 @@ pub struct App {
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
     genui: std::cell::RefCell<chat::GenLive>,
+    /// The universal handlers' pointer, key and focus state (genui/common.rs).
+    gen_prims: std::cell::RefCell<chat::GenPrims>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
@@ -320,6 +322,8 @@ fn scene_world() -> Result<World, String> {
     view::register(&world);
     world.component::<HoverLift>().writable();
     world.component::<Bump>().writable();
+    world.component::<chat::GenFeel>().writable();
+    world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
     world.set(Clock::default());
@@ -384,9 +388,14 @@ impl App {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
             // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron, a control deep in a
             // chat's drawn view, whose hover shows the view's code button).
-            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
-                std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
-            });
+            // A menu's item lights where its owner keeps the highlight (`Lit`), which the pointer and the keys move.
+            let on = if e.has(HoverSteered::id()) {
+                e.has(Lit::id())
+            } else {
+                w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
+                    std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
+                })
+            };
             if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
                 moving(&w);
             }
@@ -410,6 +419,8 @@ impl App {
         let root = View::root(w, "hn.Window");
         let side = root.child("hn.SideClip").child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
+        // Its count shows on its hover (scene/widgets/parts.flecs).
+        device.set(HoverAmt::default());
         let side_w = crate::prefs::get("sidebar_width")
             .and_then(|v| v.as_f64())
             .map(|v| {
@@ -449,6 +460,7 @@ impl App {
             chats,
             chat: std::cell::RefCell::default(),
             genui: std::cell::RefCell::default(),
+            gen_prims: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
             side_w,
@@ -748,7 +760,8 @@ impl App {
             n.text(&host);
         }
         if let Some(n) = device.part("count") {
-            n.text(&link_word);
+            // How many objects, on the header's hover; the link's trouble (offline, refused, connecting) always.
+            crate::look::hover_show(n.text(&link_word).entity(), 0, link != *w.component_id::<model::Up>());
         }
         // The refusal in words (which daemon, `harness stop`), in place of a spinner that never ends.
         let why = dev.try_cloned::<&model::LinkError>().map(|e| e.text.as_str().to_owned()).unwrap_or_default();
@@ -814,6 +827,7 @@ impl App {
                 ("depth", Prop::Int(depth as i64)),
                 ("kids", Prop::Bool(fold::has_kids(o))),
                 ("open", Prop::Bool(!o.has(model::Collapsed::id()))),
+                ("focus", Prop::Bool(sel == Some(e) && me.tree_focus && me.focused)),
             ];
             if me.run_of(e).is_some() {
                 // A run: a small dot tinted by how it went, breathing while it runs; how long it took (and how it failed)
@@ -845,11 +859,16 @@ impl App {
                     .filter(|&&i| i < 9)
                     .map(|i| me.hint(&format!("Select{}", i + 1)))
                     .unwrap_or_default();
+                // How it stands, as a mark (hn.Status): a dot while it runs, a ring once it exited, red when it failed
+                // or was killed, amber when lost; the words (with a failure's exit code) are the mark's tooltip.
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
-                let badge = match (status, code) {
-                    ("killed", _) => "\u{2715}".to_owned(),
-                    (_, Some(c)) => c.to_string(),
-                    _ => String::new(),
+                let (mark, why) = match (status, code) {
+                    ("killed", _) => ("failed", "Killed".to_owned()),
+                    (_, Some(c)) => ("failed", format!("Exited with code {c}")),
+                    ("running", _) => ("running", "Running".to_owned()),
+                    ("lost", _) => ("lost", "Lost (the daemon restarted under it)".to_owned()),
+                    ("exited", _) => ("exited", "Exited".to_owned()),
+                    _ => ("", String::new()),
                 };
                 row.props(
                     "hn.ObjRow",
@@ -857,7 +876,8 @@ impl App {
                         &common[..],
                         &[
                             ("kind", Prop::Str(model::kind_name(o))),
-                            ("badge", Prop::Str(&badge)),
+                            ("status", Prop::Str(mark)),
+                            ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
                         ],
                     ]
@@ -1720,6 +1740,10 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("chat:pick:") {
+                self.chat_pick_action(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:set:") {
+                self.chat_pick_set(rest);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
@@ -1729,7 +1753,7 @@ impl App {
                 self.media_action(m);
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (the browser), or a file (a cell's FileRef) in the app its kind opens in, at its line.
-                crate::open::open(target);
+                crate::open::open(target, alt);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {
@@ -1804,7 +1828,7 @@ impl App {
                 }
             };
             let (np, ng) = (at.panels, at.glyphs);
-            let turn = (p.kind == PaintKind::Icon).then(|| crate::look::turn(e)).flatten();
+            let turn = matches!(p.kind, PaintKind::Icon | PaintKind::Mark).then(|| crate::look::turn(e)).flatten();
             if is_term && p.kind == PaintKind::Plate {
                 let cells = (d.panels.len(), d.glyphs.len(), d.sprites.len());
                 self.emit_term(id, d, sc, upload);

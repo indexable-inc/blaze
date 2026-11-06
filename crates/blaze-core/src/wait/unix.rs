@@ -52,7 +52,7 @@ fn poll(fds: &mut [libc::pollfd], n: libc::nfds_t, ms: libc::c_int) -> libc::c_i
 }
 
 /// A relative wait in the shape a `timespec` takes, saturating at its end.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(super) fn timespec(left: std::time::Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),

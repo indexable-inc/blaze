@@ -1012,6 +1012,19 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
         o.pos = float4(vpos.x * m0.x + m0.w, vpos.y * m1.y + m1.w, 0, 1);
         o.y = top.y + vpos.y * sc.y;
         o.x = top.x + vpos.x * sc.x;
+        // A turned mark (the tree's disclosure chevron): its dilated corners turned about its middle, clockwise (y down).
+        // The em coordinates ride along, so the outline turns whole.
+        if (g.clip.z != 0.0)
+        {
+            float2 m = g.rect.xy + g.rect.zw * 0.5 + float2(0, rise);
+            float2 d = float2(o.x, o.y) - m;
+            float sn = sin(g.clip.z);
+            float cs = cos(g.clip.z);
+            float2 q = m + float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+            o.pos = float4(to_ndc(q, frame.view), 0, 1);
+            o.x = q.x;
+            o.y = q.y;
+        }
         return o;
     }
     float2 pt = g.rect.xy + c * g.rect.zw + float2(0, rise);

@@ -1,5 +1,5 @@
 <script>
-  // Every Chart kind: what the gallery shows (HARNESS_NATIVE_GALLERY=genui) and what an agent can copy.
+  // Every Chart kind, and a Table filtered by its query: what the gallery shows (HARNESS_NATIVE_GALLERY=genui) and what an agent can copy.
   const usage = [
     { label: 'system prompt', value: 4200 },
     { label: 'tools', value: 2600 },
@@ -8,6 +8,15 @@
     { label: 'other', value: 600 },
   ];
   const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const crates = [
+    { crate: 'blaze-query', ms: 1840, path: '/Volumes/Projects/blaze/crates/blaze-query' },
+    { crate: 'blaze-core', ms: 920, path: '/Volumes/Projects/blaze/crates/blaze-core' },
+    { crate: 'harness-native', ms: 2610, path: '/Volumes/Projects/blaze/crates/harness/harness-native' },
+    { crate: 'harness', ms: 480, path: '/Volumes/Projects/blaze/crates/harness/harness' },
+  ];
+  let query = $state('harness');
+  let row = $state(-1);
+  let opened = $state('');
 </script>
 <Column gap={16}>
   <Row gap={24}>
@@ -35,11 +44,16 @@
       ]} height={110} />
     </Card>
   </Row>
+  <Card title="Crates by build time">
+    <Input bind:value={query} placeholder="Filter crates" />
+    <Table rows={crates} {query} onselect={(i) => (row = i)} onopen={(path) => (opened = path)} />
+    <Text tone="muted">{row < 0 ? 'No row picked' : `Picked ${crates[row].crate}`}{opened ? `, opened ${opened}` : ''}</Text>
+  </Card>
   <Row gap={24}>
-    <Card title="Memory (GB)">
+    <Card title="Memory (GB)" grow>
       <Chart kind="area" data={[3.1, 3.4, 4.8, 4.2, 5.9, 6.3, 5.1, 4.4]} unit="GB" height={100} />
     </Card>
-    <Card title="Size against time">
+    <Card title="Size against time" grow>
       <Chart kind="scatter" data={[[1, 2], [2, 3.5], [3, 3.1], [4, 5.2], [5, 4.8], [6, 6.9], [7, 7.4]]} height={100} />
     </Card>
   </Row>

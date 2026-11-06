@@ -23,6 +23,9 @@ harness tui [claude|codex|cursor|shell [args...]]
                               terminal UI instead of the native app (ctrl-] returns to the tree)
 harness ls [--all]            print the session tree (--all: past sessions too, from the index)
 harness send <id> <text...>   type a message into a session and press Enter
+harness set-model <id> [--model <m>] [--effort <e>]
+                              switch a chat's model and/or reasoning effort for its turns from here on
+                              (one its agent lists: `harness log <id>` shows its `models` event)
 harness screen <id>           print a session's current screen
 harness log <id>              print a chat's log, one event per line (JSON; bad records on stderr)
 harness kill <id>             kill a session's process
@@ -77,6 +80,21 @@ async fn main() -> Result<()> {
         Some("send") => {
             let id: u64 = arg(1).parse()?;
             client::Ctl::connect().await?.req(Request::Send { id, text: args[2..].join(" "), raw: false, submit: None }).await?;
+            Ok(())
+        }
+        Some("set-model") => {
+            let id: u64 = arg(1).parse().map_err(|e| anyhow::anyhow!("harness set-model: {:?} is not a session id: {e}", arg(1)))?;
+            let (mut model, mut effort) = (None, None);
+            let mut rest = args[2..].iter();
+            while let Some(a) = rest.next() {
+                let slot = match a.as_str() {
+                    "--model" => &mut model,
+                    "--effort" => &mut effort,
+                    other => bail!("harness set-model: unknown argument {other:?} (expected --model <m> or --effort <e>)"),
+                };
+                *slot = Some(rest.next().ok_or_else(|| anyhow::anyhow!("harness set-model: {a} needs a value"))?.clone());
+            }
+            client::Ctl::connect().await?.req(Request::SetModel { id, model, effort }).await?;
             Ok(())
         }
         Some("screen") => {

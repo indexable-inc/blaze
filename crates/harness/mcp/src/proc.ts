@@ -4,6 +4,7 @@ import { table, type Table } from "./table.ts";
 import { req, daemonPresent, DaemonUnreachable } from "./daemon.ts";
 import { REPL_ID } from "./repl.ts";
 import { oneLine, quiet, step } from "./effects.ts";
+import { checkShell, refusal } from "./shell-check.ts";
 
 type Stream = "stdout" | "stderr";
 
@@ -34,6 +35,8 @@ export type ShOpts = {
   cwd?: string; env?: Record<string, string>; stdin?: string; maxBytes?: number; timeoutMs?: number;
   /** Spawn here with Bun.spawn instead of through harnessd (no stored stages). */
   local?: boolean;
+  /** Why a command that only reads files or the tree needs the shell; without it such a command is refused (shell-check.ts). */
+  why?: string;
 };
 export type ShResult = { id: string; run: string | null; pid: number; exit_code: number | null; signal: string | null; stdout: string; stderr: string };
 
@@ -156,6 +159,10 @@ let seq = 0;
 /** Spawn a command; returns a handle at once. `await` it for { exit_code, stdout, stderr }. Goes through harnessd when it's up. */
 export function sh(cmd: string | string[], opts: ShOpts = {}): Proc {
   const text = typeof cmd === "string" ? cmd : cmd.map(shq).join(" ");
+  // The shell is for running programs; reading files or the tree has typed calls (glob, ls, du, rg, Bun.file) that the person
+  // sees as what they did. Needs initShellCheck() at startup (functions/index.ts).
+  const verdict = checkShell(text, opts.why);
+  if (!verdict.ok) throw refusal(verdict.message);
   const argv = typeof cmd === "string" ? ["/bin/sh", "-c", cmd] : cmd;
   const short = oneLine(text);
   const s = step("exec", `Running ${short}`, `Ran ${short}`, text);

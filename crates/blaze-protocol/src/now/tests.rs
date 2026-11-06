@@ -35,7 +35,7 @@ fn span(name: &str, for_ms: u64) -> Span {
 }
 
 fn look<'a>(threads: &'a [Worker], downloads: &'a [Download], memory: &'a Memory) -> Look<'a> {
-    Look { workers: 16, threads, downloads, stage: "", closed: 0, memory }
+    Look { workers: 16, threads, downloads, stage: "", memory, expanders: &[], expansion_threads: 0 }
 }
 
 fn named(now: &Now) -> Vec<&str> {
@@ -146,8 +146,6 @@ fn one_codegen_holds_back_the_build() {
     }
     moved(&mut fold, core, NodeState::Ready);
     moved(&mut fold, core, NodeState::Running);
-    fold.released();
-    fold.released();
     fold.advance_clock(271 * S);
 
     let mut threads: Vec<Worker> = (0..16)
@@ -171,6 +169,7 @@ fn one_codegen_holds_back_the_build() {
         held: 99 * GIB,
         limit: 24 * GIB,
         over: Some("mir".into()),
+        releases: 5,
         ..Memory::default()
     };
     let now = fold.look(&look(&threads, &[], &memory));
@@ -204,24 +203,29 @@ fn one_codegen_holds_back_the_build() {
     assert_eq!((now.slowest[0].task.id, now.slowest[0].ms), (0, 1000), "ties go by id");
 
     assert_eq!(now.memory.pressure(), Pressure::Over);
-    assert_eq!((now.memory.peak, now.memory.releases), (99 * GIB, 2));
+    assert_eq!((now.memory.peak, now.memory.releases), (99 * GIB, 0), "counted from the first look");
+    assert_eq!(now.running.len(), 1);
+    assert_eq!((now.running[0].task.id, now.running[0].for_ms), (u64::from(core), 270_000));
+    assert_eq!(now.running[0].thread.as_deref(), Some("blaze-worker-3"));
+    assert_eq!(now.running[0].span.as_ref(), Some(&freeze));
+    assert_eq!(now.recent, 0, "the settles were 270 s ago");
     assert_eq!(now.memory.over.as_deref(), Some("mir"));
 
-    // Memory let go, and a span closed: the peak stays, the quiet time restarts.
-    let lower = Memory { held: 20 * GIB, limit: 24 * GIB, ..Memory::default() };
-    let now = fold.look(&Look { closed: 3, ..look(&threads, &[], &lower) });
+    // Memory let go by two releases: the peak stays, the releases count since the first look.
+    let lower = Memory { held: 20 * GIB, limit: 24 * GIB, releases: 7, ..Memory::default() };
+    let now = fold.look(&look(&threads, &[], &lower));
     assert_eq!((now.memory.held, now.memory.peak), (20 * GIB, 99 * GIB));
+    assert_eq!(now.memory.releases, 2);
     assert_eq!(now.memory.pressure(), Pressure::Rising);
-    assert_eq!(now.quiet_ms, 0);
-    assert!(!now.slow());
+    assert!(now.slow());
 
-    // No worker busy and nothing moving for 20 s: stalled.
+    // No worker busy, no process running and nothing settled for 290 s: stalled.
     fold.advance_clock(291 * S);
     let idle: Vec<Worker> = (0..16)
         .map(|at| Worker { thread: format!("blaze-worker-{at}"), task: None, open: vec![] })
         .collect();
     let now = fold.look(&look(&idle, &[], &lower));
-    assert_eq!((now.busy.len(), now.quiet_ms), (0, 20_000));
+    assert_eq!((now.busy.len(), now.quiet_ms), (0, 290_000));
     assert!(now.stalled() && !now.slow());
     assert_eq!(now.blockers[0].span, None);
 }

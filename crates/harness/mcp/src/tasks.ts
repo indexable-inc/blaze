@@ -59,6 +59,12 @@ export function newTask(code: string, call: string | null = null): Task {
   return t;
 }
 
+/** The tool call id that ran task `id` (`t3`): null when the client did not say it, undefined when this kernel ran no such task. */
+export const taskCall = (id: string): string | null | undefined => registry.get(id)?.call;
+
+/** How many tasks this kernel has run: their ids are t1 to this. */
+export const taskCount = (): number => seq;
+
 /** Run fn with console output routed to the task's logs. */
 export const inTask = <T>(t: Task, fn: () => T): T => als.run(t, fn);
 

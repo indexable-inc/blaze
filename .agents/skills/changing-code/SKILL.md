@@ -19,14 +19,14 @@ re-exports, macro output), never by text, and leave it compiling and lint-clean,
 holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only
 shapes, scoped and checked by a build afterward.
 
-## whole-ports (rule 23)
+## whole-ports (rule 24)
 
 A change to a shared signature or type (a struct's fields, a trait, a lock type) updates every
 caller in the same batch, so the shared tree compiles at every save point. Do it through `blaze
 check --fix`, `blaze check --replace` or a scoped rewrite, then build, then hand the batch over. A
 half-ported tree blocks every lane's run.
 
-## best-long-term-design (rule 27)
+## best-long-term-design (rule 28)
 
 Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and
 spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel
@@ -35,7 +35,7 @@ of parsers of hostile bytes.
 
 See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
 
-## spec-then-build (rule 28)
+## spec-then-build (rule 29)
 
 Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a
 hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the
@@ -49,7 +49,7 @@ a lane that cannot build what it specified says what blocks it and who it handed
 
 See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
 
-## one-concept-one-home (rule 29)
+## one-concept-one-home (rule 30)
 
 Each concept has one type, one rule and one place it is computed: two types for the same thing (a
 `BuiltFor` in two crates), two copies of a rule (where code runs, what a key covers), two paths that

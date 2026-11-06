@@ -12,11 +12,11 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text,
+    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::GlyphsIn;
@@ -84,6 +84,20 @@ pub fn set_of(s: &TextStyle) -> Style {
 }
 
 #[must_use]
+/// Ink `c` of node `e` (its fill's, or with `outline` its edge's or stroke's) mixed toward its `HoverInk` by how hovered
+/// it is (its HoverAmt).
+fn hovered(e: EntityView<'_>, c: Rgba, outline: bool, dark: bool) -> Rgba {
+    let Some(h) = e.try_cloned::<&HoverInk>() else { return c };
+    let (bit, to) = if outline { (HoverInk::STROKE, h.stroke) } else { (HoverInk::FILL, h.fill) };
+    let t = e.try_cloned::<&HoverAmt>().map_or(0.0, |a| a.spring.x.clamp(0.0, 1.0));
+    if h.set & bit == 0 || t <= 0.0 {
+        return c;
+    }
+    let to = if dark { to.dark } else { to.light };
+    let m = |a: f32, b: f32| a + (b - a) * t;
+    Rgba { r: m(c.r, to.r), g: m(c.g, to.g), b: m(c.b, to.b), a: m(c.a, to.a) }
+}
+
 pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
@@ -428,7 +442,7 @@ impl Painter {
         let rect = [laid.x, laid.y, laid.w, laid.h];
         let ink = e
             .try_cloned::<&Fill>()
-            .map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
+            .map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(hovered(e, if dark { f.dark } else { f.light }, false, dark)));
         match p.kind {
             PaintKind::Plate => {
                 // At rest, on whole device pixels at this frame's scale (the zoom's): crisp, and lined up with the words
@@ -448,6 +462,7 @@ impl Painter {
                     shape.n = 4.0;
                 }
                 let (fc, ec) = if dark { (fill.dark, edge.dark) } else { (fill.light, edge.light) };
+                let (fc, ec) = (hovered(e, fc, false, dark), hovered(e, ec, true, dark));
                 let mut panel = panel_from(rgba(fc), rgba(ec), shape, rect, p.alpha);
                 if let Some(l) = e.try_cloned::<&Lift>() {
                     panel.fx = [l.blur, l.alpha, 0.0, 0.0];
@@ -502,6 +517,8 @@ impl Painter {
                     .map(|t| t.mode)
                     .or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail));
                 let mut shown_md = None;
+                // Whether the words were cut to fit (their glyphs are then not the text's).
+                let mut elided = false;
                 let lay = if let (Some(_), Some(_)) = (truncate, md) {
                     // Inline markdown on one line (a table's cell): cut at its end, its faces kept.
                     let (lay, m) = self.layout_md_cut(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
@@ -517,6 +534,7 @@ impl Painter {
                             .map(|l| l.width)
                             .fold(0.0, f32::max)
                     });
+                    elided = cut.as_str() != text.s.as_str();
                     self.layout(&cut, &style, 1.0e5)
                 } else {
                     self.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md.is_some())
@@ -583,6 +601,23 @@ impl Painter {
                     let flash = e.try_cloned::<&CopyFlash>();
                     grow = select::Grow::of(&plates, &look, flash).map(|g| (lo, hi, g));
                     select::emit(d, &plates, &look, look.colour(dark), flash, p.alpha, sc);
+                }
+                // The stretches of its words a child marks (a `TextRange`: a table's match), a plate in the child's Fill and
+                // Shape over each row they cover, under the words. Not on words cut to fit or set from markdown: their glyphs
+                // are not the text's.
+                if md.is_none() && !elided {
+                    let mut marks = Vec::new();
+                    e.each_child(|c| {
+                        if let (Some(r), Some(f)) = (c.try_cloned::<&TextRange>(), c.try_cloned::<&Fill>()) {
+                            marks.push((r, f, c.try_cloned::<&Shape>().unwrap_or_default()));
+                        }
+                    });
+                    for (r, f, shape) in marks {
+                        let ink = rgba(if dark { f.dark } else { f.light });
+                        for s in spans_of(&lay, r.from as usize, r.to as usize) {
+                            d.panel(panel_from(ink, [0.0; 4], shape, [laid.x + s[0], laid.y + s[1], s[2], s[3]], p.alpha));
+                        }
+                    }
                 }
                 let pen = emit_glyphs(
                     d,
@@ -795,9 +830,9 @@ impl Painter {
         upload: &mut Upload<'_>,
     ) -> Result<(), String> {
         let Some(v) = e.try_cloned::<&Vector>() else { return Ok(()) };
-        let pick = |c: (Rgba, Rgba)| rgba(if dark { c.0 } else { c.1 });
-        let fill = e.try_cloned::<&Fill>().map(|f| pick((f.dark, f.light)));
-        let stroke = e.try_cloned::<&Stroke>().map(|s| pick((s.dark, s.light)));
+        let pick = |c: (Rgba, Rgba), outline: bool| rgba(hovered(e, if dark { c.0 } else { c.1 }, outline, dark));
+        let fill = e.try_cloned::<&Fill>().map(|f| pick((f.dark, f.light), false));
+        let stroke = e.try_cloned::<&Stroke>().map(|s| pick((s.dark, s.light), true));
         let map = VectorMap::new(&v, laid, p.scale);
         let segs = if v.d.as_str().trim().is_empty() {
             None

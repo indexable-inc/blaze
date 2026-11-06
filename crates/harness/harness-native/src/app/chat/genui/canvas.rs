@@ -6,6 +6,9 @@
 use super::*;
 use harness_native_ui_layout_api::Aspect;
 use harness_native_ui_look_api::{Rgba, Stroke};
+use harness_native_ui_input_api::{Action, HitBox, Hoverable};
+use harness_native_ui_node_api::Laid;
+use harness_native_ui_spring_api::{Spring, Tune};
 use harness_native_ui_text_api::{Vector, VectorFit, VectorText};
 
 /// The most shapes one Canvas draws (each is an entity; the element cap counts them too).
@@ -45,6 +48,47 @@ pub(super) struct Shape {
     pub fixed: bool,
     pub even_odd: bool,
     pub text: Option<Words>,
+    /// A Canvas shape's poses, outermost Group first and its own last, which [`canvas`] springs and folds into `m` and
+    /// its inks' alpha (empty: `m` and the inks are as drawn, a chart's).
+    pub chain: Vec<Link>,
+    /// A Canvas shape's own element, for its hover, handlers and tip (Null: a chart's).
+    pub node: Value,
+}
+
+/// One level of a Canvas shape's pose: a Group round it, or the shape itself. Its `transform` (`pre`), then its pose
+/// `[x, y, scale, rotate (degrees), opacity]` about the user origin, as den's Group places it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Link {
+    pub pre: Affine,
+    pub pose: [f32; 5],
+}
+
+/// Pose `p` as a transform: scaled and turned about the user origin, then moved.
+fn place(p: [f32; 5]) -> Affine {
+    let (sn, cs) = p[3].to_radians().sin_cos();
+    [cs * p[2], sn * p[2], -sn * p[2], cs * p[2], p[0], p[1]]
+}
+
+/// A chain's transform and opacity with each level at the pose `at(level)` gives.
+fn fold(chain: &[Link], at: impl Fn(usize) -> [f32; 5]) -> (Affine, f32) {
+    chain.iter().enumerate().fold((IDENTITY, 1.0), |(m, a), (i, l)| {
+        let p = at(i);
+        (compose(m, compose(place(p), l.pre)), a * p[4].clamp(0.0, 1.0))
+    })
+}
+
+/// A shape's or Group's pose: `x` and `y` (but a Rect's and words', which are where they are), `scale` (0 to 8),
+/// `rotate` and `opacity` (0 to 1).
+fn pose_of(node: &Value) -> [f32; 5] {
+    let geometry = matches!(node["type"].as_str(), Some("Rect" | "Text"));
+    let n = |k: &str| if geometry && (k == "x" || k == "y") { None } else { num(node, k) };
+    [
+        n("x").unwrap_or(0.0),
+        n("y").unwrap_or(0.0),
+        n("scale").map_or(1.0, |s| s.clamp(0.0, 8.0)),
+        n("rotate").unwrap_or(0.0),
+        n("opacity").map_or(1.0, |o| o.clamp(0.0, 1.0)),
+    ]
 }
 
 /// An ink per appearance.
@@ -79,6 +123,8 @@ impl Shape {
             fixed: false,
             even_odd: false,
             text: None,
+            chain: Vec::new(),
+            node: Value::Null,
         }
     }
 }
@@ -174,15 +220,6 @@ fn matrix(node: &Value, name: &str) -> Result<Affine, String> {
     }
 }
 
-/// A Group's own move: `transform`, then `x`, `y`, `scale` and `rotate` (degrees) as den's Group takes them.
-fn group_matrix(node: &Value) -> Result<Affine, String> {
-    let own = matrix(node, "transform")?;
-    let s = num(node, "scale").unwrap_or(1.0);
-    let (sn, cs) = num(node, "rotate").unwrap_or(0.0).to_radians().sin_cos();
-    let place = [cs * s, sn * s, -sn * s, cs * s, num(node, "x").unwrap_or(0.0), num(node, "y").unwrap_or(0.0)];
-    Ok(compose(place, own))
-}
-
 /// A Canvas's view box: `[x, y, w, h]` or `"x y w h"`; None when not given.
 fn view_box(node: &Value) -> Result<Option<[f32; 4]>, String> {
     let nums: Vec<f32> = match prop(node, "view") {
@@ -273,8 +310,7 @@ pub(super) const SHAPES: [&str; 7] = ["Group", "Path", "Rect", "Circle", "Line",
 fn flatten(
     world: WorldRef<'_>,
     nodes: &[Value],
-    m: Affine,
-    opacity: f32,
+    chain: &[Link],
     view: [f32; 4],
     out: &mut Vec<Shape>,
     depth: usize,
@@ -288,23 +324,25 @@ fn flatten(
             return Err(format!("a Canvas draws at most {MAX_SHAPES} shapes"));
         }
         let at = |e: String| format!("<{kind}> {e}");
-        let own = compose(m, matrix(node, "transform").map_err(at)?);
-        let alpha = opacity * num(node, "opacity").unwrap_or(1.0).clamp(0.0, 1.0);
+        let mut links = chain.to_vec(); // alloc: this shape's chain of poses, kept on its Shape for the frame
+        links.push(Link { pre: matrix(node, "transform").map_err(at)?, pose: pose_of(node) });
         if kind == "Group" {
             if depth >= MAX_DEPTH {
                 return Err(format!("Groups nest at most {MAX_DEPTH} deep"));
             }
-            let g = compose(m, group_matrix(node).map_err(at)?);
             let kids = node["children"].as_array().map_or(&[][..], Vec::as_slice);
-            flatten(world, kids, g, alpha, view, out, depth + 1)?;
+            flatten(world, kids, &links, view, out, depth + 1)?;
             continue;
         }
-        let fill_op = alpha * num(node, "fillOpacity").unwrap_or(1.0);
-        let stroke_op = alpha * num(node, "strokeOpacity").unwrap_or(1.0);
+        let (own, _) = fold(&links, |i| links[i].pose);
+        // The poses' opacity is folded in as they spring ([`canvas`]); these are the inks' own.
+        let fill_op = num(node, "fillOpacity").unwrap_or(1.0);
+        let stroke_op = num(node, "strokeOpacity").unwrap_or(1.0);
         let named = |p: &str| -> Option<String> { prop(node, p).as_str().map(str::to_owned) };
         if kind == "Text" {
             let mut s = Shape::new(String::new(), view);
             s.m = own;
+            (s.chain, s.node) = (links, node.clone()); // alloc: the shape's own element, for its input
             let anchor = match words(node, "anchor").as_str() {
                 "middle" => 1,
                 "end" => 2,
@@ -325,6 +363,7 @@ fn flatten(
         let (d, open) = path_of(node).map_err(|e| if e.starts_with('<') { e } else { at(e) })?;
         let mut s = Shape::new(d, view);
         s.m = own;
+        (s.chain, s.node) = (links, node.clone()); // alloc: the shape's own element, for its input
         let (fill, stroke) = (named("fill"), named("stroke"));
         // Den's rule: a shape is filled in the ink when its inks are not said, an open line stroked in it.
         let (fill, stroke) = match (fill, stroke) {
@@ -387,17 +426,167 @@ pub(super) fn canvas(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) -> Resul
     let vb = view.unwrap_or([0.0; 4]);
     let kids = node["children"].as_array().map_or(&[][..], Vec::as_slice);
     let mut shapes = Vec::new(); // alloc: this frame's shapes of one canvas, laid onto its entities and dropped
-    flatten(world, kids, IDENTITY, 1.0, vb, &mut shapes, 0)?;
+    flatten(world, kids, &[], vb, &mut shapes, 0)?;
     if shapes.len() > b.left {
         b.cut = true;
         shapes.truncate(b.left);
     }
     b.left -= shapes.len();
     tip(v, &words(node, "tip"));
+    // A press on the Canvas sends its onClick, with its value.
+    clicks(v, node, b.cell);
+    let feel = common::feel(world);
+    let tune = Tune { omega: feel.shape_omega, zeta: feel.shape_zeta };
+    let (now, cell, room) = (b.now, b.cell, v.entity().try_cloned::<&Laid>().unwrap_or_default());
+    let mut going = false;
     view::for_each_of(v, shapes.iter().enumerate().map(|(i, s)| (format!("s{i}"), "hn.GenShape", s)), |sv, s, _| {
-        put_shape(sv, s)
+        let mut s = s.clone(); // alloc: the shape posed where its springs are this frame
+        let (m, alpha, still) = sprung(sv.entity(), &s, now, tune);
+        going |= still;
+        s.m = m;
+        for ink in [&mut s.fill, &mut s.stroke].into_iter().flatten() {
+            ink.dark.a *= alpha;
+            ink.light.a *= alpha;
+        }
+        put_shape(sv, &s);
+        shape_input(sv, &s, cell, room);
     });
+    if going && let Some(live) = b.live.as_deref_mut() {
+        live.anim = true;
+    }
     Ok(())
+}
+
+/// The springs of a Canvas shape's poses, one set per level of its chain (its Groups' and its own; den's Group and shape
+/// poses), at clock time `at`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+struct ShapeSprings {
+    lv: [[Spring; 5]; MAX_LEVELS],
+    n: u8,
+    at: f32,
+}
+
+/// The most levels of a shape's chain that spring; deeper ones land at once.
+const MAX_LEVELS: usize = 8;
+
+/// Shape `s`'s transform and opacity this frame, its poses sprung on `tune` from where they were (its own mixed toward
+/// its `hover` by its hover spring); whether any still moves. A shape new (or whose chain changed) lands where it rests.
+fn sprung(e: EntityView<'_>, s: &Shape, now: f32, tune: Tune) -> (Affine, f32, bool) {
+    if s.chain.is_empty() {
+        return (s.m, 1.0, false);
+    }
+    let n = s.chain.len().min(MAX_LEVELS);
+    let old = e.try_cloned::<&ShapeSprings>().filter(|o| usize::from(o.n) == n);
+    let fresh = old.is_none();
+    let mut sp = old.unwrap_or_default();
+    let dt = if fresh { 0.0 } else { (now - sp.at).clamp(0.0, 0.1) };
+    let hot = e.try_cloned::<&harness_native_api::HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+    let hover = prop(&s.node, "hover");
+    let target = |i: usize| {
+        let mut p = s.chain[i].pose;
+        if i + 1 == s.chain.len() && hot > 0.0 {
+            for (j, k) in ["x", "y", "scale", "rotate", "opacity"].iter().enumerate() {
+                if let Some(h) = num_of(&hover[*k]) {
+                    p[j] += (h - p[j]) * hot;
+                }
+            }
+        }
+        p
+    };
+    let mut going = false;
+    for i in 0..n {
+        let t = target(i);
+        for j in 0..5 {
+            let spr = &mut sp.lv[i][j];
+            if fresh {
+                *spr = Spring::at(t[j]);
+            } else if harness_native_api::settle(spr, t[j], tune, dt) {
+                going = true;
+            } else {
+                *spr = Spring::at(t[j]);
+            }
+        }
+    }
+    sp.n = n as u8;
+    sp.at = now;
+    if e.try_cloned::<&ShapeSprings>() != Some(sp) {
+        e.set(sp);
+    }
+    let (m, a) = fold(&s.chain, |i| if i < n { sp.lv[i].map(|x| x.x) } else { target(i) });
+    (m, a, going)
+}
+
+fn num_of(v: &Value) -> Option<f32> {
+    v.as_f64().filter(|x| x.is_finite()).map(|x| x as f32)
+}
+
+/// `v`'s onClick (a Canvas's or a shape's), sending its `value` (null when it has none).
+fn clicks(v: View<'_>, node: &Value, cell: &str) {
+    match prop(node, "onClick").as_str() {
+        Some(h) => control::arm(v, Some(&control::send(cell, h, prop(node, "value").clone()))),
+        None if v.entity().has(Action::id()) => control::arm(v, None),
+        None => {}
+    }
+}
+
+/// What a Canvas shape takes of the pointer: its onClick, its handlers, its hover inks and its tip, hit only over its
+/// bounds (`room`, the canvas's box as laid out last frame, is where they are drawn).
+fn shape_input(sv: View<'_>, s: &Shape, cell: &str, room: Laid) {
+    let e = sv.entity();
+    let node = &s.node;
+    clicks(sv, node, cell);
+    common::hover_ink(e, prop(node, "hover"));
+    common::handlers(e, &node["props"], cell);
+    tip(sv, &words(node, "tip"));
+    let hit = e.has(Hoverable::id());
+    match bounds(s, room).filter(|_| hit) {
+        Some(b) => {
+            if e.try_cloned::<&HitBox>() != Some(b) {
+                e.set(b);
+            }
+        }
+        None if e.has(HitBox::id()) => drop(e.remove(HitBox::id())),
+        None => {}
+    }
+}
+
+/// Shape `s`'s bounds in points from its box's corner, its box `room` as the painter fits its view box into it (an
+/// outline's control points count; words are guessed from their size).
+fn bounds(s: &Shape, room: Laid) -> Option<HitBox> {
+    let mut pts: Vec<[f32; 2]> = Vec::new(); // alloc: one shape's outline points, dropped
+    if let Some(t) = &s.text {
+        let w = t.s.chars().count() as f32 * t.size * 0.6;
+        let x0 = t.x - w * f32::from(t.anchor) * 0.5;
+        pts.extend([[x0, t.y - t.size], [x0 + w, t.y + t.size * 0.3]]);
+    }
+    if !s.d.is_empty() {
+        use harness_native_render::vector::Seg;
+        for seg in harness_native_render::vector::segments(&s.d).ok()? {
+            match seg {
+                Seg::Move(p) | Seg::Line(p) => pts.push([p[0] as f32, p[1] as f32]),
+                Seg::Quad(a, p) => pts.extend([[a[0] as f32, a[1] as f32], [p[0] as f32, p[1] as f32]]),
+                Seg::Cubic(a, c, p) => pts.extend([a, c, p].map(|q| [q[0] as f32, q[1] as f32])),
+                Seg::Close => {}
+            }
+        }
+    }
+    let m = s.m;
+    let (bw, bh) = ((room.w - s.inset[0] - s.inset[2]).max(0.0), (room.h - s.inset[1] - s.inset[3]).max(0.0));
+    let [vx, vy, vw, vh] = if s.view[2] > 0.0 && s.view[3] > 0.0 { s.view } else { [0.0, 0.0, bw.max(1e-6), bh.max(1e-6)] };
+    let (mut sx, mut sy, mut ox, mut oy) = (bw / vw, bh / vh, s.inset[0], s.inset[1]);
+    if s.fit == VectorFit::Meet {
+        let k = sx.min(sy);
+        (ox, oy) = (ox + (bw - vw * k) * 0.5, oy + (bh - vh * k) * 0.5);
+        (sx, sy) = (k, k);
+    }
+    let pad = s.width * 0.5 * sx.max(sy).max(1.0);
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for [x, y] in pts {
+        let (ux, uy) = (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+        let (px, py) = (ox + (ux - vx) * sx, oy + (uy - vy) * sy);
+        (x0, y0, x1, y1) = (x0.min(px), y0.min(py), x1.max(px), y1.max(py));
+    }
+    (x1 >= x0).then(|| HitBox { x: x0 - pad, y: y0 - pad, w: x1 - x0 + 2.0 * pad, h: y1 - y0 + 2.0 * pad })
 }
 
 /// The words shown while the pointer rests on `v` (none: no tip, and it takes no hover).
@@ -426,5 +615,5 @@ pub(super) fn check(world: WorldRef<'_>, node: &Value) -> Option<String> {
     };
     let kids = node["children"].as_array().map_or(&[][..], Vec::as_slice);
     let mut scratch = Vec::new(); // alloc: the shapes read once to check them, dropped
-    flatten(world, kids, IDENTITY, 1.0, vb, &mut scratch, 0).err()
+    flatten(world, kids, &[], vb, &mut scratch, 0).err()
 }

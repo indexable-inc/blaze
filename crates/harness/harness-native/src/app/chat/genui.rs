@@ -13,7 +13,12 @@ use harness_native_ui_layout_api::{Flex, Padding};
 use harness_native_ui_node_api::Laid;
 
 mod canvas;
+mod cellref;
 mod chart;
+mod color;
+mod dropzone;
+mod files;
+mod common;
 mod control;
 mod float;
 mod layout;
@@ -21,6 +26,7 @@ mod media;
 mod props;
 mod surface;
 
+pub use common::{GenFeel, GenOn, Prims};
 pub use control::Live;
 
 /// The most elements one cell draws, how deep they nest, and the most rows and columns a table shows.
@@ -30,7 +36,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 48] = [
+const ELEMENTS: [(&str, &str); 52] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -79,6 +85,10 @@ const ELEMENTS: [(&str, &str); 48] = [
     ("Kip", "hn.GenKip"),
     ("Shader", "hn.GenShader"),
     ("Video", "hn.GenVideo"),
+    ("File", "hn.GenFile"),
+    ("CellRef", "hn.GenCellRef"),
+    ("ColorPicker", "hn.GenColorPicker"),
+    ("DropZone", "hn.GenDropZone"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -108,6 +118,10 @@ struct Budget<'a, 'm> {
     /// where an id sits in the tree does not matter.
     ids: std::collections::BTreeMap<String, surface::Ref>,
     shaders: Vec<u64>,
+    /// This chat's cells, by tool call (its transcript's `details`), for a CellRef; None outside a transcript.
+    cells: Option<&'a std::collections::HashMap<String, Detail>>,
+    /// The tree is a cell's view shown in another's CellRef: a CellRef in it shows only a note.
+    nested: bool,
 }
 
 /// What an element sits in, when that changes how it is drawn or what a press on it sends.
@@ -126,10 +140,24 @@ enum Within {
 /// Fill a `hn.ChatUi` row with the tree `ui` that cell `cell` (`<repl>.<task>`) drew. `live` is the app's controls in use
 /// (a field being typed in shows its own words); None draws the tree's values. `playing`: the agent is at work, so what is
 /// new plays (a Kip's moods).
+#[cfg(test)]
 pub(super) fn fill(
     row: View<'_>,
     ui: &Value,
     cell: &str,
+    live: Option<&std::cell::RefCell<Live>>,
+    playing: bool,
+    measure: &mut Measure<'_>,
+) {
+    fill_in(row, ui, cell, None, live, playing, measure);
+}
+
+/// [`fill`], with the chat's cells by tool call (`cells`: its transcript's `details`), which a CellRef shows.
+pub(super) fn fill_in(
+    row: View<'_>,
+    ui: &Value,
+    cell: &str,
+    cells: Option<&std::collections::HashMap<String, Detail>>,
     live: Option<&std::cell::RefCell<Live>>,
     playing: bool,
     measure: &mut Measure<'_>,
@@ -151,6 +179,8 @@ pub(super) fn fill(
         playing,
         ids: std::collections::BTreeMap::new(),
         shaders: Vec::new(),
+        cells,
+        nested: false,
     };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
@@ -212,6 +242,11 @@ fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&
 /// does not know, or props it cannot draw (a Table's rows that are not a list, a Chart's data, a Canvas's shapes), or a
 /// Shader the GPU could not draw (`live`'s media said so: [`surface::failed`]).
 fn refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&Live>) -> Option<String> {
+    own_refusal(world, node, within, live).or_else(|| common::check(world, node))
+}
+
+/// The half of [`refusal`] that is the element's own: its type and its own props.
+fn own_refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&Live>) -> Option<String> {
     let kind = node["type"].as_str().unwrap_or("");
     match kind {
         k if props::TIER3.contains(&k) => props::check(node, within).or_else(|| surface::failed(node, live)),
@@ -294,6 +329,10 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
             surface::record(v, node, kind, b);
         }
         "Shader" | "Video" => surface::element(v, node, kind, b),
+        "File" => files::element(v, node, b),
+        "CellRef" => cellref::element(v, node, depth, b),
+        "ColorPicker" => color::element(v, node, b),
+        "DropZone" => dropzone::element(v, node, &kids, depth, b),
         "Column" | "Row" => {
             spacing(v, prefab_of(kind), node);
             children(v, &kids, depth + 1, b);
@@ -376,6 +415,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
         }
         _ => {}
     }
+    common::apply(v, node, kind, b);
 }
 
 /// A container's `gap` and `pad` (points), else its prefab's.
@@ -475,19 +515,48 @@ fn table(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) {
             _ => &Value::Null,
         }
     };
-    let shown = rows.len().min(MAX_ROWS);
+    // A cell `{text, open}`: its words, and a press that sends `open` to onOpen.
+    let on_open = control::handler(node, "onOpen");
+    let made = |x: &Value| match x {
+        Value::Object(o) if o.contains_key("text") => {
+            let c = super::value_cell(&o["text"], "");
+            match (&on_open, o.get("open")) {
+                (Some(h), Some(open)) => c.with_press(control::send(b.cell, h, open.clone())),
+                _ => c,
+            }
+        }
+        x => super::value_cell(x, ""),
+    };
+    let built: Vec<Vec<view::table::Cell>> = (0..rows.len()).map(|r| (0..cols.len()).map(|c| made(cell(r, c))).collect()).collect();
+    // `query` keeps the rows with a cell that has it (as the cell shows), each match marked; rows keep their own index.
+    let query = words(node, "query");
+    let query = query.trim();
+    let kept: Vec<usize> =
+        (0..rows.len()).filter(|&r| query.is_empty() || built[r].iter().any(|c| view::table::find(&c.shown(), query).is_some())).collect();
+    let total = kept.len();
+    let shown = total.min(MAX_ROWS);
+    // onSelect is sent the row's index in `rows`.
+    let on_select = control::handler(node, "onSelect");
+    let presses: Option<Vec<String>> = on_select.as_deref().map(|h| kept.iter().take(shown).map(|&r| control::send(b.cell, h, Value::from(r))).collect());
+    let mut built = built;
     let data = view::table::Table {
         cols: cols.iter().map(|(title, _)| view::table::Column { name: title.clone(), align: view::table::Align::Auto }).collect(),
-        rows: (0..shown).map(|r| (0..cols.len()).map(|c| super::value_cell(cell(r, c), "")).collect()).collect(),
+        rows: kept.iter().take(shown).map(|&r| std::mem::take(&mut built[r])).collect(),
         head: true,
     };
     if let Some(grid) = v.part("card").and_then(|c| c.part("grid")) {
-        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: None, open: None };
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, presses: presses.as_deref(), find: query, ..view::table::Opts::default() };
         view::table(grid, &data, opts, &mut *b.measure);
     }
     if let Some(f) = v.part("foot") {
-        let total = rows.len();
-        super::foot(f, &if shown < total { format!("{shown} of {total} rows") } else { String::new() });
+        let foot = if total == 0 && !query.is_empty() {
+            "No rows match".to_owned()
+        } else if shown < rows.len() {
+            format!("{shown} of {} rows", rows.len())
+        } else {
+            String::new()
+        };
+        super::foot(f, &foot);
     }
 }
 
@@ -496,6 +565,127 @@ mod tests {
     use super::*;
     use harness_native_api::Clock;
     use harness_native_ui_layout_api::Viewport;
+
+    /// Property `new-elements-draw-and-send`: a File row sends its value, else its name; a ColorPicker's swatches send
+    /// their #rrggbb, its well asks for the panel, its ring is on the selected swatch and moves at once to a pick (before
+    /// the tree echoes it); a DropZone lights only while files are over it; a CellRef shows its cell's live view (that
+    /// cell's events, not this one's) or its printed output cut to 30 lines, and a cell shown inside a cell is a note.
+    #[test]
+    fn new_elements_draw_and_send() {
+        use harness_native_ui_input_api::Action;
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 2000.0 });
+        let ui = serde_json::json!([
+            {"type": "File", "props": {"name": "src/", "modified": "today", "onClick": "h1"}, "children": []},
+            {"type": "File", "props": {"name": "package.json", "size": 812, "modified": "2 hours ago", "value": "pkg", "onClick": "h2"}, "children": []},
+            {"type": "File", "props": {"name": "README", "kind": "markdown", "size": 14336}, "children": []},
+            {"type": "ColorPicker", "props": {"options": ["#0A84FF", "#bf5af2", "accent"], "selected": "#0a84ff", "label": "Accent", "onChange": "h3"}, "children": []},
+            {"type": "DropZone", "props": {"label": "Drop here", "onDrop": "h4"}, "children": []},
+            {"type": "CellRef", "props": {"task": "t1", "call": "c1", "title": "First"}, "children": []},
+            {"type": "CellRef", "props": {"task": "t2", "call": "c2"}, "children": []}
+        ]);
+        let printed: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let mut cells = std::collections::HashMap::new();
+        cells.insert("c1".to_owned(), Detail {
+            cell: "other.1".to_owned(),
+            status: "running".to_owned(),
+            ui: std::sync::Arc::new(serde_json::json!({"type": "Column", "props": {}, "children": [
+                {"type": "File", "props": {"name": "inner.txt", "onClick": "h9"}, "children": []},
+                {"type": "CellRef", "props": {"task": "t1", "call": "c1"}, "children": []}]})),
+            ..Default::default()
+        });
+        cells.insert("c2".to_owned(), Detail { cell: "other.2".to_owned(), status: "error".to_owned(), logs: printed.join("\n"), ..Default::default() });
+        let live = std::cell::RefCell::new(Live::default());
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        let mut frame = || {
+            fill_in(row, &ui, "test.0", Some(&cells), Some(&live), true, &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        };
+        for _ in 0..4 {
+            frame();
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let is = |v: View<'_>, prefab: &str| {
+            let p = view::prefab(w, prefab).unwrap_or_else(|| panic!("no prefab {prefab}"));
+            v.entity().owns((flecs::IsA::ID, *p.id()))
+        };
+        let action = |v: View<'_>| v.entity().try_cloned::<&Action>().map(|a| a.name.as_str().to_owned());
+        let words_of = |v: View<'_>| v.entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).unwrap_or_default();
+        // Every action and every word under `v`, depth first.
+        fn under(e: EntityView<'_>, acts: &mut Vec<String>, words: &mut Vec<String>) {
+            if let Some(a) = e.try_cloned::<&harness_native_ui_input_api::Action>() {
+                acts.push(a.name.as_str().to_owned());
+            }
+            if let Some(t) = e.try_cloned::<&Text>() {
+                words.push(t.s.as_str().to_owned());
+            }
+            e.each_child(|c| under(c, acts, words));
+        }
+        let all = |v: View<'_>| {
+            let (mut a, mut t) = (Vec::new(), Vec::new());
+            under(v.entity(), &mut a, &mut t);
+            (a, t)
+        };
+
+        // File: a folder's name loses its slash and sends the name; a value is sent over the name; no onClick, no press.
+        assert!(is(el(0), "hn.GenFileOn") && is(el(1), "hn.GenFileOn") && is(el(2), "hn.GenFile") && !is(el(2), "hn.GenFileOn"));
+        assert_eq!(action(el(0)).as_deref(), Some(r#"ui:["test.0","h1","src/"]"#));
+        assert_eq!(words_of(part(el(0), "name")), "src");
+        assert_eq!(action(el(1)).as_deref(), Some(r#"ui:["test.0","h2","pkg"]"#));
+        assert_eq!(words_of(part(el(1), "meta")), "812 B \u{00B7} 2 hours ago");
+        assert_eq!(words_of(part(el(2), "meta")), "14.3 KB");
+        assert_eq!(action(el(2)), None, "a File with no onClick takes no press");
+
+        // ColorPicker: each swatch sends its #rrggbb; the well asks for the panel; the ring is on the selected one.
+        let picker = el(3);
+        let sw = |i: &str| part(picker, &format!("body.{i}"));
+        for (i, hex) in [("s0", "#0a84ff"), ("s1", "#bf5af2")] {
+            let a = action(sw(i)).unwrap_or_default();
+            assert!(a.starts_with("ui:{") && a.contains(r#""k":"color""#) && a.contains(r#""change":"h3""#) && a.contains(&format!(r#""value":"{hex}""#)), "{i} sends {hex}: {a}");
+            assert!(!a.contains("well"), "a swatch is no well: {a}");
+        }
+        let accent = action(sw("s2")).unwrap_or_default();
+        assert!(accent.contains(r##""value":"#"##), "a tone sends a #rrggbb too: {accent}");
+        let well = action(sw("well")).unwrap_or_default();
+        assert!(well.contains(r#""well":true"#) && well.contains(r#""k":"color""#), "the well asks for the panel: {well}");
+        let ringed = || ["s0", "s1", "s2", "well"].into_iter().filter(|i| sw(i).part("ring").is_some()).collect::<Vec<_>>();
+        assert_eq!(ringed(), ["s0"], "the selected swatch is ringed");
+        // A pick (what App::genui_color does with the s1 press) moves the ring at once, while the tree still says s0.
+        live.borrow_mut().colors.keep(picker.id(), "#bf5af2");
+        frame();
+        assert_eq!(ringed(), ["s1"], "a pick shows before the tree echoes it");
+
+        // DropZone: lit only while files are over it.
+        let zone = el(4);
+        assert!(is(zone, "hn.GenDropZone") && zone.part("hot").is_none(), "a zone at rest is not lit");
+        assert_eq!(words_of(part(zone, "label")), "Drop here");
+        live.borrow_mut().drops.over = Some(zone.id());
+        frame();
+        assert!(zone.part("hot").is_some(), "a zone with files over it lights");
+        live.borrow_mut().drops.over = None;
+
+        // CellRef: the live view sends to its own cell; a cell inside a cell is a note; printed output is cut to 30 lines.
+        let (acts, words) = all(el(5));
+        assert!(words.iter().any(|t| t == "First") && words.iter().any(|t| t == "running"), "head and badge: {words:?}");
+        assert!(acts.iter().any(|a| a == r#"ui:["other.1","h9","inner.txt"]"#), "the embedded view sends to its cell: {acts:?}");
+        assert!(words.iter().any(|t| t.contains("shows only what that one made itself")), "the nested CellRef is a note: {words:?}");
+        let (_, words) = all(el(6));
+        assert!(words.iter().any(|t| t == "cell t2") && words.iter().any(|t| t == "failed"), "{words:?}");
+        let code = words.iter().find(|t| t.contains("line 0")).unwrap_or_else(|| panic!("printed output: {words:?}"));
+        assert!(code.contains("line 29") && !code.contains("line 30\n") && code.ends_with("10 more lines"), "30 lines, then the cut: {code}");
+    }
 
     /// Property `a-table-given-rows-shows-them`: a cell's `<Table rows=...>` lays out a body row for each of its rows, each
     /// with height, under its header; never a header alone. Headless (the scene world and layout; no window or daemon).
@@ -791,7 +981,12 @@ mod tests {
                 {"type": "Split", "props": {"ratio": 0.5, "vertical": true}, "children": [t("up"), t("down")]},
                 {"type": "Grid", "props": {"fit": 120, "gap": 12, "pad": 0}, "children": [t("x"), t("y")]},
                 {"type": "Scroll", "props": {"height": 80, "horizontal": true}, "children": [t("across")]},
-                {"type": "Toast", "props": {"text": "Going", "tone": "ink", "duration": 500, "onDismiss": "h19"}, "children": []}
+                {"type": "Toast", "props": {"text": "Going", "tone": "ink", "duration": 500, "onDismiss": "h19"}, "children": []},
+                {"type": "Button", "props": {"label": "Go", "value": {"n": 2}, "onClick": "h20"}, "children": []},
+                {"type": "Table", "props": {"rows": [{"name": "alpha", "n": 1}, {"name": "beta", "n": 2}, {"name": {"text": "Gamma", "open": "g"}, "n": 3}],
+                    "query": "ga", "onSelect": "h21", "onOpen": "h22"}, "children": []},
+                {"type": "Table", "props": {"rows": [{"name": "alpha"}], "query": "zzz"}, "children": []},
+                {"type": "FileRef", "props": {"path": "/x/a.rs", "line": 3, "name": "entry", "onClick": "h23"}, "children": []}
             ])
         };
         let live = std::cell::RefCell::new(Live::default());
@@ -914,6 +1109,22 @@ mod tests {
         assert_eq!(action(el(16)), Some(one("h5", "\"icon\"")));
         assert_eq!(action(el(17)).as_deref(), Some("open:60:/x/src/tree.ts"), "a file chip opens its file at its line");
         assert_eq!((words_of(part(el(17), "name")), words_of(part(el(17), "line"))), ("tree.ts".to_owned(), ":60".to_owned()));
+        // A Button sends its value; a Table's query keeps the rows that have it, each marked, and its rows and cells send.
+        assert_eq!(action(el(25)), Some(one("h20", r#"{"n":2}"#)), "a button sends its value");
+        let row0 = part(el(26), "card.grid.scroll.inner.body.r0");
+        assert_eq!(action(row0), Some(one("h21", "2")), "onSelect hears the row's index in rows");
+        assert!(el(26).part("card").and_then(|c| part(c, "grid.scroll.inner.body").part("r1")).is_none(), "the rows without the query go");
+        assert_eq!(action(part(row0, "c1")), Some(one("h22", "\"g\"")), "a cell's open goes to onOpen");
+        assert!(is(part(row0, "c1"), "hn.ChatTableCellLink"));
+        let found = part(row0, "c1.text.match").entity().try_cloned::<&harness_native_ui_text_api::TextRange>();
+        assert_eq!(found, Some(harness_native_ui_text_api::TextRange { from: 0, to: 2 }), "the match is marked, case aside");
+        assert_eq!(words_of(part(el(27), "foot")), "No rows match");
+        assert_eq!(
+            action(el(28)).as_deref(),
+            Some(r#"ui:{"open":"3:/x/a.rs","send":[["test.0","h23","/x/a.rs"]]}"#),
+            "a file chip with onClick opens it, then sends its path"
+        );
+        assert_eq!(words_of(part(el(28), "name")), "entry");
         for (i, says) in [(18, "<Layer> is not in a Stack"), (19, "<Icon> name"), (20, "<Grid> has no prop \u{201C}foo\u{201D}")] {
             let t = words_of(el(i));
             assert!(t.contains(says), "element {i} is refused in words: {t:?}");

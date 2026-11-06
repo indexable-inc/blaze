@@ -27,6 +27,7 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Ok(g) = std::env::var("HARNESS_NATIVE_GALLERY") {
         if g == "genui" {
             genui = Some((crate::gallery::load_genui(&app, 32.0)?, crate::gallery::genui_tree()?));
+            crate::gallery::genui_cells()?;
         } else {
             crate::gallery::load(&app, 32.0, g == "prims")?;
         }
@@ -56,6 +57,10 @@ pub fn run(path: &str) -> Result<(), String> {
             }
         } else if let Ok(sid) = s.parse() {
             app.select_session(sid);
+            // HARNESS_NATIVE_SHOT_CHAT_MENU `model|effort|all`: that chat's model and effort picker open on that menu.
+            if let Ok(page) = std::env::var("HARNESS_NATIVE_SHOT_CHAT_MENU") {
+                app.shot_chat_pick(sid, &page);
+            }
         }
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
@@ -136,17 +141,36 @@ pub fn run(path: &str) -> Result<(), String> {
         .map(|s| nums(&s))
         .filter(|v| v.len() == 4)
         .map(|v| (v, 0usize));
+    // HARNESS_NATIVE_SHOT_DROP `x,y,t[,t_off]`: Finder files carried over (x, y) (window points) from t seconds, as the
+    // window's dragging callbacks report them (a DropZone there lights), and carried off at t_off. No drag is made.
+    let mut carried = std::env::var("HARNESS_NATIVE_SHOT_DROP").ok().map(|s| nums(&s)).filter(|v| v.len() == 3 || v.len() == 4);
     let mut at = (0.0f32, 0.0f32);
     let (left, none) = (crate::term::Button::Left, crate::app::KeyMods::default());
+    // HARNESS_NATIVE_GENUI_NEXT=<tree.json>,<secs>: the cell's tree changes to that one at that time (a value gliding to
+    // its next, a float opening).
+    let mut next = match std::env::var("HARNESS_NATIVE_GENUI_NEXT") {
+        Ok(v) => {
+            let (path, secs) = v.rsplit_once(',').ok_or_else(|| format!("HARNESS_NATIVE_GENUI_NEXT={v}: not <tree.json>,<secs>"))?;
+            let secs: f32 = secs.trim().parse().map_err(|e| format!("HARNESS_NATIVE_GENUI_NEXT={v}: {secs}: {e}"))?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("HARNESS_NATIVE_GENUI_NEXT {path}: {e}"))?;
+            Some((secs, serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("HARNESS_NATIVE_GENUI_NEXT {path}: {e}"))?))
+        }
+        Err(_) => None,
+    };
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
         // AVFoundation says its players' status and first frames through the main queue, and a shot runs no run loop.
         harness_native_render::media::Media::pump();
+        let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
+        if next.as_ref().is_some_and(|(secs, _)| t >= *secs)
+            && let (Some((_, tree)), Some((_, now))) = (&mut genui, next.take())
+        {
+            *tree = now;
+        }
         if let Some((root, tree)) = &genui {
             app.fill_genui_gallery(*root, tree);
         }
-        let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
         frames += 1;
         // The last hover's shape, resolved by the frame after it moved.
         if let Some((x, y)) = hovered.take() {
@@ -173,6 +197,17 @@ pub fn run(path: &str) -> Result<(), String> {
             *n += 1;
             if *n > 9 {
                 wheel = None;
+            }
+        }
+        if let Some(v) = carried.as_mut() {
+            if v[2] >= 0.0 && t >= v[2] {
+                let lit = app.genui_files_over(Some((v[0], v[1])));
+                eprintln!("harness-native: shot files over {},{} at {t:.3}: a drop zone takes them: {lit}", v[0], v[1]);
+                v[2] = -1.0;
+            }
+            if v.len() == 4 && v[2] < 0.0 && t >= v[3] {
+                app.genui_files_over(None);
+                carried = None;
             }
         }
         if copy_at.take_if(|c| t >= *c).is_some() {

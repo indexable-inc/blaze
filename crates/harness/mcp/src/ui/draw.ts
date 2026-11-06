@@ -19,11 +19,13 @@ export const SVG_SAID = 'path, rect, circle, ellipse, line, polyline, polygon, g
 
 /** Paint a `<g>` or `<svg>` says for what it holds, as SVG inherits it. */
 const PAINT = ['fill', 'stroke', 'stroke-width', 'fill-opacity', 'stroke-opacity', 'fill-rule', 'stroke-linecap', 'stroke-linejoin', 'font-size', 'font-weight', 'text-anchor'];
-const SHAPE_ATTRS = ['fill', 'stroke', 'stroke-width', 'fill-opacity', 'stroke-opacity', 'opacity', 'transform', 'stroke-linecap', 'stroke-linejoin', 'class', 'id', 'tip'];
+/** The events a drawn element hears (its press, the pointer over it), sent as the Canvas element's handler ids (tree.ts). */
+const EVENTS = ['onclick', 'onpointerdown', 'onpointermove', 'onpointerup', 'ondrag', 'onwheel', 'onhover'];
+const SHAPE_ATTRS = ['fill', 'stroke', 'stroke-width', 'fill-opacity', 'stroke-opacity', 'opacity', 'transform', 'stroke-linecap', 'stroke-linejoin', 'class', 'id', 'tip', ...EVENTS];
 /** The attributes each SVG tag takes. */
 const SVG_ATTRS: Readonly<Record<string, readonly string[]>> = {
-  svg: ['viewBox', 'width', 'height', 'xmlns', 'xmlns:xlink', 'version', 'preserveAspectRatio', 'class', 'id', 'tip', ...PAINT],
-  g: ['transform', 'opacity', 'class', 'id', 'tip', ...PAINT],
+  svg: ['viewBox', 'width', 'height', 'xmlns', 'xmlns:xlink', 'version', 'preserveAspectRatio', 'class', 'id', 'tip', ...EVENTS, ...PAINT],
+  g: ['transform', 'opacity', 'class', 'id', 'tip', ...EVENTS, ...PAINT],
   path: ['d', 'fill-rule', ...SHAPE_ATTRS],
   rect: ['x', 'y', 'width', 'height', 'rx', 'ry', ...SHAPE_ATTRS],
   circle: ['cx', 'cy', 'r', ...SHAPE_ATTRS],
@@ -31,7 +33,7 @@ const SVG_ATTRS: Readonly<Record<string, readonly string[]>> = {
   line: ['x1', 'y1', 'x2', 'y2', ...SHAPE_ATTRS],
   polyline: ['points', ...SHAPE_ATTRS],
   polygon: ['points', ...SHAPE_ATTRS],
-  text: ['x', 'y', 'text-anchor', 'font-size', 'font-weight', 'fill', 'class', 'id', 'tip'],
+  text: ['x', 'y', 'text-anchor', 'font-size', 'font-weight', 'fill', 'class', 'id', 'tip', ...EVENTS],
 };
 /** Attributes models reach for that the scene has no way to honour, and what to say instead. */
 const REFUSED: Readonly<Record<string, string>> = {
@@ -109,7 +111,7 @@ export function parseTransform(value: unknown): Affine | string {
 }
 
 /** What an SVG tag takes, as an error says it. */
-const svgTakes = (tag: string) => `a <${tag}> takes ${SVG_ATTRS[tag]!.filter(name => !['class', 'id', 'xmlns', 'xmlns:xlink', 'version'].includes(name)).join(', ')}`;
+const svgTakes = (tag: string) => `a <${tag}> takes ${SVG_ATTRS[tag]!.filter(name => !['class', 'id', 'xmlns', 'xmlns:xlink', 'version'].includes(name) && !EVENTS.includes(name)).join(', ')}, and hears ${EVENTS.join(', ')}`;
 
 /**
  * The error for attribute `name` set to `value` on the SVG tag `tag` (`rect`), or undefined when the kernel can send it: an attribute
@@ -119,12 +121,12 @@ export function svgError(tag: string, name: string, value: unknown, where?: stri
   const fail = (wants: string) => new TypeError(`${said(name, value)} on <${tag}> ${wants}${at(where)}`);
   if (Object.hasOwn(REFUSED, name)) return fail(`is not drawn: ${REFUSED[name]}`);
   if (!SVG_ATTRS[tag]!.includes(name)) {
-    if (/^on/.test(name)) return new TypeError(`${name} on <${tag}> answers nothing${at(where)}: drawings take no events yet`);
+    if (/^on/.test(name)) return new TypeError(`${name} on <${tag}> answers nothing${at(where)}: a drawing hears ${EVENTS.join(', ')}; for keys and transitions draw the Canvas elements (<Rect>, <Group>, ...)`);
     if (tag === 'text' && name === 'transform') return new TypeError(`<text transform> is not drawn${at(where)}: a <text> takes x and y; put it in a <g transform="...">`);
     if (tag === 'svg' && name === 'opacity') return new TypeError(`<svg opacity> is not drawn${at(where)}: put what fades in a <g opacity="...">`);
     return new TypeError(`<${tag}> has no attribute ${JSON.stringify(name)}${at(where)}: ${svgTakes(tag)}`);
   }
-  if (value === undefined || value === null || value === false) return undefined;
+  if (value === undefined || value === null || value === false || EVENTS.includes(name)) return undefined;
   switch (name) {
     case 'fill': case 'stroke': return inkError(tag, name, value, where);
     case 'class': case 'id': case 'xmlns': case 'xmlns:xlink': case 'version': return undefined;

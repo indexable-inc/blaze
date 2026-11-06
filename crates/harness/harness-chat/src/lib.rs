@@ -123,6 +123,17 @@ pub struct Transcript {
     /// The agent's own id for the conversation (Claude's session id, Codex's thread id): what resumes it. Empty when the
     /// log never said (a chat recorded before `session` events carried it).
     pub session_id: String,
+    /// The models the agent offers (its latest `models` event); empty when it never listed them.
+    pub models: Vec<ev::ModelChoice>,
+    /// The person's latest choice of model (a [`ev::ModelChoice::id`]) and of effort (`choice` events); empty when they
+    /// never chose. What a resume starts the agent with.
+    pub chosen_model: String,
+    pub chosen_effort: String,
+    /// Tokens of the model's context window the conversation fills, and the window (0: unknown), as the agent last said
+    /// (its `context` event); None before it said.
+    pub context: Option<(u64, u64)>,
+    /// What the conversation has cost so far (the sum of its turns' `cost_usd`); None while no turn said.
+    pub cost_usd: Option<f64>,
     /// The first user message's first line, cut to [`TITLE_CHARS`].
     pub title: String,
     /// Moves on every change (what the view redraws on).
@@ -139,8 +150,10 @@ pub struct Transcript {
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
-            == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
+        (&self.models, &self.chosen_model, &self.chosen_effort, self.context, self.cost_usd)
+            == (&o.models, &o.chosen_model, &o.chosen_effort, o.context, o.cost_usd)
+            && (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
+                == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
     }
 }
 
@@ -219,6 +232,20 @@ impl Transcript {
                     self.session_id.clone_from(id);
                 }
             }
+            Body::Models { models } => self.models.clone_from(models),
+            Body::Choice { model, effort } => {
+                // Shown at once (the next turn runs with it); the agent's `session` event confirms it, naming the model
+                // as it runs.
+                if let Some(m) = model {
+                    self.chosen_model.clone_from(m);
+                    self.model = self.models.iter().find(|c| c.is(m)).map_or_else(|| m.clone(), |c| if c.model.is_empty() { c.id.clone() } else { c.model.clone() });
+                }
+                if let Some(e) = effort {
+                    self.chosen_effort.clone_from(e);
+                    self.effort.clone_from(e);
+                }
+            }
+            Body::Context { used, window } => self.context = Some((*used, *window)),
             Body::User { text } => {
                 if self.title.is_empty() {
                     self.title = title_of(text);
@@ -297,6 +324,9 @@ impl Transcript {
             Body::Note { text } => self.push("", Item::Note { text: text.clone() }),
             Body::Error { text } => self.push("", Item::Error { text: text.clone() }),
             Body::TurnEnd { ok, stop, duration_ms, cost_usd, .. } => {
+                if let Some(c) = cost_usd {
+                    self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + c);
+                }
                 // A turn's partials that never came whole (the agent died mid-block) stop streaming.
                 for it in &mut self.items {
                     match it {

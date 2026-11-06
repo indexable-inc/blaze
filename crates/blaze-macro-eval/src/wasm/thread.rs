@@ -217,6 +217,12 @@ static THREADS: Mutex<Threads> =
 
 const THREADS_NAME: &str = "the wasm expansion threads";
 
+/// The expansion threads alive now, idle ones included: the proc-macro lane's width the build
+/// view shows (`proc macros 3 of 32 expanding`).
+pub fn alive() -> usize {
+    wait::lock(&THREADS, THREADS_NAME).started
+}
+
 /// The most expansion threads kept: twice the process's workers, so every worker's job can
 /// have an expansion running and one more whose job answers its questions. Fixed for the
 /// process, however many crates and programs a build expands at once.

@@ -245,14 +245,13 @@ impl Tasks {
         }
     }
 
-    /// The program as of `now_ns`, with `threads` the workers (`workers` of them), `closed`
-    /// spans closed since the last look and `memory` the program's.
+    /// The program as of `now_ns`, with `threads` the workers (`workers` of them) and `memory`
+    /// the program's.
     pub fn look(
         &mut self,
         now_ns: i64,
         workers: u32,
         threads: &[Worker],
-        closed: u64,
         memory: &Memory,
     ) -> Now {
         self.clock(now_ns);
@@ -275,7 +274,7 @@ impl Tasks {
             })
             // alloc: the look's downloads, a handful
             .collect();
-        let look = Look { workers, threads, downloads: &downloads, stage: "", closed, memory };
+        let look = Look { workers, threads, downloads: &downloads, stage: "", memory, expanders: &[], expansion_threads: 0 };
         self.fold.look(&look)
     }
 }

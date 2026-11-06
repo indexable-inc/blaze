@@ -45,15 +45,100 @@ hn {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: 0, b: 0}
-        model : ui.Line, Faint {
-          TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        // The model, the effort and the context meter (src/app/chat/pick.rs fills it: hn.ChatPick, hn.ChatPickWord,
+        // hn.ChatPickMore, hn.ChatContext, each only while it has something to say).
+        pick : ui.Row {
+          Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         }
         spacer : ui.Spacer {}
         state : ui.Line, Faint {
           TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
         }
+        // The picker's menu while it is open (a ui.Menu): out of the row's flow, its plate placed above what opened it.
+        menu : ui.Node {
+          Overlay
+        }
       }
     }
+  }
+
+  // Den's model and effort picker under the composer (src/app/chat/pick.rs): the model's name in the ink, the effort's
+  // word and a chevron muted, each its own control with no plate, its ink easing to the strong ink under the pointer
+  // (pick.rs mixes hn.ChatPickInk's by the hover spring). The name opens the models, the word the efforts, the chevron
+  // both; Command-/ opens the models and Shift-Command-/ steps the effort (scene/20-keys.flecs).
+  prefab ChatPickBase : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+  }
+  prefab ChatPick : hn.ChatPickBase {
+    Tooltip: {text: "Select model  ⌘/"}
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatPickWord : hn.ChatPickBase {
+    Tooltip: {text: "Effort  ⇧⌘/"}
+    label : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatPickMore : hn.ChatPickBase {
+    Tooltip: {text: "Model and effort"}
+    icon : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_term_muted
+      Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
+    }
+  }
+  // The picker's inks at rest (the name's, the effort's and the chevron's); under the pointer each eases to `name` at
+  // full strength.
+  prefab ChatPickInk {
+    name { Fill: $tone_term_ink }
+    word { Fill: $tone_term_muted }
+  }
+  // Its menu is a ui.Menu (prims.flecs) above what opened it: a head over each part when it shows both (the chevron's),
+  // the current row ticked, a model's line about it muted at the end; where nothing can be chosen, a ui.MenuNote says
+  // why.
+  // The context meter (den's): a ring filling as the conversation fills its model's window, and the percentage; muted,
+  // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Its tooltip says the tokens.
+  prefab ChatContext : ui.Row {
+    Hoverable
+    Cursor: {shape: Arrow}
+    Tooltip: {text: ""}
+    Flex: {axis: Row, gap: $chat_context_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+    Padding: {l: $chat_context_lead, r: 0, t: 0, b: 0}
+    ring : ui.ZStack {
+      Size: {w: {kind: Fixed, value: $chat_ring, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ring, min: 0, max: 0}}
+      track : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_faint.dark, light: $tone_term_faint.light}
+        Vector: {d: "M6 1 A5 5 0 1 1 6 11 A5 5 0 1 1 6 1", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
+      }
+      arc : ui.Node {
+        Overlay
+        Fill: $tone_clear
+        Stroke: {dark: $tone_term_muted.dark, light: $tone_term_muted.light}
+        Vector: {d: "M6 1 A5 5 0 0 1 6.5 1.03", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
+      }
+    }
+    pct : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
+    }
+  }
+  prefab ChatContextTone {
+    ok { Fill: $tone_term_muted }
+    warn { Fill: $tone_lost }
+    full { Fill: $tone_failed }
   }
 
   // Kip on the composer, as chat.rs `chat_kip` copies him onto its `kip`: greeting over an empty chat, his feet above
@@ -170,23 +255,17 @@ hn {
     }
   }
 
-  // One line for every tool call, run of calls, step and thought (src/app/chat.rs fill_row), Claude Code's calm: a small
-  // icon, its words, its argument in the code face, a quiet detail ("exit 1", "2 failed"), all in the muted ink at one
-  // weight, on one line. No chevron and no timing: pressed, it opens what it folds; how long it took is its tooltip. A
-  // failure says so once: its words in the failed tone (a run's, its count), never its icon too.
+  // One line for every tool call, run of calls, step and thought (src/app/chat.rs fill_row), Claude Code's calm: its
+  // words, its argument in the code face, a quiet detail ("exit 1", "2 failed"), all in the muted ink at the body size,
+  // on one line, with no icon, plate or border. Under the pointer a soft wash and a small chevron after its words (right
+  // folded, down open; src/app/chat.rs `line` turns it); pressed, it opens what it folds; how long it took is its
+  // tooltip. A failure says so once: its words in the failed tone (a run's, its count).
   // Its words are spaced by the room after each (text draws at its node's leading edge), not the row's gap, so an argument
   // with nothing to say (src/app/chat.rs `line` folds it to nothing) leaves no gap behind.
   prefab ChatLineLook : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
     Padding: {l: $chat_line_pad, r: 8, t: 0, b: 0}
-    icon : ui.Symbol {
-      Fill: $tone_term_muted
-      Size: {w: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}}
-    }
-    lead : ui.Node {
-      Size: {w: {kind: Fixed, value: $chat_line_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-    }
     words : ui.Line {
       Fill: $tone_term_muted
       LayoutPriority: {value: 1}
@@ -201,11 +280,38 @@ hn {
     detail : ui.Line {
       Fill: $tone_term_muted
       LayoutPriority: {value: 2}
+      Padding: {l: 0, r: $chat_line_word_gap, t: 0, b: 0}
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+    // Shown while its line is hovered (the nearest ancestor with a hover look: a step has none, so never).
+    chevron : ui.Symbol {
+      Fill: $tone_term_muted
+      HoverShow: {row: 0, keep: false}
+      Size: {w: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}}
     }
     spacer : ui.Spacer {}
   }
+
+  // The faint guide down the left of what a line opened (its output, its table, its steps, its words, a run's calls):
+  // laid to its row's frame behind it, a hairline at chat_guide_x, so the rows under one line join into one guide.
+  prefab ChatGuide : ui.Row {
+    Background
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $chat_guide_x, r: 0, t: 0, b: 0}
+    line : ui.Node {
+      Fill: $tone_chat_guide
+      Size: {w: {kind: Fixed, value: $chat_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+  }
+  // A line row's own guide, clear unless the row is one of an opened run's calls (src/app/chat.rs fills it then).
+  prefab ChatGuideOff : hn.ChatGuide {
+    line : ui.Node { Fill: $tone_clear }
+  }
+  // Pressable, it hugs its words and chevron (its wash a highlight on them, never a full-width plate).
   prefab ChatLine : hn.ChatLineLook {
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
+    AlignSelf: {align: Start}
+    Padding: {l: $chat_line_pad, r: $chat_line_pad, t: 0, b: 0}
     Pressable
     Action: {name: ""}
     Cursor: {shape: Arrow}
@@ -221,6 +327,7 @@ hn {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 1, b: 1}
+    guide : hn.ChatGuideOff {}
     head : hn.ChatLine {}
   }
   // Failed: its words in the failed tone.
@@ -237,6 +344,7 @@ hn {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_line_inset, r: 0, t: 2, b: 0}
+      guide : hn.ChatGuide {}
       card : ui.Column {
         Fill: $tone_chat_card
         Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
@@ -263,7 +371,7 @@ hn {
 
   // A harness REPL cell (src/app/chat.rs card_rows) and a run of calls with no words between them ("Read 2 files, ran 1
   // shell command", rows_nested): the same line. A run with failures says how many in its detail, the one red thing on
-  // it, and lists each failed call under it as its own red line. A run's calls sit in from it by $chat_nest.
+  // it, and lists each failed call under it as its own red line. A run's calls sit in from it by $chat_nest, on its guide.
   prefab ChatCard : hn.ChatTool {}
   prefab ChatCardFailed : hn.ChatToolFailed {}
   prefab ChatRun : hn.ChatTool {}
@@ -278,7 +386,8 @@ hn {
 
   // One step of an opened cell that took several: the same line, not pressable, under the cell's words.
   prefab ChatStep : hn.ChatLineLook {
-    Padding: {l: $chat_nest + $chat_line_pad, r: 8, t: 0, b: 0}
+    Padding: {l: $chat_line_inset, r: 8, t: 0, b: 0}
+    guide : hn.ChatGuide {}
   }
   prefab ChatStepFailed : hn.ChatStep {
     words : ui.Line { Fill: $tone_failed }
@@ -344,6 +453,7 @@ hn {
     Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_line_inset, r: 0, t: 4, b: 8}
+    guide : hn.ChatGuide {}
     list : ui.ResultList {}
     foot : ui.Line, Faint {
       Padding: {l: 0, r: 0, t: 4, b: 0}
@@ -357,6 +467,7 @@ hn {
     Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_line_inset, r: 0, t: 2, b: 6}
+    guide : hn.ChatGuide {}
     card : ui.Column {
       Clip
       Fill: $tone_chat_card
@@ -379,6 +490,7 @@ hn {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_line_inset, r: 0, t: 2, b: 6}
+    guide : hn.ChatGuide {}
     card : ui.Column {
       Fill: $tone_chat_card
       Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
@@ -403,6 +515,7 @@ hn {
     Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_line_inset - $chat_line_pad, r: 0, t: 0, b: 2}
+    guide : hn.ChatGuide {}
     head : ui.Row {
       Pressable
       Action: {name: ""}
@@ -426,14 +539,20 @@ hn {
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 1, b: 1}
+    guide : hn.ChatGuideOff {}
     head : hn.ChatLine {}
   }
   prefab ChatThinkingOpen : hn.ChatThinking {
     Padding: {l: 0, r: 0, t: 1, b: 8}
-    text : ui.Words {
-      Fill: $tone_term_muted
+    body : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_line_inset, r: 0, t: 0, b: 0}
-      TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+      guide : hn.ChatGuide {}
+      text : ui.Words {
+        Fill: $tone_term_muted
+        TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+      }
     }
   }
 

@@ -21,13 +21,40 @@
 //! `Ring::enter` did on 0.20261105.0; [`the_oracle_catches_a_retry_with_the_first_timeout`]
 //! must find a seed it breaks. Then [`Sim`] waits through the same loop under its own
 //! interruptions ([`a_sim_under_interruption_delivers_everything_by_each_deadline`]).
+//!
+//! The park ([`parking`], a pool worker's idle wait, a futex on its thread's ring on Linux):
+//! a simulated futex on the virtual clock runs a drawn unpark between any two of the park's
+//! atomics ([`Futex::switch`]) or while it waits, with interruptions, spurious returns and
+//! latency; the oracle is that no unpark is lost (a park an unpark came to ends `Ready`,
+//! promptly; one with a token waiting takes it at once; `Deadline` only with no unpark) and
+//! every park ends by its deadline. The plant ([`ParkPlant::CheckThenStore`]) looks for a token
+//! and then stores `PARKED` over it, the lost wakeup [`the_oracle_catches_a_lost_wakeup`] must
+//! find.
+//!
+//! The reap ([`reaping`], `IORING_OP_WAITID` then `wait4(WNOHANG)` on Linux): simulated children
+//! exit at drawn times, before or after their reap begins and its deadline, under the same
+//! faults; the oracle is that every child reaped is reported with its status, never before it
+//! exited and promptly after, a reap that ends at its deadline leaves its child unreaped, and no
+//! child is left a zombie. The plant ([`ReapPlant::ReapInWait`]) waits without `WNOWAIT`, so the
+//! wait reaps the child and its exit is never reported, which
+//! [`the_oracle_catches_a_reaped_child_never_reported`] must find.
 
-use std::{cell::Cell, convert::Infallible, fmt::Write as _, io, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, VecDeque},
+    convert::Infallible,
+    fmt::Write as _,
+    io,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 use hegel::{TestCase, generators as gs};
 
 use super::{
     Clock, Deadline, Once, Plant, WaitError, Waited,
+    parking::{self, Futex, ParkPlant},
+    reaping::{self, Children, ReapPlant},
     retry::{self, FUEL, Retry},
     until,
 };
@@ -417,4 +444,581 @@ fn a_sim_under_interruption_delivers_everything_by_each_deadline(tc: TestCase) {
     for it in &seen {
         assert!(matches!(it.done, Done::Fired | Done::Written), "{it:?}");
     }
+}
+
+// --- The park: a futex wait and the unparks that come to it -----------------------------
+
+/// The faults of the park's and the reap's simulated kernel.
+#[derive(Debug, Clone, Copy)]
+struct FutexFaults {
+    /// A call is interrupted within 100 µs of its start once in this many (0: never).
+    eintr_one_in: u64,
+    /// A call returns with nothing within 100 µs of its start once in this many (0: never).
+    spurious_one_in: u64,
+    /// Each call returns up to this long after it ended, and at least a nanosecond.
+    max_latency: Duration,
+    /// Each step between two atomics takes up to this long, and at least a nanosecond.
+    max_step: Duration,
+}
+
+impl FutexFaults {
+    /// How late after its cause a park or a reap may end: a few calls and steps.
+    fn bound(&self) -> Duration {
+        (self.max_latency + self.max_step + Duration::from_nanos(1)) * 16
+    }
+}
+
+fn futex_faults(d: &mut impl Draw) -> FutexFaults {
+    FutexFaults {
+        eintr_one_in: sometimes(d),
+        spurious_one_in: sometimes(d),
+        max_latency: Duration::from_nanos(d.int(0, 20_000)),
+        max_step: Duration::from_nanos(d.int(1, 50_000)),
+    }
+}
+
+/// One park: its deadline, when an unpark comes after it begins, and whether a stray unpark
+/// comes after it ends (a token the next park must take at once).
+#[derive(Debug, Clone, Copy)]
+struct Round {
+    deadline: Option<Duration>,
+    unpark: Option<Duration>,
+    stray: bool,
+}
+
+#[derive(Debug)]
+struct ParkPlan {
+    seed: u64,
+    faults: FutexFaults,
+    rounds: Vec<Round>,
+}
+
+fn park_plan(d: &mut impl Draw) -> ParkPlan {
+    let seed = d.int(0, u64::MAX);
+    let faults = futex_faults(d);
+    let n = d.int(1, MOST_WAITS);
+    let rounds = (0..n)
+        .map(|_| {
+            let deadline = match d.int(0, 4) {
+                0 => None,
+                _ => Some(us(d.int(0, 50_000))),
+            };
+            // Nanoseconds, dense where the park's steps are; a park with no deadline always
+            // gets one, or it would wait forever, as it should.
+            let unpark = match (deadline, d.int(0, 2)) {
+                (Some(_), 0) => None,
+                _ => Some(Duration::from_nanos(d.int(0, 300_000))),
+            };
+            Round { deadline, unpark, stray: d.int(0, 5) == 0 }
+        })
+        .collect(); // alloc: a test's plan
+    ParkPlan { seed, faults, rounds }
+}
+
+/// A futex on the virtual clock, with the unparks of a plan to run at their times: at a
+/// switch point of the park once their time has come, or while the park waits in it.
+struct FutexSim<'a> {
+    now: &'a Cell<Duration>,
+    rng: RefCell<Rng>,
+    faults: FutexFaults,
+    word: &'a AtomicU32,
+    unparks: RefCell<VecDeque<Duration>>,
+    /// When each unpark ran, since the last clear.
+    fired: RefCell<Vec<Duration>>,
+    in_unpark: Cell<bool>,
+    waiting: Cell<bool>,
+    woken: Cell<bool>,
+}
+
+impl FutexSim<'_> {
+    /// The real unpark, at `at`.
+    fn fire(&self, at: Duration) {
+        self.in_unpark.set(true);
+        parking::unpark(self.word, self);
+        self.in_unpark.set(false);
+        self.fired.borrow_mut().push(at);
+    }
+
+    fn next_unpark(&self) -> Option<Duration> {
+        self.unparks.borrow().front().copied()
+    }
+
+    fn fault_at(&self, rng: &mut Rng, one_in_n: u64, t0: Duration) -> Option<Duration> {
+        one_in(rng, one_in_n).then(|| t0 + Duration::from_nanos(rng.below(100_000)))
+    }
+
+    /// One wait call on `word` for `expected`, given `left`.
+    fn call(
+        &self,
+        word: &AtomicU32,
+        expected: u32,
+        left: Option<Duration>,
+    ) -> io::Result<Once<()>> {
+        let t0 = self.now.get();
+        let (latency, eintr, spurious) = {
+            let mut rng = self.rng.borrow_mut();
+            let latency =
+                Duration::from_nanos(1 + rng.below(self.faults.max_latency.as_nanos() as u64 + 1));
+            let eintr = self.fault_at(&mut rng, self.faults.eintr_one_in, t0);
+            let spurious = self.fault_at(&mut rng, self.faults.spurious_one_in, t0);
+            (latency, eintr, spurious)
+        };
+        // The kernel's compare: a word that changed is `EAGAIN`, at once.
+        if word.load(Ordering::SeqCst) != expected {
+            self.now.set(t0 + latency);
+            return Ok(Once::Ready(()));
+        }
+        let mut end: Option<(Duration, Once<()>)> =
+            left.map(|it| (t0.saturating_add(it), Once::TimedOut));
+        for (at, why) in [(eintr, Once::Interrupted), (spurious, Once::Spurious)] {
+            if let Some(at) = at
+                && end.as_ref().is_none_or(|(e, _)| at < *e)
+            {
+                end = Some((at, why));
+            }
+        }
+        self.waiting.set(true);
+        self.woken.set(false);
+        while let Some(at) = self.next_unpark() {
+            if end.as_ref().is_some_and(|(e, _)| at > *e) {
+                break;
+            }
+            self.unparks.borrow_mut().pop_front();
+            let at = at.max(t0);
+            self.now.set(at);
+            self.fire(at);
+            if self.woken.get() {
+                end = Some((at, Once::Ready(())));
+                break;
+            }
+        }
+        self.waiting.set(false);
+        let Some((at, outcome)) = end else {
+            return Err(io::Error::other(
+                "a futex wait with no deadline that nothing will wake: a lost wakeup",
+            ));
+        };
+        self.now.set(at.max(t0) + latency);
+        Ok(outcome)
+    }
+}
+
+impl Futex for FutexSim<'_> {
+    fn wait<C: Clock>(
+        &self,
+        what: &'static str,
+        word: &AtomicU32,
+        expected: u32,
+        deadline: Option<Deadline>,
+        clock: &C,
+    ) -> Result<Waited<()>, WaitError> {
+        until(what, clock, deadline, |left| self.call(word, expected, left))
+    }
+
+    fn wake(&self, _: &AtomicU32) {
+        if self.waiting.get() {
+            self.woken.set(true);
+        }
+    }
+
+    fn switch(&self) {
+        if self.in_unpark.get() {
+            return;
+        }
+        let step = {
+            let mut rng = self.rng.borrow_mut();
+            Duration::from_nanos(1 + rng.below(self.faults.max_step.as_nanos() as u64))
+        };
+        self.now.set(self.now.get() + step);
+        while let Some(at) = self.next_unpark() {
+            if at > self.now.get() {
+                break;
+            }
+            self.unparks.borrow_mut().pop_front();
+            self.fire(at);
+        }
+    }
+}
+
+/// `plan`'s parks one after another on one word and clock, with `plant`: the first broken rule.
+fn run_parks(plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
+    let now = Cell::new(Duration::ZERO);
+    let clock = Virtual(&now);
+    let word = AtomicU32::new(parking::EMPTY);
+    let sim = FutexSim {
+        now: &now,
+        rng: RefCell::new(Rng::new(plan.seed)),
+        faults: plan.faults,
+        word: &word,
+        unparks: RefCell::new(VecDeque::new()),
+        fired: RefCell::new(Vec::new()), // alloc: a test's record
+        in_unpark: Cell::new(false),
+        waiting: Cell::new(false),
+        woken: Cell::new(false),
+    };
+    let bound = plan.faults.bound();
+    let mut token = false;
+    for (n, round) in plan.rounds.iter().enumerate() {
+        let start = now.get();
+        let unpark = round.unpark.map(|it| start + it);
+        sim.unparks.borrow_mut().extend(unpark);
+        sim.fired.borrow_mut().clear();
+        let deadline = round.deadline.map(|it| Deadline::after(start, it));
+        let parked = parking::park(&word, &sim, "a simulated park", deadline, &clock, plant);
+        let end = now.get();
+        let fired = sim.fired.borrow().first().copied();
+        let said = |what: &str| {
+            format!(
+                "park {n} (began {start:?}, deadline {deadline:?}, unpark {unpark:?}, a token \
+                 waiting {token}) said {parked:?} at {end:?}: {what}"
+            )
+        };
+        match &parked {
+            Err(error) => return Err(said(&format!("it failed: {error}"))),
+            Ok(Waited::Ready(())) if token => {
+                if end > start + bound {
+                    return Err(said("the token waiting for it was taken late"));
+                }
+            }
+            Ok(Waited::Ready(())) => {
+                let Some(fired) = fired else { return Err(said("it woke with no unpark")) };
+                if end > fired + bound {
+                    return Err(said(&format!("woken more than {bound:?} after its unpark")));
+                }
+            }
+            Ok(Waited::Deadline) => {
+                if token {
+                    return Err(said("the token waiting for it was lost"));
+                }
+                if let Some(fired) = fired {
+                    return Err(said(&format!("the unpark at {fired:?} was lost: a lost wakeup")));
+                }
+                let Some(deadline) = deadline else {
+                    return Err(said("a park with no deadline said its deadline passed"));
+                };
+                if end < deadline.get() {
+                    return Err(said("its deadline had not passed"));
+                }
+            }
+        }
+        if let Some(deadline) = deadline
+            && end > deadline.get() + bound
+        {
+            return Err(said(&format!("past its deadline by more than {bound:?}")));
+        }
+        // The unparks still to come land now, after the park, and a stray one: a token for
+        // the next park.
+        let late: Vec<Duration> = sim.unparks.borrow_mut().drain(..).collect(); // alloc: a test's record
+        token = !late.is_empty() || round.stray;
+        for _ in late {
+            sim.fire(now.get());
+        }
+        if round.stray {
+            sim.fire(now.get());
+        }
+        let left = word.load(Ordering::SeqCst);
+        if (left == parking::NOTIFIED) != token {
+            return Err(said(&format!(
+                "the word is {left} after it, with a token waiting {token}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: whatever interrupts it and whenever its unpark comes, no wakeup is lost and
+/// every park ends by its deadline.
+#[hegel::test(test_cases = 300)]
+fn no_unpark_is_lost_under_interruption(tc: TestCase) {
+    let plan = park_plan(&mut Drawn(&tc));
+    if let Err(broke) = run_parks(&plan, ParkPlant::None) {
+        panic!("{broke}\nplan {plan:?}");
+    }
+}
+
+/// The lost wakeup the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans: a park that
+/// looks for a token and then stores over one that came between.
+#[test]
+fn the_oracle_catches_a_lost_wakeup() {
+    let plant = ParkPlant::CheckThenStore;
+    for seed in 0..CONTROL_SEEDS {
+        if let Err(why) = run_parks(&park_plan(&mut Rng::new(seed)), plant) {
+            eprintln!("{plant:?} caught at seed {seed}: {why}");
+            return;
+        }
+    }
+    panic!(
+        "the oracle caught ParkPlant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    );
+}
+
+// --- The reap: a child's exit waited for, then reaped ------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Life {
+    Running,
+    Zombie,
+    Reaped,
+}
+
+struct SimChild {
+    exits: Duration,
+    status: i32,
+    life: Life,
+}
+
+/// One child: when it exits after its reap begins (zero: it had exited), its status, and the
+/// reap's deadline.
+#[derive(Debug, Clone, Copy)]
+struct Kid {
+    exits: Duration,
+    status: i32,
+    deadline: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct ReapPlan {
+    seed: u64,
+    faults: FutexFaults,
+    kids: Vec<Kid>,
+}
+
+fn reap_plan(d: &mut impl Draw) -> ReapPlan {
+    let seed = d.int(0, u64::MAX);
+    let faults = futex_faults(d);
+    let n = d.int(1, MOST_WAITS);
+    let kids = (0..n)
+        .map(|_| Kid {
+            exits: match d.int(0, 3) {
+                0 => Duration::ZERO,
+                _ => us(d.int(0, 100_000)),
+            },
+            status: d.int(0, 255) as i32,
+            deadline: match d.int(0, 2) {
+                0 => None,
+                _ => Some(us(d.int(0, 150_000))),
+            },
+        })
+        .collect(); // alloc: a test's plan
+    ReapPlan { seed, faults, kids }
+}
+
+/// The kernel's children on the virtual clock.
+struct ChildSim<'a> {
+    now: &'a Cell<Duration>,
+    rng: RefCell<Rng>,
+    faults: FutexFaults,
+    kids: RefCell<BTreeMap<i32, SimChild>>,
+}
+
+impl ChildSim<'_> {
+    fn latency(&self) -> Duration {
+        let mut rng = self.rng.borrow_mut();
+        Duration::from_nanos(1 + rng.below(self.faults.max_latency.as_nanos() as u64 + 1))
+    }
+
+    /// Children whose exit has come are zombies.
+    fn settle(&self) {
+        let now = self.now.get();
+        for kid in self.kids.borrow_mut().values_mut() {
+            if kid.life == Life::Running && kid.exits <= now {
+                kid.life = Life::Zombie;
+            }
+        }
+    }
+
+    fn life(&self, pid: i32) -> Option<Life> {
+        self.kids.borrow().get(&pid).map(|it| it.life)
+    }
+
+    fn no_child(pid: i32) -> io::Error {
+        // alloc: a test's error
+        io::Error::other(format!("ECHILD: process {pid} is no child, or was reaped already"))
+    }
+
+    /// One `waitid` call for `pid`, given `left`.
+    fn call(&self, pid: i32, keep: bool, left: Option<Duration>) -> io::Result<Once<()>> {
+        let t0 = self.now.get();
+        let latency = self.latency();
+        let (eintr, spurious) = {
+            let mut rng = self.rng.borrow_mut();
+            let at = |rng: &mut Rng, n| {
+                one_in(rng, n).then(|| t0 + Duration::from_nanos(rng.below(100_000)))
+            };
+            (at(&mut rng, self.faults.eintr_one_in), at(&mut rng, self.faults.spurious_one_in))
+        };
+        self.settle();
+        let exits = match self.kids.borrow().get(&pid) {
+            None => return Err(ChildSim::no_child(pid)),
+            Some(kid) => match kid.life {
+                Life::Reaped => return Err(ChildSim::no_child(pid)),
+                Life::Zombie => t0,
+                Life::Running => kid.exits,
+            },
+        };
+        let mut end = (exits, Once::Ready(()));
+        let timeout = left.map(|it| (t0.saturating_add(it), Once::TimedOut));
+        for (at, why) in [
+            timeout,
+            eintr.map(|it| (it, Once::Interrupted)),
+            spurious.map(|it| (it, Once::Spurious)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if at < end.0 {
+                end = (at, why);
+            }
+        }
+        self.now.set(end.0.max(t0) + latency);
+        if end.1 == Once::Ready(()) {
+            self.settle();
+            if !keep && let Some(kid) = self.kids.borrow_mut().get_mut(&pid) {
+                // Reaped by the wait itself: its status goes to no one.
+                kid.life = Life::Reaped;
+            }
+        }
+        Ok(end.1)
+    }
+}
+
+impl Children for ChildSim<'_> {
+    type Reaped = i32;
+
+    fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
+        self.now.set(self.now.get() + self.latency());
+        self.settle();
+        let mut kids = self.kids.borrow_mut();
+        let Some(kid) = kids.get_mut(&pid) else { return Err(ChildSim::no_child(pid)) };
+        match kid.life {
+            Life::Running => Ok(None),
+            Life::Zombie => {
+                kid.life = Life::Reaped;
+                Ok(Some(kid.status))
+            }
+            Life::Reaped => Err(ChildSim::no_child(pid)),
+        }
+    }
+
+    fn exited<C: Clock>(
+        &self,
+        what: &'static str,
+        pid: i32,
+        keep: bool,
+        deadline: Option<Deadline>,
+        clock: &C,
+    ) -> Result<Waited<()>, WaitError> {
+        until(what, clock, deadline, |left| self.call(pid, keep, left))
+    }
+}
+
+/// `plan`'s children reaped one after another on one clock, with `plant`: the first broken rule.
+fn run_reaps(plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
+    let now = Cell::new(Duration::ZERO);
+    let clock = Virtual(&now);
+    let sim = ChildSim {
+        now: &now,
+        rng: RefCell::new(Rng::new(plan.seed)),
+        faults: plan.faults,
+        kids: RefCell::new(BTreeMap::new()),
+    };
+    let bound = plan.faults.bound();
+    let what = "a simulated child's exit";
+    for (n, kid) in plan.kids.iter().enumerate() {
+        let pid = 100 + n as i32;
+        let start = now.get();
+        let exits = start + kid.exits;
+        sim.kids
+            .borrow_mut()
+            .insert(pid, SimChild { exits, status: kid.status, life: Life::Running });
+        let deadline = kid.deadline.map(|it| Deadline::after(start, it));
+        let reaped = reaping::reap(what, &sim, pid, deadline, &clock, plant);
+        let end = now.get();
+        let life = sim.life(pid);
+        let said = |what: &str| {
+            format!(
+                "child {pid} (exits {exits:?}, status {}, reap began {start:?}, deadline \
+                 {deadline:?}) said {reaped:?} at {end:?}, its life now {life:?}: {what}",
+                kid.status
+            )
+        };
+        match &reaped {
+            Err(error) if life == Some(Life::Reaped) => {
+                return Err(said(&format!("it was reaped and its exit never reported ({error})")));
+            }
+            Err(error) => return Err(said(&format!("the reap failed: {error}"))),
+            Ok(Waited::Ready(status)) => {
+                if *status != kid.status {
+                    return Err(said("reported with another status"));
+                }
+                if life != Some(Life::Reaped) {
+                    return Err(said("reported and not reaped"));
+                }
+                if end < exits {
+                    return Err(said("reported before it exited"));
+                }
+                if end > exits.max(start) + bound {
+                    return Err(said(&format!("reported more than {bound:?} after it exited")));
+                }
+            }
+            Ok(Waited::Deadline) => {
+                if life == Some(Life::Reaped) {
+                    return Err(said("it was reaped and its exit never reported"));
+                }
+                let Some(deadline) = deadline else {
+                    return Err(said("a reap with no deadline said its deadline passed"));
+                };
+                if end < deadline.get() {
+                    return Err(said("its deadline had not passed"));
+                }
+                if exits + bound <= deadline.get() {
+                    return Err(said("it had exited well before the deadline"));
+                }
+                // No zombie is left: a reap with no deadline reports it.
+                match reaping::reap(what, &sim, pid, None, &clock, plant) {
+                    Ok(Waited::Ready(status))
+                        if status == kid.status && sim.life(pid) == Some(Life::Reaped) => {}
+                    other => {
+                        return Err(said(&format!(
+                            "reaped again with no deadline it said {other:?}, its life then {:?}: \
+                             a child whose exit is never reported",
+                            sim.life(pid)
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(deadline) = deadline
+            && end > deadline.get() + bound
+        {
+            return Err(said(&format!("past its deadline by more than {bound:?}")));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: whatever interrupts the wait and whenever the child exits, every child is
+/// reaped once and its exit reported, by the reap's deadline or after it.
+#[hegel::test(test_cases = 300)]
+fn every_reaped_child_is_reported_under_interruption(tc: TestCase) {
+    let plan = reap_plan(&mut Drawn(&tc));
+    if let Err(broke) = run_reaps(&plan, ReapPlant::None) {
+        panic!("{broke}\nplan {plan:?}");
+    }
+}
+
+/// The unreported child the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans: a wait
+/// that reaps, leaving the reap after it nothing to report.
+#[test]
+fn the_oracle_catches_a_reaped_child_never_reported() {
+    let plant = ReapPlant::ReapInWait;
+    for seed in 0..CONTROL_SEEDS {
+        if let Err(why) = run_reaps(&reap_plan(&mut Rng::new(seed)), plant) {
+            eprintln!("{plant:?} caught at seed {seed}: {why}");
+            return;
+        }
+    }
+    panic!(
+        "the oracle caught ReapPlant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    );
 }

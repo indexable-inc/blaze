@@ -16,6 +16,13 @@ pub(super) fn element(v: View<'_>, node: &Value, kind: &str, kids: &[&Value], de
     match kind {
         "Grid" => grid(v, node, kids, depth, b),
         "Stack" => {
+            // Where its children that are not Layers sit (a Layer has its own anchor): `align`, else the middle.
+            let (across, down) = anchored(prop(node, "align").as_str().unwrap_or("center"));
+            let base = view::prefab(v.entity().world(), "hn.GenStack").and_then(|p| p.try_cloned::<&Flex>()).unwrap_or_default();
+            let flex = Flex { align: across.0, justify: down.1, ..base };
+            if v.entity().try_cloned::<&Flex>() != Some(flex) {
+                v.set(flex);
+            }
             b.next = Within::Stack;
             children(v, kids, depth + 1, b);
         }
@@ -115,10 +122,8 @@ fn grid(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget
     });
 }
 
-/// A Layer in a Stack: laid on the stack's frame, its children at its `anchor` (the column's alignment across and down)
-/// moved by `x` and `y` (its padding: what it gives on one side it takes on the other), above the rest by `z`.
-fn layer(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
-    let anchor = prop(node, "anchor").as_str().unwrap_or("top-left");
+/// Where anchor `anchor` (one of props.rs's ANCHORS) sits, across and then down, each as an alignment and a justification.
+fn anchored(anchor: &str) -> ((Align, Justify), (Align, Justify)) {
     let (down, across) = anchor.split_once('-').unwrap_or(match anchor {
         "top" | "bottom" => (anchor, "center"),
         _ => ("center", anchor),
@@ -128,8 +133,16 @@ fn layer(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budge
         "bottom" | "right" => (Align::End, Justify::End),
         _ => (Align::Center, Justify::Center),
     };
+    (at(across), at(down))
+}
+
+/// A Layer in a Stack: laid on the stack's frame, its children at its `anchor` (the column's alignment across and down)
+/// moved by `x` and `y` (its padding: what it gives on one side it takes on the other), above the rest by `z`. A press on
+/// it sends its onClick (null).
+fn layer(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
+    let (across, down) = anchored(prop(node, "anchor").as_str().unwrap_or("top-left"));
     let base = view::prefab(v.entity().world(), "hn.GenLayer").and_then(|p| p.try_cloned::<&Flex>()).unwrap_or_default();
-    let flex = Flex { align: at(across).0, justify: at(down).1, ..base };
+    let flex = Flex { align: across.0, justify: down.1, ..base };
     if v.entity().try_cloned::<&Flex>() != Some(flex) {
         v.set(flex);
     }
@@ -143,5 +156,6 @@ fn layer(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budge
     if v.entity().try_cloned::<&Z>() != Some(z) {
         v.set(z);
     }
+    arm(v, control::handler(node, "onClick").map(|h| send(b.cell, &h, Value::Null)).as_deref());
     children(v, kids, depth + 1, b);
 }

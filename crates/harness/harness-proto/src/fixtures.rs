@@ -2,7 +2,7 @@
 //! value as JSON (`fixtures/<name>.json`). This crate's test checks its encoder writes exactly the checked-in bytes;
 //! `mcp/src/wire.test.ts` checks the kernel decodes each `.cbor` to its `.json` and encodes that back to the same bytes.
 //! `HARNESS_PROTO_BLESS=1 cargo test -p harness-proto` rewrites them after a deliberate schema change.
-use crate::event::{Body, Detail, Effect, Event, Kind};
+use crate::event::{Body, Detail, Effect, Event, Kind, ModelChoice};
 use crate::msg::{Down, Reply, Request, RunReq, SessionInfo, Up};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,8 +61,26 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         ),
         one("up-resize", &Up::Resize { cols: 300, rows: 70 }),
         one("up-detach", &Up::Detach),
+        one("up-set-model", &Up::Req(Request::SetModel { id: 7, model: Some("haiku".into()), effort: Some("xhigh".into()) })),
         one("down-hello", &Down::Hello { schema: crate::SCHEMA, pid: 4242 }),
-        one("down-sessions", &Down::Reply(Reply::Sessions { sessions: vec![info.clone()] })),
+        one(
+            "down-sessions",
+            &Down::Reply(Reply::Sessions {
+                sessions: vec![info.clone()],
+                models: [(
+                    "claude".to_owned(),
+                    vec![ModelChoice {
+                        id: "sonnet".into(),
+                        model: "claude-sonnet-5".into(),
+                        name: "Sonnet 5".into(),
+                        about: String::new(),
+                        efforts: vec!["low".into(), "high".into()],
+                        effort: None,
+                    }],
+                )]
+                .into(),
+            }),
+        ),
         one("down-attached", &Down::Reply(Reply::Attached { info })),
         one("down-ok", &Down::Reply(Reply::Ok)),
         one("down-record", &Down::Reply(Reply::Record(json!({"id": "r12", "exit_code": 0, "signal": null})))),
@@ -71,8 +89,29 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         one("down-exit", &Down::Exit { code: -1 }),
         one(
             "event-session",
-            &Event { ts: 1, body: Body::Session { agent: "claude".into(), model: "opus".into(), session_id: Some("9f2c".into()), effort: None } },
+            &Event { ts: 1, body: Body::Session { agent: "claude".into(), model: "opus".into(), session_id: Some("9f2c".into()), effort: Some("high".into()) } },
         ),
+        one(
+            "event-models",
+            &Event {
+                ts: 1,
+                body: Body::Models {
+                    models: vec![
+                        ModelChoice {
+                            id: "opus".into(),
+                            model: "claude-opus-5-5".into(),
+                            name: "Opus 5.5".into(),
+                            about: "For complex work".into(),
+                            efforts: vec!["low".into(), "high".into(), "max".into()],
+                            effort: None,
+                        },
+                        ModelChoice { id: "gpt-5.6".into(), effort: Some("medium".into()), ..ModelChoice::default() },
+                    ],
+                },
+            },
+        ),
+        one("event-choice", &Event { ts: 2, body: Body::Choice { model: None, effort: Some("xhigh".into()) } }),
+        one("event-context", &Event { ts: 3, body: Body::Context { used: 46_200, window: 200_000 } }),
         one("event-block", &Event { ts: 5, body: Body::Block { block: "m:0".into(), kind: Kind::Thinking, text: "list them\n\u{2026}".into() } }),
         one(
             "event-tool-call",

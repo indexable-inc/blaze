@@ -4,7 +4,7 @@ import { askComponent, cellRuntime, elementGlobals, runtime } from './svelte.ts'
 import { askProps, planAsk, type AskOptions } from './ask.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
-import { currentTask, inTask, type Task } from '../tasks.ts';
+import { currentTask, inTask, taskCall, taskCount, type Task } from '../tasks.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
@@ -58,7 +58,18 @@ function treeOf(t: Task, shown: Shown): UiTree {
       t.touch();
     },
     enter: (fn) => inTask(t, fn),
+    cell: (task) => cellCall(t, task),
   });
+}
+
+/** The tool call that ran `task`, for a CellRef in task `t`'s UI; or why it cannot be shown: only another cell this lane ran can be. */
+function cellCall(t: Task, task: string): string | { refused: string } {
+  const ran = taskCount() === 0 ? 'this lane has run no cells' : `this lane's cells are t1 to t${taskCount()}`;
+  if (task === t.id) return { refused: `is the cell itself: a CellRef shows another cell of this lane (${ran})` };
+  const call = taskCall(task);
+  if (call === undefined) return { refused: `names a cell this lane never ran: ${ran}` };
+  if (call === null) return { refused: `names ${task}, whose tool call the agent's client did not say, so the app cannot find it` };
+  return call;
 }
 
 /**

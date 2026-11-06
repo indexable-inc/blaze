@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { parse } from 'acorn';
-import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, PROPS, SVELTE, TEXT_PROP, WORDS_ONLY, article, BIND_ALIAS, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
+import { AT, CANVAS_TEXT_PROPS, DRAWING, NOT_DRAWN, OUTRO, PROPS, SVELTE, TEXT_PROP, TRANSITIONS, WORDS_ONLY, article, BIND_ALIAS, bindError, isKnownElement, notDrawnError, unknownPropError } from './element.ts';
 import { SVG_SAID, attributeError, isSvgTag, svgSizeError, unknownTagError } from './draw.ts';
 import { svelteSpecifier } from './files.ts';
 
@@ -461,7 +461,7 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
       const prop = BIND_ALIAS[name]?.[written] ?? written;
       if (prop !== written && source[attribute.start] !== '{') splices.push({ start: attribute.start, end: attribute.start + written.length, text: prop });
       if (name === 'Text' && within === 'page' && CANVAS_TEXT_PROPS.has(prop)) {
-        throw fail(new TypeError(`<Text ${prop}=...> outside a drawing (${here}): only a Text in a Canvas or an <svg> takes x, y, anchor, size and fill; words elsewhere take tone and bold`));
+        throw fail(new TypeError(`<Text ${prop}=...> outside a drawing (${here}): only a Text in a Canvas or an <svg> takes anchor, size, fill, value and onclick; words elsewhere take tone and bold`));
       }
       if (name === 'Text' && within === 'draw' && prop === 'tone') {
         throw fail(new TypeError(`<Text tone=...> inside a drawing (${here}): words in a drawing take fill= (an ink), not tone`));
@@ -503,6 +503,53 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
     for (const [key, child] of Object.entries(it)) if (key !== 'metadata' && child && typeof child === 'object') visit(child, next);
   };
   visit(ast.fragment, 'page');
+  return apply(source, splices, log);
+}
+
+/**
+ * Svelte's `transition:`, `in:` and `out:` on one of the app's elements, and `animate:flip`, as the props the app springs them by (a
+ * component cannot take a directive): `in:fly={{ y: 8 }}` is `enter={__repl_svelte.trans('fly', { y: 8 }, ...)}`, `out:` the same as
+ * `__outro`, which the renderer plays when the element goes (svelte.ts `removeNode`), `transition:` both, and `animate:flip` is
+ * `flip={true}`. A name the app does not play is an error at its line, and so is a directive on an SVG tag (draw one of the Canvas
+ * elements instead). `before` is the template before `checkElements` (whose splices are the last of `log`), for the places errors
+ * name. Only text on the directive's own lines changes, so no line moves. Copied from den's repl/src/ui/compile.ts.
+ */
+function mapTransitions(source: string, before: string, shift: number, log: Splice[][]): string {
+  if (!/\b(?:transition|in|out|animate):/.test(source)) return source;
+  let ast: Anything;
+  try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return source; }
+  const lines = before.split('\n');
+  const splices: Splice[] = [];
+  const directive = (attribute: Anything) => attribute.type === 'AnimateDirective' ? 'animate' : attribute.intro && attribute.outro ? 'transition' : attribute.intro ? 'in' : 'out';
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) { for (const item of node) visit(item); return; }
+    if (!node || typeof node !== 'object') return;
+    const element = node as Anything;
+    const ours = element.type === 'Component' && isKnownElement(element.name);
+    if (ours || element.type === 'RegularElement') {
+      for (const attribute of element.attributes as Anything[]) {
+        if (attribute.type !== 'AnimateDirective' && attribute.type !== 'TransitionDirective') continue;
+        const { line, at } = placeOf(before, lines, back(log, attribute.start), shift);
+        const written = `${directive(attribute)}:${attribute.name}`;
+        if (!ours) throw syntaxError(`${written} on <${element.name}> is not played (${at}): a drawing's shapes come and go as the Canvas elements, <Rect in:fade ...> inside a <Canvas>`);
+        if (attribute.type === 'AnimateDirective') {
+          if (attribute.name !== 'flip') throw syntaxError(`${written} on <${element.name}> is not one the app plays (${at}): only animate:flip, which eases an element to where it moved`);
+          splices.push({ start: attribute.start, end: attribute.end, text: 'flip={true}' });
+          continue;
+        }
+        if (!(TRANSITIONS as readonly string[]).includes(attribute.name)) throw syntaxError(`${written} on <${element.name}> is not a transition the app plays (${at}): ${TRANSITIONS.join(', ')}`);
+        const params = attribute.expression ? source.slice(attribute.expression.start, attribute.expression.end) : 'undefined';
+        const call = (text: string) => `${SVELTE}.trans(${JSON.stringify(attribute.name)}, ${text}, ${line}, ${JSON.stringify(at)})`;
+        const props: string[] = [];
+        if (attribute.intro) props.push(`enter={${call(params)}}`);
+        // The second copy is on the first's line, so a param that spans lines is joined there.
+        if (attribute.outro) props.push(`${OUTRO}={${call(attribute.intro ? params.replace(/\s*\n\s*/g, ' ') : params)}}`);
+        splices.push({ start: attribute.start, end: attribute.end, text: props.join(' ') });
+      }
+    }
+    for (const [key, child] of Object.entries(element)) if (key !== 'metadata' && child && typeof child === 'object') visit(child);
+  };
+  visit(ast.fragment);
   return apply(source, splices, log);
 }
 
@@ -808,7 +855,7 @@ export function compileComponent(original: string, options: { filename?: string;
   let input = '';
   try {
     source = rawText(original, shift);
-    const aliased = aliasDollar(checkElements(source, shift, edits), edits);
+    const aliased = aliasDollar(mapTransitions(checkElements(source, shift, edits), source, shift, edits), edits);
     dollar = aliased.aliased;
     input = withLifecycleImports(withBoundaryDefaults(aliased.source, edits), edits);
     result = svelteCompiler().compile(input, {

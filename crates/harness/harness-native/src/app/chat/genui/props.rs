@@ -5,29 +5,29 @@
 use super::*;
 
 /// The tier-3 elements and the props each takes on the wire.
-const PROPS: [(&str, &[&str]); 25] = [
+const PROPS: [(&str, &[&str]); 29] = [
     ("Grid", &["columns", "fit", "gap", "pad"]),
-    ("Stack", &[]),
-    ("Layer", &["anchor", "x", "y", "z"]),
+    ("Stack", &["align"]),
+    ("Layer", &["anchor", "x", "y", "z", "onClick"]),
     ("Wrap", &["gap"]),
     ("Scroll", &["height", "horizontal"]),
     ("Split", &["ratio", "vertical", "onChange"]),
     ("Tabs", &["tabs", "selected", "onChange"]),
     ("Disclosure", &["title", "open", "onToggle"]),
     ("Accordion", &[]),
-    ("Popover", &["placement", "open", "onToggle"]),
-    ("Menu", &["items", "open", "onSelect", "onToggle"]),
+    ("Popover", &["placement", "align", "trigger", "open", "onToggle"]),
+    ("Menu", &["items", "open", "context", "onSelect", "onToggle"]),
     ("Dialog", &["title", "open", "dismissable", "onClose"]),
     ("Sheet", &["title", "open", "dismissable", "onClose"]),
     ("Toast", &["text", "tone", "duration", "onDismiss"]),
     ("Progress", &["value", "max", "label"]),
     ("Loading", &["label"]),
     ("Skeleton", &["lines"]),
-    ("Icon", &["name"]),
+    ("Icon", &["name", "kind"]),
     ("Image", &["src", "width", "height", "fit", "alt", "id"]),
     ("Chip", &["label", "selected", "value", "onClick"]),
     ("Tile", &["gap", "pad", "value", "onClick"]),
-    ("FileRef", &["path", "line"]),
+    ("FileRef", &["path", "line", "kind", "name", "onClick"]),
     ("Kip", &["mood", "size"]),
     ("Shader", &["msl", "key", "uniforms", "textures", "width", "height", "aspect", "animate", "pointer", "id"]),
     (
@@ -37,19 +37,24 @@ const PROPS: [(&str, &[&str]); 25] = [
             "onTimeUpdate", "onEnded", "onPlay", "onPause",
         ],
     ),
+    // The new elements (lane E: genui/files.rs, cellref.rs, color.rs, dropzone.rs).
+    ("File", &["name", "kind", "size", "modified", "value", "onClick"]),
+    ("CellRef", &["task", "call", "title"]),
+    ("ColorPicker", &["options", "selected", "label", "disabled", "onChange"]),
+    ("DropZone", &["label", "onDrop"]),
 ];
 
-pub(super) const TIER3: [&str; 25] = {
-    let mut out = [""; 25];
+pub(super) const TIER3: [&str; 29] = {
+    let mut out = [""; 29];
     let mut i = 0;
-    while i < 25 {
+    while i < 29 {
         out[i] = PROPS[i].0;
         i += 1;
     }
     out
 };
 
-/// A Layer's anchors.
+/// A Layer's anchors, and where a Stack puts its children that have none (its `align`).
 pub(super) const ANCHORS: [&str; 9] = ["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"];
 /// The most a Scroll is tall (points), the most tabs and menu items, the longest title or label, the most skeleton lines.
 pub(super) const MAX_SCROLL_H: f64 = 600.0;
@@ -62,7 +67,7 @@ const MAX_LINES: f64 = 20.0;
 const TONES: [&str; 7] = ["ink", "muted", "strong", "error", "accent", "success", "warning"];
 
 /// The elements that hold nothing.
-const LEAVES: [&str; 11] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef", "Kip", "Shader", "Video"];
+const LEAVES: [&str; 14] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef", "Kip", "Shader", "Video", "File", "CellRef", "ColorPicker"];
 
 /// A Kip's mood words (the kernel's `KIP_MOODS`; harness-native-kip act.rs plays them), what joins them, the most it plays in
 /// turn, and how tall it stands (points).
@@ -80,6 +85,7 @@ pub(super) fn prefab(kind: &str, node: &Value) -> Option<&'static str> {
         "Split" if p["vertical"] == true => "hn.GenSplitDown",
         "Chip" if p["selected"] == true => "hn.GenChipOn",
         "Tile" if p["onClick"].is_string() => "hn.GenTileOn",
+        "File" if p["onClick"].is_string() => "hn.GenFileOn",
         _ => return None,
     })
 }
@@ -91,7 +97,7 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
     let kids: &[Value] = node["children"].as_array().map_or(&[], Vec::as_slice);
     let names = PROPS.iter().find(|(k, _)| *k == kind).map_or(&[][..], |(_, n)| *n);
     if let Value::Object(m) = p {
-        if let Some(k) = m.keys().find(|k| !names.contains(&k.as_str())) {
+        if let Some(k) = m.keys().find(|k| !names.contains(&k.as_str()) && !super::common::COMMON.contains(&k.as_str())) {
             let said: String = k.chars().take(32).collect();
             let has = if names.is_empty() { "it takes none".to_owned() } else { format!("its props are {}", names.join(", ")) };
             return Some(format!("<{kind}> has no prop \u{201C}{said}\u{201D}: {has}"));
@@ -125,6 +131,13 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
         Ok(Some(v)) if v < lo || (open && v == lo) => bad(name, &format!("a number {} {lo}", if open { "above" } else { "of at least" })),
         Ok(_) => None,
     };
+    // A file kind's name (an Icon's or a FileRef's `kind`): one of media.rs's kinds.
+    let file_kind = |k: &str| {
+        (!media::KIND_NAMES.contains(&k)).then(|| {
+            let said: String = k.chars().take(40).collect();
+            format!("<{kind}> kind \u{201C}{said}\u{201D} is not a file kind: {}", media::KIND_NAMES.join(", "))
+        })
+    };
     if LEAVES.contains(&kind) && !kids.is_empty() {
         return Some(format!("<{kind}> holds nothing, but is given {} children", kids.len()));
     }
@@ -136,6 +149,11 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
             (Ok(None), Ok(None)) => Some(format!("<{kind}> is given neither columns nor fit")),
             (_, Ok(Some(f))) if f <= 0.0 => bad("fit", "points above 0"),
             _ => at_least("gap", 0.0, false).or_else(|| at_least("pad", 0.0, false)),
+        },
+        "Stack" => match &p["align"] {
+            Value::Null => None,
+            Value::String(a) if ANCHORS.contains(&a.as_str()) => None,
+            _ => bad("align", &ANCHORS.join(", ")),
         },
         "Layer" => {
             if *within != Within::Stack {
@@ -167,9 +185,15 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
             (t != "Disclosure").then(|| format!("<{kind}> holds only Disclosures, but child {i} is a {}", if t.is_empty() { "value" } else { t }))
         }),
         "Popover" | "Menu" => {
-            let least = if kind == "Menu" { kids.len() != 1 } else { kids.is_empty() };
+            // A context menu's children are the region a right press on opens it in; any other's first is its trigger.
+            let context = kind == "Menu" && p["context"] == true;
+            let least = if kind == "Menu" && !context { kids.len() != 1 } else { kids.is_empty() };
             if least {
-                let want = if kind == "Menu" { "exactly 1 child (its trigger)" } else { "its trigger first" };
+                let want = match kind {
+                    "Menu" if context => "the region a right press opens it in",
+                    "Menu" => "exactly 1 child (its trigger)",
+                    _ => "its trigger first",
+                };
                 return Some(format!("<{kind}> holds {want}, not {} children", kids.len()));
             }
             if kind == "Popover" {
@@ -178,8 +202,18 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
                     Value::String(s) if matches!(s.as_str(), "top" | "bottom" | "left" | "right") => {}
                     _ => return bad("placement", "top, bottom, left or right"),
                 }
+                match &p["align"] {
+                    Value::Null => {}
+                    Value::String(s) if matches!(s.as_str(), "start" | "center") => {}
+                    _ => return bad("align", "start or center"),
+                }
+                match &p["trigger"] {
+                    Value::Null => {}
+                    Value::String(s) if matches!(s.as_str(), "click" | "hover") => {}
+                    _ => return bad("trigger", "click or hover"),
+                }
             }
-            flag("open").or_else(|| if kind == "Menu" { items(node).err() } else { None })
+            flag("open").or_else(|| flag("context")).or_else(|| if kind == "Menu" { items(node).err() } else { None })
         }
         "Dialog" | "Sheet" => text("title", false).or_else(|| flag("open")).or_else(|| flag("dismissable")),
         "Toast" => text("text", true).or_else(|| at_least("duration", 0.0, false)).or_else(|| match &p["tone"] {
@@ -218,13 +252,18 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
             Ok(Some(n)) if !(1.0..=MAX_LINES).contains(&n) || n.fract() != 0.0 => bad("lines", "a whole number from 1 to 20"),
             Ok(_) => None,
         },
-        "Icon" => match &p["name"] {
-            Value::String(n) if media::glyph(n).is_some() => None,
-            Value::String(n) => {
-                let said: String = n.chars().take(40).collect();
-                Some(format!("<Icon> name \u{201C}{said}\u{201D} is not an icon: a file kind ({}) or a Nerd Font symbol (cod-…)", media::KIND_NAMES.join(", ")))
-            }
-            _ => bad("name", "an icon's name (it is required)"),
+        "Icon" => match (&p["name"], &p["kind"]) {
+            (_, Value::String(k)) => file_kind(k),
+            (_, Value::Null) => match &p["name"] {
+                Value::String(n) if media::glyph(n).is_some() => None,
+                Value::String(n) => {
+                    let said: String = n.chars().take(40).collect();
+                    Some(format!("<Icon> name \u{201C}{said}\u{201D} is not an icon: a file kind ({}) or a Nerd Font symbol (cod-…)", media::KIND_NAMES.join(", ")))
+                }
+                Value::Null => Some("<Icon> has neither name nor kind: one says what it draws".to_owned()),
+                _ => bad("name", "an icon's name"),
+            },
+            _ => bad("kind", "a file kind"),
         },
         "Image" => {
             let src = match &p["src"] {
@@ -288,6 +327,42 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
         }
         "Chip" => text("label", true).or_else(|| flag("selected")),
         "Tile" => at_least("gap", 0.0, false).or_else(|| at_least("pad", 0.0, false)),
+        "File" => text("name", true).or_else(|| text("modified", false)).or_else(|| at_least("size", 0.0, false)).or_else(|| match &p["kind"] {
+            Value::Null => None,
+            Value::String(k) if media::kind_named(k).is_some() => None,
+            _ => bad("kind", &format!("a file kind ({})", media::KIND_NAMES.join(", "))),
+        }),
+        "CellRef" => match (&p["task"], &p["call"]) {
+            (Value::String(_) | Value::Number(_), Value::Null | Value::String(_)) => text("title", false),
+            (Value::String(_) | Value::Number(_), _) => bad("call", "the cell's tool call id"),
+            _ => bad("task", "a cell's task, 't3' or 3 (it is required)"),
+        },
+        "ColorPicker" => {
+            let colour = |name: &str, s: &str| {
+                (color::parse_hex(s).is_none() && !color::NAMED.contains(&s)).then(|| {
+                    let said: String = s.chars().take(32).collect();
+                    format!("<ColorPicker> {name} \u{201C}{said}\u{201D} is not a colour: #rrggbb or a tone ({})", color::NAMED.join(", "))
+                })
+            };
+            let options = match &p["options"] {
+                Value::Null => None,
+                Value::Array(a) if a.len() > color::MAX_SWATCHES => Some(format!("<ColorPicker> has {} options: at most {}", a.len(), color::MAX_SWATCHES)),
+                Value::Array(a) => a.iter().enumerate().find_map(|(i, o)| match o {
+                    Value::String(s) => colour(&format!("options[{i}]"), s),
+                    _ => Some(format!("<ColorPicker> options[{i}] is {}, not #rrggbb or a tone", control::describe(o))),
+                }),
+                _ => bad("options", "a list of #rrggbb words or tones"),
+            };
+            options
+                .or_else(|| match &p["selected"] {
+                    Value::Null => None,
+                    Value::String(s) => colour("selected", s),
+                    _ => bad("selected", "#rrggbb or a tone"),
+                })
+                .or_else(|| text("label", false))
+                .or_else(|| flag("disabled"))
+        }
+        "DropZone" => text("label", false),
         "FileRef" => {
             let path = match &p["path"] {
                 Value::String(s) => s,
@@ -297,9 +372,14 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
                 return Some(format!("<FileRef> path \u{201C}{path}\u{201D} is not an absolute path"));
             }
             match number("line") {
-                Err(e) => e,
-                Ok(Some(l)) if l < 1.0 || l.fract() != 0.0 => bad("line", "a whole number of at least 1"),
-                Ok(_) => None,
+                Err(e) => return e,
+                Ok(Some(l)) if l < 1.0 || l.fract() != 0.0 => return bad("line", "a whole number of at least 1"),
+                Ok(_) => {}
+            }
+            match &p["kind"] {
+                Value::Null => text("name", false),
+                Value::String(k) => file_kind(k).or_else(|| text("name", false)),
+                _ => bad("kind", "a file kind"),
             }
         }
         _ => None,
