@@ -255,6 +255,8 @@ export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
 export const tone_ink_2: Fill = {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
 export const tone_ink_3: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
 export const tone_ink_4: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+// A field's placeholder (ui.TextArea's hint, a search menu's, a cell's fields'): clearly a hint, well under the words.
+export const tone_hint: Fill = {dark: {1, 1, 1, 0.24}, light: {0, 0, 0, 0.26}}
 export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
@@ -439,9 +441,6 @@ export const chat_bubble_pad_x = 12
 export const chat_bubble_pad_y = 7
 export const line_chat_bubble = 20
 export const chat_bubble_lead = 48
-// The input's words' inset on its plate; the status line under it keeps the same inset.
-export const chat_input_pad_x = 14
-export const chat_input_pad_y = 10
 export const size_chat = 14
 export const line_chat = 21
 export const size_chat_h1 = 19
@@ -451,35 +450,50 @@ export const line_chat_code = 17
 export const chat_bubble_radius = 12
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = 540
-export const chat_input_radius = 12
-// The status line under the composer (hn.ChatPane's foot.status): its words, and den's model and effort picker in it
-// (hn.ChatPick, src/app/chat/pick.rs): each word its own control chat_pick_h tall, chat_pick_gap apart, the chevron
-// chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
-// chat_ring_stroke, chat_context_gap from its percentage. The model's name leads with its maker's mark (Claude's,
-// OpenAI's, Cursor's) chat_pick_mark across, chat_pick_mark_gap before the name. The picker's menu is a ui.Menu (the
-// menu_* tokens). The agent's state at its end is an icon (scene/widgets/chat_status.flecs) chat_status_icon across. The
-// foot keeps tight: the input and the status line chat_foot_gap apart, chat_foot_pad_b under it, the status line's parts
-// chat_status_gap apart.
+// The composer (hn.ChatPane's foot.card): one card holding the words over a bar of controls, centred in the reading
+// column (chat_w wide at most, as the transcript), chat_foot_pad_t over it and chat_foot_pad_b under it. The card is a
+// step lighter than the chat's ground with a hairline a few percent of white and a soft lift (no heavy border),
+// chat_composer_radius round, chat_composer_pad in from its edges; the words sit a further chat_composer_text_inset in
+// (so they start where the model control's words do, its wash hanging into the inset), chat_composer_pad_t under its
+// top, chat_composer_gap over the bar.
+export const chat_foot_pad_t = 6
+export const chat_foot_pad_b = 14
+export const chat_composer_radius = 18
+export const chat_composer_pad = 8
+export const chat_composer_pad_t = 12
+export const chat_composer_text_inset = 6
+export const chat_composer_gap = 6
+export const chat_composer_lift_blur = 22
+export const chat_composer_lift_alpha = 0.22
+export const chat_composer_lift_dy = 4
+// The bar (foot.card.bar), chat_bar_h tall, its controls chat_bar_gap apart: on the left den's model and effort picker
+// as one quiet control (hn.ChatPick, src/app/chat/pick.rs: "Opus · Medium" and a small chevron, chat_pick_h tall,
+// chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the words, a wash under the pointer);
+// on the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke chat_ring_stroke, in a square
+// chat_bar_h across that takes the pointer) and the send button (hn.ChatSend*: a circle chat_send across, its arrow
+// chat_send_glyph across, stroke chat_send_stroke; hn.ChatStop's square chat_stop_square across, chat_stop_radius
+// round, while the agent works, breathing down to chat_stop_breath). The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
-export const chat_pick_h = 18
-export const chat_pick_gap = 5
+export const size_chat_pick = 12.5
+export const chat_bar_h = 28
+export const chat_bar_gap = 2
+export const chat_pick_h = 26
+export const chat_pick_pad_x = 6
+export const chat_pick_radius = 8
+export const chat_pick_gap = 4
 export const chat_pick_chevron = 8
-export const chat_pick_mark = 12
-export const chat_pick_mark_gap = 5
-export const chat_ring = 10
-export const chat_ring_stroke = 2
-export const chat_context_gap = 4
-export const chat_context_lead = 4
-export const chat_status_icon = 11
-export const chat_status_gap = 6
-export const chat_foot_gap = 4
-export const chat_foot_pad_b = 9
-// The foot's inset above the composer.
-export const chat_foot_pad_t = 4
-// What the chat pane shows around the composer's words besides the transcript (the foot's insets and gap, the status
-// line, the composer's own inset): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_foot_gap + $chat_pick_h + 2 * $chat_input_pad_y
+export const chat_ring = 14
+export const chat_ring_stroke = 1.6
+export const chat_send = 28
+export const chat_send_glyph = 14
+export const chat_send_stroke = 1.8
+export const chat_stop_square = 9
+export const chat_stop_radius = 2
+export const chat_stop_breath = 0.62
+// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets
+// and gap, the bar): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad + $chat_composer_gap + $chat_bar_h
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a bar chat_ctx_bar_h tall (chat_ctx_bar_r round, chat_ctx_bar_pad above
@@ -533,8 +547,14 @@ export const tone_chat_line: Fill = {dark: {1, 1, 1, 0.075}, light: {0.216, 0.20
 export const tone_chat_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.137, 0.514, 0.886, 1}}
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.055}, light: {0.216, 0.208, 0.184, 0.045}}
 export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.03}, light: {0.216, 0.208, 0.184, 0.028}}
-export const tone_chat_input: Fill = {dark: {0.129, 0.129, 0.129, 1}, light: {1, 1, 1, 1}}
-export const tone_chat_input_edge: Fill = {dark: {1, 1, 1, 0.09}, light: {0.216, 0.208, 0.184, 0.14}}
+// The composer's card: a step lighter than the page in dark (white with a stronger hairline and the lift in light).
+// The send button: quiet (tone_chat_send_idle, its arrow faint) with nothing to send, then solid in the words' ink
+// with its arrow (and the stop's square) in the page's ground.
+export const tone_chat_composer: Fill = {dark: {0.137, 0.137, 0.137, 1}, light: {1, 1, 1, 1}}
+export const tone_chat_composer_edge: Fill = {dark: {1, 1, 1, 0.055}, light: {0.216, 0.208, 0.184, 0.12}}
+export const tone_chat_send: Fill = {dark: {1, 1, 1, 0.9}, light: {0.216, 0.208, 0.184, 1}}
+export const tone_chat_send_idle: Fill = {dark: {1, 1, 1, 0.06}, light: {0.216, 0.208, 0.184, 0.06}}
+export const tone_chat_send_glyph: Fill = {dark: {0.098, 0.098, 0.098, 1}, light: {1, 1, 1, 1}}
 // Inline code amid the words: the UI face on a faint plate (no monospace in prose), in the words' own ink.
 export const tone_chat_code: Fill = {dark: {1, 1, 1, 0.07}, light: {0.216, 0.208, 0.184, 0.06}}
 // A text caret: plain white on the dark page (near-black on the light one), no accent: colour that says nothing.

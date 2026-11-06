@@ -973,9 +973,19 @@ fn keep_in_view(from: f32, at: f32, view: f32, len: f32) -> f32 {
     to.clamp(0.0, (len - view).max(0.0))
 }
 
+/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words over the bar).
+fn composer(pv: View<'_>) -> Option<View<'_>> {
+    pv.part("foot")?.part("card")
+}
+
+/// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
+fn composer_area(pv: View<'_>) -> Option<View<'_>> {
+    composer(pv)?.part("entry")?.part("area")
+}
+
 /// Chat pane `p`'s input words.
 fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
-    View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")
+    composer_area(View::of(w.entity_from_id(p)))?.part("text")
 }
 
 impl App {
@@ -1177,16 +1187,22 @@ impl App {
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
         let focused =
             self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing();
-        if let Some(area) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) {
+        let ended = self.status_of(e) != "running";
+        if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
-                // Its agent's name: "Message Codex…" in a Codex session.
+                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
                     "cursor" => "Cursor",
                     _ => "Claude",
                 };
-                h.text(&if shown.is_empty() { format!("Message {agent}\u{2026}") } else { String::new() });
+                let hint = match (shown.is_empty(), ended) {
+                    (false, _) => String::new(),
+                    (true, false) => format!("Message {agent}"),
+                    (true, true) => format!("Message {agent} to resume"),
+                };
+                h.text(&hint);
             }
             if let Some(txt) = area.part("text") {
                 txt.text(&shown);
@@ -1203,7 +1219,7 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
+        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs): the transcript's when its `session`
             // event (or a choice) said them, else the daemon's listing; the model alone when the effort is unknown.
@@ -1214,19 +1230,18 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
-            // The agent's state as an icon (scene/widgets/chat_status.flecs), its words the icon's tooltip; breathing only
-            // while it works, so an idle chat lets the window rest.
-            let state = if self.status_of(e) != "running" {
-                Some("ended")
-            } else if t.busy {
-                Some("working")
-            } else {
-                None
-            };
-            if let Some(s) = status.part("state") {
-                let words = status_on(s, state);
-                tooltip(s, &words);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
+            // The send button: the stop while the agent works (breathing, the composer's one sign of work, so an idle chat
+            // lets the window rest), else the send, solid once there are words to send.
+            if let Some(act) = bar.part("act") {
+                let (key, prefab, action) = if t.busy && !ended {
+                    ("stop", "hn.ChatStop", format!("chat:stop:{sid}"))
+                } else if st.draft.text.trim().is_empty() {
+                    ("send", "hn.ChatSend", String::new())
+                } else {
+                    ("ready", "hn.ChatSendReady", format!("chat:send:{sid}"))
+                };
+                view::for_each_of(act, std::iter::once((key, prefab, ())), |v, (), _| { v.action(&action); });
             }
         }
     }
@@ -1382,7 +1397,7 @@ impl App {
                 continue;
             }
             let Some(sid) = self.session_of(*o.id()) else { continue };
-            let Some(area) = View::of(w.entity_from_id(p)).part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) else {
+            let Some(area) = composer_area(View::of(w.entity_from_id(p))) else {
                 continue;
             };
             let caret =
@@ -1405,7 +1420,7 @@ impl App {
             if model::pane_kind(o) != model::PaneKind::Chat {
                 return None;
             }
-            let area = View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?;
+            let area = composer_area(View::of(w.entity_from_id(p)))?;
             area.entity().try_cloned::<&Laid>()?.contains(x, y).then_some(())?;
             Some((self.session_of(*o.id())?, area.entity()))
         });
@@ -1486,6 +1501,25 @@ impl App {
         true
     }
 
+    /// Send chat `sid`'s draft (Return, or a press on the composer's send button: `chat:send:<sid>`), the draft emptied;
+    /// nothing while it holds only blanks.
+    pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
+        let text = {
+            let mut states = self.chat.borrow_mut();
+            let Some(st) = states.get_mut(&sid) else { return };
+            let d = &mut st.draft;
+            if d.text.trim().is_empty() {
+                return;
+            }
+            let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            (d.caret, d.anchor, d.marked) = (0, 0, None);
+            st.stick = true;
+            text
+        };
+        self.link.chat_send(sid, &text);
+        self.poke();
+    }
+
     /// An `act.Edit` on the focused chat's input (scene/20-keys.flecs ctx.Chat).
     pub(super) fn chat_edit(&mut self, op: &str) {
         if self.genui_editing() {
@@ -1547,24 +1581,7 @@ impl App {
         match op {
             "newline" => _ = self.with_draft(|d| d.insert("\n")),
             // Return, or Command-Return (which submits a cell's TextArea).
-            "send" | "submit" => {
-                let mut text = String::new();
-                self.with_draft(|d| {
-                    if d.text.trim().is_empty() {
-                        return;
-                    }
-                    text = std::mem::take(&mut d.text).trim_end().to_owned();
-                    d.caret = 0;
-                    d.anchor = 0;
-                    d.marked = None;
-                });
-                if !text.is_empty() {
-                    self.link.chat_send(sid, &text);
-                    if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
-                        st.stick = true;
-                    }
-                }
-            }
+            "send" | "submit" => self.chat_send_draft(sid),
             "interrupt" => {
                 let busy = self.chats.borrow().get(&sid).is_some_and(|t| t.busy);
                 if busy {
@@ -1885,7 +1902,10 @@ impl App {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
-        let (in_input, in_list) = (over(pv.part("foot").and_then(|f| f.part("input"))), over(pv.part("list")));
+        // On the composer's card but off its bar of controls is on the words (its insets too).
+        let card = composer(pv);
+        let in_input = over(card) && !over(card.and_then(|c| c.part("bar")));
+        let in_list = over(pv.part("list"));
         // A press on a cell's control is the control's (genui/control.rs): it starts no selection in the transcript.
         let on_control = w.entity_named(APP).target(Hovered::id(), 0).is_some_and(|h| {
             std::iter::successors(Some(h), |n| n.parent())

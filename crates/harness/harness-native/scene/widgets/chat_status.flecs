@@ -20,19 +20,6 @@ prefab thought {
   Tooltip: {text: "Thought"}
 }
 
-// The composer's status line: the agent at work (a pulse, breathing), or its agent ended (a quiet empty ring).
-prefab working {
-  Icon: {glyph: ""}
-  Fill: $tone_chat_muted
-  Tooltip: {text: "Working…  esc to interrupt"}
-  Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_floor}
-}
-prefab ended {
-  Icon: {glyph: ""}
-  Fill: $tone_chat_faint
-  Tooltip: {text: "Ended · a message resumes it"}
-}
-
 // A tool call's or a run's line: a call still running (a small breathing dot, the sidebar's running dot), or one that
 // ended with no result (a slashed circle, faint).
 prefab running {

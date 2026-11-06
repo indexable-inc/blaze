@@ -127,6 +127,7 @@ fn kind_of(a: Act) -> &'static str {
         Act::Query => "sql",
         Act::Spawn => "spawn",
         Act::Wait => "wait",
+        Act::Skill => "skill",
         Act::Cell => "cell",
         Act::Other => "tool",
     }

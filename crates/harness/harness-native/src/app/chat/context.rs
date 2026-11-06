@@ -14,7 +14,7 @@ const INKS: [&str; 8] = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
 /// hn.ChatContextInk's slot for a [`ContextPart::REST`] part.
 const REST_INK: &str = "rest";
 
-/// The popover in `pop` (the status line's overlay slot for it) over `meter` (its hn.ChatContext), for context `c` as an
+/// The popover in `pop` (the composer bar's overlay slot for it) over `meter` (its hn.ChatContext ring), for context `c` as an
 /// agent of kind `agent` reported it; none while `hidden` (the picker's menu is open) or while the pointer is elsewhere.
 pub(super) fn fill_context_pop(pop: View<'_>, meter: Option<View<'_>>, c: Option<&ContextUse>, agent: &str, hidden: bool) {
     let w = pop.entity().world();

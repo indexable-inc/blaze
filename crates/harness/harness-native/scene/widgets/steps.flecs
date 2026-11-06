@@ -30,6 +30,8 @@ hn {
     sql { Icon: {glyph: ""} }
     // an agent or task started (cod-rocket)
     spawn { Icon: {glyph: ""} }
+    // a skill's instructions loaded (cod-book)
+    skill { Icon: {glyph: ""} }
     // waiting on an earlier cell (cod-history)
     wait { Icon: {glyph: ""} }
     // a cell that did nothing more particular (cod-play)
