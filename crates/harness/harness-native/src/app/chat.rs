@@ -26,7 +26,10 @@ use std::sync::Arc;
 mod context;
 mod genui;
 mod pick;
+mod rename;
 mod steps;
+
+pub(super) use rename::Rename;
 
 pub(super) use genui::Live as GenLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
@@ -56,6 +59,38 @@ enum Move {
     LineEnd,
     DocStart,
     DocEnd,
+}
+
+impl Move {
+    /// The move an `EditOp` names, less its `select_` (`left`, `word_right`, `doc_end`, ...), if it names one.
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "word_left" => Self::WordLeft,
+            "word_right" => Self::WordRight,
+            "line_start" => Self::LineStart,
+            "line_end" => Self::LineEnd,
+            "doc_start" => Self::DocStart,
+            "doc_end" => Self::DocEnd,
+            _ => return None,
+        })
+    }
+
+    /// The move an erasing `EditOp` erases over (`backspace`: back a character, `line_erase`: to the line's start), if
+    /// it is one.
+    fn erasing(op: &str) -> Option<Self> {
+        Some(match op {
+            "backspace" => Self::Left,
+            "delete" => Self::Right,
+            "word_erase" => Self::WordLeft,
+            "word_delete" => Self::WordRight,
+            "line_erase" => Self::LineStart,
+            _ => return None,
+        })
+    }
 }
 
 impl Draft {
@@ -1186,7 +1221,8 @@ impl App {
         }
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
         let focused =
-            self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing();
+            self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing()
+                && !self.renaming();
         let ended = self.status_of(e) != "running";
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
@@ -1334,13 +1370,11 @@ impl App {
         if moving {
             self.poke();
         }
-        // A focused input's caret fades on the clock: keep drawing.
+        // A focused input's caret (or a name's being renamed) fades on the clock: keep drawing.
         if self.focused
             && self.look.themes[usize::from(self.dark)].blink
-            && self.chat_focused()
-            && !self.tree_focus
-            && self.palette.is_none()
-            && !self.genui_editing()
+            && (self.renaming()
+                || (self.chat_focused() && !self.tree_focus && self.palette.is_none() && !self.genui_editing()))
         {
             self.poke_why("caret blink");
         }
@@ -1491,7 +1525,10 @@ impl App {
 
     /// Run `f` on the focused chat's draft; true when there is one.
     fn with_draft(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
-        // A cell's field that has the keys takes them before the chat's input.
+        // A name being renamed takes them first (chat/rename.rs), then a cell's field that has the keys, then the input.
+        if self.renaming() {
+            return self.rename_draft(f);
+        }
         if self.genui_editing() {
             return self.genui_draft(f);
         }
@@ -1522,6 +1559,10 @@ impl App {
 
     /// An `act.Edit` on the focused chat's input (scene/20-keys.flecs ctx.Chat).
     pub(super) fn chat_edit(&mut self, op: &str) {
+        // A name being renamed has the keys before anything in the pane (chat/rename.rs).
+        if self.renaming() {
+            return self.rename_edit(op);
+        }
         if self.genui_editing() {
             return self.genui_edit(op);
         }
@@ -1545,34 +1586,13 @@ impl App {
             Some(n) => (true, n),
             None => (false, op),
         };
-        let mv = match name {
-            "left" => Some(Move::Left),
-            "right" => Some(Move::Right),
-            "up" => Some(Move::Up),
-            "down" => Some(Move::Down),
-            "word_left" => Some(Move::WordLeft),
-            "word_right" => Some(Move::WordRight),
-            "line_start" => Some(Move::LineStart),
-            "line_end" => Some(Move::LineEnd),
-            "doc_start" => Some(Move::DocStart),
-            "doc_end" => Some(Move::DocEnd),
-            _ => None,
-        };
-        if let Some(m) = mv {
+        if let Some(m) = Move::named(name) {
             if let Some(to) = self.chat_target(m) {
                 self.with_draft(|d| d.go(m, to, select));
             }
             return;
         }
-        let erase = match op {
-            "backspace" => Some(Move::Left),
-            "delete" => Some(Move::Right),
-            "word_erase" => Some(Move::WordLeft),
-            "word_delete" => Some(Move::WordRight),
-            "line_erase" => Some(Move::LineStart),
-            _ => None,
-        };
-        if let Some(m) = erase {
+        if let Some(m) = Move::erasing(op) {
             if let Some(to) = self.chat_target(m) {
                 self.with_draft(|d| d.erase(to));
             }
@@ -1642,6 +1662,9 @@ impl App {
     }
 
     pub(super) fn chat_marked(&self) -> Option<Option<String>> {
+        if let Some(r) = &self.rename {
+            return Some(r.marked());
+        }
         if let Some(m) = self.genui_marked() {
             return Some(m);
         }
@@ -1652,6 +1675,9 @@ impl App {
     /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
     /// else its input's.
     pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
+        if let Some(c) = self.rename_copy() {
+            return Some(c);
+        }
         if let Some((text, node)) = self.genui_copy() {
             return Some((!text.is_empty()).then_some((text, Copied::Field(node))));
         }
@@ -1769,6 +1795,9 @@ impl App {
     /// Command-A in the focused chat: the whole transcript after a press in it, else the input's draft. Whether a chat
     /// took it.
     pub(super) fn chat_select_all(&mut self) -> bool {
+        if self.renaming() {
+            return self.with_draft(|d| (d.anchor, d.caret) = (0, d.text.len()));
+        }
         let Some((_, _, sid)) = self.focused_chat() else { return false };
         let n = self.chat_rows(sid).len();
         let reading = self.chat.borrow().get(&sid).is_some_and(|st| st.reading);
@@ -1815,6 +1844,10 @@ impl App {
     pub(super) fn chat_caret_rect(&mut self) -> Option<Option<[f32; 4]>> {
         let z = self.zoom();
         let zoomed = |r: Option<[f32; 4]>| r.map(|r| r.map(|v| v * z));
+        if let Some(node) = self.rename.as_ref().and_then(|r| self.rename_node(r.obj)) {
+            let w = self.world.world_ref();
+            return Some(zoomed(words_caret(&mut self.paint.borrow_mut(), w.entity_from_id(node))));
+        }
         if let Some(r) = self.genui_caret() {
             return Some(zoomed(r));
         }

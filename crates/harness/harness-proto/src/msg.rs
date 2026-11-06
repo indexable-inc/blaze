@@ -139,6 +139,11 @@ pub enum Request {
         #[serde(default)]
         effort: Option<String>,
     },
+    /// Name session `id` (its [`SessionInfo::label`], what the app shows for it): `title` trimmed; empty takes the name
+    /// away, and the session is called what it was before (its `name`, else its kind and number). The daemon keeps it in
+    /// the session's index row, so it outlives the daemon and the app. Refused, naming the session, for a title over a
+    /// line.
+    Rename { id: u64, title: String },
     Screen { id: u64 },
     Resize { id: u64, cols: u16, rows: u16 },
     Kill { id: u64 },
@@ -293,6 +298,9 @@ pub struct SessionInfo {
     /// claude | codex | cursor | shell.
     pub kind: String,
     pub name: Option<String>,
+    /// What the person named it ([`Request::Rename`]), shown in place of its `name`; None until it is renamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub parent: Option<u64>,
     /// A chat's first user line, a terminal's title.
     pub title: String,

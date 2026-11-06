@@ -82,6 +82,8 @@ enum Do {
     /// An archived object: opened with the way back to the Archive.
     Archived(u64),
     Kill,
+    /// Rename the selected session in its row (cmd+R).
+    Rename,
     Sidebar,
     Zoom(i32),
 }
@@ -200,6 +202,8 @@ pub struct App {
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
     genui: std::cell::RefCell<chat::GenLive>,
+    /// A session's name being renamed in its sidebar row (cmd+R, chat/rename.rs).
+    rename: Option<chat::Rename>,
     /// The universal handlers' pointer, key and focus state (genui/common.rs).
     gen_prims: std::cell::RefCell<chat::GenPrims>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
@@ -484,6 +488,7 @@ impl App {
             chats,
             chat: std::cell::RefCell::default(),
             genui: std::cell::RefCell::default(),
+            rename: None,
             gen_prims: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
@@ -706,6 +711,8 @@ impl App {
     fn sync_view(&mut self) {
         // Folds kept in native.json land on objects before their rows are read.
         self.read_folds();
+        // A rename whose row is no longer the selection (or under the palette) is saved before the rows are filled.
+        self.rename_settle();
         let w = self.world.world_ref();
         let up = w
             .lookup(model::LOCAL)
@@ -894,6 +901,13 @@ impl App {
                     ("running", _) => (ago(now.saturating_sub(model::when(o))), "Started".to_owned()),
                     _ => (ago(now.saturating_sub(model::when(o))), "Ended".to_owned()),
                 };
+                // Its name being renamed (chat/rename.rs): the field's words in its place, still (no breath) and alone
+                // on the row (no trailing words or shortcut).
+                let edit = me.rename_shown(e);
+                let (name, busy, meta, hint) = match &edit {
+                    Some((shown, _)) => (shown.clone(), false, String::new(), String::new()),
+                    None => (name, busy, meta, hint),
+                };
                 row.props(
                     "hn.ObjRow",
                     &[
@@ -905,10 +919,14 @@ impl App {
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
+                            ("edit", Prop::Bool(edit.is_some())),
                         ],
                     ]
                     .concat(),
                 );
+                if let Some((_, units)) = edit {
+                    me.rename_caret(row, units);
+                }
             }
         });
         self.fold.animate(
@@ -1276,6 +1294,16 @@ impl App {
             self.hint("Archive"),
             Do::Kill,
         ));
+        // A session (not a run, not the Archive) can be renamed in its row.
+        let renamable = self
+            .selected()
+            .filter(|&e| self.run_of(e).is_none())
+            .map(|e| w.entity_from_id(e))
+            .filter(|o| o.has(model::Object::id()));
+        if let Some(o) = renamable {
+            let what = if o.has(model::ChatMode::id()) { "Rename chat" } else { "Rename session" };
+            out.push(("rename".into(), PalGlyph::Char(crate::look::RENAME_ICON), what.into(), self.hint("Rename"), Do::Rename));
+        }
         out.push((
             "sidebar".into(),
             PalGlyph::Char(crate::look::SIDEBAR_ICON),
@@ -1890,6 +1918,7 @@ impl App {
             Do::Select(e) => self.select(Some(e)),
             Do::Archived(e) => self.open_from_archive(e),
             Do::Kill => self.kill(),
+            Do::Rename => self.rename_start(),
             Do::Sidebar => self.toggle_sidebar(),
             Do::Zoom(by) => self.step_zoom(by),
         }

@@ -104,6 +104,8 @@ pub struct Pending;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Skipped;
 
+/// What an object is called where it shows (its row, the window's title, the palette): a session's rename, else its
+/// daemon name, else its kind and number (`reconcile`); a run's command.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Name {
     pub s: ScriptString,
@@ -892,7 +894,13 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
                 e.set(code);
             }
         }
-        let name = s["name"].as_str().filter(|n| !n.is_empty()).map(str::to_owned).unwrap_or_else(|| format!("{} {id}", s["kind"].as_str().unwrap_or("session")));
+        // What it is called: what the person renamed it to (the daemon's `label`), else its daemon name, else its kind and
+        // number (its automatic name).
+        let name = [&s["label"], &s["name"]]
+            .into_iter()
+            .find_map(|n| n.as_str().filter(|n| !n.is_empty()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} {id}", s["kind"].as_str().unwrap_or("session")));
         if e.try_cloned::<&Name>().is_none_or(|n| n.s.as_str() != name) {
             e.set(Name { s: name.as_str().into() });
         }

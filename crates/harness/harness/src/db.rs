@@ -285,8 +285,8 @@ pub fn mark_lost_sessions() {
 const SESSION_COLS: &str =
     "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code, meta from objects where kind not in ('proc', 'stage', 'repl')";
 
-/// One row of `SESSION_COLS` as a session row (daemon::Session::info's type): its mode (`chat` or `tui`), title and model
-/// from its meta.
+/// One row of `SESSION_COLS` as a session row (daemon::Session::info's type): its mode (`chat` or `tui`), title, label
+/// (a rename) and model from its meta.
 fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
     let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
     let object: String = r.get(0)?;
@@ -306,6 +306,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         ended_ms: u(r.get(8)?),
         exit: r.get(9)?,
         title: meta["title"].as_str().unwrap_or("").to_owned(),
+        label: meta["label"].as_str().filter(|l| !l.is_empty()).map(str::to_owned),
         mode: meta["mode"].as_str().unwrap_or("tui").to_owned(),
         model: meta["model"].as_str().map(str::to_owned),
         effort: meta["effort"].as_str().map(str::to_owned),
@@ -380,11 +381,14 @@ pub fn agent_sessions(only_running: bool) -> Vec<(String, String, Value)> {
 }
 
 pub fn set_meta(id: &str, key: &str, v: &Value) {
-    let r = conn().execute(
+    log("set_meta", set_meta_in(&conn(), id, key, v));
+}
+
+fn set_meta_in(c: &Connection, id: &str, key: &str, v: &Value) -> rusqlite::Result<usize> {
+    c.execute(
         "update objects set meta = json_set(coalesce(meta, '{}'), '$.' || ?2, json(?3)) where id = ?1",
         params![id, key, v.to_string()],
-    );
-    log("set_meta", r);
+    )
 }
 
 /// (kind, meta) of one object.
@@ -456,4 +460,33 @@ pub fn repl_task(v: &Value) -> Result<()> {
         ..Default::default()
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session's label (a rename) round-trips through its index row: set, read back as the row a restart restores the
+    /// session from, kept when a resume writes the row again with the meta it read, and gone when taken away.
+    #[test]
+    fn a_label_round_trips_through_the_index() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        let row = |c: &Connection| c.query_row(&format!("{SESSION_COLS} and id = ?1"), ["s7"], session_row).unwrap();
+        let start = |c: &Connection, meta: Value| {
+            put_obj(c, &Obj { id: "s7", kind: "claude", status: Some("running"), meta, ..Default::default() }).unwrap();
+        };
+        start(&c, json!({"mode": "chat", "title": "count the files"}));
+        assert_eq!(row(&c).label, None, "a session nobody renamed has no label");
+        set_meta_in(&c, "s7", "label", &json!("tidy the build")).unwrap();
+        let back = row(&c);
+        assert_eq!(back.label.as_deref(), Some("tidy the build"));
+        assert_eq!(back.title, "count the files", "the automatic title stays beside it");
+        // A resume starts the row again with the meta it read (daemon.rs `resume`).
+        let meta: String = c.query_row("select meta from objects where id = 's7'", [], |r| r.get(0)).unwrap();
+        start(&c, serde_json::from_str(&meta).unwrap());
+        assert_eq!(row(&c).label.as_deref(), Some("tidy the build"), "a resume keeps the label");
+        set_meta_in(&c, "s7", "label", &Value::Null).unwrap();
+        assert_eq!(row(&c).label, None, "taken away, the session has its automatic name again");
+    }
 }

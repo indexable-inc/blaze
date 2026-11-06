@@ -370,7 +370,8 @@ pub fn tree_lines(list: &[SessionInfo]) -> Vec<(u64, String, bool)> {
             };
             (
                 s.id,
-                format!("{indent}#{} {:<6} {:<9} {:>4}  {}", s.id, s.kind, state, age(s.created_ms.unwrap_or(0)), s.title),
+                // What the person renamed it to, else its automatic title.
+                format!("{indent}#{} {:<6} {:<9} {:>4}  {}", s.id, s.kind, state, age(s.created_ms.unwrap_or(0)), s.label.as_deref().unwrap_or(&s.title)),
                 s.exit.is_some() || lost,
             )
         })

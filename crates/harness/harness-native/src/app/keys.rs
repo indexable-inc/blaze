@@ -48,6 +48,8 @@ const HANDLERS: &[(&str, Handler)] = &[
         }
     }),
     ("Archive", |a, _, _| a.kill()),
+    // cmd+R: the selected session's name in its row turns into a field (chat/rename.rs).
+    ("Rename", |a, _, _| a.rename_start()),
     ("SelectAll", |a, _, _| a.select_all()),
     ("Edit", |a, act, _| {
         let op = a
@@ -233,6 +235,9 @@ impl App {
             &[keys::PALETTE]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
+        } else if self.renaming() {
+            // A name being renamed in its row has the keys: the chat input's edits act on it (chat/rename.rs).
+            &[keys::CHAT]
         } else if self.genui_editing() {
             // A cell's field has the keys: the chat input's edits act on it.
             &[keys::CHAT]

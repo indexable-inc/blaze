@@ -27,6 +27,8 @@ harness send <id> <text...>   type a message into a session and press Enter
 harness set-model <id> [--model <m>] [--effort <e>]
                               switch a chat's model and/or reasoning effort for its turns from here on
                               (one its agent lists: `harness log <id>` shows its `models` event)
+harness rename <id> [title...]
+                              name a session (what the app shows for it); no title: its automatic name again
 harness screen <id>           print a session's current screen
 harness log <id>              print a chat's log, one event per line (JSON; bad records on stderr)
 harness kill <id>             kill a session's process
@@ -98,6 +100,11 @@ async fn main() -> Result<()> {
                 *slot = Some(rest.next().ok_or_else(|| anyhow::anyhow!("harness set-model: {a} needs a value"))?.clone());
             }
             client::Ctl::connect().await?.req(Request::SetModel { id, model, effort }).await?;
+            Ok(())
+        }
+        Some("rename") => {
+            let id: u64 = arg(1).parse().map_err(|e| anyhow::anyhow!("harness rename: {:?} is not a session id: {e}", arg(1)))?;
+            client::Ctl::connect().await?.req(Request::Rename { id, title: args[2..].join(" ") }).await?;
             Ok(())
         }
         Some("screen") => {
