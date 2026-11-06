@@ -325,7 +325,7 @@ impl App {
             .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>())
             .map(|c| c.s.as_str().to_owned())
             .filter(|c| !c.is_empty());
-        let fresh = self.chats.borrow().get(&sid).is_none_or(|t| !t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })));
+        let fresh = !self.sent(sid);
         self.remember_choice(&kind, Some(&m), None);
         self.spawning(&kind);
         self.spawn_on(&kind, Some(m), None, cwd);

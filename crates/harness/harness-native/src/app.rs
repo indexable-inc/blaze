@@ -1597,7 +1597,20 @@ impl App {
     /// cmd+N: a chat of the last agent kind on its last model and effort ([`Self::remember_choice`]). A remembered model
     /// (or effort) its kind no longer lists is not started on: the chat starts as its agent does by default, its models'
     /// menu open with an error naming what is gone.
+    /// Whether the chat `sid` has had a message sent in it: a chat with none is still the new chat Cmd-N would make.
+    pub(in crate::app) fn sent(&self, sid: u64) -> bool {
+        self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })))
+    }
+
     pub(in crate::app) fn new_chat(&mut self) {
+        // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
+        if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
+            && self.chats.borrow().contains_key(&sid)
+            && !self.sent(sid)
+        {
+            self.poke();
+            return;
+        }
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
