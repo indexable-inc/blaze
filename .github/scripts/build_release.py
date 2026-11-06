@@ -353,7 +353,7 @@ async def main_async(build: Build) -> None:
     if wrong:
         raise Failed(
             f"check: a shipped binary would not run on a user's machine: {'; '.join(wrong)} (LLVM and, on "
-            "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs)"
+            "Linux, libstdc++ are linked in statically: vendor/llvm-sys/build.rs)"
         )
     how = f"with the profile {profile.name}" if profile else "without PGO"
     print(

@@ -248,20 +248,29 @@ fn homebrew_prefix(name: Option<&str>) -> Option<String> {
         .map(|val| val.trim().to_string())
 }
 
-/// blaze: libstdc++.a of the C++ compiler cc-rs would use (`CXX`, else `c++`).
-fn static_libstdcxx() -> PathBuf {
-    println!("cargo:rerun-if-env-changed=CXX");
-    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_owned());
-    let out = Command::new(&cxx)
-        .arg("-print-file-name=libstdc++.a")
-        .output()
-        .unwrap_or_else(|e| panic!("{cxx} -print-file-name=libstdc++.a: {e}"));
+/// blaze: libstdc++.a of the C++ compiler that built wrappers/passes.cpp, `passes`, for this
+/// script's `TARGET`: cc-rs's own choice, from `CXX_<target>`, `CXX_<target with _>`,
+/// `TARGET_CXX` (or `HOST_CXX` when not cross-compiling), then `CXX`, else its default for the
+/// target, with each variable it reads named in `rerun-if-env-changed` by cc-rs. Its flags go
+/// along (`-m64`, a clang `--target`), so the library is the one for that target. One lookup,
+/// cc-rs's: a copy of it here read plain `CXX` alone, so the host copy of llvm-sys (a
+/// build-dependency, built for the host while the job's `CXX` named a cross compiler) linked
+/// the target's libstdc++.a into an AArch64 build script.
+fn static_libstdcxx(passes: &cc::Build) -> PathBuf {
+    let target = env::var("TARGET").unwrap_or_default();
+    let tool = passes.try_get_compiler().unwrap_or_else(|e| {
+        panic!("cc-rs found no C++ compiler for `{target}` to ask for libstdc++.a: {e}")
+    });
+    let mut cmd = tool.to_command();
+    cmd.arg("-print-file-name=libstdc++.a");
+    let cxx = format!("{cmd:?}");
+    let out = cmd.output().unwrap_or_else(|e| panic!("{cxx} (for `{target}`): {e}"));
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     assert!(
         out.status.success() && path.is_absolute() && path.exists(),
-        "`{cxx} -print-file-name=libstdc++.a` found no libstdc++.a ({}): a static LLVM links \
+        "{cxx}, the C++ compiler for `{target}`, found no libstdc++.a ({}): a static LLVM links \
          libstdc++ statically, so install the C++ compiler's static library (Debian and Ubuntu: \
-         libstdc++-<version>-dev)",
+         libstdc++-<version>-dev, or libstdc++-<version>-dev-<arch>-cross for a cross compiler)",
         path.display()
     );
     path
@@ -601,7 +610,7 @@ fn main() {
         // blaze: a static LLVM on Linux takes its C++ runtime statically too, so a binary built
         // with it asks the system for nothing of C++.
         if name == "stdc++" && kind == LibraryKind::Static && target_os_is("linux") {
-            let archive = static_libstdcxx();
+            let archive = static_libstdcxx(&passes);
             let dir = archive.parent().expect("libstdc++.a is in a directory");
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib=static:-bundle=stdc++");

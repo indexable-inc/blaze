@@ -172,6 +172,14 @@ jobs:
   # ix runner, and not run: the target's LLVM `llvm-config` (which llvm-sys's build script runs)
   # under qemu-user, and Ubuntu's x86-64 cross gcc and glibc for the C and C++ and the start
   # files blaze's linker asks the C driver for. Not in `ci`'s needs until it has passed once.
+  # llvm-sys is built twice: for the target (hir-ty-codegen, through blaze-engine) and for the
+  # host (a build-dependency of blaze-stencil's build script, which runs here). blaze gives each
+  # run of its build script the LLVM llvm.json pins for that run's target (a pinned native input,
+  # Cargo.toml's `[workspace.metadata.blaze.native.llvm]`, set over the shell's
+  # LLVM_SYS_231_PREFIX), so the job fetches and names none. The C and C++ compilers are named
+  # for the target only: cc-rs (and llvm-sys's libstdc++.a, which it asks cc-rs's compiler for)
+  # takes CC_<target>/CXX_<target> before plain CC/CXX, so the host copy keeps the runner's own
+  # gcc. A plain CXX here would give the host copy x86-64 libstdc++.a and objects.
   linux-x64-cross:
     name: linux x64 (cross-compiled, not run)
     needs: changes
@@ -180,11 +188,9 @@ jobs:
     timeout-minutes: 150
     env:
       # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
-      # set for the whole job. llvm-sys finds libstdc++ by asking plain CXX.
+      # set for the whole job. For the target alone: no plain CC or CXX (see above).
       CC_x86_64_unknown_linux_gnu: x86_64-linux-gnu-gcc
       CXX_x86_64_unknown_linux_gnu: x86_64-linux-gnu-g++
-      CXX: x86_64-linux-gnu-g++
-      LLVM_SYS_231_PREFIX: /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
       # The x86-64 llvm-config's own libraries, for qemu-user.
       QEMU_LD_PREFIX: /usr/x86_64-linux-gnu
     steps:
@@ -201,12 +207,6 @@ jobs:
         uses: ./.github/actions/blaze
         with:
           job: cross-x86_64
-      - name: LLVM for x86_64-unknown-linux-gnu (the pin)
-        run: |
-          sudo mkdir -p /usr/local/lib/blaze-llvm
-          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"x86_64-unknown-linux-gnu\", \"dir\": \"$LLVM_SYS_231_PREFIX\"}"
-          "$LLVM_SYS_231_PREFIX/bin/llvm-config" --version
       - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
       - name: an x86-64 ELF, not run
         run: |

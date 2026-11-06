@@ -10,7 +10,10 @@ Changes, each marked `blaze:` in build.rs:
 1. Static LLVM archives are linked `static:-bundle`: named to the final link, not copied into the
    rlib.
 2. A static LLVM on Linux links libstdc++ statically, from the C++ compiler's own `libstdc++.a`
-   (`$CXX -print-file-name`), so a release binary needs no C++ runtime where it runs.
+   (`-print-file-name`), so a release binary needs no C++ runtime where it runs. The compiler is
+   the one cc-rs built `wrappers/passes.cpp` with, for the script's `TARGET` (`CXX_<target>`,
+   `CXX_<target with _>`, `TARGET_CXX` or `HOST_CXX`, then `CXX`), so a host copy of llvm-sys
+   (a build-dependency) and a target copy in one cross build each link their own arch's.
 3. `wrappers/passes.cpp` (built with `llvm-config --cxxflags`, declared in
    `src/transforms/pass_builder.rs` as `LLVMBlaze*Passes`): the pass builder, analysis managers,
    standard instrumentation and parsed pipelines `LLVMRunPasses` makes on every call, kept per
@@ -25,7 +28,9 @@ Changes, each marked `blaze:` in build.rs:
    `LLVMDisposeMessage`, the thread rules) and says `#![forbid(unsafe_code)]`: the crate stays
    declarations only, and every call is made behind a safe wrapper in hir-ty-codegen's `llvm`.
 6. `pin.rs`, included by build.rs and run before anything else there, links only the LLVM
-   `crates/hir-ty-codegen/llvm.json` pins: `LLVM_SYS_231_PREFIX` must name a prefix whose
+   `crates/hir-ty-codegen/llvm.json` pins: `LLVM_SYS_231_PREFIX`, which blaze sets for each run
+   of the script to the release for that run's `TARGET` (a pinned native input, docs/cargo.md),
+   so a host and a target copy each get their own, must name a prefix whose
    `blaze-llvm.json` (written by `.github/scripts/llvm.py build`) has the pinned commit and
    version and whose `llvm-config --version` says that version. Anything else (the variable
    unset, a stock LLVM, another build) stops the build with one `cargo::error` naming what was

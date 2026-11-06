@@ -122,7 +122,7 @@ runs:
         [ -n "$sigign" ] && (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn ${sigign:-unread}): BASH_ENV's trap did not reach it"; exit 1; }
         grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
-    # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
+    # sha256 and unpacks it; vendor/llvm-sys/pin.rs refuses any other prefix. Below
     # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
     # build script in blaze's sandbox may name only system directories of libraries
     # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
