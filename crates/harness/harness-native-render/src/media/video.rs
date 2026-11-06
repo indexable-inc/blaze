@@ -1,12 +1,17 @@
 //! Videos: an AVPlayer per element over an AVPlayerItem (an AVURLAsset of a file or an http(s) URL) whose frames an
-//! AVPlayerItemVideoOutput hands over as BGRA pixel buffers, mapped into Metal by CoreVideo's texture cache with no copy.
+//! AVPlayerItemVideoOutput hands over as RGBA half-float pixel buffers, mapped into Metal by CoreVideo's texture cache with
+//! no copy.
 //!
 //! Everything is polled from `prepare` (no KVO, no notifications): the item's status, its time and duration, the end (looped
 //! by seeking to zero). A frame is pulled only for a player something visible shows; a hidden one keeps its clock (AVPlayer
 //! runs on its own) and costs no copies.
 //!
-//! The frames are BGRA8Unorm, sampled as a non-sRGB format so the values stay sRGB-encoded (Rec. 709 video's transfer is
-//! close to sRGB's): the same encoding as every other colour the UI draws, so a video frame composites like a photo.
+//! The frames are RGBA16Float holding the video's own signal, unconverted: an SDR video's Rec. 709 values (its transfer
+//! is close to sRGB's, the encoding every other colour the UI draws uses, so it composites like a photo, as before), an
+//! HDR video's PQ or HLG code values. AVFoundation's own conversion to linear light clips at 1.0 (measured: a PQ clip's
+//! 1000-nit patch came back as 1.0), so it cannot carry HDR; the raw signal can (203 nits reads 0.580, PQ's code for
+//! it). Each frame keeps how it is encoded ([`Frame::hdr`], from the pixel buffer's attachments) and the surface pass
+//! decodes it (crate::hdr's PQ and HLG, BT.2020 to BT.709) and tone-maps it to the display's headroom.
 //!
 //! AVPlayer and AVPlayerItem are main-thread-only (objc2 marks them `MainThreadOnly`): players are made only when
 //! `prepare` runs on the main thread, and a video asked for elsewhere fails naming why. AVFoundation posts status changes
@@ -24,17 +29,21 @@ use objc2_av_foundation::{
     AVPlayer, AVPlayerActionAtItemEnd, AVPlayerItem, AVPlayerItemStatus, AVPlayerItemVideoOutput, AVPlayerStatus,
     AVPlayerTimeControlStatus, AVURLAsset,
 };
-use objc2_core_foundation::{CFRetained, CFString};
+use objc2_core_foundation::{CFData, CFRetained, CFString};
 use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
-    kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+    kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferContentLightLevelInfoKey,
+    kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPixelFormatTypeKey,
+    kCVPixelFormatType_64RGBAHalf, kCVReturnSuccess,
 };
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 use objc2_metal::{MTLPixelFormat, MTLTexture};
 
 use super::{FORGET_SECS, VideoSpec, VideoState};
 use crate::gpu::{Dev, Tex};
+use crate::hdr::{Transfer, WHITE_NITS};
 
 /// Frames a player keeps mapped: the one shown and those the window's frames in flight (gpu.rs FRAMES) still sample. One
 /// older than these is let go only once no pass or shader render still reads it.
@@ -47,6 +56,9 @@ const SEEK_TIMESCALE: i32 = 600;
 /// One video frame mapped into Metal, alive while anything may sample it.
 pub(crate) struct Frame {
     pub(crate) tex: Tex,
+    /// How its texels encode light, as `SurfaceInst::hdr`: x the transfer (`Transfer`), y the peak in SDR-white units
+    /// from its light-level metadata (0: unknown), z 1 for BT.2020 primaries.
+    pub(crate) hdr: [f32; 4],
     /// The window frame that last drew it (Media's serial).
     sampled: std::cell::Cell<u64>,
     /// The CoreVideo texture and its pixel buffer: while these live, AVFoundation does not recycle the buffer `tex` reads.
@@ -130,10 +142,11 @@ impl Player {
             }
             NSURL::fileURLWithPath(&NSString::from_str(src))
         };
-        // The output's buffers: BGRA, IOSurface-backed so CoreVideo can map them into Metal.
+        // The output's buffers: RGBA half floats of the unconverted signal (module doc), IOSurface-backed so CoreVideo can
+        // map them into Metal.
         // SAFETY: two CoreVideo string constants, alive for the process.
         let (format_key, metal_key) = unsafe { (kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferMetalCompatibilityKey) };
-        let format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_32BGRA);
+        let format = NSNumber::numberWithUnsignedInt(kCVPixelFormatType_64RGBAHalf);
         let metal = NSNumber::numberWithBool(true);
         let (format, metal): (&AnyObject, &AnyObject) = (&format, &metal);
         let attrs = NSDictionary::<NSString, AnyObject>::from_slices(&[bridged(format_key), bridged(metal_key)], &[format, metal]);
@@ -289,7 +302,7 @@ impl Player {
         let Some(buf) = buf else { return };
         let (w, h) = (CVPixelBufferGetWidth(&buf), CVPixelBufferGetHeight(&buf));
         let mut out: *mut CVMetalTexture = std::ptr::null_mut();
-        // SAFETY: a live cache and a live, Metal-compatible BGRA pixel buffer (the output's attributes ask for one), mapped
+        // SAFETY: a live cache and a live, Metal-compatible RGBA half-float pixel buffer (the output's attributes ask for one), mapped
         // whole as plane 0; `out` is a valid place for the result, which comes with +1 retain count (Create rule).
         let r = unsafe {
             CVMetalTextureCache::create_texture_from_image(
@@ -297,7 +310,7 @@ impl Player {
                 cache,
                 &buf,
                 None,
-                MTLPixelFormat::BGRA8Unorm,
+                MTLPixelFormat::RGBA16Float,
                 w,
                 h,
                 0,
@@ -314,7 +327,8 @@ impl Player {
             self.error = Some(format!("{}: CoreVideo gave a frame with no Metal texture", self.src));
             return;
         };
-        self.frames.push_back(Rc::new(Frame { tex, sampled: std::cell::Cell::new(0), _cv: cv, _buf: buf }));
+        let hdr = encoding(&buf);
+        self.frames.push_back(Rc::new(Frame { tex, hdr, sampled: std::cell::Cell::new(0), _cv: cv, _buf: buf }));
         self.version += 1;
     }
 
@@ -437,6 +451,12 @@ impl Videos {
         Some(&f.tex)
     }
 
+    /// How the newest frame of `key`'s video encodes light (`Frame::hdr`); None when it has no frame.
+    pub(crate) fn encoding(&self, key: u64) -> Option<[f32; 4]> {
+        let Entry::Live(p) = &self.slots.get(&key)?.entry else { return None };
+        p.frames.back().map(|f| f.hdr)
+    }
+
     /// The newest frame of `key`'s video and how many it has pulled, for a shader that samples it (it holds the Rc while
     /// its render is in flight).
     pub(crate) fn frame(&self, key: u64) -> Option<(Rc<Frame>, u64)> {
@@ -467,4 +487,45 @@ impl Videos {
             Entry::Broken { .. } => true,
         })
     }
+}
+
+/// How a pixel buffer's texels encode light (`Frame::hdr`), from the attachments the decoder puts on it: the transfer
+/// function and primaries, and the peak from the content light level (MaxCLL) or else the mastering display's maximum
+/// luminance. A buffer with neither PQ nor HLG is SDR (x 0), drawn as it is.
+fn encoding(buf: &CVPixelBuffer) -> [f32; 4] {
+    // SAFETY: CoreVideo's attachment keys and values, static for the process; `attachment` takes a live buffer and a
+    // null mode pointer (the mode is not wanted) and returns a +1 reference or None.
+    let (transfer, primaries, cll, mastering) = unsafe {
+        let get = |key: &CFString| buf.attachment(key, std::ptr::null_mut());
+        (
+            get(kCVImageBufferTransferFunctionKey),
+            get(kCVImageBufferColorPrimariesKey),
+            get(kCVImageBufferContentLightLevelInfoKey),
+            get(kCVImageBufferMasteringDisplayColorVolumeKey),
+        )
+    };
+    let is = |v: &Option<CFRetained<objc2_core_foundation::CFType>>, want: &CFString| {
+        v.as_ref().and_then(|v| v.downcast_ref::<CFString>()).is_some_and(|s| s == want)
+    };
+    // SAFETY: CoreVideo's static string constants.
+    let (pq, hlg, bt2020) = unsafe {
+        (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferTransferFunction_ITU_R_2100_HLG, kCVImageBufferColorPrimaries_ITU_R_2020)
+    };
+    let transfer = if is(&transfer, pq) {
+        Transfer::Pq
+    } else if is(&transfer, hlg) {
+        Transfer::Hlg
+    } else {
+        return [0.0; 4];
+    };
+    let bytes = |v: Option<CFRetained<objc2_core_foundation::CFType>>| v.and_then(|v| v.downcast_ref::<CFData>().map(CFData::to_vec));
+    // MaxCLL: two big-endian u16, MaxCLL then MaxFALL, in cd/m² (CTA-861.3). Mastering display colour volume: six u16
+    // primaries, two u16 white point, then max and min luminance as big-endian u32 in 0.0001 cd/m² (SMPTE ST 2086).
+    let max_cll = bytes(cll).filter(|b| b.len() >= 2).map(|b| f32::from(u16::from_be_bytes([b[0], b[1]])));
+    let mastering_max = bytes(mastering)
+        .filter(|b| b.len() >= 20)
+        .map(|b| u32::from_be_bytes([b[16], b[17], b[18], b[19]]) as f32 * 0.0001);
+    let nits = max_cll.filter(|n| *n > 0.0).or(mastering_max.filter(|n| *n > 0.0));
+    let peak = nits.map_or(0.0, |n| n / WHITE_NITS);
+    [transfer as u32 as f32, peak, if is(&primaries, bt2020) { 1.0 } else { 0.0 }, 0.0]
 }

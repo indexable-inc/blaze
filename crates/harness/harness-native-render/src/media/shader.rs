@@ -396,7 +396,7 @@ impl Shaders {
         let stamp = mtime();
         // Straight RGBA, sRGB-encoded bytes (photo.rs un-premultiplies CoreGraphics's output), sampled as RGBA8Unorm so the
         // shader sees the values as the UI's colours are: encoded, not linearised.
-        let tex = crate::photo::decode(std::path::Path::new(path), None)
+        let tex = crate::photo::decode(std::path::Path::new(path), None, false)
             .and_then(|ph| rgba8(&self.dev, ph.w as usize, ph.h as usize, &ph.rgba).map_err(|e| format!("{path}: {e}")));
         let version = self.photos.get(path).map_or(1, |p| p.version + 1);
         self.photos.insert(path.to_owned(), Photo { tex: tex.clone(), mtime: stamp, checked: Instant::now(), version });

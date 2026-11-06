@@ -34,6 +34,9 @@ struct Sheet {
     w: u32,
     h: u32,
     frames: Vec<Rc<[u8]>>,
+    /// An HDR photo's brightest light (linear over reference white; its frames are premultiplied linear half floats,
+    /// photo.rs): None for sRGB RGBA8 texels.
+    peak: Option<f32>,
 }
 
 /// The host's fonts, glyph atlas and layout cache, and the pictures it has decoded.
@@ -933,6 +936,7 @@ impl Painter {
                 clip: [0.0; 4],
                 clipx: [0.0; 4],
                 uv: [0.0, 0.0, 1.0, 1.0],
+                hdr: [0.0; 4],
             };
             d.surface(inst, sf.key);
             return Ok(());
@@ -967,14 +971,16 @@ impl Painter {
             let sheet = match self.sheets.get(&key) {
                 Some(s) => s.clone(),
                 None => {
-                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0))
+                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0), true)
                         .map_err(|err| format!("{path}: {err}"))?;
-                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba] });
+                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba], peak: ph.peak });
                     self.sheets.insert(key, s.clone());
                     s
                 }
             };
-            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
+            // An HDR photo is drawn in its own range, tone-mapped to the display's headroom from its brightest.
+            let hdr = sheet.peak.map_or([0.0; 4], |peak| [1.0, peak, 0.0, 0.0]);
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr };
             d.image(img, sheet.frames[0].clone());
             return Ok(());
         }
@@ -984,7 +990,7 @@ impl Painter {
             .map_err(|err| format!("{path}: {err}"))?;
         let frame = ((time * frames.fps).floor().max(0.0) as usize) % sheet.frames.len();
         let img =
-            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] };
+            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] };
         d.image(img, sheet.frames[frame].clone());
         Ok(())
     }
@@ -1025,11 +1031,14 @@ impl Painter {
         let place = |r: [f32; 4]| [rect[0] + (r[0] - rest[0]) * k, rect[1] + (r[1] - rest[1]) * k, r[2] * k, r[3] * k];
         let size = [img.w as f32, img.h as f32, alpha, 0.0];
         let at = place([x, y, img.w as f32 / sc, img.h as f32 / sc]);
-        d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4] }, img.rgba.into());
-        // Past white: the hot pixels again, as light over the picture, lifting them by heat up to `glow` whites.
-        if m.glow > 1.0 {
-            let light = [m.glow, 0.0, 0.0, 0.0];
-            d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light }, img.light.into());
+        d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] }, img.rgba.into());
+        // Past white: the hot pixels again, as light over the picture, lifting them by heat up to `glow` whites. A scene
+        // that sets its glow (a video's HDR10 master) gets that; otherwise the fire burns up to the display's headroom this
+        // frame (1 on an SDR display: no light layer at all, the picture exactly as before).
+        let glow = if m.glow > 0.0 { m.glow } else { d.frame.headroom() };
+        if glow > 1.0 {
+            let light = [glow, 0.0, 0.0, 0.0];
+            d.image(ImageInst { rect: at, size, clip: [0.0; 4], clipx: [0.0; 4], light, hdr: [0.0; 4] }, img.light.into());
         }
         Ok(())
     }
@@ -1077,7 +1086,7 @@ impl Painter {
         let h = info.height / count;
         let per = (info.width * h * 4) as usize;
         let frames = rgba.chunks_exact(per).map(Rc::from).collect();
-        let sheet = Rc::new(Sheet { w: info.width, h, frames });
+        let sheet = Rc::new(Sheet { w: info.width, h, frames, peak: None });
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
     }

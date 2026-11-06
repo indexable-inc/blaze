@@ -12,8 +12,10 @@ pub struct Frame {
     /// Device pixels to a point this frame. Unlike `scale` (the zoom stepped to) it follows the eased zoom, so an outline
     /// glyph's half-pixel dilation matches the pixels it lands on while the zoom runs.
     pub live: f32,
-    /// Expressive text (textfx.rs): how far past SDR white glowing words go (1 on an SDR display or layer), and how long a
-    /// word's motion lasts in seconds (0 under Reduce Motion: nothing moves).
+    /// x: the display's EDR headroom this frame (hdr.rs, the one home of it): the most linear light over SDR reference
+    /// white it can show now (1 on an SDR display or target). Everything that draws past white reads it here: HDR pictures
+    /// tone-map to it, the blaze mark's fire lifts to it, glowing words (textfx.rs) go up to it. y: how long a word's
+    /// motion lasts in seconds (0 under Reduce Motion: nothing moves). Read it through [`Frame::headroom`].
     pub textfx: [f32; 2],
     /// x text gamma dark, y text gamma light, z frosted glass saturation, w unused.
     pub tune: [f32; 4],
@@ -219,6 +221,18 @@ pub struct ImageInst {
     /// over that picture to lift each pixel, in linear light, to up to `x` times its colour; it adds and covers nothing.
     /// 0 for a plain picture.
     pub light: [f32; 4],
+    /// An HDR picture (x = 1): its texels are premultiplied linear light in half floats (8 bytes a texel; 1.0 SDR
+    /// reference white, hdr.rs), tone-mapped to the frame's headroom from its brightest, y (linear; 0: unknown). All 0 for
+    /// sRGB-encoded RGBA8 texels.
+    pub hdr: [f32; 4],
+}
+
+impl ImageInst {
+    /// Bytes a texel of its texture: 8 for an HDR picture's half floats, 4 for RGBA8.
+    #[must_use]
+    pub fn texel_bytes(&self) -> usize {
+        if self.hdr[0] > 0.5 { 8 } else { 4 }
+    }
 }
 
 /// A live picture from the host's Media (a Shader's or a Video's latest finished frame, media/): its texture, premultiplied,
@@ -237,6 +251,10 @@ pub struct SurfaceInst {
     pub clipx: [f32; 4],
     /// The part of the texture shown: u0, v0, u1, v1. The renderer fills it from the texture's size (gpu.rs).
     pub uv: [f32; 4],
+    /// How the texture encodes light, filled by the renderer from Media (gpu.rs): x the transfer (`hdr::Transfer`: 0 sRGB,
+    /// drawn as it is; 1 PQ, 2 HLG: decoded to linear and tone-mapped to the frame's headroom), y the picture's brightest
+    /// (linear over reference white; 0: unknown), z 1 for BT.2020 primaries, w 0.
+    pub hdr: [f32; 4],
 }
 
 #[repr(C)]

@@ -241,6 +241,9 @@ pub struct App {
     chrome_laid: Option<(Chrome, f32, f32)>,
     /// The dark appearance (the window's effective NSAppearance; the scene's fills pick their dark or light half).
     pub dark: bool,
+    /// The window's screen's EDR headroom (window.rs reads it every frame and when the screen changes; the shot sets it
+    /// from HARNESS_NATIVE_SHOT_HEADROOM): carried into the frame (`Frame::headroom`) for HDR pictures and the mark's fire.
+    pub headroom: harness_native_render::hdr::Headroom,
     /// The sidebar tree's scroll (src/app/sidebar.rs).
     tree: sidebar::TreeScroll,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
@@ -501,6 +504,7 @@ impl App {
             chrome: Chrome::default(),
             chrome_laid: None,
             dark: true,
+            headroom: harness_native_render::hdr::Headroom::SDR,
             tree: sidebar::TreeScroll::default(),
             fold: fold::TreeFold::default(),
             tree_focus: false,
@@ -1558,7 +1562,7 @@ impl App {
                 time: self.time,
                 dark: f32::from(u8::from(self.dark)),
                 live: scale,
-                textfx: [1.0, 0.0],
+                textfx: [self.headroom.frame(), 0.0],
                 tune: [0.82, 1.12, 1.0, 0.0],
                 slug: [0.0, 1.0, 1.0, 0.0],
             },
