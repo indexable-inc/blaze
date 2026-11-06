@@ -1,7 +1,8 @@
 //! The session core: what a session answers and sends, with no transport in it. Its clock is
 //! the driver's (`at_ns` arguments), it owns no socket, thread or timer, and each step hands back
-//! a typed decision the driver carries out ([`Step`], [`Emit`], the bytes of a header or an
-//! answer).
+//! a typed decision the driver carries out ([`Step`], [`Emit`], the bytes of a header, an
+//! answer's header). An answer's Arrow IPC is [`frame::answer_bytes`]'s: arrow's IPC writer keys
+//! its dictionaries in a `HashMap` of `RandomState`, OS randomness a core does not reach.
 //!
 //! - **Hello first.** A session's first good request is `hello` with the link's token: until
 //!   then every other op is answered `unauthenticated`. A wrong token is answered `bad_token`
@@ -27,7 +28,7 @@ use serde_json::{Map, Value};
 use super::{
     PROTOCOL, frame,
     link::Token,
-    source::{Answer, Hello, Kind, OpError, Rule, Tick},
+    source::{Answer, Hello, Kind, OpError, Rule, Table, Tick},
     wasm::CoreWasm,
 };
 
@@ -132,7 +133,8 @@ impl Session {
 
     /// `slot`'s request ended, however it ended (answered, refused, stopped by the page).
     pub fn ended(&mut self, slot: Slot) {
-        let Slot { started_ns: _ } = slot;
+        // Moved in and dropped: a slot ends once, so it is taken by value, never by reference.
+        drop(slot);
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
@@ -414,31 +416,15 @@ pub fn cert_header(served: &Served) -> Map<String, Value> {
     header
 }
 
-/// An answer as the wire carries it: its header, `rows` and `elapsed_ns` added, then its
-/// table's IPC; or the error it became.
-pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8> {
-    // alloc: once an answer, the bytes the driver writes
-    let mut out = Vec::new();
-    let encoded = answer.and_then(|mut answer| {
-        if let Some(table) = &answer.table {
-            // alloc: once an answer
-            answer.header.insert("rows".to_owned(), table.rows().into());
-        }
+/// What the core adds to an answer's header: `rows` when it has a table, and `elapsed_ns`.
+/// The bytes are [`frame::answer_bytes`]'s, which calls this.
+pub fn answer_header(answer: &mut Answer, elapsed_ns: u64) {
+    if let Some(rows) = answer.table.as_ref().map(Table::rows) {
         // alloc: once an answer
-        answer.header.insert("elapsed_ns".to_owned(), elapsed_ns.into());
-        head(&mut out, &answer.header);
-        if let Some(table) = &answer.table {
-            frame::ipc(&mut out, &table.schema, &table.batches).map_err(|why| {
-                OpError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}"))
-            })?;
-        }
-        Ok(())
-    });
-    if let Err(why) = encoded {
-        out.clear();
-        head(&mut out, &why.header());
+        answer.header.insert("rows".to_owned(), rows.into());
     }
-    out
+    // alloc: once an answer
+    answer.header.insert("elapsed_ns".to_owned(), elapsed_ns.into());
 }
 
 /// An error as the wire carries it: its header alone.

@@ -17,7 +17,7 @@ use blaze_serde::{Deserialize, Serialize};
 
 use crate::{
     Error,
-    live::OpenRow,
+    live::{OpenRow, Stream},
     state::{BLAZE, Busy, Session, elapsed},
     tasks::Tasks,
 };
@@ -298,8 +298,8 @@ pub struct SessionView {
 }
 
 /// `which` at `now_ns` into `out` (cleared first) as one deterministic CBOR item.
-pub fn render(
-    session: &mut Session,
+pub fn render<S: Stream>(
+    session: &mut Session<S>,
     which: Which,
     now_ns: i64,
     out: &mut Vec<u8>,
@@ -350,7 +350,8 @@ pub fn bytes_text(bytes: u64) -> String {
         if bytes < next {
             break;
         }
-        (scale, unit) = (next, name);
+        scale = next;
+        unit = *name;
     }
     // alloc: a view's text
     format!("{}.{} {unit}", bytes / scale, bytes % scale * 10 / scale)
@@ -595,7 +596,7 @@ fn memory_line(memory: &now::Memory) -> MemoryLine {
     }
 }
 
-pub fn running_now(session: &mut Session, now_ns: i64) -> Result<RunningNow, Error> {
+pub fn running_now<S: Stream>(session: &mut Session<S>, now_ns: i64) -> Result<RunningNow, Error> {
     let model = session.look(now_ns)?;
     let running = session.running(now_ns)?;
     let tasks = session.tasks();
@@ -670,7 +671,7 @@ pub fn running_now(session: &mut Session, now_ns: i64) -> Result<RunningNow, Err
     })
 }
 
-pub fn recent(session: &Session, now_ns: i64) -> Result<Recent, Error> {
+pub fn recent<S: Stream>(session: &Session<S>, now_ns: i64) -> Result<Recent, Error> {
     let (_, at_ns, now) = session.clock(Which::Recent.name(), now_ns)?;
     let spans = session
         .recent()
@@ -724,7 +725,7 @@ pub fn recent(session: &Session, now_ns: i64) -> Result<Recent, Error> {
     Ok(Recent { at_ns: decimal(at_ns), spans })
 }
 
-pub fn counters(session: &Session, now_ns: i64) -> Result<Counters, Error> {
+pub fn counters<S: Stream>(session: &Session<S>, now_ns: i64) -> Result<Counters, Error> {
     let (_, at_ns, now) = session.clock(Which::Counters.name(), now_ns)?;
     let counters = session
         .counters()
@@ -745,7 +746,7 @@ pub fn counters(session: &Session, now_ns: i64) -> Result<Counters, Error> {
     Ok(Counters { at_ns: decimal(at_ns), counters })
 }
 
-pub fn session_view(session: &Session, now_ns: i64) -> Result<SessionView, Error> {
+pub fn session_view<S: Stream>(session: &Session<S>, now_ns: i64) -> Result<SessionView, Error> {
     let (hello, at_ns, _) = session.clock(Which::Session.name(), now_ns)?;
     let stats = session.stats();
     let (certhash, not_after) = match &session.cert {

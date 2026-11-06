@@ -10,7 +10,8 @@
 //! - [`frame`]: what the server sends: a header padded so the Arrow IPC stream after it starts
 //!   8-aligned, then one IPC stream, then FIN; and the live stream's frames.
 //! - [`session`]: the sans-IO core of a session: hello first, the token, the requests in
-//!   flight, the live stream's emit rule, and the bytes of every header and answer.
+//!   flight, the live stream's emit rule, and the bytes of every header; an answer's Arrow IPC
+//!   is [`frame`]'s ([`frame::answer_bytes`]), outside the core.
 //! - [`Source`]: what a program serves: its `hello` fields, its live feed and its ops.
 //! - [`wasm`]: the explorer core a program serves the page ([`CoreWasm`]): `hello`'s `core`
 //!   and the `core` op's bytes.

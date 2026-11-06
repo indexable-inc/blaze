@@ -385,6 +385,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-bytes",
+ "blaze-core",
  "blaze-dbsp",
  "blaze-format",
  "blaze-graph",
@@ -403,7 +404,6 @@ dependencies = [
  "intern",
  "inventory",
  "la-arena",
- "parking_lot",
  "paths",
  "semver",
  "smallvec",
@@ -608,7 +608,6 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "lzma-rust2",
- "parking_lot",
  "paths",
  "proc-macro-api",
  "ratatui",
@@ -647,7 +646,6 @@ dependencies = [
  "blaze-v2-proof",
  "hegeltest",
  "lz4_flex",
- "parking_lot",
  "serde",
  "tracing",
  "zstd",
@@ -683,7 +681,6 @@ dependencies = [
  "blaze-vfs",
  "crossbeam-channel",
  "hashbrown 0.17.1",
- "parking_lot",
  "ring",
  "rustls",
  "rustls-native-certs",
@@ -699,6 +696,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-check",
+ "blaze-core",
  "blaze-format",
  "blaze-graph",
  "blaze-hash",
@@ -712,7 +710,6 @@ dependencies = [
  "blaze-store-check",
  "crossbeam-channel",
  "hashbrown 0.17.1",
- "parking_lot",
  "serde",
  "serde_json",
  "tracing",
@@ -767,6 +764,7 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-api",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -789,7 +787,6 @@ dependencies = [
  "hir-ty-print",
  "intern",
  "memchr",
- "parking_lot",
  "rustc_abi",
  "rustc_apfloat",
  "rustc_lexer",
@@ -838,6 +835,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cargo",
  "blaze-codegen-code",
+ "blaze-core",
  "blaze-diagnostics",
  "blaze-fetch",
  "blaze-format",
@@ -859,7 +857,6 @@ dependencies = [
  "ix-prof",
  "libmimalloc-sys",
  "lzma-rust2",
- "parking_lot",
  "serde_json",
  "stdx",
  "tar",
@@ -876,6 +873,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "blaze-core",
  "blaze-fetch",
  "blaze-hash",
  "blaze-http",
@@ -886,7 +884,6 @@ dependencies = [
  "blaze-web",
  "crossbeam-channel",
  "ix-prof",
- "parking_lot",
  "serde",
  "serde_derive",
  "serde_json",
@@ -915,6 +912,7 @@ name = "blaze-fetch"
 version = "0.0.0"
 dependencies = [
  "blaze-cas",
+ "blaze-core",
  "blaze-format",
  "blaze-ids",
  "blaze-sha256",
@@ -922,7 +920,6 @@ dependencies = [
  "filetime",
  "hegeltest",
  "papaya",
- "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1082,7 +1079,6 @@ dependencies = [
  "expect-test",
  "hegeltest",
  "libc",
- "parking_lot",
  "serde",
  "serde_json",
  "stdx",
@@ -1106,10 +1102,10 @@ name = "blaze-hashcons"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-ids",
  "blaze-mem",
- "parking_lot",
 ]
 
 [[package]]
@@ -1131,6 +1127,7 @@ name = "blaze-http"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "blaze-core",
  "blaze-sha256",
  "bytes",
  "flate2",
@@ -1153,13 +1150,13 @@ dependencies = [
  "blake3-servil",
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-core",
  "blaze-hash",
  "blaze-mem",
  "blaze-radix",
  "blaze-rng",
  "blaze-serde",
  "hegeltest",
- "parking_lot",
  "postcard",
  "serde",
  "serde_json",
@@ -1189,7 +1186,6 @@ dependencies = [
  "blaze-spin",
  "crossbeam-channel",
  "libc",
- "parking_lot",
 ]
 
 [[package]]
@@ -1233,6 +1229,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -1247,7 +1244,6 @@ dependencies = [
  "hir-ty-borrowck",
  "hir-ty-matchck",
  "la-arena",
- "parking_lot",
  "rustc_type_ir",
  "smallvec",
  "span",
@@ -1303,6 +1299,7 @@ dependencies = [
  "blaze-bytes",
  "blaze-cas",
  "blaze-codegen",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-inproc",
@@ -1312,7 +1309,6 @@ dependencies = [
  "blaze-stencil",
  "crossbeam-queue",
  "libc",
- "parking_lot",
 ]
 
 [[package]]
@@ -1335,7 +1331,6 @@ dependencies = [
  "blaze-sha256",
  "gimli",
  "object 0.40.0",
- "parking_lot",
  "smallvec",
  "tracing",
  "zerocopy",
@@ -1358,6 +1353,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-diagnostics",
  "blaze-graph",
  "blaze-hash",
@@ -1458,7 +1454,6 @@ dependencies = [
  "intern",
  "ix-prof",
  "libc",
- "parking_lot",
  "parser",
  "proc-macro-api",
  "rustc_lexer",
@@ -1591,7 +1586,6 @@ dependencies = [
  "hegeltest",
  "ix-prof",
  "libc",
- "parking_lot",
  "parquet",
  "serde",
  "serde_derive",
@@ -1642,7 +1636,6 @@ dependencies = [
  "hegeltest",
  "indexmap",
  "intern",
- "parking_lot",
  "serde",
  "smallvec",
  "thin-vec",
@@ -1683,6 +1676,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-cas",
+ "blaze-core",
  "blaze-fetch",
  "blaze-format",
  "blaze-hash",
@@ -1698,7 +1692,6 @@ dependencies = [
  "flate2",
  "http",
  "libc",
- "parking_lot",
  "percent-encoding",
  "semver",
  "serde",
@@ -1728,6 +1721,7 @@ name = "blaze-resolve"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-serde",
@@ -1735,7 +1729,6 @@ dependencies = [
  "blaze-spin",
  "cargo-platform",
  "imbl",
- "parking_lot",
  "semver",
  "serde",
  "serde_json",
@@ -1816,6 +1809,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-codegen",
+ "blaze-core",
  "blaze-format",
  "blaze-ids",
  "blaze-inproc",
@@ -1836,7 +1830,6 @@ dependencies = [
  "libc",
  "llvm-sys",
  "object 0.40.0",
- "parking_lot",
  "serde",
  "serde_json",
  "smallvec",
@@ -1863,7 +1856,6 @@ dependencies = [
  "blaze-rng",
  "blaze-store-check",
  "crossbeam-channel",
- "parking_lot",
 ]
 
 [[package]]
@@ -2009,7 +2001,6 @@ dependencies = [
  "blaze-reclaim",
  "blaze-serde",
  "hashbrown 0.17.1",
- "parking_lot",
  "serde",
  "smallvec",
 ]
@@ -2026,6 +2017,7 @@ name = "blaze-wasm-pack"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-hash",
  "blaze-query",
  "blaze-serde",
@@ -2033,7 +2025,6 @@ dependencies = [
  "hir",
  "hir-expand",
  "intern",
- "parking_lot",
  "serde",
  "span",
  "syntax-bridge",
@@ -2047,13 +2038,13 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-protocol",
  "crossbeam-channel",
  "flate2",
  "flecs-c",
- "parking_lot",
  "sha1",
 ]
 
@@ -3514,6 +3505,7 @@ dependencies = [
  "arrayvec",
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-hashcons",
@@ -3537,7 +3529,6 @@ dependencies = [
  "intern",
  "itertools 0.15.0",
  "la-arena",
- "parking_lot",
  "rustc_type_ir",
  "smallvec",
  "span",
@@ -3556,6 +3547,7 @@ dependencies = [
  "base-db",
  "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-dbsp",
  "blaze-format",
  "blaze-graph",
@@ -3579,7 +3571,6 @@ dependencies = [
  "inventory",
  "itertools 0.15.0",
  "la-arena",
- "parking_lot",
  "ra-ap-rustc_ast_ir",
  "rustc_abi",
  "rustc_apfloat",
@@ -3686,6 +3677,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-codegen-code",
+ "blaze-core",
  "blaze-dbsp",
  "blaze-format",
  "blaze-graph",
@@ -3713,7 +3705,6 @@ dependencies = [
  "itertools 0.15.0",
  "la-arena",
  "macros",
- "parking_lot",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "rustc_abi",
@@ -3821,7 +3812,6 @@ dependencies = [
  "intern",
  "la-arena",
  "object 0.40.0",
- "parking_lot",
  "postcard",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
@@ -3952,6 +3942,7 @@ dependencies = [
  "arrayvec",
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-hashcons",
@@ -3979,7 +3970,6 @@ dependencies = [
  "itertools 0.15.0",
  "la-arena",
  "macros",
- "parking_lot",
  "parser",
  "ra-ap-rustc_ast_ir",
  "rustc_abi",
@@ -4021,6 +4011,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-item-hash",
@@ -4154,6 +4145,7 @@ version = "0.0.0"
 dependencies = [
  "air",
  "base-db",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-query",
@@ -4476,13 +4468,13 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
  "blaze-image",
  "blaze-mem",
  "blaze-phf",
- "parking_lot",
 ]
 
 [[package]]
@@ -4554,7 +4546,6 @@ dependencies = [
  "hegeltest",
  "libc",
  "object 0.40.0",
- "parking_lot",
  "rcgen",
  "regex",
  "rustc-demangle",
@@ -5256,7 +5247,6 @@ dependencies = [
  "crossbeam-queue",
  "hir-expand",
  "intern",
- "parking_lot",
  "rustc_lexer",
  "span",
  "tt",
@@ -5779,12 +5769,11 @@ dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
  "blaze-alloc-count",
- "blaze-graph",
+ "blaze-core",
  "blaze-mem",
  "derive-where",
  "ena",
  "indexmap",
- "parking_lot",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "rustc-hash",
@@ -6356,11 +6345,11 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "stdx"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "crossbeam-channel",
  "hegeltest",
  "itertools 0.15.0",
  "libc",
- "parking_lot",
  "stacker",
  "tracing",
 ]
@@ -6490,11 +6479,11 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-bytes",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
  "blaze-spin",
- "parking_lot",
  "text-size",
 ]
 

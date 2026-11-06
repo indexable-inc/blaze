@@ -61,6 +61,11 @@ const skills = {
 		description:
 			"Conventions for blaze's documents, scripts and agent-facing interfaces: docs/ front matter (current, plan, record, superseded) and `tools/docs.py`, scripts that take one typed JSON value, and no MCP. Load before writing or editing a doc under docs/, writing or changing a script, or designing an interface agents call.",
 	},
+	debugging: {
+		title: "Debugging blaze from its profile",
+		description:
+			"How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something.",
+	},
 } as const satisfies Record<string, { title: string; description: string }>;
 
 type SkillId = keyof typeof skills;

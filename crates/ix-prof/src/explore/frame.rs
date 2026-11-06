@@ -22,6 +22,8 @@ use arrow_ipc::{
 use arrow_schema::{ArrowError, Schema};
 use serde_json::{Map, Value};
 
+use super::{Answer, Kind, OpError, session};
+
 /// Where the Arrow IPC stream starts: a multiple of this from the start of the answer or frame.
 pub const ALIGN: usize = 8;
 
@@ -73,6 +75,30 @@ pub fn ipc(out: &mut Vec<u8>, schema: &Schema, batches: &[RecordBatch]) -> Resul
         writer.write(batch)?;
     }
     writer.finish()
+}
+
+/// An answer as the wire carries it: its header, `rows` and `elapsed_ns` added
+/// ([`session::answer_header`]), then its table's IPC; or the error it became. The session core
+/// decides the header; the IPC is written here, outside the core, since arrow's IPC writer keys
+/// its dictionaries in a `HashMap` of `RandomState`, OS randomness a sans-IO core does not reach.
+pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8> {
+    // alloc: once an answer, the bytes the driver writes
+    let mut out = Vec::new();
+    let encoded = answer.and_then(|mut answer| {
+        session::answer_header(&mut answer, elapsed_ns);
+        head(&mut out, &answer.header).expect("a JSON map always serializes");
+        if let Some(table) = &answer.table {
+            ipc(&mut out, &table.schema, &table.batches).map_err(|why| {
+                OpError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}"))
+            })?;
+        }
+        Ok(())
+    });
+    if let Err(why) = encoded {
+        out.clear();
+        head(&mut out, &why.header()).expect("a JSON map always serializes");
+    }
+    out
 }
 
 #[cfg(test)]

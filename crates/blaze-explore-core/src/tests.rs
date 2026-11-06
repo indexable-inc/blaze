@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array};
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::{reader::StreamDecoder, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema};
 use ix_prof::explore::{Tick, frame};
 use blaze_profile::{
@@ -116,9 +116,9 @@ fn a_live_stream_across_three_frames_follows_deltas_and_the_reset_at_end() {
     assert!(ipcs[2].starts_with(&END), "the third frame starts a new stream");
     // The second frame's dictionaries are deltas on the first's: alone, it does not read.
     let mut back = Vec::new();
-    assert!(Decoder::new("open").decode(&ipcs[1], &mut back).is_err());
+    assert!(Decoder::<StreamDecoder>::new("open").decode(&ipcs[1], &mut back).is_err());
 
-    let mut session = Session::new();
+    let mut session = Session::<StreamDecoder>::new();
     session.feed_hello(&hello((9 * S) as u64)).unwrap();
     // The stream as it arrives: the frames back to back, cut into 7-byte reads.
     let stream: Vec<u8> = frames.concat();
@@ -188,7 +188,7 @@ fn ids_past_two_to_the_53_survive_to_the_view() {
     writer.finish().unwrap();
     drop(writer);
 
-    let mut session = Session::new();
+    let mut session = Session::<StreamDecoder>::new();
     session.feed_hello(&hello((2 * S) as u64)).unwrap();
     session.feed_live_frame(&live_frame("open", 1, 3 * S, &ipc)[wire::HEAD..]).unwrap();
     let mut out = Vec::new();
@@ -306,7 +306,7 @@ fn the_daemons_tasks_fold_through_the_one_model_into_running_now() {
     let names: Vec<_> = tick.tables.iter().map(|it| (it.name, it.rows)).collect();
     assert_eq!(names, [("tasks", 2), ("task_edges", 1)]);
 
-    let mut session = Session::new();
+    let mut session = Session::<StreamDecoder>::new();
     session.feed_hello(&hello(0)).unwrap();
     for table in &tick.tables {
         let frame = live_frame(table.name, table.rows, 3 * S, &table.ipc);

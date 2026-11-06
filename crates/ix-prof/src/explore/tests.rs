@@ -281,7 +281,7 @@ fn an_unknown_op_is_named_with_the_layers_that_have_ops() {
 #[test]
 fn an_answer_carries_rows_and_elapsed_and_one_aligned_ipc_stream() {
     let answer = Answer { table: Table::of(vec![numbers(5), numbers(2)]), ..Answer::new("count") };
-    let bytes = session::answer_bytes(Ok(answer), 1234);
+    let bytes = frame::answer_bytes(Ok(answer), 1234);
     let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     assert_eq!((4 + len) % frame::ALIGN, 0, "the IPC starts 8-aligned");
     let header: Value = serde_json::from_slice(&bytes[4..4 + len]).unwrap();
@@ -293,7 +293,7 @@ fn an_answer_carries_rows_and_elapsed_and_one_aligned_ipc_stream() {
 
 #[test]
 fn an_answer_that_fails_becomes_its_error_with_no_ipc() {
-    let bytes = session::answer_bytes(Err(OpError::new("sql", "no")), 0);
+    let bytes = frame::answer_bytes(Err(OpError::new("sql", "no")), 0);
     let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     assert_eq!(bytes.len(), 4 + len, "an error has no IPC");
     let header: Value = serde_json::from_slice(&bytes[4..]).unwrap();

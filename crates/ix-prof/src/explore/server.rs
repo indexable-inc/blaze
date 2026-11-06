@@ -36,6 +36,7 @@ use super::{
     frame,
     link::{self, Origins, Token},
     session::{self, Emit, Served, Slot, Step},
+    wasm::CoreWasm,
 };
 use crate::clock;
 
@@ -429,7 +430,7 @@ async fn answer(
                 let answer = source
                     .op(&name, &args, &stopping)
                     .unwrap_or_else(|| Err(session::unknown_op(&name, &source.hello())));
-                session::answer_bytes(answer, session::elapsed_ns(started_ns, clock::now_ns()))
+                frame::answer_bytes(answer, session::elapsed_ns(started_ns, clock::now_ns()))
             });
             let bytes = tokio::select! {
                 done = work => match done {

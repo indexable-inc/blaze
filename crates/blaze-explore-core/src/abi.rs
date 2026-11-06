@@ -30,6 +30,8 @@
 
 use std::{alloc::Layout, cell::RefCell, collections::BTreeMap, ptr::NonNull};
 
+use arrow_ipc::reader::StreamDecoder;
+
 use crate::{
     state::Session,
     view::{self, Which},
@@ -77,9 +79,10 @@ impl Kind {
     }
 }
 
-/// The module's state: the sessions, and the buffers the page reads.
+/// The module's state: the sessions, each reading IPC through arrow-ipc's decoder (the driver's
+/// choice, [`crate::ipc`]), and the buffers the page reads.
 struct Core {
-    sessions: BTreeMap<u32, Session>,
+    sessions: BTreeMap<u32, Session<StreamDecoder>>,
     /// The next handle; 0 is never one.
     next: u32,
     out: Vec<u8>,

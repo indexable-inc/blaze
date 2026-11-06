@@ -25,6 +25,8 @@
 //! - [`view`]: view models, display-ready, in deterministic CBOR (blaze-protocol's codec):
 //!   ids as decimal strings, durations as integer milliseconds.
 //! - [`abi`]: the C ABI the page calls over linear memory, no wasm-bindgen.
+//! - [`ipc`]: arrow-ipc's `StreamDecoder` as [`live::Stream`], the IPC decoder the drivers
+//!   hand the cores, which take it as a type parameter.
 //!
 //! Every error names the message and the field it is about (`live frame for table `open`,
 //! column `thread`: ...`), and nothing guesses a value the daemon did not send.
@@ -32,6 +34,7 @@
 // The one module with unsafe code: it reads the linear memory the page wrote (`abi`'s own
 // `#![allow(unsafe_code)]`, each use with its invariant).
 pub mod abi;
+pub mod ipc;
 pub mod live;
 pub mod state;
 pub mod tasks;
