@@ -1,0 +1,19 @@
+// ui.SearchMenu's look laid in the flow (a gallery's): the filter with "son" typed, the matches under their makers'
+// heads with their marks, the first match highlighted.
+
+@tree ChildOf
+ex {
+  prefab SearchMenuDemo : ex.Card {
+    label : ui.Label { Text: {s: "SEARCH MENU"} }
+    menu : ui.MenuPlate {
+      filter : ui.MenuFilter { text { Text: {s: "son"} } }
+      rule : ui.MenuSep {}
+      items : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        claude : ui.MenuHead { label { Text: {s: "Claude"} } }
+        sonnet : ui.MenuItemMarked { Lit; label { Text: {s: "Sonnet"} }; about { Text: {s: "Efficient for routine tasks"} }; lead { icon { Mark: {name: "claude"} } } }
+      }
+    }
+  }
+}

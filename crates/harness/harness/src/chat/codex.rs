@@ -218,6 +218,11 @@ impl Codex {
                 if let Some(m) = &self.model {
                     params["model"] = json!(m);
                 }
+                // The thread starts at the chosen effort (a config override; thread/start has no effort of its own), so
+                // its answer's `reasoningEffort` already says it.
+                if let Some(e) = &self.effort {
+                    params["config"] = json!({"model_reasoning_effort": e});
+                }
                 let method = match &self.resume {
                     Some(thread) => {
                         // Its turns are already in the chat's log: only the thread's state comes back.

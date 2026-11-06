@@ -669,6 +669,8 @@ impl Link {
         &self,
         kind: &str,
         cwd: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
         cols: u16,
         rows: u16,
         then: impl FnOnce(u64) + Send + 'static,
@@ -688,6 +690,8 @@ impl Link {
                 cols: Some(cols),
                 rows: Some(rows),
                 mode: mode.map(str::to_owned),
+                model,
+                effort,
             };
             match request(r) {
                 Ok(Ok(Reply::Spawned { id })) => {

@@ -322,6 +322,8 @@ fn spawn_req(kind: &str, args: Vec<String>, cwd: &str, cols: u16, rows: u16) -> 
         cols: Some(cols),
         rows: Some(rows),
         mode: Some("tui".to_owned()),
+        model: None,
+        effort: None,
     }
 }
 

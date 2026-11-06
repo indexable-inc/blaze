@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 pub mod menu;
+pub mod search;
 pub mod table;
 pub use table::table;
 
