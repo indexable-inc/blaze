@@ -137,20 +137,34 @@ pub fn output(
     output_with(&CACHE, &System, triple, shared, debug, incremental)
 }
 
+/// The native libraries of one crate and the directories that crate's own compile searches
+/// for them: the `-L`s rustc is given for it (its rustflags', then the build scripts' of it
+/// and of what it depends on, its own `OUT_DIR` first). rustc finds a crate's `-l` among the
+/// `-L`s of that crate's own invocation, so two crates' libraries of one name in two
+/// directories (two copies of one `-sys` crate, each with its own `OUT_DIR`) are two
+/// libraries, each found where its own crate's compile finds it. `search` is empty for
+/// libraries no crate names (the link arguments').
+#[derive(Clone, Copy, Debug)]
+pub struct CrateLibs<'a> {
+    pub libs: &'a [NativeLib],
+    pub search: &'a [PathBuf],
+}
+
 /// The files of `output`'s link line, in its order: the C runtime's start objects, the
-/// runtimes of [`Output::sanitize`]'s sanitizers, `libs` (searched in `search`, the link's
-/// `-L`s, then the toolchain's directories), the libraries the toolchain's driver adds, the C
-/// runtime's end objects. A linker script's files follow it, and so do the libraries a PE
-/// archive's members ask for and those a Mach-O object's or archive member's
-/// `LC_LINKER_OPTION`s ask for. A library not found is an error naming it (and the script,
-/// object or member that asked) and every directory searched. `sysroot` is blaze's toolchain
-/// (`blaze toolchain --path`), whose self-contained C runtime WASI links and whose target
-/// library directory has the sanitizer runtimes. Sets [`Output::rpaths`] to where the loader
-/// finds a shared runtime, then the link arguments' ([`crate::LinkArgs::rpaths`]); set
-/// [`Output::sanitize`] and [`Output::link`] first.
+/// runtimes of [`Output::sanitize`]'s sanitizers, `libs` in their order (each crate's searched
+/// in its own [`CrateLibs::search`] first, then in `search`, the link's `-L`s, then the
+/// toolchain's directories), the libraries the toolchain's driver adds, the C runtime's end
+/// objects. A linker script's files follow it, and so do the libraries a PE archive's members
+/// ask for and those a Mach-O object's or archive member's `LC_LINKER_OPTION`s ask for, which
+/// are searched in `search` and the toolchain's directories. A library not found is an error
+/// naming it (and the script, object or member that asked) and every directory searched.
+/// `sysroot` is blaze's toolchain (`blaze toolchain --path`), whose self-contained C runtime
+/// WASI links and whose target library directory has the sanitizer runtimes. Sets
+/// [`Output::rpaths`] to where the loader finds a shared runtime, then the link arguments'
+/// ([`crate::LinkArgs::rpaths`]); set [`Output::sanitize`] and [`Output::link`] first.
 pub fn locate(
     output: &mut Output,
-    libs: &[NativeLib],
+    libs: &[CrateLibs<'_>],
     search: &[PathBuf],
     sysroot: &Path,
 ) -> Result<Vec<Located>, LinkError> {
@@ -388,7 +402,7 @@ fn locate_with<A: Ask>(
     cache: &Cache,
     ask: &A,
     output: &Output,
-    libs: &[NativeLib],
+    libs: &[CrateLibs<'_>],
     search: &[PathBuf],
     sysroot: &Path,
 ) -> Result<Vec<Located>, LinkError> {
@@ -413,7 +427,7 @@ fn locate_with<A: Ask>(
         output,
         search,
         found: &found,
-        out: Vec::with_capacity(libs.len() + 8),
+        out: Vec::with_capacity(libs.iter().map(|it| it.libs.len()).sum::<usize>() + 8),
         listings: RefCell::default(),
     };
     for name in target.start(&output.kind)? {
@@ -422,14 +436,16 @@ fn locate_with<A: Ask>(
     for (path, kind) in runtimes {
         line.push(path, kind)?;
     }
-    for lib in libs {
-        if !lib.verbatim && target.provided_by_rust(&lib.name) {
-            continue;
+    for CrateLibs { libs, search: own } in libs {
+        for lib in *libs {
+            if !lib.verbatim && target.provided_by_rust(&lib.name) {
+                continue;
+            }
+            line.library(&lib.name, lib.kind, lib.verbatim, own)?;
         }
-        line.library(&lib.name, lib.kind, lib.verbatim)?;
     }
     for &(name, kind) in target.late() {
-        line.library(name, kind, false)?;
+        line.library(name, kind, false, &[])?;
     }
     for name in target.end() {
         line.object(name)?;
@@ -1497,20 +1513,25 @@ fn listing(dir: &Path) -> Option<Listing> {
 }
 
 impl Line<'_> {
-    /// Where a library is searched for, and what named each directory: the link's, then those
-    /// the C driver passes its linker, then the toolchain's.
-    fn searched(&self, framework: bool) -> impl Iterator<Item = (&Path, Searched)> {
+    /// Where a library is searched for, and what named each directory: `own`, the directories
+    /// of the compile of the crate that names it ([`CrateLibs::search`]), then the link's, then
+    /// those the C driver passes its linker, then the toolchain's.
+    fn searched<'b>(
+        &'b self,
+        framework: bool,
+        own: &'b [PathBuf],
+    ) -> impl Iterator<Item = (&'b Path, Searched)> {
         let (driver, theirs) = match framework {
             true => (&self.found.linker_frameworks, &self.found.frameworks),
             false => (&self.found.linker, &self.found.dirs),
         };
-        let link = self.search.iter().map(|it| (it.as_path(), Searched::Link));
+        let link = own.iter().chain(self.search).map(|it| (it.as_path(), Searched::Link));
         let driver = driver.iter().map(|it| (it.as_path(), Searched::CDriver));
         link.chain(driver).chain(theirs.iter().map(|it| (it.as_path(), Searched::Toolchain)))
     }
 
-    fn dirs(&self, framework: bool) -> impl Iterator<Item = &Path> {
-        self.searched(framework).map(|it| it.0)
+    fn dirs<'b>(&'b self, framework: bool, own: &'b [PathBuf]) -> impl Iterator<Item = &'b Path> {
+        self.searched(framework, own).map(|it| it.0)
     }
 
     /// Whether `dir` may have `file`: false only when no entry of `dir` is `file`'s first
@@ -1546,17 +1567,20 @@ impl Line<'_> {
         name: &str,
         kind: NativeLibKind,
         verbatim: bool,
+        own: &[PathBuf],
     ) -> Result<(), LinkError> {
-        let (path, kind) = self.find(name, kind, verbatim)?;
+        let (path, kind) = self.find(name, kind, verbatim, own)?;
         self.push(path, kind)
     }
 
-    /// The first file in the first directory that has one of those `kind` allows.
+    /// The first file in the first directory that has one of those `kind` allows, `own` (the
+    /// directories of the compile of the crate that names it) searched first.
     fn find(
         &self,
         name: &str,
         kind: NativeLibKind,
         verbatim: bool,
+        own: &[PathBuf],
     ) -> Result<(PathBuf, NativeKind), LinkError> {
         if name.is_empty() {
             // alloc: error path
@@ -1564,7 +1588,7 @@ impl Line<'_> {
         }
         let files = files(self.output.format, name, kind, verbatim)?;
         let framework = matches!(kind, NativeLibKind::Framework);
-        for dir in self.dirs(framework) {
+        for dir in self.dirs(framework, own) {
             for (file, kind) in &files {
                 if !self.may_have(dir, file) {
                     continue;
@@ -1575,7 +1599,7 @@ impl Line<'_> {
                 }
             }
         }
-        Err(not_found(name, &files, self.searched(framework), &self.found.unpassed))
+        Err(not_found(name, &files, self.searched(framework, own), &self.found.unpassed))
     }
 
     /// `path` on the line, unless it is already, then the files it names when it is a linker
@@ -1772,7 +1796,7 @@ impl Line<'_> {
                 crate::macho::Autolink::Framework(name) => (name, NativeLibKind::Framework),
             };
             let (path, kind) = self
-                .find(name, kind, false)
+                .find(name, kind, false, &[])
                 .map_err(|it| LinkError { what: by(&it.what).what, ..it })?;
             self.push(path, kind)?;
         }
@@ -1790,7 +1814,7 @@ impl Line<'_> {
                 false => Err(fail(format!("{library} is not a file"))),
             };
         }
-        for dir in self.dirs(false) {
+        for dir in self.dirs(false, &[]) {
             if !self.may_have(dir, library) {
                 continue;
             }
@@ -1804,7 +1828,7 @@ impl Line<'_> {
         }
         // alloc: error path
         let files = [(library.to_owned(), NativeKind::Archive { whole: false })];
-        Err(not_found(library, &files, self.searched(false), &self.found.unpassed))
+        Err(not_found(library, &files, self.searched(false, &[]), &self.found.unpassed))
     }
 
     /// The files the linker script at `at` names, after it on the line: an absolute path as it
@@ -1833,7 +1857,7 @@ impl Line<'_> {
                         None => (lib, false),
                     };
                     let (path, kind) = self
-                        .find(lib, NativeLibKind::Dylib, verbatim)
+                        .find(lib, NativeLibKind::Dylib, verbatim, &[])
                         // alloc: error path
                         .map_err(|it| LinkError {
                             what: format!("{name} names {input}, and {}", it.what),
@@ -1843,7 +1867,7 @@ impl Line<'_> {
                     continue;
                 }
                 None if Path::new(&input).is_absolute() => PathBuf::from(&input),
-                None => self.find(&input, NativeLibKind::Dylib, true)?.0,
+                None => self.find(&input, NativeLibKind::Dylib, true, &[])?.0,
             };
             if !path.is_file() {
                 // alloc: error path
