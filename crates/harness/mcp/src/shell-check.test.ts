@@ -104,3 +104,24 @@ test('checkShell is synchronous once the parser is loaded', async () => {
   if (!refused.ok) expect(refused.message).toStartWith("Not run: use await Bun.file('Cargo.toml').text()");
   expect(checkShell('cat Cargo.toml', 'reading a fifo')).toEqual({ ok: true, equivalent: "await Bun.file('Cargo.toml').text()" });
 });
+
+test("gh's GitHub reads and curl are refused with github.* and fetch; gh's writes run", async () => {
+  const cases: [string, string][] = [
+    ["gh api graphql -f query='{ viewer { login } }' | jq .data", "await github.graphql<{ ... }>(`query { ... }`, { ...vars })"],
+    ['gh api repos/o/r/actions/runs', "await github.rest('repos/o/r/actions/runs')"],
+    ['gh api -X POST /repos/o/r/dispatches', "await github.rest('repos/o/r/dispatches', { method: 'POST' })"],
+    ['gh pr list -R indexable-inc/ix --author andrew -L 12', "await github.prs({ repo: 'indexable-inc/ix', author: 'andrew', limit: 12 })"],
+    ['gh pr view 42 --repo o/r --json files', "await github.pr({ repo: 'o/r', n: 42 })"],
+    ['gh pr checks https://github.com/o/r/pull/9', "await github.pr({ repo: 'o/r', n: 9 })"],
+    ['gh pr view 5', "await github.pr({ repo: 'owner/name', n: 5 })"],
+    ['gh issue list -R o/r -l bug,ui', "await github.issues({ repo: 'o/r', labels: ['bug', 'ui'] })"],
+    ['curl -s https://example.com/a.json | jq .', "await (await fetch('https://example.com/a.json')).text()"],
+    ['curl -L -o out.tgz https://example.com/x.tgz', "await Bun.write('out.tgz', await fetch('https://example.com/x.tgz'))"],
+  ];
+  for (const [line, call] of cases) expect(await typed(line), line).toBe(call);
+  expect(await refusal('gh pr list')).toContain('github.* in ts');
+  expect(await refusal('curl https://x.dev')).toContain('HTTP is fetch in ts');
+  for (const runs of ['gh pr create --fill', 'gh pr merge 3 --squash', 'gh run view 5 --log', 'gh auth status', "gh api user # why: checking gh's own auth"]) {
+    expect(await refusal(runs), runs).toBeUndefined();
+  }
+});

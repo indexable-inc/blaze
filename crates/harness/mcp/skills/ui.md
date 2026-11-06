@@ -6,6 +6,11 @@ To show a result as UI instead of prose (a dashboard, a comparison, a summary), 
 markup (start it with <script> or an element); runes only ($state, $derived, $effect, $props), and the person sees it
 drawn under the cell. An element or prop not listed here is an error naming it and its line.
 
+Make it something to use, not just look at: a button that runs the next step, a toggle or slider that filters
+the table, a diagram that steps through what happened (like ix.dev's learn pages: one idea per view, a small
+animated diagram, one clear action). Keep each view to one idea; ask with `ask(...)` when the person's choice
+decides what you do next.
+
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
 records; query, onselect), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
