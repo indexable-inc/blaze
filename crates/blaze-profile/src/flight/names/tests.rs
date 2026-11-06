@@ -259,6 +259,8 @@ struct Run<'p> {
     reader: Streams,
     /// Per ring, the next row the reader's drain reads.
     cursor: Vec<u64>,
+    /// Per ring, the next row the reader's names read: 0 again after a crash.
+    names_to: Vec<u64>,
     seen: Seen,
 }
 
@@ -289,6 +291,7 @@ impl<'p> Run<'p> {
             records: Vec::new(), // alloc: a run's model
             reader: Streams::default(),
             cursor: vec![0; plan.threads], // alloc: a run's model
+            names_to: vec![0; plan.threads], // alloc: a run's model
             seen: Seen::default(),
         };
         for thread in 0..plan.threads {
@@ -388,11 +391,9 @@ impl<'p> Run<'p> {
             Act::Respawn { thread } => self.locals[*thread] = self.local_of(*thread),
             Act::Drain => self.drain()?,
             Act::Crash => {
-                // Restarted with nothing held: names written over before it began again are
-                // gone, and may read as forgotten from here on.
-                if self.rings.iter().any(|it| it.head > it.cap) {
-                    self.seen.lossy = true;
-                }
+                // Restarted with nothing held: it reads every ring's names again from the
+                // oldest row, and those written over first are gone ([`Run::drain`]).
+                self.names_to.iter_mut().for_each(|it| *it = 0);
                 self.reader = Streams::default();
                 self.reader.plant(self.plant());
             }
@@ -402,13 +403,16 @@ impl<'p> Run<'p> {
 
     /// Reads every ring's rows since the last drain and checks each name they hold.
     fn drain(&mut self) -> Result<(), String> {
+        // Rows written over before the reader read them, rows or definitions: from here on a
+        // name may read as forgotten.
         for (at, ring) in self.rings.iter().enumerate() {
-            if ring.oldest() > self.cursor[at] {
+            if ring.oldest() > self.cursor[at].min(self.names_to[at]) {
                 self.seen.lossy = true;
             }
         }
         for at in 0..self.rings.len() {
             self.reader.catch_up(at as u16 + 1, &mut Rings(&self.rings));
+            self.names_to[at] = self.rings[at].head;
         }
         for at in 0..self.rings.len() {
             let (oldest, head) = (self.rings[at].oldest(), self.rings[at].head);
