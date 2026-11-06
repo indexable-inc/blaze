@@ -30,6 +30,7 @@ mod archive;
 mod chat;
 mod fold;
 mod keys;
+mod live;
 mod panes;
 mod pointer;
 mod side_drag;
@@ -260,6 +261,8 @@ pub struct App {
     stats: stats::Stats,
     /// The user's Ghostty config, live: the terminal's themes, font size and padding (src/app/ghostty.rs).
     look: ghostty::Look,
+    /// Edits to the app's own code, applied while it runs (src/app/live.rs); `None` unless `blaze run` started it.
+    patches: Option<live::Patches>,
 }
 
 /// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
@@ -414,6 +417,7 @@ impl App {
             model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
         let look = ghostty::Look::new(wake.clone());
+        let patches = live::Patches::start(wake.clone());
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
@@ -510,6 +514,7 @@ impl App {
             keys_gen: 0,
             stats: stats::Stats::default(),
             look,
+            patches,
         };
         app.apply_ghostty();
         app.load_keys()?;
@@ -1483,6 +1488,7 @@ impl App {
         self.time += dt;
         self.pending = self.pending.saturating_sub(1);
         self.stats_begin();
+        self.take_patches();
         self.reload_keys_if_changed();
         self.reload_ghostty_if_changed();
         let z = self.zoom();
