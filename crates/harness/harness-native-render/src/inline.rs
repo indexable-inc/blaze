@@ -1,20 +1,65 @@
 //! An inline component read against the scene's `ui.inline` module (harness-native-ui-prims/scene/inline.flecs): the
-//! entity a tag's name means, its icon, and where a press on it opens. The painter draws chips from it and the chat's
-//! press opens through it, so both read one vocabulary.
+//! entity a tag's name means, its icon, where a press on it opens, and for a component with live state (a pull request)
+//! the state the host knows it in. The painter draws chips from it and the chat's press opens through it, so both read
+//! one vocabulary.
+//!
+//! Live state is data too: the host keeps one entity per thing it knows under `ui.inline.live`, an `InlineLive` named by
+//! the component's `key` format, with `(InlineState, <the component's state child>)` and `(InlineMark, <a
+//! ui.inline.marks child>)`. Each state child carries the icon and its ink, so which colour an open, draft, merged or
+//! closed pull request gets is the scene's, not code's.
+use std::collections::BTreeMap;
+
 use harness_native_flecs::prelude::*;
-use harness_native_ui_inline::{Tag, files, open_target};
+use harness_native_ui_inline::{Form, Tag, files, format, open_target};
 use harness_native_ui_look_api::{Fill, Shape};
-use harness_native_ui_text_api::InlineRef;
+use harness_native_ui_text_api::{InlineLive, InlineMark, InlineRef, InlineState};
 
 /// The module's path, as lookups write it.
 pub const MODULE: &str = "ui::inline";
+
+/// Where the host keeps what it knows of live components: one `InlineLive` child per thing.
+pub const LIVE: &str = "ui::inline::live";
+
+/// Hand the module's words (each component's label format and whether a mark follows it) to the grammar, which the
+/// typesetter reads with no world. Run once the scene is loaded; a module missing is a scene bug, named.
+pub fn install(w: WorldRef<'_>) {
+    let m = w.try_lookup(MODULE).unwrap_or_else(|| panic!("the scene has no {MODULE} (inline.flecs)"));
+    let mut forms = BTreeMap::new(); // alloc: the vocabulary, kept for the process by the grammar.
+    m.each_child(|c| {
+        if let Some(r) = c.try_cloned::<&InlineRef>() {
+            forms.insert(c.name(), Form { label: r.label.as_str().to_owned(), mark: r.mark });
+        }
+    });
+    harness_native_ui_inline::install(forms);
+}
 
 /// What every chip shares (`ui.inline.look`): its icon's ink and its corners. Missing is a scene bug, named.
 pub fn look(w: WorldRef<'_>, dark: bool) -> ([f32; 4], Shape) {
     let e = w.try_lookup(&format!("{MODULE}::look")).unwrap_or_else(|| panic!("the scene has no {MODULE}::look (inline.flecs)"));
     let fill = e.try_cloned::<&Fill>().unwrap_or_else(|| panic!("{MODULE}::look has no Fill"));
-    let c = if dark { fill.dark } else { fill.light };
-    (crate::paint::rgba(c), e.try_cloned::<&Shape>().unwrap_or_default())
+    (ink_of(fill, dark), e.try_cloned::<&Shape>().unwrap_or_default())
+}
+
+/// The plate of the chip the pointer is over (`ui.inline.hover`), or holds down (`ui.inline.pressed`).
+pub fn hot(w: WorldRef<'_>, pressed: bool, dark: bool) -> [f32; 4] {
+    fill_of(w, if pressed { "pressed" } else { "hover" }, dark)
+}
+
+/// The underline under a hovered chip's label (`ui.inline.underline`).
+pub fn underline(w: WorldRef<'_>, dark: bool) -> [f32; 4] {
+    fill_of(w, "underline", dark)
+}
+
+fn fill_of(w: WorldRef<'_>, name: &str, dark: bool) -> [f32; 4] {
+    let fill = w
+        .try_lookup(&format!("{MODULE}::{name}"))
+        .and_then(|e| e.try_cloned::<&Fill>())
+        .unwrap_or_else(|| panic!("the scene has no {MODULE}::{name} with a Fill (inline.flecs)"));
+    ink_of(fill, dark)
+}
+
+fn ink_of(fill: Fill, dark: bool) -> [f32; 4] {
+    crate::paint::rgba(if dark { fill.dark } else { fill.light })
 }
 
 /// The entity a tag names, with its `InlineRef`; None for a name the module has no entity for.
@@ -25,30 +70,81 @@ fn component<'w>(w: WorldRef<'w>, tag: &Tag) -> Option<(EntityView<'w>, InlineRe
 }
 
 /// Where a press on `tag` opens, as the host's `open:` action takes it, or why it opens nothing (an unknown name, a
-/// missing or unevaluable prop, a target that is not a place).
+/// missing or unevaluable prop, a target that is not a place). A component with an `href` format opens that.
 pub fn target(w: WorldRef<'_>, tag: &Tag, cwd: &str, home: &str) -> Result<String, String> {
     let (_, r) = component(w, tag).ok_or_else(|| format!("<{}> is not an inline component ({MODULE} has no such entity)", tag.name))?;
+    if !r.href.as_str().is_empty() {
+        return open_target(&format(r.href.as_str(), tag)?, None, cwd, home);
+    }
     let loc = tag.prop(r.target.as_str())?;
     let line = if r.line.as_str().is_empty() { None } else { tag.line(r.line.as_str())? };
     open_target(&loc, line, cwd, home)
 }
 
-/// The icon a chip for `tag` shows: its file kind's for a `file_icon` component, else its `glyph`; `unknown`'s
-/// for a tag that cannot open (no such component, or a bad target).
-pub fn glyph(w: WorldRef<'_>, tag: &Tag) -> String {
-    let own = component(w, tag).and_then(|(_, r)| {
-        let loc = tag.prop(r.target.as_str()).ok()?;
-        open_target(&loc, None, "/", "/").ok()?;
-        if r.file_icon {
-            Some(files::kind_glyph(files::kind_of(&loc)).to_string())
-        } else {
-            Some(r.glyph.as_str().to_owned())
+/// The live-state feed `tag` is kept by and its key there (`github.pr`, `pr:indexable-inc/ix#7652`), for the host to
+/// ask after; None for a component with no live state, or one whose key its props cannot fill.
+pub fn keyed(w: WorldRef<'_>, tag: &Tag) -> Option<(String, String)> {
+    let (_, r) = component(w, tag)?;
+    if r.key.as_str().is_empty() {
+        return None;
+    }
+    Some((r.feed.as_str().to_owned(), format(r.key.as_str(), tag).ok()?))
+}
+
+/// What the host knows of `tag`: its `ui.inline.live` entity, when there is one.
+fn live<'w>(w: WorldRef<'w>, tag: &Tag) -> Option<EntityView<'w>> {
+    let (_, key) = keyed(w, tag)?;
+    let root = w.try_lookup(LIVE)?;
+    let mut found = None;
+    root.each_child(|c| {
+        if found.is_none() && c.try_cloned::<&InlineLive>().is_some_and(|l| l.key.as_str() == key) {
+            found = Some(c);
         }
     });
-    own.unwrap_or_else(|| {
-        w.try_lookup(&format!("{MODULE}::unknown"))
+    found
+}
+
+/// The icon a chip for `tag` shows and its ink: for a live component, its state child's (`unknown`'s while nothing is
+/// known); else its file kind's for a `file_icon` component, else its `glyph`, in the look's ink; `ui.inline.unknown`'s
+/// for a tag that cannot open (no such component, or a bad target).
+pub fn icon(w: WorldRef<'_>, tag: &Tag, dark: bool) -> (String, [f32; 4]) {
+    let (quiet, _) = look(w, dark);
+    let unknown = || {
+        let r = w
+            .try_lookup(&format!("{MODULE}::unknown"))
             .and_then(|e| e.try_cloned::<&InlineRef>())
-            .map(|r| r.glyph.as_str().to_owned())
-            .unwrap_or_else(|| panic!("the scene has no {MODULE}::unknown with an InlineRef (inline.flecs)"))
-    })
+            .unwrap_or_else(|| panic!("the scene has no {MODULE}::unknown with an InlineRef (inline.flecs)"));
+        (r.glyph.as_str().to_owned(), quiet)
+    };
+    let Some((e, r)) = component(w, tag) else { return unknown() };
+    if !r.key.as_str().is_empty() {
+        // Its state child, else its own `unknown` child: never a guessed state.
+        let state = live(w, tag).and_then(|l| l.target(InlineState::id(), 0)).or_else(|| e.lookup_child("unknown"));
+        let Some(s) = state else { panic!("{} has live state but no `unknown` child (inline.flecs)", e.path()) };
+        let glyph = s.try_cloned::<&InlineRef>().map_or_else(String::new, |r| r.glyph.as_str().to_owned());
+        return (glyph, s.try_cloned::<&Fill>().map_or(quiet, |f| ink_of(f, dark)));
+    }
+    let opens = if r.href.as_str().is_empty() {
+        tag.prop(r.target.as_str()).ok().filter(|loc| open_target(loc, None, "/", "/").is_ok())
+    } else {
+        format(r.href.as_str(), tag).ok()
+    };
+    match opens {
+        Some(loc) if r.file_icon => (files::kind_glyph(files::kind_of(&loc)).to_string(), quiet),
+        Some(_) => (r.glyph.as_str().to_owned(), quiet),
+        None => unknown(),
+    }
+}
+
+/// The mark after `tag`'s label and its ink (a pull request's CI check), when its live state has one.
+pub fn mark(w: WorldRef<'_>, tag: &Tag, dark: bool) -> Option<(String, [f32; 4])> {
+    let m = live(w, tag)?.target(InlineMark::id(), 0)?;
+    let glyph = m.try_cloned::<&InlineRef>()?.glyph.as_str().to_owned();
+    let (quiet, _) = look(w, dark);
+    Some((glyph, m.try_cloned::<&Fill>().map_or(quiet, |f| ink_of(f, dark))))
+}
+
+/// What hovering `tag`'s chip says: its live state's tip (a pull request's title, or the error that left it unknown).
+pub fn tip(w: WorldRef<'_>, tag: &Tag) -> Option<String> {
+    live(w, tag)?.try_cloned::<&InlineLive>().map(|l| l.tip.as_str().to_owned()).filter(|t| !t.is_empty())
 }

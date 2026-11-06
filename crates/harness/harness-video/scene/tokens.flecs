@@ -153,3 +153,19 @@ export const menu_max_w = 380
 export const menu_sep_pad = 5
 export const menu_zeta = 1
 export const tone_icon_hover: Fill = $tone_ink_1
+
+// Inline components (harness-native-ui-prims/scene/inline.flecs): the chip under the pointer brightens a step and
+// underlines its label, held down a step more (--ink-1 at 11% and 16% over inline code's 6% --s-tint). A GitHub pull
+// request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
+// merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
+// pending amber).
+export const tone_inline_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.11}, light: {0.086, 0.086, 0.090, 0.10}}
+export const tone_inline_pressed: Fill = {dark: {0.922, 0.918, 0.902, 0.16}, light: {0.086, 0.086, 0.090, 0.15}}
+export const tone_inline_underline: Fill = {dark: {0.922, 0.918, 0.902, 0.42}, light: {0.086, 0.086, 0.090, 0.40}}
+export const tone_gh_open: Fill = {dark: {0.247, 0.725, 0.314, 1}, light: {0.102, 0.498, 0.216, 1}}
+export const tone_gh_draft: Fill = {dark: {0.569, 0.596, 0.631, 1}, light: {0.349, 0.388, 0.431, 1}}
+export const tone_gh_merged: Fill = {dark: {0.671, 0.490, 0.973, 1}, light: {0.510, 0.314, 0.875, 1}}
+export const tone_gh_closed: Fill = {dark: {0.973, 0.318, 0.286, 1}, light: {0.812, 0.133, 0.180, 1}}
+export const tone_gh_ci_success: Fill = $tone_gh_open
+export const tone_gh_ci_failure: Fill = $tone_gh_closed
+export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: {0.604, 0.404, 0.0, 1}}

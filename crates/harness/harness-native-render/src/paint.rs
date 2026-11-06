@@ -613,6 +613,26 @@ impl Painter {
                     (Some(m), Some(_)) => m.links.iter().map(|l| (l.0, l.1)).collect(),
                     _ => Vec::new(),
                 };
+                // Inline code's glyphs in the code ink, bold's in the strong ink (each the text's own when unset).
+                let pick = |dark_c: Rgba, light_c: Rgba| {
+                    let c = if dark { dark_c } else { light_c };
+                    (c.a > 0.0).then(|| rgba(c))
+                };
+                let code_ink = md.and_then(|m| pick(m.code_dark, m.code_light));
+                let strong_ink = md.and_then(|m| pick(m.strong_dark, m.strong_light));
+                let faced: Vec<(usize, usize, [f32; 4])> = shown_md
+                    .as_ref()
+                    .map(|m| {
+                        m.runs
+                            .iter()
+                            .filter_map(|r| match r.face {
+                                Face::InlineCode => code_ink.map(|c| (r.start, r.end, c)),
+                                Face::Bold | Face::BoldItalic => strong_ink.map(|c| (r.start, r.end, c)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 // A Pose's `cut`: that share of its glyphs, from the end, not drawn yet (words typed on). Layout keeps
                 // their room, so nothing moves as they arrive.
                 let total: usize = lay.lines.iter().map(|l| l.glyphs.len()).sum();
@@ -647,6 +667,7 @@ impl Painter {
                                 .map(|s| tokens[s.name].1)
                         })
                         .or_else(|| link_ink.filter(|_| links.iter().any(|l| (l.0..l.1).contains(&g.idx))))
+                        .or_else(|| faced.iter().find(|f| (f.0..f.1).contains(&g.idx)).map(|f| f.2))
                         .unwrap_or(ink);
                     let (a, dy, heat) = arrive.map_or((1.0, 0.0, 0.0), |m| m.of(n, time));
                     let (a, dy) = match came.as_ref().and_then(|(g, c)| c.of(n).map(|at| g.of(at, time))) {
@@ -702,7 +723,8 @@ impl Painter {
                 if let Some(m) = md {
                     // Code spans on a chip, a plate per line they cover.
                     let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
-                    let shape = Shape { radius: crate::markdown::CHIP_RADIUS, n: 4.0, border: 0.0, feather: 0.0 };
+                    let radius = if m.chip_radius > 0.0 { m.chip_radius } else { crate::markdown::CHIP_RADIUS };
+                    let shape = Shape { radius, n: 4.0, border: 0.0, feather: 0.0 };
                     let size = set_of(&style).size;
                     let inset = size * crate::markdown::CHIP_INSET_EM;
                     let (units, code): (Vec<u16>, &[(usize, usize)]) = shown_md
@@ -721,17 +743,24 @@ impl Painter {
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
                         }
                     }
-                    // Inline components on the same chip: one plate from the icon's hole to the end of the label, the
-                    // icon drawn in the hole in the look's ink (quiet: the label carries the meaning).
+                    // Inline components on the same chip: one plate from the icon's hole to the end of the label (and its
+                    // mark), the icon drawn in the hole in its ink (the look's, quiet, or its live state's: a merged pull
+                    // request's purple), the mark in its own. The one the pointer is over (InlineHot) on the hover or
+                    // pressed plate, its label underlined.
                     let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
                     if !tags.is_empty() {
-                        let (icon_ink, ref_shape) = crate::inline::look(e.world(), dark);
+                        let w = e.world();
+                        let (_, ref_shape) = crate::inline::look(w, dark);
+                        let hot = e.try_cloned::<&harness_native_ui_text_api::InlineHot>();
                         let icon_style = TextStyle {
                             size: size * crate::markdown::REF_ICON_SIZE_EM,
                             line: set_of(&style).line,
                             ..TextStyle::default()
                         };
-                        for t in tags {
+                        let mark_style = TextStyle { size: size * crate::markdown::MARK_SIZE_EM, ..icon_style };
+                        for (n, t) in tags.iter().enumerate() {
+                            let here = hot.filter(|h| h.tag as usize == n);
+                            let plate = here.map_or(chip, |h| crate::inline::hot(w, h.pressed, dark));
                             let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
                             let rects = spans_of(&lay, t.start, t.end);
                             let last = rects.len().saturating_sub(1);
@@ -739,17 +768,38 @@ impl Painter {
                                 let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
                                 let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                                 let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
-                                d.panel(panel_from(chip, [0.0; 4], ref_shape, rect, p.alpha));
+                                d.panel(panel_from(plate, [0.0; 4], ref_shape, rect, p.alpha));
+                            }
+                            if here.is_some() {
+                                // The label's underline: a hairline under its words, past the icon's hole, before the mark.
+                                let label_end = t.mark().unwrap_or(t.end);
+                                let under = crate::inline::underline(w, dark);
+                                for r in spans_of(&lay, t.start + 1, label_end) {
+                                    let y = laid.y + r[1] + r[3] - 3.0;
+                                    let rect = [laid.x + r[0], (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
+                                    let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                                    d.panel(panel_from(under, [0.0; 4], flat, rect, p.alpha));
+                                }
                             }
                             // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
                             let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
-                            let glyph = crate::inline::glyph(e.world(), &t.tag);
+                            let (glyph, icon_ink) = crate::inline::icon(w, &t.tag, dark);
                             let icon = self.layout(&glyph, &icon_style, 1.0e5);
                             let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
                             let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
                             let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
                             let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
                             emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
+                            // The mark's hole is MARK_EM wide: the gap after the label, then the mark at its end. Nothing
+                            // while its live state has none (unknown, or not asked yet).
+                            let (Some(at), Some((mglyph, mink))) = (t.mark(), crate::inline::mark(w, &t.tag, dark)) else { continue };
+                            let Some(mhole) = spans_of(&lay, at, at + 1).into_iter().next() else { continue };
+                            let mlay = self.layout(&mglyph, &mark_style, 1.0e5);
+                            let mw = mlay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                            let mh = mlay.lines.first().map_or(mark_style.line, |l| l.height);
+                            let x = laid.x + mhole[0] + mhole[2] - mw;
+                            let y = laid.y + mhole[1] + (mhole[3] - mh) * 0.5;
+                            emit_layout(d, &self.fonts, &mut self.cache, &mlay, (x, y), mink, p.alpha, sc, usize::MAX, upload);
                         }
                     }
                 }
@@ -1191,7 +1241,7 @@ impl Painter {
 }
 
 /// The rects (x, y from the layout's origin, w, h) of UTF-16 units `lo..hi` of `lay`, one per line they cover.
-fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
+pub fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
     let mut out = Vec::new();
     if lo >= hi || lay.lines.is_empty() {
         return out;

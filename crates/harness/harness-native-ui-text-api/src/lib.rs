@@ -8,14 +8,20 @@ pub struct Text {
 }
 
 /// The `Text` beside it is inline markdown (a paragraph, a heading or a list item of a transcript): `**bold**`, `*italic*`,
-/// `` `code` `` in the code face on a chip in `chip` (dark, light), `[links](url)` as their words in `link` (dark, light;
-/// unset, the text's own ink). The markers are not shown; blocks (fences, lists) are the host's rows, not this.
+/// `` `code` `` in the code face on a chip in `chip` (dark, light) `chip_radius` round (0: the painter's
+/// `markdown::CHIP_RADIUS`), its glyphs in `code` (dark, light), `[links](url)` as their words in `link`, bold in `strong`.
+/// An ink left unset (alpha 0) is the text's own. The markers are not shown; blocks (fences, lists) are the host's rows.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct MarkdownText {
     pub chip_dark: harness_native_ui_look_api::Rgba,
     pub chip_light: harness_native_ui_look_api::Rgba,
     pub link_dark: harness_native_ui_look_api::Rgba,
     pub link_light: harness_native_ui_look_api::Rgba,
+    pub code_dark: harness_native_ui_look_api::Rgba,
+    pub code_light: harness_native_ui_look_api::Rgba,
+    pub strong_dark: harness_native_ui_look_api::Rgba,
+    pub strong_light: harness_native_ui_look_api::Rgba,
+    pub chip_radius: f32,
 }
 
 /// One inline component of inline markdown (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar): an entity
@@ -23,13 +29,66 @@ pub struct MarkdownText {
 /// prop that says where a press goes (`loc`, `href`; empty: the chip opens nothing) and `line` the prop with a line in it
 /// (empty: none); with `file_icon` the icon is the target's file kind's (harness-native-ui-inline's files.rs), not `glyph`.
 /// The glyph lives here, not in an `Icon`, because inside `ui.inline` the name `Icon` resolves to the `ui.Icon` prefab.
+///
+/// The rest are formats over the tag's props (`{n}` is its `n`; harness-native-ui-inline's `format`), each unused when
+/// empty: `label` what a self-closing tag shows (`#{n}`; empty: its first prop's value), `href` where a press opens in
+/// place of the `target` prop (`https://github.com/{repo}/pull/{n}`), `key` the name its live state goes by
+/// ([`InlineLive`]; empty: it has none), and `feed` which of the host's feeds keeps that state (`github.pr`). `mark`: room
+/// after its label for a small mark its live state picks ([`InlineMark`]: a CI check).
+///
+/// A component with live state has a child per state it can be in (`ui.inline.PR.merged`), each with its own `InlineRef`
+/// (only its `glyph`) and `Fill` (the icon's ink), and an `unknown` child for while nothing is known.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct InlineRef {
     pub target: ScriptString,
     pub line: ScriptString,
     pub file_icon: bool,
     pub glyph: ScriptString,
+    pub label: ScriptString,
+    pub href: ScriptString,
+    pub key: ScriptString,
+    pub feed: ScriptString,
+    pub mark: bool,
 }
+
+/// What the host knows of the thing a live inline component names (a pull request), on an entity of its own the host's
+/// feed keeps: `key` as the component's `InlineRef.key` formats it, `tip` what hovering the chip says (its title, or the
+/// error that left it unknown). Which state it is in is `(InlineState, <the component's state child>)`, the mark after
+/// its label `(InlineMark, <a ui.inline.marks child>)`; neither while nothing is known, and then the chip is drawn in its
+/// component's `unknown` state with no mark, never a guessed one.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct InlineLive {
+    pub key: ScriptString,
+    pub tip: ScriptString,
+}
+
+/// Where a live view of web page `url` goes (a chip's hover card, scene/widgets/peek.flecs): the seam for an embedded
+/// browser. Nothing draws it yet, and the node holding it is laid out at no height while `ready` is false; a browser
+/// host (CEF) that renders `url` offscreen hands its frames to the Media cache under `key` (as a Shader's or a Video's
+/// are, [`Surface`]), sets `ready`, and the node shows them. Until one does, the card shows the page's OpenGraph data.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct PageView {
+    pub url: ScriptString,
+    pub key: u64,
+    pub ready: bool,
+}
+
+/// On a `MarkdownText`'s entity, set by its host: which of its inline components (`tag`, their index in the words) the
+/// pointer is over, and whether it is held down. The painter draws that chip's plate in `ui.inline.hover`'s or
+/// `ui.inline.pressed`'s Fill and underlines its label; gone when the pointer leaves.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineHot {
+    pub tag: u32,
+    pub pressed: bool,
+}
+
+/// `(InlineState, state)`: the state child of its component a live inline component is drawn as (exclusive).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct InlineState;
+
+/// `(InlineMark, mark)`: the mark drawn after a live inline component's label (exclusive).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct InlineMark;
 
 /// Where a truncated line loses its words for the ellipsis.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -266,6 +325,11 @@ hyperion_api_layouts::api_layouts! {
     "Text" => alias Text,
     "MarkdownText" => alias MarkdownText,
     "InlineRef" => alias InlineRef,
+    "InlineLive" => alias InlineLive,
+    "InlineHot" => alias InlineHot,
+    "PageView" => alias PageView,
+    "InlineState" => alias InlineState,
+    "InlineMark" => alias InlineMark,
     "OneLine" => alias OneLine,
     "Icon" => alias Icon,
     "Mark" => alias Mark,
@@ -293,6 +357,11 @@ pub fn register(world: &World) {
     world.component::<Text>().writable();
     world.component::<MarkdownText>().writable();
     world.component::<InlineRef>().writable();
+    world.component::<InlineLive>().writable();
+    world.component::<InlineHot>().writable();
+    world.component::<PageView>().writable();
+    world.component::<InlineState>().add_trait::<flecs::Exclusive>();
+    world.component::<InlineMark>().add_trait::<flecs::Exclusive>();
     world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();

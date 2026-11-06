@@ -8,7 +8,58 @@
 //! else (`Vec<T>`, `a < b`, an unclosed tag) is plain words, so ordinary prose and type names never turn into chips.
 //! Prop values are strings (`"..."`, `'...'`, or the same inside braces as JSX writes them), numbers (`{12}`), or an
 //! expression (`{blazePath}`), which the words cannot evaluate: [`Tag::prop`] reports it as an error naming the prop.
+//!
+//! What a self-closing tag shows, and whether a mark follows its label, is the vocabulary's too ([`Form`]), installed
+//! from the scene once it loads ([`install`]): `<PR repo="indexable-inc/ix" n={7652}/>` reads `#7652` because
+//! `ui.inline.PR` says `label: "#{n}"`. It is process-wide because the typesetter that sets the words has no world.
 pub mod files;
+
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
+/// What the vocabulary says of one component's words: `label`, a format over its props ([`format`]) a self-closing tag
+/// shows (empty: its first prop's value, a path cut to its last part), and `mark`, whether its label is followed by a
+/// mark its live state picks (a pull request's CI check).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Form {
+    pub label: String,
+    pub mark: bool,
+}
+
+// alloc: the vocabulary lives for the process; the scene installs it once, words read it.
+static FORMS: RwLock<BTreeMap<String, Form>> = RwLock::new(BTreeMap::new());
+
+/// Make `forms` (by component name) the vocabulary's words, replacing what was installed.
+pub fn install(forms: BTreeMap<String, Form>) {
+    *FORMS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = forms;
+}
+
+fn form(name: &str) -> Option<Form> {
+    FORMS.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
+}
+
+/// `fmt` with each `{prop}` replaced by `tag`'s prop of that name ([`Tag::prop`]); an error naming the tag and the prop
+/// when it has none or it is an expression. `{{` and `}}` are a brace.
+pub fn format(fmt: &str, tag: &Tag) -> Result<String, String> {
+    let mut out = String::new(); // alloc: the formatted words outlive this call.
+    let mut rest = fmt;
+    while let Some(i) = rest.find(['{', '}']) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if tail.starts_with("{{") || tail.starts_with("}}") {
+            out.push_str(&tail[..1]);
+            rest = &tail[2..];
+            continue;
+        }
+        let Some(end) = tail.find('}').filter(|_| tail.starts_with('{')) else {
+            return Err(format!("<{}>'s format {fmt:?} has an unmatched brace", tag.name));
+        };
+        out.push_str(&tag.prop(&tail[1..end])?);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
 
 /// A prop's value as written.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,13 +72,14 @@ pub enum Prop {
     Expr(String),
 }
 
-/// One inline component: its name, its props in order, and its label (its words, or for a self-closing tag its first
-/// prop's value, a path cut to its last part).
+/// One inline component: its name, its props in order, its label (its words, or for a self-closing tag its [`Form`]'s
+/// label, or with none its first prop's value, a path cut to its last part), and whether a mark follows the label.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tag {
     pub name: String,
     pub props: Vec<(String, Prop)>,
     pub label: String,
+    pub mark: bool,
 }
 
 impl Tag {
@@ -75,12 +127,19 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
                 if chars.get(i + 1) != Some(&'>') {
                     return None;
                 }
-                let label = props.first().and_then(|(_, v): &(String, Prop)| match v {
-                    Prop::Text(s) => Some(tail(s)),
-                    Prop::Number(n) => Some(fmt_number(*n)),
-                    Prop::Expr(_) => None,
-                })?;
-                return Some((Tag { name, props, label }, i + 2));
+                let form = form(&name).unwrap_or_default();
+                let mut tag = Tag { name, props, label: String::new(), mark: form.mark };
+                // A label its props cannot fill (a missing prop) leaves the tag as words, shown as written.
+                tag.label = if form.label.is_empty() {
+                    tag.props.first().and_then(|(_, v)| match v {
+                        Prop::Text(s) => Some(tail(s)),
+                        Prop::Number(n) => Some(fmt_number(*n)),
+                        Prop::Expr(_) => None,
+                    })?
+                } else {
+                    format(&form.label, &tag).ok()?
+                };
+                return Some((tag, i + 2));
             }
             '>' => {
                 i += 1;
@@ -110,7 +169,8 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
             if label.is_empty() {
                 return None;
             }
-            return Some((Tag { name, props, label }, i + close.len()));
+            let mark = form(&name).is_some_and(|f| f.mark);
+            return Some((Tag { name, props, label, mark }, i + close.len()));
         }
         i += 1;
     }
@@ -221,6 +281,20 @@ mod tests {
         for words in ["<T>", "Vec<T> and more", "<Path loc=\"x\">no close", "<Path loc=\"x\">a\nb</Path>", "< Path />", "<path loc=\"x\"/>"] {
             assert!(at(words).is_none(), "{words:?} is words");
         }
+    }
+
+    /// A form's label over the props, its mark, and a tag its format cannot fill staying words.
+    #[test]
+    fn forms() {
+        install(BTreeMap::from([("PR".to_owned(), Form { label: "#{n}".to_owned(), mark: true })]));
+        let (t, _) = at(r#"<PR repo="indexable-inc/ix" n={7652}/>"#).unwrap();
+        assert_eq!((t.label.as_str(), t.mark), ("#7652", true));
+        assert_eq!(format("https://github.com/{repo}/pull/{n}", &t).unwrap(), "https://github.com/indexable-inc/ix/pull/7652");
+        assert_eq!(format("{{n}}", &t).unwrap(), "{n}");
+        assert!(format("{n", &t).unwrap_err().contains("unmatched brace"));
+        assert!(at(r#"<PR repo="indexable-inc/ix"/>"#).is_none(), "no n: words");
+        let (t, _) = at(r#"<Path loc="a/b"/>"#).unwrap();
+        assert_eq!((t.label.as_str(), t.mark), ("b", false));
     }
 
     #[test]
