@@ -14,7 +14,7 @@ use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
 use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
-use harness_native_ui_node_api::Laid;
+use harness_native_ui_node_api::{Laid, wrap_width};
 use harness_native_ui_text_api::{
     BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
@@ -578,16 +578,18 @@ impl Painter {
                 let mut shown_md = None;
                 // Whether the words were cut to fit (their glyphs are then not the text's).
                 let mut elided = false;
+                // The width its lines break (or its one line is cut) at: layout's, or while a fold moves its box, the
+                // width it has once the fold rests (WrapAt), so its words change once per fold, not every frame.
+                let room = wrap_width(e, laid.w).max(1.0) + 0.5;
                 let lay = if let (Some(_), Some(_)) = (truncate, md) {
                     // Inline markdown on one line (a table's cell): its first line (`one_line`), cut at its
                     // end, its faces kept.
-                    let (lay, m) = self.layout_md_cut(&harness_native_ui_text_api::one_line(text.s.as_str()), &style, laid.w.max(1.0) + 0.5);
+                    let (lay, m) = self.layout_md_cut(&harness_native_ui_text_api::one_line(text.s.as_str()), &style, room);
                     shown_md = Some(m);
                     lay
                 } else if let Some(mode) = truncate {
                     // One line, never wrapped: its first line (`one_line`, as layout measured it), cut with an
-                    // ellipsis (at its end, middle or start) to the width layout gave it.
-                    let room = laid.w.max(1.0) + 0.5;
+                    // ellipsis (at its end, middle or start) to that width.
                     let cut = typeset::elide(&harness_native_ui_text_api::one_line(text.s.as_str()), mode, room, |t| {
                         self.layout(t, &style, 1.0e5)
                             .lines
@@ -598,7 +600,7 @@ impl Painter {
                     elided = cut.as_str() != text.s.as_str();
                     self.layout(&cut, &style, 1.0e5)
                 } else {
-                    self.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md.is_some())
+                    self.layout_as(text.s.as_str(), &style, room, md.is_some())
                 };
                 // Inline markdown's links, in the link ink (the text's own when MarkdownText says none).
                 let shown_md = match (md, shown_md) {

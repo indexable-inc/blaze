@@ -23,7 +23,9 @@
 //! a `Grid` sizes columns by their widest cell; `GridColumns` makes adaptive columns; `Lazy` stands for rows that do not
 //! exist yet and says which are in view (`range`); a Row aligned on `FirstBaseline`/`LastBaseline` lines up its text;
 //! `LaysAtRest` lays a node's children in the room it gets with every moving `RestSize` at that length (`rest_room`,
-//! carried down from the moving node's parent) and places them in the frame it has now (a pane beside a folding sidebar); `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's
+//! carried down from the moving node's parent) and places them in the frame it has now (a terminal pane beside a folding
+//! sidebar), while a words node anywhere breaks its lines at its rest width (`wrap`, written as `WrapAt`) inside a box that
+//! follows the frame; `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's
 //! `SafeAreaInset` (a second pass, once the first has said where the node is); a `GrowLimit` caps a growing height at a
 //! share of its pane's (`grow_limits`, a second height pass once the first has said how tall the pane is).
 use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, Side, SizeKind, Sizing};
@@ -114,6 +116,11 @@ pub struct Item {
     /// The size it gets on each axis once every moving `RestSize` (a sibling's or an ancestor's sibling's) is at its
     /// `RestSize` (`assign` sets it on every node each pass; None: the size it has now).
     pub rest_room: [Option<f32>; 2],
+    /// It is words (`Text`): while its width at rest (`rest_room`) is not the width it has, it breaks its lines there
+    /// (`wrap`), so its box follows a moving frame while its words wrap once per motion.
+    pub words: bool,
+    /// The width its words break their lines at where that is not its laid width (`WrapAt`; set on the width pass).
+    pub wrap: Option<f32>,
     pub children: Vec<usize>,
     pub nat: [f32; 2],
     /// How far a parent's shortfall may shrink it on each axis.
@@ -197,6 +204,7 @@ fn pass(items: &mut [Item], root: usize, room: [f32; 2]) {
     for it in items.iter_mut() {
         it.hidden = false;
         it.range = None;
+        it.wrap = None;
         it.cols.clear();
     }
     natural(items, root, 0);
@@ -508,7 +516,13 @@ fn across_size(ch: &Item, a: usize, inner: f32, align: Align, stretch_fit: bool,
 
 fn assign(items: &mut [Item], i: usize, a: usize, size: f32) {
     items[i].set_dim(a, size);
+    if a == 0 && items[i].words {
+        items[i].wrap = items[i].rest_room[0];
+    }
+    // Layered children take its frame, now and at rest.
+    let rest = items[i].rest_room[a];
     for c in layered(items, i) {
+        items[c].rest_room[a] = rest;
         assign(items, c, a, size);
     }
     let kids = flow(items, i);
@@ -1105,6 +1119,38 @@ mod tests {
         // Too wide for the open card: it takes the open card's width from the first frame, centred in the frame as it moves.
         assert_eq!(lay(0.0, 800.0), (0.0, 1000.0, 150.0, 700.0));
         assert_eq!(lay(150.0, 800.0), (150.0, 850.0, 225.0, 700.0));
+    }
+
+    /// A card (at most 800 wide, centred) in a pane beside a sidebar folding open (`now` wide, laid against 300), holding words
+    /// and a trailing control after a spacer: the card, its spacer and its control follow the moving frame, while its words
+    /// break their lines at the width they have once the sidebar is open (`wrap`), so they wrap once and the card's edges
+    /// and controls glide. At rest the words break at the width they have.
+    #[test]
+    fn words_break_at_rest_while_their_boxes_follow_the_frame() {
+        let lay = |now: f32| {
+            let side = Item { rest: Some(300.0), ..item([Sizing::fixed(now), Sizing::fixed(10.0)], vec![]) };
+            let pane = Item {
+                flex: Flex { axis: FlexAxis::Column, align: Align::Center, ..Flex::default() },
+                ..item([Sizing::GROW, Sizing::fixed(40.0)], vec![3])
+            };
+            let card = Item {
+                flex: Flex { axis: FlexAxis::Column, align: Align::Stretch, ..Flex::default() },
+                ..item([Sizing { max: 800.0, ..Sizing::GROW }, Sizing::fixed(20.0)], vec![4, 5])
+            };
+            let words = Item { words: true, ..item([Sizing::GROW, Sizing::fixed(10.0)], vec![]) };
+            let bar = row(0.0, Align::Start, vec![6, 7]);
+            let spacer = item([Sizing::GROW, Sizing::fixed(10.0)], vec![]);
+            let control = item([Sizing::fixed(20.0), Sizing::fixed(10.0)], vec![]);
+            let mut items = vec![row(0.0, Align::Start, vec![1, 2]), side, pane, card, words, bar, spacer, control];
+            solve(&mut items, 0, [1000.0, 500.0]);
+            let c = items[7].out;
+            (items[3].out.x, items[3].out.w, items[4].out.w, items[4].wrap, c.x + c.w)
+        };
+        // Opening: the card shrinks with the frame from 800 to 700, its words break at 700 from the first frame.
+        assert_eq!(lay(0.0), (100.0, 800.0, 800.0, Some(700.0), 900.0));
+        assert_eq!(lay(150.0), (175.0, 800.0, 800.0, Some(700.0), 975.0));
+        assert_eq!(lay(250.0), (250.0, 750.0, 750.0, Some(700.0), 1000.0));
+        assert_eq!(lay(300.0), (300.0, 700.0, 700.0, None, 1000.0));
     }
 
     /// A row of a fixed box, a spacer and a fixed box, 8 apart in 200 points: the spacer takes what is left.
