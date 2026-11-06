@@ -90,6 +90,9 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         opened_ns: 0,
         opened_unix_ns: None,
         leases: Arc::new(blaze_core::lock::Lock::new("serve.job.leases", Leases::default())),
+        paused: blaze_graph::pressure::Paused::default(),
+        began: std::time::Duration::ZERO,
+        doing_said: None,
     }
 }
 

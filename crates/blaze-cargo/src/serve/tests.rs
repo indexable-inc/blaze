@@ -4248,9 +4248,9 @@ fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
     let (mut heard, said) = std::io::pipe().unwrap();
     let said: std::os::fd::OwnedFd = said.into();
-    let mut said = std::fs::File::from(said);
+    let said = super::Ready::new(std::fs::File::from(said)).unwrap();
     let path = state.path().to_owned();
-    let b = std::thread::spawn(move || super::hold(&path, Some(&mut said)).map(drop));
+    let b = std::thread::spawn(move || super::hold(&path, Some(&said)).map(drop));
     let mut byte = [0u8; 1];
     heard.read_exact(&mut byte).unwrap();
     assert_eq!(super::Phase::of(byte[0]), Some(super::Phase::Waiting));
