@@ -63,7 +63,10 @@ act {
     MenuItem: {bar: "File", title: "New Cursor"} }
   SpawnShell : act.Spawn { SpawnKind: {kind: "shell", title: "Shell"}
     MenuItem: {bar: "File", title: "New Shell"} }
-  Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
+  // The selected session's name in its sidebar row turns into a field, all of it selected (src/app/chat/rename.rs):
+  // Return saves, Escape cancels, a press anywhere else saves; saved empty, it has its automatic name again.
+  Rename { MenuItem: {bar: "File", title: "Rename", sep: 1} }
+  Archive { MenuItem: {bar: "File", title: "Archive"} }
 
   // The Edit menu's: sent up the responder chain to the view (src/window.rs), which runs the app's cut, copy, paste.
   Cut { Selector: {sel: "cut:"}
@@ -188,6 +191,9 @@ key {
     (Does, act.SpawnClaude) }
   new_codex { Keybind: {key: "t", cmd: 1, shift: 1}
     (Does, act.SpawnCodex) }
+  // No When: it holds over the chat's and the terminal's keys (cmd+R was bound to nothing before it).
+  rename { Keybind: {key: "r", cmd: 1}
+    (Does, act.Rename) }
   archive { Keybind: {key: "w", cmd: 1}
     (Does, act.Archive) }
 

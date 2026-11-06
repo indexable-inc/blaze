@@ -44,6 +44,8 @@ pub struct Session {
     pub kind: String,
     /// Unique among running objects; how a get-or-create spawn finds it again.
     pub name: Option<String>,
+    /// What the person renamed it to (`rename`), kept in its index row's meta as `label`.
+    label: Mutex<Option<String>>,
     pub parent: Option<u64>,
     pub cwd: String,
     pub argv: Vec<String>,
@@ -118,12 +120,12 @@ impl Session {
     /// A chat session around `chat`, its agent not running yet (a new chat starts it next; a restored one when resumed).
     #[allow(clippy::too_many_arguments)]
     fn chat(
-        id: u64, kind: &str, name: Option<String>, parent: Option<u64>, cwd: String, argv: Vec<String>, created_ms: u64,
-        chat: Arc<chat::Chat>, ended: Option<(&'static str, u64)>, exit: Option<i32>,
+        id: u64, kind: &str, name: Option<String>, label: Option<String>, parent: Option<u64>, cwd: String, argv: Vec<String>,
+        created_ms: u64, chat: Arc<chat::Chat>, ended: Option<(&'static str, u64)>, exit: Option<i32>,
     ) -> Self {
         let (tx, _) = broadcast::channel(16384);
         Self {
-            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Mutex::new(None),
+            id, kind: kind.into(), name, label: Mutex::new(label), parent, cwd, argv, created_ms, pid: Mutex::new(None),
             term: Mutex::new(harness_vt::Term::new(80, 24, 0)),
             writer: Mutex::new(Box::new(NoAgent)), master: Mutex::new(None), killer: Mutex::new(Box::new(NoAgent)),
             tx, exit: Mutex::new(exit), ended: Mutex::new(ended), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
@@ -185,6 +187,7 @@ impl Session {
             object: format!("s{}", self.id),
             kind: self.kind.clone(),
             name: self.name.clone(),
+            label: self.label.lock().clone(),
             parent: self.parent,
             title,
             cwd: Some(self.cwd.clone()),
@@ -242,6 +245,20 @@ impl Session {
         let lines = c.choose(&self.kind, model, effort, live, &self.tx)?;
         changed();
         self.write_lines(&lines)
+    }
+
+    /// Name it `title` (trimmed; empty: its name taken away), in its index row too, so a restart and `list`'s past rows
+    /// keep it. Refused, naming the session, for a title over a line.
+    pub fn rename(&self, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.contains(['\n', '\r']) {
+            anyhow::bail!("session {}: {title:?} is not a name: a name is one line", self.id);
+        }
+        let label = (!title.is_empty()).then(|| title.to_owned());
+        db::set_meta(&format!("s{}", self.id), "label", &json!(label));
+        *self.label.lock() = label;
+        changed();
+        Ok(())
     }
 
     /// Stop a chat session's turn in flight.
@@ -302,7 +319,7 @@ impl Daemon {
         };
         let ended = row.ended_ms.or(row.created_ms).unwrap_or(0);
         Ok(Session::chat(
-            id, &row.kind, row.name.clone(), row.parent, row.cwd.clone().unwrap_or_else(|| "/".to_owned()),
+            id, &row.kind, row.name.clone(), row.label.clone(), row.parent, row.cwd.clone().unwrap_or_else(|| "/".to_owned()),
             row.argv.clone(), row.created_ms.unwrap_or(0), Arc::new(c), Some((status, ended)), row.exit.map(|c| c as i32),
         ))
     }
@@ -403,7 +420,7 @@ impl Daemon {
             id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "pty",
         });
         let session = Arc::new(Session {
-            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Mutex::new(pid),
+            id, kind: kind.into(), name, label: Mutex::new(None), parent, cwd, argv, created_ms, pid: Mutex::new(pid),
             term: Mutex::new(harness_vt::Term::new(if cols == 0 { 80 } else { cols }, if rows == 0 { 24 } else { rows }, 10_000)),
             writer: Mutex::new(writer), master: Mutex::new(Some(pair.master)), killer: Mutex::new(killer),
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
@@ -483,7 +500,7 @@ impl Daemon {
             id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "chat",
         });
         let c = Arc::new(chat::Chat::open(&oid, &db::object_dir(&oid), Box::new(chat::NoAdapter))?);
-        let session = Arc::new(Session::chat(id, kind, name, parent, cwd, argv, created_ms, c, None, None));
+        let session = Arc::new(Session::chat(id, kind, name, None, parent, cwd, argv, created_ms, c, None, None));
         if let (Some((model, effort)), Some(c)) = (codex_choice, &session.chat) {
             c.record(Body::Choice { model, effort }, &session.tx);
         }
@@ -747,6 +764,10 @@ impl Daemon {
             }
             Req::SetModel { id, model, effort } => {
                 self.get(id)?.chat_choose(model.as_deref(), effort.as_deref())?;
+                Reply::Ok
+            }
+            Req::Rename { id, title } => {
+                self.get(id)?.rename(&title)?;
                 Reply::Ok
             }
             Req::Screen { id } => {

@@ -1317,36 +1317,13 @@ impl App {
             Some(n) => (true, n),
             None => (false, op),
         };
-        let mv = |name: &str| {
-            Some(match name {
-                "left" => Move::Left,
-                "right" => Move::Right,
-                "up" => Move::Up,
-                "down" => Move::Down,
-                "word_left" => Move::WordLeft,
-                "word_right" => Move::WordRight,
-                "line_start" => Move::LineStart,
-                "line_end" => Move::LineEnd,
-                "doc_start" => Move::DocStart,
-                "doc_end" => Move::DocEnd,
-                _ => return None,
-            })
-        };
-        if let Some(m) = mv(name) {
+        if let Some(m) = Move::named(name) {
             if let Some(to) = self.field_target(m) {
                 self.genui_draft(|d| d.go(m, to, select));
             }
             return;
         }
-        let erase = match op {
-            "backspace" => Some(Move::Left),
-            "delete" => Some(Move::Right),
-            "word_erase" => Some(Move::WordLeft),
-            "word_delete" => Some(Move::WordRight),
-            "line_erase" => Some(Move::LineStart),
-            _ => None,
-        };
-        if let Some(m) = erase {
+        if let Some(m) = Move::erasing(op) {
             if let Some(to) = self.field_target(m) {
                 self.genui_draft(|d| d.erase(to));
             }

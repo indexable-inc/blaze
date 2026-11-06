@@ -56,6 +56,8 @@ export type Request =
   | { op: "attach"; id: number; cols?: number | null; rows?: number | null; events?: boolean }
   | { op: "send"; id: number; text: string; raw?: boolean; submit?: boolean | null }
   | { op: "set_model"; id: number; model?: string | null; effort?: string | null }
+  /** Name a session (its `label`); an empty title takes the name away. */
+  | { op: "rename"; id: number; title: string }
   | { op: "screen" | "kill" | "forget"; id: number }
   | { op: "resize"; id: number; cols: number; rows: number }
   | ({ op: "repl_task" } & Record<string, unknown>)
@@ -78,9 +80,9 @@ export type Up =
   | { t: "resize"; cols: number; rows: number }
   | { t: "detach" };
 
-/** One session as list, screen and attach describe it. */
+/** One session as list, screen and attach describe it; `label`: what the person renamed it to, shown in place of `name`. */
 export type SessionInfo = {
-  id: number; object: string; kind: string; name: string | null; parent: number | null; title: string; cwd: string | null;
+  id: number; object: string; kind: string; name: string | null; label?: string; parent: number | null; title: string; cwd: string | null;
   argv: string[]; created_ms: number | null; ended_ms: number | null; exit: number | null; status: string | null; attached: number;
   cols: number | null; rows: number | null; busy: boolean; mode: string; model: string | null; past: boolean;
 };

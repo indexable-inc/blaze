@@ -294,6 +294,9 @@ export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0.216, 0.20
 export const tone_row_select: Fill = {dark: {1, 1, 1, 0.07}, light: {0.216, 0.208, 0.184, 0.06}}
 export const tone_select_focus: Fill = {dark: {1, 1, 1, 0.10}, light: {0.216, 0.208, 0.184, 0.085}}
 export const tone_chevron: Fill = {dark: {1, 1, 1, 0.32}, light: {0.216, 0.208, 0.184, 0.38}}
+// A row whose name is being renamed (cmd+R): its pill becomes the field's ground, a step past the focused selection in
+// the dark and the paper white of a macOS field in the light, so the words under the caret read as typed into a field.
+export const tone_rename_field: Fill = {dark: {1, 1, 1, 0.14}, light: {1, 1, 1, 0.96}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.

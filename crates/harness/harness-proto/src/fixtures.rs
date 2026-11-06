@@ -19,6 +19,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         object: "s7".into(),
         kind: "claude".into(),
         name: None,
+        label: None,
         parent: Some(3),
         title: "count the files".into(),
         cwd: Some("/tmp".into()),
@@ -61,6 +62,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         ),
         one("up-resize", &Up::Resize { cols: 300, rows: 70 }),
         one("up-detach", &Up::Detach),
+        one("up-rename", &Up::Req(Request::Rename { id: 7, title: "tidy the build".into() })),
         one("up-set-model", &Up::Req(Request::SetModel { id: 7, model: Some("haiku".into()), effort: Some("xhigh".into()) })),
         one("down-hello", &Down::Hello { schema: crate::SCHEMA, pid: 4242 }),
         one(

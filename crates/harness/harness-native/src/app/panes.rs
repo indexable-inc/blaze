@@ -747,6 +747,8 @@ impl App {
             self.pointer.down = true;
             self.pointer.went_down = true;
         }
+        // A press off the row whose name is being renamed saves the rename (chat/rename.rs), and does what it does.
+        self.rename_press();
         if self.palette.is_some() {
             return;
         }
@@ -1016,13 +1018,13 @@ impl App {
             if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
                 self.tree_focus = false;
             }
-            if self.chat_focused() || self.genui_editing() {
+            if self.renaming() || self.chat_focused() || self.genui_editing() {
                 if !k.mods.cmd && !k.mods.ctrl {
                     self.chat_type(k.text);
                 }
                 return;
             }
-        } else if self.palette.is_some() || self.chat_focused() || self.genui_editing() {
+        } else if self.palette.is_some() || self.renaming() || self.chat_focused() || self.genui_editing() {
             return;
         }
         let Some(t) = self.focused_term() else { return };
@@ -1143,7 +1145,7 @@ impl App {
     /// Files pasted (a Finder copy: their paths): into a terminal as words its shell reads back as those paths (quoted
     /// where they need it), anywhere else as the paths, a space apart.
     pub fn paste_paths(&mut self, paths: &[String]) {
-        let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused();
+        let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused() && !self.renaming();
         let words: Vec<String> = paths.iter().map(|p| if terminal { term::shell_quote(p) } else { p.clone() }).collect();
         self.paste(&words.join(" "));
     }
