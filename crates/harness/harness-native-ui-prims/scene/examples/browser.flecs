@@ -1,0 +1,14 @@
+// ui.Browser: the embedded browser's live view. The gallery runs with no harness browser, and view 4242 is one no host
+// made, so it draws its "not connected" plate on the quiet ground, 16:10 at the card's width.
+
+@tree ChildOf
+ex {
+  prefab BrowserDemo : ex.Card {
+    label : ui.Label { Text: {s: "BROWSER, NOT CONNECTED"} }
+    view : ui.Browser {
+      BrowserView: {view: 4242, src: ""}
+      Aspect: {ratio: $gen_browser_aspect}
+      Size: {w: {kind: Fixed, value: 320, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+}

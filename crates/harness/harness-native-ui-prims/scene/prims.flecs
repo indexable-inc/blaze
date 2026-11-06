@@ -211,6 +211,37 @@ ui {
     TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}
   }
 
+  // The embedded browser's live view (harness-native-ui-browser-api; crates/harness/harness-browser): `BrowserView` names
+  // the host's view (or a page `src` to open), drawn on a quiet ground. Its parts, which the app fills
+  // (harness-native/src/app/browser.rs): `pic`, the view's frames (its Surface keyed by the view, so every node showing one
+  // view shares one ring; the pointer over it goes to the page while the node has BrowserFocus, its shape the page's), and
+  // `plate`, why there is no picture yet (not connected to the harness browser, the daemon's error, loading), empty once
+  // the first frame is in. It fills what it is given; a card or pane sizes it.
+  prefab Browser : ui.ZStack {
+    BrowserView: {view: 0, src: ""}
+    Fill: $tone_gen_media
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    pic : ui.Node {
+      Hoverable
+      Cursor: {shape: Arrow}
+      Surface: {key: 0, cover: 0}
+      Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+    plate : ui.Column {
+      Overlay
+      Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+      Padding: {l: 12, r: 12, t: 12, b: 12}
+      text : ui.Words {
+        Fill: $tone_term_muted
+        Text: {s: "Not connected to the harness browser"}
+        TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
+      }
+    }
+  }
+
   // ---- SwiftUI's layout vocabulary (examples in scene/examples, drawn by HARNESS_NATIVE_GALLERY=1) ----
 
   // A table: rows are ui.GridRow, cells their children; columns as wide as their widest cell. A ui.GridColumn child (not a

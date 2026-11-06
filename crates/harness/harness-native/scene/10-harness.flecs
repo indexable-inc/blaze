@@ -12,6 +12,7 @@ include widgets/panes
 include widgets/archive
 include widgets/chat
 include widgets/genui
+include widgets/web
 include widgets/palette
 include widgets/picker
 include widgets/theme

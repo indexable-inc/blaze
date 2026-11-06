@@ -33,6 +33,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("98-ex-bubble", include_str!("../scene/examples/bubble.flecs")),
     ("98-ex-scroller", include_str!("../scene/examples/scroller.flecs")),
     ("98-ex-menu", include_str!("../scene/examples/menu.flecs")),
+    ("98-ex-browser", include_str!("../scene/examples/browser.flecs")),
     ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
 ];
 
@@ -42,6 +43,7 @@ pub fn register(world: &World) {
     harness_native_ui_layout_api::register(world);
     harness_native_ui_text_api::register(world);
     harness_native_ui_state_api::register(world);
+    harness_native_ui_browser_api::register(world);
     harness_native_ui_input_api::register(world);
     harness_native_ui_motion_api::register(world);
     harness_native_ui_look_api::register(world);

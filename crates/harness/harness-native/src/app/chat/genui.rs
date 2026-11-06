@@ -12,6 +12,7 @@ use super::*;
 use harness_native_ui_layout_api::{Flex, Padding};
 use harness_native_ui_node_api::Laid;
 
+mod browser;
 mod canvas;
 mod cellref;
 mod chart;
@@ -28,6 +29,7 @@ mod surface;
 
 pub use common::{GenFeel, GenOn, Prims};
 pub use control::Live;
+pub(super) use browser::shown_card;
 
 /// The most elements one cell draws, how deep they nest, and the most rows and columns a table shows.
 const MAX_ELEMENTS: usize = 600;
@@ -36,7 +38,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 52] = [
+const ELEMENTS: [(&str, &str); 53] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -89,6 +91,7 @@ const ELEMENTS: [(&str, &str); 52] = [
     ("CellRef", "hn.GenCellRef"),
     ("ColorPicker", "hn.GenColorPicker"),
     ("DropZone", "hn.GenDropZone"),
+    ("Browser", "hn.GenBrowser"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -252,6 +255,7 @@ fn own_refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<
         k if props::TIER3.contains(&k) => props::check(node, within).or_else(|| surface::failed(node, live)),
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
+        "Browser" => browser::check(node),
         k if CONTROLS.contains(&k) => control::check(node),
         "Table" => match prop(node, "rows") {
             Value::Null | Value::Array(_) => None,
@@ -333,6 +337,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
         "CellRef" => cellref::element(v, node, depth, b),
         "ColorPicker" => color::element(v, node, b),
         "DropZone" => dropzone::element(v, node, &kids, depth, b),
+        "Browser" => browser::element(v, node),
         "Column" | "Row" => {
             spacing(v, prefab_of(kind), node);
             children(v, &kids, depth + 1, b);

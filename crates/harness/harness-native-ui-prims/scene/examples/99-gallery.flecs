@@ -39,5 +39,6 @@ swiftui_gallery : ui.Column {
     removal : ex.RemovalDemo {}
     animate : ex.AnimateDemo {}
     menu : ex.MenuDemo {}
+    browser : ex.BrowserDemo {}
   }
 }

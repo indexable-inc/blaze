@@ -50,6 +50,8 @@ objc2-core-graphics = "0.3"
 objc2-core-foundation = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
+# The embedded browser's frames (media/browser.rs): IOSurfaces over Mach ports.
+harness-mach = { path = "../harness-mach" }
 # Video elements (media/video.rs): AVPlayer, its item's video output, CoreVideo's Metal texture cache. Default features off:
 # their defaults pull in crates (MediaToolbox, CoreAudio...) the player never uses.
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
