@@ -12,7 +12,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, StrikeLook, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::{Laid, wrap_width};
 use harness_native_ui_text_api::{
@@ -409,6 +409,10 @@ impl Painter {
             l.1 = l.1.min(keep);
             l.0 < l.1
         });
+        m.strike.retain_mut(|s| {
+            s.1 = s.1.min(keep);
+            s.0 < s.1
+        });
         m.tags.retain_mut(|t| {
             t.end = t.end.min(keep);
             t.start < t.end
@@ -741,6 +745,26 @@ impl Painter {
                             let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                             let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
+                        }
+                    }
+                    // Struck-through words: a hairline over the glyphs of each line they cover, `ui.strike`'s look.
+                    let struck = shown_md.as_ref().map_or(&[][..], |m| m.strike.as_slice());
+                    if !struck.is_empty() {
+                        let look = strike_look(e.world());
+                        let thick = (look.w * sc).round().max(1.0) / sc;
+                        let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                        let line_ink = [ink[0], ink[1], ink[2], ink[3] * look.alpha];
+                        for &(lo, hi) in struck {
+                            let ((x0, l0), (x1, l1)) = (lay.caret(lo), lay.caret(hi));
+                            for (li, l) in lay.lines.iter().enumerate().take(l1 + 1).skip(l0) {
+                                let a = if li == l0 { x0 } else { 0.0 };
+                                let b = if li == l1 { x1 } else { l.width };
+                                let y = laid.y + l.baseline - size * look.rise - thick * 0.5;
+                                let rect = [laid.x + a, (y * sc).round() / sc, b - a, thick];
+                                if b > a {
+                                    d.panel(panel_from(line_ink, [0.0; 4], flat, rect, p.alpha));
+                                }
+                            }
                         }
                     }
                     // Inline components on the same chip: one plate from the icon's hole to the end of the label (and its
@@ -1238,6 +1262,15 @@ impl Painter {
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
     }
+}
+
+/// `ui.strike`'s look (prims.flecs): struck-through words' hairline. The scene is compiled in, so one without it is a bug:
+/// this panics naming it.
+fn strike_look(w: WorldRef<'_>) -> StrikeLook {
+    w.try_lookup("ui::strike")
+        .unwrap_or_else(|| panic!("the scene has no ui::strike (prims.flecs)"))
+        .try_cloned::<&StrikeLook>()
+        .unwrap_or_else(|| panic!("ui::strike has no StrikeLook"))
 }
 
 /// The rects (x, y from the layout's origin, w, h) of UTF-16 units `lo..hi` of `lay`, one per line they cover.

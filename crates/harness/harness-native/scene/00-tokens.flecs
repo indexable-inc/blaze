@@ -439,6 +439,12 @@ export const caret_glide = 0.2
 export const caret_hold = 0.5
 export const caret_blink = 1.06
 export const caret_fade = 0.09
+// Struck-through words (prims.flecs ui.strike, inline markdown's ~~struck~~): a strike_w point hairline (at least a
+// device pixel) whose middle sits strike_rise_em of the words' size over their baseline (half Inter's x-height, 0.546
+// em), in the text's own ink at strike_alpha of it.
+export const strike_w = 1
+export const strike_rise_em = 0.27
+export const strike_alpha = 0.7
 // Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132

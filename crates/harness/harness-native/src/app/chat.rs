@@ -409,16 +409,21 @@ impl Row {
     }
 }
 
-/// Markdown split into the rows it is drawn as: paragraphs (soft breaks joined), headings, list items (continuation lines
-/// joined), quotes, fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
+/// Markdown split into the rows it is drawn as: paragraphs, headings, list items (with their continuation lines), quotes
+/// (each kept a line apart, less its indent and the block's trailing white space, so inline markdown reads a soft break
+/// as a space and two trailing spaces or a backslash as a hard one), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
 /// that are no table, as code). While it is `live` (still streaming) a table's row arrives whole: a last row not yet ended
 /// is held back, and so is a head whose delimiter line has not come.
 fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
+    /// A block's lines as its inline markdown: a line apart, each less its indent, the whole less its trailing white space.
+    fn lines_of<'a>(ls: impl Iterator<Item = &'a str>) -> String {
+        ls.map(str::trim_start).collect::<Vec<_>>().join("\n").trim_end().to_owned()
+    }
     let lines: Vec<&str> = md.lines().collect();
     let mut para: Vec<&str> = Vec::new();
     let flush = |para: &mut Vec<&str>, out: &mut Vec<Row>| {
         if !para.is_empty() {
-            out.push(Row::Prose(para.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ")));
+            out.push(Row::Prose(lines_of(para.iter().copied())));
             para.clear();
         }
     };
@@ -479,13 +484,13 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
         }
         if let Some(q) = t.strip_prefix('>') {
             flush(&mut para, out);
-            let mut text = vec![q.trim()];
+            let mut text = vec![q];
             i += 1;
             while i < lines.len() && lines[i].trim_start().starts_with('>') {
-                text.push(lines[i].trim_start()[1..].trim());
+                text.push(&lines[i].trim_start()[1..]);
                 i += 1;
             }
-            out.push(Row::Quote(text.join(" ")));
+            out.push(Row::Quote(lines_of(text.into_iter())));
             continue;
         }
         if t.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ') && t.len() >= 3 {
@@ -496,7 +501,7 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
         if let Some((mark, rest)) = item(t) {
             flush(&mut para, out);
             let depth = (line.len() - t.len()) / 2;
-            let mut text = vec![rest.trim()];
+            let mut text = vec![rest];
             i += 1;
             while i < lines.len() {
                 let n = lines[i];
@@ -507,7 +512,7 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
                 text.push(nt);
                 i += 1;
             }
-            out.push(Row::ListItem { depth, mark, text: text.join(" ") });
+            out.push(Row::ListItem { depth, mark, text: lines_of(text.into_iter()) });
             continue;
         }
         para.push(line);
@@ -2600,8 +2605,8 @@ mod tests {
         blocks("# Title\n\nSome *words*\nwrapped.\n\n- one\n  more\n- two\n\n```ts\nconst x = 1;\n```\n> quoted", false, &mut out);
         let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
         assert_eq!(kinds, ["hn.ChatH1", "hn.ChatProse", "hn.ChatItem", "hn.ChatItem", "hn.ChatCode", "hn.ChatQuote"]);
-        assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words* wrapped."));
-        assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one more"));
+        assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words*\nwrapped."));
+        assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one\nmore"));
         // An ordered item and a task take their own markers' prefabs (a number and a box at the words' size).
         let mut out = Vec::new();
         blocks("1. first

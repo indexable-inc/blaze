@@ -586,6 +586,11 @@ ui {
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
   }
+  // Struck-through words' one look (harness-native-render paint.rs, inline markdown's ~~struck~~): a hairline through
+  // the glyphs about the middle of their x-height, in the text's own ink at reduced alpha.
+  prefab strike {
+    StrikeLook: {w: $strike_w, rise: $strike_rise_em, alpha: $strike_alpha}
+  }
   spring {
     // The springs the generic motion falls back on when a node has no Motion of its own.
     prefab transition {
