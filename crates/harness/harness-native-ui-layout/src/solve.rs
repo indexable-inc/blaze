@@ -996,10 +996,13 @@ fn lazy_place(items: &mut [Item], i: usize, kids: &[usize], [ox, oy, iw, ih]: [f
 }
 
 /// Where an anchored overlay of `size` goes against `anchor` on `side` (its edge, nudge and alignment along the edge),
-/// flipped to the opposite side when it overflows and then clamped inside `room`.
+/// flipped to the opposite side when it overflows and then slid to stay inside `room` (`x, y, w, h`: the viewport from its
+/// origin, or for a windowed overlay the screen's visible frame, which starts wherever the screen is), as NSPopover and
+/// NSMenu flip and shift against the screen.
 #[must_use]
-pub fn anchored(anchor: Laid, size: [f32; 2], side: Side, room: [f32; 2]) -> [f32; 2] {
+pub fn anchored(anchor: Laid, size: [f32; 2], side: Side, room: [f32; 4]) -> [f32; 2] {
     let (edge, nudge) = (side.edge, [side.dx, side.dy]);
+    let [rx, ry, rw, rh] = room;
     // Along the edge: from the anchor's start, by how much the overlay's start sits past it.
     let along = |room: f32, len: f32| match side.align {
         Align::Center => (room - len) / 2.0,
@@ -1013,7 +1016,7 @@ pub fn anchored(anchor: Laid, size: [f32; 2], side: Side, room: [f32; 2]) -> [f3
         Opens::Right => [anchor.x + anchor.w + nudge[0], ay + nudge[1]],
         Opens::Left => [anchor.x - size[0] - nudge[0], ay + nudge[1]],
     };
-    let fits = |p: [f32; 2]| p[0] >= 0.0 && p[1] >= 0.0 && p[0] + size[0] <= room[0] && p[1] + size[1] <= room[1];
+    let fits = |p: [f32; 2]| p[0] >= rx && p[1] >= ry && p[0] + size[0] <= rx + rw && p[1] + size[1] <= ry + rh;
     let flipped = match edge {
         Opens::Bottom => Opens::Top,
         Opens::Top => Opens::Bottom,
@@ -1024,7 +1027,7 @@ pub fn anchored(anchor: Laid, size: [f32; 2], side: Side, room: [f32; 2]) -> [f3
     if !fits(p) && fits(at(flipped)) {
         p = at(flipped);
     }
-    [p[0].min(room[0] - size[0]).max(0.0), p[1].min(room[1] - size[1]).max(0.0)]
+    [p[0].min(rx + rw - size[0]).max(rx), p[1].min(ry + rh - size[1]).max(ry)]
 }
 
 /// Move the subtree under `i` by `(dx, dy)` (an overlay root placed after its own pass).
@@ -1052,6 +1055,22 @@ mod tests {
     /// A text leaf `w` wide and `h` tall whose first and last baselines are `b0` and `b1` from its top.
     fn text(w: f32, h: f32, b0: f32, b1: f32) -> Item {
         Item { intrinsic: [w, h], baseline: [b0, b1], ..Item::default() }
+    }
+
+    /// A windowed overlay is kept in the screen's room, which may start left of and above the viewport: a menu with no
+    /// room above it in the window opens above it on the screen, past the window's edge, and one at the screen's edge
+    /// slides back onto it.
+    #[test]
+    fn an_overlay_is_kept_in_a_room_that_starts_anywhere() {
+        let side = Side { edge: Opens::Top, dx: 0.0, dy: 6.0, align: Align::Start };
+        let anchor = Laid { x: 10.0, y: 40.0, w: 80.0, h: 20.0 };
+        // The window's own room: no room above, so it flips below the anchor.
+        assert_eq!(anchored(anchor, [200.0, 100.0], side, [0.0, 0.0, 800.0, 600.0]), [10.0, 66.0]);
+        // The screen's, 300 points above the window and 50 left of it: it opens above, out of the window.
+        assert_eq!(anchored(anchor, [200.0, 100.0], side, [-50.0, -300.0, 1600.0, 1000.0]), [10.0, -66.0]);
+        // Slid back in at the screen's left edge.
+        let left = Laid { x: -45.0, ..anchor };
+        assert_eq!(anchored(left, [200.0, 100.0], side, [-40.0, -300.0, 1600.0, 1000.0]), [-40.0, -66.0]);
     }
 
     /// A sidebar folding away (its spring leaving it 100 wide, resting at 0) beside a `LaysAtRest` card: the card's frame takes

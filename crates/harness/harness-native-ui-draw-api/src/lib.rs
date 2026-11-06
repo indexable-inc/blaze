@@ -61,6 +61,9 @@ pub struct Painted {
     pub scale: f32,
     /// The appearance its nearest `Scheme` says it is drawn in: 0 the window's, 1 dark, 2 light.
     pub scheme: u8,
+    /// The window it is drawn in: 0 the main one, else the entity id of the `Windowed` overlay it is in (node-api), whose
+    /// own window the host draws it into, over that overlay's `Laid`.
+    pub window: u64,
 }
 
 impl Painted {

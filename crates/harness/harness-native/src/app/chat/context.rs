@@ -22,6 +22,8 @@ pub(super) fn fill_context_pop(pop: View<'_>, meter: Option<View<'_>>, c: Option
         let (m, p) = (m.id(), pop.id());
         let hovered = w.entity_named(APP).target(Hovered::id(), 0);
         hovered.is_some_and(|h| std::iter::successors(Some(h), |n| n.parent()).take(64).any(|n| *n.id() == m || *n.id() == p))
+            // Open, it stays open while the pointer crosses the gap from the ring onto its window.
+            || pop.part("plate").is_some_and(|plate| view::bridged(w.entity_from_id(m), plate.entity()))
     };
     let shown = match (meter, c) {
         (Some(m), Some(c)) if !hidden && on(m) => Some((m, c)),

@@ -41,6 +41,16 @@ pub struct Hosted;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Placed;
 
+/// On a floating node (a menu, a popover's plate, a hover card: an anchored or `Placed` node with a `Layer` of its own): it
+/// and everything in it are hosted in a window of their own above the main one (on macOS a borderless child `NSPanel`,
+/// harness-native's overlay.rs), so it reaches past the main window's edge as NSMenu and NSPopover do. Layout places and
+/// clamps it against the screen (`Screen`, layout-api) instead of the viewport; draw marks every node in it with its id
+/// (`Painted::window`), and the host draws those into its window, laid over its `Laid`. Geometry and hit testing stay in
+/// the main view's points: the host reports the pointer over that window as a point of the main view. A tag, carried by
+/// the overlay prefabs (`ui.Menu`, `ui.Overlay`, `hn.GenFloat`), so any overlay made from them is windowed by data.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Windowed;
+
 /// On the root of a node tree that is out of the frame (a code card scrolled out of view, or one a definition made for a file
 /// it is not showing): layout, draw and hit testing skip the whole tree. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -103,6 +113,7 @@ hyperion_api_layouts::api_layouts! {
     "Node" => alias Node,
     "Hosted" => alias Hosted,
     "Placed" => alias Placed,
+    "Windowed" => alias Windowed,
     "Offscreen" => alias Offscreen,
     "Laid" => alias Laid,
     "Clip" => alias Clip,
@@ -141,6 +152,7 @@ pub fn register(world: &World) {
     world.component::<Node>().writable().aliased();
     world.component::<Hosted>().writable();
     world.component::<Placed>().writable();
+    world.component::<Windowed>().writable();
     world.component::<Offscreen>().writable();
     world.component::<Laid>().writable();
     world.component::<Clip>().writable();

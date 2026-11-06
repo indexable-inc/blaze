@@ -1232,13 +1232,25 @@ impl App {
     /// Escape over a cell's floats: the open popovers and menus close (each sends its onToggle(false)); with none open,
     /// the dialogs and sheets that may be dismissed do (onClose(false)). Whether any closed.
     pub(in crate::app) fn genui_escape(&mut self) -> bool {
+        self.genui_shut(|live| {
+            let light = light_floats(live);
+            if light.is_empty() { live.floats.iter().filter(|(_, f)| !f.close.is_empty()).map(|(el, _)| *el).collect() } else { light }
+        })
+    }
+
+    /// The window lost the keyboard (floats.rs `close_floats`): a cell's open popovers and menus close, as NSPopover and
+    /// NSMenu do (each sends its onToggle(false)); its dialogs and sheets stay. Whether any closed.
+    pub(in crate::app) fn genui_blur(&mut self) -> bool {
+        self.genui_shut(light_floats)
+    }
+
+    /// Close the floats `pick` names (by their element), telling each cell through its close handlers. Whether any closed.
+    fn genui_shut(&mut self, pick: impl FnOnce(&Live) -> Vec<u64>) -> bool {
         let w = self.world.world_ref();
         let out: Vec<Out> = {
             let mut live = self.genui.borrow_mut();
             prune(w, &mut live);
-            let light: Vec<u64> = live.floats.iter().filter(|(_, f)| !f.modal).map(|(el, _)| *el).collect();
-            let shut: Vec<u64> =
-                if light.is_empty() { live.floats.iter().filter(|(_, f)| !f.close.is_empty()).map(|(el, _)| *el).collect() } else { light };
+            let shut = pick(&live);
             // A context menu closes here whether or not it has an onToggle to tell.
             let mut any = false;
             for el in &shut {
@@ -1434,6 +1446,11 @@ impl App {
 fn split_ratio(at: f32, start: f32, len: f32, hit: f32) -> f64 {
     let frac = f64::from((at - start - hit * 0.5) / (len - hit).max(1.0));
     (frac.clamp(0.05, 0.95) * 1000.0).round() / 1000.0
+}
+
+/// The open floats that close lightly (popovers and menus, not modal dialogs or sheets), by their element.
+fn light_floats(live: &Live) -> Vec<u64> {
+    live.floats.iter().filter(|(_, f)| !f.modal).map(|(el, _)| *el).collect() // alloc: the few open floats, once per close
 }
 
 /// Forget the floats and toasts whose elements are gone from the trees (or closed: no plate or scrim now).

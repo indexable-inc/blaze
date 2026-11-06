@@ -19,7 +19,7 @@ use harness_native_render::paint::{Painter, panel_from};
 use harness_native_ui_draw_api::{Paint, PaintKind};
 use harness_native_ui_input_api::{Action, Activated, Hovered, Pointer, PointerState, Pressed};
 use harness_native_ui_layout_api::{Size, SizeKind, Sizing, Viewport};
-use harness_native_ui_look_api::{Fill, Rgba, Shape};
+use harness_native_ui_look_api::{Fill, Lift, Rgba, Shape};
 use harness_native_ui_node_api::{Laid, Level};
 use harness_native_ui_view::{self as view, View, for_each};
 use harness_vt::MouseTracking;
@@ -28,8 +28,10 @@ use std::sync::{Arc, Mutex};
 
 mod archive;
 mod chat;
+mod floats;
 mod fold;
 mod keys;
+pub use floats::Float;
 mod panes;
 mod pointer;
 mod side_drag;
@@ -284,6 +286,10 @@ pub struct App {
     stats: stats::Stats,
     /// The user's Ghostty config, live: the terminal's themes, font size and padding (src/app/ghostty.rs).
     look: ghostty::Look,
+    /// The screen's room for windowed overlays, window points from the view's corner, as the host last said (src/app/floats.rs).
+    screen: Option<[f32; 4]>,
+    /// The windowed overlays the last frame drew, until the host takes them (src/app/floats.rs).
+    floats: Vec<floats::Float>,
 }
 
 /// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
@@ -538,6 +544,8 @@ impl App {
             keys_gen: 0,
             stats: stats::Stats::default(),
             look,
+            screen: None,
+            floats: Vec::new(), // alloc: empty until an overlay's window shows
         };
         app.apply_ghostty();
         app.load_keys()?;
@@ -1602,6 +1610,7 @@ impl App {
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
         }
+        self.sync_screen(z);
         self.world.set(self.pointer);
         self.world.get::<&mut Clock>(|c| {
             c.time += dt;
@@ -1643,6 +1652,7 @@ impl App {
                 textfx: [self.headroom.frame(), 0.0],
                 tune: [0.82, 1.12, 1.0, 0.0],
                 slug: [0.0, 1.0, 1.0, 0.0],
+                place: [0.0; 4],
             },
             // Clear: the window's vibrancy shows through everywhere the scene paints nothing.
             clear: [0.0; 4],
@@ -1897,10 +1907,12 @@ impl App {
 
     // ---- drawing ----
 
-    fn emit(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
+    fn emit(&mut self, main: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
         let held = self.world.lookup(APP).target(Pressed::id(), 0).map(|t| *t.id());
         let painted = harness_native_ui_draw::painted(self.world.world_ref());
         let dark = self.dark;
+        // The windowed overlays' draws (src/app/floats.rs), by their node, in the order they first paint.
+        let mut floats: Vec<(u64, Draw)> = Vec::new(); // alloc: none, or an overlay window's draw or two a frame
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -1916,6 +1928,18 @@ impl App {
             if !seen(&p) {
                 continue;
             }
+            // A terminal's cells and a Kip's picture are drawn on the main window's pixel grid and passes only.
+            if p.window != 0 && (is_term || e.has(harness_native_ui_text_api::Kip::id())) {
+                eprintln!(
+                    "harness-native: paint: {} ({id}) is a terminal or a Kip inside windowed overlay {}: an overlay's window draws neither, so it is left out",
+                    e.name(),
+                    p.window
+                );
+                continue;
+            }
+            // Into the main window's draw, or that of the windowed overlay it is in (made by its first node that shows:
+            // an overlay faded out has no window).
+            let d = floats::target(&mut *main, &mut floats, p.window);
             let rect = [laid.x, laid.y, laid.w, laid.h];
             // F3's sparkline: bars, not a plate.
             if e.has(stats::StatsSpark::id()) {
@@ -1942,7 +1966,16 @@ impl App {
                 }
             };
             let (np, ng) = (at.panels, at.glyphs);
-            let turn = matches!(p.kind, PaintKind::Icon | PaintKind::Mark).then(|| crate::look::turn(e)).flatten();
+            // A windowed overlay's plate casts the window server's shadow (overlay.rs, `hasShadow`), shaped from what its
+            // window draws, as a menu's does; its own drawn one would be cut at the window's edge, so it is left off.
+            if p.window != 0 && e.has(Lift::id()) {
+                if let Some(plate) = d.panels.get_mut(np) {
+                    plate.fx[0] = 0.0;
+                    plate.fx[1] = 0.0;
+                    plate.fx2[0] = 0.0;
+                }
+            }
+            let turn =matches!(p.kind, PaintKind::Icon | PaintKind::Mark).then(|| crate::look::turn(e)).flatten();
             if is_term && p.kind == PaintKind::Plate {
                 let cells = (d.panels.len(), d.glyphs.len(), d.sprites.len());
                 self.emit_term(id, d, sc, upload);
@@ -1980,6 +2013,7 @@ impl App {
             }
             let _ = Level::Base;
         }
+        self.floats = floats::finish(self.world.world_ref(), floats, sc);
     }
 
     /// Text typed into the open palette (a key no binding takes): its query.

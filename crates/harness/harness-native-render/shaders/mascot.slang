@@ -108,6 +108,7 @@ struct Frame
     float2 pad1;
     float4 tune;
     float4 slug;
+    float4 place;    // harness.slang's Frame.place: the view point the target's corner shows
 };
 
 struct MascotQuad
@@ -129,7 +130,7 @@ struct QuadV
 QuadV mascot_quad_vs(uint vid : SV_VertexID, ConstantBuffer<Frame> frame, ConstantBuffer<MascotQuad> quad)
 {
     float2 c = CORNERS[vid];
-    float2 pt = quad.rect.xy + c * quad.rect.zw;
+    float2 pt = quad.rect.xy + c * quad.rect.zw - frame.place.xy;
     QuadV o;
     o.pos = float4(pt.x / frame.view.x * 2.0 - 1.0, 1.0 - pt.y / frame.view.y * 2.0, 0, 1);
     o.uv = c;

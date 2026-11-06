@@ -10,7 +10,7 @@ use harness_native_ui_draw_api::{Paint, PaintKind, Painted};
 use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
 use harness_native_ui_layout_api::{Background, Overlay, ScrollExtent, ScrollState, ScrollerPart};
 use harness_native_ui_motion_api::{Drawn, HoverPose, Pose, PoseAxis, Posed, Posing, Reveal, Shown};
-use harness_native_ui_node_api::{Clip, ClipFade, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_node_api::{Clip, ClipFade, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Windowed, Z};
 use harness_native_ui_text_api::{BlazeMark, Icon, Kip, Mark, Picture, Surface, Text, Vector};
 
 /// A clip rectangle in window points.
@@ -35,13 +35,15 @@ impl Cut {
     }
 }
 
-/// Where a root stands in the draw order, and the frame being painted.
+/// Where a root stands in the draw order, the frame being painted, and the window it is drawn in (0 the main one, else
+/// the `Windowed` float's id).
 #[derive(Clone, Copy)]
 struct Stack {
     frame: u32,
     level: Level,
     z: f32,
     root: u32,
+    window: u64,
 }
 
 /// Create the draw systems in the module scope; deleting that scope removes them before unloading.
@@ -55,7 +57,7 @@ pub fn install(world: WorldRef<'_>) {
         let Some(frame) = it.world().try_get::<&Paint>(|p| p.frame) else { return };
         let level = e.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
         let z = e.try_cloned::<&Z>().map_or(0.0, |z| z.z);
-        let stack = Stack { frame, level, z, root: *e.id() as u32 };
+        let stack = Stack { frame, level, z, root: *e.id() as u32, window: 0 };
         walk(e, 1.0, Affine::ID, None, [0.0; 2], 0, stack, &mut 0);
     });
 }
@@ -155,6 +157,8 @@ fn walk(
         Some(l) if l.level > stack.level => (Stack { level: l.level, ..stack }, None, [0.0; 2]),
         _ => (stack, clip, fade),
     };
+    // A windowed float is drawn, with all in it, into a window of its own (the host's), which no clip of the main one cuts.
+    let (stack, clip, fade) = if e.has(Windowed::id()) { (Stack { window: *e.id(), ..stack }, None, [0.0; 2]) } else { (stack, clip, fade) };
     // Mid-slide (MatchedGeometry) it is drawn at its Drawn frame and its children move with it.
     let drawn = e.try_cloned::<&Drawn>();
     let frame = drawn.map_or(Cut::of(&laid), |d| Cut { x: d.x, y: d.y, w: d.w, h: d.h });
@@ -212,6 +216,7 @@ fn walk(
             h: frame.h,
             scale: mine.s,
             scheme,
+            window: stack.window,
         };
         if e.try_cloned::<&Painted>() != Some(next) {
             e.set(next);

@@ -145,6 +145,18 @@ pub struct Viewport {
     pub h: f32,
 }
 
+/// The room a windowed overlay (`Windowed`, node-api) is placed and kept in: the visible frame of the screen the main
+/// window is on (less the menu bar and the Dock; the whole screen in full screen), in view points from the main view's
+/// top-left corner, so `x` and `y` are usually negative. A singleton the host writes each frame. A world with no screen (a
+/// headless test, a video) has none, and there the viewport is the screen.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Screen {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 /// Caps a `Fit` height at `share` (0 to 1) of the height of its nearest ancestor whose height does not come from its
 /// content (a `Grow`, `Fixed` or `Percent` one, such as a pane), less `keep` points (what else that ancestor shows
 /// around it), and never under its `Size.h.min` or 1 point. Its `Size.h.max`, when set, caps it too; with no such ancestor
@@ -591,6 +603,7 @@ hyperion_api_layouts::api_layouts! {
     "Centre" => alias Centre,
     "Intrinsic" => alias Intrinsic,
     "Viewport" => alias Viewport,
+    "Screen" => alias Screen,
     "ScrollState" => alias ScrollState,
     "ScrollExtent" => alias ScrollExtent,
     "ScrollFed" => alias ScrollFed,
@@ -623,6 +636,7 @@ pub fn register(world: &World) {
     world.component::<Centre>().writable();
     world.component::<Intrinsic>().writable();
     world.component::<Viewport>().writable();
+    world.component::<Screen>().writable();
     world.component::<ShrinkFirst>().writable();
     world.component::<Collapse>().writable();
     world.component::<RestSize>().writable();

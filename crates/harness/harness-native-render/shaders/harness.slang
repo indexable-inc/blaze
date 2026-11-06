@@ -20,6 +20,7 @@ struct Frame
     float2 textfx;   // x the display's EDR headroom (linear over SDR white, 1: SDR; hdr.rs `Frame::headroom`, read by `frame_headroom`): how far past white HDR pictures, the mark's fire and glowing words go; y a motion's seconds (0: nothing moves)
     float4 tune;     // x: text gamma dark, y: text gamma light, z: frosted glass saturation, w: unused
     float4 slug;     // outline glyphs: x emboldening (ems a side), y coverage gamma dark, z light, w the emboldening's limit (device pixels)
+    float4 place;    // xy: the point (view points) the target's top-left corner shows, 0 for the window; a windowed overlay's own window shows only its part of the view (view = its size). zw unused. Instances stay in the view's points; every vertex subtracts xy, so clip bands stay where they were. Not applied to sprites' pixel grid (terminal cells, never in an overlay's window)
 };
 
 struct PanelInst
@@ -173,7 +174,7 @@ PanelV panel_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     float2 c = CORNERS[vid];
     float2 local = (c * 2.0 - 1.0) * (half_size + pad);
     PanelV o;
-    o.pos = float4(to_ndc(center + local, frame.view), 0, 1);
+    o.pos = float4(to_ndc(center + local - frame.place.xy, frame.view), 0, 1);
     o.local = local;
     o.inst = iid;
     return o;
@@ -316,7 +317,7 @@ float4 panel_shade(PanelV v, ConstantBuffer<Frame> frame, PanelInst p)
         outc = float4(0, 0, 0, sa);
     }
 
-    float2 uv = (p.rect.xy + half_size + v.local) / frame.view;
+    float2 uv = (p.rect.xy + half_size + v.local - frame.place.xy) / frame.view;
     // The plate, premultiplied: the fill over nothing.
     float3 base = fill.rgb * fill.a;
     float base_a = fill.a;
@@ -380,7 +381,7 @@ LineV line_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<F
     float2 c = CORNERS[vid];
     float2 pt = a + along * lerp(-reach, len + reach, c.x) + across * (c.y * 2.0 - 1.0) * reach;
     LineV o;
-    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pos = float4(to_ndc(pt - frame.place.xy, frame.view), 0, 1);
     o.pt = pt;
     o.inst = iid;
     return o;
@@ -443,7 +444,7 @@ LineV path_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<F
     float reach = 2.0 / frame.scale;
     float2 pt = p.rect.xy - reach + CORNERS[vid] * (p.rect.zw + reach * 2.0);
     LineV o;
-    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pos = float4(to_ndc(pt - frame.place.xy, frame.view), 0, 1);
     o.pt = pt;
     o.inst = iid;
     return o;
@@ -521,7 +522,7 @@ ImageV image_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     float2 c = CORNERS[vid];
     float2 pt = m.rect.xy + c * m.rect.zw;
     ImageV o;
-    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pos = float4(to_ndc(pt - frame.place.xy, frame.view), 0, 1);
     o.uv = c;
     o.y = pt.y;
     o.x = pt.x;
@@ -690,7 +691,7 @@ SurfaceV surface_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBu
     float2 c = CORNERS[vid];
     float2 pt = m.rect.xy + c * m.rect.zw;
     SurfaceV o;
-    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pos = float4(to_ndc(pt - frame.place.xy, frame.view), 0, 1);
     o.local = (c * 2.0 - 1.0) * m.rect.zw * 0.5;
     o.uv = lerp(m.uv.xy, m.uv.zw, c);
     o.y = pt.y;
@@ -753,7 +754,7 @@ SpriteV sprite_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuff
     SpriteInst s = insts[iid];
     float2 px = float2(s.rect.xy) + CORNERS[vid] * float2(s.rect.zw);
     SpriteV o;
-    o.pos = float4(to_ndc(px / frame.scale, frame.view), 0, 1);
+    o.pos = float4(to_ndc(px / frame.scale - frame.place.xy, frame.view), 0, 1);
     o.inst = iid;
     return o;
 }
@@ -1136,8 +1137,8 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
         float2 n = sign(span) * (c * 2.0 - 1.0);
         float2 sc = g.rect.zw / (sign(span) * max(abs(span), float2(1e-6, 1e-6)));
         float2 top = g.rect.xy + float2(0, rise) - g.uv.xy * sc;
-        float4 m0 = float4(2.0 * sc.x / frame.view.x, 0, 0, 2.0 * top.x / frame.view.x - 1.0);
-        float4 m1 = float4(0, -2.0 * sc.y / frame.view.y, 0, 1.0 - 2.0 * top.y / frame.view.y);
+        float4 m0 = float4(2.0 * sc.x / frame.view.x, 0, 0, 2.0 * (top.x - frame.place.x) / frame.view.x - 1.0);
+        float4 m1 = float4(0, -2.0 * sc.y / frame.view.y, 0, 1.0 - 2.0 * (top.y - frame.place.y) / frame.view.y);
         float4 m3 = float4(0, 0, 0, 1);
         float2 dim = frame.view * live_px(frame) / (1.0 + 2.0 * frame.slug.w);
         float2 vpos;
@@ -1154,7 +1155,7 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
             float sn = sin(g.clip.z);
             float cs = cos(g.clip.z);
             float2 q = m + float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
-            o.pos = float4(to_ndc(q, frame.view), 0, 1);
+            o.pos = float4(to_ndc(q - frame.place.xy, frame.view), 0, 1);
             o.x = q.x;
             o.y = q.y;
         }
@@ -1170,7 +1171,7 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
         float cs = cos(g.clip.z);
         pt = m + float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
     }
-    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pos = float4(to_ndc(pt - frame.place.xy, frame.view), 0, 1);
     o.uv = lerp(g.uv.xy, g.uv.zw, c);
     o.y = pt.y;
     o.x = pt.x;
