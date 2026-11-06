@@ -1,5 +1,5 @@
 ---
-status: plan
+status: current
 summary: The flight recorder names strings per thread. Each thread interns into a private table whose ids are scoped to its own ring, defines each name in the ring the first time it uses it, and starts a new generation at chunk boundaries. Readers turn per-thread ids into global ones as they decode, so the hot path shares nothing and the profile parquet is unchanged.
 date: 2026-11-05
 ---
@@ -128,6 +128,17 @@ module, so papaya is not banned in the recorder by path).
   same strings.
 - **Bench** (`crates/blaze-bench/benches/flight_names.rs`): N threads opening spans with a
   `Debug` field, distinct and repeated values, before (#1805's papaya table) and after.
+
+**Long spans keep their names.** A span may stay open for hundreds of generations of its ring
+(a 70 s task on a busy daemon). Each read collects the tokens the open slots hold
+(`Ring::held_tokens`), and `Streams::hold` keeps their texts until the read after no slot holds
+them, so the link the closing row writes resolves (`names/tests.rs`,
+`a_name_a_long_span_holds_reads_back_past_retain_generations`, which also shows the name is
+forgotten without the hold).
+
+**Named counters.** `flight::plot_named(name: &'static str, value)` writes a plot row of
+`Plot::Named` carrying a kept name. It reads back as a `counters` row whose `name` is that text,
+for counters no `Plot` names (memory owners).
 
 ## Trade-offs kept
 
