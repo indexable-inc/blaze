@@ -678,6 +678,13 @@ export const inline_peek_icon_radius = 3
 export const inline_peek_page_h = 240
 export const inline_peek_badge_pad = 6
 export const inline_peek_lines_n = 8
+// A folder's card lists its entries the Finder's way (hn.PeekEntry): folders first, inline_peek_entries_n of them, each
+// a compact row of its kind's icon (inline_peek_entry_icon_w square, the name's size) and its name in the body face,
+// inline_peek_entry_gap between rows; a quiet line says how many more.
+export const inline_peek_entries_n = 12
+export const inline_peek_entry_icon_w = 14
+export const inline_peek_entry_gap = 2
+export const line_peek_entry = 18
 export const size_peek_title = 14
 export const line_peek_title = 19
 export const size_peek_body = 12.5
@@ -759,26 +766,6 @@ export const tone_gen_video_ink: Fill = {dark: {1, 1, 1, 0.82}, light: {1, 1, 1,
 export const tone_gen_video_ink_hover: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
 export const tone_gen_video_track: Fill = {dark: {1, 1, 1, 0.28}, light: {1, 1, 1, 0.28}}
 export const tone_gen_video_fill: Fill = {dark: {1, 1, 1, 0.92}, light: {1, 1, 1, 0.92}}
-// File kinds as the IntelliJ New UI colours them (den's scene/15-filetypes.flecs): an Icon's or a FileRef's kind.
-export const tone_file_rust: Fill = {dark: {0.878, 0.38, 0.298, 1}, light: {0.784, 0.263, 0.184, 1}}
-export const tone_file_typescript: Fill = {dark: {0.298, 0.604, 0.91, 1}, light: {0.165, 0.435, 0.753, 1}}
-export const tone_file_tsx: Fill = {dark: {0.486, 0.525, 0.949, 1}, light: {0.29, 0.341, 0.816, 1}}
-export const tone_file_javascript: Fill = {dark: {0.894, 0.867, 0.314, 1}, light: {0.647, 0.627, 0, 1}}
-export const tone_file_json: Fill = {dark: {0.796, 0.796, 0.255, 1}, light: {0.541, 0.541, 0.071, 1}}
-export const tone_file_toml: Fill = {dark: {0.769, 0.529, 0.722, 1}, light: {0.604, 0.31, 0.557, 1}}
-export const tone_file_yaml: Fill = {dark: {0.878, 0.392, 0.498, 1}, light: {0.753, 0.227, 0.361, 1}}
-export const tone_file_markdown: Fill = {dark: {0.373, 0.659, 0.827, 1}, light: {0.227, 0.51, 0.69, 1}}
-export const tone_file_nix: Fill = {dark: {0.494, 0.729, 0.894, 1}, light: {0.31, 0.451, 0.753, 1}}
-export const tone_file_shell: Fill = {dark: {0.545, 0.859, 0.353, 1}, light: {0.247, 0.608, 0.114, 1}}
-export const tone_file_python: Fill = {dark: {0.31, 0.718, 0.651, 1}, light: {0.165, 0.561, 0.494, 1}}
-export const tone_file_go: Fill = {dark: {0.235, 0.769, 0.91, 1}, light: {0.055, 0.612, 0.761, 1}}
-export const tone_file_html: Fill = {dark: {0.898, 0.314, 0.227, 1}, light: {0.788, 0.227, 0.141, 1}}
-export const tone_file_css: Fill = {dark: {0.627, 0.455, 0.878, 1}, light: {0.478, 0.31, 0.753, 1}}
-export const tone_file_image: Fill = {dark: {0.333, 0.753, 0.541, 1}, light: {0.184, 0.6, 0.4, 1}}
-export const tone_file_lock: Fill = {dark: {0.557, 0.569, 0.612, 1}, light: {0.424, 0.439, 0.494, 1}}
-export const tone_file_git: Fill = {dark: {0.922, 0.353, 0.267, 1}, light: {0.816, 0.251, 0.173, 1}}
-export const tone_file_folder: Fill = {dark: {0.541, 0.643, 0.808, 1}, light: {0.427, 0.525, 0.69, 1}}
-export const tone_file_text: Fill = {dark: {0.627, 0.639, 0.678, 1}, light: {0.424, 0.439, 0.494, 1}}
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
 // `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and

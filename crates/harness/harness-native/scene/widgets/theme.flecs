@@ -90,6 +90,10 @@ hn {
     inline_peek_lines {
       Size: {w: {kind: Fixed, value: $inline_peek_lines_n, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // How many of a folder's entries its card lists.
+    inline_peek_entries {
+      Size: {w: {kind: Fixed, value: $inline_peek_entries_n, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // A reply streaming in (src/app/chat.rs): the follow to its end, each glyph's arrival, the pace bursts show at. The
     // follow's far is Size.w's value (it lands at once past it from rest).
     chat_stream {

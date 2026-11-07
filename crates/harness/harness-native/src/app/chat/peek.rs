@@ -8,9 +8,10 @@
 //!   popover) opens against an anchor laid over the chip, until the pointer leaves the chip and the card both. A pull
 //!   request or issue shows its title, state, checks, author, lines changed and description's start (the batched
 //!   `github_status` answer); a web link its OpenGraph card (`page_peek`, the daemon fetches and keeps it) with a
-//!   [`PageView`] seam on the card for an embedded browser's live view; a path its first lines. Every card is a header
-//!   row (the thing's icon, or a page's favicon, and where it is: `owner/repo #n`, the site), the title flush left, then
-//!   what there is; a line with nothing to show is left out, never laid out empty.
+//!   [`PageView`] seam on the card for an embedded browser's live view; a file its first lines, a folder its entries the
+//!   Finder's way (folders first, each with its kind's icon). Every card is a header row (the thing's icon, or a page's
+//!   favicon, and where it is: `owner/repo #n`, the site, the path), the title flush left, then what there is; a line
+//!   with nothing to show is left out, never laid out empty.
 //! - Live state: every `<PR>` and `<Issue>` in a shown chat is asked after in one `github_status` request when the chat
 //!   is focused (past the daemon's cache), when its words name new ones, and every [`REASK`] seconds while it shows; the
 //!   answers become `InlineLive` entities under `ui.inline.live` with `(InlineState, <state child>)` and
@@ -19,11 +20,14 @@
 //! - Links: every `<Link>` in a shown chat (a link to a pull request or issue is that component already, harness-native-
 //!   ui-inline's `from_url`) has its page's card asked for once (`page_peek`, its favicon with it), at most
 //!   [`PAGES_MAX`] a chat, so its chip shows the favicon at rest (`InlineLive.picture`), the globe without one.
+//! - Places: every `<Path>` and `<FileRef>` of a shown chat that names one place wherever it is said (absolute, or from
+//!   `~`) is looked at once as its words change (the `fs` feed), so its chip's icon is a folder's when it is a folder
+//!   whatever its name says, and a place that is not there says why as its tooltip ([`App::sync_places`]).
 use super::*;
-use harness_native_render::inline as vocab;
+use harness_native_render::inline::{self as vocab, ChipIcon};
 use harness_native_render::markdown::{CHIP_INSET_EM, Inline};
 use harness_native_render::paint::spans_of;
-use harness_native_ui_inline::Tag;
+use harness_native_ui_inline::{Tag, files};
 use harness_native_ui_look_api::Fill;
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
@@ -59,8 +63,8 @@ pub(super) struct Peek {
     urls: Vec<String>,
     asked: Option<f32>,
     focused: bool,
-    /// A path's first lines, by target, read once.
-    files: BTreeMap<String, String>,
+    /// What a path's card shows of its place, by target, read once.
+    files: BTreeMap<String, Peeked>,
 }
 
 /// The app's side of live components: each GitHub ref's and each link's page's key in the scene's vocabulary, and the
@@ -123,7 +127,7 @@ impl App {
 
     /// A chat pane's frame for its chips (from `fill_chat_pane`): ask after its pull requests and issues, write what the
     /// link knows into the world, find the chip under the pointer and keep its card.
-    pub(super) fn fill_chat_peek(&self, pv: View<'_>, st: &mut ChatState, t: &Transcript, rows: &[(String, Row)], focused: bool) {
+    pub(super) fn fill_chat_peek(&self, pv: View<'_>, st: &mut ChatState, t: &Transcript, rows: &[(String, Row)], focused: bool, cwd: &str) {
         let w = self.world.world_ref();
         self.ask_github(w, st, t, rows, focused);
         self.sync_live(w);
@@ -187,11 +191,12 @@ impl App {
             anchor.set(laid);
         }
         card.anchored(anchor.id());
-        self.fill_card(card, st, &c.tag);
+        self.fill_card(card, st, &c.tag, cwd);
     }
 
-    /// Gather the chat's GitHub refs when its words change, and ask after them: fresh as the chat takes the keyboard,
-    /// when there are new ones, and every [`REASK`] seconds while it shows.
+    /// Gather the chat's GitHub refs, links and places when its words change, and ask after the refs: fresh as the chat
+    /// takes the keyboard, when there are new ones, and every [`REASK`] seconds while it shows. Its places are looked at
+    /// as they are gathered ([`App::sync_places`]).
     fn ask_github(&self, w: WorldRef<'_>, st: &mut ChatState, t: &Transcript, rows: &[(String, Row)], focused: bool) {
         let p = &mut st.peek;
         let mut new = false;
@@ -200,6 +205,7 @@ impl App {
             p.rev = Some((t.rev, rows.len()));
             let mut refs: Vec<GhRef> = Vec::new(); // alloc: this chat's refs, kept with its state
             let mut urls: Vec<String> = Vec::new(); // alloc: this chat's links, kept with its state
+            let mut places: Vec<(String, String, EntityView<'_>)> = Vec::new(); // alloc: this pass's places
             let mut live = self.peek_live.borrow_mut();
             for (_, r) in rows {
                 for (_, src, md) in texts(r) {
@@ -218,6 +224,10 @@ impl App {
                         {
                             live.pages.insert(url.clone(), key);
                             urls.push(url);
+                        } else if let Some(place) = vocab::place(w, &tag.tag)
+                            && !places.iter().any(|(k, _, _)| *k == place.0)
+                        {
+                            places.push(place);
                         }
                     }
                 }
@@ -228,6 +238,8 @@ impl App {
             let asks: Vec<&str> = urls.iter().map(String::as_str).collect(); // alloc: this pass's links, borrowed
             self.link.pages(&asks);
             p.urls = urls;
+            drop(live);
+            self.sync_places(w, &places);
         }
         let fresh = focused && !p.focused;
         p.focused = focused;
@@ -296,6 +308,53 @@ impl App {
         moving(&w);
     }
 
+    /// Write what the file system says of each place into `ui.inline.live` (the `fs` feed): its component's `folder` or
+    /// `file` state, or, for one that is not there, no state and why as its tooltip, naming it. Only a place that is the
+    /// same wherever it is said (absolute, or from `~`) is kept: its key is the place as written, and a relative one is
+    /// another place in each session's directory, so its chip keeps the icon its name says.
+    fn sync_places(&self, w: WorldRef<'_>, places: &[(String, String, EntityView<'_>)]) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let fixed = places.iter().filter(|(_, loc, _)| loc.starts_with('/') || loc == "~" || loc.starts_with("~/"));
+        let mut fixed = fixed.peekable();
+        if fixed.peek().is_none() {
+            return;
+        }
+        let Some(root) = w.try_lookup(vocab::LIVE) else { panic!("the scene has no {} (inline.flecs)", vocab::LIVE) };
+        let mut have: BTreeMap<String, EntityView<'_>> = BTreeMap::new(); // alloc: the live entities, this pass
+        root.each_child(|c| {
+            if let Some(l) = c.try_cloned::<&InlineLive>() {
+                have.insert(l.key.as_str().to_owned(), c);
+            }
+        });
+        let rel = *w.component::<InlineState>().id();
+        for (key, loc, component) in fixed {
+            let Ok(path) = harness_native_ui_inline::open_target(loc, None, "/", &home) else { continue };
+            let (state, tip) = match std::fs::metadata(&path) {
+                Ok(m) => (Some(if m.is_dir() { "folder" } else { "file" }), String::new()),
+                Err(e) => (None, format!("{path}: {e}")),
+            };
+            let to = state.map(|s| {
+                let Some(t) = component.lookup_child(s) else { panic!("{} has no `{s}` state (inline.flecs)", component.path()) };
+                *t.id()
+            });
+            let e = match have.get(key) {
+                Some(e) => *e,
+                None => w.entity().child_of(*root.id()),
+            };
+            let l = InlineLive { key: key.as_str().into(), tip: tip.as_str().into(), picture: "".into() };
+            if e.try_cloned::<&InlineLive>() != Some(l.clone()) {
+                e.set(l);
+            }
+            let cur = e.target(rel, 0).map(|t| *t.id());
+            match to {
+                Some(t) if cur != Some(t) => _ = e.add((rel, t)),
+                None if cur.is_some() => _ = e.remove((rel, flecs::Wildcard::ID)),
+                _ => {}
+            }
+        }
+        moving(&w);
+    }
+
     /// The chip under the pointer in chat pane `pv`'s transcript, when there is one.
     fn chip_under(&self, pv: View<'_>, rows: &[(String, Row)]) -> Option<Chip> {
         let (x, y) = (self.pointer.x, self.pointer.y);
@@ -346,9 +405,10 @@ impl App {
         found
     }
 
-    /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file it names. A link's card
-    /// carries its page's [`PageView`] (the live view's seam), and its live view line only once a browser host made one.
-    fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag) {
+    /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file or folder it names (a
+    /// relative one from `cwd`, the session's directory). A link's card carries its page's [`PageView`] (the live view's
+    /// seam), and its live view line only once a browser host made one.
+    fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag, cwd: &str) {
         let w = self.world.world_ref();
         let dark = self.chat_dark();
         let mut lines: Vec<(&'static str, &'static str, Line)> = Vec::new(); // alloc: a handful of lines, while it is up
@@ -357,31 +417,37 @@ impl App {
             let item = self.link.peeks().gh.get(&r).cloned();
             gh_lines(w, tag, &r, item.as_ref(), dark, &mut lines);
         } else {
-            // Relative paths from the session's directory, as a press opens them (chat_open_at).
             let home = std::env::var("HOME").unwrap_or_default();
-            let cwd = self
-                .focused_chat()
-                .and_then(|(_, e, _)| w.entity_from_id(e).try_cloned::<&model::Cwd>())
-                .map_or_else(|| home.clone(), |c| c.s.as_str().to_owned());
-            match vocab::target(w, tag, &cwd, &home) {
+            match vocab::target(w, tag, cwd, &home) {
                 Ok(url) if url.starts_with("https://") || url.starts_with("http://") => {
                     self.link.page(&url);
                     let page = self.link.peeks().pages.get(&url).cloned();
-                    let (globe, _) = vocab::icon(w, tag, dark);
+                    let globe = vocab::icon(w, tag, dark);
                     let view = card.entity().try_cloned::<&PageView>().filter(|v| v.url.as_str() == url);
                     page_lines(&url, page.as_ref(), &globe, view.as_ref(), &mut lines);
                     page_view = Some(view.unwrap_or(PageView { url: url.as_str().into(), key: 0, ready: false }));
                 }
                 Ok(target) => {
-                    let text = st
-                        .peek
-                        .files
-                        .entry(target.clone())
-                        .or_insert_with(|| first_lines(&target, crate::look::width(w, "inline_peek_lines") as usize));
+                    let n = crate::look::width(w, "inline_peek_lines") as usize;
+                    let entries = crate::look::width(w, "inline_peek_entries") as usize;
+                    let peeked = st.peek.files.entry(target.clone()).or_insert_with(|| peek_place(&target, n, entries));
                     let path = target.split_once(':').filter(|(n, _)| n.parse::<u32>().is_ok()).map_or(target.as_str(), |(_, p)| p);
-                    let (glyph, _) = vocab::icon(w, tag, dark);
-                    lines.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink: None, name: path.to_owned() }));
-                    lines.push(("code", "hn.PeekCode", Line::Words(text.clone())));
+                    // Its icon by what the file system said (a folder's whatever its name), the name's when it said nothing.
+                    let kind = match peeked {
+                        Peeked::Folder { .. } => files::kind_at(path, true),
+                        Peeked::Text(_) | Peeked::Note(_) => files::kind_of(path),
+                    };
+                    lines.push(header(ChipIcon::Drawing(files::drawing(kind)), None, path.to_owned()));
+                    match peeked {
+                        Peeked::Text(text) => lines.push(("code", "hn.PeekCode", Line::Words(text.clone()))),
+                        Peeked::Note(note) => lines.push(("why", "hn.PeekMeta", Line::Words(note.clone()))),
+                        Peeked::Folder { entries, more } => {
+                            lines.push(("entries", "hn.PeekList", Line::Entries(entries.clone())));
+                            if *more > 0 {
+                                lines.push(("more", "hn.PeekMeta", Line::Words(format!("{more} more"))));
+                            }
+                        }
+                    }
                 }
                 Err(why) => lines.push(("why", "hn.PeekMeta", Line::Words(why))),
             }
@@ -406,6 +472,24 @@ impl App {
                 if let Some(n) = v.part("name") {
                     n.text(name);
                 }
+            }
+            Line::Art { drawing, name } => {
+                if let Some(i) = v.part("icon") {
+                    i.drawing(drawing);
+                }
+                if let Some(n) = v.part("name") {
+                    n.text(name);
+                }
+            }
+            Line::Entries(entries) => {
+                view::for_each(v, "hn.PeekEntry", entries.iter().map(|(k, d, n)| (k.as_str(), (*d, n.as_str()))), |r, (d, n), _| {
+                    if let Some(i) = r.part("icon") {
+                        i.drawing(d);
+                    }
+                    if let Some(l) = r.part("name") {
+                        l.text(n);
+                    }
+                });
             }
             Line::Favicon { picture, name } => {
                 if let Some(i) = v.part("icon") {
@@ -444,12 +528,25 @@ enum Line {
     Title(String),
     /// The header row: an icon in an ink (a pull request's state's; None: the look's) and where the thing is.
     Site { glyph: String, ink: Option<Fill>, name: String },
+    /// The header row of a file or a folder: its kind's drawing and its path.
+    Art { drawing: &'static str, name: String },
+    /// A folder's entries: each its row's key, its kind's drawing and its name.
+    Entries(Vec<(String, &'static str, String)>),
     /// The header row of a page with a favicon (a local picture) and its site.
     Favicon { picture: String, name: String },
     State { label: String, ink: Fill, mark: Option<(String, Fill)>, checks: String },
     Image(String),
     /// The live view of the page, by its Media key (only once a browser host made one).
     Page(u64),
+}
+
+/// A card's header row: `icon` (a glyph, in `ink` or the look's, or a file kind's drawing in its own colours) and where
+/// the thing is.
+fn header(icon: ChipIcon, ink: Option<Fill>, name: String) -> (&'static str, &'static str, Line) {
+    match icon {
+        ChipIcon::Glyph(glyph, _) => ("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }),
+        ChipIcon::Drawing(drawing) => ("site", "hn.PeekSiteArt", Line::Art { drawing, name }),
+    }
 }
 
 /// `v`'s `c`, set only when it differs.
@@ -462,7 +559,7 @@ fn set_if<T: harness_native_flecs::prelude::ComponentId + Clone + PartialEq>(v: 
 /// A GitHub item's card: a header of its icon in its state's ink and `owner/repo #n`, its title, its state and checks,
 /// who and how much, its description's start. Before an answer: asking; after a failure: the error, naming it.
 fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bool, out: &mut Vec<(&'static str, &'static str, Line)>) {
-    let (glyph, _) = vocab::icon(w, tag, dark);
+    let icon = vocab::icon(w, tag, dark);
     let component = match r.kind {
         GhKind::Pr => "PR",
         GhKind::Issue => "Issue",
@@ -471,14 +568,14 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
     let name = format!("{} #{}", r.repo, r.n);
     let Some(it) = it.filter(|it| it.error.is_empty()) else {
         let ink = fill_of(&format!("{}::{component}::unknown", vocab::MODULE));
-        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }));
+        out.push(header(icon, ink, name));
         let why = it.map_or_else(|| "Asking GitHub…".to_owned(), |it| it.error.clone());
         out.push(("why", "hn.PeekMeta", Line::Words(why)));
         return;
     };
     let state = it.state.map(state_name);
     let ink = state.and_then(|s| fill_of(&format!("{}::{component}::{s}", vocab::MODULE)));
-    out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }));
+    out.push(header(icon, ink, name));
     out.push(("title", "hn.PeekTitle", Line::Title(it.title.clone())));
     if let (Some(s), Some(ink)) = (it.state, ink) {
         let label = match s {
@@ -521,10 +618,10 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
 
 /// A page's card: a header of its favicon (else `globe`) and its site, its title flush left, its description, its
 /// picture only when it has one, its live view only when a browser host made one; asking, or its error.
-fn page_lines(url: &str, page: Option<&PageMeta>, globe: &str, view: Option<&PageView>, out: &mut Vec<(&'static str, &'static str, Line)>) {
+fn page_lines(url: &str, page: Option<&PageMeta>, globe: &ChipIcon, view: Option<&PageView>, out: &mut Vec<(&'static str, &'static str, Line)>) {
     let host = harness_native_ui_inline::host(url).to_owned();
     let Some(p) = page.filter(|p| p.error.is_empty()) else {
-        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph: globe.to_owned(), ink: None, name: host }));
+        out.push(header(globe.clone(), None, host));
         out.push(("title", "hn.PeekTitle", Line::Title(harness_native_ui_inline::bare(url).to_owned())));
         let why = page.map_or_else(|| "Fetching the page…".to_owned(), |p| p.error.clone());
         out.push(("why", "hn.PeekMeta", Line::Words(why)));
@@ -532,7 +629,7 @@ fn page_lines(url: &str, page: Option<&PageMeta>, globe: &str, view: Option<&Pag
     };
     let site = if p.site.is_empty() { host } else { p.site.clone() };
     if p.icon.is_empty() {
-        out.push(("site", "hn.PeekSiteGlyph", Line::Site { glyph: globe.to_owned(), ink: None, name: site }));
+        out.push(header(globe.clone(), None, site));
     } else {
         out.push(("site", "hn.PeekSite", Line::Favicon { picture: p.icon.clone(), name: site }));
     }
@@ -555,39 +652,77 @@ fn first_text_lines(s: &str, n: usize) -> String {
     lines.join("\n")
 }
 
-/// The first `n` lines of the file a path target names (`<line>:<path>` from that line), or of a folder its first
-/// entries; what could not be read says why, naming it.
-fn first_lines(target: &str, n: usize) -> String {
+/// What a path's card shows of its place, read once and kept with the chat.
+#[derive(Clone)]
+enum Peeked {
+    /// A file's first lines, in the code face.
+    Text(String),
+    /// A quiet line: why the place could not be read (naming it), that a file is binary, that a folder is empty.
+    Note(String),
+    /// A folder's first entries (each its row's key, its kind's drawing and its name) and how many more it has.
+    Folder { entries: Vec<(String, &'static str, String)>, more: usize },
+}
+
+/// What a path target (`<line>:<path>` from that line) shows: a file's first `n` lines from there, a folder's first
+/// `entries` entries; what could not be read says why, naming it.
+fn peek_place(target: &str, n: usize, entries: usize) -> Peeked {
     let (from, path) = match target.split_once(':') {
         Some((l, p)) if l.parse::<usize>().is_ok() => (l.parse::<usize>().unwrap_or(1).max(1), p),
         _ => (1, target),
     };
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(e) => return format!("{path}: {e}"),
+        Err(e) => return Peeked::Note(format!("{path}: {e}")),
     };
     if meta.is_dir() {
-        let mut names: Vec<String> = match std::fs::read_dir(path) {
-            Ok(d) => d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect(),
-            Err(e) => return format!("{path}: {e}"),
-        };
-        names.sort();
-        return names.into_iter().take(n).collect::<Vec<_>>().join("\n");
+        return folder(path, entries);
     }
     use std::io::Read;
     let f = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) => return format!("{path}: {e}"),
+        Err(e) => return Peeked::Note(format!("{path}: {e}")),
     };
     // Bounded: FILE_PEEK_BYTES, more for a line further in (a window's worth a 200 lines, at most 64), never the whole of
     // a large file.
     let mut buf = Vec::new(); // alloc: the card's words, read once and kept with the chat
     let limit = FILE_PEEK_BYTES * (1 + from as u64 / 200).min(64);
     if let Err(e) = f.take(limit).read_to_end(&mut buf) {
-        return format!("{path}: {e}");
+        return Peeked::Note(format!("{path}: {e}"));
     }
     if buf.iter().take(4096).any(|&b| b == 0) {
-        return format!("{path}: binary, {} bytes", meta.len());
+        return Peeked::Note(format!("Binary, {} bytes", meta.len()));
     }
-    String::from_utf8_lossy(&buf).lines().skip(from - 1).take(n).collect::<Vec<_>>().join("\n")
+    Peeked::Text(String::from_utf8_lossy(&buf).lines().skip(from - 1).take(n).collect::<Vec<_>>().join("\n"))
+}
+
+/// A folder's entries the Finder's way: hidden ones left out, folders first (a link to a folder counts as one), then by
+/// name whatever its case; the first `n`, each with its kind's drawing.
+fn folder(path: &str, n: usize) -> Peeked {
+    let read = match std::fs::read_dir(path) {
+        Ok(d) => d,
+        Err(e) => return Peeked::Note(format!("{path}: {e}")),
+    };
+    let mut all: Vec<(bool, String, String)> = read // alloc: the folder's names, sorted once
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            let dir = e.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir()));
+            Some((!dir, name.to_lowercase(), name))
+        })
+        .collect();
+    if all.is_empty() {
+        return Peeked::Note("Empty folder".to_owned());
+    }
+    all.sort_unstable();
+    let more = all.len().saturating_sub(n);
+    let entries = all
+        .into_iter()
+        .take(n)
+        .enumerate()
+        .map(|(i, (file, _, name))| (format!("e{i}"), files::drawing(files::kind_at(&name, !file)), name))
+        .collect();
+    Peeked::Folder { entries, more }
 }

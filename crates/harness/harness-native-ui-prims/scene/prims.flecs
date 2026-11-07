@@ -88,6 +88,14 @@ ui {
     Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
   }
 
+  // A multi-colour vector drawing by name, in its own colours (`Drawing: {name: "rust"}`: a file kind's icon, IntelliJ's,
+  // harness-native-render drawing.rs; the dark appearance takes its `_dark` variant), 16 points, square in its box, crisp
+  // at every zoom. A file's icon is harness-native-ui-inline files.rs's drawing for its kind, never a name picked here.
+  prefab Art : ui.Node {
+    Drawing: {name: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
   // A picture from the media cache, square until an instance sets another Aspect or a Size.
   prefab Image : ui.Node {
     Picture: {handle: ""}

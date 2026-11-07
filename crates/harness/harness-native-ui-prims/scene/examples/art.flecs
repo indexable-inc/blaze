@@ -1,0 +1,37 @@
+// ui.Art: multi-colour vector drawings by name, in their own colours (harness-native-render drawing.rs, IntelliJ's file
+// icons), the dark appearance's variant in a dark window. A folder's entries the way a path's hover card lists them,
+// the Finder's way: folders first, each icon at its name's size, one compact row an entry.
+
+@tree ChildOf
+ex {
+  prefab ArtEntry : ui.Row {
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Art {
+      Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
+    }
+    name : ui.Lead, Ink { Text: {s: ""} }
+  }
+
+  prefab ArtDemo : ex.Card {
+    label : ui.Label { Text: {s: "ART, FILE ICONS"} }
+    list : ui.Column {
+      Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      github : ex.ArtEntry { icon { Drawing: {name: "folderGithub"} }; name { Text: {s: ".github"} } }
+      crates : ex.ArtEntry { icon { Drawing: {name: "folder"} }; name { Text: {s: "crates"} } }
+      cargo : ex.ArtEntry { icon { Drawing: {name: "toml"} }; name { Text: {s: "Cargo.toml"} } }
+      lock : ex.ArtEntry { icon { Drawing: {name: "lockFile"} }; name { Text: {s: "Cargo.lock"} } }
+      flake : ex.ArtEntry { icon { Drawing: {name: "nix"} }; name { Text: {s: "flake.nix"} } }
+      agents : ex.ArtEntry { icon { Drawing: {name: "markdown"} }; name { Text: {s: "AGENTS.md"} } }
+      lib : ex.ArtEntry { icon { Drawing: {name: "rust"} }; name { Text: {s: "lib.rs"} } }
+      license : ex.ArtEntry { icon { Drawing: {name: "text"} }; name { Text: {s: "LICENSE"} } }
+    }
+    sizes : ui.Row {
+      Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+      small : ui.Art { Drawing: {name: "rust"}; Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}} }
+      body : ui.Art { Drawing: {name: "typeScript"} }
+      large : ui.Art { Drawing: {name: "docker"}; Size: {w: {kind: Fixed, value: 32, min: 0, max: 0}, h: {kind: Fixed, value: 32, min: 0, max: 0}} }
+    }
+  }
+}
