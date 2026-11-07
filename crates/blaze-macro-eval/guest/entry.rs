@@ -5,9 +5,15 @@
 // module. It is written for every edition a macro crate may have, and allows no lint a crate
 // may forbid (`unsafe_code`): a crate's `#![forbid]` of one would make its `allow` an error.
 // Every edition means 2015 and 2018 too, whose prelude has no `TryFrom`: a trait the 2015
-// prelude lacks is named by its path (`<usize as std::convert::TryFrom<isize>>::try_from`),
-// never called as `usize::try_from`, which resolves to nothing there (serde_derive 1.0.214,
-// seq-macro, zerocopy-derive 0.7).
+// prelude lacks is named by its path
+// (`<usize as __blaze_std::convert::TryFrom<isize>>::try_from`), never called as
+// `usize::try_from`, which resolves to nothing there (serde_derive 1.0.214, seq-macro,
+// zerocopy-derive 0.7).
+//
+// It is written for a `#![no_std]` macro crate too (multiversion_no_op), whose extern prelude
+// has no `std` and whose prelude has no `Vec`, `String` or `Box`: std is reached only through
+// `__blaze_std`, the `extern crate std` of `__blaze_proc_macros`, never as `std` or `::std`,
+// and std's types the core prelude lacks are imported from it by name.
 //
 // The bridge's `Buffer`, `Closure` and `BridgeConfig` are private to `proc_macro`; their
 // `#[repr(C)]` layouts are mirrored here, as blaze's server checks them against the pinned
@@ -17,9 +23,10 @@
 #[doc(hidden)]
 #[allow(warnings, clippy::all)]
 pub mod __blaze_wasm_entry {
-    use std::{mem::ManuallyDrop, panic};
-
-    use super::listed;
+    use super::{
+        __blaze_std::{self, boxed::Box, mem::ManuallyDrop, panic, string::String, vec::Vec},
+        listed,
+    };
 
     #[link(wasm_import_module = "blaze_proc_macro")]
     unsafe extern "C" {
@@ -48,7 +55,7 @@ pub mod __blaze_wasm_entry {
         let mut dir = Vec::<u8>::new();
         loop {
             let len = unsafe { current_dir(dir.as_mut_ptr(), dir.capacity()) };
-            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return Ok(()) };
+            let Ok(len) = <usize as __blaze_std::convert::TryFrom<isize>>::try_from(len) else { return Ok(()) };
             if len <= dir.capacity() {
                 unsafe { dir.set_len(len) };
                 break;
@@ -56,7 +63,7 @@ pub mod __blaze_wasm_entry {
             dir.reserve_exact(len);
         }
         let dir = String::from_utf8(dir).map_err(|_| 0u32)?;
-        std::env::set_current_dir(dir).map_err(|error| error.raw_os_error().map_or(0, |errno| errno as u32 & 0xFF_FFFF))
+        __blaze_std::env::set_current_dir(dir).map_err(|error| error.raw_os_error().map_or(0, |errno| errno as u32 & 0xFF_FFFF))
     }
 
     /// libc's `getenv`, linked in place of wasi-libc's, which reads every variable through
@@ -65,12 +72,12 @@ pub mod __blaze_wasm_entry {
     /// is never freed, as C's `getenv` gives a pointer that outlives the call, and an instance
     /// lives for one expansion.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn getenv(name: *const std::ffi::c_char) -> *mut std::ffi::c_char {
-        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    pub unsafe extern "C" fn getenv(name: *const __blaze_std::ffi::c_char) -> *mut __blaze_std::ffi::c_char {
+        let name = unsafe { __blaze_std::ffi::CStr::from_ptr(name) }.to_bytes();
         let mut value = Vec::<u8>::new();
         loop {
             let len = unsafe { env_var(name.as_ptr(), name.len(), value.as_mut_ptr(), value.capacity()) };
-            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return std::ptr::null_mut() };
+            let Ok(len) = <usize as __blaze_std::convert::TryFrom<isize>>::try_from(len) else { return __blaze_std::ptr::null_mut() };
             if len <= value.capacity() {
                 unsafe { value.set_len(len) };
                 break;
@@ -110,7 +117,7 @@ pub mod __blaze_wasm_entry {
     }
 
     extern "C" fn drop(buffer: Buffer) {
-        std::mem::drop(unsafe { buffer.into_vec() });
+        __blaze_std::mem::drop(unsafe { buffer.into_vec() });
     }
 
     #[repr(C)]
@@ -189,10 +196,10 @@ pub mod __blaze_wasm_entry {
         }
         panic::set_hook(Box::new(hook));
         // SAFETY: `Client` is the bridge's `#[repr(C)]` struct of one `extern "C" fn` pointer.
-        let client: Client = unsafe { std::mem::transmute(client) };
+        let client: Client = unsafe { __blaze_std::mem::transmute(client) };
         let config = Config {
             input: Buffer::of(input),
-            dispatch: Closure { call, env: std::ptr::null_mut() },
+            dispatch: Closure { call, env: __blaze_std::ptr::null_mut() },
             force_show_panics: true,
         };
         let out = unsafe { (client.run)(config).into_vec() };
