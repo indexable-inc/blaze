@@ -1672,6 +1672,12 @@ impl Front<Real> for JobFront {
         say::refused(what, self.0.unit_of(unit).ok(), self.0.input.color)
     }
 
+    fn subject(&self, unit: usize) -> Option<(String, String)> {
+        let of = self.0.unit(unit).ok()?;
+        // alloc: a task span's names, once a phase task
+        Some((of.target.name.clone(), compile::span_unit(of)))
+    }
+
     fn script(&self, unit: usize, tags: u64) -> Result<UnitRuns, ApiError> {
         script::start(&self.0, unit, tags).map(UnitRuns::Script)
     }

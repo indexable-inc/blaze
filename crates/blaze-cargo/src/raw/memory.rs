@@ -181,6 +181,45 @@ pub fn purge_freed_pages() {
     unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
+// SAFETY: libsystem_malloc's `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t
+// goal)`, as <malloc/malloc.h> declares it (macOS 10.7 on): a null zone is every zone, a goal of
+// 0 is as much as each can give.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    // Undocumented (rule macos-private-apis): declared in <malloc/malloc.h> with no man page.
+    // The system zones (nano and scalable, which std, the C libraries blaze links and every
+    // `malloc` outside mimalloc use) keep freed pages until memory is short; this has them
+    // madvise those pages away now, which no documented call does. A purge before the plane
+    // refuses work or the guard ends the daemon (docs/v2/plan/admission-by-footprint.md).
+    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+}
+
+/// Has every malloc zone of the system give back the freed pages it keeps; the bytes they
+/// gave. The system's allocator only: mimalloc's are [`purge_freed_pages`]'.
+#[cfg(target_os = "macos")]
+pub fn relieve_system_zones() -> u64 {
+    // SAFETY: a null zone and a goal of 0 are the documented "every zone, all it can"; the call
+    // takes each zone's lock itself and touches no memory of the caller's.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) as u64 }
+}
+
+/// Gives back every freed page the process keeps that a purge can reach: each thread's
+/// mimalloc heaps on its next settle (`blaze_mem::tag::give_back_heap`) and the calling thread's
+/// now with what was abandoned (`mi_collect`), the warm chunks `blaze_mem` caches
+/// (`blaze_mem::chunks::trim`), and on macOS the system's malloc zones. On Linux each of these
+/// is `madvise(MADV_DONTNEED)` on the free spans, so the resident set falls at once. What admission
+/// does before it refuses work, and the guard before it ends the daemon at its ceiling
+/// (docs/v2/plan/admission-by-footprint.md).
+pub fn purge() {
+    let _span = tracing::info_span!(target: "blaze", "memory purge").entered();
+    blaze_mem::tag::give_back_heap();
+    #[cfg(feature = "native")]
+    purge_freed_pages();
+    blaze_mem::chunks::trim();
+    #[cfg(target_os = "macos")]
+    relieve_system_zones();
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
@@ -230,6 +269,23 @@ mod tests {
             "libSystem has no `memorystatus_control`, which the daemon's hard memory ceiling calls \
              (MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES)"
         );
+    }
+
+    /// The purge before a refusal or the ceiling rests on the undocumented
+    /// `malloc_zone_pressure_relief` (rule macos-private-apis): a macOS without it fails here,
+    /// by name, not in a daemon whose purge then links nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn malloc_zone_pressure_relief_is_in_libsystem() {
+        // SAFETY: `dlsym` reads the nul-terminated name and returns an address or null; nothing
+        // is called through it.
+        let found =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc_zone_pressure_relief".as_ptr()) };
+        assert!(
+            !found.is_null(),
+            "libSystem has no `malloc_zone_pressure_relief`, which the daemon's memory purge calls"
+        );
+        super::relieve_system_zones();
     }
 
     /// The limit's record is the kernel's `memorystatus_memlimit_properties_t`: four 32-bit

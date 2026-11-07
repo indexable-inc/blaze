@@ -176,8 +176,10 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 
 **Memory by task.**
 - `blaze explain task_memory build=N` shows, per task kind, the memory granted against the peak
-  held, and how many tasks went over their grant. A kind that is often over its grant has a
-  forecast that is too low.
+  held, how many tasks went over their grant and how many stayed under half of it. A kind that
+  is often over its grant has a forecast that is too low.
+- `blaze explain task_grants build=N` lists each task whose grant missed its peak (over, or
+  under half), worst first, with its crate and unit.
 - The whole-process line is the `live bytes` and `footprint bytes` counters
   (`blaze explain footprint_per_build`).
 - Single tasks: `SELECT function, node, granted_bytes, peak_bytes FROM spans WHERE build_id = 3

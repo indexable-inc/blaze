@@ -444,6 +444,13 @@ impl<S: Steps> plane::Work for Step<S> {
     type Value = Value<S>;
     type Readers = Readers<S>;
 
+    fn subject(&self, arg: u32) -> Option<(String, String)> {
+        match &self.does {
+            Does::Compile { front, .. } => front.subject(Phase::of(arg).0),
+            _ => None,
+        }
+    }
+
     fn run(&self, arg: u32, readers: Readers<S>) -> Option<Did<Value<S>>> {
         let at = arg as usize;
         let _span = match &self.does {

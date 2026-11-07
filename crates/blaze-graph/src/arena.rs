@@ -618,6 +618,16 @@ fn peak_of(account: Account) -> u64 {
     account.slot().map_or(0, |slot| u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
 }
 
+/// What `account`'s work held at most so far, while it is open: what a task has realized as it
+/// runs, read from another thread (the daemon's loop, for the plane's
+/// `PlaneInput::Realized`). `None` once it closed, so a task that ended is never read as
+/// another's whose account took its slot. Lock-free: one load of the slot's generation and one
+/// of its peak.
+pub fn peak_now(account: Account) -> Option<u64> {
+    let slot = account.slot()?;
+    Some(u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
+}
+
 /// Runs `f` in a new account, inside the job's account if it has one, and says the most bytes
 /// its work held at once through [`Counting`]: what it allocated less what it freed, on this
 /// job and on every job a pool scope of `f` ran ([`charged_to`]), wherever each ran and

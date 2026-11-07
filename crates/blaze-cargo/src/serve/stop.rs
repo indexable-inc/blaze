@@ -369,12 +369,26 @@ impl Memory {
             return;
         };
         self.unread = false;
+        let mut look = self.watch.look(footprint, ceiling);
+        let mut footprint = footprint;
+        if look == CeilingLook::Purge {
+            // Past the ceiling: what the allocators keep freed goes back first, and only a
+            // footprint still past it after that ends the daemon.
+            crate::raw::memory::purge();
+            footprint = crate::raw::memory::own_footprint().unwrap_or(footprint);
+            look = self.watch.look(footprint, ceiling);
+            tracing::warn!(
+                target: "blaze",
+                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after"
+            );
+        }
         let (at, of) = (Gib(footprint), Gib(ceiling));
-        let line = match self.watch.look(footprint, ceiling) {
+        let line = match look {
             CeilingLook::Under => return,
             CeilingLook::Near => NEAR,
             CeilingLook::Eased => EASED,
-            CeilingLook::Passed => passed(pid, footprint, ceiling),
+            // A purge gave back too little: the second look ends it.
+            CeilingLook::Purge | CeilingLook::Passed => passed(pid, footprint, ceiling),
         };
         // A crossing's line, once a crossing: written straight to stderr, which buffers nothing.
         tracing::warn!(

@@ -102,6 +102,7 @@ pub const VIEWS: &[View] = &[
     view("cycle_reruns", &[BUILD, LIMIT]),
     view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
     view("task_memory", &[BUILD]),
+    view("task_grants", &[BUILD, LIMIT]),
     view("admission_waits", &[BUILD, LIMIT]),
     view("busiest_threads", &[BUILD, LIMIT]),
     view("longest_gaps", &[BUILD, LIMIT]),
