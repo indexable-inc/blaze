@@ -1,0 +1,20 @@
+[package]
+name = "blaze-shader"
+description = "blaze's device backend for shaders and GPU kernels, MIR to naga IR (docs/future/gpu/shaders.md); so far the structurizer that turns a reducible control-flow graph into naga's if, loop, break and continue"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
