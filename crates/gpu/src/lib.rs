@@ -1,8 +1,9 @@
 //! Rust on the GPU, the shader side (docs/future/gpu/shaders.md): what a `#[gpu::vertex]` or
 //! `#[gpu::fragment]` function is written with, and the binding table its signature generates.
 //!
-//! - [`vec`]: `Vec2`, `Vec3`, `Vec4`, `UVec4`, `IVec2`, laid out as Metal's `float4` and the rest.
-//! - [`math`]: Slang's free functions under Slang's names (`lerp`, `smoothstep`, `saturate`, ...).
+//! - [`vec`]: `Vec2`, `Vec3`, `Vec4`, `UVec4`, `IVec2`, `IVec4`, laid out as Metal's `float4` and the rest.
+//! - [`math`]: Slang's free functions under Slang's names (`lerp`, `smoothstep`, `saturate`, `frac`,
+//!   `sign`, `asuint`, ...).
 //! - [`entry`]: built-ins ([`VertexIndex`], [`InstanceIndex`], [`Position`]), interpolation
 //!   ([`Flat`], [`Linear`]) and resources (`&T`, `&[T]`, [`Texture2d`], [`Sampler`]) as types; what
 //!   each is, through [`Param`] and [`Varying`]; and [`layout`], the one rule for slots.
@@ -29,8 +30,8 @@ pub use gpu_macros::{Pod, Varyings, fragment, vertex};
 pub mod prelude {
     pub use crate::entry::{Flat, InstanceIndex, Linear, Position, Sampler, Texture2d, VertexIndex};
     pub use crate::intrinsic::{discard, dpdx, dpdy, fwidth};
-    pub use crate::math::{dot, length, lerp, normalize, pow, saturate, smoothstep, step};
-    pub use crate::vec::{IVec2, UVec4, Vec2, Vec3, Vec4, ivec2, uvec4, vec2, vec3, vec4};
+    pub use crate::math::{asuint, dot, frac, length, lerp, normalize, pow, saturate, sign, smoothstep, step};
+    pub use crate::vec::{IVec2, IVec4, UVec4, Vec2, Vec3, Vec4, ivec2, ivec4, uvec4, vec2, vec3, vec4};
 }
 
 /// The crate's entry points, in one static at the crate root, `GPU_ENTRIES`: what a device build
