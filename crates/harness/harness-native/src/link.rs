@@ -13,7 +13,7 @@ use harness_native_model::{LinkState, Mailbox, Msg};
 use harness_proto::frame::{self, T_CBOR, T_DATA, T_EVENT};
 use harness_proto::event::ModelChoice;
 use harness_proto::msg::{Down, Reply, Request, RunReq, Up};
-use harness_proto::peek::{GhItem, GhRef, PageMeta, REFS_MAX};
+use harness_proto::peek::{GhChecks, GhItem, GhRef, PageMeta, REFS_MAX};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -342,13 +342,16 @@ pub struct Link {
     peeks: Arc<Mutex<Peeks>>,
 }
 
-/// The daemon's answers about chips' targets: a pull request's or issue's state by ref, a page's card by URL, what is
-/// being asked now (asked once at a time), and a revision that moves with each answer.
+/// The daemon's answers about chips' targets: a pull request's or issue's state by ref, a shown pull request's checks one
+/// by one, a page's card by URL, what is being asked now (asked once at a time), and a revision that moves with each
+/// answer.
 #[derive(Default)]
 pub struct Peeks {
     pub gh: BTreeMap<GhRef, GhItem>,
+    pub checks: BTreeMap<GhRef, GhChecks>,
     pub pages: BTreeMap<String, PageMeta>,
     pub asking_gh: std::collections::BTreeSet<GhRef>,
+    pub asking_checks: std::collections::BTreeSet<GhRef>,
     pub asking_pages: std::collections::BTreeSet<String>,
     pub rev: u64,
 }
@@ -704,6 +707,33 @@ impl Link {
                 drop(p);
                 wake();
             }
+        });
+    }
+
+    /// Ask the daemon after pull request `pr`'s checks one by one (`github_checks`) unless they are being asked now. The
+    /// answer lands in [`Peeks::checks`]; a failed request as checks whose error names the pull request and why.
+    pub fn checks(&self, pr: GhRef) {
+        if !self.peeks().asking_checks.insert(pr.clone()) {
+            return;
+        }
+        let (peeks, wake) = (self.peeks.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let failed = |why: String| GhChecks::failed(&pr, format!("{}#{}: {why}", pr.repo, pr.n));
+            let checks = match request(Request::GithubChecks { pr: pr.clone() }) {
+                Ok(Ok(Reply::GithubChecks { checks })) => checks,
+                Ok(Ok(r)) => failed(format!("the daemon answered github_checks with {r:?}")),
+                Ok(Err(e)) => failed(e),
+                Err(e) => failed(format!("no daemon: {e}")),
+            };
+            if !checks.error.is_empty() {
+                eprintln!("harness-native: github: {}", checks.error);
+            }
+            let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.asking_checks.remove(&pr);
+            p.checks.insert(pr, checks);
+            p.rev += 1;
+            drop(p);
+            wake();
         });
     }
 

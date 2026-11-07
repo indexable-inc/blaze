@@ -16,6 +16,12 @@
 //!   answers become `InlineLive` entities under `ui.inline.live` with `(InlineState, <state child>)` and
 //!   `(InlineMark, <mark>)`, which pick the chip's icon, ink and CI mark. A failed fetch leaves the chip in its unknown
 //!   state with the error, naming the repository and number, as its card's words and in the log.
+//! - Checks: an open pull request card whose rollup says running or failed asks after its checks one by one
+//!   (`github_checks`, [`App::ask_checks`]: as it opens, then every [`REASK`] seconds while one is unfinished). Its checks
+//!   line then says what is left (`2 of 9 running · 4m`, `1 failed`: chat/checks.rs), its mark breathing while anything
+//!   is unfinished (the frames that keep coming tick the times); with the pointer on that line, a list opens under it: a
+//!   row each check not passed (failed, running, queued), its step in progress and its time, and one row the rest fold
+//!   into. A row's press opens its log in the harness browser (`web:open:`, app/browser.rs).
 //! - Links: every `<Link>` in a shown chat (a link to a pull request or issue is that component already, harness-native-
 //!   ui-inline's `from_url`) has its page's card asked for once (`page_peek`, its favicon with it), at most
 //!   [`PAGES_MAX`] a chat, so its chip shows the favicon at rest (`InlineLive.picture`), the globe without one.
@@ -27,7 +33,8 @@ use harness_native_ui_inline::Tag;
 use harness_native_ui_look_api::Fill;
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
-use harness_proto::peek::{GhCi, GhItem, GhKind, GhRef, GhState, PageMeta};
+use super::checks;
+use harness_proto::peek::{GhCheckState, GhChecks, GhCi, GhItem, GhKind, GhRef, GhState, PageMeta};
 use std::collections::BTreeMap;
 
 /// How often a shown chat asks again after its pull requests' state (seconds; the daemon keeps answers a minute).
@@ -59,6 +66,9 @@ pub(super) struct Peek {
     urls: Vec<String>,
     asked: Option<f32>,
     focused: bool,
+    /// The pull request whose checks one by one the open card last asked after, and when (cleared as the card goes, so
+    /// each opening asks again past the daemon's few seconds' cache).
+    checks_asked: Option<(GhRef, f32)>,
     /// A path's first lines, by target, read once.
     files: BTreeMap<String, String>,
 }
@@ -129,12 +139,7 @@ impl App {
         self.sync_live(w);
         // The card first: the pointer on it is on no chip under it.
         let slot = pv.part("peek");
-        let card_id = slot.and_then(|s| s.part("card")).map(View::id);
-        let on_card = card_id.is_some_and(|card| {
-            w.entity_named(APP)
-                .target(Hovered::id(), 0)
-                .is_some_and(|h| std::iter::successors(Some(h), |n| n.parent()).take(64).any(|n| *n.id() == card))
-        });
+        let on_card = slot.and_then(|s| s.part("card")).is_some_and(|card| under_pointer(w, card));
         let chip = if focused && !on_card { self.chip_under(pv, rows) } else { None };
         // The hot chip: its node's InlineHot, kept since it was first under the pointer.
         let was = st.peek.hot.as_ref().map(|(c, _)| (c.node, c.index));
@@ -176,6 +181,9 @@ impl App {
             && let Some((c, _)) = st.peek.hot.as_ref().filter(|(c, _)| c.node == open.node && c.index == open.index)
         {
             open.rect = c.rect;
+        }
+        if st.peek.open.is_none() {
+            st.peek.checks_asked = None;
         }
         let Some(slot) = slot else { return };
         let open = st.peek.open.clone();
@@ -354,8 +362,15 @@ impl App {
         let mut lines: Vec<(&'static str, &'static str, Line)> = Vec::new(); // alloc: a handful of lines, while it is up
         let mut page_view = None;
         if let Some((r, _)) = gh_ref(w, tag) {
-            let item = self.link.peeks().gh.get(&r).cloned();
-            gh_lines(w, tag, &r, item.as_ref(), dark, &mut lines);
+            let (item, checks) = {
+                let p = self.link.peeks();
+                (p.gh.get(&r).cloned(), p.checks.get(&r).cloned())
+            };
+            self.ask_checks(st, &r, item.as_ref(), checks.as_ref());
+            // The checks' list opens while the pointer is on the state line or the list (one hit target, PeekState).
+            let open = card.part("state").is_some_and(|s| under_pointer(w, s));
+            let at = Checks { known: checks.as_ref(), open, now: unix_now() };
+            gh_lines(w, tag, &r, item.as_ref(), &at, dark, &mut lines);
         } else {
             // Relative paths from the session's directory, as a press opens them (chat_open_at).
             let home = std::env::var("HOME").unwrap_or_default();
@@ -415,25 +430,156 @@ impl App {
                     n.text(name);
                 }
             }
-            Line::State { label, ink, mark, checks } => {
-                if let Some(b) = v.part("badge") {
+            Line::State { label, ink, mark, checks, running, rows } => {
+                let top = v.part("top");
+                if let Some(b) = top.and_then(|t| t.part("badge")) {
                     set_if(b, *ink);
                     if let Some(l) = b.part("label") {
                         l.text(label);
                     }
                 }
-                if let Some(m) = v.part("mark") {
+                if let Some(m) = top.and_then(|t| t.part("mark")) {
                     let (g, f) = mark.clone().unwrap_or_default();
                     set_if(m, Icon { glyph: g.as_str().into() });
                     set_if(m, f);
+                    breathe(m, *running);
                 }
-                if let Some(c) = v.part("checks") {
+                if let Some(c) = top.and_then(|t| t.part("checks")) {
                     c.text(checks);
+                }
+                if let Some(list) = v.part("list") {
+                    view::for_each_of(list, rows.iter().map(|(k, p, r)| (k.as_str(), *p, r)), |rv, r, _| fill_check(rv, r));
                 }
             }
             Line::Image(path) => set_if(v, Picture { handle: path.as_str().into() }),
             Line::Page(key) => set_if(v, harness_native_ui_text_api::Surface { key: *key, cover: 1 }),
         });
+    }
+
+    /// A pull request's open card asks after its checks one by one while the rollup says some run or failed: once as it
+    /// opens, then every [`REASK`] seconds while a check is unfinished (or the rollup still says running, a push GitHub
+    /// has yet to list), and never for one whose checks all passed. One pull request at a time, only while its card
+    /// shows: the daemon's answer is bounded by [`harness_proto::peek::CHECKS_MAX`] checks.
+    fn ask_checks(&self, st: &mut ChatState, r: &GhRef, it: Option<&GhItem>, known: Option<&GhChecks>) {
+        let Some(it) = it.filter(|it| r.kind == GhKind::Pr && it.error.is_empty()) else { return };
+        if !matches!(it.ci, Some(GhCi::Pending | GhCi::Failure)) {
+            return;
+        }
+        let stale = it.ci == Some(GhCi::Pending) || known.is_none_or(|c| c.unfinished() || !c.error.is_empty());
+        let due = match &st.peek.checks_asked {
+            Some((asked, at)) if asked == r => stale && self.time - at >= REASK,
+            _ => stale || known.is_none(),
+        };
+        if due {
+            st.peek.checks_asked = Some((r.clone(), self.time));
+            self.link.checks(r.clone());
+        }
+    }
+}
+
+/// Whether the pointer is on `v` or something inside it (the app's `Hovered`, a hit node, and its ancestors).
+fn under_pointer(w: WorldRef<'_>, v: View<'_>) -> bool {
+    let id = v.id();
+    w.entity_named(APP)
+        .target(Hovered::id(), 0)
+        .is_some_and(|h| std::iter::successors(Some(h), |n| n.parent()).take(64).any(|n| *n.id() == id))
+}
+
+/// Seconds since the Unix epoch, the clock GitHub's check times are on.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// What a card knows of a pull request's checks one by one, whether its list is open, and the time to say them at.
+struct Checks<'a> {
+    known: Option<&'a GhChecks>,
+    open: bool,
+    now: i64,
+}
+
+/// One row of the checks' list.
+enum CheckRow {
+    /// A check not passed: its name, the step it is on, its time, the words of its tooltip, and its press's action.
+    Check { name: String, step: String, time: String, tip: String, action: String },
+    /// The passed and skipped ones, folded (`7 passed`).
+    Folded(String),
+    /// Why its checks could not be read, naming the pull request.
+    Why(String),
+}
+
+/// A check's row's prefab: its mark by its state.
+fn check_prefab(s: GhCheckState) -> &'static str {
+    match s {
+        GhCheckState::Failed => "hn.PeekCheckFailed",
+        GhCheckState::Running => "hn.PeekCheckRunning",
+        GhCheckState::Queued | GhCheckState::Passed | GhCheckState::Skipped => "hn.PeekCheckQueued",
+    }
+}
+
+/// The list's rows for `c` at `now`: a row each check not passed (in [`checks::listed`]'s order, keyed by its place in
+/// the answer so a row keeps its node while its state moves), then the folded rest; or why there are none.
+fn check_rows(c: &GhChecks, now: i64) -> Vec<(String, &'static str, CheckRow)> {
+    if !c.error.is_empty() {
+        return vec![("why".to_owned(), "hn.PeekMeta", CheckRow::Why(c.error.clone()))];
+    }
+    let mut rows: Vec<(String, &'static str, CheckRow)> = checks::listed(&c.checks)
+        .into_iter()
+        .map(|(j, k)| {
+            let step = if k.state == GhCheckState::Running { k.step.clone() } else { String::new() };
+            let tip = [k.workflow.as_str(), k.name.as_str(), step.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            let row = CheckRow::Check {
+                name: k.name.clone(),
+                step,
+                time: checks::elapsed(k, now).map(checks::clock).unwrap_or_default(),
+                tip,
+                action: if k.url.is_empty() { String::new() } else { format!("web:open:{}", k.url) },
+            };
+            (format!("c{j}"), check_prefab(k.state), row)
+        })
+        .collect();
+    if let Some(words) = checks::folded(&c.checks, c.total) {
+        rows.push(("rest".to_owned(), "hn.PeekChecksFolded", CheckRow::Folded(words)));
+    }
+    rows
+}
+
+/// Fill one row of the checks' list.
+fn fill_check(v: View<'_>, r: &CheckRow) {
+    match r {
+        CheckRow::Check { name, step, time, tip, action } => {
+            for (part, words) in [("name", name), ("step", step), ("time", time)] {
+                if let Some(p) = v.part(part) {
+                    p.text(words);
+                }
+            }
+            set_if(v, Tooltip { text: tip.as_str().into() });
+            set_if(v, Action { name: action.as_str().into() });
+        }
+        CheckRow::Folded(words) => {
+            if let Some(l) = v.part("label") {
+                l.text(words);
+            }
+        }
+        CheckRow::Why(words) => {
+            v.text(words);
+        }
+    }
+}
+
+/// The running dot's breath (`hn.chat_status.running`'s, src/look.rs) on mark `m` while a check runs, none once none
+/// does, so nothing moves on a card whose checks are done. The scene is compiled in, so a missing one is a bug.
+fn breathe(m: View<'_>, on: bool) {
+    use crate::look::Breath;
+    let e = m.entity();
+    match (on, e.has(Breath::id())) {
+        (true, false) => {
+            let running = view::prefab(e.world(), "hn.chat_status.running")
+                .and_then(|p| p.try_cloned::<&Breath>())
+                .unwrap_or_else(|| panic!("the scene's hn.chat_status.running has no Breath (scene/widgets/chat_status.flecs)"));
+            m.set(running);
+        }
+        (false, true) => _ = e.remove(Breath::id()),
+        _ => {}
     }
 }
 
@@ -446,7 +592,9 @@ enum Line {
     Site { glyph: String, ink: Option<Fill>, name: String },
     /// The header row of a page with a favicon (a local picture) and its site.
     Favicon { picture: String, name: String },
-    State { label: String, ink: Fill, mark: Option<(String, Fill)>, checks: String },
+    /// A pull request's or issue's state: its pill, its checks' mark (breathing while one runs) and words, and the rows
+    /// of its checks' list (empty while the list is shut).
+    State { label: String, ink: Fill, mark: Option<(String, Fill)>, checks: String, running: bool, rows: Vec<(String, &'static str, CheckRow)> },
     Image(String),
     /// The live view of the page, by its Media key (only once a browser host made one).
     Page(u64),
@@ -459,9 +607,10 @@ fn set_if<T: harness_native_flecs::prelude::ComponentId + Clone + PartialEq>(v: 
     }
 }
 
-/// A GitHub item's card: a header of its icon in its state's ink and `owner/repo #n`, its title, its state and checks,
-/// who and how much, its description's start. Before an answer: asking; after a failure: the error, naming it.
-fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bool, out: &mut Vec<(&'static str, &'static str, Line)>) {
+/// A GitHub item's card: a header of its icon in its state's ink and `owner/repo #n`, its title, its state and checks
+/// (what is left of them once they are known one by one, their list while it is open), who and how much, its
+/// description's start. Before an answer: asking; after a failure: the error, naming it.
+fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, at: &Checks<'_>, dark: bool, out: &mut Vec<(&'static str, &'static str, Line)>) {
     let (glyph, _) = vocab::icon(w, tag, dark);
     let component = match r.kind {
         GhKind::Pr => "PR",
@@ -494,14 +643,20 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, dark: bo
             let g = e.lookup_child("card")?.try_cloned::<&harness_native_ui_text_api::InlineRef>()?.glyph.as_str().to_owned();
             Some((g, e.try_cloned::<&Fill>()?))
         });
-        let checks = match it.ci {
-            Some(GhCi::Success) => "Checks passed",
-            Some(GhCi::Failure) => "Checks failed",
-            Some(GhCi::Pending) => "Checks running",
-            None if r.kind == GhKind::Pr => "No checks",
-            None => "",
+        // One by one once the daemon has them (asked only while some run or failed); until then the rollup's word.
+        let known = at.known.filter(|_| matches!(it.ci, Some(GhCi::Pending | GhCi::Failure)));
+        let checks = match (known.filter(|c| c.error.is_empty()), it.ci) {
+            (Some(c), _) => checks::summary(&c.checks, c.total, at.now),
+            (None, Some(GhCi::Success)) => "All checks passed".to_owned(),
+            (None, Some(GhCi::Failure)) => "Checks failed".to_owned(),
+            (None, Some(GhCi::Pending)) => "Checks running".to_owned(),
+            (None, None) if r.kind == GhKind::Pr => "No checks".to_owned(),
+            (None, None) => String::new(),
         };
-        out.push(("state", "hn.PeekState", Line::State { label: label.to_owned(), ink, mark, checks: checks.to_owned() }));
+        // The mark breathes while anything is unfinished: the frames that keep coming tick the times it shows.
+        let running = known.map_or(it.ci == Some(GhCi::Pending), GhChecks::unfinished);
+        let rows = known.filter(|_| at.open).map(|c| check_rows(c, at.now)).unwrap_or_default();
+        out.push(("state", "hn.PeekState", Line::State { label: label.to_owned(), ink, mark, checks, running, rows }));
     }
     let mut meta = Vec::new(); // alloc: a line's parts, while it is up
     if !it.author.is_empty() {
