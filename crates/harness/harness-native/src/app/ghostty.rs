@@ -1,15 +1,16 @@
-//! The user's Ghostty config, live (crates/harness/harness-ghostty-config): the terminal's colours, font and padding, and the
-//! tokens that sit on the terminal's ground (the main card, the title bar's inks, the sidebar's tint, the plates),
-//! derived from the theme's ground and ink for each appearance whose theme sets a background, and the selection plate in its
-//! selection-background. Where nothing is set the scene's tokens and the built-in theme stay.
+//! The user's Ghostty config, live (crates/harness/harness-ghostty-config): the terminal's colours, font and padding, the
+//! terminal's ground (`tone_term_ground`, under a terminal pane's grid) from the theme's background for each appearance whose
+//! theme sets one, and the selection plate in its selection-background. Where nothing is set the scene's tokens and the
+//! built-in theme stay. The app's own surfaces (the sidebar, the main card, the cards, menus and inks) are the scene's theme
+//! (scene/00-tokens.flecs) and never follow Ghostty: one theme, whatever the terminal is painted in.
 use super::*;
 
 /// The terminal's padding when the config sets none (points: left, right, top, bottom).
 const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
-/// The `export mut` tokens (scene/00-tokens.flecs) on the terminal's ground that follow the theme, in [`derived`]'s order:
-/// the plates, the main card's ground, the overlays' cards, the sidebar's tint, the ink and the muted ink over the ground.
-const TOKENS: [&str; 6] = ["tone_plate", "tone_term_ground", "tone_card", "tone_side_tint", "tone_term_ink", "tone_term_muted"];
+/// The `export mut` tokens (scene/00-tokens.flecs) that follow the Ghostty theme, in [`derived`]'s order: the terminal's
+/// ground, alone.
+const TOKENS: [&str; 1] = ["tone_term_ground"];
 
 /// Each `code_ink` capture (scene/00-tokens.flecs) and the ANSI colour a themed appearance colours it with, as editors
 /// that follow the terminal's palette do: keywords magenta, functions blue, types yellow, strings green, numbers and
@@ -67,24 +68,9 @@ fn rgba(v: term::Rgba) -> Rgba {
     Rgba { r: v[0], g: v[1], b: v[2], a: v[3] }
 }
 
-fn alpha(mut c: term::Rgba, a: f32) -> term::Rgba {
-    c[3] = a;
-    c
-}
-
-fn mix(a: term::Rgba, b: term::Rgba, t: f32) -> term::Rgba {
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, 1.0]
-}
-
-/// Each of [`TOKENS`]'s colour from theme `t` in one appearance (`dark` picks the light or dark variant of the rule).
-fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 6] {
-    let ground = t.bg;
-    // The overlays' cards (the palette's, the picker's) a touch off the ground: toward the ink in the dark, toward white in the light.
-    let card = if dark { mix(t.bg, t.fg, 0.04) } else { mix(t.bg, [1.0; 4], 0.6) };
-    let side = t.bg;
-    let ink = alpha(t.fg, 0.92);
-    let muted = alpha(t.fg, if dark { 0.5 } else { 0.55 });
-    [ground, ground, card, side, ink, muted]
+/// Each of [`TOKENS`]'s colour from theme `t` in one appearance: the terminal's ground is the theme's background.
+fn derived(t: &term::Theme) -> [term::Rgba; 1] {
+    [t.bg]
 }
 
 /// Token `token`'s value (`export mut`), None when the scene has no such token or it is not a Fill.
@@ -203,9 +189,8 @@ impl App {
         self.poke();
     }
 
-    /// The tokens on the terminal's ground from each appearance's theme where it sets a background (`themed`: light,
-    /// dark), else the scene's: the main card and the plates in its ground, the title bar's ink and muted ink in its
-    /// foreground, the sidebar's tint its ground part see-through.
+    /// The terminal's ground from each appearance's theme where it sets a background (`themed`: light, dark), else the
+    /// scene's; and code's colours from its ANSI palette likewise.
     fn tint_tokens(&mut self, themed: [bool; 2]) {
         let w = self.world.world_ref();
         let scene = self
@@ -213,7 +198,7 @@ impl App {
             .scene
             .get_or_insert_with(|| TOKENS.map(|t| token(w, t).unwrap_or_default()).to_vec());
         let [l, d] = &self.look.themes;
-        let (dl, dd) = (derived(l, false), derived(d, true));
+        let (dl, dd) = (derived(l), derived(d));
         for (i, name) in TOKENS.iter().enumerate() {
             let s = scene[i];
             let f = Fill {

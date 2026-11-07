@@ -303,7 +303,7 @@ pub struct App {
     browser: browser::Browser,
 }
 
-/// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
+/// The fill of the theme's role `name` (`success`: `hn.Theme.success`).
 fn tone(w: WorldRef<'_>, name: &str) -> Fill {
     crate::look::tone(w, name)
 }
@@ -714,11 +714,11 @@ impl App {
         let w = self.world.world_ref();
         let code = w.entity_from_id(e).try_cloned::<&model::ExitCode>().map(|c| c.code);
         match self.status_of(e) {
-            "running" => tone(w, "running"),
-            "lost" => tone(w, "lost"),
-            "killed" => tone(w, "failed"),
-            _ if code.is_some_and(|c| c != 0) => tone(w, "failed"),
-            _ => tone(w, "exited"),
+            "running" => tone(w, "success"),
+            "lost" => tone(w, "warning"),
+            "killed" => tone(w, "error"),
+            _ if code.is_some_and(|c| c != 0) => tone(w, "error"),
+            _ => tone(w, "ink_faint"),
         }
     }
 
@@ -1419,7 +1419,7 @@ impl App {
         }
         let entries = self.entries();
         let at = at.min(entries.len().saturating_sub(1));
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selection"));
         if let Some(items) = card.and_then(|c| c.part("items")) {
             let rows = entries
                 .into_iter()
@@ -1437,7 +1437,7 @@ impl App {
                         PalGlyph::Kind(k) => crate::look::kind_mark(w, p.entity(), &k),
                         PalGlyph::Char(c) => {
                             crate::look::show_glyph(p.entity(), c);
-                            set_if(p, tone(w, "muted"));
+                            set_if(p, tone(w, "ink_muted"));
                         }
                     }
                 }
@@ -2377,10 +2377,10 @@ impl RowLooks {
         Self {
             clear,
             accent: tone(w, "accent"),
-            failed: tone(w, "failed"),
-            failed_wash: tone(w, "failed_wash"),
-            faint: tone(w, "faint"),
-            lost: tone(w, "lost"),
+            failed: tone(w, "error"),
+            failed_wash: tone(w, "error_wash"),
+            faint: tone(w, "ink_faint"),
+            lost: tone(w, "warning"),
             badge_on: crate::look::padding(w, "badge_on"),
         }
     }
@@ -2588,5 +2588,102 @@ mod tests {
             let path = format!("{}::{e}", harness_native_render::inline::MODULE);
             assert!(w.try_lookup(&path).is_some(), "the scene has no {path}");
         }
+        // The theme's colour roles (scene/00-tokens.flecs's `tone_<role>`, scene/widgets/theme.flecs's children): each has
+        // a Fill, so the roles the code names (look::tone panics on a missing one) are all there.
+        for role in [
+            "ground", "sidebar", "card", "raised", "well", "term_ground", "line", "line_strong", "ink_strong", "ink",
+            "ink_muted", "ink_faint", "hover", "wash", "selection", "selection_focus", "press", "scrim", "clear",
+            "text_selection", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
+            "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell",
+        ] {
+            let _ = crate::look::tone(w, role);
+        }
+    }
+
+    /// The colour of a brace `{...}` at the start of `s` when it is a colour literal: four plain numbers (`{0.1, 0.1,
+    /// 0.1, 1}`) or four named `r`, `g`, `b`, `a` (`{r: 1, g: 1, b: 1, a: 1}`). A Padding's `{l, r, t, b}` is not one.
+    fn colour_literal(s: &str) -> bool {
+        let Some(body) = s.strip_prefix('{').and_then(|b| b.split_once('}')).map(|(b, _)| b) else { return false };
+        let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+        if parts.len() != 4 {
+            return false;
+        }
+        let num = |p: &str| p.parse::<f32>().is_ok();
+        parts.iter().all(|p| num(p))
+            || parts.iter().zip(["r", "g", "b", "a"]).all(|(p, k)| {
+                p.split_once(':').is_some_and(|(name, v)| name.trim() == k && num(v.trim()))
+            })
+    }
+
+    /// One theme: no colour is chosen anywhere but the theme. Outside the tokens files (harness-native's
+    /// scene/00-tokens.flecs, which holds the theme's roles and the palettes; harness-video's tokens.flecs, its mirror)
+    /// and Kip's artwork (kip.flecs: a character's own paint, not a surface), no scene script writes a colour literal, and
+    /// no Rust in this crate builds an `Rgba` from numbers: each names a role (`Fill: $tone_card`, `look::tone(w, "card")`).
+    /// `cargo test -p harness-native no_raw_colours`.
+    #[test]
+    fn no_raw_colours() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let roots = [
+            here.join("scene"),
+            here.join("src"),
+            here.join("../harness-native-ui-prims/scene"),
+            here.join("../harness-video/scene"),
+        ];
+        let allowed = [
+            "harness-native/scene/00-tokens.flecs",
+            "harness-video/scene/tokens.flecs",
+            "harness-native-ui-prims/scene/kip.flecs",
+        ];
+        let mut files = Vec::new();
+        let mut dirs: Vec<std::path::PathBuf> = roots.to_vec();
+        while let Some(d) = dirs.pop() {
+            let entries = std::fs::read_dir(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+            for entry in entries {
+                let p = entry.unwrap_or_else(|e| panic!("{}: {e}", d.display())).path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "flecs" || x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        assert!(files.iter().any(|f| f.ends_with("scene/widgets/frame.flecs")), "found no scene scripts under {roots:?}");
+        let mut bad = Vec::new();
+        for f in files.iter().filter(|f| !allowed.iter().any(|a| f.ends_with(a))) {
+            let src = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            let rust = f.extension().is_some_and(|x| x == "rs");
+            for (i, line) in src.lines().enumerate() {
+                // A Rust file's tests (at its end) may build what they check.
+                if rust && line.trim_start().starts_with("#[cfg(test)]") {
+                    break;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                let hit = if rust {
+                    code.match_indices("Rgba {").any(|(at, _)| colour_literal(&code[at + "Rgba ".len()..]))
+                } else {
+                    code.match_indices('{').any(|(at, _)| colour_literal(&code[at..]))
+                };
+                if hit {
+                    bad.push(format!("{}:{}: {}", f.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a colour outside the theme (name a role: a scene's `$tone_<role>`, Rust's `look::tone(w, \"<role>\")`; add a \
+             role to scene/00-tokens.flecs and hn.Theme if none fits):\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The raw-colour check sees both literal shapes and lets a Padding by.
+    #[test]
+    fn colour_literals() {
+        assert!(colour_literal("{0.063, 0.063, 0.067, 1}"));
+        assert!(colour_literal("{r: 1, g: 0.5, b: 0, a: 1}}"));
+        assert!(!colour_literal("{l: 0, r: 0, t: 0, b: 0}"));
+        assert!(!colour_literal("{dark: $tone_line.dark, light: $tone_line.light}"));
+        assert!(!colour_literal("{w: 1, h: 2}"));
     }
 }

@@ -14,19 +14,19 @@ module ui.inline
 @tree ChildOf
 // What every chip shares: its icon's ink (quiet: the label carries the meaning) and its corners.
 look {
-  Fill: $tone_ink_3
+  Fill: $tone_ink_muted
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
 }
 // The chip under the pointer (a brighter plate, its label underlined) and held down (brighter still); the pointer is
 // the pointing hand over any chip that opens.
 hover {
-  Fill: $tone_inline_hover
+  Fill: $tone_selection_focus
 }
 pressed {
-  Fill: $tone_inline_pressed
+  Fill: $tone_press
 }
 underline {
-  Fill: $tone_inline_underline
+  Fill: $tone_ink_faint
 }
 // What the host knows of live components: one InlineLive child a thing (src/app/chat/peek.rs keeps them).
 live {
@@ -96,7 +96,7 @@ PR {
   // Not asked yet, or the fetch failed (its error is the tooltip): the plain icon, quiet, no mark.
   unknown {
     InlineRef: {glyph: ""}
-    Fill: $tone_ink_3
+    Fill: $tone_ink_muted
   }
 }
 // A GitHub issue, `<Issue repo="indexable-inc/ix" n={812}/>`: open green, closed (completed) purple, closed as not
@@ -120,7 +120,7 @@ Issue {
   }
   unknown {
     InlineRef: {glyph: ""}
-    Fill: $tone_ink_3
+    Fill: $tone_ink_muted
   }
 }
 // A tag with no entity here, or whose target is not a place: a warning icon, the error as its tooltip, no press.

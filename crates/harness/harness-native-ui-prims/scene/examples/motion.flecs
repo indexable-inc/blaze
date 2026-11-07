@@ -13,7 +13,7 @@ ex {
   prefab Selection : ui.Node {
     Background
     MatchedGeometry: {id: "ex.selection"}
-    Fill: $tone_select
+    Fill: $tone_selection
     Shape: {radius: 6, n: 4, border: 0, feather: 0}
   }
 

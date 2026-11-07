@@ -15,7 +15,7 @@ hn {
   // pane laid out at its full width from the clip's left edge.
   prefab WebClip : ui.Row {
     Clip
-    Fill: $tone_term_ground
+    Fill: $tone_ground
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     seam : hn.Seam {}
@@ -34,7 +34,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $web_url_h, min: 0, max: 0}}
     Padding: {l: 10, r: 10, t: 0, b: 0}
     text : ui.LineMiddle {
-      Fill: $tone_term_ink
+      Fill: $tone_ink
       TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
     }
   }
@@ -64,7 +64,7 @@ hn {
       close : hn.WebButton { Action: {name: "web:close"}; Tooltip: {text: "Close"} }
     }
     load : ui.Node {
-      Fill: $tone_browser_load
+      Fill: $tone_accent
       Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_browser_load, min: 0, max: 0}}
     }
     page : ui.Browser {

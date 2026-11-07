@@ -1,32 +1,76 @@
 // harness-native's tokens: the names den's primitives (harness-native-ui-prims, prims.flecs) read, and the app's own.
-// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws, in a native macOS look:
-// the window and sidebar are clear over an NSVisualEffectView (material .sidebar), so the sidebar's inks are vibrant
-// labels (white at an alpha in the dark appearance, black at an alpha in the light one, as AppKit's label colours are)
-// rather than fixed greys; the main card is an opaque plate in the terminal's ground. Colours are sRGB 0..1, `{r, g, b,
-// a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
+// After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws. Colours are sRGB 0..1,
+// `{r, g, b, a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
 
-// The blaze site's palette (site/styles/tokens.css, the ix docs' .site ladder; https://ix.dev/blaze/learn/builds): the
-// one source the app's grounds, inks, hairlines and inline code take their colours from. Each token is the site variable
-// of its name, dark from :root and light from its prefers-color-scheme: light block, as sRGB 0..1.
-// --bg (--g-1), --bg-2 (--g-2), --bg-3 (--g-3), --bg-4 (--g-4): the page and its surfaces, a near-black ladder.
-export const tone_site_bg: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.949, 0.945, 0.933, 1}}
-export const tone_site_bg_2: Fill = {dark: {0.078, 0.078, 0.082, 1}, light: {0.918, 0.914, 0.894, 1}}
-export const tone_site_bg_3: Fill = {dark: {0.098, 0.098, 0.102, 1}, light: {0.965, 0.961, 0.949, 1}}
-export const tone_site_bg_4: Fill = {dark: {0.122, 0.122, 0.125, 1}, light: {0.886, 0.882, 0.863, 1}}
-// --code-bg: a code block's and a card's plate (dark: --g-2 70% over --g-1).
-export const tone_site_code_bg: Fill = {dark: {0.074, 0.074, 0.078, 1}, light: {0.922, 0.918, 0.898, 1}}
-// --line (--g-5), --line-2 (--g-6): a card's hairline, and the stronger one.
-export const tone_site_line: Fill = {dark: {0.157, 0.157, 0.165, 1}, light: {0.863, 0.859, 0.835, 1}}
-export const tone_site_line_2: Fill = {dark: {0.200, 0.200, 0.208, 1}, light: {0.804, 0.800, 0.776, 1}}
-// --ink-1 (strong: headings, bold), --ink-2 (body), --ink-3 (muted), --ink-4 (faint: a list's markers).
-export const tone_site_ink_1: Fill = {dark: {0.922, 0.918, 0.902, 1}, light: {0.086, 0.086, 0.090, 1}}
-export const tone_site_ink_2: Fill = {dark: {0.702, 0.698, 0.686, 1}, light: {0.275, 0.275, 0.290, 1}}
-export const tone_site_ink_3: Fill = {dark: {0.529, 0.525, 0.518, 1}, light: {0.420, 0.416, 0.431, 1}}
-export const tone_site_ink_4: Fill = {dark: {0.341, 0.341, 0.353, 1}, light: {0.635, 0.631, 0.616, 1}}
-// --s-tint: --ink-1 at 6%, inline code's plate (base.css `.doc :not(pre) > code`).
-export const tone_site_tint: Fill = {dark: {0.922, 0.918, 0.902, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
-// --doc-code-ink: inline code's red-coral ink (Blocks.svelte's), in the code face.
-export const tone_site_code_ink: Fill = {dark: {1.0, 0.451, 0.412, 1}, light: {0.922, 0.341, 0.341, 1}}
+// ---- The theme: the one place a colour is chosen ----
+// Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
+// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). The values are the blaze site's palette
+// (site/styles/tokens.css, the ix docs' .site ladder; https://ix.dev/blaze/learn/builds), dark from its :root and light
+// from its prefers-color-scheme: light block. Another look is another set of these values; nothing else changes. The
+// scene test `no_raw_colours` (src/app.rs) fails on a colour literal anywhere but here and the palettes below.
+//
+// Grounds, darkest to most lifted:
+// - ground: the window and the main card under every pane (--bg, #101011 / #f2f1ee).
+// - sidebar: the sidebar. The same ground as the main card, divided from it by one `line` hairline (hn.Seam), as Linear
+//   and Notion do: one dark field, never a lighter slab beside it.
+// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (--bg-3).
+// - raised: what floats over everything: menus, popovers, hover cards, a user's bubble (dark --bg-4; light --bg-3, so a
+//   popover lifts toward the light on the paper ground).
+// - well: what is sunk into a surface: a field, a code block, a rename field (--code-bg).
+// - term_ground: the terminal's own ground, under a terminal pane's grid only; the one role the user's Ghostty theme sets
+//   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is --bg in both.
+export const tone_ground: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.949, 0.945, 0.933, 1}}
+export const tone_sidebar: Fill = $tone_ground
+export const tone_card: Fill = {dark: {0.098, 0.098, 0.102, 1}, light: {0.965, 0.961, 0.949, 1}}
+export const tone_raised: Fill = {dark: {0.122, 0.122, 0.125, 1}, light: {0.965, 0.961, 0.949, 1}}
+export const tone_well: Fill = {dark: {0.075, 0.075, 0.078, 1}, light: {0.922, 0.918, 0.898, 1}}
+export mut tone_term_ground: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.063, 0.063, 0.067, 1}}
+// Lines: a hairline (a card's edge, a rule, the sidebar's seam; --line) and the stronger one (a floating plate's edge, a
+// control's track or outline; --line-2).
+export const tone_line: Fill = {dark: {0.157, 0.157, 0.165, 1}, light: {0.863, 0.859, 0.835, 1}}
+export const tone_line_strong: Fill = {dark: {0.200, 0.200, 0.208, 1}, light: {0.804, 0.800, 0.776, 1}}
+// Inks: strong (titles, headings, a selected row, bold), the body, muted (secondary words, icons at rest), faint (meta,
+// markers, a placeholder, what has ended); --ink-1..4.
+export const tone_ink_strong: Fill = {dark: {0.922, 0.918, 0.902, 1}, light: {0.086, 0.086, 0.090, 1}}
+export const tone_ink: Fill = {dark: {0.702, 0.698, 0.686, 1}, light: {0.275, 0.275, 0.290, 1}}
+export const tone_ink_muted: Fill = {dark: {0.529, 0.525, 0.518, 1}, light: {0.420, 0.416, 0.431, 1}}
+export const tone_ink_faint: Fill = {dark: {0.341, 0.341, 0.353, 1}, light: {0.635, 0.631, 0.616, 1}}
+// Washes: the strong ink at an alpha, so they read on any ground. Hover (a row's, a button's), wash (a resting plate,
+// inline code's: --s-tint), selection (the selected row's pill), selection_focus (the same while its list has the
+// keyboard, a menu's highlighted item), press (held). A scrim dims what is under a sheet.
+export const tone_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.045}, light: {0.086, 0.086, 0.090, 0.04}}
+export const tone_wash: Fill = {dark: {0.922, 0.918, 0.902, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
+export const tone_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.07}, light: {0.086, 0.086, 0.090, 0.06}}
+export const tone_selection_focus: Fill = {dark: {0.922, 0.918, 0.902, 0.10}, light: {0.086, 0.086, 0.090, 0.085}}
+export const tone_press: Fill = {dark: {0.922, 0.918, 0.902, 0.13}, light: {0.086, 0.086, 0.090, 0.11}}
+export const tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.14}}
+export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+// Selected text's plate (ui.selection; every surface's, the terminal's too): the strong ink at 22% (18% on the paper).
+export const tone_text_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.18}}
+// The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
+// match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
+export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_accent_wash: Fill = {dark: {0.580, 0.600, 1.0, 0.24}, light: {0.369, 0.384, 0.902, 0.18}}
+export const tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+export const tone_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.137, 0.514, 0.886, 1}}
+export const tone_code_ink: Fill = {dark: {1.0, 0.451, 0.412, 1}, light: {0.922, 0.341, 0.341, 1}}
+// States, colour that carries meaning only: success (running, passed; --ok), warning (lost, pending), error (failed,
+// killed; --danger), each with a faint wash for a plate behind words in it.
+export const tone_success: Fill = {dark: {0.298, 0.761, 0.478, 1}, light: {0.169, 0.541, 0.310, 1}}
+export const tone_warning: Fill = {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
+export const tone_error: Fill = {dark: {1.0, 0.443, 0.408, 1}, light: {0.769, 0.200, 0.165, 1}}
+export const tone_success_wash: Fill = {dark: {0.298, 0.761, 0.478, 0.15}, light: {0.169, 0.541, 0.310, 0.11}}
+export const tone_warning_wash: Fill = {dark: {0.949, 0.733, 0.322, 0.15}, light: {0.78, 0.55, 0.10, 0.12}}
+export const tone_error_wash: Fill = {dark: {1.0, 0.443, 0.408, 0.14}, light: {0.769, 0.200, 0.165, 0.10}}
+// Controls' parts: a switch's or slider's knob (a light disc in both appearances), an overlay scroller's knob and the
+// faint track it widens over (ui.Scroller; AppKit's).
+export const tone_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export const tone_scroller_knob: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.20}}
+export const tone_scroller_track: Fill = {dark: {0.922, 0.918, 0.902, 0.04}, light: {0.086, 0.086, 0.090, 0.03}}
+
+// ---- Palettes: colours that name a thing, not a surface ----
+// A kind's icon, a brand mark, a file type, a chart series, a GitHub state, code by capture, the colour well's hues and
+// F3's overlay. Each is data (which thing this is), so it is not a role; it still lives only in this file.
 
 // Type: macOS sidebar sizes in Inter. Rows 13, runs 12, section labels 11, a run's command in the code face 11.5.
 export const size_caption = 11
@@ -55,7 +99,7 @@ export const disclose_w = 18
 // starts its chevron gutter (tree_gutter wide) tree_pad in from its left edge plus indent_step a level, so a child's
 // chevron sits under its parent's title (gutter and step are equal) and the title column never moves; then its title,
 // tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
-// about 7.5 tall), shown in tone_chevron where the row has rows under it (folded, it holds what finished). tree_icon is
+// about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
 // the Archive button's glyph box.
 export const tree_row_h = 30
 export const tree_run_h = 24
@@ -221,7 +265,7 @@ export const overlay_lift_dy = 8
 // Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
 // least menu_min_w, at most menu_max_w), menu_pad in from its edge, hung menu_gap off what opened it, its shadow
 // menu_lift_*; it opens growing from menu_in_scale out of that edge and fading in, on the menu spring. An item is
-// menu_item_h tall at size_menu, its highlight a pill menu_item_radius round in tone_menu_hot (on the hover spring);
+// menu_item_h tall at size_menu, its highlight a pill menu_item_radius round in tone_selection_focus (on the hover spring);
 // a ticked item's check sits in the leading gutter (menu_gutter_l in, menu_check across, menu_gutter_gap before the
 // label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
 // muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
@@ -254,11 +298,6 @@ export const menu_caret_w = 1.5
 export const size_menu = 13
 export const line_menu = 16
 export const size_menu_head = 11
-export const tone_menu: Fill = {dark: {0.157, 0.157, 0.169, 1}, light: {0.988, 0.988, 0.992, 1}}
-export const tone_menu_edge: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.11}}
-export const tone_menu_hot: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.07}}
-export const tone_menu_press: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.11}}
-export const tone_menu_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.09}}
 // The palette: a wide card near the window's top, its query line, its entries.
 export const palette_w = 560
 export const palette_top = 96
@@ -284,108 +323,34 @@ export const radius_card = 12
 export const radius_bubble = 12
 export const bubble_max_w = 480
 
-// Vibrant labels: primary, secondary, tertiary, quaternary.
-export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
-export const tone_ink_2: Fill = {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
-export const tone_ink_3: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
-export const tone_ink_4: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-// A field's placeholder (ui.TextArea's hint, a search menu's, a cell's fields'): clearly a hint, well under the words.
-export const tone_hint: Fill = {dark: {1, 1, 1, 0.24}, light: {0, 0, 0, 0.26}}
-export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
-
-export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
-export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
-export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
-// An icon button (ui.IconButton) has no plate: its glyph rests in tone_icon_rest and eases to tone_icon_hover under the
-// pointer (tone_icon_on while what it opens is open); held, it scales to icon_press_scale and dims to icon_press_dim, and
+// An icon button (ui.IconButton) has no plate: its glyph rests in tone_ink_muted and eases to tone_ink_strong under the
+// pointer (tone_accent while what it opens is open); held, it scales to icon_press_scale and dims to icon_press_dim, and
 // springs back on the press spring (a little under-damped, so the release has a touch of give).
-export const tone_icon_rest: Fill = $tone_ink_3
-export const tone_icon_hover: Fill = $tone_ink_1
-export const tone_icon_on: Fill = $tone_accent
 export const icon_press_scale = 0.92
 export const icon_press_dim = 0.7
 export const spring_press_omega = 38
 export const spring_press_zeta = 0.62
-// An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
-// black over a light one (a scroll on the terminal's ground follows its Scheme).
-export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
-export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
-// The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_select: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
-// The tree's rows (hn.ObjRow, hn.RunRow), in the chat's Notion palette (tone_chat_*: white at an alpha on the dark
-// ground, Notion's warm ink on the light one): a title's ink while live, selected, and once it ended (quieter, so what
-// is live reads first); a run's command; the trailing words (how long ago, how long it took) and, when it went wrong
-// (an exit code, killed, lost), those words in a softened red: the one colour, and only where it means something. The
-// hover wash, softer than the selection (tone_row_select, Notion's neutral pill); the selection while the tree has the
-// keyboard (a step brighter, still neutral: the accent stays for what is pressable); the disclosure chevron.
-export const tone_row: Fill = {dark: {1, 1, 1, 0.80}, light: {0.216, 0.208, 0.184, 0.86}}
-export const tone_row_on: Fill = {dark: {1, 1, 1, 0.94}, light: {0.216, 0.208, 0.184, 1}}
-export const tone_row_done: Fill = {dark: {1, 1, 1, 0.50}, light: {0.216, 0.208, 0.184, 0.55}}
-export const tone_row_run: Fill = {dark: {1, 1, 1, 0.56}, light: {0.216, 0.208, 0.184, 0.62}}
-export const tone_row_meta: Fill = {dark: {1, 1, 1, 0.30}, light: {0.216, 0.208, 0.184, 0.38}}
-export const tone_row_alarm: Fill = {dark: {1.0, 0.45, 0.43, 0.78}, light: {0.84, 0.22, 0.20, 0.82}}
-export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0.216, 0.208, 0.184, 0.04}}
-export const tone_row_select: Fill = {dark: {1, 1, 1, 0.07}, light: {0.216, 0.208, 0.184, 0.06}}
-export const tone_select_focus: Fill = {dark: {1, 1, 1, 0.10}, light: {0.216, 0.208, 0.184, 0.085}}
-export const tone_chevron: Fill = {dark: {1, 1, 1, 0.32}, light: {0.216, 0.208, 0.184, 0.38}}
-// A row whose name is being renamed (cmd+R): its pill becomes the field's ground, a step past the focused selection in
-// the dark and the paper white of a macOS field in the light, so the words under the caret read as typed into a field.
-export const tone_rename_field: Fill = {dark: {1, 1, 1, 0.14}, light: {1, 1, 1, 0.96}}
-// The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
-// Built in, dark: the site's --bg (tone_site_bg), as the terminal's ground is.
-export mut tone_side_tint: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.965, 0.965, 0.970, 1}}
-// The one hairline between the sidebar and the main card.
-export const tone_seam: Fill = {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
-// Nothing: a node that paints no fill.
-export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
-// The palette's scrim over the window and its card.
-export const tone_scrim: Fill = {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
-// Built in, dark: the site's --bg-3 (tone_site_bg_3), a step over the ground.
-export mut tone_card: Fill = {dark: {0.098, 0.098, 0.102, 1}, light: {1, 1, 1, 1}}
-// Offscreen shots only (src/shot.rs): a flat stand-in for the sidebar's vibrancy, which a texture cannot sample.
-export const tone_shot_ground: Fill = {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
-export mut tone_plate: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {1, 1, 1, 1}}
-export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
-export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
-// With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
-// ground are set at runtime from each appearance's theme background and foreground: tone_term_ground (hn.Main),
-// tone_term_ink and tone_term_muted (the words on it: the title bar's, the chat's), tone_plate (Plate), tone_card (the
-// palette's and the picker's cards) and tone_side_tint (hn.SideClip); every Fill copied from one follows it. The values here are the built-in theme's, kept for an appearance the config does not theme.
-// The terminal's ground (the built-in theme's bg, the site's --bg #101011, harness-ghostty-config's BUILTIN_BG): the main
-// card and the title bar over it, in both appearances.
-export mut tone_term_ground: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.063, 0.063, 0.067, 1}}
-// Ink over the terminal's ground (the built-in theme's is dark): the title bar's and the chat's words.
-export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
-export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
-export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
-export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
-export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
-export const tone_lost: Fill = {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
-
-// The cute touch: a small warm colour per kind on its icon.
+// The cute touch: a small warm colour per kind on its icon (a shell's is the muted ink, hn.Theme.kind_shell).
 export const tone_kind_claude: Fill = {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
 export const tone_kind_codex: Fill = {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
 export const tone_kind_cursor: Fill = {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
-export const tone_kind_shell: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
 
 // The brand marks' fills (hn.Kind): Claude's orange (#D97757, its brand hex) in both appearances; OpenAI's and Cursor's
 // marks are monochrome, in the strong ink, so they turn with the appearance.
 export const tone_mark_claude: Fill = {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
-export const tone_mark_ink: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
 
 prefab Strong {
-  Fill: $tone_ink_1
+  Fill: $tone_ink_strong
 }
 prefab Ink {
-  Fill: $tone_ink_2
+  Fill: $tone_ink
 }
 prefab Muted {
-  Fill: $tone_ink_3
+  Fill: $tone_ink_muted
 }
 prefab Faint {
-  Fill: $tone_ink_4
+  Fill: $tone_ink_faint
 }
 prefab Accent {
   Fill: $tone_accent
@@ -394,8 +359,8 @@ prefab Wash {
   Fill: $tone_wash
 }
 prefab Plate {
-  Fill: $tone_plate
-  Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+  Fill: $tone_card
+  Edge: {dark: $tone_line.dark, light: $tone_line.light}
   Shape: {radius: $radius_card, n: 4, border: 1, feather: 0}
 }
 
@@ -409,11 +374,10 @@ export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.9
 export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
 export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
 
-// The selection (harness-native-render's select.rs, den's plate_selection): one plate under the glyphs wherever text is
-// selected (a chat's transcript and input, a table's copied row, the terminal), den's ink-1 at 22% (18% on the light
-// page), corners of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays
-// square). Ghostty's selection-background, where the theme sets one, retints it.
-export const plate_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.18}}
+// The selection's shape (harness-native-render's select.rs; its colour is the theme's tone_text_selection): one plate
+// under the glyphs wherever text is selected (a chat's transcript and input, a table's copied row, the terminal), corners
+// of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays square).
+// Ghostty's selection-background, where the theme sets one, retints it.
 export const plate_selection_radius = 4
 export const plate_selection_n = 2
 // Cmd+C pulses it: den's FlashLook (after the site's selshape.ts and the os text field), a timeline of copy_secs rather
@@ -431,7 +395,7 @@ export const copy_row_in = 0.11
 // font's size tall about its line's middle, caret_radius round. A jump farther than its height sweeps from where it was
 // over caret_glide seconds on an ease-out cubic, its tail at half the bar's ink; after it last moved it stays solid
 // caret_hold seconds, then blinks once every caret_blink seconds (on for the first half), each turn eased over caret_fade
-// of the cycle. Its ink is tone_caret (white on the dark page).
+// of the cycle. Its ink is tone_ink_strong.
 export const caret_w = 1.5
 export const caret_h = 1.25
 export const caret_radius = 0.75
@@ -440,7 +404,6 @@ export const caret_hold = 0.5
 export const caret_blink = 1.06
 export const caret_fade = 0.09
 // Inline code's chip (MarkdownText).
-export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
 // A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height
 // (less what the pane shows around it), then scrolls; a caret out of view glides back textarea_caret_margin points inside
@@ -499,7 +462,7 @@ export const line_chat = 21
 // The measure (chat_w, above).
 export const chat_measure = 35
 export const chat_w = $size_chat * $chat_measure
-// Headings: a scale of about 1.15 over the body, each semibold in the strong ink (tone_chat_strong), set by size and
+// Headings: a scale of about 1.15 over the body, each semibold in the strong ink (tone_ink_strong), set by size and
 // weight, never by colour. Each sits closer to what it heads than to what came before: chat_h<n>_above over it,
 // chat_h<n>_below under it (less a block's half gap, which the block under it brings).
 export const size_chat_h1 = 21
@@ -517,7 +480,7 @@ export const chat_h3_below = 0
 // Lists (hn.ChatItem*): a hanging indent, the marker in a chat_list_mark_w gutter so wrapped lines align with the words,
 // not the marker; chat_list_inset in from the column's edge; a nested list chat_list_nest further in (the parent's words'
 // edge); chat_item_gap between items, much less than between paragraphs. A bullet is small (size_chat_bullet) and faint
-// (tone_chat_marker), a number the body's size in the muted ink with tabular figures.
+// (tone_ink_faint), a number the body's size in the muted ink with tabular figures.
 export const chat_list_mark_w = 18
 export const chat_list_inset = 2
 export const chat_list_nest_w = $chat_list_mark_w
@@ -607,7 +570,7 @@ export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, and a status icon only where
 // one says more than a word (scene/widgets/chat_status.flecs: a thought's ring leads, a call's running dot trails),
 // chat_line_status across. Its height, its lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
-// table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_chat_guide, chat_guide_w wide)
+// table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_line, chat_guide_w wide)
 // at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
 export const chat_tool_h = 24
 export const chat_line_pad = 4
@@ -621,48 +584,24 @@ export const chat_line_inset = 22
 export const chat_nest = $chat_line_inset - $chat_line_pad
 // Between a line's words, its argument and its detail.
 export const chat_line_word_gap = 5
-export const tone_chat_guide: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.09}}
 // A drawn view's code button's glyph.
 export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
 export const chat_view_code = 20
 export const chat_view_code_hang = $chat_view_code + 2
-// The chat's own palette, the blaze site's (tone_site_*): the chat is a document, not a terminal, so it does not take the
-// Ghostty theme's ground or inks (those stay the terminal's and the sidebar's). The site's near-black page (--bg) with
-// its surfaces a few close steps up (--bg-3, --bg-4, --code-bg); text in its inks (--ink-1 strong for headings and bold,
-// --ink-2 the words, --ink-3 quiet, --ink-4 faint); its hairline (--line) on cards; the one accent only on what is
-// pressable, nowhere else. Drawn in the window's appearance (chat.rs `chat_dark`).
-export const tone_chat_ground: Fill = $tone_site_bg
-export const tone_chat_strong: Fill = $tone_site_ink_1
-export const tone_chat_ink: Fill = $tone_site_ink_2
-export const tone_chat_muted: Fill = $tone_site_ink_3
-export const tone_chat_faint: Fill = $tone_site_ink_4
-export const tone_chat_marker: Fill = $tone_site_ink_4
-export const tone_chat_line: Fill = $tone_site_line
-export const tone_chat_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.137, 0.514, 0.886, 1}}
-export const tone_chat_bubble: Fill = $tone_site_bg_4
-export const tone_chat_card: Fill = $tone_site_code_bg
-// The composer's card: a step lighter than the page in dark (white with a stronger hairline and the lift in light).
-// The send button: quiet (tone_chat_send_idle, its arrow faint) with nothing to send, then solid in the words' ink
-// with its arrow (and the stop's square) in the page's ground.
-export const tone_chat_composer: Fill = $tone_site_bg_3
-export const tone_chat_composer_edge: Fill = $tone_site_line
-export const tone_chat_send: Fill = {dark: {1, 1, 1, 0.9}, light: {0.216, 0.208, 0.184, 1}}
-export const tone_chat_send_idle: Fill = {dark: {1, 1, 1, 0.06}, light: {0.216, 0.208, 0.184, 0.06}}
-export const tone_chat_send_glyph: Fill = $tone_site_bg
+// The chat is the theme's page: tone_ground under it, cards and the composer in tone_card, code in tone_well, a user's
+// bubble tone_raised, words in the four inks, tone_line on cards; the one accent only on what is pressable. Drawn in the
+// window's appearance (chat.rs `chat_dark`).
+// The send button: quiet (tone_wash, its arrow faint) with nothing to send, then solid in the strong ink with its arrow
+// (and the stop's square) in tone_ground.
 // Inline code amid the words, as the site sets it: the code face (the one monospace in prose) at chat_code_em of the
-// words, in the site's coral (--doc-code-ink) on its faint plate (--s-tint), chat_code_radius round.
-export const tone_chat_code: Fill = $tone_site_tint
-export const tone_chat_code_ink: Fill = $tone_site_code_ink
+// words, in tone_code_ink on tone_wash, chat_code_radius round.
 export const chat_code_radius = 5
-// Inline components (harness-native-ui-prims/scene/inline.flecs): the chip under the pointer brightens a step and
-// underlines its label, held down a step more (--ink-1 at 11% and 16% over inline code's 6% --s-tint). A GitHub pull
-// request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
+// Inline components (harness-native-ui-prims/scene/inline.flecs): the chip under the pointer brightens a step
+// (tone_selection_focus over inline code's tone_wash) and underlines its label (tone_ink_faint), held down a step more
+// (tone_press). A GitHub pull request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
 // merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
 // pending amber).
-export const tone_inline_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.11}, light: {0.086, 0.086, 0.090, 0.10}}
-export const tone_inline_pressed: Fill = {dark: {0.922, 0.918, 0.902, 0.16}, light: {0.086, 0.086, 0.090, 0.15}}
-export const tone_inline_underline: Fill = {dark: {0.922, 0.918, 0.902, 0.42}, light: {0.086, 0.086, 0.090, 0.40}}
 export const tone_gh_open: Fill = {dark: {0.247, 0.725, 0.314, 1}, light: {0.102, 0.498, 0.216, 1}}
 export const tone_gh_draft: Fill = {dark: {0.569, 0.596, 0.631, 1}, light: {0.349, 0.388, 0.431, 1}}
 export const tone_gh_merged: Fill = {dark: {0.671, 0.490, 0.973, 1}, light: {0.510, 0.314, 0.875, 1}}
@@ -690,9 +629,7 @@ export const line_peek_body = 17.5
 export const size_peek_meta = 11.5
 export const line_peek_meta = 15
 // The words on a state pill (the pill is the state's own ink): white in both appearances, as GitHub sets them.
-export const tone_peek_badge_ink: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
 // A text caret: plain white on the dark page (near-black on the light one), no accent: colour that says nothing.
-export const tone_caret: Fill = {dark: {1, 1, 1, 0.92}, light: {0.10, 0.10, 0.10, 0.92}}
 // A cell's own UI in the chat (scene/widgets/genui.flecs, src/app/chat/genui.rs): the space between its elements, and
 // a Stat's value, set large.
 export const gen_gap = 8
@@ -711,14 +648,11 @@ export const tone_series5: Fill = {dark: {0.835, 0.318, 0.506, 1}, light: {0.910
 export const tone_series6: Fill = {dark: {0.000, 0.514, 0.000, 1}, light: {0.000, 0.514, 0.000, 1}}
 export const tone_series7: Fill = {dark: {0.565, 0.522, 0.914, 1}, light: {0.384, 0.314, 0.839, 1}}
 export const tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.890, 0.286, 0.282, 1}}
-// The quietest ink on the terminal's ground: a chart's gridlines, a canvas's `faint`.
-export const tone_term_faint: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.12}}
 export const line_gen_stat = 28
-// A cell's controls (genui/control.rs, hn.Gen<control> in widgets/genui.flecs), on the terminal's ground: one height for
-// a button, a field and a select; a switch's track and knob, a check box's square, a radio's dot, a slider's rail and
-// knob; a field's widest. Their plates each appearance its own step: a quiet control plate and the hairline round a
-// field, the off track, the knob, the solid accent under white words (the on state; deeper than tone_accent in dark so
-// white reads on it), a segment's raised plate.
+// A cell's controls (genui/control.rs, hn.Gen<control> in widgets/genui.flecs): one height for a button, a field and a
+// select; a switch's track and knob, a check box's square, a radio's dot, a slider's rail and knob; a field's widest.
+// Their colours are the theme's: a control's plate tone_card, a field tone_well edged in tone_line, the off track
+// tone_line_strong, the knob tone_knob, the on state tone_accent under tone_on_accent, a segment's plate tone_raised.
 export const gen_control_h = 28
 export const gen_switch_w = 30
 export const gen_switch_h = 18
@@ -730,18 +664,6 @@ export const gen_slider_knob = 16
 export const gen_field_w = 320
 export const gen_option_h = 26
 export const size_gen_control = 13
-export const tone_gen_plate: Fill = {dark: {1, 1, 1, 0.085}, light: {0, 0, 0, 0.055}}
-export const tone_gen_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.16}}
-export const tone_gen_field: Fill = {dark: {1, 1, 1, 0.045}, light: {1, 1, 1, 1}}
-export const tone_gen_track: Fill = {dark: {1, 1, 1, 0.17}, light: {0, 0, 0, 0.13}}
-export const tone_gen_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
-export const tone_gen_knob_edge: Fill = {dark: {0, 0, 0, 0.25}, light: {0, 0, 0, 0.16}}
-export const tone_gen_on: Fill = {dark: {0.400, 0.424, 0.957, 1}, light: {0.369, 0.384, 0.902, 1}}
-export const tone_gen_on_ink: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
-export const tone_gen_segment: Fill = {dark: {1, 1, 1, 0.16}, light: {1, 1, 1, 1}}
-export const tone_gen_error_wash: Fill = $tone_failed_wash
-export const tone_gen_success_wash: Fill = {dark: {0.298, 0.718, 0.510, 0.15}, light: {0.18, 0.60, 0.38, 0.11}}
-export const tone_gen_warning_wash: Fill = {dark: {0.949, 0.733, 0.322, 0.15}, light: {0.78, 0.55, 0.10, 0.12}}
 // How faint a control is drawn while it takes no input (disabled, or no handler): a Pose fade.
 export const gen_inert_fade = 0.55
 
@@ -763,30 +685,14 @@ export const gen_icon = 18
 export const gen_image_h = 360
 export const size_gen_title = 15
 export const gen_bone_h = 10
-export const tone_gen_float: Fill = {dark: {0.137, 0.137, 0.149, 1}, light: {1, 1, 1, 1}}
-export const tone_gen_float_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.12}}
-export const tone_gen_scrim: Fill = {dark: {0, 0, 0, 0.42}, light: {0, 0, 0, 0.18}}
-export const tone_gen_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.10}}
-export const tone_gen_bone: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.07}}
-export const tone_gen_chip_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.14}}
-export const tone_gen_chip_on: Fill = {dark: {0.263, 0.263, 0.278, 1}, light: {0.847, 0.847, 0.863, 1}}
-export const tone_gen_chip_on_edge: Fill = {dark: {1, 1, 1, 0.34}, light: {0, 0, 0, 0.30}}
-// A badge's ground is opaque and edged, so its ink reads over a picture as on the plain ground (a Layer over an Image):
-// the code chip's wash as it shows on the terminal's ground, without letting what is under it through.
-export const tone_gen_badge: Fill = {dark: {0.196, 0.196, 0.212, 1}, light: {0.937, 0.937, 0.945, 1}}
-export const tone_gen_badge_edge: Fill = {dark: {1, 1, 1, 0.14}, light: {0, 0, 0, 0.12}}
-// A toned Badge's plate (den's GenBadge<Tone>): its tone, faint, over the ground, so the pill reads as the word's colour.
-export const tone_gen_badge_accent: Fill = {dark: {0.922, 0.918, 0.902, 0.12}, light: {0.086, 0.086, 0.090, 0.08}}
-export const tone_gen_badge_success: Fill = {dark: {0.55, 0.80, 0.40, 0.18}, light: {0.25, 0.55, 0.18, 0.12}}
-export const tone_gen_badge_warning: Fill = {dark: {0.94, 0.86, 0.28, 0.18}, light: {0.58, 0.52, 0.04, 0.14}}
-export const tone_gen_badge_error: Fill = {dark: {0.980, 0.451, 0.427, 0.18}, light: {0.788, 0.204, 0.176, 0.12}}
+// A badge's ground is opaque and edged (tone_raised, tone_line_strong), so its ink reads over a picture as on the plain
+// ground (a Layer over an Image). A toned Badge's plate (den's GenBadge<Tone>) is its state's wash (tone_<state>_wash).
 // A Shader's and a Video's box (genui/surface.rs, hn.GenShader and hn.GenVideo): a Shader with no height and no aspect is
 // gen_shader_h tall; both are rounded by radius_gen_media on a quiet ground (what shows before the first frame). A video's
 // controls ride a dark plate along its foot, gen_video_bar_pad in from its edges, in light inks over the picture whatever
-// the appearance (a picture is not the ground); its scrub rail is the slider's, thinner.
+// the appearance (a picture is not the ground: a palette, not a role); its scrub rail is the slider's, thinner.
 export const gen_shader_h = 200
 export const radius_gen_media = 8
-export const tone_gen_media: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.045}}
 export const gen_video_bar_h = 32
 export const gen_video_bar_pad = 8
 export const gen_video_rail = 3
@@ -857,7 +763,6 @@ export const gen_file_icon = 16
 export const gen_file_radius = 8
 export const line_gen_file = 22
 export const line_gen_meta = 16
-export const tone_gen_file_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
 // A CellRef's card: the space between its head (the cell's name and its badge) and the cell's view or output.
 export const gen_cell_gap = 6
 export const gen_cell_head_gap = 8
@@ -875,10 +780,6 @@ export const gen_swatch_hover_pad = -1
 export const gen_swatch_hover_radius = 14
 export const gen_swatch_custom = 10
 export const gen_swatch_custom_radius = 5
-export const tone_gen_swatch_edge: Fill = {dark: {1, 1, 1, 0.14}, light: {0, 0, 0, 0.14}}
-export const tone_gen_swatch_ring: Fill = {dark: {0.922, 0.918, 0.902, 0.9}, light: {0.086, 0.086, 0.090, 0.85}}
-export const tone_gen_swatch_hover: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.08}}
-export const tone_gen_swatch_custom_edge: Fill = {dark: {1, 1, 1, 0.9}, light: {1, 1, 1, 0.95}}
 // The well's hues, a turn of the colour wheel from red (HSV saturation 0.78, value 0.95), the same in both appearances.
 export const tone_gen_wheel_0: Fill = {dark: {0.950, 0.209, 0.209, 1}, light: {0.950, 0.209, 0.209, 1}}
 export const tone_gen_wheel_1: Fill = {dark: {0.950, 0.580, 0.209, 1}, light: {0.950, 0.580, 0.209, 1}}
@@ -900,26 +801,21 @@ export const gen_drop_pad = 16
 export const gen_drop_gap = 8
 export const gen_drop_min_h = 96
 export const gen_drop_hot_border = 1.5
-export const tone_gen_drop_edge: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.16}}
-export const tone_gen_drop_hot: Fill = {dark: {0.922, 0.918, 0.902, 0.08}, light: {0.086, 0.086, 0.090, 0.07}}
-export const tone_gen_drop_hot_edge: Fill = {dark: {0.922, 0.918, 0.902, 0.6}, light: {0.086, 0.086, 0.090, 0.55}}
 
 // genui element props and motion (scene/widgets/genui.flecs, "Element props and motion"). A Progress glides to a new
 // value on the gen_glide spring; below its max a sheen sweeps along its fill (den ui/progress.rs's shimmer): across in
 // gen_sweep_period seconds, gen_sweep_share of the fill long, fading to gen_sweep_low as an end cuts it, in
-// tone_gen_sheen. A Loading or a Skeleton stays unseen for gen_pending_delay seconds, then fades in on the gen_pending
+// tone_press. A Loading or a Skeleton stays unseen for gen_pending_delay seconds, then fades in on the gen_pending
 // spring (den's PendingLook), so a wait that ends at once never flickers. A Table's query marks what it found in each
-// cell with a tone_gen_match plate, gen_match_radius round.
+// cell with a tone_accent_wash plate, gen_match_radius round.
 export const gen_glide_omega = 18
 export const gen_glide_zeta = 1
 export const gen_sweep_period = 1.4
 export const gen_sweep_share = 0.34
 export const gen_sweep_low = 0.25
-export const tone_gen_sheen: Fill = {dark: {1, 1, 1, 0.28}, light: {1, 1, 1, 0.35}}
 export const gen_pending_delay = 0.15
 export const gen_pending_omega = 14
 export const gen_pending_zeta = 1
-export const tone_gen_match: Fill = {dark: {0.580, 0.600, 1.0, 0.28}, light: {0.369, 0.384, 0.902, 0.22}}
 export const gen_match_radius = 3
 
 // ---- genui universal props ----------------------------------------------------------------------------------------
@@ -937,12 +833,11 @@ export const gen_shape_zeta = 1
 // ---- the embedded browser ---------------------------------------------------------------------------------------------
 // The harness browser's views (src/app/browser.rs; crates/harness/harness-browser). A chat card (hn.GenBrowser) shows the
 // page at gen_browser_aspect (width over height, 16:10) above its title and address, a gen_browser_load hairline in
-// tone_browser_load along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
+// tone_accent along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
 // web_pane_w wide, opening and folding on the sidebar's spring; its toolbar is web_toolbar_h tall with the address in a
 // web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h.
 export const gen_browser_aspect = 1.6
 export const gen_browser_load = 2
-export const tone_browser_load: Fill = $tone_accent
 export const web_pane_w = 520
 export const web_toolbar_h = 40
 export const web_url_h = 26

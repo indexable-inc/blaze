@@ -11,7 +11,7 @@ ex {
 
   // A rounded plate in the accent, for backgrounds and badges.
   prefab Plate : ui.Node {
-    Fill: {dark: {0.580, 0.600, 1.0, 0.22}, light: {0.369, 0.384, 0.902, 0.16}}
+    Fill: $tone_accent_wash
     Shape: {radius: 7, n: 4, border: 0, feather: 0}
   }
 
@@ -28,7 +28,7 @@ ex {
 
   // A thin outline drawn over its parent (an Overlay child).
   prefab Outline : ui.Node {
-    Edge: {dark: {0.580, 0.600, 1.0, 0.9}, light: {0.369, 0.384, 0.902, 0.9}}
+    Edge: {dark: $tone_accent.dark, light: $tone_accent.light}
     Shape: {radius: 7, n: 4, border: 1, feather: 0}
   }
 }

@@ -47,18 +47,18 @@ hn {
     AlignSelf: {align: Start}
     Padding: {l: $chat_line_pad, r: $chat_line_pad, t: 0, b: 0}
     icon : ui.Symbol {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Size: {w: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}}
     }
     words : ui.Lead {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
     }
   }
 
   // A failure's mark: a small dot in the failed tone after the words, the one coloured thing; what failed is its tooltip.
   prefab StepMark : ui.Node {
-    Fill: $tone_failed
+    Fill: $tone_error
     Shape: {radius: 2.5, n: 4, border: 0, feather: 0}
     Size: {w: {kind: Fixed, value: 5, min: 0, max: 0}, h: {kind: Fixed, value: 5, min: 0, max: 0}}
     Cursor: {shape: Arrow}
@@ -66,7 +66,7 @@ hn {
 
   // The chevron shown while its line is hovered (right folded, down open).
   prefab StepChevron : ui.Symbol {
-    Fill: $tone_chat_muted
+    Fill: $tone_ink_muted
     HoverShow: {row: 0, keep: false}
     Size: {w: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}}
   }
@@ -78,8 +78,8 @@ hn {
     Cursor: {shape: Arrow}
     Fill: $tone_clear
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
 
   // A run's or a cell's one line ("Searched 3 times, fetched 4 pages"), folded until pressed. Failed: the same words (they
@@ -116,7 +116,7 @@ hn {
     line : hn.StepLook {
       mark : hn.StepMark {}
       why : ui.Lead {
-        Fill: $tone_chat_muted
+        Fill: $tone_ink_muted
         TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
       }
     }
@@ -133,7 +133,7 @@ hn {
         TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
       }
       path : ui.Lead {
-        Fill: $tone_chat_muted
+        Fill: $tone_ink_muted
         TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
       }
     }
@@ -161,7 +161,7 @@ hn {
       TextStyle: {size: $size_body, line: 18, role: 0, bold: 0}
     }
     host : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     }
   }
@@ -179,7 +179,7 @@ hn {
   prefab StepResultsQuery : hn.StepOut {
     Padding: {l: $chat_line_inset, r: 0, t: 4, b: 2}
     query : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     }
     list : ui.ResultList {
@@ -193,7 +193,7 @@ hn {
   // A short answer (a string, a number), in the UI face.
   prefab StepText : hn.StepOut {
     text : ui.Words {
-      Fill: $tone_chat_ink
+      Fill: $tone_ink
       TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
     }
   }
@@ -213,10 +213,10 @@ hn {
       Cursor: {shape: Arrow}
       Fill: $tone_clear
       Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-      PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+      HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_press.dark, light: $tone_press.light}
       words : ui.Lead {
-        Fill: $tone_chat_muted
+        Fill: $tone_ink_muted
         TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
       }
       chevron : hn.StepChevron {}
@@ -234,7 +234,7 @@ hn {
       Padding: {l: $chat_line_pad, r: 0, t: 2, b: 2}
       mark : hn.StepMark {}
       why : ui.Words {
-        Fill: $tone_chat_muted
+        Fill: $tone_ink_muted
         TextStyle: {size: $size_body, line: 18, role: 0, bold: 0}
       }
     }
