@@ -58,25 +58,100 @@ hn {
     TextStyle: {size: $size_peek_title, line: $line_peek_title, role: 0, bold: 1}
   }
 
-  // Its state as GitHub shows it: a pill in the state's ink with its name (Open, Draft, Merged, Closed), then the head
-  // commit's checks, their mark in its ink and a word.
-  prefab PeekState : ui.Row {
-    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+  // Its state as GitHub shows it (`top`): a pill in the state's ink with its name (Open, Draft, Merged, Closed), then the
+  // head commit's checks, their mark in its ink and what is left of them (`2 of 9 running · 4m`, `1 failed`, `All checks
+  // passed`). Under the pointer, `list` opens under it: a row a check not passed (failed, running, queued: the host's
+  // keyed rows, hn.PeekCheck*) and one row the passed ones fold into; out from under it, the list is empty again. The
+  // whole block is one hit target (its Cursor), so the pointer crossing from the line to the rows keeps it open.
+  prefab PeekState : ui.Column {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    badge : ui.Row {
-      Shape: {radius: 100, n: 4, border: 0, feather: 0}
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      Padding: {l: $inline_peek_badge_pad, r: $inline_peek_badge_pad, t: 1, b: 1}
-      label : ui.Line {
-        Fill: $tone_on_accent
-        TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 1}
+    top : ui.Row {
+      Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      badge : ui.Row {
+        Shape: {radius: 100, n: 4, border: 0, feather: 0}
+        Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: $inline_peek_badge_pad, r: $inline_peek_badge_pad, t: 1, b: 1}
+        label : ui.Line {
+          Fill: $tone_on_accent
+          TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 1}
+        }
+      }
+      mark : ui.Symbol {
+        Size: {w: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}}
+      }
+      checks : ui.Lead, Muted {
+        TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
       }
     }
-    mark : ui.Symbol {
-      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
+    list : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
-    checks : ui.Line, Muted {
+  }
+
+  // One check not passed, a row of the state's list: its mark (the variants below), its name, the step it is on in the
+  // quiet ink (it gives up its room first), and its time at the end in tabular figures (how long it has run or waited,
+  // ticking while it does; how long a failed one took). A press opens its log in the harness browser (the host sets its
+  // Action, `web:open:<url>`); a wash under the pointer, as a menu's items.
+  prefab PeekCheck : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $inline_peek_check_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: $inline_peek_check_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_check_h, min: 0, max: 0}}
+    Padding: {l: $inline_peek_check_pad, r: $inline_peek_check_pad, t: 0, b: 0}
+    mark : ui.Symbol {
+      Size: {w: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}}
+    }
+    name : ui.Line, Ink {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+    }
+    step : ui.Lead, Muted {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+    }
+    gap : ui.Spacer {
+      Size: {w: {kind: Grow, value: 1, min: $inline_peek_check_gap, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    time : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 10, bold: 0}
+    }
+  }
+  // A failed one: the cross, in the failing checks' ink (oct-x).
+  prefab PeekCheckFailed : hn.PeekCheck {
+    mark : ui.Symbol { Icon: {glyph: ""}; Fill: $tone_gh_ci_failure }
+  }
+  // A running one: the running dot, breathing while it shows, in the pending checks' ink (cod-circle_small_filled).
+  prefab PeekCheckRunning : hn.PeekCheck {
+    mark : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_gh_ci_pending
+      Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_floor}
+    }
+  }
+  // A queued one: a hollow ring, faint (cod-circle_small).
+  prefab PeekCheckQueued : hn.PeekCheck {
+    mark : ui.Symbol { Icon: {glyph: ""}; Fill: $tone_ink_faint }
+  }
+  // The passed and skipped ones, folded into one quiet row (`7 passed, 2 skipped`) under the rest; not a link.
+  prefab PeekChecksFolded : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_check_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_check_h, min: 0, max: 0}}
+    Padding: {l: $inline_peek_check_pad, r: $inline_peek_check_pad, t: 0, b: 0}
+    mark : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_ink_faint
+      Size: {w: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_mark_w, min: 0, max: 0}}
+    }
+    label : ui.Lead, Muted {
       TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
     }
   }
