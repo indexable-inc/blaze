@@ -822,6 +822,55 @@ fn extern_and_variadic_calls_list_their_symbols() {
     });
 }
 
+const PROJECTED_C_SIGNATURE: &str = r#"
+//- minicore: sized, fn
+pub trait Convert<F> { type Inner; }
+impl<T, F> Convert<F> for T { type Inner = T; }
+#[repr(C)]
+pub struct Rect { pub x: f64, pub y: f64, pub w: f64, pub h: f64 }
+#[repr(C)]
+pub struct Wrap<T: Convert<()>> { pub inner: <T as Convert<()>>::Inner, pub tag: f64 }
+pub struct View;
+impl View {
+    pub extern "C" fn frame(&self) -> <Rect as Convert<()>>::Inner {
+        Rect { x: 1.0, y: 2.0, w: 3.0, h: 4.0 }
+    }
+}
+pub extern "C" fn wrapped<T: Convert<()>>(
+    inner: <T as Convert<()>>::Inner,
+) -> <Wrap<T> as Convert<()>>::Inner {
+    Wrap { inner, tag: 5.0 }
+}
+pub fn class() -> (extern "C" fn(&View) -> Rect, extern "C" fn(Rect) -> Wrap<Rect>) {
+    let register = || {
+        let method = || {
+            (
+                View::frame as extern "C" fn(&View) -> Rect,
+                wrapped::<Rect> as extern "C" fn(Rect) -> Wrap<Rect>,
+            )
+        };
+        method()
+    };
+    register()
+}
+pub fn roots() -> f64 {
+    let (frame, wrap) = class();
+    wrap(frame(&View)).inner.h
+}
+"#;
+
+/// An `extern "C"` fn whose signature names a projection (objc2's `define_class!` method,
+/// `-> <CGRect as ConvertReturn<()>>::Inner`), cast to a fn pointer in a closure in a
+/// closure as objc2's `class()` registers it, has its C ABI computed from the types the
+/// projections normalize to, a `repr(C)` struct's projected field too. Of the declared
+/// signature, the walk of the inner closure refused the alias "in the C ABI".
+#[test]
+fn an_extern_c_fn_whose_signature_names_a_projection_is_passed_as_what_it_normalizes_to() {
+    let (db, reached) = reach_from(PROJECTED_C_SIGNATURE, "roots");
+    assert_reached(&db, &reached, &["class", "frame", "wrapped"]);
+    assert!(count(&reached, |def| matches!(def, InstanceDef::Closure(_))) >= 2, "{reached:?}");
+}
+
 const INTRINSICS: &str = r#"
 //- minicore: sized
 #![feature(intrinsics)]

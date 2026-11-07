@@ -4885,6 +4885,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     };
                     for (field, ty) in self.cg.db.field_types(variant).iter() {
                         let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        // A field may be a projection the arguments resolve (`T::Inner`).
+                        let ty = self.normalize(ty);
                         let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
                         self.scalar_leaves(ty, offset + field.bytes(), leaves)?;
                     }
@@ -8707,7 +8709,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if track_caller(db, callee) {
             return self.reified(fn_ty, false);
         }
-        let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
+        let sig = self.abi_sig(fn_ty)?;
         let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
         let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;
         let mut sig = self.signature(&abi.args, abi.ret);
@@ -10197,6 +10199,34 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(tuple)
     }
 
+    /// The signature of the fn item or fn pointer type `ty` as its ABI is computed from:
+    /// lifetimes erased and every projection normalized under this function's `ParamEnv`, as
+    /// rustc's `fn_sig_for_fn_abi` normalizes erasing regions. A fn item's declared signature
+    /// can name a projection the instance's arguments resolve, as objc2's `define_class!`
+    /// writes a method's return as `<CGRect as ConvertReturn<()>>::Inner`, and a calling
+    /// convention classifies the type it stands for, never the alias. Where it does not
+    /// normalize, the signature is refused, naming `ty`.
+    fn abi_sig(&self, ty: Ty<'db>) -> Result<rustc_type_ir::FnSig<DbInterner<'db>>> {
+        use rustc_type_ir::TypeVisitableExt;
+        let sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        if !sig.has_aliases() {
+            return Ok(sig);
+        }
+        let normalized = hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .deeply_normalize(
+                &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                sig,
+            );
+        match normalized {
+            Ok(normalized) if !normalized.has_infer() => Ok(normalized),
+            Ok(normalized) => {
+                unsupported!("the signature of `{ty:?}` normalizes to `{normalized:?}`, unsolved")
+            }
+            Err(why) => unsupported!("the signature of `{ty:?}` does not normalize: {why:?}"),
+        }
+    }
+
     /// The types a function with this signature is passed, one by one: the final tuple of a
     /// `rust-call` signature is one argument per field, as its compiled body takes them.
     fn abi_inputs<'a>(abi: ExternAbi, inputs: &'a [Ty<'db>]) -> Result<Cow<'a, [Ty<'db>]>> {
@@ -10984,7 +11014,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..)) {
             unsupported!("Fn-trait vtable of {ty:?}");
         }
-        let fn_sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        let fn_sig = self.abi_sig(ty)?;
         if fn_sig.c_variadic() {
             unsupported!("shim for a variadic function");
         }
