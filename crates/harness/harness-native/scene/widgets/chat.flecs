@@ -6,8 +6,8 @@
 hn {
   // The pane: the transcript scrolling over the card's ground, a column as wide as reads well; the input under it.
   prefab ChatPane : hn.Pane {
-    // The chat's own page (tone_chat_ground), over the main card's terminal ground.
-    Fill: $tone_chat_ground
+    // The chat's page: the theme's ground (tone_ground), the main card's own.
+    Fill: $tone_ground
     // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, while their
     // words break their lines at the width they have once the fold rests (WrapAt), so they wrap once per fold.
     list : ui.Scroll {
@@ -28,15 +28,15 @@ hn {
     // The foot is opaque, in the page's own ground: the transcript ends at its top (thinning out under it), and nothing
     // drawn behind the pane shows around the composer.
     foot : ui.Column {
-      Fill: $tone_chat_ground
+      Fill: $tone_ground
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
       // The composer: one card, the words over a bar of controls, as wide as the transcript's column. A press anywhere
       // on it that no control takes gives the words the keys.
       card : ui.Column {
-        Fill: $tone_chat_composer
-        Edge: {dark: $tone_chat_composer_edge.dark, light: $tone_chat_composer_edge.light}
+        Fill: $tone_card
+        Edge: {dark: $tone_line.dark, light: $tone_line.light}
         Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
         Lift: {blur: $chat_composer_lift_blur, alpha: $chat_composer_lift_alpha, dy: $chat_composer_lift_dy}
         Cursor: {shape: Text}
@@ -99,7 +99,7 @@ hn {
     Padding: {l: $chat_effort_lead - $chat_pick_gap, r: $chat_pick_gap, t: 0, b: 0}
   }
   prefab ChatEffortBar : ui.Node {
-    Fill: $tone_chat_faint
+    Fill: $tone_ink_faint
     Shape: {radius: $chat_effort_bar_radius, n: 4, border: 0, feather: 0}
     Size: {w: {kind: Fixed, value: $chat_effort_bar_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_effort_h, min: $chat_effort_h * $chat_effort_floor, max: 0}}
   }
@@ -117,13 +117,13 @@ hn {
     Tooltip: {text: "Model and effort  ⌘/"}
     Fill: $tone_clear
     Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
     Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
     label : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
       TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
     }
@@ -135,19 +135,19 @@ hn {
     }
     chevron : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_chat_faint
+      Fill: $tone_ink_faint
       Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
     }
   }
   // The bar's quiet controls' inks (the picker's words and lit bars, the stop's ring and square): at rest, under the
   // pointer (eased between by each control's hover spring), and a level's unlit bars.
   prefab ChatControlInk {
-    rest { Fill: $tone_chat_muted }
-    hot { Fill: $tone_chat_ink }
-    off { Fill: $tone_chat_faint }
+    rest { Fill: $tone_ink_muted }
+    hot { Fill: $tone_ink }
+    off { Fill: $tone_ink_faint }
   }
   prefab ChatPickWord : ui.Line {
-    Fill: $tone_chat_ink
+    Fill: $tone_ink_muted
     Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
     TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
   }
@@ -187,7 +187,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: $chat_pick_detail_t, b: $chat_pick_detail_b}
     words : ui.Words {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       TextStyle: {size: $size_chat_pick_detail, line: $line_chat_pick_detail, role: 0, bold: 0}
     }
@@ -215,21 +215,21 @@ hn {
       track : ui.Node {
         Overlay
         Fill: $tone_clear
-        Stroke: {dark: $tone_chat_faint.dark, light: $tone_chat_faint.light}
+        Stroke: {dark: $tone_ink_faint.dark, light: $tone_ink_faint.light}
         Vector: {d: "M6 1 A5 5 0 1 1 6 11 A5 5 0 1 1 6 1", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
       }
       arc : ui.Node {
         Overlay
         Fill: $tone_clear
-        Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+        Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
         Vector: {d: "M6 1 A5 5 0 0 1 6.5 1.03", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
       }
     }
   }
   prefab ChatContextTone {
-    ok { Fill: $tone_chat_muted }
-    warn { Fill: $tone_lost }
-    full { Fill: $tone_failed }
+    ok { Fill: $tone_ink_muted }
+    warn { Fill: $tone_warning }
+    full { Fill: $tone_error }
   }
 
   // While the agent works, a ring at the bar's trailing edge breathing gently in the bar's muted ink (src/app/chat.rs
@@ -242,7 +242,7 @@ hn {
     ring : ui.Node {
       Overlay
       Fill: $tone_clear
-      Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+      Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
       Vector: {d: "M10 1 A9 9 0 1 1 10 19 A9 9 0 1 1 10 1", view_x: 0, view_y: 0, view_w: 20, view_h: 20,
         inset_l: 0, inset_t: 0, inset_r: 0, inset_b: 0, stroke_w: $chat_working_stroke * 20 / $chat_working}
       Breath: {spring: {x: 1, v: 0}, up: false, low: $chat_working_breath}
@@ -256,13 +256,13 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
     bubble : ui.Bubble {
-      Fill: $tone_chat_bubble
+      Fill: $tone_raised
       Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
       Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
-        Fill: $tone_chat_ink
+        Fill: $tone_ink
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
@@ -275,11 +275,11 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
-      Fill: $tone_chat_ink
-      MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
-        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light,
-        strong_dark: $tone_chat_strong.dark, strong_light: $tone_chat_strong.light, chip_radius: $chat_code_radius}
+      Fill: $tone_ink
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_link.dark, link_light: $tone_link.light,
+        code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+        strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -289,21 +289,21 @@ hn {
   prefab ChatH1 : hn.ChatProse {
     Padding: {l: 0, r: 0, t: $chat_h1_above, b: $chat_h1_below}
     text : ui.Words {
-      Fill: $tone_chat_strong
+      Fill: $tone_ink_strong
       TextStyle: {size: $size_chat_h1, line: $line_chat_h1, role: 0, bold: 1}
     }
   }
   prefab ChatH2 : hn.ChatProse {
     Padding: {l: 0, r: 0, t: $chat_h2_above, b: $chat_h2_below}
     text : ui.Words {
-      Fill: $tone_chat_strong
+      Fill: $tone_ink_strong
       TextStyle: {size: $size_chat_h2, line: $line_chat_h2, role: 0, bold: 1}
     }
   }
   prefab ChatH3 : hn.ChatProse {
     Padding: {l: 0, r: 0, t: $chat_h3_above, b: $chat_h3_below}
     text : ui.Words {
-      Fill: $tone_chat_strong
+      Fill: $tone_ink_strong
       TextStyle: {size: $size_chat_h3, line: $line_chat_h3, role: 0, bold: 1}
     }
   }
@@ -321,31 +321,31 @@ hn {
     }
     // A bullet: small and faint.
     mark : ui.Words {
-      Fill: $tone_chat_marker
+      Fill: $tone_ink_faint
       Size: {w: {kind: Fixed, value: $chat_list_mark_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       TextStyle: {size: $size_chat_bullet, line: $line_chat, role: 0, bold: 0}
     }
     text : ui.Words {
-      Fill: $tone_chat_ink
+      Fill: $tone_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
-        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light,
-        strong_dark: $tone_chat_strong.dark, strong_light: $tone_chat_strong.light, chip_radius: $chat_code_radius}
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_link.dark, link_light: $tone_link.light,
+        code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+        strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
   // An ordered item: its number at the body's size in the muted ink, tabular figures (role 10) so a column of them lines up.
   prefab ChatItemNumber : hn.ChatItem {
     mark : ui.Words {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_chat, line: $line_chat, role: 10, bold: 0}
     }
   }
   // A task item: its box at the body's size in the muted ink.
   prefab ChatItemTask : hn.ChatItem {
     mark : ui.Words {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -357,11 +357,11 @@ hn {
     Padding: {l: 2, r: 0, t: $chat_block_half, b: $chat_block_half}
     bar : hn.Seam {}
     text : ui.Words {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      MarkdownText: {chip_dark: $tone_chat_code.dark, chip_light: $tone_chat_code.light,
-        link_dark: $tone_chat_link.dark, link_light: $tone_chat_link.light,
-        code_dark: $tone_chat_code_ink.dark, code_light: $tone_chat_code_ink.light, chip_radius: $chat_code_radius}
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_link.dark, link_light: $tone_link.light,
+        code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -372,14 +372,14 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 4, b: 8}
     card : ui.Column {
-      Fill: $tone_chat_card
-      Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
+      Fill: $tone_well
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
       Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
       Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: 12, r: 12, t: 9, b: 10}
       text : ui.Words {
-        Fill: $tone_chat_ink
+        Fill: $tone_ink
         TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
       }
     }
@@ -401,22 +401,22 @@ hn {
     // tooltip; src/app/chat.rs `status_on` folds it to nothing on a line without one.
     glyph : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Size: {w: {kind: Fixed, value: $chat_line_status, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_status, min: 0, max: 0}}
     }
     words : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       LayoutPriority: {value: 1}
       Padding: {l: 0, r: $chat_line_word_gap, t: 0, b: 0}
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
     }
     arg : ui.Lead {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Padding: {l: 0, r: $chat_line_word_gap, t: 0, b: 0}
       TextStyle: {size: $size_code, line: 16, role: 9, bold: 0}
     }
     detail : ui.Line {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       LayoutPriority: {value: 2}
       Padding: {l: 0, r: $chat_line_word_gap, t: 0, b: 0}
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
@@ -425,12 +425,12 @@ hn {
     // nothing on a line without one, as the glyph is.
     state : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       Size: {w: {kind: Fixed, value: $chat_line_status, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_status, min: 0, max: 0}}
     }
     // Shown while its line is hovered (the nearest ancestor with a hover look: a step has none, so never).
     chevron : ui.Symbol {
-      Fill: $tone_chat_muted
+      Fill: $tone_ink_muted
       HoverShow: {row: 0, keep: false}
       Size: {w: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_chevron, min: 0, max: 0}}
     }
@@ -444,7 +444,7 @@ hn {
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $chat_guide_x, r: 0, t: 0, b: 0}
     line : ui.Node {
-      Fill: $tone_chat_guide
+      Fill: $tone_line
       Size: {w: {kind: Fixed, value: $chat_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
   }
@@ -462,8 +462,8 @@ hn {
     Cursor: {shape: Arrow}
     Fill: $tone_clear
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
 
   // A tool call folded to its line (an agent's own tool: its name and main argument; a harness REPL cell: what it did in
@@ -478,7 +478,7 @@ hn {
   // Failed: the same muted words; its detail (a dot, src/app/chat.rs item_rows) in the failed tone, the one coloured mark.
   prefab ChatToolFailed : hn.ChatTool {
     head : hn.ChatLine {
-      detail : ui.Line { Fill: $tone_failed }
+      detail : ui.Line { Fill: $tone_error }
     }
   }
 
@@ -491,18 +491,18 @@ hn {
       Padding: {l: $chat_line_inset, r: 0, t: 2, b: 0}
       guide : hn.ChatGuide {}
       card : ui.Column {
-        Fill: $tone_chat_card
-        Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
+        Fill: $tone_well
+        Edge: {dark: $tone_line.dark, light: $tone_line.light}
         Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
         Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 12, r: 12, t: 9, b: 10}
         input : ui.Words {
-          Fill: $tone_chat_muted
+          Fill: $tone_ink_muted
           TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
         }
         result : ui.Words {
-          Fill: $tone_chat_ink
+          Fill: $tone_ink
           TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
         }
       }
@@ -510,7 +510,7 @@ hn {
   }
   prefab ChatToolOpenFailed : hn.ChatToolOpen {
     head : hn.ChatLine {
-      detail : ui.Line { Fill: $tone_failed }
+      detail : ui.Line { Fill: $tone_error }
     }
   }
 
@@ -523,34 +523,34 @@ hn {
   // The chat's look of a ui.Table (harness_native_ui_view::table with look "hn.ChatTable"): the ui.Table* cells in the
   // terminal ground's inks: words and numbers in its ink, nulls, the index and the header muted, links in the accent.
   prefab ChatTableCell : ui.TableCell {
-    text : ui.Line { Fill: $tone_chat_ink }
+    text : ui.Line { Fill: $tone_ink }
   }
   prefab ChatTableCellMd : ui.TableCellMd {
-    text : ui.Line { Fill: $tone_chat_ink }
+    text : ui.Line { Fill: $tone_ink }
   }
   prefab ChatTableCellCode : ui.TableCellCode {
-    text : ui.Line { Fill: $tone_chat_ink }
+    text : ui.Line { Fill: $tone_ink }
   }
   prefab ChatTableCellNum : ui.TableCellNum {
-    text : ui.Line { Fill: $tone_chat_ink }
+    text : ui.Line { Fill: $tone_ink }
   }
   prefab ChatTableCellDim : ui.TableCellDim {
-    text : ui.Line { Fill: $tone_chat_muted }
+    text : ui.Line { Fill: $tone_ink_muted }
   }
   prefab ChatTableCellLink : ui.TableCellLink {}
   prefab ChatTableCellMark : ui.TableCellMark {
-    text : ui.Line { Fill: $tone_chat_muted }
+    text : ui.Line { Fill: $tone_ink_muted }
   }
   prefab ChatTableHead : ui.TableHead {
-    text : ui.Line { Fill: $tone_chat_muted }
+    text : ui.Line { Fill: $tone_ink_muted }
   }
   prefab ChatTableField : ui.TableField {
-    key : ui.Line { Fill: $tone_chat_muted }
-    value : ui.Words { Fill: $tone_chat_ink }
+    key : ui.Line { Fill: $tone_ink_muted }
+    value : ui.Words { Fill: $tone_ink }
   }
   prefab ChatTableFieldMd : ui.TableFieldMd {
-    key : ui.Line { Fill: $tone_chat_muted }
-    value : ui.Words { Fill: $tone_chat_ink }
+    key : ui.Line { Fill: $tone_ink_muted }
+    value : ui.Words { Fill: $tone_ink }
   }
 
   // A markdown table in the agent's words (src/app/chat.rs Row::Table): a ui.Table on a card's plate, its cells inline
@@ -561,8 +561,8 @@ hn {
     Padding: {l: 0, r: 0, t: 4, b: 8}
     card : ui.Column {
       Clip
-      Fill: $tone_chat_card
-      Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
+      Fill: $tone_well
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
       Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -580,8 +580,8 @@ hn {
     guide : hn.ChatGuide {}
     card : ui.Column {
       Clip
-      Fill: $tone_chat_card
-      Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
+      Fill: $tone_well
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
       Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -601,14 +601,14 @@ hn {
     Padding: {l: $chat_line_inset, r: 0, t: 2, b: 6}
     guide : hn.ChatGuide {}
     card : ui.Column {
-      Fill: $tone_chat_card
-      Edge: {dark: $tone_chat_line.dark, light: $tone_chat_line.light}
+      Fill: $tone_well
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
       Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: 10, r: 10, t: 7, b: 8}
       text : ui.Words {
-        Fill: $tone_chat_ink
+        Fill: $tone_ink
         TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
       }
     }
@@ -630,7 +630,7 @@ hn {
       Padding: {l: $chat_line_inset, r: 0, t: 0, b: 0}
       guide : hn.ChatGuide {}
       text : ui.Words {
-        Fill: $tone_chat_muted
+        Fill: $tone_ink_muted
         TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
       }
     }
@@ -650,7 +650,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
-      Fill: $tone_failed
+      Fill: $tone_error
       TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
     }
   }

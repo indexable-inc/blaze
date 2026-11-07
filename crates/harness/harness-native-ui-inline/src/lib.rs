@@ -12,18 +12,28 @@
 //! What a self-closing tag shows, and whether a mark follows its label, is the vocabulary's too ([`Form`]), installed
 //! from the scene once it loads ([`install`]): `<PR repo="indexable-inc/ix" n={7652}/>` reads `#7652` because
 //! `ui.inline.PR` says `label: "#{n}"`. It is process-wide because the typesetter that sets the words has no world.
+//!
+//! A web address is read the same way backwards: a component whose form has an `href` format (`ui.inline.PR`:
+//! `https://github.com/{repo}/pull/{n}`) is what a link to such an address means, so `<Link href="https://github.com/
+//! indexable-inc/ix/pull/7652">`, `[the fix](https://github.com/indexable-inc/ix/pull/7652)` and the bare address all
+//! become `<PR repo="indexable-inc/ix" n={7652}/>` ([`from_url`]); the agent need not pick the component. A component
+//! whose form names its `url` prop (`ui.inline.Link`: `href`) is the one links are, and a link that stays one shows its
+//! host after its words ([`Tag::meta`]).
 pub mod files;
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 /// What the vocabulary says of one component's words: `label`, a format over its props ([`format`]) a self-closing tag
-/// shows (empty: its first prop's value, a path cut to its last part), and `mark`, whether its label is followed by a
-/// mark its live state picks (a pull request's CI check).
+/// shows (empty: its first prop's value, a path cut to its last part), `mark`, whether its label is followed by a mark
+/// its live state picks (a pull request's CI check), `href`, the format of the web address it opens (read backwards by
+/// [`from_url`]), and `url`, the prop that holds a web address when the component is a link (`ui.inline.Link`'s `href`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Form {
     pub label: String,
     pub mark: bool,
+    pub href: String,
+    pub url: String,
 }
 
 // alloc: the vocabulary lives for the process; the scene installs it once, words read it.
@@ -36,6 +46,127 @@ pub fn install(forms: BTreeMap<String, Form>) {
 
 fn form(name: &str) -> Option<Form> {
     FORMS.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
+}
+
+/// The props that make `fmt` (an `href` format, `https://github.com/{repo}/pull/{n}`) read `url`: each `{prop}` takes
+/// the text up to the literal after it (the last one up to the address's end, its query or its fragment), never empty
+/// and at most two path parts (`{repo}` before `/pull/` takes `owner/name`; the last prop one). A longer
+/// address that goes on past the format by a path (`/pull/7652/files`) still reads. None when it does not fit.
+#[must_use]
+pub fn unformat(fmt: &str, url: &str) -> Option<Vec<(String, String)>> {
+    // The format's pieces: literals and prop names, alternating from a literal (maybe empty).
+    let mut lits: Vec<&str> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    let mut rest = fmt;
+    loop {
+        match rest.find('{') {
+            Some(i) => {
+                let close = rest[i..].find('}')? + i;
+                lits.push(&rest[..i]);
+                names.push(&rest[i + 1..close]);
+                rest = &rest[close + 1..];
+            }
+            None => {
+                lits.push(rest);
+                break;
+            }
+        }
+    }
+    if names.is_empty() || fmt.contains("{{") {
+        return None;
+    }
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let mut at = url.strip_prefix(lits[0])?;
+    let mut props = Vec::new();
+    for (k, name) in names.iter().enumerate() {
+        let next = lits[k + 1];
+        let value = if next.is_empty() {
+            // The last prop: to the end, or to a path that goes on past the format.
+            let v = at.split('/').next().unwrap_or(at);
+            at = &at[v.len()..];
+            v
+        } else {
+            let i = at.find(next)?;
+            let v = &at[..i];
+            // At most two path parts (`owner/name`), so a longer path is no fit.
+            if v.matches('/').count() > 1 {
+                return None;
+            }
+            at = &at[i + next.len()..];
+            v
+        };
+        if value.is_empty() {
+            return None;
+        }
+        props.push(((*name).to_owned(), value.to_owned()));
+    }
+    (at.is_empty() || at.starts_with('/')).then_some(props)
+}
+
+/// The component a link to `url` is, by the vocabulary's `href` formats ([`unformat`]), as a tag of its props: its
+/// label `words` when it was written with words of its own (not the address again), else its form's. None when no
+/// component's address fits, or one fits whose label its props cannot fill.
+#[must_use]
+pub fn from_url(url: &str, words: Option<&str>) -> Option<Tag> {
+    let forms = FORMS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (name, form, props) = forms
+        .iter()
+        .filter(|(_, f)| !f.href.is_empty())
+        .find_map(|(n, f)| unformat(&f.href, url).map(|p| (n.clone(), f.clone(), p)))?;
+    drop(forms);
+    let props: Vec<(String, Prop)> = props
+        .into_iter()
+        .map(|(k, v)| {
+            let p = if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && v.len() < 16 {
+                v.parse::<f64>().map_or(Prop::Text(v.clone()), Prop::Number)
+            } else {
+                Prop::Text(v)
+            };
+            (k, p)
+        })
+        .collect();
+    let mut tag = Tag { name, props, label: String::new(), mark: form.mark, meta: String::new() };
+    let words = words.map(str::trim).filter(|w| !w.is_empty() && !w.contains("://") && *w != bare(url));
+    tag.label = match words {
+        Some(w) => w.to_owned(),
+        None if form.label.is_empty() => return None,
+        None => format(&form.label, &tag).ok()?,
+    };
+    Some(tag)
+}
+
+/// A web address's host, `www.` off (`https://www.example.com/a` gives `example.com`).
+#[must_use]
+pub fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let h = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    h.strip_prefix("www.").unwrap_or(h)
+}
+
+/// A web address as words: without its scheme, `www.` or a trailing `/` (`example.com/doc`).
+#[must_use]
+pub fn bare(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    rest.strip_suffix('/').unwrap_or(rest)
+}
+
+/// What a tag whose form is a link's (`url` names its prop) becomes: the component its address is, when one's `href`
+/// fits ([`from_url`]: its words kept), else itself with its host after its words (none when its words are the address).
+fn as_link(mut tag: Tag, form: &Form, own_words: bool) -> Tag {
+    let Ok(url) = tag.prop(&form.url) else { return tag };
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return tag;
+    }
+    if let Some(t) = from_url(&url, own_words.then_some(tag.label.as_str())) {
+        return t;
+    }
+    if own_words && tag.label != bare(&url) && !tag.label.contains("://") {
+        tag.meta = host(&url).to_owned();
+    } else {
+        tag.label = bare(&url).to_owned();
+    }
+    tag
 }
 
 /// `fmt` with each `{prop}` replaced by `tag`'s prop of that name ([`Tag::prop`]); an error naming the tag and the prop
@@ -73,13 +204,15 @@ pub enum Prop {
 }
 
 /// One inline component: its name, its props in order, its label (its words, or for a self-closing tag its [`Form`]'s
-/// label, or with none its first prop's value, a path cut to its last part), and whether a mark follows the label.
+/// label, or with none its first prop's value, a path cut to its last part), whether a mark follows the label, and
+/// `meta`, quiet words after the label (a link's host; empty: none).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tag {
     pub name: String,
     pub props: Vec<(String, Prop)>,
     pub label: String,
     pub mark: bool,
+    pub meta: String,
 }
 
 impl Tag {
@@ -128,9 +261,12 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
                     return None;
                 }
                 let form = form(&name).unwrap_or_default();
-                let mut tag = Tag { name, props, label: String::new(), mark: form.mark };
+                let mut tag = Tag { name, props, label: String::new(), mark: form.mark, meta: String::new() };
                 // A label its props cannot fill (a missing prop) leaves the tag as words, shown as written.
-                tag.label = if form.label.is_empty() {
+                tag.label = if form.label.is_empty() && !form.url.is_empty() {
+                    // A link with no words: its address, shown bare (or what it is, `as_link`).
+                    bare(&tag.prop(&form.url).ok()?).to_owned()
+                } else if form.label.is_empty() {
                     tag.props.first().and_then(|(_, v)| match v {
                         Prop::Text(s) => Some(tail(s)),
                         Prop::Number(n) => Some(fmt_number(*n)),
@@ -139,6 +275,7 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
                 } else {
                     format(&form.label, &tag).ok()?
                 };
+                let tag = if form.url.is_empty() { tag } else { as_link(tag, &form, false) };
                 return Some((tag, i + 2));
             }
             '>' => {
@@ -169,8 +306,10 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
             if label.is_empty() {
                 return None;
             }
-            let mark = form(&name).is_some_and(|f| f.mark);
-            return Some((Tag { name, props, label, mark }, i + close.len()));
+            let form = form(&name).unwrap_or_default();
+            let tag = Tag { name, props, label, mark: form.mark, meta: String::new() };
+            let tag = if form.url.is_empty() { tag } else { as_link(tag, &form, true) };
+            return Some((tag, i + close.len()));
         }
         i += 1;
     }
@@ -286,7 +425,7 @@ mod tests {
     /// A form's label over the props, its mark, and a tag its format cannot fill staying words.
     #[test]
     fn forms() {
-        install(BTreeMap::from([("PR".to_owned(), Form { label: "#{n}".to_owned(), mark: true })]));
+        install(vocabulary());
         let (t, _) = at(r#"<PR repo="indexable-inc/ix" n={7652}/>"#).unwrap();
         assert_eq!((t.label.as_str(), t.mark), ("#7652", true));
         assert_eq!(format("https://github.com/{repo}/pull/{n}", &t).unwrap(), "https://github.com/indexable-inc/ix/pull/7652");
@@ -295,6 +434,44 @@ mod tests {
         assert!(at(r#"<PR repo="indexable-inc/ix"/>"#).is_none(), "no n: words");
         let (t, _) = at(r#"<Path loc="a/b"/>"#).unwrap();
         assert_eq!((t.label.as_str(), t.mark), ("b", false));
+    }
+
+    /// The scene's words for the tests: a pull request and an issue by their addresses, and a link.
+    fn vocabulary() -> BTreeMap<String, Form> {
+        let gh = |kind: &str, mark| Form {
+            label: "#{n}".to_owned(),
+            mark,
+            href: format!("https://github.com/{{repo}}/{kind}/{{n}}"),
+            url: String::new(),
+        };
+        BTreeMap::from([
+            ("PR".to_owned(), gh("pull", true)),
+            ("Issue".to_owned(), gh("issues", false)),
+            ("Link".to_owned(), Form { url: "href".to_owned(), ..Form::default() }),
+        ])
+    }
+
+    /// A link to a GitHub pull request or issue is one, its own words kept; other links show their host after them.
+    #[test]
+    fn links_become_what_they_point_at() {
+        install(vocabulary());
+        let pr = "https://github.com/indexable-inc/blaze/pull/1770";
+        let t = from_url(pr, None).unwrap();
+        assert_eq!((t.name.as_str(), t.label.as_str(), t.mark), ("PR", "#1770", true));
+        assert_eq!((t.prop("repo").unwrap(), t.prop("n").unwrap()), ("indexable-inc/blaze".to_owned(), "1770".to_owned()));
+        assert_eq!(from_url(&format!("{pr}/files?w=1"), Some("the charts")).unwrap().label, "the charts");
+        assert_eq!(from_url("https://github.com/a/b/issues/9#top", None).unwrap().name, "Issue");
+        for no in ["https://github.com/a/b", "https://github.com/a/b/pull/", "https://gitlab.com/a/b/pull/1", "https://github.com/a/b/pulls"] {
+            assert!(from_url(no, None).is_none(), "{no} is no component");
+        }
+        let (t, _) = at(&format!(r#"<Link href="{pr}">charts</Link>"#)).unwrap();
+        assert_eq!((t.name.as_str(), t.label.as_str()), ("PR", "charts"));
+        let (t, _) = at(&format!(r#"<Link href="{pr}"/>"#)).unwrap();
+        assert_eq!((t.name.as_str(), t.label.as_str()), ("PR", "#1770"));
+        let (t, _) = at(r#"<Link href="https://www.example.com/doc/">the design doc</Link>"#).unwrap();
+        assert_eq!((t.name.as_str(), t.label.as_str(), t.meta.as_str()), ("Link", "the design doc", "example.com"));
+        let (t, _) = at(r#"<Link href="https://www.example.com/doc/"/>"#).unwrap();
+        assert_eq!((t.label.as_str(), t.meta.as_str()), ("example.com/doc", ""));
     }
 
     #[test]

@@ -363,8 +363,9 @@ const SETTLE: Duration = Duration::from_secs(3);
 
 fn write_png(path: &str, app: &App, px: &[u8], w: u32, h: u32) -> Result<(), String> {
     let mut px = px.to_vec();
-    // The window is clear where the sidebar's vibrancy shows; offscreen there is none, so stand in a flat ground for it.
-    let g = crate::look::tone(app.world.world_ref(), "shot_ground");
+    // Where the scene paints nothing the window shows what is under it; offscreen there is nothing, so lay the theme's
+    // ground under it.
+    let g = crate::look::tone(app.world.world_ref(), "ground");
     let g = if app.dark { g.dark } else { g.light };
     let ground = [g.r, g.g, g.b];
     for c in px.chunks_exact_mut(4) {

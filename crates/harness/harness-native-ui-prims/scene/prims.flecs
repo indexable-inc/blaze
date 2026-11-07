@@ -103,8 +103,8 @@ ui {
     Flex: {axis: Row, gap: 8, align: Center, justify: Center, wrap: false}
     Padding: {l: 12, r: 12, t: 6, b: 6}
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
 
   // An icon button, the borderless way (a macOS toolbar or sidebar button): no plate, at rest or under the pointer. Its
@@ -119,13 +119,13 @@ ui {
     Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 0, b: 0}
     Fill: $tone_clear
-    Inks: {rest: $tone_icon_rest, hover: $tone_icon_hover}
+    Inks: {rest: $tone_ink_muted, hover: $tone_ink_strong}
     PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
   }
 
   // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
   prefab Toggle : ui.Button {
-    OnLook: {dark: $tone_switch_on.dark, light: $tone_switch_on.light}
+    OnLook: {dark: $tone_accent.dark, light: $tone_accent.light}
   }
 
   // A text field: a Box laid along a row with an editable buffer and a placeholder (Editable brings Focusable).
@@ -193,7 +193,7 @@ ui {
 
   // A hairline across its container.
   prefab Divider : ui.Node {
-    Fill: $tone_plate_line
+    Fill: $tone_line
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
 
@@ -222,7 +222,7 @@ ui {
   // the first frame is in. It fills what it is given; a card or pane sizes it.
   prefab Browser : ui.ZStack {
     BrowserView: {view: 0, src: ""}
-    Fill: $tone_gen_media
+    Fill: $tone_wash
     Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
     Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
@@ -238,7 +238,7 @@ ui {
       Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
       Padding: {l: 12, r: 12, t: 12, b: 12}
       text : ui.Words {
-        Fill: $tone_term_muted
+        Fill: $tone_ink_muted
         Text: {s: "Not connected to the harness browser"}
         TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
       }
@@ -302,13 +302,13 @@ ui {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $textarea_max_h}}
     // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start),
-    // in the hint's own ink (tone_hint), well under the words' so it never reads as typed text.
+    // in the faint ink (tone_ink_faint), well under the words' so it never reads as typed text.
     hint_at : ui.Row {
       Background
       Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
       Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
       hint : ui.Words {
-        Fill: $tone_hint
+        Fill: $tone_ink_faint
         TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       }
     }
@@ -316,7 +316,7 @@ ui {
       Cursor: {shape: Text}
       TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_ink_1.dark, caret_light: $tone_ink_1.light}
+        caret_dark: $tone_ink_strong.dark, caret_light: $tone_ink_strong.light}
     }
   }
 
@@ -339,7 +339,7 @@ ui {
     Action: {name: ""}
     Fill: $tone_clear
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
   }
   prefab TableCell : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
@@ -349,7 +349,7 @@ ui {
   }
   prefab TableCellMd : ui.TableCell {
     text : ui.Line {
-      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
         link_dark: $tone_accent.dark, link_light: $tone_accent.light}
     }
   }
@@ -361,7 +361,7 @@ ui {
   }
   prefab TableCellDim : ui.TableCell {
     text : ui.Line {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_table, line: 16, role: 10, bold: 0}
     }
   }
@@ -372,11 +372,11 @@ ui {
     text : ui.Line { Fill: $tone_accent }
   }
   prefab TableCellMark : ui.TableCell {
-    text : ui.Line { Fill: $tone_ink_3 }
+    text : ui.Line { Fill: $tone_ink_muted }
   }
   prefab TableHead : ui.TableCell {
     text : ui.Line {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_table, line: 16, role: 0, bold: 0, weight: 500}
     }
   }
@@ -392,7 +392,7 @@ ui {
     Flex: {axis: Row, gap: $table_gap, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     key : ui.Line {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_table, line: 18, role: 0, bold: 0, weight: 500}
     }
     value : ui.Words {
@@ -403,7 +403,7 @@ ui {
   }
   prefab TableFieldMd : ui.TableField {
     value : ui.Words {
-      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
         link_dark: $tone_accent.dark, link_light: $tone_accent.light}
     }
   }
@@ -449,13 +449,13 @@ ui {
       TextStyle: {size: $size_body, line: 18, role: 0, bold: 0, weight: 500}
     }
     host : ui.Line {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
     }
     snippet : ui.Words {
       Clip
       Cursor: {shape: Text}
-      Fill: $tone_ink_2
+      Fill: $tone_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $result_snippet_h}}
       TextStyle: {size: $size_table, line: 18, role: 0, bold: 0}
     }
@@ -476,8 +476,8 @@ ui {
   // the edge it hangs from, so an instance that hangs it Bottom sets `from: Top`).
   prefab MenuPlate : ui.Column {
     Hoverable
-    Fill: $tone_menu
-    Edge: {dark: $tone_menu_edge.dark, light: $tone_menu_edge.light}
+    Fill: $tone_raised
+    Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
     Shape: {radius: $menu_radius, n: 4, border: 1, feather: 0}
     Lift: {blur: $menu_lift_blur, alpha: $menu_lift_alpha, dy: $menu_lift_dy}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
@@ -505,8 +505,8 @@ ui {
     Cursor: {shape: Arrow}
     Fill: $tone_clear
     Shape: {radius: $menu_item_radius, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_menu_hot.dark, light: $tone_menu_hot.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_menu_press.dark, light: $tone_menu_press.light}
+    HoverLook: {dark: $tone_selection_focus.dark, light: $tone_selection_focus.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
     Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
@@ -532,7 +532,7 @@ ui {
       Size: {w: {kind: Fixed, value: $menu_meta_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     meta : ui.Line {
-      Fill: $tone_ink_3
+      Fill: $tone_ink_muted
       FixedSize: {h: true, v: false}
       TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
     }
@@ -549,7 +549,7 @@ ui {
   }
   // The item that is chosen now: its check shown.
   prefab MenuItemOn : ui.MenuItem {
-    mark : ui.Check { Fill: $tone_ink_1 }
+    mark : ui.Check { Fill: $tone_ink_strong }
   }
   // A section's head: small, muted, in line with the items' labels.
   prefab MenuHead : ui.Row {
@@ -579,7 +579,7 @@ ui {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $menu_gutter_l, r: $menu_gutter_l, t: $menu_sep_pad, b: $menu_sep_pad}
     line : ui.Node {
-      Fill: $tone_menu_rule
+      Fill: $tone_line
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
   }
@@ -599,7 +599,7 @@ ui {
   // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
   // here, and a Cmd+C pulses it with CopyLook (den's FlashLook: a 300 ms timeline, not a spring).
   prefab selection {
-    Fill: $plate_selection
+    Fill: $tone_text_selection
     Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
     CopyLook: {secs: $copy_secs, rise: $copy_rise, grow: $copy_grow, light: $copy_light, stagger: $copy_stagger, row_in: $copy_row_in}
   }
@@ -607,6 +607,11 @@ ui {
   // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
+  }
+  // Struck-through words' one look (harness-native-render paint.rs, inline markdown's ~~struck~~): a hairline through
+  // the glyphs about the middle of their x-height, in the text's own ink at reduced alpha.
+  prefab strike {
+    StrikeLook: {w: $strike_w, rise: $strike_rise_em, alpha: $strike_alpha}
   }
   spring {
     // The springs the generic motion falls back on when a node has no Motion of its own.

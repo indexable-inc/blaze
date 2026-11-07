@@ -174,6 +174,16 @@ pub struct CaretLook {
     pub fade: f32,
 }
 
+/// Struck-through words' one look (`ui.strike` in prims.flecs; inline markdown's `~~struck~~`): a hairline `w` points
+/// thick (at least one device pixel), its middle `rise` of the words' size over their baseline (about the middle of the
+/// x-height), drawn over the glyphs in the text's own ink at `alpha` of it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct StrikeLook {
+    pub w: f32,
+    pub rise: f32,
+    pub alpha: f32,
+}
+
 /// A band across the node's width that joins two other nodes' heights, as a merge view joins a chunk in one pane to the same
 /// chunk in the next: its left end spans the height of `(RibbonFrom, a)`, its right end that of `(RibbonTo, b)`, and its edges
 /// ease between them. Drawn in the node's Fill, cut to the clip it sits in. An end shorter than `min` (a side with no lines
@@ -300,6 +310,7 @@ hyperion_api_layouts::api_layouts! {
     "HoverLook" => alias HoverLook,
     "CopyLook" => alias CopyLook,
     "CaretLook" => alias CaretLook,
+    "StrikeLook" => alias StrikeLook,
     "Scheme" => alias Scheme,
     "MascotLook" => alias MascotLook,
     "MascotMotion" => alias MascotMotion,
@@ -326,6 +337,7 @@ pub fn register(world: &World) {
     world.component::<HoverInk>().writable();
     world.component::<CopyLook>().writable();
     world.component::<CaretLook>().writable();
+    world.component::<StrikeLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();
     world.component::<MascotLook>().writable();

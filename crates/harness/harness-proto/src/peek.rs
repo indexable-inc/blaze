@@ -110,9 +110,11 @@ pub const BODY_MAX: usize = 600;
 /// The most refs one request may ask after (a chat with more asks in batches).
 pub const REFS_MAX: usize = 100;
 
-/// A web page's card: its OpenGraph (else `<title>` and meta description) title, description and site name, and its
-/// `og:image` saved where the app can read it (`image`, a local path; empty when it has none or it could not be fetched).
-/// With `error` set nothing else is known.
+/// A web page's card: its OpenGraph (else `<title>` and meta description) title, description and site name, its
+/// `og:image` saved where the app can read it (`image`, a local path; empty when it has none or it could not be fetched),
+/// and its favicon the same way (`icon`, a local PNG or JPEG: the page's `apple-touch-icon` or `icon` link, else the
+/// site's `/favicon.ico`; empty when it has none the app can draw, and the app shows a globe). With `error` set nothing
+/// else is known.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct PageMeta {
     pub url: String,
@@ -124,6 +126,8 @@ pub struct PageMeta {
     pub site: String,
     #[serde(default)]
     pub image: String,
+    #[serde(default)]
+    pub icon: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
 }

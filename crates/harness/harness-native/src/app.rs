@@ -100,6 +100,15 @@ struct Choice {
     effort: Option<String>,
 }
 
+/// A session to select once the list has it: a spawn's, with the model and effort it was asked to start on (seeded as
+/// its chat's choice when it is selected, so its picker never shows a placeholder), or a deep link's (neither).
+#[derive(Clone, Debug)]
+struct Spawned {
+    sid: u64,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// The agent kinds cmd+N may start (Claude and Codex in the chat pane, Cursor in its terminal).
 const CHAT_KINDS: [&str; 3] = ["claude", "codex", "cursor"];
 
@@ -244,8 +253,8 @@ pub struct App {
     pressed: Vec<u16>,
     /// Session ids attached since launch: an ended one is attached again only when it is still running.
     tried: HashMap<u64, f32>,
-    /// The session a spawn made, to select once the list shows it.
-    spawned: Arc<Mutex<Option<u64>>>,
+    /// The session a spawn made (with the model and effort it was asked to start on), to select once the list shows it.
+    spawned: Arc<Mutex<Option<Spawned>>>,
     /// Why cmd+N could not start on the remembered model, shown on the new chat's models menu once it is selected.
     refuse_spawned: Option<String>,
     /// What cmd+N starts on: the agent kind last used, and by kind the model and effort last chosen (native.json
@@ -306,7 +315,7 @@ pub struct App {
     browser: browser::Browser,
 }
 
-/// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
+/// The fill of the theme's role `name` (`success`: `hn.Theme.success`).
 fn tone(w: WorldRef<'_>, name: &str) -> Fill {
     crate::look::tone(w, name)
 }
@@ -718,11 +727,11 @@ impl App {
         let w = self.world.world_ref();
         let code = w.entity_from_id(e).try_cloned::<&model::ExitCode>().map(|c| c.code);
         match self.status_of(e) {
-            "running" => tone(w, "running"),
-            "lost" => tone(w, "lost"),
-            "killed" => tone(w, "failed"),
-            _ if code.is_some_and(|c| c != 0) => tone(w, "failed"),
-            _ => tone(w, "exited"),
+            "running" => tone(w, "success"),
+            "lost" => tone(w, "warning"),
+            "killed" => tone(w, "error"),
+            _ if code.is_some_and(|c| c != 0) => tone(w, "error"),
+            _ => tone(w, "ink_faint"),
         }
     }
 
@@ -777,13 +786,16 @@ impl App {
         }
         // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
         let mut refused = None;
-        let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
-        if let Some(sid) = pending {
-            if let Some(e) = self.entity_of(sid) {
+        let pending = self.spawned.lock().unwrap().clone().filter(|_| self.restore.is_none());
+        if let Some(p) = pending {
+            if let Some(e) = self.entity_of(p.sid) {
+                // Its chat shows what it was started on from the frame it is selected in, not what its agent says once
+                // it is up (chat.rs `chat_started_on`).
+                self.chat_started_on(p.sid, p.model.as_deref(), p.effort.as_deref());
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
                 if let Some(why) = self.refuse_spawned.take() {
-                    refused = Some((sid, why));
+                    refused = Some((p.sid, why));
                 }
             }
         }
@@ -1423,7 +1435,7 @@ impl App {
         }
         let entries = self.entries();
         let at = at.min(entries.len().saturating_sub(1));
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selection"));
         if let Some(items) = card.and_then(|c| c.part("items")) {
             let rows = entries
                 .into_iter()
@@ -1441,7 +1453,7 @@ impl App {
                         PalGlyph::Kind(k) => crate::look::kind_mark(w, p.entity(), &k),
                         PalGlyph::Char(c) => {
                             crate::look::show_glyph(p.entity(), c);
-                            set_if(p, tone(w, "muted"));
+                            set_if(p, tone(w, "ink_muted"));
                         }
                     }
                 }
@@ -1589,7 +1601,20 @@ impl App {
     /// cmd+N: a chat of the last agent kind on its last model and effort ([`Self::remember_choice`]). A remembered model
     /// (or effort) its kind no longer lists is not started on: the chat starts as its agent does by default, its models'
     /// menu open with an error naming what is gone.
+    /// Whether the chat `sid` has had a message sent in it: a chat with none is still the new chat Cmd-N would make.
+    pub(in crate::app) fn sent(&self, sid: u64) -> bool {
+        self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })))
+    }
+
     pub(in crate::app) fn new_chat(&mut self) {
+        // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
+        if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
+            && self.chats.borrow().contains_key(&sid)
+            && !self.sent(sid)
+        {
+            self.poke();
+            return;
+        }
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
@@ -2191,7 +2216,10 @@ impl App {
         let cwd = cwd.or_else(|| std::env::var("HOME").ok());
         let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();
-        self.link.spawn(kind, cwd, model, effort, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
+        let asked = (model.clone(), effort.clone());
+        self.link.spawn(kind, cwd, model, effort, cols, rows, move |sid| {
+            *slot.lock().unwrap() = Some(Spawned { sid, model: asked.0, effort: asked.1 });
+        });
     }
 
     fn kill(&mut self) {
@@ -2226,7 +2254,7 @@ impl App {
 
     /// Select the object of daemon session `sid` once the list has it (the shot's `HARNESS_NATIVE_SHOT_SELECT`).
     pub fn select_session(&mut self, sid: u64) {
-        *self.spawned.lock().unwrap() = Some(sid);
+        *self.spawned.lock().unwrap() = Some(Spawned { sid, model: None, effort: None });
     }
 
     /// Select run `r{n}` (or its stage `k`) once the runs show it (the shot's `HARNESS_NATIVE_SHOT_SELECT=r12[.0]`).
@@ -2374,10 +2402,10 @@ impl RowLooks {
         Self {
             clear,
             accent: tone(w, "accent"),
-            failed: tone(w, "failed"),
-            failed_wash: tone(w, "failed_wash"),
-            faint: tone(w, "faint"),
-            lost: tone(w, "lost"),
+            failed: tone(w, "error"),
+            failed_wash: tone(w, "error_wash"),
+            faint: tone(w, "ink_faint"),
+            lost: tone(w, "warning"),
             badge_on: crate::look::padding(w, "badge_on"),
         }
     }
@@ -2554,7 +2582,7 @@ mod tests {
             "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
             "hn.ChatContext", "hn.ChatWorking",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
-            "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekHead", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
+            "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
             "hn.PeekImage", "hn.PeekPage",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
@@ -2578,12 +2606,110 @@ mod tests {
             assert!(w.try_lookup(m).is_some_and(|e| e.has(module)), "{m} is not a module");
         }
         for e in [
-            "look", "unknown", "hover", "pressed", "underline", "live", "marks::success", "marks::failure", "marks::pending",
-            "Path", "FileRef", "Symbol", "Link", "PR::open", "PR::draft", "PR::merged", "PR::closed", "PR::unknown",
+            "look", "rest", "meta", "unknown", "hover", "pressed", "underline", "live", "marks::success", "marks::failure",
+            "marks::pending", "marks::success::card", "marks::failure::card", "marks::pending::card", "Path", "FileRef",
+            "Symbol", "Link", "Link::unknown", "PR::open", "PR::draft", "PR::merged", "PR::closed", "PR::unknown",
             "Issue::open", "Issue::closed", "Issue::not_planned", "Issue::unknown",
         ] {
             let path = format!("{}::{e}", harness_native_render::inline::MODULE);
             assert!(w.try_lookup(&path).is_some(), "the scene has no {path}");
         }
+        // The theme's colour roles (scene/00-tokens.flecs's `tone_<role>`, scene/widgets/theme.flecs's children): each has
+        // a Fill, so the roles the code names (look::tone panics on a missing one) are all there.
+        for role in [
+            "ground", "sidebar", "card", "raised", "well", "term_ground", "line", "line_strong", "ink_strong", "ink",
+            "ink_muted", "ink_faint", "hover", "wash", "selection", "selection_focus", "press", "scrim", "clear",
+            "text_selection", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
+            "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell",
+        ] {
+            let _ = crate::look::tone(w, role);
+        }
+    }
+
+    /// The colour of a brace `{...}` at the start of `s` when it is a colour literal: four plain numbers (`{0.1, 0.1,
+    /// 0.1, 1}`) or four named `r`, `g`, `b`, `a` (`{r: 1, g: 1, b: 1, a: 1}`). A Padding's `{l, r, t, b}` is not one.
+    fn colour_literal(s: &str) -> bool {
+        let Some(body) = s.strip_prefix('{').and_then(|b| b.split_once('}')).map(|(b, _)| b) else { return false };
+        let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+        if parts.len() != 4 {
+            return false;
+        }
+        let num = |p: &str| p.parse::<f32>().is_ok();
+        parts.iter().all(|p| num(p))
+            || parts.iter().zip(["r", "g", "b", "a"]).all(|(p, k)| {
+                p.split_once(':').is_some_and(|(name, v)| name.trim() == k && num(v.trim()))
+            })
+    }
+
+    /// One theme: no colour is chosen anywhere but the theme. Outside the tokens files (harness-native's
+    /// scene/00-tokens.flecs, which holds the theme's roles and the palettes; harness-video's tokens.flecs, its mirror)
+    /// and Kip's artwork (kip.flecs: a character's own paint, not a surface), no scene script writes a colour literal, and
+    /// no Rust in this crate builds an `Rgba` from numbers: each names a role (`Fill: $tone_card`, `look::tone(w, "card")`).
+    /// `cargo test -p harness-native no_raw_colours`.
+    #[test]
+    fn no_raw_colours() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let roots = [
+            here.join("scene"),
+            here.join("src"),
+            here.join("../harness-native-ui-prims/scene"),
+            here.join("../harness-video/scene"),
+        ];
+        let allowed = [
+            "harness-native/scene/00-tokens.flecs",
+            "harness-video/scene/tokens.flecs",
+            "harness-native-ui-prims/scene/kip.flecs",
+        ];
+        let mut files = Vec::new();
+        let mut dirs: Vec<std::path::PathBuf> = roots.to_vec();
+        while let Some(d) = dirs.pop() {
+            let entries = std::fs::read_dir(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+            for entry in entries {
+                let p = entry.unwrap_or_else(|e| panic!("{}: {e}", d.display())).path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "flecs" || x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        assert!(files.iter().any(|f| f.ends_with("scene/widgets/frame.flecs")), "found no scene scripts under {roots:?}");
+        let mut bad = Vec::new();
+        for f in files.iter().filter(|f| !allowed.iter().any(|a| f.ends_with(a))) {
+            let src = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            let rust = f.extension().is_some_and(|x| x == "rs");
+            for (i, line) in src.lines().enumerate() {
+                // A Rust file's tests (at its end) may build what they check.
+                if rust && line.trim_start().starts_with("#[cfg(test)]") {
+                    break;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                let hit = if rust {
+                    code.match_indices("Rgba {").any(|(at, _)| colour_literal(&code[at + "Rgba ".len()..]))
+                } else {
+                    code.match_indices('{').any(|(at, _)| colour_literal(&code[at..]))
+                };
+                if hit {
+                    bad.push(format!("{}:{}: {}", f.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a colour outside the theme (name a role: a scene's `$tone_<role>`, Rust's `look::tone(w, \"<role>\")`; add a \
+             role to scene/00-tokens.flecs and hn.Theme if none fits):\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The raw-colour check sees both literal shapes and lets a Padding by.
+    #[test]
+    fn colour_literals() {
+        assert!(colour_literal("{0.063, 0.063, 0.067, 1}"));
+        assert!(colour_literal("{r: 1, g: 0.5, b: 0, a: 1}}"));
+        assert!(!colour_literal("{l: 0, r: 0, t: 0, b: 0}"));
+        assert!(!colour_literal("{dark: $tone_line.dark, light: $tone_line.light}"));
+        assert!(!colour_literal("{w: 1, h: 2}"));
     }
 }

@@ -96,10 +96,62 @@ fn maker(cur: Option<&ModelChoice>, model: &str, agent: &str) -> &'static str {
     }
 }
 
-/// The model the chat runs, among `models`: what it runs as, else what was last chosen.
-fn current<'a>(t: &Transcript, models: &'a [ModelChoice]) -> Option<&'a ModelChoice> {
+/// The model the chat runs, among `models`: what it runs as, else what was last chosen (or started on), else `listed`
+/// (the daemon's word for it).
+fn current<'a>(t: &Transcript, models: &'a [ModelChoice], listed: &str) -> Option<&'a ModelChoice> {
     let by = |m: &str| if m.is_empty() { None } else { models.iter().find(|c| c.is(m)) };
-    by(&t.model).or_else(|| by(&t.chosen_model))
+    by(&t.model).or_else(|| by(&t.chosen_model)).or_else(|| by(listed))
+}
+
+/// The model and effort chat `t` shows: what its agent said it runs (its `session` event, or a choice), else what it was
+/// chosen or started on ([`Transcript::start_on`]: a cmd+N's, until its agent is up), else `listed`, the daemon's listing
+/// of the object (`(model, effort)`, empty while its agent has not said).
+fn shown<'a>(t: &'a Transcript, listed: (&'a str, &'a str)) -> (&'a str, &'a str) {
+    let or = |a: &'a str, b: &'a str| if a.is_empty() { b } else { a };
+    if !t.model.is_empty() {
+        (t.model.as_str(), or(t.effort.as_str(), listed.1))
+    } else if !t.chosen_model.is_empty() || !t.chosen_effort.is_empty() {
+        (or(t.chosen_model.as_str(), listed.0), or(t.chosen_effort.as_str(), listed.1))
+    } else {
+        listed
+    }
+}
+
+/// What the picker's control says for a chat: the models it picks from, the one it runs, its name and effort, the
+/// control's words, the effort's level (its place among the model's efforts, from its kind's kept list until its own
+/// log lists them) and its tooltip. A chat with a choice shows it from its first frame; `name` is empty (no control)
+/// only while nothing names a model.
+struct Label<'a> {
+    models: &'a [ModelChoice],
+    cur: Option<&'a ModelChoice>,
+    name: &'a str,
+    effort: &'a str,
+    words: String,
+    level: Option<(usize, usize)>,
+    tip: String,
+}
+
+impl<'a> Label<'a> {
+    /// Chat `t`'s, an agent of kind `kind`, its kind's kept lists `kept`, the daemon's listing `listed`.
+    fn of(t: &'a Transcript, kind: &'a str, kept: &'a BTreeMap<String, Vec<ModelChoice>>, listed: (&'a str, &'a str)) -> Self {
+        let models = models_of(t, kind, kept);
+        let (model, effort) = shown(t, listed);
+        let cur = current(t, models, model);
+        let name = cur.map_or(model, |c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() });
+        // The model's name and its effort's level; an effort with no place among its model's said in words
+        // ("Opus · Medium"), and the model alone when the effort is unknown. The effort's name is the tooltip either way.
+        let level = level(cur, effort);
+        let words = match level {
+            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(effort)),
+            _ => name.to_owned(),
+        };
+        let tip = if effort.is_empty() {
+            "Model and effort  \u{2318}/".to_owned()
+        } else {
+            format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(effort))
+        };
+        Self { models, cur, name, effort, words, level, tip }
+    }
 }
 
 /// An effort's word as den shows it: `xhigh` is Extra High, the rest capitalised.
@@ -232,22 +284,20 @@ impl EffortState {
 
 /// The efforts the model chat `t` runs takes, lowest first (none when unknown or it takes none).
 fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>) -> Vec<String> {
-    current(t, models_of(t, kind, kept)).map(|m| m.efforts.clone()).unwrap_or_default()
+    current(t, models_of(t, kind, kept), shown(t, ("", "")).0).map(|m| m.efforts.clone()).unwrap_or_default()
 }
 
 impl App {
-    /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, running `model` at
-    /// `said` effort as the pane has them, `ended` when no agent runs it), and its menu while `open`.
+    /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, `listed` the daemon's
+    /// `(model, effort)` for it, `ended` when no agent runs it), and its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
-        model: &str, said: &str, ended: bool,
+        listed: (&str, &str), ended: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
-        let models = models_of(t, kind, &kept);
-        let cur = current(t, models);
-        let name = cur.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(model);
+        let Label { models, cur, name, effort: said, .. } = Label::of(t, kind, &kept, listed);
         let effort = eff.shown(t, ended, said, self.time);
         let context = t.context.as_ref().filter(|c| c.window > 0);
         let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
@@ -362,7 +412,7 @@ impl App {
             .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>())
             .map(|c| c.s.as_str().to_owned())
             .filter(|c| !c.is_empty());
-        let fresh = self.chats.borrow().get(&sid).is_none_or(|t| !t.items.iter().any(|i| matches!(i, model::chat::Item::User { .. })));
+        let fresh = !self.sent(sid);
         self.remember_choice(&kind, Some(&m), None);
         self.spawning(&kind);
         self.spawn_on(&kind, Some(m), None, cwd);
@@ -380,7 +430,7 @@ impl App {
             let Some(t) = chats.get(&sid) else { return };
             let kept = self.link.agent_models();
             let kind = self.agent_kind_of(sid, t);
-            let cur = current(t, models_of(t, &kind, &kept)).map(|c| c.id.clone());
+            let cur = current(t, models_of(t, &kind, &kept), "").map(|c| c.id.clone());
             let same = model.is_none() || model == cur;
             let effort = effort.or_else(|| Some(t.effort.clone()).filter(|e| same && !e.is_empty()));
             (kind, model.or(cur), effort)
@@ -998,5 +1048,44 @@ mod tests {
         assert_eq!(s("Opus", "Best for everyday tasks"), (String::new(), "Best for everyday tasks".into()));
         assert_eq!(s("gpt-6.1", "A frontier agentic coding model for long work \u{b7} reasoning"), (String::new(), "A frontier agentic coding model for long work \u{b7} reasoning".into()));
         assert_eq!(s("Sonnet", "Sonnet \u{b7} Fast"), (String::new(), "Fast".into()));
+    }
+
+    use harness_proto::event::{Body, Event};
+
+    fn kept() -> BTreeMap<String, Vec<ModelChoice>> {
+        let efforts = ["low", "medium", "high", "xhigh"].map(str::to_owned).to_vec();
+        let opus = ModelChoice { id: "opus".into(), model: "claude-opus-5-5".into(), name: "Opus 5.5".into(), efforts, ..ModelChoice::default() };
+        BTreeMap::from([("claude".to_owned(), vec![opus])])
+    }
+
+    /// A cmd+N chat's control says the remembered model and effort from its first frame (its transcript seeded, before
+    /// the agent or the daemon's listing say anything), and the same once its agent says it runs them and lists its
+    /// models: never blank, never the effort in words, the meter's bars there from the start. Without the seed the first
+    /// frame has no control at all (the flash).
+    #[test]
+    fn a_new_chat_shows_its_remembered_choice_from_its_first_frame() {
+        let kept = kept();
+        let said = |l: &Label<'_>| (l.words.clone(), l.level, l.tip.clone());
+        let unseeded = Transcript::default();
+        assert_eq!(Label::of(&unseeded, "claude", &kept, ("", "")).name, "", "the cause: nothing names a model yet");
+
+        let mut t = Transcript::default();
+        t.start_on(Some("opus"), Some("high"));
+        let first = said(&Label::of(&t, "claude", &kept, ("", "")));
+        assert_eq!(first, ("Opus 5.5".to_owned(), Some((2, 4)), "Opus 5.5 \u{b7} High effort  \u{2318}/".to_owned()));
+
+        // The agent is up: its `session` names the model as it runs; then the daemon's listing; then its own list.
+        let ev = |body: Body| Event { ts: 1, body };
+        t.apply(&ev(Body::Session { agent: "claude".into(), model: "claude-opus-5-5".into(), session_id: None, effort: Some("high".into()) }));
+        assert_eq!(said(&Label::of(&t, "claude", &kept, ("", ""))), first);
+        assert_eq!(said(&Label::of(&t, "claude", &kept, ("claude-opus-5-5", "high"))), first);
+        t.apply(&ev(Body::Models { models: kept["claude"].clone() }));
+        assert_eq!(said(&Label::of(&t, "claude", &kept, ("claude-opus-5-5", "high"))), first);
+
+        // A choice in the log (a Codex spawn's, or one the person made) is the chat's own and wins over the seed.
+        let mut c = Transcript::default();
+        c.apply(&ev(Body::Choice { model: Some("opus".into()), effort: Some("low".into()) }));
+        c.start_on(Some("opus"), Some("high"));
+        assert_eq!(Label::of(&c, "claude", &kept, ("", "")).level, Some((0, 4)));
     }
 }

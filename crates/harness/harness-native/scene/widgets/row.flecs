@@ -43,7 +43,7 @@ hn {
         Disclose: {open: $open}
         // Clear with nothing under the row (a re-run sets components, it never removes them: so both arms set the Fill).
         if $kids {
-          Fill: $tone_chevron
+          Fill: $tone_ink_faint
         } else {
           Fill: $tone_clear
         }

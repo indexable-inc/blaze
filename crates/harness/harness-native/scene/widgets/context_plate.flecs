@@ -16,7 +16,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: $chat_ctx_bar_pad, b: $chat_ctx_bar_pad}
     track : ui.Row {
-      Fill: $tone_menu_rule
+      Fill: $tone_line
       Shape: {radius: $chat_ctx_bar_r, n: 4, border: 0, feather: 0}
       Clip
       Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}

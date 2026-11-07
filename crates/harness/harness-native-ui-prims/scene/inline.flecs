@@ -1,52 +1,69 @@
 // Inline components: the vocabulary of chips an agent writes in its words, `<Path loc="/Volumes/Projects/blaze">blaze</Path>`
 // (harness-native-ui-inline is the tag grammar; this module is what each name means). One entity per name: its icon
 // (`glyph`, or the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
-// the one with a line in it (`line`). A chip is the label in the UI face, medium, after its icon, on the plate the text's
-// MarkdownText gives code (`chip`), so each host tints both alike. A new component is an entity here; nothing in Rust
+// the one with a line in it (`line`). A chip is the label in the UI face, medium, after its icon, on `rest`'s plate (clear)
+// at rest and `hover`'s under the pointer. A new component is an entity here; nothing in Rust
 // lists them. Depends on the primitives (prims.flecs: MarkdownText's chips) and the tokens.
 //
 // A self-closing tag's words and where it opens can be formats over its props (InlineRef `label`, `href`: `#{n}`), and a
 // component can have live state the host keeps (`key`, `feed`; harness-native-render inline.rs): a child per state it
 // can be in, each its icon (InlineRef.glyph) and its ink (Fill), with `unknown` for while nothing is known, and with
 // `mark` a small mark after its label from `marks` (a pull request's CI). The host keeps what it knows under `live`.
+//
+// A link is read for what it points at: `url` names the prop a component keeps a web address in (Link's `href`), and a
+// link whose address fits another component's `href` format is that component (a link to a GitHub pull request is its
+// PR chip, with its state and checks), whether written as <Link>, as [words](address) or bare. A link that stays one
+// shows its words, then its host quiet (`meta`), after its page's favicon (the host's live picture; the globe without).
 module ui.inline
 
 @tree ChildOf
 // What every chip shares: its icon's ink (quiet: the label carries the meaning) and its corners.
 look {
-  Fill: $tone_ink_3
+  Fill: $tone_ink_muted
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+}
+// A chip's plate at rest: clear, so a chip reads as a reference in the words (as GitHub's and Linear's do), its icon in
+// its state's ink saying what it is; the plate shows on hover.
+rest {
+  Fill: $tone_clear
+}
+// The quiet words after a label: a link's host.
+meta {
+  Fill: $tone_ink_muted
 }
 // The chip under the pointer (a brighter plate, its label underlined) and held down (brighter still); the pointer is
 // the pointing hand over any chip that opens.
 hover {
-  Fill: $tone_inline_hover
+  Fill: $tone_selection_focus
 }
 pressed {
-  Fill: $tone_inline_pressed
+  Fill: $tone_press
 }
 underline {
-  Fill: $tone_inline_underline
+  Fill: $tone_ink_faint
 }
 // What the host knows of live components: one InlineLive child a thing (src/app/chat/peek.rs keeps them).
 live {
 }
-// The marks a live component's state picks after its label: a pull request's head commit's checks.
+// The marks a live component's state picks after its label: a pull request's head commit's checks, a small dot in their
+// ink on the chip (oct-dot-fill), and on its hover card (`card`) the check, the cross or the dot.
 marks {
   success {
-    // oct-check
-    InlineRef: {glyph: ""}
+    InlineRef: {glyph: ""}
     Fill: $tone_gh_ci_success
+    // oct-check
+    card { InlineRef: {glyph: ""} }
   }
   failure {
-    // oct-x
-    InlineRef: {glyph: ""}
+    InlineRef: {glyph: ""}
     Fill: $tone_gh_ci_failure
+    // oct-x
+    card { InlineRef: {glyph: ""} }
   }
   pending {
-    // oct-dot-fill
     InlineRef: {glyph: ""}
     Fill: $tone_gh_ci_pending
+    card { InlineRef: {glyph: ""} }
   }
 }
 
@@ -63,10 +80,16 @@ Symbol {
   // cod-symbol-method
   InlineRef: {target: "loc", line: "line", file_icon: false, glyph: ""}
 }
-// A web page: a press opens it in the browser.
+// A web page: its favicon (the host fetches it with the page's card: InlineLive.picture), else the globe, then its words
+// and its host, quiet; a press opens it in the browser. A link to what another component is becomes that component.
 Link {
-  // cod-link
-  InlineRef: {target: "href", line: "", file_icon: false, glyph: ""}
+  // cod-globe
+  InlineRef: {target: "href", line: "", file_icon: false, glyph: "", url: "href", key: "page:\{href}", feed: "page"}
+  // Its page not fetched yet, fetched with no favicon, or not fetched at all: the globe, quiet.
+  unknown {
+    InlineRef: {glyph: ""}
+    Fill: $tone_ink_muted
+  }
 }
 // A GitHub pull request, `<PR repo="indexable-inc/ix" n={7652}/>`: `#7652` after its icon in its state's ink (open
 // green, draft grey, merged purple, closed red, as GitHub draws them), then its head commit's checks; its title on hover,
@@ -96,7 +119,7 @@ PR {
   // Not asked yet, or the fetch failed (its error is the tooltip): the plain icon, quiet, no mark.
   unknown {
     InlineRef: {glyph: ""}
-    Fill: $tone_ink_3
+    Fill: $tone_ink_muted
   }
 }
 // A GitHub issue, `<Issue repo="indexable-inc/ix" n={812}/>`: open green, closed (completed) purple, closed as not
@@ -120,7 +143,7 @@ Issue {
   }
   unknown {
     InlineRef: {glyph: ""}
-    Fill: $tone_ink_3
+    Fill: $tone_ink_muted
   }
 }
 // A tag with no entity here, or whose target is not a place: a warning icon, the error as its tooltip, no press.

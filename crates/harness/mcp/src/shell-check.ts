@@ -546,8 +546,9 @@ function flagValue(args: Word[], ...names: string[]): string | undefined {
   return undefined;
 }
 
-/** What a program with a typed call does instead, and why: GitHub's reads through `gh`, and HTTP through curl or wget. */
-type Covered = { call: string; kind: 'github' | 'http' };
+/** What a program with a typed call does instead, and why: GitHub's reads through `gh`, HTTP through curl or wget, and a
+ *  web page opened with `open` (the Mac's default browser, not the harness browser the person sees). */
+type Covered = { call: string; kind: 'github' | 'http' | 'browser' };
 
 /** The typed call for a `gh` read: the api, a pull request's or issue's list or view. Writes (`gh pr create`, `merge`,
  *  `comment`) and what has no call (`gh run view --log`, `gh auth`) run. */
@@ -606,6 +607,10 @@ function coveredBy(cmd: Cmd): Covered | undefined {
     const out = flagValue(cmd.args, '-o', '--output', '-O', '--output-document');
     const fetched = `await fetch(${js(url)})`;
     return { call: out && out !== '-' ? `await Bun.write(${js(out)}, ${fetched})` : `await (${fetched}).text()`, kind: 'http' };
+  }
+  if (cmd.name === 'open') {
+    const url = cmd.args.map(word => word.text).find(text => /^https?:\/\//.test(text));
+    if (url !== undefined) return { call: `await browser.open(${js(url)})`, kind: 'browser' };
   }
   return undefined;
 }
@@ -693,6 +698,7 @@ function vet(parser: Parser, script: string, reason?: string): ShellVerdict {
       readers.length ? `${readers.join(', ')} only ${readers.length === 1 ? 'reads' : 'read'} files or the tree, which the typed helpers return as data.` : '',
       namesOf('github').length ? "GitHub's reads are github.* in ts (rows as Tables, gh's token, one step per call; await skill('github')), not `gh` in a shell." : '',
       namesOf('http').length ? 'HTTP is fetch in ts (one step per request), not curl or wget.' : '',
+      namesOf('browser').length ? "A web page opens in the harness browser with browser.open in ts (the person sees it as a card and in the browser pane; you can read and drive it), not `open` in the Mac's default browser." : '',
     ].filter(Boolean).join(' ');
     return {
       refusal: [

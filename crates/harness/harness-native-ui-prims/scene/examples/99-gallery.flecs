@@ -6,7 +6,7 @@
 swiftui_gallery : ui.Column {
   Clip
   ScrollState: {x: 0, y: 0}
-  Fill: $tone_plate
+  Fill: $tone_card
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
   SafeAreaInset: {l: 0, r: 0, t: 0, b: 0}

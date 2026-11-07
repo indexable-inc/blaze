@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{LazyRange, Padding, SafeAreaInset, Size, Sizing};
-use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_node_api::{Node, Offscreen};
 use harness_native_ui_view::{self as view, View};
 
@@ -240,7 +239,6 @@ fn change(w: WorldRef<'_>) {
     if let Some(bar) = at(w, "cards::animate::bar") {
         bar.set(Size { w: Sizing::fixed(240.0), h: Sizing::fixed(40.0) });
         bar.set(Padding { l: 40.0, r: 6.0, t: 0.0, b: 0.0 });
-        let accent = Rgba { r: 0.58, g: 0.6, b: 1.0, a: 0.45 };
-        bar.set(Fill { dark: accent, light: Rgba { r: 0.37, g: 0.38, b: 0.9, a: 0.35 } });
+        bar.set(crate::look::tone(w, "accent_wash"));
     }
 }

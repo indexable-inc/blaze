@@ -3,7 +3,9 @@
 // leaves the chip and the plate both. The plate is a ui.Menu (the shared popover: an overlay placed against what it is
 // anchored to, flipped to fit, its lift and motion), anchored to a Placed node the host lays over the chip. Its lines
 // are a keyed list the host keeps (harness_native_ui_view::for_each_of), one prefab a kind of line; the host passes
-// words and which scene entity's Fill an ink is, never a colour or a size.
+// words and which scene entity's Fill an ink is, never a colour or a size. Every card reads the same way: a header row
+// (an icon or the page's favicon, then where the thing is: `owner/repo #n`, the site, the path), the title flush left
+// under it, then what there is. A line with nothing to show (no picture, no live view) is not added, so no room is kept.
 @tree ChildOf
 hn {
   // Where the plate opens against: a node the host lays over the chip's rectangle (Placed: layout keeps the Laid it is
@@ -21,19 +23,39 @@ hn {
     Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
   }
 
-  // The head: the thing's icon in its state's ink (the host copies the Fill of the component's state child,
-  // ui.inline.PR.merged), then its title, strong, wrapping.
-  prefab PeekHead : ui.Row {
-    Flex: {axis: Row, gap: $inline_peek_gap, align: FirstBaseline, justify: Start, wrap: false}
+  // The header of a page with a favicon: the favicon (a picture the daemon saved, inline_peek_icon_w square, a little
+  // rounded), then the site's name, quiet.
+  prefab PeekSite : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Node {
+      Picture: {handle: ""}
+      Clip
+      Shape: {radius: $inline_peek_icon_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}}
+    }
+    name : ui.Line, Muted {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+    }
+  }
+
+  // The header of anything else: its icon (a pull request's in its state's ink: the host copies the Fill of the
+  // component's state child, ui.inline.PR.merged; a page without a favicon the globe), then where it is, quiet.
+  prefab PeekSiteGlyph : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     icon : ui.Symbol {
-      AlignSelf: {align: Start}
-      Padding: {l: 0, r: 0, t: 2, b: 0}
+      Size: {w: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}}
     }
-    title : ui.Words, Strong {
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      TextStyle: {size: $size_peek_title, line: $line_peek_title, role: 0, bold: 1}
+    name : ui.Line, Muted {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
     }
+  }
+
+  // The title, strong, wrapping, flush left under the header.
+  prefab PeekTitle : ui.Words, Strong {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_title, line: $line_peek_title, role: 0, bold: 1}
   }
 
   // Its state as GitHub shows it: a pill in the state's ink with its name (Open, Draft, Merged, Closed), then the head
@@ -47,7 +69,7 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $inline_peek_badge_pad, r: $inline_peek_badge_pad, t: 1, b: 1}
       label : ui.Line {
-        Fill: $tone_peek_badge_ink
+        Fill: $tone_on_accent
         TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 1}
       }
     }
@@ -59,7 +81,7 @@ hn {
     }
   }
 
-  // A quiet line: who opened it and how many lines it changes; a page's site; a file's path.
+  // A quiet line: who opened it and how many lines it changes; asking, or what failed.
   prefab PeekMeta : ui.Words, Muted {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
@@ -77,7 +99,8 @@ hn {
     TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
   }
 
-  // A page's og:image (the daemon saves it as a file), cut to the plate's width and inline_peek_image_h, rounded.
+  // A page's og:image (the daemon saves it as a file), cut to the plate's width and inline_peek_image_h, rounded; only on
+  // a page that has one.
   prefab PeekImage : ui.Node {
     Picture: {handle: ""}
     Clip
@@ -85,13 +108,13 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_image_h, min: 0, max: 0}}
   }
 
-  // The seam for a live view of the page (an embedded browser, CEF): PageView names the URL; until a browser host
-  // renders it and sets `ready` (harness-native-ui-text-api PageView) the line is laid out at no height, and the card is
-  // the page's OpenGraph data above.
+  // The live view of the page (an embedded browser, CEF): the card's PageView names the URL, and only once a browser
+  // host renders it and sets `ready` (harness-native-ui-text-api PageView) is this line added, its frames by `key`;
+  // until then the card is the page's OpenGraph data and holds no room for it.
   prefab PeekPage : ui.Node {
-    PageView: {url: "", key: 0, ready: false}
+    Surface: {key: 0, cover: 1}
     Clip
     Shape: {radius: $inline_peek_radius, n: 4, border: 0, feather: 0}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_page_h, min: 0, max: 0}}
   }
 }

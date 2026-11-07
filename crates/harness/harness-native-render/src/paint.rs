@@ -12,7 +12,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, StrikeLook, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::{Laid, wrap_width};
 use harness_native_ui_text_api::{
@@ -409,6 +409,10 @@ impl Painter {
             l.1 = l.1.min(keep);
             l.0 < l.1
         });
+        m.strike.retain_mut(|s| {
+            s.1 = s.1.min(keep);
+            s.0 < s.1
+        });
         m.tags.retain_mut(|t| {
             t.end = t.end.min(keep);
             t.start < t.end
@@ -620,6 +624,11 @@ impl Painter {
                 };
                 let inline_code_ink = md.and_then(|m| pick(m.code_dark, m.code_light));
                 let strong_ink = md.and_then(|m| pick(m.strong_dark, m.strong_light));
+                // An inline component's quiet words after its label (a link's host), in `ui.inline.meta`'s ink.
+                let meta_ink = shown_md
+                    .as_ref()
+                    .filter(|m| m.tags.iter().any(|t| t.meta.is_some()))
+                    .map(|_| crate::inline::meta(e.world(), dark));
                 let faced: Vec<(usize, usize, [f32; 4])> = shown_md
                     .as_ref()
                     .map(|m| {
@@ -630,6 +639,7 @@ impl Painter {
                                 Face::Bold | Face::BoldItalic => strong_ink.map(|c| (r.start, r.end, c)),
                                 _ => None,
                             })
+                            .chain(m.tags.iter().filter_map(|t| t.meta.zip(meta_ink).map(|((a, b), c)| (a, b, c))))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -743,10 +753,31 @@ impl Painter {
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
                         }
                     }
-                    // Inline components on the same chip: one plate from the icon's hole to the end of the label (and its
-                    // mark), the icon drawn in the hole in its ink (the look's, quiet, or its live state's: a merged pull
-                    // request's purple), the mark in its own. The one the pointer is over (InlineHot) on the hover or
-                    // pressed plate, its label underlined.
+                    // Struck-through words: a hairline over the glyphs of each line they cover, `ui.strike`'s look.
+                    let struck = shown_md.as_ref().map_or(&[][..], |m| m.strike.as_slice());
+                    if !struck.is_empty() {
+                        let look = strike_look(e.world());
+                        let thick = (look.w * sc).round().max(1.0) / sc;
+                        let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                        let line_ink = [ink[0], ink[1], ink[2], ink[3] * look.alpha];
+                        for &(lo, hi) in struck {
+                            let ((x0, l0), (x1, l1)) = (lay.caret(lo), lay.caret(hi));
+                            for (li, l) in lay.lines.iter().enumerate().take(l1 + 1).skip(l0) {
+                                let a = if li == l0 { x0 } else { 0.0 };
+                                let b = if li == l1 { x1 } else { l.width };
+                                let y = laid.y + l.baseline - size * look.rise - thick * 0.5;
+                                let rect = [laid.x + a, (y * sc).round() / sc, b - a, thick];
+                                if b > a {
+                                    d.panel(panel_from(line_ink, [0.0; 4], flat, rect, p.alpha));
+                                }
+                            }
+                        }
+                    }
+                    // Inline components: at rest on `ui.inline.rest`'s plate (clear: the icon says what it is, as GitHub's
+                    // and Linear's references read), from the icon's hole to the end of the label (its host, its mark);
+                    // the icon drawn in the hole in its ink (the look's, quiet, or its live state's: a merged pull
+                    // request's purple), or its live picture there (a link's favicon); the mark in its own ink. The one
+                    // the pointer is over (InlineHot) on the hover or pressed plate, its label underlined.
                     let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
                     if !tags.is_empty() {
                         let w = e.world();
@@ -758,23 +789,25 @@ impl Painter {
                             ..TextStyle::default()
                         };
                         let mark_style = TextStyle { size: size * crate::markdown::MARK_SIZE_EM, ..icon_style };
+                        let rest = crate::inline::rest(w, dark);
                         for (n, t) in tags.iter().enumerate() {
                             let here = hot.filter(|h| h.tag as usize == n);
-                            let plate = here.map_or(chip, |h| crate::inline::hot(w, h.pressed, dark));
+                            let plate = here.map_or(rest, |h| crate::inline::hot(w, h.pressed, dark));
                             let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
                             let rects = spans_of(&lay, t.start, t.end);
                             let last = rects.len().saturating_sub(1);
-                            for (k, r) in rects.iter().enumerate() {
+                            for (k, r) in rects.iter().enumerate().filter(|_| plate[3] > 0.0) {
                                 let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
                                 let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                                 let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                                 d.panel(panel_from(plate, [0.0; 4], ref_shape, rect, p.alpha));
                             }
                             if here.is_some() {
-                                // The label's underline: a hairline under its words, past the icon's hole, before the mark.
-                                let label_end = t.mark().unwrap_or(t.end);
+                                // The label's underline: a hairline under its words, past the icon's hole, before its host
+                                // and its mark.
+                                let (label_lo, label_hi) = t.label();
                                 let under = crate::inline::underline(w, dark);
-                                for r in spans_of(&lay, t.start + 1, label_end) {
+                                for r in spans_of(&lay, label_lo, label_hi) {
                                     let y = laid.y + r[1] + r[3] - 3.0;
                                     let rect = [laid.x + r[0], (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
                                     let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
@@ -783,13 +816,23 @@ impl Painter {
                             }
                             // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
                             let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
-                            let (glyph, icon_ink) = crate::inline::icon(w, &t.tag, dark);
-                            let icon = self.layout(&glyph, &icon_style, 1.0e5);
-                            let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
-                            let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
-                            let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
-                            let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
-                            emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
+                            if let Some(pic) = crate::inline::picture(w, &t.tag) {
+                                // Its live picture (a favicon), square, the icon's size, where the icon goes.
+                                let s = icon_style.size;
+                                let sheet = self.photo(&pic, 1000).map_err(|err| format!("{}: {}'s picture: {err}", e.path(), t.tag.name))?;
+                                let rect = [laid.x + hole[0] + before * 0.5, laid.y + hole[1] + (hole[3] - s) * 0.5, s, s];
+                                let hdr = sheet.peak.map_or([0.0; 4], |peak| [1.0, peak, 0.0, 0.0]);
+                                let size = [sheet.w as f32, sheet.h as f32, p.alpha, 1.0];
+                                d.image(ImageInst { rect, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr }, sheet.frames[0].clone());
+                            } else {
+                                let (glyph, icon_ink) = crate::inline::icon(w, &t.tag, dark);
+                                let icon = self.layout(&glyph, &icon_style, 1.0e5);
+                                let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                                let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
+                                let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
+                                let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
+                                emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
+                            }
                             // The mark's hole is MARK_EM wide: the gap after the label, then the mark at its end. Nothing
                             // while its live state has none (unknown, or not asked yet).
                             let (Some(at), Some((mglyph, mink))) = (t.mark(), crate::inline::mark(w, &t.tag, dark)) else { continue };
@@ -1062,6 +1105,19 @@ impl Painter {
     /// seam between neighbours at any size, offset or scale. A `Picture` is a PNG (`Pixelated`; with `Frames`, a sheet of
     /// frames stacked downwards, played from the `Clock` and looped); a `BlazeMark` is drawn live.
     #[allow(clippy::too_many_arguments)]
+    /// The photo at absolute path `handle` (a PNG or JPEG) as a sheet, cut to the shape `milli` (width over height, in
+    /// thousandths) about its middle, decoded once per path and shape.
+    fn photo(&mut self, handle: &str, milli: u32) -> Result<Rc<Sheet>, String> {
+        let key = format!("photo:{milli}:{handle}");
+        if let Some(s) = self.sheets.get(&key) {
+            return Ok(s.clone());
+        }
+        let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0), true)?;
+        let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba], peak: ph.peak });
+        self.sheets.insert(key, s.clone()); // alloc: the sheet cache, kept with the painter
+        Ok(s)
+    }
+
     fn picture(
         &mut self,
         d: &mut Draw,
@@ -1115,17 +1171,7 @@ impl Painter {
             }
             // The shape to a thousandth, so a box that wobbles by a fraction of a point decodes once.
             let milli = (rest[0] / rest[1] * 1000.0).round().max(1.0) as u32;
-            let key = format!("photo:{milli}:{handle}");
-            let sheet = match self.sheets.get(&key) {
-                Some(s) => s.clone(),
-                None => {
-                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0), true)
-                        .map_err(|err| format!("{path}: {err}"))?;
-                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba], peak: ph.peak });
-                    self.sheets.insert(key, s.clone());
-                    s
-                }
-            };
+            let sheet = self.photo(handle, milli).map_err(|err| format!("{path}: {err}"))?;
             // An HDR photo is drawn in its own range, tone-mapped to the display's headroom from its brightest.
             let hdr = sheet.peak.map_or([0.0; 4], |peak| [1.0, peak, 0.0, 0.0]);
             let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr };
@@ -1238,6 +1284,15 @@ impl Painter {
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
     }
+}
+
+/// `ui.strike`'s look (prims.flecs): struck-through words' hairline. The scene is compiled in, so one without it is a bug:
+/// this panics naming it.
+fn strike_look(w: WorldRef<'_>) -> StrikeLook {
+    w.try_lookup("ui::strike")
+        .unwrap_or_else(|| panic!("the scene has no ui::strike (prims.flecs)"))
+        .try_cloned::<&StrikeLook>()
+        .unwrap_or_else(|| panic!("ui::strike has no StrikeLook"))
 }
 
 /// The rects (x, y from the layout's origin, w, h) of UTF-16 units `lo..hi` of `lay`, one per line they cover.

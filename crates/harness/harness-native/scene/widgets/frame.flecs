@@ -22,23 +22,24 @@ hn {
     back : ui.Symbol {
       Pressable
       Action: {name: "nav:back"}
-      Fill: $tone_term_muted
+      Fill: $tone_ink_muted
       Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
     }
   }
 
-  // The hairline between the sidebar and the main card: the only seam (no shadow, same ground on both sides).
+  // The hairline between the sidebar and the main card: the only seam (no shadow; tone_sidebar is the main card's own
+  // ground, so this line is all that divides them).
   prefab Seam : ui.Node {
-    Fill: $tone_seam
+    Fill: $tone_line
     Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   }
 
-  // The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
+  // The sidebar's fold (cmd+S), in the theme's sidebar ground: a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
   // full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
   // width. The main card's left edge follows the clip's right edge.
   prefab SideClip : ui.Column {
     Clip
-    Fill: $tone_side_tint
+    Fill: $tone_sidebar
     Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
     Padding: {l: 0, r: 0, t: 0, b: 0}
@@ -75,7 +76,7 @@ hn {
   // speaks another schema), naming its pid and socket and `harness stop`. No room and no words while it is not
   // (src/app.rs sync_view sets its height and text).
   prefab LinkNote : ui.Words {
-    Fill: $tone_failed
+    Fill: $tone_error
     TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
     Padding: {l: $row_pad, r: $row_pad, t: 0, b: 8}
@@ -85,29 +86,29 @@ hn {
   // frame on every side so it hugs the row's content with air between neighbours, and matched by id: the tree's one
   // highlight, whichever row holds it, its position springing (the tree's spring family) from where it was drawn to the
   // new row while its size is always the new row's, so it is never shorter than the words it sits under. A row still
-  // folding in is Settling: its pill holds where it was until the row has opened, then slides in. The row picks the plate's Fill (tone_row_select, or tone_select_focus while the tree has the keyboard).
+  // folding in is Settling: its pill holds where it was until the row has opened, then slides in. The row picks the plate's Fill (tone_selection, or tone_selection_focus while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
     plate : ui.Node {
       MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
-      Fill: $tone_select
+      Fill: $tone_selection
       Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
       Motion: {omega: $pill_omega, zeta: $pill_zeta}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
   }
 
-  // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
-  // bottom edges (the window's corners round it). Nothing sits over its top (no title); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
+  // The main card: an opaque plate in the theme's ground from the window's top edge to its right and bottom edges (the
+  // window's corners round it). Nothing sits over its top (no title); hn.Seam is the line between it and the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
   // a split is a second node. Through a cmd+S fold the plate, its panes and their boxes follow the spring, while words
   // break their lines at the width they have once the fold rests (WrapAt; the sidebar's clip says which width, src/app.rs
   // lay_chrome), so they wrap once per fold. What cannot follow a moving box (a terminal's grid, which resizes once) lays
   // out at that width too (LaysAtRest on the pane), riding its pane's leading edge.
   prefab Main : ui.Row, Plate {
-    Fill: $tone_term_ground
+    Fill: $tone_ground
     Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
     Shape: {radius: 0, n: 4, border: 0, feather: 0}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
@@ -133,9 +134,11 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   }
 
-  // A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane.
+  // A session (Claude, Codex, Cursor, a shell): its terminal, the whole pane, on the terminal's own ground (the Ghostty
+  // theme's, tone_term_ground), which the grid's default-coloured cells leave showing.
   prefab TermPane : hn.Pane {
     LaysAtRest
+    Fill: $tone_term_ground
     term : hn.Terminal {}
   }
 
@@ -156,8 +159,10 @@ hn {
 
   // A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
   // they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
+  // Its terminal's ground is the terminal's (tone_term_ground), as a TermPane's is.
   prefab RunPane : hn.Pane {
     LaysAtRest
+    Fill: $tone_term_ground
     info : ui.Column {
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
@@ -176,7 +181,7 @@ hn {
     Pressable
     Fill: $tone_clear
     Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_row_hover.dark, light: $tone_row_hover.light, pad: 0 - $pill_inset, radius: $radius_row}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0 - $pill_inset, radius: $radius_row}
     Flex: {axis: Row, gap: $tree_gap, align: Center, justify: Start, wrap: false}
   }
 }

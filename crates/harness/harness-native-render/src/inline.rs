@@ -6,7 +6,8 @@
 //! Live state is data too: the host keeps one entity per thing it knows under `ui.inline.live`, an `InlineLive` named by
 //! the component's `key` format, with `(InlineState, <the component's state child>)` and `(InlineMark, <a
 //! ui.inline.marks child>)`. Each state child carries the icon and its ink, so which colour an open, draft, merged or
-//! closed pull request gets is the scene's, not code's.
+//! closed pull request gets is the scene's, not code's. A link's live state is its page's favicon (`InlineLive.picture`),
+//! drawn in its icon's place; without one it is its `unknown` child's globe.
 use std::collections::BTreeMap;
 
 use harness_native_flecs::prelude::*;
@@ -20,14 +21,21 @@ pub const MODULE: &str = "ui::inline";
 /// Where the host keeps what it knows of live components: one `InlineLive` child per thing.
 pub const LIVE: &str = "ui::inline::live";
 
-/// Hand the module's words (each component's label format and whether a mark follows it) to the grammar, which the
-/// typesetter reads with no world. Run once the scene is loaded; a module missing is a scene bug, named.
+/// Hand the module's words (each component's label format, whether a mark follows it, the web address it opens and the
+/// prop a link keeps its address in) to the grammar, which the typesetter reads with no world. Run once the scene is
+/// loaded; a module missing is a scene bug, named.
 pub fn install(w: WorldRef<'_>) {
     let m = w.try_lookup(MODULE).unwrap_or_else(|| panic!("the scene has no {MODULE} (inline.flecs)"));
     let mut forms = BTreeMap::new(); // alloc: the vocabulary, kept for the process by the grammar.
     m.each_child(|c| {
         if let Some(r) = c.try_cloned::<&InlineRef>() {
-            forms.insert(c.name(), Form { label: r.label.as_str().to_owned(), mark: r.mark });
+            let form = Form {
+                label: r.label.as_str().to_owned(),
+                mark: r.mark,
+                href: r.href.as_str().to_owned(),
+                url: r.url.as_str().to_owned(),
+            };
+            forms.insert(c.name(), form);
         }
     });
     harness_native_ui_inline::install(forms);
@@ -48,6 +56,23 @@ pub fn hot(w: WorldRef<'_>, pressed: bool, dark: bool) -> [f32; 4] {
 /// The underline under a hovered chip's label (`ui.inline.underline`).
 pub fn underline(w: WorldRef<'_>, dark: bool) -> [f32; 4] {
     fill_of(w, "underline", dark)
+}
+
+/// A chip's plate at rest (`ui.inline.rest`): clear or nearly, so a chip reads as a reference in the words, its icon
+/// carrying what it is, not as a button; the hover plate is the one that shows.
+pub fn rest(w: WorldRef<'_>, dark: bool) -> [f32; 4] {
+    fill_of(w, "rest", dark)
+}
+
+/// The ink of a chip's quiet words after its label (`ui.inline.meta`: a link's host).
+pub fn meta(w: WorldRef<'_>, dark: bool) -> [f32; 4] {
+    fill_of(w, "meta", dark)
+}
+
+/// The picture a chip shows in its icon's place, when its live state has one (a link's page's favicon, a local PNG or
+/// JPEG the daemon saved).
+pub fn picture(w: WorldRef<'_>, tag: &Tag) -> Option<String> {
+    live(w, tag)?.try_cloned::<&InlineLive>().map(|l| l.picture.as_str().to_owned()).filter(|p| !p.is_empty())
 }
 
 fn fill_of(w: WorldRef<'_>, name: &str, dark: bool) -> [f32; 4] {

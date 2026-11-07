@@ -260,6 +260,9 @@ pub struct ChatState {
     rows_open: HashMap<String, usize>,
     /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
     pick: Option<pick::Pick>,
+    /// The model and effort a spawn asked it to start on ([`App::chat_started_on`]): seeded into its transcript at every
+    /// attach, since an attach replays the log from nothing and a Claude chat's log names neither until its agent is up.
+    started: Option<(Option<String>, Option<String>)>,
     pick_nav: pick::PickNav,
     /// Its effort as this app moves it (a swipe over the control, the menu's slider, a key): shown at once, sent once it
     /// rests (chat/pick.rs).
@@ -339,6 +342,7 @@ impl Default for ChatState {
             pick: None,
             pick_nav: pick::PickNav::default(),
             effort: pick::EffortState::default(),
+            started: None,
             input_scroll: view::field::FieldScroll::default(),
             stream: HashMap::new(),
             cut: HashMap::new(),
@@ -409,16 +413,21 @@ impl Row {
     }
 }
 
-/// Markdown split into the rows it is drawn as: paragraphs (soft breaks joined), headings, list items (continuation lines
-/// joined), quotes, fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
+/// Markdown split into the rows it is drawn as: paragraphs, headings, list items (with their continuation lines), quotes
+/// (each kept a line apart, less its indent and the block's trailing white space, so inline markdown reads a soft break
+/// as a space and two trailing spaces or a backslash as a hard one), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
 /// that are no table, as code). While it is `live` (still streaming) a table's row arrives whole: a last row not yet ended
 /// is held back, and so is a head whose delimiter line has not come.
 fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
+    /// A block's lines as its inline markdown: a line apart, each less its indent, the whole less its trailing white space.
+    fn lines_of<'a>(ls: impl Iterator<Item = &'a str>) -> String {
+        ls.map(str::trim_start).collect::<Vec<_>>().join("\n").trim_end().to_owned()
+    }
     let lines: Vec<&str> = md.lines().collect();
     let mut para: Vec<&str> = Vec::new();
     let flush = |para: &mut Vec<&str>, out: &mut Vec<Row>| {
         if !para.is_empty() {
-            out.push(Row::Prose(para.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ")));
+            out.push(Row::Prose(lines_of(para.iter().copied())));
             para.clear();
         }
     };
@@ -479,13 +488,13 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
         }
         if let Some(q) = t.strip_prefix('>') {
             flush(&mut para, out);
-            let mut text = vec![q.trim()];
+            let mut text = vec![q];
             i += 1;
             while i < lines.len() && lines[i].trim_start().starts_with('>') {
-                text.push(lines[i].trim_start()[1..].trim());
+                text.push(&lines[i].trim_start()[1..]);
                 i += 1;
             }
-            out.push(Row::Quote(text.join(" ")));
+            out.push(Row::Quote(lines_of(text.into_iter())));
             continue;
         }
         if t.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ') && t.len() >= 3 {
@@ -496,7 +505,7 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
         if let Some((mark, rest)) = item(t) {
             flush(&mut para, out);
             let depth = (line.len() - t.len()) / 2;
-            let mut text = vec![rest.trim()];
+            let mut text = vec![rest];
             i += 1;
             while i < lines.len() {
                 let n = lines[i];
@@ -507,7 +516,7 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
                 text.push(nt);
                 i += 1;
             }
-            out.push(Row::ListItem { depth, mark, text: text.join(" ") });
+            out.push(Row::ListItem { depth, mark, text: lines_of(text.into_iter()) });
             continue;
         }
         para.push(line);
@@ -1055,15 +1064,15 @@ impl App {
         genui::fill_in(ui, tree, "gallery.0", cells, Some(&self.genui), true, &mut measure);
     }
 
-    /// Whether a chat (its transcript, composer and cells, on `tone_chat_ground`) draws dark: the window's appearance.
+    /// Whether a chat (its transcript, composer and cells, on the theme's `tone_ground`) draws dark: the window's appearance.
     pub(super) fn chat_dark(&self) -> bool {
         self.dark
     }
 
-    /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
+    /// Whether the terminal's ground (`hn.Theme.term_ground`, `tone_term_ground`: a terminal pane's) is dark in the window's
+    /// appearance.
     pub(super) fn term_ground_dark(&self) -> bool {
-        let w = self.world.world_ref();
-        let Some(f) = view::prefab(w, "hn.Main").and_then(|e| e.try_cloned::<&Fill>()) else { return self.dark };
+        let f = crate::look::tone(self.world.world_ref(), "term_ground");
         let c = if self.dark { f.dark } else { f.light };
         0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.5
     }
@@ -1082,6 +1091,17 @@ impl App {
         }
         let e = *o.id();
         Some((p, e, self.session_of(e)?))
+    }
+
+    /// Chat `sid` was spawned on `model` at `effort` (cmd+N's remembered choice, or a pick of another kind's model): its
+    /// choice from now, so the frame that first shows it already names them ([`Transcript::start_on`]), and again at each
+    /// attach. Neither given (a deep link's session, a plain spawn): nothing to seed.
+    pub(in crate::app) fn chat_started_on(&self, sid: u64, model: Option<&str>, effort: Option<&str>) {
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+        self.chat.borrow_mut().entry(sid).or_default().started = Some((model.map(str::to_owned), effort.map(str::to_owned)));
+        self.chats.borrow_mut().entry(sid).or_default().start_on(model, effort);
     }
 
     /// Fill a chat pane from its session's transcript: attach for its events, its rows in view, its input and status.
@@ -1111,12 +1131,17 @@ impl App {
                 st.stream.clear();
                 st.cut.clear();
                 st.row_born.clear();
-                self.chats.borrow_mut().remove(&sid);
+                let mut chats = self.chats.borrow_mut();
+                chats.remove(&sid);
+                if let Some((m, e)) = &st.started {
+                    chats.entry(sid).or_default().start_on(m.as_deref(), e.as_deref());
+                }
+                drop(chats);
                 self.link.attach(sid, 80, 24, true);
             }
         }
-        // Drawn in the window's appearance on the chat's own ground (`tone_chat_ground`, not the terminal's): a chat is a
-        // page, so it takes the app's palette, not the Ghostty theme's.
+        // Drawn in the window's appearance on the theme's ground (`tone_ground`, not the terminal's): a chat is a page, so it
+        // takes the app's theme, not the Ghostty theme's.
         let scheme = harness_native_ui_look_api::Scheme { dark: self.chat_dark() };
         for part in ["list", "foot"] {
             if let Some(v) = pv.part(part)
@@ -1273,16 +1298,11 @@ impl App {
         }
         if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
             let o = w.entity_from_id(e);
-            // The model and the effort it runs with, as den's picker (chat/pick.rs): the transcript's when its `session`
-            // event (or a choice) said them, else the daemon's listing; the model alone when the effort is unknown.
+            // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
+            // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
-            let (model, effort) = if t.model.is_empty() {
-                (listed.s.as_str().to_owned(), listed.effort.as_str().to_owned())
-            } else {
-                let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
-                (t.model.clone(), effort.to_owned())
-            };
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, &model, &effort, ended);
+            let listed = (listed.s.as_str(), listed.effort.as_str());
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
             // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
             if let Some(act) = bar.part("act") {
                 let working = t.busy && !ended;
@@ -2589,8 +2609,8 @@ mod tests {
         blocks("# Title\n\nSome *words*\nwrapped.\n\n- one\n  more\n- two\n\n```ts\nconst x = 1;\n```\n> quoted", false, &mut out);
         let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
         assert_eq!(kinds, ["hn.ChatH1", "hn.ChatProse", "hn.ChatItem", "hn.ChatItem", "hn.ChatCode", "hn.ChatQuote"]);
-        assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words* wrapped."));
-        assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one more"));
+        assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words*\nwrapped."));
+        assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one\nmore"));
         // An ordered item and a task take their own markers' prefabs (a number and a box at the words' size).
         let mut out = Vec::new();
         blocks("1. first

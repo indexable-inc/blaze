@@ -18,7 +18,7 @@ hn {
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 0, b: 0}
     code : ui.Line {
-      Fill: $tone_failed
+      Fill: $tone_error
       TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
     }
   }
@@ -66,20 +66,20 @@ hn {
     }
     codex : ui.Icon {
       Mark: {name: "openai"}
-      Fill: $tone_mark_ink
+      Fill: $tone_ink_strong
     }
     cursor : ui.Icon {
       Mark: {name: "cursor"}
-      Fill: $tone_mark_ink
+      Fill: $tone_ink_strong
     }
     shell : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_kind_shell
+      Fill: $tone_ink_muted
     }
     // Any other kind (a process): a small dot in the shell's tone.
     other : ui.Symbol {
       Icon: {glyph: ""}
-      Fill: $tone_kind_shell
+      Fill: $tone_ink_muted
     }
   }
 }

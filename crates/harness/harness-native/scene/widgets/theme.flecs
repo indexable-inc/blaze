@@ -3,28 +3,53 @@
 @tree ChildOf
 hn {
   // The theme: every tone, size and spring the host reads by role (src/look.rs `role`, `hn.Theme.<role>`), one child
-  // each, valued from the tokens (00-tokens.flecs). Another look is another hn.Theme.
+  // each, valued from the tokens (00-tokens.flecs). Its colour roles are the theme's, one child per `tone_<role>` token
+  // (each named without the prefix: a token named like the entity that reads it does not resolve, flecs#2389), and
+  // what each is for is said there. A widget in script names the token; Rust names the role here. Another look is
+  // another set of those tokens.
   prefab Theme {
-    // Status: a dot's or an icon's.
-    running { Fill: $tone_running }
-    exited { Fill: $tone_exited }
-    failed { Fill: $tone_failed }
-    failed_wash { Fill: $tone_failed_wash }
-    lost { Fill: $tone_lost }
-    // Rows: the selected row's pill, nothing, the accent, the tertiary and quaternary inks.
-    selected { Fill: $tone_select }
+    // Grounds.
+    ground { Fill: $tone_ground }
+    sidebar { Fill: $tone_sidebar }
+    card { Fill: $tone_card }
+    raised { Fill: $tone_raised }
+    well { Fill: $tone_well }
+    term_ground { Fill: $tone_term_ground }
+    // Lines.
+    line { Fill: $tone_line }
+    line_strong { Fill: $tone_line_strong }
+    // Inks.
+    ink_strong { Fill: $tone_ink_strong }
+    ink { Fill: $tone_ink }
+    ink_muted { Fill: $tone_ink_muted }
+    ink_faint { Fill: $tone_ink_faint }
+    // Washes.
+    hover { Fill: $tone_hover }
+    wash { Fill: $tone_wash }
+    selection { Fill: $tone_selection }
+    selection_focus { Fill: $tone_selection_focus }
+    press { Fill: $tone_press }
+    scrim { Fill: $tone_scrim }
     clear { Fill: $tone_clear }
+    text_selection { Fill: $tone_text_selection }
+    // Accent, links, code.
     accent { Fill: $tone_accent }
-    strong { Fill: $tone_ink_1 }
-    muted { Fill: $tone_ink_3 }
-    faint { Fill: $tone_ink_4 }
-    // The cute touch: a small warm colour per kind on its icon.
+    accent_wash { Fill: $tone_accent_wash }
+    on_accent { Fill: $tone_on_accent }
+    link { Fill: $tone_link }
+    code_ink { Fill: $tone_code_ink }
+    // States (a status dot's: running success, lost warning, failed or killed error, ended ink_faint; src/app.rs dot_tone).
+    success { Fill: $tone_success }
+    warning { Fill: $tone_warning }
+    error { Fill: $tone_error }
+    success_wash { Fill: $tone_success_wash }
+    warning_wash { Fill: $tone_warning_wash }
+    error_wash { Fill: $tone_error_wash }
+    // The cute touch, a palette: a small warm colour per kind on its icon; a shell's is the muted ink.
     kind_claude { Fill: $tone_kind_claude }
     kind_codex { Fill: $tone_kind_codex }
     kind_cursor { Fill: $tone_kind_cursor }
-    kind_shell { Fill: $tone_kind_shell }
-    // Offscreen shots' stand-in for the vibrancy (src/shot.rs).
-    shot_ground { Fill: $tone_shot_ground }
+    kind_shell { Fill: $tone_ink_muted }
     // How long after it ended a finished run with no session leaves the tree for the Archive (seconds, as a width).
     archive_after {
       Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}

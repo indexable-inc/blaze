@@ -7,11 +7,13 @@ main', {path, type: 'rust', context: 2}); files by name with await glob('src/**/
 'size'} for sizes); a folder with await ls(dir); disk use with await du(dir); history with gitLog(); a build,
 lint or test with await cargo.check(args) (build, test, clippy; follow(cmd) for any other), which the person
 watches live and which returns you a digest of its errors, not its log; GitHub with github.prs, pr, issues,
-checks or graphql; HTTP with fetch. An npm package imports by name, pinned on first use (import { z } from
+checks or graphql; HTTP with fetch; a web page with await browser.open(url), which opens it in the harness
+browser the person sees beside the chat (a card, and the browser pane) and gives you a page to read, click and
+screenshot: "go to", "open" or "look at" a site always means this, never the Mac's own browser. An npm package imports by name, pinned on first use (import { z } from
 'zod', or await import('lodash@4.17.21') for a version).
 
-Rule: whatever a typed call covers (files, search, listing, builds, git history, GitHub, HTTP, packages), use the
+Rule: whatever a typed call covers (files, search, listing, builds, git history, GitHub, HTTP, web pages, packages), use the
 call, never a shell command. The shell ($`cmd`, sh) is only for running a real program no call covers (git
 commit, bun, make, a server), and when you use it, say in one clause why no ts call fits. A command that reads
-files or the tree, gh's GitHub reads (gh api, gh pr list/view/checks, gh issue list/view) and curl/wget are
+files or the tree, gh's GitHub reads (gh api, gh pr list/view/checks, gh issue list/view) curl/wget and `open <url>` are
 refused with the call to use.

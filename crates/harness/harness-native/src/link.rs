@@ -710,30 +710,45 @@ impl Link {
     /// Ask the daemon for `url`'s card (`page_peek`) unless it is known or being asked; it lands in [`Peeks::pages`],
     /// a failure as a card whose error names the URL.
     pub fn page(&self, url: &str) {
-        {
+        self.pages(&[url]);
+    }
+
+    /// Ask the daemon for each of `urls`' cards (their favicons too) that is neither known nor being asked, one after
+    /// another on one thread, each landing in [`Peeks::pages`] as it comes (a chat's links: their chips' favicons).
+    pub fn pages(&self, urls: &[&str]) {
+        let urls: Vec<String> = {
             let mut p = self.peeks();
-            if p.pages.contains_key(url) || !p.asking_pages.insert(url.to_owned()) {
-                return;
+            let mut new = Vec::new(); // alloc: the URLs this call asks after, moved to its thread
+            for u in urls {
+                if !p.pages.contains_key(*u) && p.asking_pages.insert((*u).to_owned()) {
+                    new.push((*u).to_owned());
+                }
             }
+            new
+        };
+        if urls.is_empty() {
+            return;
         }
-        let (peeks, wake, url) = (self.peeks.clone(), self.wake.clone(), url.to_owned());
+        let (peeks, wake) = (self.peeks.clone(), self.wake.clone());
         std::thread::spawn(move || {
-            let failed = |why: String| PageMeta { url: url.clone(), error: format!("{url}: {why}"), ..PageMeta::default() };
-            let page = match request(Request::PagePeek { url: url.clone() }) {
-                Ok(Ok(Reply::Page { page })) => page,
-                Ok(Ok(r)) => failed(format!("the daemon answered page_peek with {r:?}")),
-                Ok(Err(e)) => failed(e),
-                Err(e) => failed(format!("no daemon: {e}")),
-            };
-            if !page.error.is_empty() {
-                eprintln!("harness-native: page: {}", page.error);
+            for url in urls {
+                let failed = |why: String| PageMeta { url: url.clone(), error: format!("{url}: {why}"), ..PageMeta::default() };
+                let page = match request(Request::PagePeek { url: url.clone() }) {
+                    Ok(Ok(Reply::Page { page })) => page,
+                    Ok(Ok(r)) => failed(format!("the daemon answered page_peek with {r:?}")),
+                    Ok(Err(e)) => failed(e),
+                    Err(e) => failed(format!("no daemon: {e}")),
+                };
+                if !page.error.is_empty() {
+                    eprintln!("harness-native: page: {}", page.error);
+                }
+                let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                p.asking_pages.remove(&url);
+                p.pages.insert(url, page);
+                p.rev += 1;
+                drop(p);
+                wake();
             }
-            let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.asking_pages.remove(&url);
-            p.pages.insert(url, page);
-            p.rev += 1;
-            drop(p);
-            wake();
         });
     }
 
