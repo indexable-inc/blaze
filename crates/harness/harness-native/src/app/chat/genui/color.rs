@@ -89,11 +89,11 @@ fn dark_at(v: View<'_>) -> bool {
     true
 }
 
-/// Fill `f` as it shows in `dark` (or light) over the terminal's ground, opaque.
+/// Fill `f` as it shows in `dark` (or light) over the chat's ground (the theme's `ground`), opaque.
 fn shown(world: WorldRef<'_>, f: Fill, dark: bool) -> [f32; 3] {
     let pick = |f: Fill| if dark { f.dark } else { f.light };
     let c = pick(f);
-    let g = view::prefab(world, "hn.Main").and_then(|m| m.try_cloned::<&Fill>()).map_or(Rgba::default(), pick);
+    let g = pick(crate::look::tone(world, "ground"));
     let mix = |a: f32, b: f32| a * c.a + b * (1.0 - c.a);
     [mix(c.r, g.r), mix(c.g, g.g), mix(c.b, g.b)]
 }

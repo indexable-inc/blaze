@@ -108,7 +108,7 @@ pub fn role<'a>(w: WorldRef<'a>, role: &str) -> EntityView<'a> {
         .unwrap_or_else(|| panic!("the scene's hn.Theme has no {role}"))
 }
 
-/// A role's fill (`running`, `kind_claude`).
+/// A role's fill (`card`, `ink_muted`, `kind_claude`): the theme's colour roles are scene/00-tokens.flecs's `tone_<role>`.
 pub fn tone(w: WorldRef<'_>, name: &str) -> Fill {
     role(w, name).try_cloned::<&Fill>().unwrap_or_else(|| panic!("hn.Theme.{name} has no Fill"))
 }

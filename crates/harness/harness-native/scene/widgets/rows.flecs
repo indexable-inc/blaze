@@ -33,13 +33,13 @@ hn {
     name : hn.tree.Head {
       Text: {s: $name}
       if $look == "on" {
-        Fill: $tone_row_on
+        Fill: $tone_ink_strong
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree_on}
       } else {
         if $look == "done" {
-          Fill: $tone_row_done
+          Fill: $tone_ink_muted
         } else {
-          Fill: $tone_row
+          Fill: $tone_ink
         }
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
       }
@@ -55,9 +55,9 @@ hn {
       Text: {s: $meta}
       Tooltip: {text: $why}
       if $alarm {
-        Fill: $tone_row_alarm
+        Fill: $tone_error
       } else {
-        Fill: $tone_row_meta
+        Fill: $tone_ink_faint
       }
       // Gone while hovered when the shortcut shows in its place.
       if $hint == "" {
@@ -81,12 +81,12 @@ hn {
       pill : hn.Selection {
         plate {
           if $edit {
-            Fill: $tone_rename_field
+            Fill: $tone_well
           } else {
             if $focus {
-              Fill: $tone_select_focus
+              Fill: $tone_selection_focus
             } else {
-              Fill: $tone_row_select
+              Fill: $tone_selection
             }
           }
         }
@@ -114,12 +114,12 @@ hn {
     name : hn.tree.Cmd {
       Text: {s: $name}
       if $look == "on" {
-        Fill: $tone_row_on
+        Fill: $tone_ink_strong
       } else {
         if $look == "done" {
-          Fill: $tone_row_done
+          Fill: $tone_ink_muted
         } else {
-          Fill: $tone_row_run
+          Fill: $tone_ink_muted
         }
       }
       if $busy {
@@ -132,9 +132,9 @@ hn {
     meta : hn.tree.Trail {
       Text: {s: $meta}
       if $alarm {
-        Fill: $tone_row_alarm
+        Fill: $tone_error
       } else {
-        Fill: $tone_row_meta
+        Fill: $tone_ink_faint
       }
       HoverShow: {row: 0, keep: $keep, away: false}
     }
@@ -142,9 +142,9 @@ hn {
       pill : hn.Selection {
         plate {
           if $focus {
-            Fill: $tone_select_focus
+            Fill: $tone_selection_focus
           } else {
-            Fill: $tone_row_select
+            Fill: $tone_selection
           }
         }
       }
@@ -159,9 +159,9 @@ hn {
     (IsA, ui.IconButton)
     Tooltip: {text: "Archive"}
     if $selected {
-      Inks: {rest: $tone_icon_on, hover: $tone_icon_on}
+      Inks: {rest: $tone_accent, hover: $tone_accent}
     } else {
-      Inks: {rest: $tone_icon_rest, hover: $tone_icon_hover}
+      Inks: {rest: $tone_ink_muted, hover: $tone_ink_strong}
     }
     icon : ui.Symbol {
       Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}

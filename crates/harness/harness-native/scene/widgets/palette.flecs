@@ -19,8 +19,7 @@ hn {
   }
 
   // An overlay's card: a plate lifted off the window that grows in from a touch smaller as its scrim fades in (and
-  // shrinks back as it goes). Each overlay sets its card's Fill to $tone_card itself (src/app/ghostty.rs retints the
-  // card by its path, hn.Palette.card and hn.Picker.card).
+  // shrinks back as it goes). Each overlay's card is in tone_card, the theme's.
   prefab OverlayCard : ui.Column, Plate {
     Hoverable
     Lift: {blur: $overlay_lift_blur, alpha: $overlay_lift_alpha, dy: $overlay_lift_dy}
@@ -60,7 +59,7 @@ hn {
     Action: {name: ""}
     Fill: $tone_clear
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
     Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $palette_row_h, min: 0, max: 0}}
     Padding: {l: 10, r: 10, t: 0, b: 0}
@@ -106,8 +105,8 @@ hn {
     Pressable
     Fill: $tone_clear
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
     Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $picker_row_h, min: 0, max: 0}}
     Padding: {l: 10, r: 8, t: 0, b: 0}
@@ -118,7 +117,7 @@ hn {
   prefab PickPill : ui.Node {
     Background
     MatchedGeometry: {id: "hn.picker", jump: 0}
-    Fill: $tone_select
+    Fill: $tone_selection
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
     Motion: {omega: $pill_omega, zeta: $pill_zeta}
   }

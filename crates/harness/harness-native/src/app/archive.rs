@@ -308,8 +308,8 @@ impl App {
     pub(super) fn fill_archive_pane(&self, pane: u64) {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(pane));
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
-        let (strong, muted, faint) = (tone(w, "strong"), tone(w, "muted"), tone(w, "faint"));
+        let (clear, chosen) = (tone(w, "clear"), tone(w, "selection"));
+        let (strong, muted, faint) = (tone(w, "ink_strong"), tone(w, "ink_muted"), tone(w, "ink_faint"));
         let q = self.archive_query();
         if let Some(head) = pv.part("head") {
             if let Some(s) = head.part("search") {

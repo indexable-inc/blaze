@@ -1060,15 +1060,15 @@ impl App {
         genui::fill_in(ui, tree, "gallery.0", cells, Some(&self.genui), true, &mut measure);
     }
 
-    /// Whether a chat (its transcript, composer and cells, on `tone_chat_ground`) draws dark: the window's appearance.
+    /// Whether a chat (its transcript, composer and cells, on the theme's `tone_ground`) draws dark: the window's appearance.
     pub(super) fn chat_dark(&self) -> bool {
         self.dark
     }
 
-    /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
+    /// Whether the terminal's ground (`hn.Theme.term_ground`, `tone_term_ground`: a terminal pane's) is dark in the window's
+    /// appearance.
     pub(super) fn term_ground_dark(&self) -> bool {
-        let w = self.world.world_ref();
-        let Some(f) = view::prefab(w, "hn.Main").and_then(|e| e.try_cloned::<&Fill>()) else { return self.dark };
+        let f = crate::look::tone(self.world.world_ref(), "term_ground");
         let c = if self.dark { f.dark } else { f.light };
         0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.5
     }
@@ -1136,8 +1136,8 @@ impl App {
                 self.link.attach(sid, 80, 24, true);
             }
         }
-        // Drawn in the window's appearance on the chat's own ground (`tone_chat_ground`, not the terminal's): a chat is a
-        // page, so it takes the app's palette, not the Ghostty theme's.
+        // Drawn in the window's appearance on the theme's ground (`tone_ground`, not the terminal's): a chat is a page, so it
+        // takes the app's theme, not the Ghostty theme's.
         let scheme = harness_native_ui_look_api::Scheme { dark: self.chat_dark() };
         for part in ["list", "foot"] {
             if let Some(v) = pv.part(part)
