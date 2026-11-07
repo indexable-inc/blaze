@@ -240,11 +240,6 @@ export const spring_layout_zeta = 1
 // A Posed node's glide to its pose (prims.flecs ui.spring.pose, motion's Posing): den's `smooth` GenSpring.
 export const spring_pose_omega = 22
 export const spring_pose_zeta = 1
-// Words re-wrapping live (a cmd+S fold, a resize; prims.flecs ui.spring.reflow, harness-native-render reflow.rs): a glyph
-// a new break moves along its line slides there, one moved to another line fades in, on this spring. Quick and critically
-// damped, so the words read as fluid, never as busy.
-export const spring_reflow_omega = 34
-export const spring_reflow_zeta = 1
 
 // The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
 export const size_title = 15

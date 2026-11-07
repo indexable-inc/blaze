@@ -1767,10 +1767,6 @@ impl App {
         if self.paint.get_mut().gliding {
             self.poke_why("caret glide");
         }
-        // Words that re-wrapped glide into their new lines (harness-native-render reflow.rs): draw until they have.
-        if self.paint.get_mut().reflowing {
-            self.poke_why("reflow");
-        }
         // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
         // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
         if self.paint.get_mut().kip_wake == harness_native_render::kips::Wake::Lively {
