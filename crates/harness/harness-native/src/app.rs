@@ -2578,7 +2578,7 @@ mod tests {
             "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
             "hn.ChatContext", "hn.ChatWorking",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
-            "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekHead", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
+            "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
             "hn.PeekImage", "hn.PeekPage",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
@@ -2602,8 +2602,9 @@ mod tests {
             assert!(w.try_lookup(m).is_some_and(|e| e.has(module)), "{m} is not a module");
         }
         for e in [
-            "look", "unknown", "hover", "pressed", "underline", "live", "marks::success", "marks::failure", "marks::pending",
-            "Path", "FileRef", "Symbol", "Link", "PR::open", "PR::draft", "PR::merged", "PR::closed", "PR::unknown",
+            "look", "rest", "meta", "unknown", "hover", "pressed", "underline", "live", "marks::success", "marks::failure",
+            "marks::pending", "marks::success::card", "marks::failure::card", "marks::pending::card", "Path", "FileRef",
+            "Symbol", "Link", "Link::unknown", "PR::open", "PR::draft", "PR::merged", "PR::closed", "PR::unknown",
             "Issue::open", "Issue::closed", "Issue::not_planned", "Issue::unknown",
         ] {
             let path = format!("{}::{e}", harness_native_render::inline::MODULE);

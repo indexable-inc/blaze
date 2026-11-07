@@ -6,7 +6,9 @@
 //! break (any other newline a space), `\*` as a plain star. Blocks (fences, lists, quotes) are the host's rows, not this;
 //! [`table`] reads a GitHub table's lines into its cells for the host's table row. Inline components
 //! (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar) become their label after a hole the painter draws
-//! the component's icon in, on a chip. Ranges are UTF-16 units of the plain text, as layouts count.
+//! the component's icon in, on a chip; so does a markdown link or a bare address that is
+//! one (`[the fix](https://github.com/o/r/pull/7)` is that pull request's chip, harness-native-ui-inline's `from_url`).
+//! Ranges are UTF-16 units of the plain text, as layouts count.
 use crate::text::{Face, Hole, Run};
 
 /// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip), the links (their
@@ -24,12 +26,14 @@ pub struct Inline {
 }
 
 /// One inline component in the words: `start` is its icon's hole (one unit, [`crate::text::HOLE`]), its label runs to
-/// `end`. The painter draws its chip and icon from the scene's `ui.inline.<name>`; a press opens its target there. A tag
-/// whose form has a mark (`tag.mark`) ends in a second hole, `end - 1`, the mark its live state picks is drawn in.
+/// `end`. The painter draws its chip and icon from the scene's `ui.inline.<name>`; a press opens its target there. Its
+/// `meta` (a link's host) follows the label after a no-break space, `meta` its range, drawn quiet. A tag whose form has a
+/// mark (`tag.mark`) ends in a second hole, `end - 1`, the mark its live state picks is drawn in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineTag {
     pub start: usize,
     pub end: usize,
+    pub meta: Option<(usize, usize)>,
     pub tag: harness_native_ui_inline::Tag,
 }
 
@@ -39,6 +43,42 @@ impl InlineTag {
     pub fn mark(&self) -> Option<usize> {
         self.tag.mark.then(|| self.end - 1)
     }
+
+    /// The label's range: after the icon's hole, before the meta and the mark.
+    #[must_use]
+    pub fn label(&self) -> (usize, usize) {
+        let end = self.meta.map_or_else(|| self.mark().unwrap_or(self.end), |(a, _)| a - 1);
+        (self.start + 1, end)
+    }
+}
+
+/// Inline component `tag` set into `out` at `at`: its icon's hole, its label, its meta, its mark's hole, in the chip's
+/// face.
+fn emit_tag(out: &mut Inline, at: &mut usize, tag: harness_native_ui_inline::Tag) {
+    fn push(out: &mut Inline, at: &mut usize, c: char) {
+        out.text.push(c);
+        *at += c.len_utf16();
+    }
+    let start = *at;
+    push(out, at, crate::text::HOLE);
+    for ch in tag.label.chars() {
+        push(out, at, ch);
+    }
+    let meta = if tag.meta.is_empty() {
+        None
+    } else {
+        push(out, at, '\u{a0}');
+        let from = *at;
+        for ch in tag.meta.chars() {
+            push(out, at, ch);
+        }
+        Some((from, *at))
+    };
+    if tag.mark {
+        push(out, at, crate::text::HOLE);
+    }
+    out.runs.push(Run { start, end: *at, face: Face::InlineRef });
+    out.tags.push(InlineTag { start, end: *at, meta, tag });
 }
 
 impl Inline {
@@ -208,16 +248,7 @@ pub fn inline(src: &str) -> Inline {
                     i = next;
                 } else if let Some((tag, next)) = harness_native_ui_inline::tag(&chars, i) {
                     // An inline component: a hole for its icon, then its label (plain words), all in the chip's face.
-                    let start = at;
-                    push(&mut out, &mut at, crate::text::HOLE);
-                    for ch in tag.label.chars() {
-                        push(&mut out, &mut at, ch);
-                    }
-                    if tag.mark {
-                        push(&mut out, &mut at, crate::text::HOLE);
-                    }
-                    out.runs.push(Run { start, end: at, face: Face::InlineRef });
-                    out.tags.push(InlineTag { start, end: at, tag });
+                    emit_tag(&mut out, &mut at, tag);
                     i = next;
                 } else {
                     push(&mut out, &mut at, c);
@@ -229,6 +260,13 @@ pub fn inline(src: &str) -> Inline {
                 // words is words.
                 Some((words, url, next)) => {
                     let inner = inline(&chars[words].iter().collect::<String>());
+                    // A link to what a component is (a pull request) is that component's chip, its words kept.
+                    let href: String = chars[url.clone()].iter().collect();
+                    if let Some(tag) = harness_native_ui_inline::from_url(href.trim(), Some(&inner.text)) {
+                        emit_tag(&mut out, &mut at, tag);
+                        i = next;
+                        continue;
+                    }
                     let base = at;
                     for ch in inner.text.chars() {
                         push(&mut out, &mut at, ch);
@@ -253,6 +291,12 @@ pub fn inline(src: &str) -> Inline {
             _ => match bare_url(&chars, i) {
                 // A bare https://, http:// or www. address: its words as written, a link to it.
                 Some((next, href)) => {
+                    // An address of what a component is (a pull request): its chip.
+                    if let Some(tag) = harness_native_ui_inline::from_url(&href, None) {
+                        emit_tag(&mut out, &mut at, tag);
+                        i = next;
+                        continue;
+                    }
                     let start = at;
                     for &ch in &chars[i..next] {
                         push(&mut out, &mut at, ch);
@@ -616,6 +660,27 @@ mod tests {
         let m = inline("see [the **docs**](https://x.dev/a) now");
         assert_eq!(m.text, "see the docs now");
         assert_eq!(m.links, vec![(4, 12, "https://x.dev/a".to_owned())]);
+    }
+
+    /// A markdown link or a bare address that a component's `href` fits is that component's chip (its words kept, the
+    /// form's label for a bare one); other links and addresses stay links; a link's host follows its words.
+    #[test]
+    fn links_to_pull_requests_are_chips() {
+        use harness_native_ui_inline::{Form, install};
+        let pr = Form { label: "#{n}".to_owned(), mark: true, href: "https://github.com/{repo}/pull/{n}".to_owned(), url: String::new() };
+        let link = Form { url: "href".to_owned(), ..Form::default() };
+        install(std::collections::BTreeMap::from([("PR".to_owned(), pr), ("Link".to_owned(), link)]));
+        let url = "https://github.com/indexable-inc/blaze/pull/1770";
+        let m = inline(&format!("- [charts]({url}) and {url}. Also [docs](https://x.dev/a), https://x.dev/b"));
+        let tags: Vec<(&str, &str)> = m.tags.iter().map(|t| (t.tag.name.as_str(), t.tag.label.as_str())).collect();
+        assert_eq!(tags, [("PR", "charts"), ("PR", "#1770")]);
+        assert!(m.text.ends_with(". Also docs, https://x.dev/b"), "{:?}", m.text);
+        // The docs link and the bare address (a link too, GitHub's autolink rule).
+        assert_eq!(m.links.len(), 2);
+        let m = inline(r#"<Link href="https://www.x.dev/a">the doc</Link>"#);
+        let t = &m.tags[0];
+        assert_eq!(t.meta.map(|(a, b)| m.text.encode_utf16().collect::<Vec<_>>()[a..b].to_vec()), Some("x.dev".encode_utf16().collect()));
+        assert_eq!(t.label(), (1, 8));
     }
 
     /// A GitHub table's cells: pipes in code spans and escaped pipes do not split, ragged rows are evened to the header,
