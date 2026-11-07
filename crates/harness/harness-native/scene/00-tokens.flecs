@@ -75,6 +75,11 @@ export const tone_scroller_track: Fill = {dark: {0.922, 0.918, 0.902, 0.04}, lig
 // Type: macOS sidebar sizes in Inter. Rows 13, runs 12, section labels 11, a run's command in the code face 11.5.
 export const size_caption = 11
 export const size_body = 13
+// Chrome: the words on controls that sit around content rather than being it (the composer's model picker, a bar's
+// readouts), clearly a step under the body (size_chat, size_body) so what was typed or said leads; line_chrome is
+// their line, which the bar centres them on.
+export const size_chrome = 11.5
+export const line_chrome = 14
 export const size_row = 13
 export const size_run = 12
 export const size_label = 11
@@ -125,9 +130,6 @@ export const group_h = 28
 // header's left edge: side_inset + tree_pad + the chevron's inset in its gutter, in line with the depth-0 chevrons.
 export const side_inset = 8
 export const label_inset = 16
-// The seam between the sidebar and the main card: a soft shadow off the card's left edge.
-export const seam_blur = 14
-export const seam_alpha = 0
 export const row_gap = 8
 export const row_pad = 8
 
@@ -522,24 +524,25 @@ export const chat_composer_lift_dy = 4
 // chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works, its sign
 // (hn.ChatWorking, not a button: Return sends, Escape stops) after the meter: a ring chat_working across (stroke
 // chat_working_stroke) breathing down to chat_working_breath.
+// Everything in the bar is chrome, secondary to the words typed over it: the picker's name at size_chrome in the muted
+// ink, and its marks (chevron, level meter, rings) and their hit plates scaled to that size, not to the body's.
 // The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
-export const size_chat_pick = 12.5
-export const chat_bar_h = 28
+export const chat_bar_h = 24
 export const chat_bar_gap = 2
-export const chat_pick_h = 26
+export const chat_pick_h = 22
 export const chat_pick_pad_x = 6
-export const chat_pick_radius = 8
-export const chat_pick_gap = 4
-export const chat_pick_chevron = 8
-export const chat_ring = 14
-export const chat_ring_stroke = 1.6
-export const chat_working = 16
-export const chat_working_stroke = 1.2
+export const chat_pick_radius = 7
+export const chat_pick_gap = 3
+export const chat_pick_chevron = 7
+export const chat_ring = 12
+export const chat_ring_stroke = 1.4
+export const chat_working = 13
+export const chat_working_stroke = 1.1
 export const chat_working_breath = 0.45
-export const chat_effort_lead = 6
-export const chat_effort_h = 10
+export const chat_effort_lead = 5
+export const chat_effort_h = 8
 export const chat_effort_bar_w = 2
 export const chat_effort_gap = 1.5
 export const chat_effort_bar_radius = 1

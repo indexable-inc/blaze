@@ -472,7 +472,10 @@ impl App {
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
-        let side = root.child("hn.SideClip").child("hn.Sidebar");
+        // The fold's clip holds the sidebar and, at its right edge, the hairline between it and the main card: folded to
+        // nothing, the clip leaves neither, and the main card meets the window's edge.
+        let side_clip = root.child("hn.SideClip");
+        let side = side_clip.child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
         // Its count shows on its hover (scene/widgets/parts.flecs).
         device.set(HoverAmt::default());
@@ -492,8 +495,8 @@ impl App {
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
+        side_clip.child("hn.Seam");
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
-        root.child("hn.Seam");
         let main = root.child("hn.Main");
         // The browser pane on the right (scene/widgets/web.flecs): its clip folds, the pane inside keeps its width.
         let web_clip = root.child("hn.WebClip");
@@ -1790,21 +1793,26 @@ impl App {
         let w = self.world.world_ref();
         let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
         let Some(full) = proto.try_cloned::<&Size>() else { return };
+        // The hairline at the sidebar's right edge (hn.Seam) folds with it, inside its clip.
+        let Some(seam) = view::prefab(w, "hn.Seam").and_then(|p| p.try_cloned::<&Size>()) else { return };
+        let seam = seam.w.value;
         let x = self.side_x.x.clamp(0.0, 1.0);
         let open = self.side_w.unwrap_or(full.w.value);
-        let width = open * x;
+        let shown = open + seam;
+        let width = shown * x;
         // What the card's words (WrapAt) and its panes' LaysAtRest nodes lay out against while the fold moves: the open
         // width, where the card is narrowest, so nothing overflows the moving boxes, and words wrap and a terminal resizes
         // once per cmd+S, not on every frame of the spring: opening, on its first frame; folding, once the spring rests
         // closed. Every box (the composer's plate, its controls, the column) follows the spring.
-        let rest = if self.side_x.settled(0.0) { 0.0 } else { open };
+        let rest = if self.side_x.settled(0.0) { 0.0 } else { shown };
         if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
         }
         self.chrome_laid = Some((self.chrome, z, width, rest));
         let top = self.chrome.strip / z;
         // The sidebar keeps its open width (its rows never relayout mid-fold); its clip (hn.SideClip) takes the
-        // spring's width and slides it left by the part folded away.
+        // spring's share of it and its seam, and slides both left by the part folded away: at rest folded the clip is
+        // 0 wide, so nothing of the sidebar or its hairline paints.
         if let Some(side) = w.entity_from_id(self.ids.device).parent() {
             let mut size = side.try_cloned::<&Size>().unwrap_or(full);
             size.w = Sizing::fixed(open);
@@ -1813,7 +1821,7 @@ impl App {
                 let mut size = clip.try_cloned::<&Size>().unwrap_or(full);
                 size.w = Sizing::fixed(width);
                 clip.set(size);
-                clip.set(ScrollState { x: open - width, y: 0.0 });
+                clip.set(ScrollState { x: shown - width, y: 0.0 });
                 clip.set(harness_native_ui_layout_api::RestSize { len: rest });
             }
         }
