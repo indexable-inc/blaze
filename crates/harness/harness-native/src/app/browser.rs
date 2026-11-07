@@ -22,7 +22,8 @@
 //! has it the keys go there (`AppUp::Key` with the Mac key code and the characters) after the bindings in ctx.Browser
 //! (cmd+L, cmd+[, cmd+], cmd+R: scene/20-keys.flecs), and the input method's work goes through the window's
 //! NSTextInputClient path as `AppUp::Ime` (setMarkedText: Set, insertText: Commit, unmarkText: Finish). A card's press
-//! opens its view in the pane.
+//! opens its view in the pane; a `web:open:<url>` action (a check's row on a pull request's hover card) opens that page
+//! in the pane as a view of its own.
 use super::*;
 use harness_mach::iosurface::Surface as IoSurface;
 use harness_mach::{Msg, RecvPort, SendRight, Source};
@@ -144,6 +145,8 @@ pub(super) struct Browser {
     ext_req: Option<u64>,
     extensions: Option<Vec<Extension>>,
     popup: Option<u64>,
+    /// A page to open in the pane as a view of its own once the link is up (a check's log from a chat card, `web:open:`).
+    go: Option<String>,
 }
 
 impl Browser {
@@ -181,6 +184,7 @@ impl Browser {
             ext_req: None,
             extensions: None,
             popup: None,
+            go: None,
         }
     }
 
@@ -393,6 +397,19 @@ impl App {
         }
     }
 
+    /// Open `url` in the pane, as a view of its own (the pane shows it once the host made it; what the pane showed stays
+    /// a view): the pane opens, the link is asked for if it is not up, and the next frame sends the open.
+    fn web_open(&mut self, url: &str) {
+        self.browser.note = None;
+        if matches!(self.browser.conn, Conn::Failed(_)) {
+            self.browser.conn = Conn::Idle;
+        }
+        self.browser.go = Some(url.to_owned());
+        let s = self.web();
+        self.set_web(WebState { open: true, ..s });
+        self.web_focus_page();
+    }
+
     /// Open the pane on `view`, its page focused.
     fn web_show(&mut self, view: u64) {
         let s = self.web();
@@ -483,6 +500,11 @@ impl App {
             self.web_show(v);
             return;
         }
+        if let Some(url) = a.strip_prefix("open:") {
+            self.web_open(url);
+            self.poke();
+            return;
+        }
         if let Some(id) = a.strip_prefix("ext:") {
             let view = self.web().view;
             let req = self.browser.req();
@@ -554,16 +576,23 @@ impl App {
         if let Some(p) = self.web_page() {
             set_if(self.world.entity_from_id(p), BrowserView { view: s.view, src: "".into() });
         }
-        // A refused open stays refused (its plate says why) until the pane is opened again.
+        // A page asked for (`web:open:`) opens as a view of its own, the pane's once it is made; an open pane with no view
+        // gets a blank one. A refused open stays refused (its plate says why) until the pane is opened again.
         if s.open
-            && s.view == 0
             && self.browser.live()
             && self.browser.note.is_none()
             && !self.browser.opening.values().any(|o| matches!(o, Opening::Pane))
         {
-            let req = self.browser.req();
-            self.browser.opening.insert(req, Opening::Pane);
-            self.browser.up(&AppUp::Open { req, url: BLANK.into() });
+            let url = match self.browser.go.take() {
+                Some(url) => Some(url),
+                None if s.view == 0 => Some(BLANK.to_owned()),
+                None => None,
+            };
+            if let Some(url) = url {
+                let req = self.browser.req();
+                self.browser.opening.insert(req, Opening::Pane);
+                self.browser.up(&AppUp::Open { req, url });
+            }
         }
         for (e, bv) in nodes {
             self.browser_node(e, &bv);

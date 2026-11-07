@@ -2587,7 +2587,7 @@ mod tests {
             "hn.ChatContext", "hn.ChatWorking",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
-            "hn.PeekImage", "hn.PeekPage",
+            "hn.PeekImage", "hn.PeekPage", "hn.PeekCheckFailed", "hn.PeekCheckRunning", "hn.PeekCheckQueued", "hn.PeekChecksFolded",
             "hn.chat_status.running", "hn.chat_status.no_result", "hn.tree.Head", "hn.tree.Cmd", "hn.tree.Trail",
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",

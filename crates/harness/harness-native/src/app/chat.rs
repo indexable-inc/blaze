@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod checks;
 mod context;
 mod genui;
 mod peek;

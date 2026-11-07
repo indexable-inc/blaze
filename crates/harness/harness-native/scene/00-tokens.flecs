@@ -617,7 +617,9 @@ export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: 
 // `owner/repo #n` or the site), the title flush left, then a GitHub item's state and checks, author and lines changed,
 // its description's first lines; a page's description and picture (inline_peek_image_h tall, only when it has one) and
 // its live view once a browser host has one (inline_peek_page_h); a file's first lines in the code face. It closes
-// when the pointer leaves the chip and the card both.
+// when the pointer leaves the chip and the card both. The checks' marks are inline_peek_mark_w square; under the
+// pointer the checks line opens a list of the checks not passed, a row each inline_peek_check_h tall, its parts
+// inline_peek_check_gap apart and inline_peek_check_pad in from its wash's ends (inline_peek_check_radius round).
 export const inline_peek_dwell_s = 0.35
 export const inline_peek_w = 360
 export const inline_peek_pad = 12
@@ -629,6 +631,11 @@ export const inline_peek_icon_radius = 3
 export const inline_peek_page_h = 240
 export const inline_peek_badge_pad = 6
 export const inline_peek_lines_n = 8
+export const inline_peek_mark_w = 12
+export const inline_peek_check_h = 22
+export const inline_peek_check_gap = 6
+export const inline_peek_check_pad = 4
+export const inline_peek_check_radius = 5
 export const size_peek_title = 14
 export const line_peek_title = 19
 export const size_peek_body = 12.5
