@@ -1038,7 +1038,6 @@ dependencies = [
  "harness-native-ui-look-api",
  "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
- "harness-native-ui-spring-api",
  "harness-native-ui-text-api",
  "harness-native-ui-timeline-api",
  "hegeltest",
