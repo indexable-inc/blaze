@@ -537,9 +537,12 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
     touch(&one.join("libasm.a"), ARCHIVE);
     touch(&two.join("libasm.a"), ARCHIVE);
     touch(&link.join("libshared.a"), ARCHIVE);
+    // A dylib each crate's directories have: given to the final link, found as the link's are.
+    touch(&one.join("libdyn.so"), &elf(3));
+    touch(&two.join("libdyn.so"), &elf(3));
     let (one_dirs, two_dirs) = (vec![one.clone()], vec![two.clone()]);
     let first = [static_lib("asm", false)];
-    let second = [static_lib("asm", false), static_lib("shared", false)];
+    let second = [static_lib("asm", false), static_lib("shared", false), dylib("dyn")];
     let libs = [
         CrateLibs { libs: &first, search: &one_dirs },
         CrateLibs { libs: &second, search: &two_dirs },
@@ -557,16 +560,19 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
     )
     .unwrap();
     assert_eq!(
-        line(&located)[3..6],
+        line(&located)[3..7],
         [
             (one.join("libasm.a"), ARCHIVED),
             (two.join("libasm.a"), ARCHIVED),
             (link.join("libshared.a"), ARCHIVED),
+            (one.join("libdyn.so"), SHARED),
         ],
-        "each crate's `asm` from its own directory, both on the line; one its crate's directories \
-         lack from the link's"
+        "each crate's bundled `asm` from its own directory, both on the line; one its crate's \
+         directories lack from the link's; a dylib from the link's first directory, as the final \
+         link finds it"
     );
 }
+
 
 #[test]
 fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_one() {

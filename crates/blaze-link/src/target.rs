@@ -139,29 +139,32 @@ pub fn output(
 
 /// The native libraries of one crate and the directories that crate's own compile searches
 /// for them: the `-L`s rustc is given for it (its rustflags', then the build scripts' of it
-/// and of what it depends on, its own `OUT_DIR` first). rustc finds a crate's `-l` among the
-/// `-L`s of that crate's own invocation, so two crates' libraries of one name in two
+/// and of what it depends on, its own `OUT_DIR` first). rustc finds a bundled static library
+/// (`static`, not `-bundle`) among the `-L`s of the invocation that builds the crate naming it,
+/// and bundles it into that crate, so two crates' bundled libraries of one name in two
 /// directories (two copies of one `-sys` crate, each with its own `OUT_DIR`) are two
-/// libraries, each found where its own crate's compile finds it. `search` is empty for
-/// libraries no crate names (the link arguments').
+/// libraries, each found where its own crate's compile finds it. Every other kind (a dylib, a
+/// framework, a `-bundle` static library) is given to the final link, whose one list of `-L`s
+/// finds it, and is searched as the link's are. `search` is empty for libraries no crate names
+/// (the link arguments').
 #[derive(Clone, Copy, Debug)]
 pub struct CrateLibs<'a> {
     pub libs: &'a [NativeLib],
     pub search: &'a [PathBuf],
 }
 
-/// The files of `output`'s link line, in its order: the C runtime's start objects, the
-/// runtimes of [`Output::sanitize`]'s sanitizers, `libs` in their order (each crate's searched
-/// in its own [`CrateLibs::search`] first, then in `search`, the link's `-L`s, then the
-/// toolchain's directories), the libraries the toolchain's driver adds, the C runtime's end
-/// objects. A linker script's files follow it, and so do the libraries a PE archive's members
-/// ask for and those a Mach-O object's or archive member's `LC_LINKER_OPTION`s ask for, which
-/// are searched in `search` and the toolchain's directories. A library not found is an error
-/// naming it (and the script, object or member that asked) and every directory searched.
-/// `sysroot` is blaze's toolchain (`blaze toolchain --path`), whose self-contained C runtime
-/// WASI links and whose target library directory has the sanitizer runtimes. Sets
-/// [`Output::rpaths`] to where the loader finds a shared runtime, then the link arguments'
-/// ([`crate::LinkArgs::rpaths`]); set [`Output::sanitize`] and [`Output::link`] first.
+/// The files of `output`'s link line, in its order: the C runtime's start objects, the runtimes of
+/// [`Output::sanitize`]'s sanitizers, `libs` in their order (a crate's bundled static libraries
+/// searched in its own [`CrateLibs::search`] first; each searched in `search`, the link's `-L`s,
+/// then the toolchain's directories), the libraries the toolchain's driver adds, the C runtime's
+/// end objects. A linker script's files follow it, and so do the libraries a PE archive's members
+/// ask for and those a Mach-O object's or archive member's `LC_LINKER_OPTION`s ask for, which are
+/// searched in `search` and the toolchain's directories. A library not found is an error naming it
+/// (and the script, object or member that asked) and every directory searched. `sysroot` is blaze's
+/// toolchain (`blaze toolchain --path`), whose self-contained C runtime WASI links and whose target
+/// library directory has the sanitizer runtimes. Sets [`Output::rpaths`] to where the loader finds
+/// a shared runtime, then the link arguments' ([`crate::LinkArgs::rpaths`]); set
+/// [`Output::sanitize`] and [`Output::link`] first.
 pub fn locate(
     output: &mut Output,
     libs: &[CrateLibs<'_>],
@@ -441,6 +444,10 @@ fn locate_with<A: Ask>(
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
                 continue;
             }
+            let own: &[PathBuf] = match lib.kind {
+                NativeLibKind::Static { bundle: true, .. } => own,
+                _ => &[],
+            };
             line.library(&lib.name, lib.kind, lib.verbatim, own)?;
         }
     }

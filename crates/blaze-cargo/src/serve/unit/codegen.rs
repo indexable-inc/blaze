@@ -1503,9 +1503,10 @@ pub(crate) fn script_args(
     Ok(args)
 }
 
-/// The `-l`s of the rustflags of the crates linked into `unit` other than its own, each with
-/// its crate's package, in link order: its link reads them ([`natives`]), and its plan holds
-/// only its own rustflags. Empty for a unit that links nothing.
+/// The `-l`s and `-L`s of the rustflags of the crates linked into `unit` other than its own
+/// (each `-L` as `-L DIR`), each with its crate's package, in link order: its link reads them,
+/// a crate's `-L`s being where its bundled static libraries are found first ([`natives`]), and
+/// its plan holds only its own rustflags. Empty for a unit that links nothing.
 pub(crate) fn linked_rustflag_libs(job: &Job, unit: u32) -> Result<Vec<(String, String)>, String> {
     // alloc: none unless a crate linked in has a `-l` in its rustflags
     let mut out = Vec::new();
@@ -1520,6 +1521,10 @@ pub(crate) fn linked_rustflag_libs(job: &Job, unit: u32) -> Result<Vec<(String, 
         let package = &job.units().graph.units[at as usize].pkg_id;
         // alloc: once per `-l` per unit's key
         out.extend(flags.libs.into_iter().map(|lib| (package.to_string(), lib)));
+        // alloc: once per `-L` per unit's key
+        out.extend(
+            flags.search.iter().map(|dir| (package.to_string(), format!("-L {}", dir.display()))),
+        );
     }
     Ok(out)
 }

@@ -404,13 +404,16 @@ start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `
 `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
 wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
 
-A crate's native libraries (its rustflags' `-l`s, its build script's `cargo:rustc-link-lib`s,
-its `#[link]`s) are found first in the directories its own compile searches, the `-L`s rustc is
-given for that crate: its rustflags', then the build scripts' of it and of what it depends on,
-its own `OUT_DIR` first. Only then are the linked program's directories and the toolchain's
-searched. So two crates whose build scripts each make a library of one name in their own
-`OUT_DIR` (two copies of one `-sys` crate) link two libraries, each its own crate's, as rustc
-finds a crate's `-l` when it builds that crate (`crates/blaze-link/src/target.rs`, `CrateLibs`).
+A crate's bundled static libraries (`static` without `-bundle`, from its rustflags' `-l`s, its
+build script's `cargo:rustc-link-lib`s or its `#[link]`s) are found first in the directories its
+own compile searches, the `-L`s rustc is given for that crate: its rustflags', then the build
+scripts' of it and of what it depends on, its own `OUT_DIR` first; then the linked program's
+directories and the toolchain's are searched. So two crates whose build scripts each make a
+static library of one name in their own `OUT_DIR` (two copies of one `-sys` crate) link two
+libraries, each its own crate's, as rustc bundles each into the crate that names it. Every
+other kind (a dylib, a framework, a `-bundle` static library) is found as the final link finds
+it, in the program's directories (`crates/blaze-link/src/target.rs`, `CrateLibs`). The linked
+crates' rustflags' `-L`s are in the program's key.
 
 The rest of the rustflags that are the link's, rather than the code's, are read by
 `crates/blaze-link/src/args/rustflags.rs`, and none is dropped:
