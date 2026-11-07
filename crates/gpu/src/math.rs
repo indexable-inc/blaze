@@ -46,11 +46,12 @@ pub fn normalize<V: FloatVec>(v: V) -> V {
     v.normalize()
 }
 
-/// `a` to `b` by `t` (Slang's `lerp`, Metal's `mix`): `a + (b - a) * t`.
+/// `a` to `b` by `t` (Slang's `lerp`, Metal's `mix`): `a + (b - a) * t`. `t` is a scalar, or a
+/// vector like `a` for a component-wise blend (Slang's `lerp(float2, float2, float2)`).
 #[inline]
-pub fn lerp<T>(a: T, b: T, t: f32) -> T
+pub fn lerp<T, S>(a: T, b: T, t: S) -> T
 where
-    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<S, Output = T>,
 {
     a + (b - a) * t
 }
@@ -78,4 +79,31 @@ pub fn pow(x: f32, y: f32) -> f32 {
 #[inline]
 pub fn step(edge: f32, x: f32) -> f32 {
     if x < edge { 0.0 } else { 1.0 }
+}
+
+/// The fractional part, `x - floor(x)` (Slang's `frac`, Metal's `fract`): 0 to 1, also for a
+/// negative `x` (`frac(-0.25)` is 0.75).
+#[inline]
+pub fn frac(x: f32) -> f32 {
+    x - x.floor()
+}
+
+/// -1, 0 or 1 by the sign of `x` (Slang's `sign`): 0 for 0, -0 and NaN, where `f32::signum` gives
+/// 1, -1 and NaN.
+#[inline]
+pub fn sign(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// The bits of `x`, as a `u32` (Slang's `asuint`): a reinterpretation, not a conversion, so bit 31
+/// is the sign, set for -0 too. The device lowers it to a bitcast.
+#[inline]
+pub fn asuint(x: f32) -> u32 {
+    x.to_bits()
 }

@@ -6,7 +6,7 @@
 //! holding its [`EntryDesc`] (`ENTRY`) and one [`Slot`] per resource parameter, named like the
 //! parameter. The host binds through those; the device backend reads the same constants by
 //! const evaluation, so the two can't number differently.
-use crate::vec::{IVec2, UVec4, Vec2, Vec3, Vec4};
+use crate::vec::{IVec2, IVec4, UVec4, Vec2, Vec3, Vec4};
 
 /// Which stage an entry point is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -327,7 +327,7 @@ macro_rules! pod {
         unsafe impl Pod for $t {}
     )+};
 }
-pod!(f32, u32, i32, Vec2, Vec3, Vec4, UVec4, IVec2);
+pod!(f32, u32, i32, Vec2, Vec3, Vec4, UVec4, IVec2, IVec4);
 // SAFETY: an array of `Pod` has no padding between its elements and every bit pattern is a value.
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 

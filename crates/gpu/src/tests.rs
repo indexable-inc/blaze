@@ -139,3 +139,59 @@ fn smoothstep_and_lerp_keep_their_ends(tc: hegel::TestCase) {
     assert_eq!(lerp(a, b, 0.0), a);
     assert_eq!(lerp(vec3(a, b, a), vec3(b, a, b), 0.0), vec3(a, b, a));
 }
+
+/// `asuint` is the bit pattern: bit 31 the sign (set for -0, which `<` can't see), the exponent and
+/// mantissa below it, so it round-trips through `f32::from_bits` exactly.
+#[hegel::test]
+fn asuint_is_the_bits(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let x = tc.draw(gs::floats::<f32>().allow_nan(false));
+    let u = asuint(x);
+    assert_eq!(f32::from_bits(u), x);
+    assert_eq!(u >> 31, u32::from(x.is_sign_negative()), "{x}'s sign bit");
+    assert_eq!(asuint(1.0), 127 << 23);
+    assert_eq!(asuint(-0.0) >> 31, 1);
+    assert_eq!(asuint(0.0), 0);
+}
+
+/// `frac` is what `floor` leaves, 0 to 1 also for negatives; `sign` is -1, 0 or 1 and 0 at 0 and
+/// NaN (where `signum` would say 1 and NaN), per component on a vector.
+#[hegel::test]
+fn frac_and_sign_are_slangs(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let x = tc.draw(gs::floats::<f32>().min_value(-1e4).max_value(1e4).allow_nan(false).allow_infinity(false));
+    let f = frac(x);
+    assert!((0.0..=1.0).contains(&f), "frac({x}) = {f}");
+    assert_eq!(x - f, x.floor());
+    assert_eq!(frac(-0.25), 0.75);
+    let s = sign(x);
+    assert_eq!(s, if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 });
+    assert_eq!((sign(0.0), sign(-0.0), sign(f32::NAN)), (0.0, 0.0, 0.0));
+    assert_eq!(vec3(x, 0.0, -2.0).sign(), vec3(s, 0.0, -1.0));
+}
+
+/// `lerp` with a vector `t` blends each component by its own `t`, as the scalar `lerp` would.
+#[hegel::test]
+fn lerp_by_a_vector_is_per_component(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let f = |lo: f32, hi: f32| gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false);
+    let (a, b) = (vec2(tc.draw(f(-1e3, 1e3)), tc.draw(f(-1e3, 1e3))), vec2(tc.draw(f(-1e3, 1e3)), tc.draw(f(-1e3, 1e3))));
+    let t = vec2(tc.draw(f(0.0, 1.0)), tc.draw(f(0.0, 1.0)));
+    assert_eq!(lerp(a, b, t), vec2(lerp(a.x, b.x, t.x), lerp(a.y, b.y, t.y)));
+    assert_eq!(lerp(a, b, vec2(0.0, 0.0)), a);
+}
+
+/// Float to integer vectors go toward zero (Slang's `int2(v)`), back exactly; `clamp` on an integer
+/// vector is `max(lo)` then `min(hi)`, so an empty range gives `hi`, as Slang's.
+#[test]
+fn integer_vectors_convert_and_clamp() {
+    assert_eq!(vec2(1.9, -1.9).as_ivec2(), ivec2(1, -1));
+    assert_eq!(vec2(-0.5, 0.5).floor().as_ivec2(), ivec2(-1, 0));
+    assert_eq!(ivec2(3, -4).as_vec2(), vec2(3.0, -4.0));
+    assert_eq!(ivec2(-3, 9).clamp(ivec2(0, 0), ivec2(5, 5)), ivec2(0, 5));
+    assert_eq!(ivec2(2, 2).clamp(ivec2(0, 0), ivec2(-1, -1)), ivec2(-1, -1));
+    let r = ivec4(1, 2, 3, 4);
+    assert_eq!((r.xy(), r.zw(), r.xy().yx()), (ivec2(1, 2), ivec2(3, 4), ivec2(2, 1)));
+    assert_eq!(vec2(1.0, 2.0).extend(3.0).extend(4.0), vec4(1.0, 2.0, 3.0, 4.0));
+    assert_eq!(size_of::<IVec4>(), 16);
+}

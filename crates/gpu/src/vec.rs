@@ -4,7 +4,8 @@
 //! instruction there; here, on the host, it is the plain Rust below.
 //!
 //! The swizzles the shaders read are methods (`.xy()`, `.zw()`, `.xyz()`); a swizzle written to
-//! is a struct literal, as in WGSL.
+//! is a struct literal, as in WGSL. A conversion between float and integer vectors is a method
+//! named for what it makes (`.as_ivec2()`, `.as_vec2()`), Slang's `int2(v)` and `float2(v)`.
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// Component-wise binary operators with `Self` and with a scalar on either side.
@@ -85,6 +86,13 @@ macro_rules! vector {
             pub fn max(self, o: $v) -> $v {
                 $v { $($f: if o.$f > self.$f { o.$f } else { self.$f }),+ }
             }
+
+            /// Each component clamped between `lo`'s and `hi`'s: `max(lo)` then `min(hi)`, as Slang's
+            /// `clamp`, so `hi` wins where `hi < lo`.
+            #[inline]
+            pub fn clamp(self, lo: $v, hi: $v) -> $v {
+                self.max(lo).min(hi)
+            }
         }
 
         ops!($v, $s, $($f),+);
@@ -127,10 +135,11 @@ macro_rules! float_vector {
                 $v { $($f: self.$f.floor()),+ }
             }
 
-            /// Each component clamped between `lo`'s and `hi`'s.
+            /// Component-wise sign: -1, 0 or 1 (Slang's `sign`; 0 for a zero or NaN component, unlike
+            /// `f32::signum`).
             #[inline]
-            pub fn clamp(self, lo: $v, hi: $v) -> $v {
-                self.max(lo).min(hi)
+            pub fn sign(self) -> $v {
+                $v { $($f: crate::math::sign(self.$f)),+ }
             }
 
             /// Each component clamped to 0 to 1.
@@ -170,9 +179,54 @@ vector!(
     /// Slang's `int2`.
     IVec2, ivec2, i32, x, y
 );
+vector!(
+    /// Slang's `int4`.
+    IVec4, ivec4, i32, x, y, z, w
+);
 float_vector!(Vec2, x, y);
 float_vector!(Vec3, x, y, z);
 float_vector!(Vec4, x, y, z, w);
+
+impl Vec2 {
+    /// It with a third component (Slang's `float3(v.xy, z)`); `.extend(z).extend(w)` is
+    /// `float4(v.xy, z, w)`.
+    #[inline]
+    pub const fn extend(self, z: f32) -> Vec3 {
+        vec3(self.x, self.y, z)
+    }
+
+    /// Each component converted to `i32`, toward zero (Slang's `int2(v)`). Out of range, Rust's `as`
+    /// saturates and NaN is 0, where a GPU leaves it undefined.
+    #[inline]
+    pub fn as_ivec2(self) -> IVec2 {
+        ivec2(self.x as i32, self.y as i32)
+    }
+}
+
+impl IVec2 {
+    /// Each component converted to `f32` (Slang's `float2(v)`).
+    #[inline]
+    pub fn as_vec2(self) -> Vec2 {
+        vec2(self.x as f32, self.y as f32)
+    }
+
+    #[inline]
+    pub const fn yx(self) -> IVec2 {
+        ivec2(self.y, self.x)
+    }
+}
+
+impl IVec4 {
+    #[inline]
+    pub const fn xy(self) -> IVec2 {
+        ivec2(self.x, self.y)
+    }
+
+    #[inline]
+    pub const fn zw(self) -> IVec2 {
+        ivec2(self.z, self.w)
+    }
+}
 
 impl Vec3 {
     /// It with a fourth component (Slang's `float4(v.xyz, w)`).
