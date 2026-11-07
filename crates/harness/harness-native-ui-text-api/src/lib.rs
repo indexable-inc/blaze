@@ -34,7 +34,9 @@ pub struct MarkdownText {
 /// empty: `label` what a self-closing tag shows (`#{n}`; empty: its first prop's value), `href` where a press opens in
 /// place of the `target` prop (`https://github.com/{repo}/pull/{n}`), `key` the name its live state goes by
 /// ([`InlineLive`]; empty: it has none), and `feed` which of the host's feeds keeps that state (`github.pr`). `mark`: room
-/// after its label for a small mark its live state picks ([`InlineMark`]: a CI check).
+/// after its label for a small mark its live state picks ([`InlineMark`]: a CI check). `url` names the prop a link keeps
+/// its web address in (`ui.inline.Link`: `href`): a link whose address another component's `href` fits is that component
+/// (a link to a pull request is its `PR` chip), and one that stays a link shows its host after its words.
 ///
 /// A component with live state has a child per state it can be in (`ui.inline.PR.merged`), each with its own `InlineRef`
 /// (only its `glyph`) and `Fill` (the icon's ink), and an `unknown` child for while nothing is known.
@@ -49,23 +51,27 @@ pub struct InlineRef {
     pub key: ScriptString,
     pub feed: ScriptString,
     pub mark: bool,
+    pub url: ScriptString,
 }
 
 /// What the host knows of the thing a live inline component names (a pull request), on an entity of its own the host's
 /// feed keeps: `key` as the component's `InlineRef.key` formats it, `tip` what hovering the chip says (its title, or the
 /// error that left it unknown). Which state it is in is `(InlineState, <the component's state child>)`, the mark after
 /// its label `(InlineMark, <a ui.inline.marks child>)`; neither while nothing is known, and then the chip is drawn in its
-/// component's `unknown` state with no mark, never a guessed one.
+/// component's `unknown` state with no mark, never a guessed one. `picture`: a local PNG or JPEG drawn in the icon's place
+/// (a link's page's favicon; empty: the state's glyph).
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct InlineLive {
     pub key: ScriptString,
     pub tip: ScriptString,
+    pub picture: ScriptString,
 }
 
-/// Where a live view of web page `url` goes (a chip's hover card, scene/widgets/peek.flecs): the seam for an embedded
-/// browser. Nothing draws it yet, and the node holding it is laid out at no height while `ready` is false; a browser
-/// host (CEF) that renders `url` offscreen hands its frames to the Media cache under `key` (as a Shader's or a Video's
-/// are, [`Surface`]), sets `ready`, and the node shows them. Until one does, the card shows the page's OpenGraph data.
+/// Where a live view of web page `url` goes: on a link's hover card (scene/widgets/peek.flecs `hn.ChatPeek`), the seam
+/// for an embedded browser. Nothing renders it yet; a browser host (CEF) that renders `url` offscreen hands its frames to
+/// the Media cache under `key` (as a Shader's or a Video's are, [`Surface`]) and sets `ready`, and only then does the card
+/// add its live view line (`hn.PeekPage`, a `Surface` of `key`), so a card never holds room for a view it lacks. Until
+/// one does, the card is the page's OpenGraph data.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct PageView {
     pub url: ScriptString,
