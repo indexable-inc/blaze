@@ -125,7 +125,7 @@ hn {
     label : ui.Line {
       Fill: $tone_ink_muted
       Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
-      TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
+      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
     }
     effort : hn.ChatEffort {}
     chevron : ui.Symbol {
