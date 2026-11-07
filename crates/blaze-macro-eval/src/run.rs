@@ -111,6 +111,8 @@ impl Bridge {
 pub(crate) struct Expansion<'a> {
     /// The macro's `#[proc_macro*]` function.
     pub(crate) function: FunctionId,
+    /// The function's place in the wasm module's exported proc-macro list.
+    pub(crate) wasm_index: u32,
     /// An attribute's: its client is `expand2`, given the attribute's arguments then the item.
     pub(crate) attr: bool,
     pub(crate) inputs: &'a [Stream],

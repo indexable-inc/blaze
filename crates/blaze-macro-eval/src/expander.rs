@@ -28,11 +28,9 @@
 //! were left; when one holds an address, which no fresh run can be given, the session's earlier
 //! calls are run again on the same evaluator before the next one.
 //!
-//! A crate's wasm module ([`load_wasm`]) runs each expansion in a fresh instance given the
-//! statics the session's calls before it left, and says which it changed, as the evaluator
-//! does (`wasm.rs`); a static left holding an address of the heap stops the expansion, naming
-//! the static. Its expansions and its verdict are kept apart from the evaluator's, under the
-//! module's id.
+//! A crate's wasm module ([`load_wasm`]) runs each session replay in one fresh instance, so
+//! heap addresses in statics remain valid while prior calls are replayed (`wasm.rs`). Its
+//! expansions and its verdict are kept apart from the evaluator's, under the module's id.
 //!
 //! A call is kept and found under the state it started from too: none for a call whose
 //! session's calls before it left nothing, else a digest of the statics they left, by item key
@@ -60,6 +58,7 @@ use std::{
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
+use blaze_core::lock::{Lock, LockGuard};
 use blaze_graph::Key;
 use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
@@ -74,7 +73,6 @@ use hir_expand::proc_macro::{
     Expanded, ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
     ProcMacroKind, ProcMacroLoadResult, StateUse,
 };
-use blaze_core::lock::{Lock, LockGuard};
 use intern::Symbol;
 use proc_macro_api::kept::verdict::{
     self as verdicts, Left, SETTLES, STATEFUL, STATELESS, Verdict,
@@ -434,7 +432,10 @@ impl SessionOf {
         turn[..8].copy_from_slice(&SESSIONS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
         turn[8..].copy_from_slice(b"a macro session's turn\0\0");
         // alloc: once per calling crate of a proc-macro crate
-        Arc::new(SessionOf { state: Lock::new("macro.session.state", Session::default()), turn: Key(turn) })
+        Arc::new(SessionOf {
+            state: Lock::new("macro.session.state", Session::default()),
+            turn: Key(turn),
+        })
     }
 
     /// Its state, for a field's read or write: never held across a wait.
@@ -605,14 +606,28 @@ fn start_digest(db: &Db, statics: &[(StaticId, Vec<u8>)]) -> Option<ContentId> {
 }
 
 /// A call kept for running it again.
-#[derive(PartialEq)]
 struct Kept {
     function: FunctionId,
+    index: u32,
     attr: bool,
     inputs: Vec<tt::TopSubtree>,
     sites: [span::Span; 3],
     edition: span::Edition,
     forced_keywords: bool,
+    /// Whether this call can be rerun without changing an untraceable input.
+    replay_safe: bool,
+}
+
+impl PartialEq for Kept {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function
+            && self.index == other.index
+            && self.attr == other.attr
+            && self.inputs == other.inputs
+            && self.sites == other.sites
+            && self.edition == other.edition
+            && self.forced_keywords == other.forced_keywords
+    }
 }
 
 #[derive(Debug)]
@@ -838,11 +853,13 @@ impl Evaluated {
     fn kept(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Kept {
         Kept {
             function: self.function,
+            index: self.index,
             attr: self.kind == ProcMacroKind::Attr,
             inputs: self.inputs(call),
             sites: [call.def_site, call.call_site, call.mixed_site],
             edition: call.call_site.anchor.file_id.edition(),
             forced_keywords: forced_keywords(db, calling),
+            replay_safe: true,
         }
     }
 
@@ -857,7 +874,7 @@ impl Evaluated {
         call: &ProcMacroCall<'_>,
     ) -> Result<(Ran, From), ProcMacroExpansionError> {
         let library = &*self.library;
-        let this = self.kept(db, calling, call);
+        let mut this = self.kept(db, calling, call);
         let session = library.session(db, calling);
         let mut turn = library.turn(db, calling, &session)?;
         let (stateless, holds, preset, ahead) = {
@@ -904,6 +921,8 @@ impl Evaluated {
             let replayed: &[Kept] = if holds { &turn.calls } else { &[] };
             self.run_on(db, calling, call, &preset, replayed, &this)?
         };
+        this.replay_safe =
+            !ran.seen.iter().any(|(seen, _)| *seen == blaze_usercode::trace::Seen::Untraceable);
         let left_holding = ran.statics.iter().any(|it| it.2);
         library.saw(match () {
             () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
@@ -967,6 +986,14 @@ impl Evaluated {
         replayed: &[Kept],
         this: &Kept,
     ) -> Result<Ran, ProcMacroExpansionError> {
+        if matches!(&self.library.engine, Engine::Wasm(_))
+            && replayed.iter().any(|it| !it.replay_safe)
+        {
+            return Err(system(format!(
+                "{} cannot replay a prior call that read the clock or randomness while preserving heap-backed macro state",
+                self.name.as_str()
+            )));
+        }
         // alloc: once per call, its streams and those of the calls run again
         let streams: Vec<Vec<Stream>> = replayed
             .iter()
@@ -979,6 +1006,7 @@ impl Evaluated {
             .zip(&streams)
             .map(|(it, inputs)| Expansion {
                 function: it.function,
+                wasm_index: it.index,
                 attr: it.attr,
                 inputs,
                 sites: it.sites,
@@ -1005,15 +1033,9 @@ impl Evaluated {
                 &expansions,
                 &mut spent,
             ),
-            Engine::Wasm(module) => module.run(
-                db,
-                call.env,
-                self.index,
-                &expansions,
-                preset,
-                call.current_dir,
-                &mut spent,
-            ),
+            Engine::Wasm(module) => {
+                module.run(db, call.env, &expansions, preset, call.current_dir, &mut spent)
+            }
         };
         run::ran_on(span, &spent, &ran);
         // An expansion that stopped (a budget, a refused call) names what it expanded and where,
@@ -1184,10 +1206,7 @@ impl Evaluated {
             },
             // From the settled state: the other is the fresh one.
             (false, Some(digest)) => {
-                if library.settled.lock()
-                    .as_ref()
-                    .is_some_and(|it| it.digest != digest)
-                {
+                if library.settled.lock().as_ref().is_some_and(|it| it.digest != digest) {
                     if demote {
                         library.saw(Left::Moved)?;
                     }
