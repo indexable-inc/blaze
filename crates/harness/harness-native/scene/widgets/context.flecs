@@ -15,7 +15,7 @@ hn {
   @tree ChildOf
   template ChatContextInk {
     prop ink: string = ""
-    Fill: match $ink { "s1": $tone_series1; "s2": $tone_series2; "s3": $tone_series3; "s4": $tone_series4; "s5": $tone_series5; "s6": $tone_series6; "s7": $tone_series7; "s8": $tone_series8; "rest": $tone_ink_4; _: $tone_clear }
+    Fill: match $ink { "s1": $tone_series1; "s2": $tone_series2; "s3": $tone_series3; "s4": $tone_series4; "s5": $tone_series5; "s6": $tone_series6; "s7": $tone_series7; "s8": $tone_series8; "rest": $tone_ink_faint; _: $tone_clear }
   }
 
   // "Context", then how much of the window it fills (`used` of `window`, `pct`), muted at the end.
@@ -78,9 +78,9 @@ hn {
       Text: {s: $name}
       TextStyle: {size: $size_chat_status, line: $line_chat_status, role: 0, bold: 0}
       if $split {
-        Fill: $tone_ink_3
+        Fill: $tone_ink_muted
       } else {
-        Fill: $tone_ink_1
+        Fill: $tone_ink_strong
       }
     }
     spacer : ui.Spacer {}
@@ -92,9 +92,9 @@ hn {
         Text: {s: $tokens}
       }
       if $split {
-        Fill: $tone_ink_3
+        Fill: $tone_ink_muted
       } else {
-        Fill: $tone_ink_2
+        Fill: $tone_ink
       }
     }
     share : ui.Row {

@@ -84,7 +84,7 @@ launch : ui.ZStack {
       Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
       scheme : launch_part.Lead {
         Text: {s: "https://"}
-        Fill: $tone_ink_3
+        Fill: $tone_ink_muted
         cue.FadeIn arrive(at: $home - 0.3, dur: 0.6)
       }
       name : launch_part.Lead {

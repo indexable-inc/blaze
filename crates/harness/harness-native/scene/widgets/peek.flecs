@@ -69,7 +69,7 @@ hn {
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $inline_peek_badge_pad, r: $inline_peek_badge_pad, t: 1, b: 1}
       label : ui.Line {
-        Fill: $tone_peek_badge_ink
+        Fill: $tone_on_accent
         TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 1}
       }
     }

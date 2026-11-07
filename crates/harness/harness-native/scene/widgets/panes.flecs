@@ -14,18 +14,18 @@ hn {
     Pressable
     Action: {name: "select:{obj}"}
     if $selected {
-      Fill: $tone_select
+      Fill: $tone_selection
     } else {
       Fill: $tone_clear
     }
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
     Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
     Padding: {l: 8, r: 8, t: 0, b: 0}
     dot : hn.Dot {
-      Fill: match $state { "running": $tone_running; "lost": $tone_lost; "failed": $tone_failed; _: $tone_exited }
+      Fill: match $state { "running": $tone_success; "lost": $tone_warning; "failed": $tone_error; _: $tone_ink_faint }
     }
     id : ui.Words, Faint {
       TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}

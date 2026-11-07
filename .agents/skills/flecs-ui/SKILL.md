@@ -125,12 +125,21 @@ template hn.ObjRow {
 
 ## Tokens, theme and look
 
-- No literal colour, size, radius or spring in a view: add an `export const` token in 00-tokens.flecs.
-- Colour, size and spring roles come from `hn.Theme` children; Rust reads them by name (`harness-native/src/look.rs`
-  `role`) and panics on a missing one.
-- The terminal ground, card, sidebar tint (`tone_side_tint`, same ground as the terminal, one `tone_seam` hairline,
-  no shadow) and title inks follow the user's Ghostty theme (dark/light) live; terminal palette, cursor, font and
-  padding come from it too.
+- One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`, the blaze site's palette, dark and
+  light): grounds `ground`, `sidebar`, `card`, `raised` (menus, popovers), `well` (fields, code), `term_ground`; lines
+  `line`, `line_strong`; inks `ink_strong`, `ink`, `ink_muted`, `ink_faint`; washes `hover`, `wash`, `selection`,
+  `selection_focus`, `press`, `scrim`; `accent`, `accent_wash`, `on_accent`, `link`, `code_ink`; states `success`,
+  `warning`, `error` and their `_wash`. Below them sit the palettes (kinds, brand marks, file types, chart series,
+  GitHub states, `code_ink.*`), colours that name a thing. A widget names a role (`Fill: $tone_card`), never a colour,
+  and never a new one-off token: add a role if none fits. `no_raw_colours` (harness-native's app.rs tests) fails on a
+  colour literal elsewhere; harness-video/scene/tokens.flecs mirrors the roles in its own look.
+- Sizes, radii and springs are `export const` tokens in 00-tokens.flecs too, never literals in a view.
+- Colour, size and spring roles come from `hn.Theme` children (`hn.Theme.card` reads `$tone_card`: a token named like
+  the entity that reads it does not resolve, flecs#2389); Rust reads them by name (`harness-native/src/look.rs` `role`,
+  `tone`) and panics on a missing one.
+- The sidebar is the main card's own ground with one `line` hairline (hn.Seam) between them: no lighter slab, no
+  shadow. Only the terminal follows the user's Ghostty theme: its palette, cursor, font, padding and `term_ground` (a
+  terminal pane's ground, src/app/ghostty.rs); the app's chrome stays the theme's.
 - Taste: native macOS, minimal. One font family for UI (Inter) at macOS sizes, hierarchy by weight/size/tone,
   no noise on rows, meta on hover, highlights hug their target, motion on springs, never a step.
 

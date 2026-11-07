@@ -13,14 +13,14 @@ module hn.chat_status
 // its box (radius 4 of 12), so it weighs what the step glyphs beside it do.
 prefab thinking {
   Fill: $tone_clear
-  Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+  Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
   Vector: {d: "M6 2 A4 4 0 1 1 6 10 A4 4 0 1 1 6 2", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_think_stroke}
   Tooltip: {text: "Thinking…"}
   Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_floor}
 }
 prefab thought {
   Fill: $tone_clear
-  Stroke: {dark: $tone_chat_muted.dark, light: $tone_chat_muted.light}
+  Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
   Vector: {d: "M6 2 A4 4 0 1 1 6 10 A4 4 0 1 1 6 2", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_think_stroke}
   Tooltip: {text: "Thought"}
 }
@@ -29,12 +29,12 @@ prefab thought {
 // ended with no result (a slashed circle, faint).
 prefab running {
   Icon: {glyph: ""}
-  Fill: $tone_chat_muted
+  Fill: $tone_ink_muted
   Tooltip: {text: "Running…"}
   Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_floor}
 }
 prefab no_result {
   Icon: {glyph: ""}
-  Fill: $tone_chat_faint
+  Fill: $tone_ink_faint
   Tooltip: {text: "No result"}
 }
