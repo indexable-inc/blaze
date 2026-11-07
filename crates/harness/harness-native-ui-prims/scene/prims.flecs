@@ -605,6 +605,10 @@ ui {
     prefab pose {
       Motion: {omega: $spring_pose_omega, zeta: $spring_pose_zeta}
     }
+    // Words re-wrapping live (harness-native-render reflow.rs): the glyphs a new line break moves glide on it.
+    prefab reflow {
+      Motion: {omega: $spring_reflow_omega, zeta: $spring_reflow_zeta}
+    }
     // The overlay scroller's: showing, fading away, widening near its edge, and a page on its track.
     prefab scroller_show {
       Motion: {omega: $scroller_show_omega, zeta: $scroller_show_zeta}

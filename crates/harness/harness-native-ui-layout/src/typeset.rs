@@ -4,7 +4,7 @@
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Intrinsic, Padding};
 use harness_native_ui_look_api::TextStyle;
-use harness_native_ui_node_api::{Laid, wrap_width};
+use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{MarkdownText, OneLine, Text, Truncate, TruncateMode};
 
 /// The host's typesetter, seen from layout: how wide a string runs on one line and how tall it is wrapped at a width. `node`
@@ -91,7 +91,7 @@ pub fn wanted(world: WorldRef<'_>) -> Vec<Wanted> {
             // A one-line node is measured as it draws: its first line only (`harness_native_ui_text_api::one_line`).
             text: if one { harness_native_ui_text_api::one_line(t.s.as_str()).into_owned() } else { t.s.as_str().to_owned() },
             style: e.try_cloned::<&TextStyle>().unwrap_or_default(),
-            at: e.try_cloned::<&Laid>().filter(|l| l.w > 0.0).map(|l| (wrap_width(e, l.w) - pad).max(0.0)),
+            at: e.try_cloned::<&Laid>().filter(|l| l.w > 0.0).map(|l| (l.w - pad).max(0.0)),
             now: *now,
             truncate: e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail)),
             one_line: one,

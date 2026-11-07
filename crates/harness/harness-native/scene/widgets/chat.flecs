@@ -8,8 +8,9 @@ hn {
   prefab ChatPane : hn.Pane {
     // The chat's own page (tone_chat_ground), over the main card's terminal ground.
     Fill: $tone_chat_ground
-    // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, while their
-    // words break their lines at the width they have once the fold rests (WrapAt), so they wrap once per fold.
+    // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, and their
+    // words re-wrap live at the width they have each frame (the glyphs a new break moves glide there), the row at the
+    // top of the view held still (src/app/chat.rs).
     list : ui.Scroll {
       Cursor: {shape: Text}
       ClipFade: {len: $chat_fade_len}

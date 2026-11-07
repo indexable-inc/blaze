@@ -75,6 +75,8 @@ export const spring_layout_omega = 18
 export const spring_layout_zeta = 1
 export const spring_pose_omega = 22
 export const spring_pose_zeta = 1
+export const spring_reflow_omega = 34
+export const spring_reflow_zeta = 1
 // ui.Scroller (the app's values, harness-native/scene/00-tokens.flecs).
 export const scroller_thin = 6
 export const scroller_wide = 10

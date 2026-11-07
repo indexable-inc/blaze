@@ -986,14 +986,13 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
     out
 }
 
-/// Words node `e` laid out as the painter draws it (its lines broken at its `wrap_width`), and where it is (window points).
+/// Words node `e` laid out as the painter draws it (its lines broken at its laid width), and where it is (window points).
 fn words_layout(paint: &mut Painter, e: EntityView<'_>) -> Option<(Rc<Layout>, Laid)> {
     let text = e.try_cloned::<&Text>()?;
     let laid = e.try_cloned::<&Laid>()?;
     let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
     let md = e.has(MarkdownText::id());
-    let at = harness_native_ui_node_api::wrap_width(e, laid.w);
-    Some((paint.layout_as(text.s.as_str(), &style, at.max(1.0) + 0.5, md), laid))
+    Some((paint.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md), laid))
 }
 
 /// Where editable words node `e` shows its caret (window points, x, y, width, height), for the input method's candidate
@@ -1305,6 +1304,43 @@ impl App {
                 view::for_each_of(act, working.then_some(("working", "hn.ChatWorking", ())), |_, (), _| {});
             }
         }
+    }
+
+    /// Once a frame's layout has settled: every chat pane whose transcript was laid out at a new width this frame (a cmd+S
+    /// fold, a resize: its words re-wrapped live) holds its view still in this same frame. Stuck to the bottom, the bottom
+    /// stays; scrolled up, the row at the top of the view keeps its share above the top (`view::lazy_anchor`), so the line
+    /// being read stays put while its words re-wrap. Whether a scroll moved (the frame is laid out once more).
+    pub(super) fn anchor_chats(&mut self) -> bool {
+        let w = self.world.world_ref();
+        let mut moved = false;
+        for p in self.panes() {
+            let Some(o) = model::shows(w, p) else { continue };
+            if model::pane_kind(o) != model::PaneKind::Chat {
+                continue;
+            }
+            let Some(sid) = self.session_of(*o.id()) else { continue };
+            let Some(list) = View::of(w.entity_from_id(p)).part("list") else { continue };
+            let Some(stack) = list.part("rows") else { continue };
+            let Some(l) = list.entity().try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { continue };
+            let mut states = self.chat.borrow_mut();
+            let Some(st) = states.get_mut(&sid) else { continue };
+            let pad = stack.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default();
+            let Some(a) = view::lazy_anchor(stack, &mut st.heights, (st.y - pad.t).max(0.0)) else { continue };
+            st.content += a.grew;
+            let max = (st.content - l.h).max(0.0);
+            let by = if st.stick { a.grew } else { a.shift };
+            let y = (st.y + by).clamp(0.0, max);
+            if (y - st.y).abs() <= 0.001 {
+                continue;
+            }
+            // The follow keeps its distance to the end; the physics adopts the new place on its next step (`rev`).
+            st.follow.shift(y - st.y);
+            st.y = y;
+            st.rev += 1;
+            scroll_quietly(list.entity(), ScrollState { x: 0.0, y });
+            moved = true;
+        }
+        moved
     }
 
     /// Step every chat pane's scroll a frame: stuck to the bottom while it is, kept still when rows above grew, the

@@ -102,10 +102,10 @@ hn {
   // The main card, the look lane's: an opaque plate in the terminal's ground from the window's top edge to its right and
   // bottom edges (the window's corners round it). Nothing sits over its top (no title); a soft shadow on its left is the seam with the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
-  // a split is a second node. Through a cmd+S fold the plate, its panes and their boxes follow the spring, while words
-  // break their lines at the width they have once the fold rests (WrapAt; the sidebar's clip says which width, src/app.rs
-  // lay_chrome), so they wrap once per fold. What cannot follow a moving box (a terminal's grid, which resizes once) lays
-  // out at that width too (LaysAtRest on the pane), riding its pane's leading edge.
+  // a split is a second node. Through a cmd+S fold the plate, its panes, their boxes and their words follow the spring:
+  // prose re-wraps live at the width it has each frame, the glyphs a new break moves gliding to their places. Only what
+  // cannot follow a moving box (a terminal's grid, which resizes its pty once) lays out at the width the fold rests at
+  // (LaysAtRest on the pane; the sidebar's clip says which width, src/app.rs lay_chrome), riding its pane's leading edge.
   prefab Main : ui.Row, Plate {
     Fill: $tone_term_ground
     Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
