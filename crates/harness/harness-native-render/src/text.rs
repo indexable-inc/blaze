@@ -1989,32 +1989,79 @@ mod wrap_tests {
         (l.start, l.end, boxed, l.hard_break, glyphs)
     }
 
+    /// Prose as a transcript holds it: runs of words, a bold run, a long unbreakable token, curly quotes, a hard line end
+    /// and a blank line.
+    const PROSE: &str = "Live re-wrap keeps every word where the typesetter puts it, whatever width came before: \
+                         blaze builds blaze, and the harness's transcript follows its column as the sidebar folds.\n\
+                         A second paragraph, with a long-unbroken-identifier_like_this_one and \u{201c}quotes\u{201d}, \
+                         then a line that ends hard.\n\nAfter a blank line, the last words.";
+    const BOLD: [Run; 1] = [Run { start: 5, end: 12, face: Face::Bold }];
+    const STYLE: Style = Style { size: 14.0, bold: false, line: 20.0 };
+
+    /// The widths a sidebar's spring passes through a fold, narrowing and then widening.
+    fn fold_widths() -> impl Iterator<Item = f32> {
+        let narrowing = (0..60).map(|k| 640.0 - 7.25 * k as f32);
+        let widening = (0..60).map(|k| 212.5 + 7.25 * k as f32);
+        narrowing.chain(widening)
+    }
+
     /// A transcript's prose re-wrapping live through a fold, shaped once: broken again at every width a sidebar's spring
     /// passes, narrowing and then widening, each break-only layout ([`Layout::wrap`], reusing the lines, cuts and seams the
     /// widths before it left) is the layout the typesetter sets from nothing at that width ([`Layout::typeset`]), line for
     /// line and glyph for glyph.
     #[test]
     fn breaking_again_at_a_width_is_a_full_layout_at_that_width() {
-        let text = "Live re-wrap keeps every word where the typesetter puts it, whatever width came before: \
-                    blaze builds blaze, and the harness's transcript follows its column as the sidebar folds.\n\
-                    A second paragraph, with a long-unbroken-identifier_like_this_one and \u{201c}quotes\u{201d}, \
-                    then a line that ends hard.\n\nAfter a blank line, the last words.";
-        let len = text.encode_utf16().count();
-        let bold = [Run { start: 5, end: 12, face: Face::Bold }];
-        let style = Style { size: 14.0, bold: false, line: 20.0 };
+        let len = PROSE.encode_utf16().count();
         let mut fonts = Fonts::default();
-        let shaped = Rc::new(Shaped::new(&mut fonts, text, &bold, &[], &[], style, 0.0));
-        let narrowing = (0..60).map(|k| 640.0 - 7.25 * k as f32);
-        let widening = (0..60).map(|k| 212.5 + 7.25 * k as f32);
-        for w in narrowing.chain(widening) {
+        let shaped = Rc::new(Shaped::new(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0));
+        for w in fold_widths() {
             let again = Layout::wrap(&mut fonts, &shaped, w);
-            let full = Layout::typeset(&mut fonts, text, &bold, &[], &[], style, 0.0, w);
+            let full = Layout::typeset(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0, w);
             assert_eq!(again.lines.len(), full.lines.len(), "at {w} points: {} lines broken again, {} set", again.lines.len(), full.lines.len());
             for (k, (a, b)) in again.lines.iter().zip(&full.lines).enumerate() {
                 assert_eq!(seen(a), seen(b), "at {w} points, line {k} differs");
             }
             assert_eq!(again.lines.last().map(|l| l.end), Some(len), "at {w} points the lines do not cover the text");
         }
+    }
+
+    /// What one frame of a fold costs a transcript of `HARNESS_BENCH_WRAP` messages (den's `bench_resize`): each width
+    /// broken again over text shaped once ([`Layout::wrap`]) against typeset from nothing ([`Layout::typeset`]), printed;
+    /// it asserts nothing and is skipped unless the variable is set (run it with `--nocapture` to see the numbers).
+    #[test]
+    fn fold_frame_cost() {
+        let Some(n) = std::env::var("HARNESS_BENCH_WRAP").ok().and_then(|v| v.parse::<usize>().ok()) else { return };
+        let mut fonts = Fonts::default();
+        let widths: Vec<f32> = fold_widths().collect();
+        let per_width = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3 / widths.len() as f64;
+        let t = std::time::Instant::now();
+        let shaped: Vec<Rc<Shaped>> =
+            (0..n).map(|_| Rc::new(Shaped::new(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0))).collect();
+        let shape = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for sh in &shaped {
+                std::hint::black_box(Layout::wrap(&mut fonts, sh, w));
+            }
+        }
+        let first = per_width(t);
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for sh in &shaped {
+                std::hint::black_box(Layout::wrap(&mut fonts, sh, w));
+            }
+        }
+        let again = per_width(t);
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for _ in 0..n {
+                std::hint::black_box(Layout::typeset(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0, w));
+            }
+        }
+        let typeset = per_width(t);
+        eprintln!("{n} messages, {} widths: shape once {shape:.2} ms", widths.len());
+        eprintln!("wrap, first fold (learning cuts): {first:.3} ms per frame; every fold after: {again:.3} ms per frame");
+        eprintln!("typeset afresh: {typeset:.3} ms per frame ({:.1}x the wrap)", typeset / again.max(1e-9));
     }
 }
 
