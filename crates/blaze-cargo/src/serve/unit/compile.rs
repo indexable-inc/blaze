@@ -467,9 +467,9 @@ pub(crate) struct RecordInputs<'a> {
     /// package ([`script_link_args`]): its link reads them, and neither its plan (which has
     /// the rustflags' `-C link-arg`s) nor its crate's identity holds them.
     pub(crate) script_link_args: Vec<(String, String)>,
-    /// The `-l`s in the rustflags of the crates it links in beside its own, each with its
-    /// crate's package ([`linked_rustflag_libs`]): its link reads them, and its plan holds only
-    /// its own rustflags (whose `-l`, `-L` and link options it covers).
+    /// The `-l`s and `-L`s in the rustflags of the crates it links in beside its own, each with
+    /// its crate's package ([`linked_rustflag_libs`]): its link reads them, and its plan holds
+    /// only its own rustflags (whose `-l`, `-L` and link options it covers).
     pub(crate) linked_rustflag_libs: Vec<(String, String)>,
     /// The code that makes the record ([`super::deps::record_makers`]): the front end's (its
     /// diagnostics, and the bodies the code generator compiles), the code generator's (the
@@ -524,7 +524,7 @@ impl RecordInputs<'_> {
                 &mut hasher,
                 scratch,
                 &self.linked_rustflag_libs,
-                "the rustflags' libraries of the crates it links",
+                "the rustflags' libraries and their directories of the crates it links",
                 unit,
             )
         })?;
@@ -594,7 +594,7 @@ impl RecordInputs<'_> {
             cbor("the check-cfgs its build scripts printed", &self.script_check_cfgs)?,
             cbor("the link arguments its build scripts printed", &self.script_link_args)?,
             cbor(
-                "the `-l`s in the rustflags of the crates it links",
+                "the `-l`s and `-L`s in the rustflags of the crates it links",
                 &self.linked_rustflag_libs,
             )?,
             id("the front end's code identity", Some(&self.makers.front_end)),
@@ -2274,7 +2274,7 @@ fn script_link_args(job: &Job, unit: usize) -> Result<Vec<(String, String)>, Api
         .collect())
 }
 
-/// The `-l`s of the rustflags of the crates `unit` links in beside its own
+/// The `-l`s and `-L`s of the rustflags of the crates `unit` links in beside its own
 /// ([`codegen::linked_rustflag_libs`]): none for a unit that links nothing.
 fn linked_rustflag_libs(job: &Job, unit: usize) -> Result<Vec<(String, String)>, ApiError> {
     let u = job.unit(unit)?;

@@ -8,8 +8,8 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with,
-    parse_version, reactor_with, rpaths, top_level_string,
+    Ask, Cache, CrateLibs, Located, Target, caseless, fhs, listing, loader, locate_with,
+    output_with, parse_version, reactor_with, rpaths, top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
@@ -223,6 +223,12 @@ fn shared(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, Link
     )
 }
 
+/// `libs` as one crate's whose compile searches no directory of its own: each searched in the
+/// link's directories alone.
+fn program(libs: &[NativeLib]) -> [CrateLibs<'_>; 1] {
+    [CrateLibs { libs, search: &[] }]
+}
+
 /// [`locate_with`] for a target that links nothing from blaze's toolchain.
 fn locate_plain(
     cache: &Cache,
@@ -231,7 +237,7 @@ fn locate_plain(
     libs: &[NativeLib],
     search: &[PathBuf],
 ) -> Result<Vec<Located>, LinkError> {
-    locate_with(cache, answers, output, libs, search, Path::new("/no-blaze-toolchain"))
+    locate_with(cache, answers, output, &program(libs), search, Path::new("/no-blaze-toolchain"))
 }
 
 fn line(located: &[Located]) -> Vec<(PathBuf, NativeKind)> {
@@ -388,7 +394,7 @@ fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
         &Cache::new(),
         &Answers::new(),
         &output,
-        &[dylib("c"), static_lib("c", false)],
+        &program(&[dylib("c"), static_lib("c", false)]),
         &[],
         &empty,
     )
@@ -398,7 +404,7 @@ fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
         &Cache::new(),
         &Answers::new(),
         &output,
-        &[static_lib("m", false)],
+        &program(&[static_lib("m", false)]),
         &[],
         &empty,
     )
@@ -411,7 +417,7 @@ fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
             &Cache::new(),
             &Answers::new(),
             &wasip1,
-            &[static_lib("c", false)],
+            &program(&[static_lib("c", false)]),
             &[],
             &empty
         )
@@ -519,6 +525,54 @@ fn debians_libgcc_s_script_is_followed_by_libgcc_s_so_1_and_libgcc() {
     let located = locate_plain(&cache, &glibc.answers, &output, &[dylib("gcc_s")], &[]).unwrap();
     assert_eq!(line(&located)[4], (libc.join("libgcc_s.so.1"), SHARED), "-l:FILE is the file");
 }
+
+#[test]
+fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
+    let glibc = glibc(Target::LinuxX86_64);
+    let cache = Cache::new();
+    let output = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
+    // Two crates' build scripts each make a `libasm.a` in their own `OUT_DIR`, of other
+    // symbols, and a third library only the link's directories have.
+    let (one, two, link) = (temp("own-one"), temp("own-two"), temp("own-link"));
+    touch(&one.join("libasm.a"), ARCHIVE);
+    touch(&two.join("libasm.a"), ARCHIVE);
+    touch(&link.join("libshared.a"), ARCHIVE);
+    // A dylib each crate's directories have: given to the final link, found as the link's are.
+    touch(&one.join("libdyn.so"), &elf(3));
+    touch(&two.join("libdyn.so"), &elf(3));
+    let (one_dirs, two_dirs) = (vec![one.clone()], vec![two.clone()]);
+    let first = [static_lib("asm", false)];
+    let second = [static_lib("asm", false), static_lib("shared", false), dylib("dyn")];
+    let libs = [
+        CrateLibs { libs: &first, search: &one_dirs },
+        CrateLibs { libs: &second, search: &two_dirs },
+    ];
+    // The link's directories have `one`'s first, which a name resolved once for the whole
+    // program would take for both.
+    let search = vec![one.clone(), two.clone(), link.clone()];
+    let located = locate_with(
+        &cache,
+        &glibc.answers,
+        &output,
+        &libs,
+        &search,
+        Path::new("/no-blaze-toolchain"),
+    )
+    .unwrap();
+    assert_eq!(
+        line(&located)[3..7],
+        [
+            (one.join("libasm.a"), ARCHIVED),
+            (two.join("libasm.a"), ARCHIVED),
+            (link.join("libshared.a"), ARCHIVED),
+            (one.join("libdyn.so"), SHARED),
+        ],
+        "each crate's bundled `asm` from its own directory, both on the line; one its crate's \
+         directories lack from the link's; a dylib from the link's first directory, as the final \
+         link finds it"
+    );
+}
+
 
 #[test]
 fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_one() {
@@ -1042,8 +1096,15 @@ fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
     let cache = Cache::new();
     let output = executable(&cache, &answers, "wasm32-wasip1").unwrap();
     let libc = static_lib("c", false);
-    let located =
-        locate_with(&cache, &answers, &output, std::slice::from_ref(&libc), &[], &sysroot).unwrap();
+    let located = locate_with(
+        &cache,
+        &answers,
+        &output,
+        &program(std::slice::from_ref(&libc)),
+        &[],
+        &sysroot,
+    )
+    .unwrap();
     assert_eq!(
         line(&located),
         [(dir.join("crt1-command.o"), NativeKind::Object), (dir.join("libc.a"), ARCHIVED)]
@@ -1094,9 +1155,15 @@ fn a_wasm_proc_macro_links_as_a_wasi_reactor() {
     );
 
     touch(&dir.join("crt1-reactor.o"), b"\0asm\x01\0\0\0");
-    let located =
-        locate_with(&Cache::new(), &answers, &output, &[static_lib("c", false)], &[], &sysroot)
-            .unwrap();
+    let located = locate_with(
+        &Cache::new(),
+        &answers,
+        &output,
+        &program(&[static_lib("c", false)]),
+        &[],
+        &sysroot,
+    )
+    .unwrap();
     assert_eq!(
         line(&located),
         [(dir.join("crt1-reactor.o"), NativeKind::Object), (dir.join("libc.a"), ARCHIVED)]
