@@ -7,7 +7,11 @@
 //! the component's `key` format, with `(InlineState, <the component's state child>)` and `(InlineMark, <a
 //! ui.inline.marks child>)`. Each state child carries the icon and its ink, so which colour an open, draft, merged or
 //! closed pull request gets is the scene's, not code's. A link's live state is its page's favicon (`InlineLive.picture`),
-//! drawn in its icon's place; without one it is its `unknown` child's globe.
+//! drawn in its icon's place; without one it is its `unknown` child's globe. A path's is whether it is a folder (the
+//! host's `fs` feed), which makes its icon a folder's.
+//!
+//! A file component's icon is its file kind's drawing (harness-native-ui-inline's files.rs, drawn by drawing.rs in its
+//! own colours, [`ChipIcon::Drawing`]); every other icon is a glyph in an ink.
 use std::collections::BTreeMap;
 
 use harness_native_flecs::prelude::*;
@@ -129,36 +133,60 @@ fn live<'w>(w: WorldRef<'w>, tag: &Tag) -> Option<EntityView<'w>> {
     found
 }
 
-/// The icon a chip for `tag` shows and its ink: for a live component, its state child's (`unknown`'s while nothing is
-/// known); else its file kind's for a `file_icon` component, else its `glyph`, in the look's ink; `ui.inline.unknown`'s
-/// for a tag that cannot open (no such component, or a bad target).
-pub fn icon(w: WorldRef<'_>, tag: &Tag, dark: bool) -> (String, [f32; 4]) {
+/// What a chip shows in its icon's place.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChipIcon {
+    /// A glyph of den's icon set (a Nerd Font codepoint) in an ink.
+    Glyph(String, [f32; 4]),
+    /// A file kind's drawing by name (drawing.rs), in its own colours.
+    Drawing(&'static str),
+}
+
+/// The icon a chip for `tag` shows: for a live component, its state child's (`unknown`'s while nothing is known), a
+/// glyph in the state's ink or, on a file component's state, the file kind's drawing (a folder's when the state says
+/// `folder`); else the drawing of the target's file kind for a `file_icon` component, else its `glyph` in the look's ink;
+/// `ui.inline.unknown`'s for a tag that cannot open (no such component, or a bad target).
+pub fn icon(w: WorldRef<'_>, tag: &Tag, dark: bool) -> ChipIcon {
     let (quiet, _) = look(w, dark);
     let unknown = || {
         let r = w
             .try_lookup(&format!("{MODULE}::unknown"))
             .and_then(|e| e.try_cloned::<&InlineRef>())
             .unwrap_or_else(|| panic!("the scene has no {MODULE}::unknown with an InlineRef (inline.flecs)"));
-        (r.glyph.as_str().to_owned(), quiet)
+        ChipIcon::Glyph(r.glyph.as_str().to_owned(), quiet)
     };
     let Some((e, r)) = component(w, tag) else { return unknown() };
-    if !r.key.as_str().is_empty() {
-        // Its state child, else its own `unknown` child: never a guessed state.
-        let state = live(w, tag).and_then(|l| l.target(InlineState::id(), 0)).or_else(|| e.lookup_child("unknown"));
-        let Some(s) = state else { panic!("{} has live state but no `unknown` child (inline.flecs)", e.path()) };
-        let glyph = s.try_cloned::<&InlineRef>().map_or_else(String::new, |r| r.glyph.as_str().to_owned());
-        return (glyph, s.try_cloned::<&Fill>().map_or(quiet, |f| ink_of(f, dark)));
-    }
     let opens = if r.href.as_str().is_empty() {
         tag.prop(r.target.as_str()).ok().filter(|loc| open_target(loc, None, "/", "/").is_ok())
     } else {
         format(r.href.as_str(), tag).ok()
     };
+    if !r.key.as_str().is_empty() {
+        // Its state child, else its own `unknown` child: never a guessed state.
+        let state = live(w, tag).and_then(|l| l.target(InlineState::id(), 0)).or_else(|| e.lookup_child("unknown"));
+        let Some(s) = state else { panic!("{} has live state but no `unknown` child (inline.flecs)", e.path()) };
+        let sr = s.try_cloned::<&InlineRef>().unwrap_or_default();
+        return match opens {
+            Some(loc) if sr.file_icon => ChipIcon::Drawing(files::drawing(files::kind_at(&loc, sr.folder))),
+            None if sr.file_icon => unknown(),
+            _ => ChipIcon::Glyph(sr.glyph.as_str().to_owned(), s.try_cloned::<&Fill>().map_or(quiet, |f| ink_of(f, dark))),
+        };
+    }
     match opens {
-        Some(loc) if r.file_icon => (files::kind_glyph(files::kind_of(&loc)).to_string(), quiet),
-        Some(_) => (r.glyph.as_str().to_owned(), quiet),
+        Some(loc) if r.file_icon => ChipIcon::Drawing(files::drawing(files::kind_of(&loc))),
+        Some(_) => ChipIcon::Glyph(r.glyph.as_str().to_owned(), quiet),
         None => unknown(),
     }
+}
+
+/// The live-state key, the place as written and the component (whose `folder` and `file` children are its states) of a
+/// file component's tag (a `<Path>` or `<FileRef>`, kept by the `fs` feed), for the host to find out whether it is a
+/// folder; None for any other tag.
+pub fn place<'w>(w: WorldRef<'w>, tag: &Tag) -> Option<(String, String, EntityView<'w>)> {
+    let (feed, key) = keyed(w, tag)?;
+    let (e, r) = component(w, tag)?;
+    (feed == "fs").then_some(())?;
+    Some((key, tag.prop(r.target.as_str()).ok()?, e))
 }
 
 /// The mark after `tag`'s label and its ink (a pull request's CI check), when its live state has one.

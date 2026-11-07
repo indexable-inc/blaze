@@ -1049,32 +1049,11 @@ hn {
     Size: {w: {kind: Percent, value: 0.6, min: 0, max: 0}, h: {kind: Fixed, value: $gen_bone_h, min: 0, max: 0}}
   }
 
-  // A file kind's icon (in the kind's colour, hn.GenFileKind) or a symbol (in the ink), $gen_icon square.
+  // A file kind's icon (its drawing in its own colours: the host swaps the glyph for a Drawing) or a symbol (in the ink),
+  // $gen_icon square.
   prefab GenIcon : ui.Symbol {
     Fill: $tone_ink
     Size: {w: {kind: Fixed, value: $gen_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_icon, min: 0, max: 0}}
-  }
-  prefab GenFileKind {
-    rust { Fill: $tone_file_rust }
-    typescript { Fill: $tone_file_typescript }
-    tsx { Fill: $tone_file_tsx }
-    javascript { Fill: $tone_file_javascript }
-    json { Fill: $tone_file_json }
-    toml { Fill: $tone_file_toml }
-    yaml { Fill: $tone_file_yaml }
-    markdown { Fill: $tone_file_markdown }
-    nix { Fill: $tone_file_nix }
-    shell { Fill: $tone_file_shell }
-    python { Fill: $tone_file_python }
-    go { Fill: $tone_file_go }
-    html { Fill: $tone_file_html }
-    css { Fill: $tone_file_css }
-    image { Fill: $tone_file_image }
-    lock { Fill: $tone_file_lock }
-    git { Fill: $tone_file_git }
-    folder { Fill: $tone_file_folder }
-    folder_open { Fill: $tone_file_folder }
-    text { Fill: $tone_file_text }
   }
   // A photo: its box (the width and height said, or the photo's own shape up to its own width and the column's), the
   // picture in it (`pic`: contained in its own shape, or covering the box).
@@ -1254,8 +1233,7 @@ hn {
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_field_w}, h: {kind: Fixed, value: $gen_file_h, min: 0, max: 0}}
     Padding: {l: 7, r: 8, t: 0, b: 0}
-    icon : ui.Symbol {
-      Fill: $tone_file_text
+    icon : ui.Art {
       Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
     }
     name : ui.Lead {
@@ -1292,7 +1270,7 @@ hn {
   // ---- New elements (lane E): File, CellRef, ColorPicker and DropZone (src/app/chat/genui/{files,cellref,color,
   // dropzone}.rs), after den's 30-genui.flecs and 33-genui-prims.flecs. ----
 
-  // A File: one row of a listing (den's GenFile). Its kind's icon in the kind's colour (hn.GenFileKind), its name, then
+  // A File: one row of a listing (den's GenFile). Its kind's icon (IntelliJ's, in its own colours: ui.Art), its name, then
   // its size and when it changed, quiet, in tabular figures. A trailing / on its name makes it a folder. With an onClick
   // it is hn.GenFileOn: it shows the hover, and a press sends its value, else its name.
   prefab GenFile : ui.Row {
@@ -1300,8 +1278,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_row_h, min: 0, max: 0}}
     Padding: {l: $gen_file_pad, r: $gen_file_pad, t: 0, b: 0}
     Shape: {radius: $gen_file_radius, n: 4, border: 0, feather: 0}
-    icon : ui.Symbol {
-      Fill: $tone_file_text
+    icon : ui.Art {
       Size: {w: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}}
     }
     name : ui.Lead {

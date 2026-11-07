@@ -20,6 +20,8 @@ pub enum PaintKind {
     Icon,
     /// Its `Mark`, a vector outline inked by its `Fill`.
     Mark,
+    /// Its `Drawing`, a multi-colour vector drawing in its own colours.
+    Drawing,
     /// Its `Picture`.
     Picture,
     /// A `Ribbon`: a band in its Fill between the nodes its `RibbonFrom` and `RibbonTo` name.

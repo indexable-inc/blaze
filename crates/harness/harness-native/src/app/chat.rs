@@ -1262,8 +1262,15 @@ impl App {
         let focused =
             self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing()
                 && !self.renaming();
-        // Its chips: the one under the pointer, its card, and the live state of the pull requests and issues it names.
-        self.fill_chat_peek(pv, st, t, &rows, focused);
+        // Its chips: the one under the pointer, its card, and the live state of the pull requests, issues and places it
+        // names (relative places from the session's directory, as a press opens them: chat_open_at).
+        let cwd = self
+            .world
+            .world_ref()
+            .entity_from_id(e)
+            .try_cloned::<&model::Cwd>()
+            .map_or_else(|| std::env::var("HOME").unwrap_or_default(), |c| c.s.as_str().to_owned());
+        self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
         let ended = self.status_of(e) != "running";
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();

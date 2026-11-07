@@ -1,5 +1,5 @@
 //! Tier 3's status, pictures, chips and files (after den's genui.rs, filetype.rs and 33-genui-prims.flecs): Progress,
-//! Loading and Skeleton (the last two move on the clock), Icon (a file kind's glyph in its colour, or a Nerd Font
+//! Loading and Skeleton (the last two move on the clock), Icon (a file kind's drawing in its own colours, or a Nerd Font
 //! symbol), Image (a photo file, decoded by harness-native-render's photo.rs), Chip, Tile and FileRef.
 use super::*;
 use crate::look::{ShowAfter, Sweep};
@@ -10,23 +10,33 @@ use harness_native_ui_layout_api::{Aspect, SizeKind};
 use harness_native_ui_motion_api::{Motion, Pose};
 use harness_native_ui_text_api::{Kip, Picture, Vector};
 
-// The file kinds (one table, shared with the words' inline <Path>): harness-native-ui-inline's files.rs.
-pub(super) use harness_native_ui_inline::files::{KIND_NAMES, kind_glyph, kind_named, kind_of};
+// The file kinds and their drawings (one table, shared with the words' inline <Path>): harness-native-ui-inline's
+// files.rs.
+pub(super) use harness_native_ui_inline::files::{self, KIND_NAMES, kind_named, kind_of};
 
 /// A spinner turns once a second; a skeleton breathes once every [`BREATH`] seconds, fading by up to [`BREATH_FADE`].
 const BREATH: f32 = 1.6;
 const BREATH_FADE: f32 = 0.5;
 
-/// What an Icon named `name` draws: a file kind's glyph (and the kind, for its colour), or the bundled Nerd Font's symbol
-/// of that name (`cod-check`; a bare `check` is a codicon; `-` and `_` within a name are one).
-pub(super) fn glyph(name: &str) -> Option<(Option<&'static str>, char)> {
+/// What an Icon draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Drawn {
+    /// A file kind's drawing, in its own colours.
+    Kind(&'static str),
+    /// A symbol of the bundled Nerd Font, in the icon's ink.
+    Symbol(char),
+}
+
+/// What an Icon named `name` draws: a file kind's drawing, or the bundled Nerd Font's symbol of that name (`cod-check`;
+/// a bare `check` is a codicon; `-` and `_` within a name are one).
+pub(super) fn glyph(name: &str) -> Option<Drawn> {
     if let Some(k) = kind_named(name) {
-        return Some((Some(k), kind_glyph(k)));
+        return Some(Drawn::Kind(files::drawing(k)));
     }
     let us = name.replace('-', "_");
     let tail = name.split_once('-').map(|(p, r)| format!("{p}-{}", r.replace('-', "_")));
     let tries = [Some(name.to_owned()), tail, Some(format!("cod-{name}")), Some(format!("cod-{us}"))];
-    tries.into_iter().flatten().find_map(|t| harness_native_render::text::nerd_symbol(&t)).map(|c| (None, c))
+    tries.into_iter().flatten().find_map(|t| harness_native_render::text::nerd_symbol(&t)).map(Drawn::Symbol)
 }
 
 thread_local! {
@@ -129,16 +139,17 @@ pub(super) fn element(v: View<'_>, node: &Value, kind: &str, kids: &[&Value], de
         "Icon" => {
             // `kind` (a file kind) says it plainly; else `name`, a kind or a symbol.
             let drawn = match prop(node, "kind").as_str() {
-                Some(k) => kind_named(k).map(|k| (Some(k), kind_glyph(k))),
+                Some(k) => kind_named(k).map(|k| Drawn::Kind(files::drawing(k))),
                 None => glyph(&words(node, "name")),
             };
-            let Some((kind, g)) = drawn else { return };
-            v.icon(&g.to_string());
-            let f = match kind {
-                Some(k) => fill_of(world, &format!("hn.GenFileKind.{k}")),
-                None => fill_of(world, "hn.GenIcon"),
-            };
-            filled(v, f);
+            match drawn {
+                Some(Drawn::Kind(d)) => _ = v.drawing(d),
+                Some(Drawn::Symbol(g)) => {
+                    v.icon(&g.to_string());
+                    filled(v, fill_of(world, "hn.GenIcon"));
+                }
+                None => {}
+            }
         }
         "Image" => image(v, node),
         "Kip" => {
@@ -173,8 +184,7 @@ pub(super) fn element(v: View<'_>, node: &Value, kind: &str, kids: &[&Value], de
             // Its kind as said, else as its name says; its name as said, else the file's.
             let kind = prop(node, "kind").as_str().and_then(kind_named).unwrap_or_else(|| kind_of(&path));
             if let Some(i) = v.part("icon") {
-                i.icon(&kind_glyph(kind).to_string());
-                filled(i, fill_of(world, &format!("hn.GenFileKind.{kind}")));
+                i.drawing(files::drawing(kind));
             }
             let said = words(node, "name");
             let name = if said.is_empty() { path.trim_end_matches('/').rsplit('/').next().unwrap_or(&path) } else { said.as_str() };
