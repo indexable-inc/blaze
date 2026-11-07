@@ -91,9 +91,9 @@ pub struct Charge<K> {
     /// No task ended or gave way since the last reading: its `kept` is still what the
     /// allocator keeps.
     fresh: bool,
-    /// The last reading came after a purge the plane asked for.
+    /// The last reading came after a purge.
     purged: bool,
-    /// A purge was asked for since the last reading.
+    /// A purge was asked for and no reading after a purge came since.
     asked_since: bool,
     /// When the plane last asked for a purge.
     asked_ns: Option<u64>,
@@ -191,8 +191,9 @@ impl<K: Copy + Eq> Charge<K> {
     }
 
     /// A footprint reading: `footprint` the process's footprint, `kept` what of it the
-    /// allocator keeps freed. What each task realized before it is now in it.
-    pub fn read(&mut self, footprint: u64, kept: u64) {
+    /// allocator keeps freed, `purged` whether the driver purged just before it. What each task
+    /// realized before it is now in it.
+    pub fn read(&mut self, footprint: u64, kept: u64, purged: bool) {
         self.by_footprint = true;
         self.reading = footprint;
         self.kept = kept.min(footprint);
@@ -201,8 +202,12 @@ impl<K: Copy + Eq> Charge<K> {
         }
         self.gone = 0;
         self.fresh = true;
-        self.purged = self.asked_since;
-        self.asked_since = false;
+        // Only the driver knows it purged: a reading taken after the plane asked but before
+        // the purge says nothing of what a purge gives back.
+        self.purged = purged;
+        if purged {
+            self.asked_since = false;
+        }
     }
 
     /// The live bytes held, under the grants mode ([`crate::plane::PlaneInput::Held`]).
@@ -231,8 +236,8 @@ impl<K: Copy + Eq> Charge<K> {
 
     /// Whether to ask the driver for a purge now, the plane being held back for memory at
     /// `at_ns`. Asked when the allocator may keep something (the last reading says so, or a
-    /// task ended since it), at most once a reading and at most every [`PURGE_EVERY_NS`].
-    /// Counts what it asks.
+    /// task ended since it), not again until a reading after a purge, and at most every
+    /// [`PURGE_EVERY_NS`]. Counts what it asks.
     pub fn ask_purge(&mut self, at_ns: u64) -> bool {
         let may_keep = self.kept > 0 || !self.fresh;
         let due = self.asked_ns.is_none_or(|it| at_ns >= it.saturating_add(PURGE_EVERY_NS));

@@ -241,6 +241,10 @@ pub enum PlaneInput {
         at_ns: u64,
         bytes: u64,
         kept: u64,
+        /// The driver purged just before it read: what the allocator kept that a purge gives
+        /// back is gone from it.
+        #[serde(default)]
+        purged: bool,
     },
     /// The running task `id` has realized `bytes`, its memory account's peak so far. Past its
     /// grant, its grant grows to that at once; what it realized counts as in the footprint
@@ -1208,9 +1212,10 @@ impl<M: Memo> Plane<M> {
     }
 
     /// Whether the driver should purge what the allocator keeps freed, then read the footprint
-    /// again and give it as a [`PlaneInput::Footprint`]: a task with memory was held back in
-    /// the last dispatch, the allocator may keep memory, and no purge was asked since the last
-    /// reading nor within [`crate::footprint::PURGE_EVERY_NS`].
+    /// again and give it as a [`PlaneInput::Footprint`] with `purged`: a task with memory was
+    /// held back in the last step's dispatch, the allocator may keep memory, and no purge was
+    /// asked since the last purged reading nor within [`crate::footprint::PURGE_EVERY_NS`].
+    /// Said by one step alone: a driver keeps it until it purges.
     pub fn purge_due(&self) -> bool {
         self.purge
     }
@@ -1568,9 +1573,9 @@ impl<M: Memo> Plane<M> {
                 self.held = bytes;
                 self.charge.held(bytes);
             }
-            PlaneInput::Footprint { bytes, kept, .. } => {
+            PlaneInput::Footprint { bytes, kept, purged, .. } => {
                 self.held = bytes;
-                self.charge.read(bytes, kept);
+                self.charge.read(bytes, kept, purged);
             }
             PlaneInput::Realized { id, bytes, .. } => {
                 // A task that ended or gave way since it was measured: its bytes are the

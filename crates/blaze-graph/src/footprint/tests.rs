@@ -218,6 +218,8 @@ struct Sim<'p> {
     clock: u64,
     stamps: u64,
     finished: Option<bool>,
+    /// The plane asked a purge since the driver last did one.
+    purge_due: bool,
 }
 
 impl<'p> Sim<'p> {
@@ -241,6 +243,7 @@ impl<'p> Sim<'p> {
             clock: 0,
             stamps: 0,
             finished: None,
+            purge_due: false,
         };
         sim.step(PlaneInput::Open {
             at_ns: 0,
@@ -277,6 +280,7 @@ impl<'p> Sim<'p> {
     /// Steps the plane, starting a job for each task it runs.
     fn step(&mut self, input: PlaneInput) -> Result<(), Broke> {
         let outputs = self.plane.step(input).map_err(harness)?;
+        self.purge_due |= self.plane.purge_due();
         for output in outputs {
             match output {
                 PlaneOutput::Run { id, .. } => {
@@ -315,6 +319,10 @@ impl<'p> Sim<'p> {
     /// The driver measures: each running task's realized bytes, then the footprint; under
     /// [`Plant::GrantsOnly`] the live bytes alone.
     fn read(&mut self) -> Result<(), Broke> {
+        self.read_after(false)
+    }
+
+    fn read_after(&mut self, purged: bool) -> Result<(), Broke> {
         let at_ns = self.clock;
         if self.plant == Plant::GrantsOnly {
             let live = self.plan.baseline + self.jobs.iter().map(|it| it.holds).sum::<u64>();
@@ -326,12 +334,13 @@ impl<'p> Sim<'p> {
             self.step(PlaneInput::Realized { at_ns, id, bytes })?;
         }
         let bytes = self.footprint();
-        self.step(PlaneInput::Footprint { at_ns, bytes, kept: self.kept })
+        self.step(PlaneInput::Footprint { at_ns, bytes, kept: self.kept, purged })
     }
 
     fn purge(&mut self) -> Result<(), Broke> {
         self.kept = 0;
-        self.read()
+        self.purge_due = false;
+        self.read_after(true)
     }
 
     /// `bytes` freed: a part sticks, the rest the allocator keeps; no purge tried since.
@@ -365,7 +374,7 @@ impl<'p> Sim<'p> {
     /// One tick: the clock moves, a purge the plane asked is done, and one running task acts.
     fn tick(&mut self, tick: u64, rng: &mut SplitMix64) -> Result<(), Broke> {
         self.clock += TICK_NS;
-        if self.plane.purge_due() && self.plant != Plant::NoPurge {
+        if self.purge_due && self.plant != Plant::NoPurge {
             self.purge()?;
         }
         if self.jobs.is_empty() || tick % self.plan.read_every == 0 {
@@ -582,17 +591,17 @@ fn replay_one_seed() {
 #[test]
 fn a_grant_counts_until_a_reading_holds_its_bytes() {
     let mut charge = Charge::<u32>::new();
-    charge.read(100, 0);
+    charge.read(100, 0, false);
     charge.started(1, 50);
     assert_eq!(charge.charged(50), 150);
     assert_eq!(charge.realized(1, 30), 0);
     // Not in a reading yet: still the whole grant.
     assert_eq!(charge.charged(50), 150);
-    charge.read(130, 0);
+    charge.read(130, 0, false);
     assert_eq!(charge.charged(50), 150);
     // Past its grant: raised at once.
     assert_eq!(charge.realized(1, 80), 30);
-    charge.read(180, 0);
+    charge.read(180, 0, false);
     assert_eq!(charge.charged(80), 180);
 }
 
@@ -600,13 +609,13 @@ fn a_grant_counts_until_a_reading_holds_its_bytes() {
 #[test]
 fn an_ended_task_stays_charged_until_the_next_reading() {
     let mut charge = Charge::<u32>::new();
-    charge.read(100, 0);
+    charge.read(100, 0, false);
     charge.started(1, 50);
     charge.realized(1, 10);
-    charge.read(110, 0);
+    charge.read(110, 0, false);
     charge.ended(1, Some(20));
     assert_eq!(charge.charged(0), 120);
-    charge.read(120, 20);
+    charge.read(120, 20, false);
     assert_eq!(charge.charged(0), 120);
     assert_eq!(charge.grades(), Grades { under: 1, under_bytes: 30, ..Grades::default() });
 }
@@ -622,16 +631,20 @@ fn held_alone_charges_the_grants_or_the_live_bytes() {
     assert!(!charge.ask_purge(0));
 }
 
-/// A purge is asked once a reading, at most every [`PURGE_EVERY_NS`], and a task starts alone
-/// only after a reading that follows it.
+/// A purge is asked once until a reading after a purge, at most every [`PURGE_EVERY_NS`], and a
+/// task starts alone only after that reading: a reading the driver took before it purged is not
+/// one.
 #[test]
-fn a_purge_is_asked_once_a_reading_and_lets_a_task_start_alone() {
+fn a_purge_is_asked_once_a_purge_and_lets_a_task_start_alone() {
     let mut charge = Charge::<u32>::new();
-    charge.read(100, 60);
+    charge.read(100, 60, false);
     assert!(!charge.alone_ok());
     assert!(charge.ask_purge(0));
     assert!(!charge.ask_purge(1));
-    charge.read(80, 40);
+    charge.read(100, 60, false);
+    assert!(!charge.alone_ok());
+    assert!(!charge.ask_purge(PURGE_EVERY_NS));
+    charge.read(80, 40, true);
     assert!(charge.alone_ok());
     assert!(!charge.ask_purge(PURGE_EVERY_NS - 1));
     assert!(charge.ask_purge(PURGE_EVERY_NS));

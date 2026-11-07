@@ -35,8 +35,9 @@ The causes:
   reading. A task's grant is counted until the task's own bytes show up in the footprint, and is
   never counted twice. Headroom is `budget - charge`.
 - **Purge before refusing.** When admission holds back work and the allocator keeps freed memory,
-  the plane says a purge is due (`Plane::purge_due`). It says so at most once per footprint reading,
-  and at most every `PURGE_EVERY_NS`. The driver purges, reads the footprint again and sends it.
+  the plane says a purge is due (`Plane::purge_due`). It asks once, and not again until a reading that
+  follows a purge, and at most every `PURGE_EVERY_NS`. The driver keeps the request until it
+  purges, then reads the footprint again and sends it with `purged`.
   - On macOS the purge is the heap give-back (`blaze_mem::tag::give_back_heap`), the chunk-cache
     trim, and `malloc_zone_pressure_relief(NULL, 0)` for the system zones.
   - On Linux the purge is the heap give-back, which is `madvise(MADV_DONTNEED)` on free spans, and
@@ -77,8 +78,10 @@ The causes:
 
 The plane gains two inputs:
 
-- `PlaneInput::Footprint { at_ns, bytes, kept }` is a reading of the footprint and of how much of
-  it the allocator could give back.
+- `PlaneInput::Footprint { at_ns, bytes, kept, purged }` is a reading of the footprint and of how
+  much of it the allocator could give back. `purged` says the driver purged just before the
+  reading. Only such a reading counts as following a purge: a reading taken after the plane asked,
+  but before the driver purged, says nothing about what a purge gives back.
 - `PlaneInput::Realized { at_ns, id, bytes }` is how much a running task's account has reached.
   When that passes the grant, the grant grows to it at once. The realized part leaves the
   unrealized sum only at the next `Footprint`, because only that reading contains it.

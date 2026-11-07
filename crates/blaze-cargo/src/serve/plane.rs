@@ -1506,12 +1506,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 .unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
         self.ran = ran;
-        self.measure(at);
+        self.measure(at, false);
         if std::mem::take(&mut self.purge_due) {
             // Admission held work back while the allocators may keep freed memory: it goes
             // back before any task waits for it, and the plane hears the footprint after.
             crate::raw::memory::purge();
-            self.measure(at);
+            self.measure(at, true);
         }
         // The pressure cap, given as it changes: on an event, and once it passes.
         let cap = self.pressure.cap(ns(at));
@@ -1532,9 +1532,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// Tells the plane what each running task has realized, where it grew past its grant or
     /// by a [`REALIZED_STEP`] since it was last told, then the process's footprint and what of
-    /// it the allocators keep freed ([`PlaneInput::Footprint`]). A task whose account closed
-    /// ended: its bytes are the footprint's to say.
-    fn measure(&mut self, at: Duration) {
+    /// it the allocators keep freed ([`PlaneInput::Footprint`]), `purged` when a purge came
+    /// just before. A task whose account closed ended: its bytes are the footprint's to say.
+    fn measure(&mut self, at: Duration, purged: bool) {
         self.began_now();
         let at_ns = ns(at);
         let mut realizing = std::mem::take(&mut self.realizing);
@@ -1560,7 +1560,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         // `blaze_graph::footprint::PURGE_EVERY_NS` while work is held back.
         let kept =
             footprint.saturating_sub(arena::held().saturating_add(snapshot.resident_committed()));
-        let input = PlaneInput::Footprint { at_ns, bytes: footprint, kept };
+        let input = PlaneInput::Footprint { at_ns, bytes: footprint, kept, purged };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the footprint: {error}"));
     }
 
