@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 pub mod field;
+pub mod level;
 pub mod menu;
 pub mod search;
 pub mod table;

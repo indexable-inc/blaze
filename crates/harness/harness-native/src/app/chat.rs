@@ -261,6 +261,9 @@ pub struct ChatState {
     /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
     pick: Option<pick::Pick>,
     pick_nav: pick::PickNav,
+    /// Its effort as this app moves it (a swipe over the control, the menu's slider, a key): shown at once, sent once it
+    /// rests (chat/pick.rs).
+    effort: pick::EffortState,
     /// The composer's scroll once its words outgrow it: wheels on AppKit's physics, the caret kept in view.
     input_scroll: view::field::FieldScroll,
     /// The agent's words as they show (hn.Theme.chat_stream): each text block's pace through the bursts it comes in, by
@@ -335,6 +338,7 @@ impl Default for ChatState {
             rows_open: HashMap::new(),
             pick: None,
             pick_nav: pick::PickNav::default(),
+            effort: pick::EffortState::default(),
             input_scroll: view::field::FieldScroll::default(),
             stream: HashMap::new(),
             cut: HashMap::new(),
@@ -1278,7 +1282,7 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, &model, &effort, ended);
             // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
             if let Some(act) = bar.part("act") {
                 let working = t.busy && !ended;

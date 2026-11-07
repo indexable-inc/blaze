@@ -75,6 +75,16 @@ pub struct SideDrag {
     pub keep: f32,
 }
 
+/// How the chat's effort moves under a sideways swipe (`hn.Theme.chat_pick`, src/app/chat/pick.rs): the fingers' travel
+/// a stop takes (`step`, points), how long after the last step the effort is sent (`commit`, seconds), and how long the
+/// control keeps saying it in words once it stops moving (`word`, seconds).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PickFeel {
+    pub step: f32,
+    pub commit: f32,
+    pub word: f32,
+}
+
 /// How a sidebar row's content comes in as the row folds in (and goes as it folds away), on the row's one fold spring
 /// (src/app/fold.rs): its words show only once the row has `lead` of its height (0 to 1), easing in over the rest, and
 /// settle down `rise` points into place as they do.
@@ -92,6 +102,7 @@ pub struct PressAmt {
 
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
+    world.component::<PickFeel>().writable();
     world.component::<FoldIn>().writable();
     world.component::<PressAmt>();
     // The row templates (scene/widgets/rows.flecs) set these.
@@ -145,6 +156,11 @@ pub fn pace(w: WorldRef<'_>, name: &str) -> Pace {
 /// The sidebar drag's numbers (`hn.Theme.side_drag`).
 pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
     role(w, "side_drag").try_cloned::<&SideDrag>().unwrap_or_else(|| panic!("hn.Theme.side_drag has no SideDrag"))
+}
+
+/// The chat effort's swipe and commit timings (`hn.Theme.chat_pick`).
+pub fn pick_feel(w: WorldRef<'_>) -> PickFeel {
+    role(w, "chat_pick").try_cloned::<&PickFeel>().unwrap_or_else(|| panic!("hn.Theme.chat_pick has no PickFeel"))
 }
 
 /// How a sidebar row's content folds in and away (`hn.Theme.tree_fold`).

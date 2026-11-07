@@ -143,12 +143,12 @@ pub fn run(path: &str) -> Result<(), String> {
     let seq =
         std::env::var("HARNESS_NATIVE_SHOT_SEQ").ok().map(|s| nums(&s)).filter(|v| v.len() == 2);
     let mut frames = 0u32;
-    // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t`: a trackpad swipe of `dy` points (negative: toward the end) over (x, y) from t
-    // seconds: a began, changed events over 8 frames, an ended.
+    // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t[,dx]`: a trackpad swipe of `dy` (and `dx`) points (negative: toward the end)
+    // over (x, y) from t seconds, under natural scrolling: a began, changed events over 8 frames, an ended.
     let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL")
         .ok()
         .map(|s| nums(&s))
-        .filter(|v| v.len() == 4)
+        .filter(|v| v.len() == 4 || v.len() == 5)
         .map(|v| (v, 0usize));
     // HARNESS_NATIVE_SHOT_DROP `x,y,t[,t_off]`: Finder files carried over (x, y) (window points) from t seconds, as the
     // window's dragging callbacks report them (a DropZone there lights), and carried off at t_off. No drag is made.
@@ -194,13 +194,14 @@ pub fn run(path: &str) -> Result<(), String> {
             if *n == 0 {
                 app.pointer_move(v[0], v[1], none);
             }
-            let (phase, dy) = match *n {
-                0 => (1, 0.0),
-                1..=8 => (4, v[2] / 8.0),
-                _ => (8, 0.0),
+            let across = v.get(4).copied().unwrap_or(0.0);
+            let (phase, dx, dy) = match *n {
+                0 => (1, 0.0, 0.0),
+                1..=8 => (4, across / 8.0, v[2] / 8.0),
+                _ => (8, 0.0, 0.0),
             };
             app.scroll_wheel(
-                crate::app::Wheel { dx: 0.0, dy, precise: true, phase, momentum: 0 },
+                crate::app::Wheel { dx, dy, precise: true, phase, momentum: 0, inverted: true },
                 none,
             );
             *n += 1;

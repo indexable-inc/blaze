@@ -247,6 +247,31 @@ export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
 export const menu_trail_gap = 20
 export const menu_head_h = 20
 export const menu_sep_pad = 5
+// A menu item's meta (prims.flecs ui.MenuItem `meta`: a version, a count) sits menu_meta_gap after its label, muted, at
+// size_menu_meta. A section head with its maker's mark (ui.MenuHeadMarked) carries the mark in the check gutter.
+export const menu_meta_gap = 5
+export const size_menu_meta = 12
+// A level slider (level.flecs ui.LevelSlider, harness_native_ui_view::level): a few named stops on a groove level_groove_h
+// tall, level_groove_radius round, filled in tone_level_fill up to a knob level_knob across (tone_level_knob, its
+// hairline tone_level_knob_edge, a small lift), each stop a dot level_tick across (tone_level_tick) where the knob rests
+// on it. The knob glides between stops on the level spring. Its head (the name of what it sets, then the stop's name) is
+// level_head_h tall at size_level_head; its scale (what the ends mean) at size_level_scale in tone_level_scale, level_gap
+// apart from the track.
+export const level_groove_h = 4
+export const level_groove_radius = 2
+export const level_knob = 14
+export const level_tick = 3
+export const level_gap = 5
+export const level_head_h = 18
+export const size_level_head = 12
+export const size_level_scale = 10.5
+export const line_level_scale = 13
+export const level_omega = 30
+export const level_zeta = 0.9
+export const tone_level_groove: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.09}}
+export const tone_level_tick: Fill = {dark: {1, 1, 1, 0.30}, light: {0, 0, 0, 0.24}}
+export const tone_level_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export const tone_level_knob_edge: Fill = {dark: {0, 0, 0, 0.30}, light: {0, 0, 0, 0.18}}
 // A searchable menu (search_menu.flecs ui.SearchMenu): a marked item's mark menu_mark across before its label, the
 // filter's caret menu_caret_w wide.
 export const menu_mark = 13
@@ -292,6 +317,10 @@ export const tone_ink_4: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 // A field's placeholder (ui.TextArea's hint, a search menu's, a cell's fields'): clearly a hint, well under the words.
 export const tone_hint: Fill = {dark: {1, 1, 1, 0.24}, light: {0, 0, 0, 0.26}}
 export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+
+// The level slider's fill and its ends' words (level_*, above), from the inks.
+export const tone_level_fill: Fill = $tone_accent
+export const tone_level_scale: Fill = $tone_ink_4
 
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
@@ -575,6 +604,22 @@ export const chat_effort_bar_w = 2
 export const chat_effort_gap = 1.5
 export const chat_effort_bar_radius = 1
 export const chat_effort_floor = 0.3
+// The picker's menu (hn.ChatPickMenu): chat_pick_menu_w wide whatever it holds, so a model's line about it wraps under
+// the list (chat_pick_detail_*: size, line, insets) instead of being cut; the effort's slider chat_pick_level_t under
+// the hairline and chat_pick_level_b over the plate's foot. A sideways two-finger swipe over the control (or the
+// slider) steps the effort a stop each chat_pick_swipe_step points the fingers travel (detents: momentum never steps
+// it), a pulse on the trackpad at each; the effort is sent chat_pick_commit_secs after the last step (one switch for a
+// swipe through several), and the control says the effort in words while it moves and chat_pick_word_secs after.
+export const chat_pick_menu_w = 252
+export const size_chat_pick_detail = 11.5
+export const line_chat_pick_detail = 15
+export const chat_pick_detail_t = 3
+export const chat_pick_detail_b = 4
+export const chat_pick_level_t = 2
+export const chat_pick_level_b = 4
+export const chat_pick_swipe_step = 22
+export const chat_pick_commit_secs = 0.35
+export const chat_pick_word_secs = 1.2
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets
 // and gap, the bar): the words grow to textarea_grow_share of the pane less it.
 export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad + $chat_composer_gap + $chat_bar_h

@@ -556,9 +556,15 @@ define_class!(
                 precise: event.hasPreciseScrollingDeltas(),
                 phase: event.phase().0 as usize,
                 momentum: event.momentumPhase().0 as usize,
+                inverted: event.isDirectionInvertedFromDevice(),
             };
             let m = mods_of(event.modifierFlags());
-            with(|st| st.app.scroll_wheel(ev, m));
+            // A swipe over the chat's effort pulses at each stop it steps (chat/pick.rs): play them with the event.
+            let pulses = with(|st| {
+                st.app.scroll_wheel(ev, m);
+                st.app.take_haptics()
+            });
+            play(&pulses.unwrap_or_default());
             wake();
         }
 
@@ -1211,7 +1217,10 @@ fn shift_window(st: &mut State) {
     st.app.set_window_moved((dx / zoom) as f32);
 }
 
-/// Play trackpad pulses (Force Touch trackpads; nothing elsewhere).
+/// Play trackpad pulses through AppKit's NSHapticFeedbackManager (`defaultPerformer`, `performFeedbackPattern:
+/// performanceTime:` at `.now`): the one API that reaches the Force Touch trackpad's actuator, so the sidebar's latch and
+/// the chat effort's detents (chat/pick.rs: `.levelChange`, Apple's pattern for stepping between discrete levels) are
+/// felt under the finger as they happen. On a trackpad without the actuator, or a mouse, it plays nothing.
 fn play(pulses: &[crate::haptic::Haptic]) {
     use objc2_app_kit::{
         NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
@@ -1814,4 +1823,19 @@ pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u6
         let _ = d.set(delegate.clone());
     });
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    /// The haptics `play` sends exist in this AppKit: the class, its shared performer and the method it calls.
+    #[test]
+    fn haptic_feedback_api_exists() {
+        use objc2::runtime::{AnyClass, Sel};
+        let class = AnyClass::get(c"NSHapticFeedbackManager").expect("AppKit has no NSHapticFeedbackManager");
+        assert!(class.class_method(Sel::register(c"defaultPerformer")).is_some(), "no +[NSHapticFeedbackManager defaultPerformer]");
+        let performer = objc2_app_kit::NSHapticFeedbackManager::defaultPerformer();
+        let performer: &objc2::runtime::AnyObject = performer.as_ref();
+        let sel = Sel::register(c"performFeedbackPattern:performanceTime:");
+        assert!(performer.class().responds_to(sel), "the default performer does not take performFeedbackPattern:performanceTime:");
+    }
 }

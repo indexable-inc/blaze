@@ -15,6 +15,9 @@ pub struct Wheel {
     pub precise: bool,
     pub phase: usize,
     pub momentum: usize,
+    /// The deltas follow the content, which follows the fingers (natural scrolling: NSEvent's
+    /// `isDirectionInvertedFromDevice`); false when they go against the fingers.
+    pub inverted: bool,
 }
 
 /// The tree's scroll: its engine, the origin it last reported, and a glide to the selected row.
@@ -85,6 +88,10 @@ impl App {
             self.tree.glide = None;
             self.tree.engine.wheel(input, t);
             self.poke();
+            return;
+        }
+        // A sideways swipe over a chat's model and effort control steps its effort (chat/pick.rs).
+        if self.chat_pick_wheel(&ev, z) {
             return;
         }
         let (gdx, gdy) = if ev.precise { (ev.dx / z, ev.dy / z) } else { (ev.dx * 12.0, ev.dy * 12.0) };

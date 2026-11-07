@@ -1,0 +1,24 @@
+// ui.LevelSlider laid in the flow (a gallery's): an effort's five stops with the knob on High (the fill's and the rest's
+// Grow weights at 3 of 4), the dots at the stops the fill has not reached, the ends' meaning under them.
+
+@tree ChildOf
+ex {
+  prefab LevelDemo : ex.Card {
+    label : ui.Label { Text: {s: "LEVEL SLIDER"} }
+    effort : ui.LevelSlider {
+      head { label { Text: {s: "Effort"} }; value { Text: {s: "High"} } }
+      track {
+        ticks {
+          t0 : ui.LevelTick {}
+          t1 : ui.LevelTick {}
+          t2 : ui.LevelTick {}
+          t3 : ui.LevelTick {}
+          t4 : ui.LevelTick {}
+        }
+        fill { Size: {w: {kind: Grow, value: 0.75, min: 0, max: 0}, h: {kind: Fixed, value: $level_groove_h, min: 0, max: 0}} }
+        rest { Size: {w: {kind: Grow, value: 0.25, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}} }
+      }
+      scale { lo { Text: {s: "Faster"} }; hi { Text: {s: "Smarter"} } }
+    }
+  }
+}

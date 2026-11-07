@@ -494,7 +494,7 @@ ui {
     Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}
     Motion: {omega: $menu_omega, zeta: $menu_zeta}
   }
-  // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label`, then trailing muted words pushed to
+  // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label` and its `meta` just after it, then trailing muted words pushed to
   // the end (`about`, a line about it that truncates first; `keys`, its shortcut). Its highlight is a pill fading in on
   // the hover spring; the pointer and the arrow keys move it together, so its owner keeps `Lit` on the highlighted item
   // (HoverSteered; harness_native_ui_view::menu::Nav). `Action` names what a press does.
@@ -527,6 +527,15 @@ ui {
       FixedSize: {h: true, v: false}
       TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
     }
+    // Quiet words right after the label (a model's version, a count), never cut: what tells close items apart.
+    metagap : ui.Node {
+      Size: {w: {kind: Fixed, value: $menu_meta_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    meta : ui.Line {
+      Fill: $tone_ink_3
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
     gap : ui.Spacer {
       Size: {w: {kind: Grow, value: 1, min: $menu_trail_gap, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
@@ -547,6 +556,19 @@ ui {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_head_h, min: 0, max: 0}}
     Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: 0, b: 0}
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu_head, line: $line_menu, role: 0, bold: 1}
+    }
+  }
+  // A section's head led by its maker's mark (`Mark: {name}` set on `icon` by its owner) in the check gutter, so the
+  // mark says once whose items follow instead of on every row.
+  prefab MenuHeadMarked : ui.Row {
+    Flex: {axis: Row, gap: $menu_gutter_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_head_h, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
+    icon : ui.Icon {
+      Size: {w: {kind: Fixed, value: $menu_check, min: 0, max: 0}, h: {kind: Fixed, value: $menu_check, min: 0, max: 0}}
+    }
     label : ui.Line, Muted {
       TextStyle: {size: $size_menu_head, line: $line_menu, role: 0, bold: 1}
     }

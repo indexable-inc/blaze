@@ -12,6 +12,7 @@ pub use harness_native_ui_layout::{Estimate, Measure, typeset};
 pub const SCENES: &[(&str, &str)] = &[
     ("06-prims", include_str!("../scene/prims.flecs")),
     ("06-search-menu", include_str!("../scene/search_menu.flecs")),
+    ("06-level", include_str!("../scene/level.flecs")),
     ("07-kip", include_str!("../scene/kip.flecs")),
     ("08-field", include_str!("../scene/field.flecs")),
     // The `ui.inline` module: inline components' vocabulary (harness-native-ui-inline is its grammar).
@@ -38,6 +39,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("98-ex-scroller", include_str!("../scene/examples/scroller.flecs")),
     ("98-ex-menu", include_str!("../scene/examples/menu.flecs")),
     ("98-ex-search-menu", include_str!("../scene/examples/search_menu.flecs")),
+    ("98-ex-level", include_str!("../scene/examples/level.flecs")),
     ("98-ex-browser", include_str!("../scene/examples/browser.flecs")),
     ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
 ];
