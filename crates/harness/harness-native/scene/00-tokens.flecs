@@ -125,9 +125,6 @@ export const group_h = 28
 // header's left edge: side_inset + tree_pad + the chevron's inset in its gutter, in line with the depth-0 chevrons.
 export const side_inset = 8
 export const label_inset = 16
-// The seam between the sidebar and the main card: a soft shadow off the card's left edge.
-export const seam_blur = 14
-export const seam_alpha = 0
 export const row_gap = 8
 export const row_pad = 8
 
