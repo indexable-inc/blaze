@@ -105,8 +105,9 @@ name or its spelling.
   backend reads the same `ENTRY` constants by const evaluation and hands their slots to naga's MSL
   writer, so the shader and the host can't number differently. It replaces build.rs's parsing of
   `entryPointParams_*` out of Slang's MSL.
-- **`gpu::entries![...]`** names the crate's entry points in one exported static, `GPU_ENTRIES`
-  (each entry's `EntryDesc` and its function). It is what a device build compiles (below) and what
+- **`gpu::entries![...]`** names the crate's entry points in one static at the crate root,
+  `GPU_ENTRIES` (each entry's `EntryDesc` and its function), found by its path, not a symbol, so
+  two shader crates in one host don't collide. It is what a device build compiles (below) and what
   a host can list.
 - **Math is a library.** `Vec2`, `Vec3`, `Vec4`, `UVec4`, `IVec2` with operators and the swizzles
   the shaders use as methods (`.xy()`, `.zw()`, `.xyz()`), and Slang's free functions under their
@@ -188,9 +189,11 @@ The rest of the lowering, MIR to naga:
   `AccessIndex` chains; `&` of a local stays a function-space pointer. A raw pointer, an
   integer-to-pointer cast, a `dyn` call, a function pointer call, recursion, an allocation, an
   `i128` or `u128`, and unwinding are typed errors naming the function and the construct
-  (`no-fallback`). A panic (a failed bounds check or `unwrap`) is lowered as plan.md's open
-  question decides; until then its edge is a typed error, so shaders use `get` or clamp, as the
-  Slang does.
+  (`no-fallback`). A panic (a failed bounds check, an `unwrap`) ends the invocation, as
+  `panic=abort` ends a thread: `discard` in a fragment stage, a position outside the clip volume
+  (so the primitive is culled) in a vertex stage. The device has nowhere to unwind to or report
+  to; an entry that opts into blaze's `nopanic` effect makes any reachable panic a compile error
+  naming it instead. So a port keeps Slang's `[]` indexing, checked.
 - Types: `f32`, `i32`, `u32`, `bool`, `f16` when the target has it; `gpu::Vec*` (a `#[repr(C)]`
   struct the backend knows by the same table as the intrinsics) is a naga vector, so the shaders'
   vector arithmetic is one instruction, not a struct per component. A `#[repr(C)]` struct is a
@@ -298,12 +301,13 @@ One shader at a time, each on its own switch, with no fallback between them:
 ## Open questions
 
 - Where does `gpu` live once kernels and drivers join it: one crate with the drivers behind a
-  feature, or the vocabulary (`gpu`) and the drivers (`gpu-metal`, ...) apart? The vocabulary has
-  to stay `no_std` with no dependencies for the device build.
-- What does a panic in a shader do? plan.md's question, sharper here: a fragment stage has no
-  launch to report an error flag to. Refusing panicking edges in device code (the phase 1 rule) is
-  strict; a `#[gpu::nopanic]`-style proof (blaze's `nopanic` effect) would make it a checked
-  property rather than a codegen error.
+  feature, or the vocabulary (`gpu`) and the drivers (`gpu-metal`, ...) apart? The vocabulary may
+  use std (its float functions call the intrinsics the device backend lowers, `powf32` and the
+  rest), but nothing in it may reach an allocation or a driver, since a device build collects
+  whatever an entry reaches.
+- Should a panic also be reported? Ending the invocation (above) is silent; a per-draw error
+  buffer the host reads after the frame (plan.md's per-launch flag) would say which entry and
+  where, at the cost of a storage binding on every entry. Opt in per build (debug), or always?
 - Is MIR always reducible? Rust gives no `goto`, but MIR passes (jump threading, early returns
   through drop elaboration) could in principle make an irreducible graph. The structurizer refuses
   one with an error; if that ever fires on real code, node splitting is the fix.
