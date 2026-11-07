@@ -6040,7 +6040,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("an async block without a state");
                 };
                 let state = SuspendedState { addr: state, ty: self.scalar(tag)?.ty, held };
-                self.enter_coroutine(body, &state, addr, ty, &layout)?;
+                self.enter_coroutine(body, &reachable, &state, addr, ty, &layout)?;
                 self.suspended = Some(state);
             }
             _ => {
@@ -15352,6 +15352,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn enter_coroutine(
         &mut self,
         body: &MirBody<'db>,
+        reachable: &blaze_hash::HashSet<BasicBlockId, Global>,
         state: &SuspendedState,
         addr: Value,
         ty: Ty<'db>,
@@ -15374,7 +15375,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(poll);
         let mut switch = Switch::new();
         switch.set_entry(UNRESUMED as u128, self.blocks[body.start_block]);
-        for (index, point) in state.held.yields.iter().enumerate() {
+        // The yields that run, by where each resumes. One in a block that never runs
+        // (`if CONST { x.await }`) never stores its state, and its resume and drop blocks are
+        // not compiled, so it has no arm.
+        // alloc: inline, a few yields a body
+        let resumes: smallvec::SmallVec<[BasicBlockId; 8]> = reachable
+            .iter()
+            .filter_map(|&id| match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+                Some(TerminatorKind::Yield { resume, .. }) => Some(*resume),
+                _ => None,
+            })
+            .collect();
+        let runs = |index: &usize| resumes.contains(&state.held.yields[*index].resume);
+        for (index, point) in state.held.yields.iter().enumerate().filter(|(it, _)| runs(it)) {
             switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[point.resume]);
         }
         switch.emit(&mut self.builder, at, finished);
@@ -15391,7 +15404,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.store_state(state.addr, state.ty, RETURNED);
         let mut dropping = Switch::new();
         dropping.set_entry(UNRESUMED as u128, unresumed);
-        for (index, point) in state.held.yields.iter().enumerate() {
+        for (index, point) in state.held.yields.iter().enumerate().filter(|(it, _)| runs(it)) {
             let Some(dropped) = point.drop else {
                 unsupported!("a yield without a drop path");
             };
