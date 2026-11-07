@@ -264,6 +264,9 @@ pub struct ChatState {
     /// attach, since an attach replays the log from nothing and a Claude chat's log names neither until its agent is up.
     started: Option<(Option<String>, Option<String>)>,
     pick_nav: pick::PickNav,
+    /// Its effort as this app moves it (a swipe over the control, the menu's slider, a key): shown at once, sent once it
+    /// rests (chat/pick.rs).
+    effort: pick::EffortState,
     /// The composer's scroll once its words outgrow it: wheels on AppKit's physics, the caret kept in view.
     input_scroll: view::field::FieldScroll,
     /// The agent's words as they show (hn.Theme.chat_stream): each text block's pace through the bursts it comes in, by
@@ -338,6 +341,7 @@ impl Default for ChatState {
             rows_open: HashMap::new(),
             pick: None,
             pick_nav: pick::PickNav::default(),
+            effort: pick::EffortState::default(),
             started: None,
             input_scroll: view::field::FieldScroll::default(),
             stream: HashMap::new(),
@@ -1298,7 +1302,7 @@ impl App {
             // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, listed);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
             // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
             if let Some(act) = bar.part("act") {
                 let working = t.busy && !ended;

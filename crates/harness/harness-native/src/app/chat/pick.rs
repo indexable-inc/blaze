@@ -1,32 +1,44 @@
 //! Den's model and effort picker in a chat's composer bar (scene/widgets/chat.flecs `hn.ChatPick`), and its context meter.
 //!
 //! The bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
-//! model takes, those up to the effort lit; the effort's name its tooltip) and a small chevron, on a wash under the
-//! pointer, its words and lit bars easing toward the ink. A press opens the menu above it: the models and the efforts (Command-/ the models alone,
-//! Shift-Command-/ with nothing to step to the efforts alone), the current rows ticked. A pick sends `Request::SetModel` (link.rs `chat_choose`);
-//! the daemon has the agent switch (claude's `set_model` and `apply_flag_settings` control requests, codex's next
-//! `turn/start`) and logs the choice, so a resumed chat keeps it. A chat whose own log has no `models` event (one from
-//! before chats listed them, or one whose agent is not running) picks from the list its agent kind last gave the daemon
-//! (`list`'s `models`, link.rs `agent_models`); an ended chat's pick is recorded and its resume starts with it. Until any
-//! agent of its kind has listed, or for a model with no efforts, that part of the menu says why in a short line. A press
-//! anywhere else, or Escape, closes it.
+//! model takes, those up to the effort lit) and a small chevron, on a wash under the pointer, its words and lit bars
+//! easing toward the ink. Its tooltip says the model and effort and how to change them; never while its menu is open.
 //!
-//! The menu (unless it is the efforts alone) is a searchable menu (search_menu.flecs `ui.SearchMenu`,
-//! harness_native_ui_view::search): typing while it is open filters it, the first match highlighted, Return picks. It
-//! offers every agent kind's models, the chat's own first, under each kind's head with its maker's mark. One of the
-//! chat's own switches it as above; another kind's cannot (a chat's agent is one process for its life: Claude's
-//! stream-json or Codex's app-server, each with its own conversation), so it starts a chat of that kind on that model in
+//! The effort moves without opening anything: a sideways two-finger swipe over the control steps it a stop per detent
+//! (harness_native_ui_view::level::Swipe: each `PickFeel::step` points the fingers travel, momentum never steps), with a
+//! pulse on a Force Touch trackpad at each stop (`Haptic::LevelChange`, played by window.rs); Shift-Command-/ steps it
+//! round. A moved effort is a [`Wish`]: shown at once (the control says its name after the meter while it moves and a
+//! moment after), sent `PickFeel::commit` after the last step (one switch for a swipe through several stops, never two
+//! requests racing), and dropped once the chat says it runs with it.
+//!
+//! A press opens the menu above it (hn.ChatPickMenu, a fixed width): the models (Command-/ opens them alone), then the
+//! effort as a level slider (prims level.flecs `ui.LevelSlider`: press or drag to a stop, the arrows step it, a swipe
+//! over it steps it as over the control; the menu stays open). The models are searchable (search_menu.flecs's filter,
+//! harness_native_ui_view::search): typing filters them, the first match highlighted, up and down move, Return picks.
+//! Each agent kind's models sit under its head led by its maker's mark, the chat's own kind first: a row is a model's
+//! name with its version quiet after it, the one the chat runs ticked; the line about the row the pointer or the keys
+//! are on (else the chat's own model) shows whole under the list, wrapping, never cut. A pick sends
+//! `Request::SetModel` (link.rs `chat_choose`); the daemon has the agent switch (claude's `set_model` and
+//! `apply_flag_settings` control requests, codex's next `turn/start`) and logs the choice, so a resumed chat keeps it. A
+//! chat whose own log has no `models` event picks from the list its agent kind last gave the daemon (`list`'s `models`,
+//! link.rs `agent_models`); an ended chat's pick is recorded and its resume starts with it. Until any agent of its kind
+//! has listed, or for a model with no efforts, that part of the menu says why in a short line. Another kind's model
+//! cannot switch this chat (its agent is one process for its life), so it starts a chat of that kind on that model in
 //! the same directory (`chat:spawn:`), which replaces this one when nothing was sent in it yet. Every pick is remembered
-//! ([`App::remember_choice`]): cmd+N starts on the last agent, model and effort.
+//! ([`App::remember_choice`]): cmd+N starts on the last agent, model and effort. A press anywhere else, or Escape,
+//! closes the menu.
 //!
-//! At the bar's trailing edge, before the send button, the context meter: a small ring filling as the conversation fills
-//! its model's window (den's: muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer,
-//! its popover (context.rs) says how full, with the percentage, and with what.
+//! At the bar's trailing edge, the context meter: a small ring filling as the conversation fills its model's window
+//! (den's: muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer, its popover
+//! (context.rs) says how full, with the percentage, and with what.
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
 use harness_proto::event::ModelChoice;
+use harness_native_ui_view::level::{self, Swipe};
 use harness_native_ui_view::search::{self, Edit, Entry};
+use crate::haptic::Haptic;
+use crate::look::PickFeel;
 use std::collections::BTreeMap;
 
 /// The share of the window from which the meter shows in the warning tone, and from which in the failed tone (den's).
@@ -225,22 +237,93 @@ fn level(model: Option<&ModelChoice>, effort: &str) -> Option<(usize, usize)> {
     Some((at, m.efforts.len()))
 }
 
+/// What the ends of the effort's slider mean.
+const FASTER: &str = "Faster";
+const SMARTER: &str = "Smarter";
+/// How long a sent effort may go unsaid by the chat before the control shows what the chat says again (the daemon's log
+/// says why it did not take).
+const UNSAID_SECS: f32 = 6.0;
+/// AppKit's scroll phases (NSEventPhase) that end a swipe.
+const ENDED: usize = 8 | 16;
+
+/// An effort moved to here (a swipe, a drag, a key) that the chat does not say it runs with yet.
+#[derive(Clone, Debug)]
+pub struct Wish {
+    effort: String,
+    /// When it last moved (the app's clock).
+    at: f32,
+    /// Sent to the daemon.
+    sent: bool,
+    /// Still held: a drag or a swipe not let go (it is sent only once let go).
+    held: bool,
+}
+
+/// A chat's effort as this app moves it: the wish not yet said back, the swipe over its control, when it last moved
+/// (the control says it in words a moment after), and the effort shown last frame (what a step steps from).
+#[derive(Default)]
+pub struct EffortState {
+    wish: Option<Wish>,
+    swipe: Swipe,
+    moved: Option<f32>,
+    shown: String,
+}
+
+impl EffortState {
+    /// The effort to show for a chat that says `said` (an ended one: what was last chosen for it, which its resume starts
+    /// with): the wish while there is one. A sent wish goes once the chat says it, or [`UNSAID_SECS`] after it moved.
+    fn shown(&mut self, t: &Transcript, ended: bool, said: &str, now: f32) -> String {
+        let said = if ended && !t.chosen_effort.is_empty() { t.chosen_effort.as_str() } else { said };
+        if self.wish.as_ref().is_some_and(|w| w.sent && (w.effort == said || now - w.at > UNSAID_SECS)) {
+            self.wish = None;
+        }
+        let shown = self.wish.as_ref().map_or(said, |w| w.effort.as_str()).to_owned();
+        self.shown.clone_from(&shown);
+        shown
+    }
+}
+
+/// The efforts the model chat `t` runs takes, lowest first (none when unknown or it takes none).
+fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>) -> Vec<String> {
+    current(t, models_of(t, kind, kept), shown(t, ("", "")).0).map(|m| m.efforts.clone()).unwrap_or_default()
+}
+
 impl App {
     /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, `listed` the daemon's
-    /// `(model, effort)` for it), and its menu while `open`.
+    /// `(model, effort)` for it, `ended` when no agent runs it), and its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
-        &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav,
-        listed: (&str, &str),
+        &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
+        listed: (&str, &str), ended: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
-        let Label { models, cur, name, effort, words, level, tip } = Label::of(t, kind, &kept, listed);
+        let Label { models, cur, name, effort: said, .. } = Label::of(t, kind, &kept, listed);
+        let effort = eff.shown(t, ended, said, self.time);
         let context = t.context.as_ref().filter(|c| c.window > 0);
         let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
         let ink = ControlInk::of(w);
+        // The model's name and its effort's level; an effort with no place among its model's said in words
+        // ("Opus · Medium"), and the model alone when the effort is unknown. While the effort moves, and a moment after,
+        // its name after the meter.
+        let level = level(cur, &effort);
+        let words = match level {
+            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(&effort)),
+            _ => name.to_owned(),
+        };
+        let feel = crate::look::pick_feel(w);
+        let moving = eff.wish.is_some() || eff.moved.is_some_and(|m| self.time - m < feel.word);
+        let word = (moving && level.is_some()).then(|| effort_word(&effort));
+        // Its tooltip says what it is and how to change it; none while the menu is open (it would cover the menu).
+        let tip = match (open, level.is_some()) {
+            (Some(_), _) => String::new(),
+            (None, true) => format!("{name} \u{b7} {} effort  \u{2318}/\nSwipe sideways here to change the effort", effort_word(&effort)),
+            (None, false) if !effort.is_empty() => format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(&effort)),
+            (None, false) => "Model and effort  \u{2318}/".to_owned(),
+        };
         let shown = (!name.is_empty()).then_some(("model", "hn.ChatPick", ()));
-        view::for_each_of(pick, shown, |v, (), _| control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink));
+        view::for_each_of(pick, shown, |v, (), _| {
+            control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink, word.as_deref());
+        });
         view::for_each_of(meter_slot, context.map(|_| ("context", "hn.ChatContext", ())), |v, (), _| {
             if let Some(c) = context {
                 meter(v, (c.used, c.window), ink.hot);
@@ -254,21 +337,25 @@ impl App {
         // Open, the menu floats above the control, its leading edge on the control's.
         let trigger = open.and_then(|_| pick.part("model"));
         let Some(menu) = bar.part("menu") else { return };
-        // The efforts alone are a plain menu; the models (and both) a searchable one.
-        let plate = match open {
-            Some(Pick::Effort) => Some(("plate", "ui.Menu")),
-            Some(_) => Some(("search", "ui.SearchMenu")),
-            None => None,
+        let page = open.filter(|_| trigger.is_some());
+        view::for_each_of(menu, page.map(|_| ("plate", "hn.ChatPickMenu", ())), |_, (), _| {});
+        let (Some(plate), Some(trigger), Some(page)) = (menu.part("plate"), trigger, page) else {
+            nav.slider = None;
+            return;
         };
-        view::for_each_of(menu, plate.filter(|_| trigger.is_some()).map(|(k, p)| (k, p, ())), |_, (), _| {});
-        let plate = plate.and_then(|(k, _)| menu.part(k));
-        if let (Some(plate), Some(trigger), Some(page)) = (plate, trigger, open) {
-            plate.anchored(trigger.id());
-            let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-            let hovered = w.entity_named(APP).target(Hovered::id(), 0);
-            let titles = self.agent_titles();
-            let ctx = MenuCtx { sid, own: models, kind, kept: &kept, cur, name, effort, titles: &titles };
-            menu_rows(w, plate, &ctx, page, hovered, nav);
+        plate.anchored(trigger.id());
+        let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
+        let hovered = w.entity_named(APP).target(Hovered::id(), 0);
+        let titles = self.agent_titles();
+        let ctx = MenuCtx { sid, own: models, kind, kept: &kept, cur, name, effort: &effort, titles: &titles };
+        if let Some(slot) = plate.part("models") {
+            view::for_each_of(slot, (page != Pick::Effort).then_some(("list", "hn.ChatPickModels", ())), |_, (), _| {});
+            if let Some(list) = slot.part("list") {
+                model_rows(w, list, &ctx, hovered, nav);
+            }
+        }
+        if let Some(slot) = plate.part("effort") {
+            effort_section(slot, &ctx, page, nav);
         }
     }
 
@@ -342,16 +429,21 @@ impl App {
             let chats = self.chats.borrow();
             let Some(t) = chats.get(&sid) else { return };
             let kept = self.link.agent_models();
-            let kind = match self.entity_of(sid) {
-                Some(e) if t.agent.is_empty() => model::kind_name(self.world.world_ref().entity_from_id(e)).to_owned(),
-                _ => t.agent.clone(),
-            };
+            let kind = self.agent_kind_of(sid, t);
             let cur = current(t, models_of(t, &kind, &kept), "").map(|c| c.id.clone());
             let same = model.is_none() || model == cur;
             let effort = effort.or_else(|| Some(t.effort.clone()).filter(|e| same && !e.is_empty()));
             (kind, model.or(cur), effort)
         };
         self.remember_choice(&kind, model.as_deref(), effort.as_deref());
+    }
+
+    /// Chat `sid`'s agent kind: its transcript's, else its object's.
+    fn agent_kind_of(&self, sid: u64, t: &Transcript) -> String {
+        match self.entity_of(sid) {
+            Some(e) if t.agent.is_empty() => model::kind_name(self.world.world_ref().entity_from_id(e)).to_owned(),
+            _ => t.agent.clone(),
+        }
     }
 
     /// Each agent kind's name, from the act.Spawn actions that have a title (scene/20-keys.flecs `SpawnKind`).
@@ -391,14 +483,17 @@ impl App {
         any
     }
 
-    /// A press off an open menu and off the picker closes it (before this frame's actions run, so a press on a control
-    /// is that control's).
+    /// Each frame: a press off an open menu and off the picker closes it (before this frame's actions run, so a press on
+    /// a control is that control's); a press or drag on the effort's slider moves the effort; a let-go wish is sent once
+    /// it has rested `PickFeel::commit`, and the control keeps drawing while its effort's words show.
     pub(in crate::app) fn step_chat_pick(&mut self) {
+        self.step_effort_drag();
+        self.step_effort_commit();
         if !self.pointer.went_down || self.chat.borrow().values().all(|st| st.pick.is_none()) {
             return;
         }
         let w = self.world.world_ref();
-        let menus = [view::prefab(w, "ui.Menu"), view::prefab(w, "ui.SearchMenu")];
+        let menus = [view::prefab(w, "ui.Menu"), view::prefab(w, "ui.SearchMenu"), view::prefab(w, "hn.ChatPickMenu")];
         let ours = |n: EntityView<'_>| {
             n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:"].iter().any(|p| a.name.as_str().starts_with(p)))
                 || menus.iter().flatten().any(|m| n.owns((flecs::IsA::ID, *m.id())))
@@ -410,40 +505,190 @@ impl App {
         }
     }
 
-    /// Command-/ (`pick_model`): the focused chat's models, open or closed. Shift-Command-/ (`effort_next`): its effort
-    /// steps to the next its model takes (round to the first); a model with none opens the efforts' menu, which says so.
-    pub(in crate::app) fn chat_pick_key(&mut self, op: &str) {
-        let Some((_, e, sid)) = self.focused_chat() else { return };
-        if op == "pick_model" {
-            return self.chat_pick_toggle(sid, Pick::Model);
-        }
-        let next = {
-            let chats = self.chats.borrow();
-            let kept = self.link.agent_models();
-            let kind = model::kind_name(self.world.world_ref().entity_from_id(e));
-            chats.get(&sid).and_then(|t| {
-                let (model, effort) = shown(t, ("", ""));
-                let efforts = &current(t, models_of(t, kind, &kept), model)?.efforts;
-                let at = efforts.iter().position(|e| e == effort).map_or(0, |i| (i + 1) % efforts.len().max(1));
-                efforts.get(at).cloned()
-            })
-        };
-        match next {
-            Some(e) => {
-                self.link.chat_choose(sid, None, Some(e.clone()));
-                self.remember_chat_choice(sid, None, Some(e));
-                self.poke();
+    /// The effort's slider under a press: the stop nearest the pointer, held until let go (then sent once it rests).
+    fn step_effort_drag(&mut self) {
+        let w = self.world.world_ref();
+        let pressed = w.entity_named(APP).target(Pressed::id(), 0).map(|e| *e.id());
+        let mut moves = Vec::new(); // alloc: at most one open menu's slider, once a frame
+        for (sid, st) in self.chat.borrow_mut().iter_mut() {
+            if !self.pointer.down {
+                if let Some(wish) = st.effort.wish.as_mut().filter(|w| w.held) {
+                    wish.held = false;
+                    wish.at = self.time;
+                }
+                continue;
             }
-            None => self.chat_pick_toggle(sid, Pick::Effort),
+            let Some(slider) = st.pick_nav.slider.filter(|s| pressed == Some(*s)) else { continue };
+            let n = st.pick_nav.efforts.len();
+            if let Some(at) = level::stop_at(View::of(w.entity_from_id(slider)), self.pointer.x, n) {
+                moves.push((*sid, st.pick_nav.efforts[at].clone()));
+            }
+        }
+        for (sid, e) in moves {
+            self.chat_effort_to(sid, &e, true, true);
         }
     }
 
-    /// A key while chat `sid`'s menu is open: the arrows move its highlight, Return picks the highlighted row (or closes
-    /// the menu when none is). Whether the menu took the key (it is open and the key is one of those).
+    /// Send each let-go wish that has rested `PickFeel::commit` (one switch for a swipe or a drag through several stops),
+    /// and keep drawing while one waits or a control still says its effort in words.
+    fn step_effort_commit(&mut self) {
+        let feel = crate::look::pick_feel(self.world.world_ref());
+        let now = self.time;
+        let mut due = Vec::new(); // alloc: the wishes due this frame, rarely more than one
+        let mut waiting = false;
+        for (sid, st) in self.chat.borrow_mut().iter_mut() {
+            if let Some(w) = st.effort.wish.as_mut().filter(|w| !w.sent) {
+                if !w.held && now - w.at >= feel.commit {
+                    w.sent = true;
+                    due.push((*sid, w.effort.clone()));
+                } else {
+                    waiting = true;
+                }
+            }
+            waiting |= st.effort.wish.is_some() || st.effort.moved.is_some_and(|m| now - m < feel.word + 0.1);
+        }
+        for (sid, e) in due {
+            self.link.chat_choose(sid, None, Some(e.clone()));
+            self.remember_chat_choice(sid, None, Some(e));
+        }
+        if waiting {
+            self.poke_why("effort settling");
+        }
+    }
+
+    /// Chat `sid`'s effort moved to `effort` here (shown at once, sent once let go and rested): `held` while a drag or a
+    /// swipe goes on, `pulse` for a trackpad tick when it changes. Whether it changed.
+    fn chat_effort_to(&mut self, sid: u64, effort: &str, held: bool, pulse: bool) -> bool {
+        let now = self.time;
+        let changed = {
+            let mut states = self.chat.borrow_mut();
+            let st = states.entry(sid).or_default();
+            let changed = st.effort.shown != effort;
+            if changed || st.effort.wish.is_some() {
+                st.effort.wish = Some(Wish { effort: effort.to_owned(), at: now, sent: false, held });
+            }
+            if changed {
+                st.effort.shown = effort.to_owned();
+                st.effort.moved = Some(now);
+            }
+            changed
+        };
+        if changed && pulse {
+            self.pulse(Haptic::LevelChange);
+        }
+        self.poke();
+        changed
+    }
+
+    /// Chat `sid`'s effort `by` stops along its model's efforts from the one shown (held at the ends, or `round` past
+    /// them). The efforts are its model's; None when it has none (or is not in the list), else whether it moved.
+    fn chat_effort_step(&mut self, sid: u64, by: i32, round: bool, held: bool, pulse: bool) -> Option<bool> {
+        let (efforts, shown) = {
+            let chats = self.chats.borrow();
+            let t = chats.get(&sid)?;
+            let kept = self.link.agent_models();
+            let efforts = efforts_of(t, &self.agent_kind_of(sid, t), &kept);
+            let shown = self.chat.borrow().get(&sid).map(|st| st.effort.shown.clone()).unwrap_or_default();
+            (efforts, shown)
+        };
+        let n = efforts.len() as i32;
+        if n == 0 {
+            return None;
+        }
+        let at = efforts.iter().position(|e| *e == shown).map(|i| i as i32);
+        let to = match at {
+            Some(i) if round => (i + by).rem_euclid(n),
+            Some(i) => (i + by).clamp(0, n - 1),
+            None => 0,
+        };
+        Some(self.chat_effort_to(sid, &efforts[to as usize], held, pulse))
+    }
+
+    /// A wheel event: a sideways two-finger swipe over a chat's picker control (or its open menu's slider) steps its
+    /// effort a stop per detent, a pulse at each; a swipe that begins up or down is not the picker's. Whether it took it.
+    pub(in crate::app) fn chat_pick_wheel(&mut self, ev: &sidebar::Wheel, z: f32) -> bool {
+        const BEGIN: usize = 1 | 32;
+        let begins = ev.phase & BEGIN != 0 || (!ev.precise && ev.phase == 0 && ev.momentum == 0);
+        // A swipe stays with the chat it began over, wherever the pointer goes.
+        let sid = match self.swiping {
+            Some(sid) if !begins => Some(sid),
+            _ => self.pick_under_pointer(),
+        };
+        self.swiping = sid.filter(|_| ev.precise);
+        let Some(sid) = sid else { return false };
+        let feel: PickFeel = crate::look::pick_feel(self.world.world_ref());
+        // The fingers' way: AppKit's deltas follow the content, which follows the fingers only under natural scrolling.
+        let k = if ev.precise { 1.0 / z } else { 1.0 } * if ev.inverted { 1.0 } else { -1.0 };
+        let steps = self.chat.borrow_mut().entry(sid).or_default().effort.swipe.wheel(
+            ev.dx * k,
+            ev.dy * k,
+            ev.precise,
+            ev.phase,
+            ev.momentum,
+            feel.step,
+        );
+        let Some(steps) = steps else {
+            self.swiping = None;
+            return false;
+        };
+        let held = ev.precise && ev.phase & ENDED == 0;
+        if steps != 0 {
+            let moved = self.chat_effort_step(sid, steps.signum(), false, held, true);
+            if moved == Some(false) {
+                self.chat.borrow_mut().entry(sid).or_default().effort.swipe.hold();
+            }
+            for _ in 1..steps.unsigned_abs() {
+                self.chat_effort_step(sid, steps.signum(), false, held, true);
+            }
+        }
+        if !held && let Some(w) = self.chat.borrow_mut().entry(sid).or_default().effort.wish.as_mut().filter(|w| w.held) {
+            w.held = false;
+            w.at = self.time;
+        }
+        true
+    }
+
+    /// The chat whose picker control, or open menu's effort slider, is under the pointer.
+    fn pick_under_pointer(&self) -> Option<u64> {
+        let w = self.world.world_ref();
+        let (x, y) = (self.pointer.x, self.pointer.y);
+        let over = |e: EntityView<'_>| e.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y));
+        let slider = self.chat.borrow().iter().find_map(|(sid, st)| {
+            let s = st.pick_nav.slider?;
+            over(w.entity_from_id(s)).then_some(*sid)
+        });
+        slider.or_else(|| {
+            self.panes().into_iter().find_map(|p| {
+                let o = model::shows(w, p)?;
+                if model::pane_kind(o) != model::PaneKind::Chat {
+                    return None;
+                }
+                let control = super::composer(View::of(w.entity_from_id(p)))?.part("bar")?.part("pick")?.part("model")?;
+                over(control.entity()).then(|| self.session_of(*o.id())).flatten()
+            })
+        })
+    }
+
+    /// Command-/ (`pick_model`): the focused chat's models, open or closed. Shift-Command-/ (`effort_next`): its effort
+    /// steps to the next its model takes (round to the first); a model with none opens the effort's menu, which says so.
+    pub(in crate::app) fn chat_pick_key(&mut self, op: &str) {
+        let Some((_, _, sid)) = self.focused_chat() else { return };
+        if op == "pick_model" {
+            return self.chat_pick_toggle(sid, Pick::Model);
+        }
+        if self.chat_effort_step(sid, 1, true, false, false).is_none() {
+            self.chat_pick_toggle(sid, Pick::Effort);
+        }
+    }
+
+    /// A key while chat `sid`'s menu is open: up and down move its highlight, Return picks the highlighted row (or closes
+    /// the menu when none is), left and right step the effort. Whether the menu took the key (it is open and the key is
+    /// one of those).
     pub(in crate::app) fn chat_pick_nav(&mut self, sid: u64, op: &str) -> bool {
         let mut states = self.chat.borrow_mut();
         let Some(st) = states.get_mut(&sid).filter(|st| st.pick.is_some()) else { return false };
-        let searching = st.pick != Some(Pick::Effort);
+        let page = st.pick;
+        let searching = page != Some(Pick::Effort);
         let n = &mut st.pick_nav;
         let edit = match op {
             "backspace" => Some(Edit::Erase),
@@ -465,6 +710,11 @@ impl App {
                 n.search.nav.step(op == "down", picks.len(), |i| picks[i].is_some());
                 drop(states);
                 self.poke();
+                true
+            }
+            "left" | "right" if page != Some(Pick::Model) => {
+                drop(states);
+                self.chat_effort_step(sid, if op == "right" { 1 } else { -1 }, false, false, false);
                 true
             }
             "send" | "submit" => {
@@ -496,9 +746,10 @@ impl App {
     }
 }
 
-/// The picker's control: its action, its tooltip, its words and its effort's level (`level`: the effort's place among
-/// how many), in the rest ink eased toward the hot one by its hover spring, a level's unlit bars faint.
-fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usize, usize)>, ink: &ControlInk) {
+/// The picker's control: its action, its tooltip (none: empty), its words, its effort's level (`level`: the effort's
+/// place among how many) and, while the effort moves, its name after the meter (`word`); in the rest ink eased toward
+/// the hot one by its hover spring, a level's unlit bars faint.
+fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usize, usize)>, ink: &ControlInk, word: Option<&str>) {
     v.action(action);
     if v.entity().try_cloned::<&Tooltip>().is_none_or(|t| t.text.as_str() != tip) {
         v.set(Tooltip { text: tip.into() });
@@ -510,6 +761,11 @@ fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usi
     }
     if let Some(m) = v.part("effort") {
         effort_meter(m, level, now, ink.off);
+    }
+    if let Some(slot) = v.part("word") {
+        view::for_each_of(slot, word.map(|w| ("word", "hn.ChatPickWord", w)), |p, w, _| {
+            p.text(w);
+        });
     }
 }
 
@@ -572,27 +828,29 @@ fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
 }
 
 /// The open menu's query and highlight (the pointer's and the arrow keys', harness_native_ui_view::search), what each of
-/// its rows picks (None for a head, a separator or a note) as last drawn (what Return picks), and an error to show at
-/// its top.
+/// its model rows picks (None for a head, a separator or a note) as last drawn (what Return picks), an error to show at
+/// its top, and its effort slider (the node a press drags, and the efforts its stops are).
 #[derive(Default)]
 pub struct PickNav {
     search: search::Search,
     picks: Vec<Option<String>>,
     error: Option<String>,
+    slider: Option<u64>,
+    efforts: Vec<String>,
 }
 
-/// A choice in the picker's menu.
+/// A model in the picker's menu: its name, its version (`meta`), the line about it (`detail`), whether the chat runs it,
+/// and what picking it does.
 struct Choice {
     label: String,
-    about: String,
+    meta: String,
+    detail: String,
     on: bool,
     action: String,
-    /// Its maker's mark (an `hn.Kind` child); empty for an effort.
-    mark: &'static str,
 }
 
 /// What the menu is built from: chat `sid`'s own models (`own`, of agent kind `kind`), every kind's kept lists, the
-/// model it runs (`cur`, named `name`) and its `effort`.
+/// model it runs (`cur`, named `name`) and its `effort` (as shown).
 struct MenuCtx<'a> {
     sid: u64,
     own: &'a [ModelChoice],
@@ -611,66 +869,65 @@ fn kind_title<'a>(titles: &'a BTreeMap<String, String>, kind: &'a str) -> &'a st
     titles.get(kind).map_or(kind, String::as_str)
 }
 
-/// The open menu's rows on its plate (the efforts' `ui.Menu`, else a `ui.SearchMenu`'s `items` under its filter): the
-/// models of every kind under their heads, the chat's own first (`page` Model), the current model's efforts (Effort), or
-/// both (All), filtered by what is typed; what cannot be chosen says why instead. The highlight goes where the pointer
-/// (on `hovered`) or the keys put it (`nav`).
-fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hovered: Option<EntityView<'_>>, nav: &mut PickNav) {
-    let mut rows: Vec<Entry<Choice>> = Vec::with_capacity(c.own.len() + 24); // alloc: the open menu's rows, once a frame
-    if page != Pick::Effort {
-        let others = c.kept.iter().filter(|(k, _)| k.as_str() != c.kind).map(|(k, m)| (k.as_str(), m.as_slice()));
-        for (kind, models) in std::iter::once((c.kind, c.own)).chain(others) {
-            if !rows.is_empty() {
-                rows.push(Entry::Sep);
-            }
-            rows.push(Entry::Head(kind_title(c.titles, kind).to_owned()));
-            if models.is_empty() {
-                rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.titles, kind))));
-                continue;
-            }
-            let own = kind == c.kind;
-            rows.extend(models.iter().map(|m| {
-                let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
-                Entry::Item {
-                    text: format!("{label} {} {} {}", m.id, m.about, kind_title(c.titles, kind)),
-                    data: Choice {
-                        label,
-                        about: m.about.clone(),
-                        on: own && c.cur.is_some_and(|x| x.id == m.id),
-                        action: if own {
-                            format!("chat:set:{}:model:{}", c.sid, m.id)
-                        } else {
-                            format!("chat:spawn:{}:{kind}:{}", c.sid, m.id)
-                        },
-                        mark: maker(Some(m), "", kind),
-                    },
-                }
-            }));
+/// The longest version that rides after a model's name; a longer head of its line goes into the line about it instead.
+const META_MAX: usize = 12;
+
+/// A model's line about it (`about`, "Opus 5.5 · Best for everyday, complex tasks") as its version after its `name`
+/// ("5.5") and the rest ("Best for everyday, complex tasks"); a line with no head is all rest.
+fn split_about(name: &str, about: &str) -> (String, String) {
+    let Some((head, rest)) = about.split_once(" \u{b7} ") else { return (String::new(), about.trim().to_owned()) };
+    let meta = head.strip_prefix(name).map(str::trim).filter(|m| !m.is_empty()).unwrap_or(head.trim());
+    if meta.chars().count() > META_MAX || meta == name {
+        return (String::new(), if meta == name { rest.trim().to_owned() } else { about.trim().to_owned() });
+    }
+    (meta.to_owned(), rest.trim().to_owned())
+}
+
+/// The menu's models (hn.ChatPickModels `list`): every kind's under its head led by its maker's mark, the chat's own
+/// first, filtered by what is typed; what cannot be chosen says why instead. The highlight goes where the pointer (on
+/// `hovered`) or the keys put it (`nav`); the line about the highlighted model (else the chat's own) shows under them.
+fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<EntityView<'_>>, nav: &mut PickNav) {
+    let mut rows: Vec<Entry<Choice>> = Vec::with_capacity(c.own.len() + 16); // alloc: the open menu's rows, once a frame
+    let mut marks: BTreeMap<String, &'static str> = BTreeMap::new(); // alloc: a mark per head, once a frame
+    let others = c.kept.iter().filter(|(k, _)| k.as_str() != c.kind).map(|(k, m)| (k.as_str(), m.as_slice()));
+    let mut own_detail = String::new();
+    for (kind, models) in std::iter::once((c.kind, c.own)).chain(others) {
+        if !rows.is_empty() {
+            rows.push(Entry::Sep);
         }
-    }
-    if page == Pick::All {
-        rows.push(Entry::Sep);
-        rows.push(Entry::Head("Effort".to_owned()));
-    }
-    if page != Pick::Model {
-        match c.cur {
-            Some(m) if !m.efforts.is_empty() => rows.extend(m.efforts.iter().map(|e| Entry::Item {
-                text: format!("{} effort", effort_word(e)),
+        let title = kind_title(c.titles, kind);
+        marks.insert(title.to_owned(), maker(None, "", kind));
+        rows.push(Entry::Head(title.to_owned()));
+        if models.is_empty() {
+            rows.push(Entry::Note(format!("Model list arrives when a {title} chat starts.")));
+            continue;
+        }
+        let own = kind == c.kind;
+        rows.extend(models.iter().map(|m| {
+            let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
+            let (meta, about) = split_about(&label, &m.about);
+            let on = own && c.cur.is_some_and(|x| x.id == m.id);
+            let detail = if own { about } else { format!("Starts a new {title} chat. {about}").trim_end().to_owned() };
+            if on {
+                own_detail.clone_from(&detail);
+            }
+            Entry::Item {
+                text: format!("{label} {} {} {title}", m.id, m.about),
                 data: Choice {
-                    label: effort_word(e),
-                    about: String::new(),
-                    on: e == c.effort,
-                    action: format!("chat:set:{}:effort:{e}", c.sid),
-                    mark: "",
+                    label,
+                    meta,
+                    detail,
+                    on,
+                    action: if own {
+                        format!("chat:set:{}:model:{}", c.sid, m.id)
+                    } else {
+                        format!("chat:spawn:{}:{kind}:{}", c.sid, m.id)
+                    },
                 },
-            })),
-            Some(_) => rows.push(Entry::Note(format!("{} has no effort levels.", c.name))),
-            None if c.own.is_empty() => rows.push(Entry::Note(format!("Model list arrives when a {} chat starts.", kind_title(c.titles, c.kind)))),
-            None => rows.push(Entry::Note(format!("{} is not in the model list, so its efforts are unknown.", c.name))),
-        }
+            }
+        }));
     }
-    let searching = page != Pick::Effort;
-    let rows = if searching { search::filter(&nav.search.query, rows) } else { rows };
+    let rows = search::filter(&nav.search.query, rows);
     // An error leads (cmd+N's remembered model no longer offered), until something is typed.
     let rows: Vec<Entry<Choice>> = match nav.error.as_ref().filter(|_| nav.search.query.is_empty()) {
         Some(e) => std::iter::once(Entry::Note(e.clone())).chain(rows).collect(),
@@ -683,12 +940,8 @@ fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hove
     }));
     let picks = &nav.picks;
     nav.search.first(picks.len(), |i| picks[i].is_some());
-    let items = if searching {
-        search::show(plate, &nav.search.query, "Search models");
-        plate.part("items").unwrap_or(plate)
-    } else {
-        plate
-    };
+    search::show(list, &nav.search.query, "Search models");
+    let Some(items) = list.part("items") else { return };
     // The row the pointer is on (one of the items' children, or inside one), if it can be chosen.
     let items_id = items.id();
     let under = hovered
@@ -699,18 +952,25 @@ fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hove
     let hot = nav.search.nav.hot;
     let keyed = rows.iter().enumerate().map(|(i, r)| {
         let prefab = match r {
+            Entry::Head(s) if marks.get(s).is_some_and(|m| *m != "other") => "ui.MenuHeadMarked",
             Entry::Head(_) => "ui.MenuHead",
             Entry::Sep => "ui.MenuSep",
-            Entry::Item { data: Choice { on: true, mark: "", .. }, .. } => "ui.MenuItemOn",
-            Entry::Item { data: Choice { mark: "", .. }, .. } => "ui.MenuItem",
-            Entry::Item { data: Choice { on: true, .. }, .. } => "ui.MenuItemMarkedOn",
-            Entry::Item { .. } => "ui.MenuItemMarked",
+            Entry::Item { data: Choice { on: true, .. }, .. } => "ui.MenuItemOn",
+            Entry::Item { .. } => "ui.MenuItem",
             Entry::Note(_) => "ui.MenuNote",
         };
         (format!("r{i}"), prefab, (i, r))
     });
     view::for_each_of(items, keyed, |v, (i, r), _| match r {
-        Entry::Head(s) | Entry::Note(s) => {
+        Entry::Head(s) => {
+            if let Some(l) = v.part("label") {
+                l.text(s);
+            }
+            if let (Some(icon), Some(m)) = (v.part("icon"), marks.get(s)) {
+                crate::look::kind_mark(w, icon.entity(), m);
+            }
+        }
+        Entry::Note(s) => {
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
@@ -721,22 +981,75 @@ fn menu_rows(w: WorldRef<'_>, plate: View<'_>, c: &MenuCtx<'_>, page: Pick, hove
             if let Some(l) = v.part("label") {
                 l.text(&c.label);
             }
-            if let Some(a) = v.part("about") {
-                a.text(&c.about);
-            }
-            if !c.mark.is_empty()
-                && let Some(icon) = v.part("lead").and_then(|l| l.part("icon"))
-            {
-                crate::look::kind_mark(w, icon.entity(), c.mark);
+            if let Some(m) = v.part("meta") {
+                m.text(&c.meta);
             }
         }
         Entry::Sep => {}
     });
+    // The line about the highlighted model, else the chat's own, whole under the list.
+    let detail = match hot.and_then(|i| rows.get(i)) {
+        Some(Entry::Item { data, .. }) => data.detail.as_str(),
+        _ => own_detail.as_str(),
+    };
+    if let Some(slot) = list.part("detail") {
+        view::for_each_of(slot, (!detail.is_empty()).then_some(("about", "hn.ChatPickDetail", ())), |v, (), _| {
+            if let Some(p) = v.part("words") {
+                p.text(detail);
+            }
+        });
+    }
+}
+
+/// The menu's effort (its `effort` slot): unless it opened on the models alone, a hairline under the models (when they
+/// show) and the level slider on the model's efforts (hn.ChatPickEffort), or a note saying why there is none.
+fn effort_section(slot: View<'_>, c: &MenuCtx<'_>, page: Pick, nav: &mut PickNav) {
+    let efforts: &[String] = c.cur.map_or(&[], |m| m.efforts.as_slice());
+    let note = match c.cur {
+        _ if page == Pick::Model => None,
+        Some(_) if !efforts.is_empty() => None,
+        Some(_) => Some(format!("{} has no effort levels.", c.name)),
+        None if c.own.is_empty() => Some(format!("Model list arrives when a {} chat starts.", kind_title(c.titles, c.kind))),
+        None => Some(format!("{} is not in the model list, so its efforts are unknown.", c.name)),
+    };
+    let slider = page != Pick::Model && note.is_none();
+    let rows = [
+        (page == Pick::All).then_some(("sep", "ui.MenuSep")),
+        slider.then_some(("level", "hn.ChatPickEffort")),
+        note.is_some().then_some(("note", "ui.MenuNote")),
+    ];
+    view::for_each_of(slot, rows.into_iter().flatten().map(|(k, p)| (k, p, ())), |_, (), _| {});
+    if let (Some(n), Some(v)) = (note.as_deref(), slot.part("note").and_then(|v| v.part("label"))) {
+        v.text(n);
+    }
+    let s = slot.part("level").and_then(|l| l.part("slider"));
+    nav.slider = s.map(View::id);
+    nav.efforts.clear();
+    nav.efforts.extend(efforts.iter().cloned());
+    let Some(s) = s else { return };
+    // An effort the model does not list sits on its default, else the first.
+    let at = efforts
+        .iter()
+        .position(|e| e == c.effort)
+        .or_else(|| c.cur.and_then(|m| m.effort.as_ref()).and_then(|d| efforts.iter().position(|e| e == d)))
+        .unwrap_or(0);
+    let value = if c.effort.is_empty() { effort_word(&efforts[at]) } else { effort_word(c.effort) };
+    level::show(s, at, efforts.len(), level::Words { label: "Effort", value: &value, lo: FASTER, hi: SMARTER });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_line_splits_into_its_version_and_the_rest() {
+        let s = |n: &str, a: &str| split_about(n, a);
+        assert_eq!(s("Opus", "Opus 5.5 \u{b7} Best for everyday, complex tasks"), ("5.5".into(), "Best for everyday, complex tasks".into()));
+        assert_eq!(s("Opus", "Best for everyday tasks"), (String::new(), "Best for everyday tasks".into()));
+        assert_eq!(s("gpt-6.1", "A frontier agentic coding model for long work \u{b7} reasoning"), (String::new(), "A frontier agentic coding model for long work \u{b7} reasoning".into()));
+        assert_eq!(s("Sonnet", "Sonnet \u{b7} Fast"), (String::new(), "Fast".into()));
+    }
+
     use harness_proto::event::{Body, Event};
 
     fn kept() -> BTreeMap<String, Vec<ModelChoice>> {

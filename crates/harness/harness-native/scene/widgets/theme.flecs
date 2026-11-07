@@ -104,6 +104,11 @@ hn {
       SideDrag: {min: $side_min, max: $side_max, latch: $side_latch, give: $side_give, soft: $side_soft, rearm: $side_rearm, grab: $side_grab, reach: $side_reach, keep: $side_keep}
     }
     window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
+    // The chat's effort under a sideways swipe over its control (src/app/chat/pick.rs): the travel a stop takes, when the
+    // effort is sent after the last step, and how long the control says it in words after.
+    chat_pick {
+      PickFeel: {step: $chat_pick_swipe_step, commit: $chat_pick_commit_secs, word: $chat_pick_word_secs}
+    }
     // A tree row folding in or away: its height on the spring, its words in once there is room (src/app/fold.rs).
     tree_fold {
       Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta}

@@ -228,6 +228,9 @@ pub struct App {
     side_w: Option<f32>,
     /// Dragging the sidebar's edge, the window's rubber band past its widest, and their pulses (src/app/side_drag.rs).
     drag: side_drag::SideDrag,
+    /// The chat a sideways swipe over its picker began on (chat/pick.rs): the rest of the swipe is its, wherever the
+    /// pointer goes.
+    swiping: Option<u64>,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
     link: Link,
@@ -529,6 +532,7 @@ impl App {
             pending_run: None,
             side_w,
             drag: side_drag::SideDrag::default(),
+            swiping: None,
             link,
             grid,
             zoom: 4,

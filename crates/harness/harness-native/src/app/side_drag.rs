@@ -173,6 +173,11 @@ impl App {
         self.drag.moved = dx;
     }
 
+    /// Ask for a trackpad pulse (window.rs plays it after the event that asked, or the next).
+    pub(in crate::app) fn pulse(&mut self, h: Haptic) {
+        self.drag.haptics.push(h);
+    }
+
     /// The trackpad pulses asked for since the last call (window.rs plays them).
     pub fn take_haptics(&mut self) -> Vec<Haptic> {
         std::mem::take(&mut self.drag.haptics)

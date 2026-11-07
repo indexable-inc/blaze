@@ -1,0 +1,87 @@
+// A level slider: a few named stops along a groove (an effort's Low to Max, a quality's Draft to Best), a knob resting
+// on one, the groove filled up to it, a dot at each stop the fill has not reached. A press anywhere on it puts the knob
+// on the nearest stop and a drag carries it from stop to stop; the arrows step it; a sideways two-finger swipe over it
+// steps it a stop per detent (harness_native_ui_view::level: the stop under the pointer, the detents, how it shows).
+// Its owner keeps the stops (`track.ticks`, ui.LevelTick each) and the knob's place (the Grow weights of `track.fill`
+// and `track.rest`, which ease on the level spring so the knob glides), and says what it sets and the stop's name in
+// `head` and what the ends mean in `scale` (tokens level_*).
+
+@tree ChildOf
+ui {
+  prefab LevelTick : ui.Node {
+    Fill: $tone_level_tick
+    Shape: {radius: $level_tick / 2, n: 2, border: 0, feather: 0}
+    Size: {w: {kind: Fixed, value: $level_tick, min: 0, max: 0}, h: {kind: Fixed, value: $level_tick, min: 0, max: 0}}
+  }
+  prefab LevelSlider : ui.Column {
+    Pressable
+    Cursor: {shape: Arrow}
+    Flex: {axis: Column, gap: $level_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    // What it sets, then the stop's name, at the far end.
+    head : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $level_head_h, min: 0, max: 0}}
+      label : ui.Line, Muted {
+        TextStyle: {size: $size_level_head, line: $level_head_h, role: 0, bold: 0}
+      }
+      gap : ui.Spacer {}
+      value : ui.Line, Strong {
+        FixedSize: {h: true, v: false}
+        TextStyle: {size: $size_level_head, line: $level_head_h, role: 0, bold: 0, weight: 500}
+      }
+    }
+    // The groove and the stops behind (Background, laid to the track), the fill, the knob and the rest along it.
+    track : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $level_knob, min: 0, max: 0}}
+      groove : ui.Column {
+        Background
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Center, wrap: false}
+        bar : ui.Node {
+          Fill: $tone_level_groove
+          Shape: {radius: $level_groove_radius, n: 2, border: 0, feather: 0}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $level_groove_h, min: 0, max: 0}}
+        }
+      }
+      // A stop's dot under the knob's middle when it rests there: the row inset half a knob less half a dot each side.
+      ticks : ui.Row {
+        Background
+        Flex: {axis: Row, gap: 0, align: Center, justify: SpaceBetween, wrap: false}
+        Padding: {l: ($level_knob - $level_tick) / 2, r: ($level_knob - $level_tick) / 2, t: 0, b: 0}
+      }
+      fill : ui.Node {
+        Animate
+        Motion: {omega: $level_omega, zeta: $level_zeta}
+        Fill: $tone_level_fill
+        Shape: {radius: $level_groove_radius, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Grow, value: 0.0001, min: 0, max: 0}, h: {kind: Fixed, value: $level_groove_h, min: 0, max: 0}}
+      }
+      knob : ui.Node {
+        Fill: $tone_level_knob
+        Edge: {dark: $tone_level_knob_edge.dark, light: $tone_level_knob_edge.light}
+        Shape: {radius: $level_knob / 2, n: 2, border: 1, feather: 0}
+        Lift: {blur: 3, alpha: 0.22, dy: 1}
+        Size: {w: {kind: Fixed, value: $level_knob, min: 0, max: 0}, h: {kind: Fixed, value: $level_knob, min: 0, max: 0}}
+      }
+      rest : ui.Node {
+        Animate
+        Motion: {omega: $level_omega, zeta: $level_zeta}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
+    }
+    // What the ends mean (Faster, Smarter), quiet, under them.
+    scale : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: SpaceBetween, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      lo : ui.Line {
+        Fill: $tone_level_scale
+        TextStyle: {size: $size_level_scale, line: $line_level_scale, role: 0, bold: 0}
+      }
+      hi : ui.Line {
+        Fill: $tone_level_scale
+        TextStyle: {size: $size_level_scale, line: $line_level_scale, role: 0, bold: 0}
+      }
+    }
+  }
+}

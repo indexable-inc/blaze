@@ -128,6 +128,11 @@ hn {
       TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
     }
     effort : hn.ChatEffort {}
+    // While the effort moves (a swipe, a drag, a key), its name after the meter (hn.ChatPickWord), until a moment after.
+    word : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
     chevron : ui.Symbol {
       Icon: {glyph: ""}
       Fill: $tone_ink_faint
@@ -141,9 +146,61 @@ hn {
     hot { Fill: $tone_ink }
     off { Fill: $tone_ink_faint }
   }
-  // Its menu is a ui.SearchMenu (search_menu.flecs) above it: each agent kind's models under its head with its maker's
-  // mark, then the efforts under theirs, the current rows ticked, a model's line about it muted at the end; where nothing
-  // can be chosen, a ui.MenuNote says why. Shift-Command-/ with no effort to step to opens the efforts alone (a ui.Menu).
+  prefab ChatPickWord : ui.Line {
+    Fill: $tone_ink_muted
+    Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
+    TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
+  }
+  // Its menu (pick.rs), a ui.Menu above it chat_pick_menu_w wide: the models (hn.ChatPickModels, unless it opened on the
+  // effort alone), then the effort (hn.ChatPickEffort, unless it opened on the models alone), a hairline between.
+  prefab ChatPickMenu : ui.Menu {
+    Size: {w: {kind: Fixed, value: $chat_pick_menu_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    models : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    effort : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  // The models, searchable (search_menu.flecs's filter over `items`): each agent kind's under its head led by its maker's
+  // mark (ui.MenuHeadMarked), a row each with its name and its version quiet after it (ui.MenuItem's `meta`), the one
+  // the chat runs ticked; where nothing can be chosen a ui.MenuNote says why. Under them, the line about the row the
+  // pointer or the keys are on (else the chat's own model), whole, wrapping (hn.ChatPickDetail): never cut mid-word.
+  prefab ChatPickModels : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    filter : ui.MenuFilter {}
+    rule : ui.MenuSep {}
+    items : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    detail : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab ChatPickDetail : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: $chat_pick_detail_t, b: $chat_pick_detail_b}
+    words : ui.Words {
+      Fill: $tone_ink_muted
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_chat_pick_detail, line: $line_chat_pick_detail, role: 0, bold: 0}
+    }
+  }
+  // The effort as a level slider (ui.LevelSlider): its stops the model's efforts, Faster to Smarter. A press or a drag
+  // sets it, the arrows step it, a sideways swipe steps it a detent at a time; the menu stays open. A model with no
+  // efforts, or one not in the list, says so in a ui.MenuNote instead.
+  prefab ChatPickEffort : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_gutter_l, t: $chat_pick_level_t, b: $chat_pick_level_b}
+    slider : ui.LevelSlider {}
+  }
 
   // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
   // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
