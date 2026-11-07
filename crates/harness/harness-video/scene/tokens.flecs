@@ -31,6 +31,9 @@ export const bubble_max_w = 480
 export const icon_press_scale = 0.92
 export const size_caption = 11
 export const size_body = 13
+// Chrome: the words on controls around content (a composer's model picker), a step under the body (harness-native's).
+export const size_chrome = 11.5
+export const line_chrome = 14
 export const size_code = 11.5
 export const table_row = 24
 export const table_gap = 14
