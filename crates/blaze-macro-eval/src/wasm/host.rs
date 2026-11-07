@@ -1,5 +1,6 @@
-//! One expansion in a fresh instance of a macro's module: its input written to the module's
-//! memory, its macro run, and each request its `proc_macro` client makes answered by
+//! A session's expansions in one fresh instance of a macro's module: each input is written to
+//! the module's memory, each macro runs in order, and each request its `proc_macro` client makes
+//! answered by
 //! [`Server::dispatch`] through the bridge's shims ([`abi::BRIDGE_SHIMS`]); the WASI calls of
 //! its std by `blaze_wasi` over the sandbox's [`wasi`].
 //!
@@ -14,7 +15,7 @@
 use std::ptr::NonNull;
 
 use wasmtime::{
-    Caller, Engine, InstancePre, Linker, Memory, ResourceLimiter, Store, Trap, TypedFunc,
+    Caller, Engine, Instance, InstancePre, Linker, Memory, ResourceLimiter, Store, Trap, TypedFunc,
 };
 
 use super::{
@@ -275,14 +276,12 @@ pub(crate) struct Used {
     pub(crate) over: Option<Over>,
 }
 
-/// Runs macro `index` of the module `pre` instantiates on `input` (what [`Server::input`]
-/// wrote), its requests answered from `cx`: what it gave, or why it stopped. On an expansion
-/// thread only ([`super::thread::run`]).
+/// Runs the calls in one fresh module instance, preserving heap state across replayed calls.
+/// On an expansion thread only ([`super::thread::run`]).
 pub(crate) fn expand(
     pre: &InstancePre<Host>,
     cx: &mut Cx<'_>,
-    index: u32,
-    input: &[u8],
+    calls: Vec<(Server, u32, Vec<u8>)>,
     watch: &mut Watch,
 ) -> (Result<Result<Stream, String>, Stop>, Used) {
     // The pointer is valid until the store drops at this function's end (`with`'s SAFETY).
@@ -290,48 +289,88 @@ pub(crate) fn expand(
     let host = Host { cx: Some(pointer), memory: None, limits: Limits::default(), requests: 0 };
     let mut store = Store::new(pre.module().engine(), host);
     store.limiter(|host| &mut host.limits);
-    let ran = run(&mut store, pre, index, input, watch);
-    let watched = match store.data().memory {
-        Some(memory) if watch.started => {
-            watch.memory_len = memory.data_size(&store);
-            read(&store, memory, &watch.statics, &mut watch.after)
+    if let Err(error) = store.set_fuel(FUEL) {
+        return (
+            Err(Stop(format!("could not set its wasm fuel: {error:#}"))),
+            Used { fuel: 0, peak_bytes: 0, over: None },
+        );
+    }
+    let mut ran = Err(Stop("was given nothing to expand".to_owned()));
+    let mut fuel = 0u64;
+    let mut over = None;
+    let setup = (|| -> wasmtime::Result<(Instance, Memory)> {
+        let instantiating = tracing::info_span!(target: "blaze", "macro instantiate").entered();
+        let instance = pre.instantiate(&mut store)?;
+        let Some(memory) = instance.get_memory(&mut store, abi::MEMORY) else {
+            return Err(wasmtime::Error::msg("the module has no memory export"));
+        };
+        store.data_mut().memory = Some(memory);
+        let init: TypedFunc<(), ()> = instance.get_typed_func(&mut store, abi::INITIALIZE)?;
+        init.call(&mut store, ())?;
+        drop(instantiating);
+        for (at, bytes) in &watch.writes {
+            memory.write(&mut store, *at as usize, bytes)?;
         }
-        _ => Ok(()),
-    };
-    // The engine counts fuel (`engine.rs`), so the store always says what is left.
-    let left = store.get_fuel();
+        read(&store, memory, &watch.statics, &mut watch.before)?;
+        watch.started = true;
+        Ok((instance, memory))
+    })();
+    match setup {
+        Err(error) => ran = Err(Stop(format!("could not initialize its wasm module: {error:#}"))),
+        Ok((instance, memory)) => {
+            for (server, index, input) in calls {
+                cx.server = server;
+                cx.output = None;
+                cx.stop = None;
+                cx.reply.clear();
+                store.data_mut().requests = 0;
+                store.data_mut().limits.over = false;
+                if let Err(error) = store.set_fuel(FUEL) {
+                    ran = Err(Stop(format!("could not set its wasm fuel: {error:#}")));
+                    break;
+                }
+                let called = run(&mut store, &instance, index, &input);
+                let remaining = store.get_fuel().unwrap_or(0);
+                fuel = fuel.saturating_add(FUEL.saturating_sub(remaining));
+                let result = match called {
+                    Ok(()) => match cx.output.take() {
+                        Some(bytes) => cx.server.output(&bytes),
+                        None => Err(Stop("returned without giving an output".to_owned())),
+                    },
+                    Err(error) => {
+                        let trap = error.downcast_ref::<Trap>().copied();
+                        let call_over = match (trap, store.data().limits.over) {
+                            (Some(Trap::OutOfFuel), _) => Some(Over::Steps),
+                            (_, true) => Some(Over::Memory),
+                            _ => None,
+                        };
+                        let result = stopped_by(cx, &error, trap, call_over);
+                        if result.is_err() {
+                            over = call_over;
+                        }
+                        result
+                    }
+                };
+                match result {
+                    Ok(output) => ran = Ok(output),
+                    Err(stop) => {
+                        ran = Err(stop);
+                        break;
+                    }
+                }
+            }
+            watch.memory_len = memory.data_size(&store);
+            if let Err(error) = read(&store, memory, &watch.statics, &mut watch.after) {
+                ran = Err(Stop(format!("left its state where it can't be read: {error:#}")));
+            }
+        }
+    }
     let limits = &store.data().limits;
     let mut spent = Used { fuel: 0, peak_bytes: limits.peak as u64, over: None };
-    let over_memory = limits.over;
+    spent.fuel = fuel;
+    spent.over = over.or_else(|| limits.over.then_some(Over::Memory));
     drop(store);
-    let left = match left {
-        Ok(left) => left,
-        // alloc: error path
-        Err(e) => {
-            return (Err(Stop(format!("ran on an engine that counts no fuel: {e:#}"))), spent);
-        }
-    };
-    spent.fuel = FUEL.saturating_sub(left);
-    if let Err(error) = watched {
-        // alloc: error path
-        return (Err(Stop(format!("left its state where it can't be read: {error:#}"))), spent);
-    }
-    let result = match ran {
-        Ok(()) => match cx.output.take() {
-            Some(bytes) => cx.server.output(&bytes),
-            None => Err(Stop("returned without giving an output".to_owned())), // alloc: error path
-        },
-        Err(error) => {
-            let trap = error.downcast_ref::<Trap>().copied();
-            spent.over = match (trap, over_memory) {
-                (Some(Trap::OutOfFuel), _) => Some(Over::Steps),
-                (_, true) => Some(Over::Memory),
-                _ => None,
-            };
-            stopped_by(cx, &error, trap, spent.over)
-        }
-    };
-    (result, spent)
+    (ran, spent)
 }
 
 /// What an instance that ended in `error` gave: the stop a shim kept, the panic its hook gave
@@ -413,30 +452,13 @@ fn read(
 /// The instance's part of [`expand`].
 fn run(
     store: &mut Store<Host>,
-    pre: &InstancePre<Host>,
+    instance: &Instance,
     index: u32,
     input: &[u8],
-    watch: &mut Watch,
 ) -> wasmtime::Result<()> {
-    store.set_fuel(FUEL)?;
-    let instantiating = tracing::info_span!(target: "blaze", "macro instantiate").entered();
-    let instance = pre.instantiate(&mut *store)?;
-    let Some(memory) = instance.get_memory(&mut *store, abi::MEMORY) else {
-        return Err(wasmtime::Error::msg("the module has no memory export"));
-    };
-    store.data_mut().memory = Some(memory);
-    // Required (`abi::EXPORTS`, checked before instantiating): a reactor's constructors and
-    // wasi-libc's start-up run there, and skipping them would expand with them unrun.
-    let init: TypedFunc<(), ()> = instance.get_typed_func(&mut *store, abi::INITIALIZE)?;
-    init.call(&mut *store, ())?;
-    drop(instantiating);
-    // The state the calls before it left, over what `_initialize` made: then what the macro
-    // changes of it.
-    for (at, bytes) in &watch.writes {
-        memory.write(&mut *store, *at as usize, bytes)?;
-    }
-    read(store, memory, &watch.statics, &mut watch.before)?;
-    watch.started = true;
+    let memory = instance
+        .get_memory(&mut *store, abi::MEMORY)
+        .ok_or_else(|| wasmtime::Error::msg("the module has no memory export"))?;
     let alloc: TypedFunc<u32, u32> = instance.get_typed_func(&mut *store, abi::ALLOC)?;
     let expand: TypedFunc<(u32, u32, u32), u32> =
         instance.get_typed_func(&mut *store, abi::EXPAND)?;

@@ -885,27 +885,27 @@ whole environment on its first call, and asks the host one variable at a time (t
 `env_var`). So `env::var` keys an expansion by the variables it read, and a per-run variable it
 never reads (`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all.
 
-Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and a
-memory budget. The instance runs on a kept expansion thread, never on a fiber, because a
-Wasmtime activation lives in its thread's locals and a fiber moves threads when it waits
-(`src/wasm/thread.rs`). The job waits on an event, holding no thread, and answers what the
-macro asks the database of a span outside any wasm call. Each expansion opens a `proc macro
-expansion` span naming the macro and the input item. A module's machine code is compiled once a
-process and kept in the store under the module's id and Wasmtime's version and settings
+Each session run uses one fresh instance under a fuel budget per call and a memory budget
+(`src/wasm/host.rs`, `FUEL`). Earlier calls replay in order in that instance, so heap addresses
+held in statics remain valid. The instance runs on a kept expansion thread, never on a fiber,
+because a Wasmtime activation lives in its thread's locals and a fiber moves threads when it
+waits (`src/wasm/thread.rs`). The job waits on an event, holding no thread, and answers what
+the macro asks the database of a span outside any wasm call. Each expansion opens a `proc
+macro expansion` span naming the macro and the input item. A module's machine code is compiled
+once a process and kept in the store under the module's id and Wasmtime's version and settings
 (`src/wasm/code.rs`), so the next process loads it without compiling. A module that can't be
 compiled, loaded or run is an error naming the macro, and nothing then runs it another way. On
 wasm32 a `#[thread_local]` static is plain data (no TLS without atomics), a panic's `Location`
 is four 32-bit words, and a direct call of an undefined weak function traps as wasm-ld's stub
 does.
 
-A macro's state carries from one call to the next as it does under
-rustc: the link lists each static of the macro's crates its code can write in the module's
-`blaze.statics` section, and the host writes what the calls before left into each fresh
-instance before the macro runs, then reads back what it changed (`src/wasm/statics.rs`). A
-module without that section is refused at load. A static left holding an address of the heap
-stops the expansion with an error naming the static, since a fresh instance has no such heap.
-A call is kept and found under the state it started from, and only when it left that state as
-it was.
+A macro's state carries from one call to the next as it does under rustc: the link lists each
+static of the macro's crates its code can write in the module's `blaze.statics` section, and
+the host reads the bytes changed during the session (`src/wasm/statics.rs`). A module without
+that section is refused at load. A prior call that read the clock or randomness cannot be
+replayed exactly, so a heap-backed session containing such a call stops with an error instead
+of silently changing its result. A call is kept and found under the state it started from, and
+only when it left that state as it was.
 
 Each expansion is kept in the store (`crates/proc-macro-api/src/kept.rs`) by the macro's
 library, its name, input and attribute tokens, the crate's variables, its directory and the
