@@ -200,6 +200,10 @@ application picks the runtime. `GlobalAlloc` works the same way.
 
 ## Targets
 
+[shaders.md](shaders.md) (2026-11-06) changes the Metal, Vulkan and WebGPU rows: they go MIR, naga IR,
+naga's writers, for kernels too, and SPIRV-Cross leaves the plan, because blaze's LLVM backend
+starts from Cranelift IR after ABI lowering, which logical SPIR-V can't express. CUDA is unchanged.
+
 | Target | Path | Notes |
 |---|---|---|
 | CUDA | MIR, LLVM IR, NVPTX, PTX | Pointers, warp ops and tensor cores all available. |
