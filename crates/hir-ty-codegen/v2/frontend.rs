@@ -34,7 +34,9 @@ use hir_ty_mir::mir::MirOptions;
 use hir_ty_mir::mir::devirt::DevirtWorld;
 use hir_ty_mir::mir::dispatch;
 use hir_ty_share::Unshared;
-use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
+use rustc_type_ir::inherent::{
+    BoundExistentialPredicates as _, GenericArgs as _, IntoKind, Ty as _,
+};
 use smallvec::{SmallVec, smallvec};
 use std::alloc::Global;
 
@@ -1732,14 +1734,35 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
         InstanceDef::VtableShim(func) => shim(2, Some(func)),
         InstanceDef::FnPointerShim => shim(3, None),
         InstanceDef::ReifyShim { receiver } => {
-            let adapted = match instance.args.as_ref().type_at(0).kind() {
+            let fn_item = instance.args.as_ref().type_at(0);
+            let mut signature = None;
+            let adapted = match fn_item.kind() {
                 TyKind::FnDef(def, _) => match def.0 {
-                    CallableDefId::FunctionId(func) => Some(func),
+                    CallableDefId::FunctionId(func)
+                        if FunctionSignature::of(db, func).has_body() =>
+                    {
+                        Some(func)
+                    }
+                    // A trait method without a body (one whose impl is the compiler's,
+                    // `Clone::clone` of a tuple) has no code of its own: the shim holds its
+                    // signature, which the shim's ABI is made of, and runs what the instance's
+                    // arguments (the fn item's type names `Self`) and its callees say.
+                    CallableDefId::FunctionId(_) => {
+                        let interner = DbInterner::new_no_crate(db);
+                        let sig = Ty::new_fn_ptr(interner, fn_item.fn_sig(interner));
+                        signature = Some(hashes.ty(db, sig)?);
+                        None
+                    }
                     CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => None,
                 },
                 _ => None,
             };
-            shim(if receiver { 5 } else { 4 }, adapted)
+            let code = shim(if receiver { 5 } else { 4 }, adapted)?;
+            let Some(signature) = signature else { return Ok(code) };
+            let mut hasher = Hasher::new(SHIM_DOMAIN);
+            hasher.id(&code.0);
+            hasher.id(&signature);
+            Ok(CodeHash(hasher.finish()))
         }
     }
 }
