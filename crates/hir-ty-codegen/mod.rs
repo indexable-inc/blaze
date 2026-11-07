@@ -483,7 +483,7 @@ impl OverflowOp {
     /// The check an `Assert` of `msg` makes, when it is an arithmetic one: `Err` with the
     /// operator of an overflow check core has no panic for. The one map of them, which the IR
     /// builder compiles and the reference walk (`v2::refs`) lists.
-    pub(crate) fn of(msg: &AssertKind) -> Option<Result<Self, BinOp>> {
+    pub(crate) fn of(msg: &AssertKind) -> Option<std::result::Result<Self, BinOp>> {
         Some(Ok(match msg {
             AssertKind::Overflow(BinOp::Add, ..) => OverflowOp::Add,
             AssertKind::Overflow(BinOp::Sub, ..) => OverflowOp::Sub,
