@@ -157,17 +157,18 @@ fn pod(di: &DeriveInput) -> syn::Result<T2> {
     if !di.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(&di.generics, format!("#[derive(gpu::Pod)] {name}: not generic")));
     }
-    let repr_c = di.attrs.iter().any(|a| {
-        a.path().is_ident("repr")
-            && a.parse_nested_meta(|m| {
-                if m.path.is_ident("C") || m.path.is_ident("transparent") {
-                    Err(m.error("found"))
-                } else {
-                    Ok(())
-                }
-            })
-            .is_err()
-    });
+    let mut repr_c = false;
+    for a in di.attrs.iter().filter(|a| a.path().is_ident("repr")) {
+        a.parse_nested_meta(|m| {
+            repr_c |= m.path.is_ident("C") || m.path.is_ident("transparent");
+            // `align(16)` and the like: step over the argument.
+            if m.input.peek(syn::token::Paren) {
+                let _arg;
+                syn::parenthesized!(_arg in m.input);
+            }
+            Ok(())
+        })?;
+    }
     if !repr_c {
         return Err(syn::Error::new_spanned(
             name,
