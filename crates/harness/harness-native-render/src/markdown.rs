@@ -98,6 +98,9 @@ impl Inline {
 pub const REF_ICON_EM: f32 = 1.3;
 /// Its icon's size, in ems of the words.
 pub const REF_ICON_SIZE_EM: f32 = 0.9;
+/// A file chip's drawing's box, in ems of the words, centred where the icon goes: IntelliJ's icons keep a unit of their
+/// 16 clear round their ink, so their box is a little larger than a glyph's for the ink to read at the glyph's size.
+pub const REF_DRAWING_EM: f32 = 1.05;
 /// The mark's hole after a label (a pull request's CI check): the room before it and the mark ([`MARK_SIZE_EM`]).
 pub const MARK_EM: f32 = 1.05;
 /// The mark's size, in ems of the words.

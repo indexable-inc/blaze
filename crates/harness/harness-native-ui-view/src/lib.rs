@@ -22,7 +22,7 @@ use harness_native_ui_input_api::Action;
 use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay, ScrollerPart};
 use harness_native_ui_motion_api::{Leaving, Transition};
 use harness_native_ui_node_api::{Clip, Node, Placed};
-use harness_native_ui_text_api::{Icon, Text};
+use harness_native_ui_text_api::{Drawing, Icon, Text};
 
 /// A node of a view tree, by entity.
 #[derive(Clone, Copy)]
@@ -83,10 +83,25 @@ impl<'a> View<'a> {
         self
     }
 
-    /// Its glyph from den's icon set (a `ui.Symbol`); written only when it changes.
+    /// Its glyph from den's icon set (a `ui.Symbol`), any `Drawing` it showed before gone; written only when it changes.
     pub fn icon(self, glyph: &str) -> Self {
+        if self.0.has(Drawing::id()) {
+            self.0.remove(Drawing::id());
+        }
         if self.0.try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != glyph) {
             self.0.set(Icon { glyph: glyph.into() });
+        }
+        self
+    }
+
+    /// Its multi-colour drawing by name (a file kind's icon, harness-native-ui-inline's files.rs), in an icon's place:
+    /// any `Icon` glyph it showed before gone, so a `ui.Symbol` part can show either. Written only when it changes.
+    pub fn drawing(self, name: &str) -> Self {
+        if self.0.has(Icon::id()) {
+            self.0.remove(Icon::id());
+        }
+        if self.0.try_cloned::<&Drawing>().is_none_or(|d| d.name.as_str() != name) {
+            self.0.set(Drawing { name: name.into() });
         }
         self
     }

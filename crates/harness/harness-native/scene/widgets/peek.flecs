@@ -52,6 +52,37 @@ hn {
     }
   }
 
+  // The header of a file or a folder: its kind's drawing (IntelliJ's icon in its own colours, ui.Art), then its path,
+  // quiet.
+  prefab PeekSiteArt : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Art {
+      Size: {w: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_icon_w, min: 0, max: 0}}
+    }
+    name : ui.LineMiddle, Muted {
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+    }
+  }
+
+  // A folder's entries, the Finder's way: a column of hn.PeekEntry rows the host keeps by name, folders first.
+  prefab PeekList : ui.Column {
+    Flex: {axis: Column, gap: $inline_peek_entry_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // One entry: its kind's icon at its name's size, then its name in the body face, one compact line.
+  prefab PeekEntry : ui.Row {
+    Flex: {axis: Row, gap: $inline_peek_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Art {
+      Size: {w: {kind: Fixed, value: $inline_peek_entry_icon_w, min: 0, max: 0}, h: {kind: Fixed, value: $inline_peek_entry_icon_w, min: 0, max: 0}}
+    }
+    name : ui.Lead, Ink {
+      TextStyle: {size: $size_peek_body, line: $line_peek_entry, role: 0, bold: 0}
+    }
+  }
+
   // The title, strong, wrapping, flush left under the header.
   prefab PeekTitle : ui.Words, Strong {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}

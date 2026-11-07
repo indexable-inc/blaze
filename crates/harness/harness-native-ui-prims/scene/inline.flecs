@@ -1,6 +1,6 @@
 // Inline components: the vocabulary of chips an agent writes in its words, `<Path loc="/Volumes/Projects/blaze">blaze</Path>`
 // (harness-native-ui-inline is the tag grammar; this module is what each name means). One entity per name: its icon
-// (`glyph`, or the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
+// (`glyph`, or the drawing of the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
 // the one with a line in it (`line`). A chip is the label in the UI face, medium, after its icon, on `rest`'s plate (clear)
 // at rest and `hover`'s under the pointer. A new component is an entity here; nothing in Rust
 // lists them. Depends on the primitives (prims.flecs: MarkdownText's chips) and the tokens.
@@ -67,13 +67,22 @@ marks {
   }
 }
 
-// A file or a folder: its kind's icon; a press opens it (at `line`), an Option-press shows it in the Finder.
+// A file or a folder: its kind's icon (IntelliJ's, in its own colours: harness-native-ui-inline files.rs); a press opens
+// it (at `line`), an Option-press shows it in the Finder. Whether it is a folder the host finds out once a chat shows it
+// (the `fs` feed, src/app/chat/peek.rs), so /Volumes/Projects/blaze is a folder's icon though its name has no slash; a
+// place that is not there keeps its name's icon and says so as its tooltip.
 Path {
-  InlineRef: {target: "loc", line: "line", file_icon: true}
+  InlineRef: {target: "loc", line: "line", file_icon: true, key: "path:\{loc}", feed: "fs"}
+  folder { InlineRef: {file_icon: true, folder: true} }
+  file { InlineRef: {file_icon: true} }
+  unknown { InlineRef: {file_icon: true} }
 }
 // A cell's FileRef, by the same name and props as in a ts cell's UI.
 FileRef {
-  InlineRef: {target: "path", line: "line", file_icon: true}
+  InlineRef: {target: "path", line: "line", file_icon: true, key: "path:\{path}", feed: "fs"}
+  folder { InlineRef: {file_icon: true, folder: true} }
+  file { InlineRef: {file_icon: true} }
+  unknown { InlineRef: {file_icon: true} }
 }
 // A symbol in code (a type, a function): a press opens the file it is in, at its line.
 Symbol {

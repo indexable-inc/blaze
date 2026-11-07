@@ -1,0 +1,5 @@
+<!-- den's open folder, drawn from folder.svg below (same grid, stroke and colours) with its front tipped forward. Apache 2.0, as folder.svg. -->
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M1.5 12.6V3.86667C1.5 3.04707 2.06804 2.5 2.63333 2.5H6.1217C6.25792 2.5 6.38824 2.55557 6.48253 2.65387L8.10584 4.34613L8.25344 4.5H8.46667H12C12.8284 4.5 13.5 5.17157 13.5 6V7.5" fill="#EBECF0" stroke="#6C707E" stroke-linejoin="round"/>
+<path d="M3.6328 8.1047C3.7845 7.7385 4.1418 7.5 4.5382 7.5H14.1007C14.7779 7.5 15.2593 8.1597 15.0541 8.8051L13.7826 12.8051C13.6507 13.2201 13.2655 13.5 12.8292 13.5H2.01C1.6538 13.5 1.4120 13.1385 1.5482 12.8095L3.6328 8.1047Z" fill="#EBECF0" stroke="#6C707E" stroke-linejoin="round"/>
+</svg>

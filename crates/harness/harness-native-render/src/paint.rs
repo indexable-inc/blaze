@@ -16,7 +16,7 @@ use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLoo
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
+    BlazeMark, Caret, Drawing, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::{GlyphsArrive, GlyphsIn};
@@ -825,13 +825,27 @@ impl Painter {
                                 let size = [sheet.w as f32, sheet.h as f32, p.alpha, 1.0];
                                 d.image(ImageInst { rect, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr }, sheet.frames[0].clone());
                             } else {
-                                let (glyph, icon_ink) = crate::inline::icon(w, &t.tag, dark);
-                                let icon = self.layout(&glyph, &icon_style, 1.0e5);
-                                let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
-                                let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
-                                let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
-                                let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
-                                emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
+                                match crate::inline::icon(w, &t.tag, dark) {
+                                    crate::inline::ChipIcon::Glyph(glyph, icon_ink) => {
+                                        let icon = self.layout(&glyph, &icon_style, 1.0e5);
+                                        let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                                        let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
+                                        let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
+                                        let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
+                                        emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
+                                    }
+                                    crate::inline::ChipIcon::Drawing(name) => {
+                                        // A file kind's drawing in its own colours, centred where the glyph would be. The
+                                        // path pass is not scaled after (below), so a transition's scale is folded in here.
+                                        let art = crate::drawing::get(name, dark).ok_or_else(|| format!("{}: file icon {name:?} is not one of drawing.rs's", e.path()))?;
+                                        let k = if p.scale > 0.0 { p.scale } else { 1.0 };
+                                        let s = size * crate::markdown::REF_DRAWING_EM;
+                                        let cx = hole[0] + before * 0.5 + icon_style.size * 0.5;
+                                        let cy = hole[1] + hole[3] * 0.5;
+                                        let rect = [laid.x + (cx - s * 0.5) * k, laid.y + (cy - s * 0.5) * k, s * k, s * k];
+                                        art.emit(d, rect, p.alpha, sc).map_err(|err| format!("{}: file icon {name:?}: {err}", e.path()))?;
+                                    }
+                                }
                             }
                             // The mark's hole is MARK_EM wide: the gap after the label, then the mark at its end. Nothing
                             // while its live state has none (unknown, or not asked yet).
@@ -927,6 +941,21 @@ impl Painter {
                     gdata: mark.gdata,
                     ..GlyphInst::default()
                 });
+            }
+            PaintKind::Drawing => {
+                // A ui.Art: its drawing (drawing.rs) in its own colours, the appearance's variant, square in its box. The
+                // path pass is not scaled after (below): a transition's scale is folded into where it goes.
+                // No name yet (a ui.Art the host has not filled) draws nothing, as an empty glyph does.
+                let Some(name) = e.try_cloned::<&Drawing>().filter(|d| !d.name.as_str().is_empty()) else { return Ok(at) };
+                let art = crate::drawing::get(name.name.as_str(), dark).ok_or_else(|| {
+                    let names: Vec<&str> = crate::drawing::names().collect(); // alloc: the error's list
+                    format!("{}: Drawing {:?} is not one of drawing.rs's ({})", e.path(), name.name.as_str(), names.join(", "))
+                })?;
+                let k = if p.scale > 0.0 { p.scale } else { 1.0 };
+                let side = laid.w.min(laid.h) * k;
+                let (cx, cy) = (laid.x + laid.w * 0.5 * k, laid.y + laid.h * 0.5 * k);
+                art.emit(d, [cx - side * 0.5, cy - side * 0.5, side, side], p.alpha, sc)
+                    .map_err(|err| format!("{}: Drawing {:?}: {err}", e.path(), name.name.as_str()))?;
             }
             PaintKind::Picture => self.picture(d, e, rect, p.alpha, dark, sc)?,
             PaintKind::Ribbon => {

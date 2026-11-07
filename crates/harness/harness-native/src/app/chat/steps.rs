@@ -425,7 +425,6 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
 
 /// Fill one output row.
 pub(super) fn fill(row: View<'_>, o: &Out) {
-    let world = row.entity().world();
     match o {
         Out::Head { kind, words, why, tip } => {
             if let Some(l) = row.part("line") {
@@ -458,10 +457,8 @@ pub(super) fn fill(row: View<'_>, o: &Out) {
                 look(l, kind, verb);
                 tooltip(l, tip);
                 if let Some(c) = l.part("chip") {
-                    let (g, fill) = genui::file_icon(world, path);
                     if let Some(i) = c.part("icon") {
-                        i.icon(&g);
-                        genui::filled(i, fill);
+                        i.drawing(genui::file_icon(path));
                     }
                     if let Some(n) = c.part("name") {
                         n.text(path.trim_end_matches('/').rsplit('/').next().unwrap_or(path));

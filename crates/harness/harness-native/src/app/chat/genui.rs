@@ -155,16 +155,9 @@ pub(super) fn fill(
     fill_in(row, ui, cell, None, live, playing, measure);
 }
 
-/// The glyph of the kind of file at `path` and that kind's colour, as a FileRef draws them (for a step's file chip,
-/// steps.rs).
-pub(super) fn file_icon(world: WorldRef<'_>, path: &str) -> (String, Option<Fill>) {
-    let kind = media::kind_of(path);
-    (media::kind_glyph(kind).to_string(), media::fill_of(world, &format!("hn.GenFileKind.{kind}")))
-}
-
-/// Set `v`'s Fill to `f` when it has one and it differs.
-pub(super) fn filled(v: View<'_>, f: Option<Fill>) {
-    media::filled(v, f);
+/// The drawing of the kind of file at `path`, as a FileRef draws it (for a step's file chip, steps.rs).
+pub(super) fn file_icon(path: &str) -> &'static str {
+    media::files::drawing(media::kind_of(path))
 }
 
 /// [`fill`], with the chat's cells by tool call (`cells`: its transcript's `details`), which a CellRef shows.
@@ -1122,7 +1115,8 @@ mod tests {
         assert!((fill.w / laid(part(el(12), "body"), "the track").w - 0.6).abs() < 0.01, "3 of 5");
         assert!(part(el(13), "spinner.arc").entity().try_cloned::<&harness_native_ui_text_api::Vector>().is_some_and(|v| v.ma != 0.0 || v.mb != 0.0), "the arc turns");
         assert!(is(part(el(14), "b1"), "hn.GenBoneShort") && laid(part(el(14), "b1"), "a bone").w < laid(part(el(14), "b0"), "a bone").w);
-        assert_eq!(el(15).entity().try_cloned::<&Icon>().map(|i| i.glyph.as_str().to_owned()).as_deref(), Some("\u{E7A8}"), "rust is a file kind");
+        let rust = harness_native_ui_inline::files::kind_named("rust").map(harness_native_ui_inline::files::drawing);
+        assert_eq!(el(15).entity().try_cloned::<&harness_native_ui_text_api::Drawing>().map(|d| d.name.as_str().to_owned()).as_deref(), rust, "rust is a file kind, drawn");
         assert_eq!(action(el(16)), Some(one("h5", "\"icon\"")));
         assert_eq!(action(el(17)).as_deref(), Some("open:60:/x/src/tree.ts"), "a file chip opens its file at its line");
         assert_eq!((words_of(part(el(17), "name")), words_of(part(el(17), "line"))), ("tree.ts".to_owned(), ":60".to_owned()));
