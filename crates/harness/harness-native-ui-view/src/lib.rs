@@ -364,11 +364,42 @@ pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
     live
 }
 
-/// The heights a [`lazy_stack`] measured its rows at, by key, at the width it was laid out at (a new width forgets them).
+/// The heights a [`lazy_stack`] measured its rows at, by key, and the width it last measured them at. A new width keeps
+/// them: each is its row's best guess until the row is laid out at that width (the rows in view re-wrap every frame of a
+/// fold; a row out of view settles when it comes into view, the scroll held still by [`Stacked::shift`]). Forgetting them
+/// would put every row out of view back at the estimate, and the transcript above the view would jump.
 #[derive(Clone, Debug, Default)]
 pub struct Heights {
     width: f32,
     h: std::collections::HashMap<String, f32>,
+}
+
+/// What [`lazy_anchor`] found after rows were laid out at a new width: how far the scroll moves to hold the row at the top
+/// of the view where it was (`shift`), and how much taller all the rows are (`grew`, negative when shorter).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Anchored {
+    pub shift: f32,
+    pub grew: f32,
+}
+
+/// How far the rows of a stack moved the place `top` points down its content, from rows `(old, new)` heights in order,
+/// the first starting `first` down: a row wholly above `top` moves it by all it grew, the row `top` is in by as much of
+/// its growth as lies above `top` (the same share of it stays above the view, so the line read at the top stays there
+/// while its words re-wrap), a row below not at all. Also how much they grew in all.
+#[must_use]
+pub fn anchor_shift(first: f32, rows: impl IntoIterator<Item = (f32, f32)>, top: f32) -> Anchored {
+    let (mut at, mut out) = (first, Anchored::default());
+    for (old, new) in rows {
+        let grew = new - old;
+        out.grew += grew;
+        if at + old <= top {
+            out.shift += grew;
+        } else if at < top && old > 0.0 {
+            out.shift += grew * (top - at) / old;
+        }
+        at += old;
+    }
+    out
 }
 
 /// What a [`lazy_stack`] call found: how tall all its rows are (measured or estimated), and how far the rows above the
@@ -396,11 +427,7 @@ pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
     use harness_native_ui_node_api::Laid;
     let e = parent.0;
     let spec = e.try_cloned::<&LazyStack>().unwrap_or(LazyStack { estimate: 40.0, overscan: 400.0 });
-    let width = e.try_cloned::<&Laid>().map_or(0.0, |l| l.w);
-    if (width - heights.width).abs() > 0.5 {
-        heights.width = width;
-        heights.h.clear();
-    }
+    heights.width = e.try_cloned::<&Laid>().map_or(0.0, |l| l.w);
     // Measure the rows that exist; what changed above the view moves the scroll.
     let keys: Vec<String> = (0..count).map(|i| key(i).as_ref().to_owned()).collect();
     let tops = |heights: &Heights| {
@@ -477,4 +504,58 @@ pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
         }
     });
     Stacked { content: total, shift }
+}
+
+/// Hold a [`lazy_stack`]'s view still once its rows were laid out at a new width (a fold moving a transcript's column),
+/// in the frame they were: measure the rows that exist into `heights` and say how far the scroll at `top` moves to keep
+/// the row at the top of the view where it was ([`anchor_shift`]). The host calls it after layout settles and before the
+/// frame is drawn, so the view never shows a frame of rows above it grown without the scroll following; [`lazy_stack`]
+/// finds them measured on the next frame and moves nothing again. None while the stack's width is the one it measured at.
+pub fn lazy_anchor(parent: View<'_>, heights: &mut Heights, top: f32) -> Option<Anchored> {
+    use harness_native_ui_layout_api::{LazyStack, Size};
+    use harness_native_ui_node_api::Laid;
+    let e = parent.0;
+    let width = e.try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+    if (width - heights.width).abs() <= 0.5 {
+        return None;
+    }
+    heights.width = width;
+    let estimate = e.try_cloned::<&LazyStack>().map_or(40.0, |s| s.estimate);
+    // The rows above the ones that exist are the `_top` spacer, as tall as their heights (which nothing changed).
+    let mut first = 0.0;
+    let mut rows = Vec::new(); // alloc: the rows in view, once a frame while a fold moves
+    // In layout's order (the stack's flow), so each row's place down the content is the sum of the ones before it.
+    for c in harness_native_ui_node_api::children(e) {
+        let name = c.name().to_string();
+        if name == "_top" {
+            first = c.try_cloned::<&Size>().map_or(0.0, |s| s.h.value);
+        }
+        if name.starts_with('_') || c.has(Placed::id()) {
+            continue;
+        }
+        let old = heights.h.get(&name).copied().unwrap_or(estimate);
+        let new = c.try_cloned::<&Laid>().map(|l| l.h).filter(|&h| h > 0.0 && (h - old).abs() > 0.25);
+        if let Some(h) = new {
+            heights.h.insert(name, h);
+        }
+        rows.push((old, new.unwrap_or(old)));
+    }
+    Some(anchor_shift(first, rows, top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three rows from 100 down, 50 tall each, re-wrapped to 80, 70 and 90, with the view's top 25 into the second: the
+    /// first, wholly above, moves the top by all it grew (30); the second by the half of its growth above the top (10);
+    /// the third, below, not at all. All three grew 90.
+    #[test]
+    fn the_row_at_the_top_keeps_the_share_of_it_above_the_view() {
+        let a = anchor_shift(100.0, [(50.0, 80.0), (50.0, 70.0), (50.0, 90.0)], 175.0);
+        assert_eq!(a, Anchored { shift: 40.0, grew: 90.0 });
+        // A top above every row (the start of the transcript) moves nothing; one at a row's top keeps that row's top.
+        assert_eq!(anchor_shift(100.0, [(50.0, 80.0)], 50.0).shift, 0.0);
+        assert_eq!(anchor_shift(100.0, [(50.0, 80.0), (50.0, 20.0)], 150.0).shift, 30.0);
+    }
 }

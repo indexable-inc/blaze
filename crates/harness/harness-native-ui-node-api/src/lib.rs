@@ -73,20 +73,6 @@ impl Laid {
     }
 }
 
-/// The width a words node breaks its lines at while that is not its `Laid` width: the width it has once every moving
-/// `RestSize` rests (a fold). Its box follows the moving frame; its words wrap once per motion, not every frame. Written by
-/// layout, removed when the two agree. Every reader of a text's lines goes through [`wrap_width`].
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct WrapAt {
-    pub w: f32,
-}
-
-/// The width words node `e` breaks its lines at: its `WrapAt`, else `laid_w`, the width layout gave it.
-#[must_use]
-pub fn wrap_width(e: EntityView<'_>, laid_w: f32) -> f32 {
-    e.try_cloned::<&WrapAt>().map_or(laid_w, |b| b.w)
-}
-
 /// A node layout left out this frame (a `ViewThatFits` variant that was not chosen): draw and hit testing skip it and
 /// everything under it. Written by layout. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -130,7 +116,6 @@ hyperion_api_layouts::api_layouts! {
     "Windowed" => alias Windowed,
     "Offscreen" => alias Offscreen,
     "Laid" => alias Laid,
-    "WrapAt" => alias WrapAt,
     "Clip" => alias Clip,
     "ClipFade" => alias ClipFade,
     "Hidden" => alias Hidden,
@@ -170,7 +155,6 @@ pub fn register(world: &World) {
     world.component::<Windowed>().writable();
     world.component::<Offscreen>().writable();
     world.component::<Laid>().writable();
-    world.component::<WrapAt>().writable();
     world.component::<Clip>().writable();
     world.component::<ClipFade>().writable();
     world.component::<Hidden>();

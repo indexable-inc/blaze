@@ -13,8 +13,7 @@ use harness_native_ui_layout_api::{
     LaysAtRest, LazyIndex, LazyRange, LayoutPriority, NoScroller, Overlay, Padding, RestSize, SafeAreaInset, SafeAreaPadding, ScrollExtent, ScrollFed, ScrollState, Scroller,
     ScrollerPart, ScrollerState, Screen, ShrinkFirst, Side, Size, Sizing, Viewport, ViewThatFits, scroller_axis,
 };
-use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed, Windowed, WrapAt};
-use harness_native_ui_text_api::Text;
+use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Node, Offscreen, Placed, Windowed};
 
 pub mod solve;
 pub mod typeset;
@@ -78,7 +77,6 @@ fn read(e: EntityView<'_>) -> Item {
         limit: e.try_cloned::<&GrowLimit>().map(|g| LimitSpec { share: g.share, keep: g.keep, max: size.h.max }),
         rest: e.try_cloned::<&RestSize>().map(|r| r.len),
         at_rest: e.has(LaysAtRest::id()),
-        words: e.has(Text::id()),
         ..Item::default()
     }
 }
@@ -238,7 +236,7 @@ fn extras(it: &Item) -> Vec<u64> {
         f(it.guide[0]),
         f(it.guide[1]),
         f(it.priority),
-        u64::from(it.fixed[0]) | u64::from(it.fixed[1]) << 1 | u64::from(it.grid_row) << 2 | u64::from(it.fits) << 3 | u64::from(it.clip) << 4 | u64::from(it.scrolls) << 5 | u64::from(it.at_rest) << 6 | u64::from(it.words) << 7,
+        u64::from(it.fixed[0]) | u64::from(it.fixed[1]) << 1 | u64::from(it.grid_row) << 2 | u64::from(it.fits) << 3 | u64::from(it.clip) << 4 | u64::from(it.scrolls) << 5 | u64::from(it.at_rest) << 6,
         it.rest.map_or(u64::MAX, f),
         it.role as u64,
         f(it.baseline[0]),
@@ -266,7 +264,7 @@ pub fn install(world: WorldRef<'_>) {
     // in the same merge) through the stage; `writes` makes flecs merge them before the systems after it in the same pass
     // (hits, matched geometry, the draw pass), so none of them reads the last pass's places. Without it (and with flecs
     // ordering a phase by recycled entity ids) a zoom drew a frame of the old layout and the selection pill chased it.
-    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Layout).reads(ScrollerState::id()).writes(Laid::id()).writes(WrapAt::id()).writes(LazyRange::id()).writes(ScrollExtent::id()).each_iter(move |it, row, _| {
+    world.system_named::<&Node>("UiLayout").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Layout).reads(ScrollerState::id()).writes(Laid::id()).writes(LazyRange::id()).writes(ScrollExtent::id()).each_iter(move |it, row, _| {
         let e = it.entity(row);
         let placed = e.has(Placed::id());
         if !placed && e.parent().is_some_and(|p| p.has(Node::id())) {
@@ -327,11 +325,6 @@ pub fn install(world: WorldRef<'_>) {
             let ent = w.entity_from_id(item.id);
             if ent.try_cloned::<&Laid>() != Some(item.out) {
                 ent.set(item.out);
-            }
-            match item.wrap.map(|w| WrapAt { w }) {
-                Some(b) if ent.try_cloned::<&WrapAt>() != Some(b) => _ = ent.set(b),
-                None if ent.has(WrapAt::id()) => _ = ent.remove(WrapAt::id()),
-                _ => {}
             }
             if item.hidden != ent.has(Hidden::id()) {
                 if item.hidden {

@@ -1720,6 +1720,11 @@ impl App {
             self.progress(0.0);
             self.poke_why("layout");
         }
+        // Words laid out at a new width (a fold moving a transcript's column) hold each chat's view still in this frame,
+        // not the next (chat.rs anchor_chats): laid out once more where a scroll moved.
+        if self.anchor_chats() {
+            self.progress(0.0);
+        }
         self.forward_clicks();
         self.actions();
         harness_native_ui_input::end_frame(self.world.world_ref());
@@ -1761,6 +1766,10 @@ impl App {
         // A caret that jumped sweeps into its place (harness-native-render caret.rs): draw until it has.
         if self.paint.get_mut().gliding {
             self.poke_why("caret glide");
+        }
+        // Words that re-wrapped glide into their new lines (harness-native-render reflow.rs): draw until they have.
+        if self.paint.get_mut().reflowing {
+            self.poke_why("reflow");
         }
         // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
         // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
@@ -1804,10 +1813,10 @@ impl App {
         let open = self.side_w.unwrap_or(full.w.value);
         let shown = open + seam;
         let width = shown * x;
-        // What the card's words (WrapAt) and its panes' LaysAtRest nodes lay out against while the fold moves: the open
-        // width, where the card is narrowest, so nothing overflows the moving boxes, and words wrap and a terminal resizes
-        // once per cmd+S, not on every frame of the spring: opening, on its first frame; folding, once the spring rests
-        // closed. Every box (the composer's plate, its controls, the column) follows the spring.
+        // What the card's LaysAtRest panes (a terminal's grid) lay out against while the fold moves: the open width, where
+        // the card is narrowest, so a terminal resizes once per cmd+S, not on every frame of the spring: opening, on its
+        // first frame; folding, once the spring rests closed. Everything else follows the spring, words included: they
+        // re-wrap live at the width they have each frame.
         let rest = if self.side_x.settled(0.0) { 0.0 } else { shown };
         if self.chrome_laid == Some((self.chrome, z, width, rest)) {
             return;
