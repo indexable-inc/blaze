@@ -905,21 +905,22 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
     assert!(error.0.contains("3 bytes of state"), "{error}");
 }
 
-/// A static left holding an address of the heap stops the expansion naming the static: no
-/// next instance has that heap.
+/// A static left holding a heap address can be replayed with the earlier call in one instance.
 #[test]
-fn a_static_left_holding_a_heap_address_stops_naming_it() {
-    let (db, krate, _, item) = counter_crate();
+fn a_static_left_holding_a_heap_address_survives_session_replay() {
+    let (db, krate, id, item) = counter_crate();
     let (mut library, _) =
         Library::load_with(&modules(), &binary(&counting(&item, true)), None, WHAT).unwrap();
     library.watch(&db, krate).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let error =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let given = given(&input);
+    let calls = [(0, given), (0, given)];
+    let ran = library.expand_calls(&db, &Env::default(), &calls, &[], "/", &mut spent).unwrap();
     assert!(
-        error.0.contains("address of its heap in the static `") && error.0.contains("COUNT`"),
-        "{error}"
+        ran.statics.iter().any(|(static_id, _, holds_heap)| *static_id == id && *holds_heap),
+        "the replayed session must keep the heap address in COUNT: {:?}",
+        ran.statics
     );
 }
 

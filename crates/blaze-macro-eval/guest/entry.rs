@@ -21,6 +21,9 @@ pub mod __blaze_wasm_entry {
 
     use super::listed;
 
+    // WASI proc-macro instances are single-threaded; keep getenv's stable pointers per instance.
+    static mut ENV: Vec<(Vec<u8>, Box<[u8]>)> = Vec::new();
+
     #[link(wasm_import_module = "blaze_proc_macro")]
     unsafe extern "C" {
         /// The request of `len` bytes at `request`, answered: the reply's length.
@@ -48,7 +51,9 @@ pub mod __blaze_wasm_entry {
         let mut dir = Vec::<u8>::new();
         loop {
             let len = unsafe { current_dir(dir.as_mut_ptr(), dir.capacity()) };
-            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return Ok(()) };
+            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else {
+                return Ok(());
+            };
             if len <= dir.capacity() {
                 unsafe { dir.set_len(len) };
                 break;
@@ -56,21 +61,29 @@ pub mod __blaze_wasm_entry {
             dir.reserve_exact(len);
         }
         let dir = String::from_utf8(dir).map_err(|_| 0u32)?;
-        std::env::set_current_dir(dir).map_err(|error| error.raw_os_error().map_or(0, |errno| errno as u32 & 0xFF_FFFF))
+        std::env::set_current_dir(dir)
+            .map_err(|error| error.raw_os_error().map_or(0, |errno| errno as u32 & 0xFF_FFFF))
     }
 
     /// libc's `getenv`, linked in place of wasi-libc's, which reads every variable through
     /// `environ_get` on its first call: this one asks the host for the one variable, so an
     /// expansion is keyed by the variables it read alone. std's `env::var` calls it. The value
-    /// is never freed, as C's `getenv` gives a pointer that outlives the call, and an instance
-    /// lives for one expansion.
+    /// is kept for this instance, as C's `getenv` gives a pointer that outlives the call.
+    /// Replayed calls share an instance, so reuse one allocation per variable name.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn getenv(name: *const std::ffi::c_char) -> *mut std::ffi::c_char {
         let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        let env = unsafe { &mut *std::ptr::addr_of_mut!(ENV) };
+        if let Some((_, value)) = env.iter().find(|(key, _)| key.as_slice() == name) {
+            return value.as_ptr().cast_mut().cast();
+        }
         let mut value = Vec::<u8>::new();
         loop {
-            let len = unsafe { env_var(name.as_ptr(), name.len(), value.as_mut_ptr(), value.capacity()) };
-            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return std::ptr::null_mut() };
+            let len =
+                unsafe { env_var(name.as_ptr(), name.len(), value.as_mut_ptr(), value.capacity()) };
+            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else {
+                return std::ptr::null_mut();
+            };
             if len <= value.capacity() {
                 unsafe { value.set_len(len) };
                 break;
@@ -78,7 +91,11 @@ pub mod __blaze_wasm_entry {
             value.reserve_exact(len);
         }
         value.push(0);
-        Box::leak(value.into_boxed_slice()).as_mut_ptr().cast()
+        let value = value.into_boxed_slice();
+        let pointer = value.as_ptr().cast_mut().cast();
+        // alloc: C requires this value and its name to stay available for the instance.
+        env.push((name.to_vec(), value));
+        pointer
     }
 
     #[repr(C)]
@@ -93,7 +110,13 @@ pub mod __blaze_wasm_entry {
     impl Buffer {
         fn of(bytes: Vec<u8>) -> Buffer {
             let mut bytes = ManuallyDrop::new(bytes);
-            Buffer { data: bytes.as_mut_ptr(), len: bytes.len(), capacity: bytes.capacity(), reserve, drop }
+            Buffer {
+                data: bytes.as_mut_ptr(),
+                len: bytes.len(),
+                capacity: bytes.capacity(),
+                reserve,
+                drop,
+            }
         }
 
         /// The buffer's bytes as the `Vec` they are.
@@ -158,7 +181,10 @@ pub mod __blaze_wasm_entry {
     /// client's `catch_unwind` never encodes it. `proc_macro`'s own hook calls this one, as
     /// `force_show_panics` asks.
     fn hook(info: &panic::PanicHookInfo<'_>) {
-        let message = match (info.payload().downcast_ref::<&str>(), info.payload().downcast_ref::<String>()) {
+        let message = match (
+            info.payload().downcast_ref::<&str>(),
+            info.payload().downcast_ref::<String>(),
+        ) {
             (Some(it), _) => *it,
             (_, Some(it)) => it.as_str(),
             (None, None) => "a payload that is not a string",
