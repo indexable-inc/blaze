@@ -722,6 +722,7 @@ impl Daemon {
             }
             // The app's chips and hover cards (github.rs, page.rs): gh's token and curl stay in their own processes.
             Req::GithubStatus { refs, fresh } => Reply::Github { items: crate::github::status(&refs, fresh)? },
+            Req::GithubChecks { pr } => Reply::GithubChecks { checks: crate::github::checks(&pr) },
             Req::PagePeek { url } => Reply::Page { page: crate::page::peek(&url) },
             Req::Info => Reply::Daemon { pid: std::process::id(), sock: paths::sock().display().to_string() },
             Req::Last => {

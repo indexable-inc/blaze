@@ -194,6 +194,11 @@ pub enum Request {
         #[serde(default)]
         fresh: bool,
     },
+    /// A pull request's head commit's checks one by one (`pr`, a pull request's ref): each one's state, the step in
+    /// progress of one that runs, when it started and ended, and its page, at most [`crate::peek::CHECKS_MAX`]. The app
+    /// asks while the pull request's hover card shows and a check is unfinished; answered from a cache of a few seconds.
+    /// A failure is a [`crate::peek::GhChecks`] whose error names the pull request.
+    GithubChecks { pr: crate::peek::GhRef },
     /// A web page's card for a hover (`url`, http or https): its OpenGraph title, description, site and image, fetched
     /// once and kept.
     PagePeek { url: String },
@@ -306,6 +311,8 @@ pub enum Reply {
     Browser { pid: u32, sock: String, service: String },
     /// `github_status`: one item a ref asked, in its order.
     Github { items: Vec<crate::peek::GhItem> },
+    /// `github_checks`.
+    GithubChecks { checks: crate::peek::GhChecks },
     /// `page_peek`.
     Page { page: crate::peek::PageMeta },
     /// A run's or an object's answer, an open record whose shape runs.rs and object.rs define.
