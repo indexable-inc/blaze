@@ -248,6 +248,8 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
 /// view keeps the place it was laid out at (`Placed`), loses its name (so its key can come back as a new row while it goes)
 /// and is deleted by motion once its spring reaches 0. One in its parent's flow folds away as it goes (`Collapse`, clipped
 /// to what it still holds), so its neighbours slide into its space as in a SwiftUI list instead of jumping at the end.
+/// One placed already (a menu, a popover, a hover card: a root of its own, laid against its anchor) was never in that
+/// flow and goes from its own place: with its anchor gone, layout keeps the `Laid` it last had.
 pub fn leave(v: View<'_>) {
     let e = v.0;
     if !e.has(Transition::id()) {
@@ -256,10 +258,16 @@ pub fn leave(v: View<'_>) {
     }
     if !e.has(Leaving::id()) {
         let id = *e.id();
+        // Whether it is in its parent's flow is read before it is placed below. Layout's `gather` keeps every placed child
+        // out of the flow, so a collapsing stand-in for one placed before would lay it at the flow's start (its slot's
+        // corner) for the rest of its exit: a closing hover card's window jumped to the pane's top-left.
+        let in_flow = !e.has(Placed::id())
+            && e.parent().is_some_and(|p| p.has(Node::id()))
+            && !e.has(Background::id())
+            && !e.has(Overlay::id());
         e.set_name(&format!("leaving_{id}"));
         e.add(Placed::id());
         e.add(Leaving::id());
-        let in_flow = e.parent().is_some_and(|p| p.has(Node::id())) && !e.has(Background::id()) && !e.has(Overlay::id());
         if in_flow {
             e.set(Collapse { k: 1.0 });
             e.add(Clip::id());

@@ -2716,4 +2716,26 @@ mod tests {
         assert!(!colour_literal("{dark: $tone_line.dark, light: $tone_line.light}"));
         assert!(!colour_literal("{w: 1, h: 2}"));
     }
+
+    /// A closing hover card keeps its place: the chat's `peek` slot is a node, so the card (a ui.Menu, placed and
+    /// anchored) is its child, and leaving it must not fold it into the slot's flow (`Collapse`, `Clip`), where layout lays
+    /// a stand-in at the flow's start and writes that corner into its `Laid`: its window jumped to the pane's top-left as
+    /// it faded. A row in a flow still folds away as it goes (the control).
+    #[test]
+    fn leaving_overlay_stays_out_of_the_flow() {
+        use harness_native_ui_layout_api::Collapse;
+        use harness_native_ui_motion_api::{Leaving, Transition};
+        use harness_native_ui_node_api::{Clip, Placed};
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let slot = View::root(world.world_ref(), "ui.Node");
+        let card = slot.child("hn.ChatPeek");
+        assert!(card.entity().has(Transition::id()) && card.entity().has(Placed::id()), "hn.ChatPeek is no placed overlay with a Transition");
+        view::leave(card);
+        let e = card.entity();
+        assert!(e.has(Leaving::id()), "the card is not leaving");
+        assert!(!e.has(Collapse::id()) && !e.has(Clip::id()), "a leaving overlay was folded into its slot's flow");
+        let row = slot.child("ui.Row").set(Transition::default());
+        view::leave(row);
+        assert!(row.entity().has(Collapse::id()), "a leaving row in a flow no longer folds away");
+    }
 }
