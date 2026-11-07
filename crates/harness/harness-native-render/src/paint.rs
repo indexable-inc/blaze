@@ -78,11 +78,6 @@ pub struct Painter {
     carets: crate::caret::Carets,
     /// A caret painted in the last frame is still sweeping ([`Painter::end_frame`]): the host draws another.
     pub gliding: bool,
-    /// Each words node's glyphs as last drawn, and the glides of those a new line break moved (reflow.rs).
-    reflows: crate::reflow::Reflows,
-    /// A glyph painted in the last frame still glides to where its words re-wrapped ([`Painter::end_frame`]): the host
-    /// draws another.
-    pub reflowing: bool,
 }
 
 /// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
@@ -210,12 +205,12 @@ pub fn emit_layout(
     upload: &mut Upload<'_>,
 ) {
     emit_glyphs(d, fonts, cache, lay, at, sc, upload, None, &mut |n, _| {
-        (n < limit).then_some((ink, alpha, [0.0; 2]))
+        (n < limit).then_some((ink, alpha, 0.0))
     });
 }
 
-/// A layout's glyphs at `(ox, oy)`, each as `look(n, glyph)` says (its ink, opacity and how far right of and below its
-/// place it sits, points), stopping at the first it gives None. Glyphs in place snap to the device pixel grid with den's subpixel steps;
+/// A layout's glyphs at `(ox, oy)`, each as `look(n, glyph)` says (its ink, opacity and how far below its place it sits,
+/// points), stopping at the first it gives None. Glyphs in place snap to the device pixel grid with den's subpixel steps;
 /// one still moving is drawn where it is. `grow` grows the glyphs of a UTF-16 range (a copied selection, under its pulse)
 /// as their plate grows. Where the pen stands after the last one drawn (x, its line's top and height), in points, if any
 /// was.
@@ -229,14 +224,14 @@ pub fn emit_glyphs(
     sc: f32,
     upload: &mut Upload<'_>,
     grow: Option<(usize, usize, select::Grow)>,
-    look: &mut dyn FnMut(usize, &Glyph) -> Option<([f32; 4], f32, [f32; 2])>,
+    look: &mut dyn FnMut(usize, &Glyph) -> Option<([f32; 4], f32, f32)>,
 ) -> Option<(f32, f32, f32)> {
     let asz = cache.size as f32;
     let mut n = 0usize;
     let mut pen = None;
     for line in &lay.lines {
         for (k, g) in line.glyphs.iter().enumerate() {
-            let Some((ink, alpha, [dx, dy])) = look(n, g) else { return pen };
+            let Some((ink, alpha, dy)) = look(n, g) else { return pen };
             n += 1;
             let next_x = line.glyphs.get(k + 1).map_or(line.width, |h| h.x);
             pen = Some((ox + next_x, oy + line.top, line.height));
@@ -245,7 +240,7 @@ pub fn emit_glyphs(
             }
             let base = (oy + line.baseline - g.y) * sc;
             let base_px = if dy == 0.0 { base.round() } else { base + dy * sc };
-            let xp = (ox + g.x + dx) * sc;
+            let xp = (ox + g.x) * sc;
             let ix = xp.floor();
             let sub = (((xp - ix) * SUBPX as f32).floor() as u32).min(SUBPX - 1);
             let Some(e) = cache.get(fonts, g.font, g.id, sc, sub, upload) else { continue };
@@ -296,8 +291,6 @@ impl Painter {
             arriving: false,
             carets: crate::caret::Carets::default(),
             gliding: false,
-            reflows: crate::reflow::Reflows::default(),
-            reflowing: false,
             highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
@@ -479,7 +472,6 @@ impl Painter {
         self.kip_wake = self.kips.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
-        self.reflowing = self.reflows.end_frame();
         if self.cache.overflowed() {
             self.cache.clear();
             return true;
@@ -621,13 +613,6 @@ impl Painter {
                     _ => None,
                 };
                 let link_ink = md.map(|m| if dark { m.link_dark } else { m.link_light }).filter(|c| c.a > 0.0).map(rgba);
-                let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
-                // Re-wrapped at a new width: the glyphs a new break moved glide there (reflow.rs). Not a line cut to fit
-                // (cut again, not broken again), nor words being edited or selected: their caret and plates sit at rest.
-                let shifts = (truncate.is_none() && edit.is_none())
-                    .then(|| self.reflows.note(e.id().0, &lay, time, || crate::reflow::tune(e.world())))
-                    .flatten();
-                let shift_at = |unit: usize| shifts.as_ref().map_or_else(crate::reflow::Shift::default, |s| s.at(unit));
                 let links: Vec<(usize, usize)> = match (&shown_md, link_ink) {
                     (Some(m), Some(_)) => m.links.iter().map(|l| (l.0, l.1)).collect(),
                     _ => Vec::new(),
@@ -663,6 +648,7 @@ impl Painter {
                 let total: usize = lay.lines.iter().map(|l| l.glyphs.len()).sum();
                 let cut = e.try_cloned::<&Pose>().map_or(0.0, |p| p.cut.clamp(0.0, 1.0));
                 let limit = ((total as f32) * (1.0 - cut)).round() as usize;
+                let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
                 let inks = match e.try_cloned::<&Highlight>() {
                     Some(h) => {
                         let tokens = code_ink(e.world(), dark);
@@ -700,8 +686,7 @@ impl Painter {
                     };
                     let hot = arrive.map_or([0.0; 4], |m| rgba(m.hot));
                     let col = std::array::from_fn(|k| col[k] + (hot[k] - col[k]) * heat);
-                    let s = shift_at(g.idx);
-                    Some((col, p.alpha * a * (1.0 - s.fade).clamp(0.0, 1.0), [s.dx, dy]))
+                    Some((col, p.alpha * a, dy))
                 };
                 // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy, the
                 // words it holds growing with it.
@@ -759,15 +744,13 @@ impl Painter {
                         // The span's carets are half the room the typesetter left (chip_room) outside its glyphs; the
                         // plate reaches `inset` past the glyphs either side, into that room.
                         let (before, after) = crate::markdown::chip_room(&units, lo, hi, size);
-                        let rects = spans_at(&lay, lo, hi);
+                        let rects = spans_of(&lay, lo, hi);
                         let last = rects.len().saturating_sub(1);
-                        for (k, (u, r)) in rects.into_iter().enumerate() {
-                            // It moves with its glyphs while they glide.
-                            let sh = shift_at(u);
-                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset + sh.dx;
-                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset + sh.dx;
+                        for (k, r) in rects.into_iter().enumerate() {
+                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                             let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
-                            d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha * (1.0 - sh.fade)));
+                            d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
                         }
                     }
                     // Struck-through words: a hairline over the glyphs of each line they cover, `ui.strike`'s look.
@@ -783,10 +766,9 @@ impl Painter {
                                 let a = if li == l0 { x0 } else { 0.0 };
                                 let b = if li == l1 { x1 } else { l.width };
                                 let y = laid.y + l.baseline - size * look.rise - thick * 0.5;
-                                let sh = shift_at(if li == l0 { lo } else { l.start });
-                                let rect = [laid.x + a + sh.dx, (y * sc).round() / sc, b - a, thick];
+                                let rect = [laid.x + a, (y * sc).round() / sc, b - a, thick];
                                 if b > a {
-                                    d.panel(panel_from(line_ink, [0.0; 4], flat, rect, p.alpha * (1.0 - sh.fade)));
+                                    d.panel(panel_from(line_ink, [0.0; 4], flat, rect, p.alpha));
                                 }
                             }
                         }
@@ -812,47 +794,44 @@ impl Painter {
                             let here = hot.filter(|h| h.tag as usize == n);
                             let plate = here.map_or(rest, |h| crate::inline::hot(w, h.pressed, dark));
                             let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
-                            let rects = spans_at(&lay, t.start, t.end);
+                            let rects = spans_of(&lay, t.start, t.end);
                             let last = rects.len().saturating_sub(1);
-                            for (k, &(u, r)) in rects.iter().enumerate().filter(|_| plate[3] > 0.0) {
-                                let sh = shift_at(u);
-                                let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset + sh.dx;
-                                let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset + sh.dx;
+                            for (k, r) in rects.iter().enumerate().filter(|_| plate[3] > 0.0) {
+                                let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                                let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
                                 let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
-                                d.panel(panel_from(plate, [0.0; 4], ref_shape, rect, p.alpha * (1.0 - sh.fade)));
+                                d.panel(panel_from(plate, [0.0; 4], ref_shape, rect, p.alpha));
                             }
                             if here.is_some() {
                                 // The label's underline: a hairline under its words, past the icon's hole, before its host
                                 // and its mark.
                                 let (label_lo, label_hi) = t.label();
                                 let under = crate::inline::underline(w, dark);
-                                for (u, r) in spans_at(&lay, label_lo, label_hi) {
-                                    let sh = shift_at(u);
+                                for r in spans_of(&lay, label_lo, label_hi) {
                                     let y = laid.y + r[1] + r[3] - 3.0;
-                                    let rect = [laid.x + r[0] + sh.dx, (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
+                                    let rect = [laid.x + r[0], (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
                                     let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
-                                    d.panel(panel_from(under, [0.0; 4], flat, rect, p.alpha * (1.0 - sh.fade)));
+                                    d.panel(panel_from(under, [0.0; 4], flat, rect, p.alpha));
                                 }
                             }
                             // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
                             let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
-                            let sh = shift_at(t.start);
                             if let Some(pic) = crate::inline::picture(w, &t.tag) {
                                 // Its live picture (a favicon), square, the icon's size, where the icon goes.
                                 let s = icon_style.size;
                                 let sheet = self.photo(&pic, 1000).map_err(|err| format!("{}: {}'s picture: {err}", e.path(), t.tag.name))?;
-                                let rect = [laid.x + hole[0] + before * 0.5 + sh.dx, laid.y + hole[1] + (hole[3] - s) * 0.5, s, s];
+                                let rect = [laid.x + hole[0] + before * 0.5, laid.y + hole[1] + (hole[3] - s) * 0.5, s, s];
                                 let hdr = sheet.peak.map_or([0.0; 4], |peak| [1.0, peak, 0.0, 0.0]);
-                                let size = [sheet.w as f32, sheet.h as f32, p.alpha * (1.0 - sh.fade), 1.0];
+                                let size = [sheet.w as f32, sheet.h as f32, p.alpha, 1.0];
                                 d.image(ImageInst { rect, size, clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr }, sheet.frames[0].clone());
                             } else {
                                 let (glyph, icon_ink) = crate::inline::icon(w, &t.tag, dark);
                                 let icon = self.layout(&glyph, &icon_style, 1.0e5);
                                 let gw = icon.lines.iter().map(|l| l.width).fold(0.0, f32::max);
                                 let gh = icon.lines.first().map_or(icon_style.line, |l| l.height);
-                                let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5 + sh.dx;
+                                let x = laid.x + hole[0] + before * 0.5 + (icon_style.size - gw) * 0.5;
                                 let y = laid.y + hole[1] + (hole[3] - gh) * 0.5;
-                                emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha * (1.0 - sh.fade), sc, usize::MAX, upload);
+                                emit_layout(d, &self.fonts, &mut self.cache, &icon, (x, y), icon_ink, p.alpha, sc, usize::MAX, upload);
                             }
                             // The mark's hole is MARK_EM wide: the gap after the label, then the mark at its end. Nothing
                             // while its live state has none (unknown, or not asked yet).
@@ -861,11 +840,9 @@ impl Painter {
                             let mlay = self.layout(&mglyph, &mark_style, 1.0e5);
                             let mw = mlay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
                             let mh = mlay.lines.first().map_or(mark_style.line, |l| l.height);
-                            let sh = shift_at(at);
-                            let x = laid.x + mhole[0] + mhole[2] - mw + sh.dx;
+                            let x = laid.x + mhole[0] + mhole[2] - mw;
                             let y = laid.y + mhole[1] + (mhole[3] - mh) * 0.5;
-                            let a = p.alpha * (1.0 - sh.fade);
-                            emit_layout(d, &self.fonts, &mut self.cache, &mlay, (x, y), mink, a, sc, usize::MAX, upload);
+                            emit_layout(d, &self.fonts, &mut self.cache, &mlay, (x, y), mink, p.alpha, sc, usize::MAX, upload);
                         }
                     }
                 }
@@ -1320,13 +1297,6 @@ fn strike_look(w: WorldRef<'_>) -> StrikeLook {
 
 /// The rects (x, y from the layout's origin, w, h) of UTF-16 units `lo..hi` of `lay`, one per line they cover.
 pub fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
-    spans_at(lay, lo, hi).into_iter().map(|(_, r)| r).collect()
-}
-
-/// [`spans_of`], each rectangle with the UTF-16 unit it starts at (the range's start on its first line, the line's start
-/// on the rest): what a decoration over glyphs that glide (reflow.rs) moves with.
-#[must_use]
-pub fn spans_at(lay: &Layout, lo: usize, hi: usize) -> Vec<(usize, [f32; 4])> {
     let mut out = Vec::new();
     if lo >= hi || lay.lines.is_empty() {
         return out;
@@ -1338,7 +1308,7 @@ pub fn spans_at(lay: &Layout, lo: usize, hi: usize) -> Vec<(usize, [f32; 4])> {
         let a = if li == l0 { x0 } else { 0.0 };
         let b = if li == l1 { x1 } else { l.width };
         if b > a {
-            out.push((if li == l0 { lo } else { l.start.max(lo) }, [a, l.top, b - a, l.height]));
+            out.push([a, l.top, b - a, l.height]);
         }
     }
     out

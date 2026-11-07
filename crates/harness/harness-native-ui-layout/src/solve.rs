@@ -25,8 +25,8 @@
 //! `LaysAtRest` lays a node's children in the room it gets with every moving `RestSize` at that length (`rest_room`,
 //! carried down from the moving node's parent) and places them in the frame it has now: what cannot follow a moving box (a
 //! terminal's grid, which resizes its pty once per fold). Words follow it: a text breaks its lines at the width it has
-//! this frame, so prose re-wraps live as a fold moves (the host only breaks it again, `Layout::wrap`, and glides the glyphs
-//! a new break moves, harness-native-render's reflow.rs); `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's
+//! this frame, so prose re-wraps live as a fold moves (the host only breaks it again over its cached shaping, harness-native-render's
+//! `Layout::wrap`); `ViewThatFits` shows the first variant that fits; `SafeAreaPadding` pads a node out of the root's
 //! `SafeAreaInset` (a second pass, once the first has said where the node is); a `GrowLimit` caps a growing height at a
 //! share of its pane's (`grow_limits`, a second height pass once the first has said how tall the pane is).
 use harness_native_ui_layout_api::{Align, FlexAxis, Flex, Justify, Opens, Side, SizeKind, Sizing};

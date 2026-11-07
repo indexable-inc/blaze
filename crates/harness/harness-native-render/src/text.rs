@@ -1979,7 +1979,7 @@ fn make_line(
 }
 
 #[cfg(test)]
-mod reflow_tests {
+mod wrap_tests {
     use super::*;
 
     /// A line as the eye and the caret see it: its units, box, width and every glyph's face, id, unit and place, to the bit.
