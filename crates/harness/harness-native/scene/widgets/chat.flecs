@@ -8,8 +8,9 @@ hn {
   prefab ChatPane : hn.Pane {
     // The chat's page: the theme's ground (tone_ground), the main card's own.
     Fill: $tone_ground
-    // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, while their
-    // words break their lines at the width they have once the fold rests (WrapAt), so they wrap once per fold.
+    // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, and their
+    // words re-wrap live at the width they have each frame (the glyphs a new break moves glide there), the row at the
+    // top of the view held still (src/app/chat.rs).
     list : ui.Scroll {
       Cursor: {shape: Text}
       ClipFade: {len: $chat_fade_len}
@@ -149,7 +150,7 @@ hn {
   prefab ChatPickWord : ui.Line {
     Fill: $tone_ink_muted
     Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
-    TextStyle: {size: $size_chat_pick, line: $line_chat_status, role: 0, bold: 0}
+    TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
   }
   // Its menu (pick.rs), a ui.Menu above it chat_pick_menu_w wide: the models (hn.ChatPickModels, unless it opened on the
   // effort alone), then the effort (hn.ChatPickEffort, unless it opened on the models alone), a hairline between.

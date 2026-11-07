@@ -1009,6 +1009,12 @@ impl Shaped {
     pub fn text(&self) -> String {
         String::from_utf16_lossy(&self.units)
     }
+
+    /// Whether this text is `prev` with more after it (words streaming in): each unit of `prev` is the same unit here.
+    #[must_use]
+    pub fn extends(&self, prev: &Self) -> bool {
+        self.units.starts_with(&prev.units)
+    }
 }
 
 /// What a line the typesetter set showed of the cut at a unit: the line starting or ending there was its paragraph's
@@ -1969,6 +1975,46 @@ fn make_line(
         hard_break: false,
         set: OnceCell::from(set),
         base: 0,
+    }
+}
+
+#[cfg(test)]
+mod reflow_tests {
+    use super::*;
+
+    /// A line as the eye and the caret see it: its units, box, width and every glyph's face, id, unit and place, to the bit.
+    fn seen(l: &Line) -> (usize, usize, [u32; 4], bool, Vec<(FontId, u16, usize, u32, u32)>) {
+        let boxed = [l.top, l.height, l.baseline, l.width].map(f32::to_bits);
+        let glyphs = l.glyphs.iter().map(|g| (g.font, g.id, g.idx, g.x.to_bits(), g.y.to_bits())).collect();
+        (l.start, l.end, boxed, l.hard_break, glyphs)
+    }
+
+    /// A transcript's prose re-wrapping live through a fold, shaped once: broken again at every width a sidebar's spring
+    /// passes, narrowing and then widening, each break-only layout ([`Layout::wrap`], reusing the lines, cuts and seams the
+    /// widths before it left) is the layout the typesetter sets from nothing at that width ([`Layout::typeset`]), line for
+    /// line and glyph for glyph.
+    #[test]
+    fn breaking_again_at_a_width_is_a_full_layout_at_that_width() {
+        let text = "Live re-wrap keeps every word where the typesetter puts it, whatever width came before: \
+                    blaze builds blaze, and the harness's transcript follows its column as the sidebar folds.\n\
+                    A second paragraph, with a long-unbroken-identifier_like_this_one and \u{201c}quotes\u{201d}, \
+                    then a line that ends hard.\n\nAfter a blank line, the last words.";
+        let len = text.encode_utf16().count();
+        let bold = [Run { start: 5, end: 12, face: Face::Bold }];
+        let style = Style { size: 14.0, bold: false, line: 20.0 };
+        let mut fonts = Fonts::default();
+        let shaped = Rc::new(Shaped::new(&mut fonts, text, &bold, &[], &[], style, 0.0));
+        let narrowing = (0..60).map(|k| 640.0 - 7.25 * k as f32);
+        let widening = (0..60).map(|k| 212.5 + 7.25 * k as f32);
+        for w in narrowing.chain(widening) {
+            let again = Layout::wrap(&mut fonts, &shaped, w);
+            let full = Layout::typeset(&mut fonts, text, &bold, &[], &[], style, 0.0, w);
+            assert_eq!(again.lines.len(), full.lines.len(), "at {w} points: {} lines broken again, {} set", again.lines.len(), full.lines.len());
+            for (k, (a, b)) in again.lines.iter().zip(&full.lines).enumerate() {
+                assert_eq!(seen(a), seen(b), "at {w} points, line {k} differs");
+            }
+            assert_eq!(again.lines.last().map(|l| l.end), Some(len), "at {w} points the lines do not cover the text");
+        }
     }
 }
 
