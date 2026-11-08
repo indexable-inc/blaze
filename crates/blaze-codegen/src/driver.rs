@@ -32,7 +32,7 @@ use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
 
 use crate::{
-    CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
+    CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Static, Target, Unit,
     backend::{
         Address, Described, DescribedStatic, Emitted, FrontRef, Frontend, Import, Prepare, Shape,
         laid_out, release_refs,
@@ -181,9 +181,10 @@ pub struct Built {
     /// By item and instance.
     pub statics: Vec<Static>,
     pub roots: Vec<InstanceKey>,
-    /// Functions outside code names, with their symbols.
-    pub symbols: Vec<(InstanceKey, String)>,
-    pub static_symbols: Vec<(ItemKey, ContentId, String)>,
+    /// Functions outside code names, with their symbols and how each is defined
+    /// ([`crate::backend::Described::linkage`]).
+    pub symbols: Vec<(InstanceKey, String, Linkage)>,
+    pub static_symbols: Vec<(ItemKey, ContentId, String, Linkage)>,
     /// Functions reached through their slots.
     pub patchable: Vec<InstanceKey>,
     /// Functions of a live build whose code [`Build::tier_up`] replaces.
@@ -1994,12 +1995,40 @@ impl<'a, B: Prepare> Build<'a, B> {
         let through_slot: HashMap<InstanceKey, bool> =
             // alloc: per build, sized by its units
             nodes.iter().map(|(key, node)| (*key, node.patchable || node.then.is_some())).collect();
+        // What is defined weakly under a name ([`Linkage::Weak`]): every reference to it is by
+        // that name, never by key, so a strong definition elsewhere on the link takes them all
+        // over, as LLVM treats a weak definition as interposable and ld64 and lld bind every
+        // reference to the strong one. The linker resolves the name to this definition when
+        // nothing stronger defines it.
+        let weakly = |symbol: &Option<String>, linkage: Linkage| match linkage {
+            // clone: per build, the name of a weakly defined function or static, a few
+            Linkage::Weak => symbol.clone(),
+            Linkage::Strong => None,
+        };
+        let weak_functions: HashMap<InstanceKey, String> = nodes
+            .iter()
+            .filter_map(|(key, node)| {
+                Some((*key, weakly(&node.described.symbol, node.described.linkage)?))
+            })
+            // alloc: per build, its weakly defined functions, a few
+            .collect();
+        let weak_statics: HashMap<(ItemKey, ContentId), String> = statics
+            .iter()
+            .filter_map(|(id, node)| {
+                Some((*id, weakly(&node.described.symbol, node.described.linkage)?))
+            })
+            // alloc: per build, its weakly defined statics, a few
+            .collect();
         let resolve = |refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>], requester: &Origin| {
             refs.iter()
                 .map(|it| match it {
                     FrontRef::Function(callee) => {
                         // clone: per build, the walk's key of a callee; who asks for it is a copy
                         let key = asked.get(&(callee.clone(), *requester))?;
+                        if let Some(name) = weak_functions.get(key) {
+                            // clone: per build, a reference to a weakly defined function
+                            return Some(Target::Extern(name.clone()));
+                        }
                         Some(match through_slot.get(key) {
                             Some(true) => Target::Function(*key),
                             _ => Target::Direct(*key),
@@ -2007,6 +2036,10 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     FrontRef::Static(value) => {
                         let (item, instance) = *static_asked.get(value)?;
+                        if let Some(name) = weak_statics.get(&(item, instance)) {
+                            // clone: per build, a reference to a weakly defined static
+                            return Some(Target::Extern(name.clone()));
+                        }
                         Some(Target::Static { item, instance })
                     }
                     // clone: per build, the instance's own target, kept by its node
@@ -2468,14 +2501,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         let built_symbols = |node: &Node<B>| node.described.symbol.clone();
         let symbols = nodes
             .iter()
-            .filter_map(|(key, node)| Some((*key, built_symbols(node)?)))
+            .filter_map(|(key, node)| {
+                Some((*key, built_symbols(node)?, node.described.linkage))
+            })
             // alloc: per build, what it gives the linker
             .collect();
         let static_symbols = statics
             .iter()
             // clone: per build, the symbols the build gives the linker
             .filter_map(|((item, instance), node)| {
-                Some((*item, *instance, node.described.symbol.clone()?))
+                Some((*item, *instance, node.described.symbol.clone()?, node.described.linkage))
             })
             // alloc: per build, what it gives the linker
             .collect();

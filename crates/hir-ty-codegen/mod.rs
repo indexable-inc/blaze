@@ -2310,6 +2310,34 @@ pub fn exported_static(db: &Db, id: StaticId) -> Option<intern::Symbol> {
     })
 }
 
+/// How a function or static Rust code defines under a name ([`exported_symbol`],
+/// [`linked_symbol`], [`exported_static`]) is defined, read off its `#[linkage]`: the one
+/// place the linkage of a named definition is decided, which codegen's driver and the linker
+/// take as it is ([`blaze_codegen::Linkage`]). rustc gives `weak`, `weak_odr`, `linkonce` and
+/// `linkonce_odr` a weak symbol in the object (LLVM's `WeakAny`, `WeakODR`, `LinkOnceAny`,
+/// `LinkOnceODR`), and `external` or no attribute a strong one. Any other linkage on a named
+/// definition (`internal`, `private`, `available_externally`, `common`, `appending`,
+/// `extern_weak`) is refused naming it: blaze links every named definition as one global
+/// symbol, and taking it for a strong one would link another program than rustc's.
+pub fn exported_linkage(
+    db: &Db,
+    owner: hir_def::AttrDefId,
+) -> std::result::Result<blaze_codegen::Linkage, String> {
+    let Some(linkage) = AttrFlags::linkage(db, owner) else {
+        return Ok(blaze_codegen::Linkage::Strong);
+    };
+    match linkage.as_str() {
+        "external" => Ok(blaze_codegen::Linkage::Strong),
+        "weak" | "weak_odr" | "linkonce" | "linkonce_odr" => Ok(blaze_codegen::Linkage::Weak),
+        // alloc: the error's message
+        other => Err(format!(
+            "`#[linkage = \"{other}\"]` on a definition outside code names by its symbol: blaze links a named \
+             definition strongly (`external`, or no `#[linkage]`) or weakly (`weak`, `weak_odr`, `linkonce`, \
+             `linkonce_odr`), never as `{other}`"
+        )),
+    }
+}
+
 /// The symbol an item of an `extern` block links to, on its crate's target. A target that
 /// does not load is an error: the symbol depends on it.
 pub fn link_name(db: &Db, func: FunctionId) -> Result<Option<String>> {

@@ -25,6 +25,8 @@ struct Function {
     statics: Vec<u32>,
     origin: Origin,
     symbol: Option<String>,
+    /// How `symbol` is defined ([`Described::linkage`]).
+    linkage: crate::Linkage,
     /// The places among its references it builds in.
     built_in: Vec<u32>,
     /// The outside symbol it calls, its last reference: no part of its code hash, so two
@@ -121,6 +123,7 @@ impl Program {
             statics: Vec::new(),
             origin: Origin::Member(Package::new("app")),
             symbol: None,
+            linkage: crate::Linkage::Strong,
             built_in: Vec::new(),
             outside: "memcpy",
             code_of: None,
@@ -187,6 +190,7 @@ impl Frontend for Program {
                 None => Address::Free,
             },
             symbol: function.symbol.clone(),
+            linkage: function.linkage,
             refs,
             built_in: function.built_in.clone(),
             name: format!("f{id}"),
@@ -206,6 +210,7 @@ impl Frontend for Program {
             origin: Origin::Member(Package::new("app")),
             owner: Owner::Workspace,
             symbol: None,
+            linkage: crate::Linkage::Strong,
             name: format!("app::S{id}"),
             refs: self
                 .static_calls
@@ -614,7 +619,7 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
     assert_eq!(cold.stats.memo, 1);
     assert_eq!(cold.functions.len(), 5);
     assert_eq!(cold.roots.len(), 1);
-    assert_eq!(cold.symbols, vec![(cold.roots[0], "main".to_owned())]);
+    assert_eq!(cold.symbols, vec![(cold.roots[0], "main".to_owned(), crate::Linkage::Strong)]);
 
     store.keep(&cold.puts);
     let warm_machine = Machine::default();
@@ -753,6 +758,41 @@ fn a_callee_edit_renames_its_callers_and_compiles_only_it() {
         after.functions.iter().find(|it| it.relocs.targets().contains(&Target::Direct(new)));
     assert!(caller.is_some_and(|it| it.code[0] == 0x22));
     assert!(after.functions.iter().all(|it| !it.relocs.targets().contains(&Target::Direct(old))));
+}
+
+/// A function defined weakly under a name (`#[linkage = "weak"]`, as compiler-builtins'
+/// intrinsics are) is referred to by that name by every caller, never by its key: a strong
+/// definition elsewhere on the link (a C library's `compiler_rt.o`) then takes every call
+/// over, as ld64 and lld bind them. Its definition is still built and named, weakly.
+#[test]
+fn a_weakly_defined_function_is_called_by_its_name() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    let weak = program.functions.get_mut(&4).unwrap();
+    weak.symbol = Some("__adddf3".to_owned());
+    weak.linkage = crate::Linkage::Weak;
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+        .unwrap();
+    let key_of = |body: u8| built.functions.iter().find(|it| it.code[0] == body).unwrap().key;
+    let (weak, strong) = (key_of(0x44), key_of(0x55));
+    assert!(
+        built.symbols.contains(&(weak, "__adddf3".to_owned(), crate::Linkage::Weak)),
+        "{:?}",
+        built.symbols
+    );
+    let by_name = Target::Extern("__adddf3".to_owned());
+    let caller = built.functions.iter().find(|it| it.relocs.targets().contains(&by_name));
+    assert!(caller.is_some_and(|it| it.code[0] == 0x22), "2 calls 4 by its name");
+    for function in &built.functions {
+        let targets = function.relocs.targets();
+        assert!(
+            !targets.contains(&Target::Direct(weak)) && !targets.contains(&Target::Function(weak)),
+            "{:?} calls the weak definition by key",
+            function.key
+        );
+    }
+    // A strong function is still called by key.
+    assert!(built.functions.iter().any(|it| it.relocs.targets().contains(&Target::Direct(strong))));
 }
 
 #[test]
@@ -1143,6 +1183,7 @@ fn test_static(id: u32) -> DescribedStatic<u32, u32> {
         origin: Origin::Member(Package::new("app")),
         owner: Owner::Workspace,
         symbol: None,
+        linkage: crate::Linkage::Strong,
         name: format!("app::S{id}"),
         refs: Vec::new(),
     }

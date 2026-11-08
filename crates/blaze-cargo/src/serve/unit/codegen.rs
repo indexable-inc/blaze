@@ -2088,14 +2088,14 @@ fn relink(
     patchable.sort_unstable();
     let mut names: Vec<(String, Target)> =
         Vec::with_capacity(built.symbols.len() + built.static_symbols.len());
-    for (key, name) in &built.symbols {
+    for (key, name, _) in &built.symbols {
         let target = match patchable.binary_search(key).is_ok() {
             true => Target::Function(*key),
             false => Target::Direct(*key),
         };
         names.push((name.clone(), target));
     }
-    for (item, instance, name) in &built.static_symbols {
+    for (item, instance, name, _) in &built.static_symbols {
         names.push((name.clone(), Target::Static { item: *item, instance: *instance }));
     }
     let (slots, slotted) = match linked.output.live {

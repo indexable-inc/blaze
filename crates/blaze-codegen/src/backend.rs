@@ -12,7 +12,7 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 
 use crate::{
-    CodegenError, CompiledFunction, InstanceKey, Owner, Static, Unit,
+    CodegenError, CompiledFunction, InstanceKey, Linkage, Owner, Static, Unit,
     plan::Origin,
     settings::Spec,
     summary::{Imports, Summary},
@@ -81,6 +81,9 @@ pub struct Described<I, S> {
     pub address: Address,
     /// The symbol it is defined as, for what outside code names it by.
     pub symbol: Option<String>,
+    /// How `symbol` is defined: [`Linkage::Weak`] makes every reference to it, its build's
+    /// own included, one by name ([`crate::Target::Extern`]); [`Linkage::Strong`] without one.
+    pub linkage: Linkage,
     /// Everything it refers to, each once, in the order of its MIR: its template's places.
     pub refs: Vec<FrontRef<I, S>>,
     /// The places among `refs` of the functions whose bodies its code builds in, as LLVM's
@@ -149,6 +152,8 @@ pub struct DescribedStatic<I, S> {
     /// the workspace's too. Never read off `origin`, which is the settings' concept.
     pub owner: Owner,
     pub symbol: Option<String>,
+    /// How `symbol` is defined, as [`Described::linkage`].
+    pub linkage: Linkage,
     /// Its path, as errors name it (`krate::module::NAME`).
     pub name: String,
     pub refs: Vec<FrontRef<I, S>>,

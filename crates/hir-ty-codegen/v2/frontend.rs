@@ -36,7 +36,9 @@ use super::{
     Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
     undescribed,
 };
-use crate::{Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol};
+use crate::{
+    Instance, InstanceDef, exported_linkage, exported_static, exported_symbol, fncache, linked_symbol,
+};
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
@@ -547,6 +549,10 @@ impl<'db> HirFrontend<'db> {
         // only, the origin's profile is already that crate's setting.
         let overflow_checks = None;
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
+        let linkage = match symbol {
+            Some(_) => linkage_of(db, &instance.0).map_err(fail)?,
+            None => blaze_codegen::Linkage::Strong,
+        };
         let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
         asked_by(owner, &mut refs);
         // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
@@ -567,6 +573,7 @@ impl<'db> HirFrontend<'db> {
             overflow_checks,
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
+            linkage,
             name: super::linked::debug_name(db, &instance.0),
             refs,
             built_in,
@@ -744,6 +751,14 @@ impl<'db> HirFrontend<'db> {
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), Some(item), what))?;
         let owner = self.static_owner(db, value);
         asked_by(owner, &mut held.refs);
+        // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
+        let symbol = exported_static(db, value.0).map(|it| it.as_str().to_owned());
+        let linkage = match symbol {
+            Some(_) => exported_linkage(db, value.0.into()).map_err(|what| {
+                undescribed(db, &super::StaticNamed(db, value.0), Some(item), what)
+            })?,
+            None => blaze_codegen::Linkage::Strong,
+        };
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),
@@ -753,8 +768,8 @@ impl<'db> HirFrontend<'db> {
             section: held.section,
             origin: self.origin(db, value.0.krate(db)),
             owner,
-            // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
-            symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
+            symbol,
+            linkage,
             // alloc: per static described, its path, which errors name it by
             name: crate::fncache::static_name(db, value.0),
             refs: held.refs,
@@ -1621,6 +1636,18 @@ pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Result<Option<String>, String> 
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(..) => None,
     })
+}
+
+/// How the instance [`symbol_of`] names is defined ([`exported_linkage`]): a function's own
+/// `#[linkage]`; the C `main` and the allocator shim's entries are strong.
+pub(super) fn linkage_of(db: &Db, kind: &Kind) -> Result<blaze_codegen::Linkage, String> {
+    match kind {
+        Kind::Code(instance, _) => match instance.def {
+            InstanceDef::Fn(func) if !instance.is_generic() => exported_linkage(db, func.into()),
+            _ => Ok(blaze_codegen::Linkage::Strong),
+        },
+        Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => Ok(blaze_codegen::Linkage::Strong),
+    }
 }
 
 #[cfg(test)]
