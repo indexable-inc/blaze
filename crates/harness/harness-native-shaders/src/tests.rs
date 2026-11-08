@@ -36,7 +36,7 @@ fn mascot_slots() {
     assert_eq!(mascot::mascot_quad_fs::quad, b(0));
     assert_eq!(mascot::mascot_quad_fs::src, Slot { table: Table::Texture, index: 0 });
     assert_eq!(mascot::mascot_quad_fs::smp, Slot { table: Table::Sampler, index: 0 });
-    let names: Vec<&str> = crate::GPU_ENTRIES.0.iter().map(|e| e.desc.name).collect();
+    let names: Vec<&str> = crate::GPU_ENTRIES.0.iter().map(|e| e.desc.name).filter(|n| n.starts_with("mascot")).collect();
     assert_eq!(names, ["mascot_vs", "mascot_fs", "mascot_quad_vs", "mascot_quad_fs"]);
 }
 
@@ -100,7 +100,7 @@ fn mascot_quad_vs_covers_its_rect() {
         time: 0.0,
         dark: 1.0,
         live: 2.0,
-        pad1: Vec2::default(),
+        textfx: Vec2::default(),
         tune: Vec4::default(),
         slug: Vec4::default(),
         place: vec4(0.0, 0.0, 0.0, 0.0),

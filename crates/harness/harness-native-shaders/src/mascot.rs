@@ -123,20 +123,8 @@ pub fn mascot_fs(v: MeshV, mf: &MascotFrame) -> Vec4 {
 
 // The composite: the picture, or the shadow under it.
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, gpu::Pod)]
-pub struct Frame {
-    pub view: Vec2,
-    pub scale: f32,
-    pub time: f32,
-    pub dark: f32,
-    pub live: f32,
-    pub pad1: Vec2,
-    pub tune: Vec4,
-    pub slug: Vec4,
-    /// harness.slang's Frame.place: the view point the target's corner shows.
-    pub place: Vec4,
-}
+/// harness.slang's Frame, which mascot.slang copies (its `textfx` named `pad1` there): one type here.
+pub use crate::harness::Frame;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, gpu::Pod)]
@@ -149,7 +137,7 @@ pub struct MascotQuad {
     pub color: Vec4,
 }
 
-const CORNERS: [Vec2; 4] = [vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(1.0, 1.0)];
+use crate::harness::CORNERS;
 
 #[derive(Copy, Clone, Debug, gpu::Varyings)]
 pub struct QuadV {
