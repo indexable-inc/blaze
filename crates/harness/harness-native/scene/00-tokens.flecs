@@ -47,6 +47,9 @@ export const tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.14}}
 export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // Selected text's plate (ui.selection; every surface's, the terminal's too): the strong ink at 22% (18% on the paper).
 export const tone_text_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.18}}
+// The light a copy sweeps over what it took (ui.selection's CopyLook): the accent lifted toward white on the dark page,
+// where it adds to the plate, and the accent itself on the paper, where it tints; its alpha is the light at its brightest.
+export const tone_copy_sheen: Fill = {dark: {0.800, 0.820, 1.0, 0.26}, light: {0.369, 0.384, 0.902, 0.16}}
 // The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
 // match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
 export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
@@ -410,17 +413,24 @@ export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.
 // Ghostty's selection-background, where the theme sets one, retints it.
 export const plate_selection_radius = 4
 export const plate_selection_n = 2
-// Cmd+C pulses it: den's FlashLook (after the site's selshape.ts and the os text field), a timeline of copy_secs rather
-// than a spring. The selection's shape and its glyphs grow by copy_grow about the selection's middle on a fast ease-out
-// (peaking copy_rise of the way in) and fall back as a cubic; a light of the plate's colour at copy_light (at its
-// brightest halfway) crosses each row left to right over the whole pulse, the rows joining copy_stagger seconds apart,
-// each taking copy_row_in to come in. At its end the pulse is exactly at rest and the frame goes idle.
+// Cmd+C pulses it, a timeline rather than a spring. The grow is den's FlashLook (after the site's selshape.ts and the os
+// text field): the shape and its glyphs grow by copy_grow about the selection's middle over copy_secs, on a fast ease-out
+// peaking copy_rise of the way in, and fall back as a cubic. With it a light (tone_copy_sheen) sweeps the whole shape left
+// to right over copy_sweep on an ease-in-out, coming up and dying away as it goes: a soft band copy_band points either
+// side of its middle, leaning back copy_tilt points for every point down so each row below lights a beat after the one
+// above. It adds to the plate on the dark page (copy_add_dark 1) and lies over it as a tint on the paper (copy_add_light
+// 0), and the glyphs it crosses take copy_ink of its colour where it is brightest. Under Reduce Motion nothing grows or
+// moves: the shape and its glyphs brighten by the light and fade back over copy_secs. At its end the pulse is exactly at
+// rest and the frame goes idle.
 export const copy_secs = 0.3
 export const copy_rise = 0.18
 export const copy_grow = 0.025
-export const copy_light = 0.12
-export const copy_stagger = 0.04
-export const copy_row_in = 0.11
+export const copy_sweep = 0.55
+export const copy_band = 30
+export const copy_tilt = 0.6
+export const copy_ink = 0.6
+export const copy_add_dark = 1
+export const copy_add_light = 0
 // The text caret (prims.flecs ui.caret, den's CaretLook): a bar caret_w wide (whole device pixels), caret_h of the
 // font's size tall about its line's middle, caret_radius round. A jump farther than its height sweeps from where it was
 // over caret_glide seconds on an ease-out cubic, its tail at half the bar's ink; after it last moved it stays solid
