@@ -109,6 +109,12 @@ pub struct Change<'a> {
     /// Names Rust code defines (`#[no_mangle]`, `#[export_name]`, the entry point's callee),
     /// for native code and the loader, and names no longer defined.
     pub names: Vec<(String, Target)>,
+    /// Of `names`, those Rust code defines weakly (codegen's [`blaze_codegen::Linkage::Weak`]:
+    /// `#[linkage = "weak"]`, as compiler-builtins' intrinsics are): a strong definition of
+    /// the name elsewhere on the link wins over it, and every reference to the name, Rust's
+    /// own included, binds to that one, as ld64 and lld link it. A name of `names` not here is
+    /// strong. A name here that `names` does not give is the caller's bug, refused.
+    pub weak_names: Vec<String>,
     pub unnamed: Vec<String>,
     /// Names for debuggers, symbol tables and backtraces.
     pub debug_names: Vec<(InstanceKey, String)>,
