@@ -84,6 +84,15 @@ name or its spelling.
 | `float4 f(..) : SV_Target` | `-> Vec4` | `Target` |
 | `discard` | `gpu::discard()` (returns `!`) | intrinsic |
 | `ddx`, `ddy`, `fwidth`, `tex.Sample*`, `tex.Load` | `dpdx`, `dpdy`, `fwidth`, `Texture2d::{sample, sample_level, load}` | intrinsic |
+| `SV_Position` read in a fragment (the pixel's centre) | `v.pos.0` | `Varying` |
+| `asuint(x)` | `asuint(x)` (`f32::to_bits`) | library |
+| `frac`, `sign` | `frac`, `sign` (`sign` is -1, 0 or 1, 0 for 0 and NaN, as Slang's) | library |
+| `lerp(a, b, t)` with a vector `t` | `lerp(a, b, t)` (per component) | library |
+| `int4`, `int2(v)`, `float2(v)`, `float3(v, z)` | `IVec4`, `v.as_ivec2()` (toward zero), `v.as_vec2()`, `v.extend(z)` | library |
+| `clamp` on an integer vector | `IVec2::clamp`, as on every vector | library |
+| `out float2 p` | `p: &mut Vec2` | language |
+| `select(c, a, b)` on vectors | the scalar `if` per component | language |
+| `for`, `break` | Rust's `for` over a range, `break` | language |
 
 - **Built-ins are typed parameters.** `VertexIndex` and `InstanceIndex` are newtypes over `u32`
   whose `Param::KIND` is the built-in. A vertex stage that takes no `VertexIndex` doesn't get one,
@@ -109,10 +118,15 @@ name or its spelling.
   `GPU_ENTRIES` (each entry's `EntryDesc` and its function), found by its path, not a symbol, so
   two shader crates in one host don't collide. It is what a device build compiles (below) and what
   a host can list.
-- **Math is a library.** `Vec2`, `Vec3`, `Vec4`, `UVec4`, `IVec2` with operators and the swizzles
-  the shaders use as methods (`.xy()`, `.zw()`, `.xyz()`), and Slang's free functions under their
-  Slang names where they are the same function (`dot`, `normalize`, `lerp`, `smoothstep`,
-  `saturate`, `clamp`, `length`), so a port maps line to line. They are plain Rust: on the host they
+- **Math is a library.** `Vec2`, `Vec3`, `Vec4`, `UVec4`, `IVec2`, `IVec4` with operators and the
+  swizzles the shaders use as methods (`.xy()`, `.zw()`, `.xyz()`, `.yx()`), `clamp` on every
+  vector, conversions as methods (`as_ivec2`, `as_vec2`, `extend`), and Slang's free functions under
+  their Slang names where they are the same function (`dot`, `normalize`, `lerp`, `smoothstep`,
+  `saturate`, `clamp`, `length`, `frac`, `sign`, `asuint`), so a port maps line to line. Slang
+  constructs that Rust has its own spelling for stay Rust: an `out` parameter is `&mut`, a vector
+  `select` is the scalar `if` per component, a loop is `for` over a range. Integer division by zero
+  and overflow panic in Rust where Slang leaves them undefined; on the device a panic ends the
+  invocation. They are plain Rust: on the host they
   run as written, which is what the shader crate's CPU tests run.
 
 ### What the compiler adds: two small primitives
@@ -291,7 +305,12 @@ One shader at a time, each on its own switch, with no fallback between them:
    leaves `SLANG`.
 3. **harness.slang.** Port the 14 entry points (SDFs, the HDR transfer functions, Slug's curve
    bands, `asuint`, loops, `SampleLevel`, `Load`, `discard`); each pair leaves `SLANG` when its
-   shots match. Then the Slang path is deleted.
+   shots match. Then the Slang path is deleted. The port is written
+   (`harness-native-shaders/src/harness.rs`, with CPU tests in `harness_tests.rs`, and
+   harness-native-render's `shader_port.rs` checking its structs against pack.rs, its parameters
+   against the MSL's `BINDINGS` and its curves against hdr.rs); the lowering for loops, slices
+   passed to helpers, `&mut` out parameters, local arrays indexed at run time, integer vectors and
+   the sampling intrinsics is what is left.
 4. **SPIR-V and WGSL out**, and the `gpu` crate's Vulkan driver, so the harness renderer can run
    off macOS.
 5. **One session**: plan.md's collector split, so a host can use a generic shader at a type it
