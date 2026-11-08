@@ -31,4 +31,6 @@ gpu::entries![
 ];
 
 #[cfg(test)]
+mod harness_tests;
+#[cfg(test)]
 mod tests;
