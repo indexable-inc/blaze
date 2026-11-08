@@ -2632,7 +2632,7 @@ mod tests {
         for role in [
             "ground", "sidebar", "card", "raised", "well", "term_ground", "line", "line_strong", "ink_strong", "ink",
             "ink_muted", "ink_faint", "hover", "wash", "selection", "selection_focus", "press", "scrim", "clear",
-            "text_selection", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
+            "text_selection", "copy_sheen", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
             "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell",
         ] {
             let _ = crate::look::tone(w, role);

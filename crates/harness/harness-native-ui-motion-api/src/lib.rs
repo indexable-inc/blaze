@@ -153,58 +153,32 @@ pub struct Shown {
     pub started: bool,
 }
 
-/// A copy's pulse on what was copied (a selected run of words, a table's row, a terminal): den's flash (ui.rs `Flash` and
-/// `pulse`, after the site's selshape.ts), a fixed timeline rather than a spring. Over `secs` the selection's shape and its
-/// glyphs grow and come back ([`CopyFlash::amount`]: up on an ease-out cubic in the first `rise` share, down as a cubic), and
-/// a light of the plate's colour crosses each row ([`CopyFlash::light`], peaking halfway). `age` is the seconds since the
-/// copy; harness-native-ui-motion steps it and puts the pulse back at rest at its end, so nothing more is drawn and the
-/// frame goes idle. harness-native-render's select.rs draws it over the selection plate.
+/// A copy's pulse on what was copied (a selected run of words, a table's row, a terminal): its clock, a fixed timeline
+/// rather than a spring. What plays over it (the grow, the light sweeping across, the glow under Reduce Motion) is the
+/// scene's `ui.selection` `CopyLook`, drawn over the selection plate by harness-native-render's select.rs. `age` is the
+/// seconds since the copy; harness-native-ui-motion steps it and puts the pulse back at rest at its end, so nothing more is
+/// drawn and the frame goes idle.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CopyFlash {
     pub age: f32,
-    /// How long the pulse lasts (0: at rest).
+    /// How long the pulse lasts (0: at rest): its look's `CopyLook::length`.
     pub secs: f32,
-    /// The share of `secs` the grow takes to peak.
-    pub rise: f32,
     /// What was copied is the node's whole rect (a table's row), drawn as a selection plate over it while the pulse lasts;
     /// false: only the node's own selection (a `TextEdit`'s words, a terminal's cells), which its painter pulses.
     pub whole: bool,
 }
 
 impl CopyFlash {
-    /// A pulse starting now that lasts `secs` and peaks `rise` of the way in (the scene's `ui.selection` CopyLook).
+    /// A pulse starting now that lasts `secs` (the scene's `ui.selection` CopyLook's `length`).
     #[must_use]
-    pub fn kicked(secs: f32, rise: f32) -> Self {
-        Self { age: 0.0, secs, rise, whole: false }
+    pub fn kicked(secs: f32) -> Self {
+        Self { age: 0.0, secs, whole: false }
     }
 
     /// Whether it is still playing.
     #[must_use]
     pub fn live(&self) -> bool {
         self.secs > 0.0 && self.age < self.secs
-    }
-
-    /// How far through it is, 0 to 1.
-    #[must_use]
-    pub fn phase(&self) -> f32 {
-        if self.secs > 0.0 { (self.age / self.secs).clamp(0.0, 1.0) } else { 1.0 }
-    }
-
-    /// The grow, 0 at rest and 1 at its peak: den's `pulse` (the os `selection_copy_scale` curve), up on an ease-out cubic
-    /// over the first `rise` of it, then down as `(1 - t)^3`.
-    #[must_use]
-    pub fn amount(&self) -> f32 {
-        if !self.live() {
-            return 0.0;
-        }
-        let (p, rise) = (self.phase(), self.rise.clamp(1e-3, 0.999));
-        if p <= rise { 1.0 - (1.0 - p / rise).powi(3) } else { (1.0 - (p - rise) / (1.0 - rise)).max(0.0).powi(3) }
-    }
-
-    /// The light crossing the rows, 0 to 1: `sin(pi * phase)`, brightest halfway through.
-    #[must_use]
-    pub fn light(&self) -> f32 {
-        if self.live() { (std::f32::consts::PI * self.phase()).sin().max(0.0) } else { 0.0 }
     }
 }
 

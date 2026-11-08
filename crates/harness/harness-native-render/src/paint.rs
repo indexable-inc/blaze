@@ -121,6 +121,20 @@ fn hovered(e: EntityView<'_>, c: Rgba, outline: bool, dark: bool) -> Rgba {
     Rgba { r: m(c.r, to.r), g: m(c.g, to.g), b: m(c.b, to.b), a: m(c.a, to.a) }
 }
 
+/// How far up from a node a copied row's words sit (a table's row, its cell, the cell's words).
+const COPIED_ROW_DEPTH: usize = 6;
+
+/// The copied row (a node with a live `CopyFlash` over its whole rect: a table's row) that words node `e` sits in, with
+/// where that row is drawn this frame (view points: its `Painted` frame, as the host draws it, else its `Laid`).
+fn copied_row(e: EntityView<'_>) -> Option<([f32; 4], CopyFlash)> {
+    std::iter::successors(e.parent(), |n| n.parent()).take(COPIED_ROW_DEPTH).find_map(|n| {
+        let f = n.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.live())?;
+        let drawn = n.try_cloned::<&Painted>().filter(|p| p.w > 0.0 || p.h > 0.0).map(|p| [p.x, p.y, p.w, p.h]);
+        let r = drawn.or_else(|| n.try_cloned::<&Laid>().map(|l| [l.x, l.y, l.w, l.h]))?;
+        Some((r, f))
+    })
+}
+
 pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
@@ -563,11 +577,13 @@ impl Painter {
                 if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held) {
                     d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                 }
-                // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts.
+                // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts, its
+                // light crossing it (its words catch that light as they are drawn: `copied_row`).
                 if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.live()) {
                     let look = select::Look::of(e.world());
                     let plate = [select::Plate::of(rect[0], rect[1], rect[2], rect[3])];
-                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount().max(f.light()), sc);
+                    let pulse = select::Pulse::of(&plate, &look, Some(f), dark);
+                    select::emit(d, &plate, &look, look.colour(dark), &pulse, p.alpha * look.shown(f), sc);
                 }
             }
             PaintKind::Glyphs => {
@@ -689,8 +705,9 @@ impl Painter {
                     Some((col, p.alpha * a, dy))
                 };
                 // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy, the
-                // words it holds growing with it.
+                // words it holds growing with it and catching its light (below).
                 let mut grow = None;
+                let mut lit = None;
                 if let Some(t) = edit.filter(|t| t.anchor != t.caret) {
                     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
                     let plates: Vec<select::Plate> = spans_of(&lay, lo, hi)
@@ -698,10 +715,17 @@ impl Painter {
                         .map(|r| select::Plate::of(laid.x + r[0], laid.y + r[1], r[2], r[3]))
                         .collect();
                     let look = select::Look::of(e.world());
-                    let flash = e.try_cloned::<&CopyFlash>();
-                    grow = select::Grow::of(&plates, &look, flash).map(|g| (lo, hi, g));
-                    select::emit(d, &plates, &look, look.colour(dark), flash, p.alpha, sc);
+                    let pulse = select::Pulse::of(&plates, &look, e.try_cloned::<&CopyFlash>(), dark);
+                    grow = pulse.grow.map(|g| (lo, hi, g));
+                    select::emit(d, &plates, &look, look.colour(dark), &pulse, p.alpha, sc);
+                    lit = Some((pulse, plates));
                 }
+                // Words in a copied row (a table's) grow with its plate and catch its light.
+                let row = copied_row(e).map(|(r, f)| {
+                    let plate = [select::Plate::of(r[0], r[1], r[2], r[3])];
+                    select::Pulse::of(&plate, &select::Look::of(e.world()), Some(f), dark)
+                });
+                let first_glyph = d.glyphs.len();
                 // The stretches of its words a child marks (a `TextRange`: a table's match), a plate in the child's Fill and
                 // Shape over each row they cover, under the words. Not on words cut to fit or set from markdown: their glyphs
                 // are not the text's.
@@ -730,6 +754,17 @@ impl Painter {
                     grow,
                     &mut look,
                 );
+                if let Some((pulse, plates)) = &lit {
+                    pulse.light_glyphs(&mut d.glyphs[first_glyph..], plates);
+                }
+                if let Some(pulse) = &row {
+                    for g in &mut d.glyphs[first_glyph..] {
+                        if let Some(gr) = pulse.grow {
+                            g.rect = gr.rect(g.rect);
+                        }
+                        pulse.light_glyph(g);
+                    }
+                }
                 if let Some(m) = md {
                     // Code spans on a chip, a plate per line they cover.
                     let chip = rgba(if dark { m.chip_dark } else { m.chip_light });

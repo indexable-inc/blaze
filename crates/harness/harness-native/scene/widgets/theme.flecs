@@ -32,6 +32,7 @@ hn {
     scrim { Fill: $tone_scrim }
     clear { Fill: $tone_clear }
     text_selection { Fill: $tone_text_selection }
+    copy_sheen { Fill: $tone_copy_sheen }
     // Accent, links, code.
     accent { Fill: $tone_accent }
     accent_wash { Fill: $tone_accent_wash }
