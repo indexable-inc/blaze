@@ -43,7 +43,9 @@ pub struct PanelInst {
     /// 4 caret (caret.rs): edge_d the sweep's start rect, edge_l the bar at rest, fx2.z the move time, shape.y the sweep's seconds,
     /// shape.z the seconds it stays solid after it moved, shape.w the share of a blink each turn eases over, fx.y the
     /// blink's cycle in seconds, fx2.w when it last moved (the scene's CaretLook), lens the box it stays in,
-    /// 5 copy light (select.rs): a band of the fill across the row at fx2.z of the way, fx2.w the square-corner mask, 6 image,
+    /// 5 copy light (select.rs `Pulse`): a soft band of the fill over the row, its middle through lens.xy (view points),
+    /// leaning back lens.w points a point down, lens.z either side (0: the whole row), fx2.z the share of it that adds to
+    /// what is under, fx2.w the square-corner mask, 6 image,
     /// 8 chevron, 9 stopwatch: begun at fx2.z (frame time), lasting lens.x seconds, 10 the light on an icon button's glass:
     /// a soft highlight of the fill at lens.xy from the rect's middle, lens.z across, and the rim facing it, 11 invisible
     /// ink, 12 an agent's art (ui/agentgrid.rs): the fill its ink over the edge as its ground, lens its clock, calm,

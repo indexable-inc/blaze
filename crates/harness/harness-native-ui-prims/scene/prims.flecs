@@ -605,11 +605,15 @@ ui {
 @tree ChildOf
 ui {
   // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
-  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook: a 300 ms timeline, not a spring).
+  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook grow and a light that sweeps it: a timeline, not a spring).
   prefab selection {
     Fill: $tone_text_selection
     Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
-    CopyLook: {secs: $copy_secs, rise: $copy_rise, grow: $copy_grow, light: $copy_light, stagger: $copy_stagger, row_in: $copy_row_in}
+    CopyLook: {
+      secs: $copy_secs, rise: $copy_rise, grow: $copy_grow,
+      sweep: $copy_sweep, band: $copy_band, tilt: $copy_tilt, ink: $copy_ink,
+      dark: $tone_copy_sheen.dark, light: $tone_copy_sheen.light, add_dark: $copy_add_dark, add_light: $copy_add_light
+    }
   }
   // The text caret's one look (harness-native-render caret.rs, harness.slang's caret): every field, text area and the
   // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.

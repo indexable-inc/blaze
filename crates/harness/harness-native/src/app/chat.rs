@@ -1816,10 +1816,9 @@ impl App {
         if hit.is_empty() {
             return;
         }
-        let look = harness_native_render::select::Look::of(w).copy;
-        let whole = matches!(what, Copied::TableRow(..));
+        let pulse = CopyFlash { whole: matches!(what, Copied::TableRow(..)), ..harness_native_render::select::Look::of(w).kick() };
         for id in hit {
-            w.entity_from_id(id).set(CopyFlash { whole, ..CopyFlash::kicked(look.secs, look.rise) });
+            w.entity_from_id(id).set(pulse);
         }
     }
 

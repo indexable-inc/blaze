@@ -143,18 +143,68 @@ pub struct HoverLook {
     pub radius: f32,
 }
 
-/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): it lasts `secs`; the selection's
-/// shape and glyphs grow by the share `grow`, peaking `rise` of the way in, and come back; a light of the plate's colour at
-/// alpha `light` crosses each row over the whole pulse, the rows joining `stagger` seconds apart, each taking `row_in`
-/// seconds to come in. The pulse itself is a `CopyFlash` (harness-native-ui-motion-api).
+/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook, with a light that sweeps). The
+/// selection's shape and glyphs grow by the share `grow` over `secs`, peaking `rise` of the way in, and come back
+/// ([`CopyLook::grow_at`], den's `pulse`). Over `sweep` seconds a soft band of light crosses the whole shape left to right
+/// ([`CopyLook::sweep_at`]): `band` points either side of its middle, leaning `tilt` points back for every point down, so
+/// the rows below light a moment after the ones above, in `dark` or `light` (the theme's `tone_copy_sheen`; its alpha the
+/// light's peak). It lies over the plate and the glyphs: `add_dark` and `add_light` say how much of it adds to what is
+/// under (1: light on a dark page) rather than lying over it (0: a tint on a light page), and the glyphs it crosses take
+/// the share `ink` of its colour at its middle. Under Reduce Motion nothing grows or moves: the whole shape brightens by
+/// the light and fades back over `secs` ([`CopyLook::glow_at`]). The pulse's clock is a `CopyFlash`
+/// (harness-native-ui-motion-api).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CopyLook {
     pub secs: f32,
     pub rise: f32,
     pub grow: f32,
-    pub light: f32,
-    pub stagger: f32,
-    pub row_in: f32,
+    pub sweep: f32,
+    pub band: f32,
+    pub tilt: f32,
+    pub ink: f32,
+    pub dark: Rgba,
+    pub light: Rgba,
+    pub add_dark: f32,
+    pub add_light: f32,
+}
+
+impl CopyLook {
+    /// How long a pulse lasts: the longer of the grow and the sweep, or under Reduce Motion (`still`) the glow's `secs`.
+    #[must_use]
+    pub fn length(&self, still: bool) -> f32 {
+        if still { self.secs } else { self.secs.max(self.sweep) }
+    }
+
+    /// The grow `age` seconds in, 0 at rest and 1 at its peak: den's `pulse` (the os `selection_copy_scale` curve), up on
+    /// an ease-out cubic over the first `rise` of `secs`, then down as `(1 - t)^3`.
+    #[must_use]
+    pub fn grow_at(&self, age: f32) -> f32 {
+        if self.secs <= 0.0 || !(0.0..self.secs).contains(&age) {
+            return 0.0;
+        }
+        let (p, rise) = (age / self.secs, self.rise.clamp(1e-3, 0.999));
+        if p <= rise { 1.0 - (1.0 - p / rise).powi(3) } else { (1.0 - (p - rise) / (1.0 - rise)).powi(3) }
+    }
+
+    /// The sweep `age` seconds in: how far across the band is (0 just before the shape, 1 just past it, on an ease-in-out
+    /// sine) and how bright it is (`sin(pi * t)`: it comes up and dies away rather than switching). None outside it.
+    #[must_use]
+    pub fn sweep_at(&self, age: f32) -> Option<(f32, f32)> {
+        if self.sweep <= 0.0 || !(0.0..self.sweep).contains(&age) {
+            return None;
+        }
+        let turn = std::f32::consts::PI * age / self.sweep;
+        Some((0.5 - 0.5 * turn.cos(), turn.sin()))
+    }
+
+    /// Under Reduce Motion, how bright the shape is `age` seconds in: up and back as `sin(pi * t)` over `secs`.
+    #[must_use]
+    pub fn glow_at(&self, age: f32) -> f32 {
+        if self.secs <= 0.0 || !(0.0..self.secs).contains(&age) {
+            return 0.0;
+        }
+        (std::f32::consts::PI * age / self.secs).sin()
+    }
 }
 
 /// The text caret's one look (`ui.caret` in prims.flecs; den's CaretLook, shaders/den.slang's caret): a bar `w` points
