@@ -21,7 +21,7 @@ pub mod vec;
 pub use entry::{
     Code, Entries, Entry, EntryDesc, Field, FieldKind, Flat, InstanceIndex, Interp, Kind, Linear, Out, Output, Param,
     ParamDesc, Pod, Position, Sampler, Slot, Stage, Table, Texture2d, Value, ValueTy, Varying, Varyings, VertexIndex,
-    check, layout, layout_fields,
+    check, layout, layout_fields, sizes_slot,
 };
 pub use gpu_macros::{Pod, Varyings, fragment, vertex};
 

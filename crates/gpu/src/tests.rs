@@ -62,6 +62,20 @@ fn slots_count_per_entry_and_table_in_parameter_order() {
     assert_eq!(quad_fs::ENTRY.param("nothing"), None);
 }
 
+/// The sizes of an entry's storage buffers go in the buffer slot after its last buffer, and an
+/// entry without a storage buffer has none.
+#[test]
+fn storage_sizes_take_the_next_buffer_slot() {
+    assert_eq!(quad_vs::ENTRY.sizes, Some(Slot { table: Table::Buffer, index: 2 }));
+    assert_eq!(quad_fs::ENTRY.sizes, Some(Slot { table: Table::Buffer, index: 2 }));
+    assert_eq!(uniform_only_fs::ENTRY.sizes, None);
+}
+
+#[crate::fragment]
+fn uniform_only_fs(v: V, g: &Globals) -> Vec4 {
+    g.tint * v.uv.y
+}
+
 /// Each parameter's kind comes from its type: `&T` a uniform of T's size, `&[T]` storage of T's
 /// stride, the built-ins and the varyings as themselves.
 #[test]

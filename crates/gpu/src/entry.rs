@@ -129,6 +129,10 @@ pub struct EntryDesc {
     pub stage: Stage,
     pub params: &'static [ParamDesc],
     pub out: Out,
+    /// Where the buffer of the storage buffers' sizes in bytes is bound ([`sizes_slot`]), which
+    /// the device reads for a slice's length; `None` when the entry binds no storage buffer. The
+    /// host writes there one `u32` per storage parameter, in parameter order.
+    pub sizes: Option<Slot>,
 }
 
 impl EntryDesc {
@@ -231,6 +235,32 @@ pub const fn layout<const N: usize>(names: [&'static str; N], kinds: [Kind; N]) 
     out
 }
 
+/// Where an entry point with these parameters binds the sizes of its storage buffers: the buffer
+/// slot after its last buffer, when it has a storage buffer (`&[T]`); the one home of that rule,
+/// which the device backend reads back from `EntryDesc::sizes` by const evaluation. A slice's
+/// length on the device is its buffer's size over its stride, and Metal gives a shader no buffer's
+/// size, so the host passes them (naga's MSL `sizes_buffer`).
+pub const fn sizes_slot(params: &[ParamDesc]) -> Option<Slot> {
+    let (mut storage, mut next) = (false, 0u32);
+    let mut i = 0;
+    while i < params.len() {
+        if let Kind::Storage { .. } = params[i].kind {
+            storage = true;
+        }
+        if let Table::Buffer = params[i].slot.table
+            && params[i].slot.index + 1 > next
+        {
+            next = params[i].slot.index + 1;
+        }
+        i += 1;
+    }
+    if !storage {
+        return None;
+    }
+    assert!(next < MAX_BUFFERS, "an entry point binds storage buffers in all 31 of Metal's buffer slots, leaving none for their sizes");
+    Some(Slot { table: Table::Buffer, index: next })
+}
+
 /// The locations of a varyings struct's fields: each value the next location in field order, the
 /// position none. A struct with two positions fails to compile.
 pub const fn layout_fields<const N: usize>(names: [&'static str; N], kinds: [FieldKind; N]) -> [Field; N] {
@@ -244,7 +274,14 @@ pub const fn layout_fields<const N: usize>(names: [&'static str; N], kinds: [Fie
                 assert!(positions <= 1, "a varyings struct has more than one Position");
                 None
             }
-            FieldKind::Value { .. } => {
+            FieldKind::Value { ty, interp } => {
+                // Integers are not interpolated: Metal, Vulkan and WebGPU each refuse one that isn't flat.
+                if let ValueTy::U32 | ValueTy::UVec4 | ValueTy::I32 | ValueTy::IVec2 = ty {
+                    assert!(
+                        matches!(interp, Interp::Flat),
+                        "an integer varying must be Flat<T>: integers are not interpolated"
+                    );
+                }
                 next += 1;
                 Some(next - 1)
             }

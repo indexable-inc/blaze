@@ -103,6 +103,7 @@ fn described(f: &ItemFn, stage: &str) -> syn::Result<T2> {
                 stage: ::gpu::Stage::#stage,
                 params: &PARAMS,
                 out: <#ret as ::gpu::Output>::OUT,
+                sizes: ::gpu::sizes_slot(&PARAMS),
             };
             const _: () = ::gpu::check(&ENTRY);
             #(#slots)*
