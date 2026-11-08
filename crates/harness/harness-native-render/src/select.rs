@@ -178,7 +178,7 @@ impl Pulse {
         let c = &look.copy;
         let (x0, y0, x1, y1) = bounds(plates);
         let colour = rgba(if dark { c.dark } else { c.light });
-        let light = |now: f32, x: f32, band: f32, tilt: f32| {
+        let lit_by = |now: f32, x: f32, band: f32, tilt: f32| {
             (now > 0.0).then_some(Light {
                 rgb: [colour[0], colour[1], colour[2]],
                 a: colour[3] * now,
@@ -192,15 +192,17 @@ impl Pulse {
             })
         };
         if look.still {
-            return Self { grow: None, light: light(c.glow_at(f.age), 0.0, 0.0, 0.0) };
+            return Self { grow: None, light: lit_by(c.glow_at(f.age), 0.0, 0.0, 0.0) };
         }
-        let grow = Some(Grow { cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5, scale: 1.0 + c.grow * c.grow_at(f.age) });
+        // Once the grow is over (the light still crossing) the plates are back on the pixel grid, as at rest.
+        let up = c.grow_at(f.age);
+        let grow = (up > 0.0).then(|| Grow { cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5, scale: 1.0 + c.grow * up });
         // The band's middle on the top edge runs from a band before the shape's left to a band past its right plus the
         // lean, so on every row it comes in from nothing and leaves to nothing.
         let light = c.sweep_at(f.age).and_then(|(across, lit)| {
             let band = c.band.max(1.0);
             let (from, to) = (x0 - band, x1 + band + c.tilt * (y1 - y0));
-            light(lit, from + (to - from) * across, band, c.tilt)
+            lit_by(lit, from + (to - from) * across, band, c.tilt)
         });
         Self { grow, light }
     }
