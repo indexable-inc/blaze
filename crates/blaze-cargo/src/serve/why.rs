@@ -69,8 +69,9 @@ const WORKSPACES: usize = 16;
 /// records are not compared with new ones under other names. 3: a record's "the blaze
 /// executable" part became its three makers' code identities (`RecordMakers`). 4: a dev
 /// template's callees that share a path and an origin are told apart by their subject, and
-/// one its build did not walk by its key.
-const NAMING: u32 = 4;
+/// one its build did not walk by its key. 5: a build script's run that ended has each read it
+/// traced as a part (`script::with_reads`), and its key covers them.
+const NAMING: u32 = 5;
 
 /// What the ledger holds of a subject: its key and the parts of it when it was last computed,
 /// by a build however it ended. Fields in the order deterministic CBOR sorts their names.

@@ -946,6 +946,11 @@ pub(crate) struct ScriptRun {
     /// The ticket of a record its run put that a value depends on where its roots are
     /// ([`blaze_usercode::roots::verify::retraction`]): durable before its job is done.
     puts: RunPuts,
+    /// Why its sandboxed run was not reused ([`run_missed`]), held from its start until the
+    /// run ends: given with what the run then read ([`with_reads`]), so `blaze why` names the
+    /// read that differs from its last run's; a run that ends with no reads known (it failed,
+    /// or was stopped) gives it as its start made it ([`Runs::take_puts`]).
+    missed: Option<blaze_kernel::Miss>,
     /// `build script run`, open from the run's start to its end, so its whole time (the
     /// program's, which no thread of the daemon spends) is a row naming the package and
     /// version. Held ([`blaze_profile::flight::HELD_FIELD`]): entered only while the loop does a step
@@ -1118,7 +1123,8 @@ fn label_run(tag: Tag, package: &str) {
 
 /// Why the sandboxed run of unit `unit`'s build script, keyed as `prepared` says, was not
 /// reused, for `blaze why`: its key's parts by name (its code, each variable it is given), and
-/// past them, what it read when it last ran. Made on a miss only.
+/// past them, what it read when it last ran, which [`with_reads`] names once this run ends.
+/// Made on a miss only.
 fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss {
     use blaze_kernel::Part;
     run_miss(job, unit, |subject, item| {
@@ -1135,6 +1141,119 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
         miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
         miss
     })
+}
+
+/// The domain of a read's value as a part of a run's miss, and of the miss's key with its
+/// reads ([`with_reads`]).
+const READ: &str = "blaze v2 why run read 1";
+const READS_KEY: &str = "blaze v2 why run key with reads 1";
+
+/// The most reads a run's miss names one by one ([`with_reads`]): the first of them by name;
+/// the rest are one part, so a script that reads ten thousand headers does not fill `blaze
+/// why`'s ledger with their names.
+const READS_NAMED: usize = 1024;
+
+/// `miss`, of a sandboxed run that has now ended having read `traced` (its run's key's
+/// inputs past the key: [`blaze_usercode::index::result_key`]), with each read as a part of
+/// it by name, hashed as the run saw it, and a key that covers them. `blaze why` then tells
+/// this run from the last one of its script by the reads that differ, by name: a file by its
+/// path, a directory's listing, a variable, cargo's watch of a whole package or of a tree a
+/// `rerun-if-changed` named, and what it read that can't be traced. Two runs that read the
+/// same have one key: the second ran because the first's result was not kept, which is what
+/// `blaze why` then says. A miss with no parts to tell apart (it failed to be made) is left
+/// as it is.
+fn with_reads(mut miss: blaze_kernel::Miss, traced: &blaze_core::Traced) -> blaze_kernel::Miss {
+    use blaze_kernel::{Miss, Missed, Part};
+    use blaze_usercode::trace;
+    if !matches!(miss.missed, Missed::New) {
+        return miss;
+    }
+    let seen = |kind: u8, bytes: Option<&[u8]>| {
+        let mut hasher = blaze_ids::Hasher::new(READ);
+        hasher.update(&[kind]).opt_part(bytes);
+        Some(hasher.finish())
+    };
+    // A path cargo's rule watches whole is named for what it is, never by the name no file has.
+    let walked = |path: &Path| {
+        trace::walked(path).map(|(dir, package)| match package {
+            // alloc: once a run that missed, a part's name
+            true => format!(
+                "every file of the package at {} (it printed no `rerun-if-changed` and read a file the sandbox did not see opened)",
+                dir.display()
+            ),
+            // alloc: as above
+            false => format!("every file below {} (its `rerun-if-changed`)", dir.display()),
+        })
+    };
+    // alloc: once a run that missed, a part each read
+    let mut reads: Vec<Part> =
+        Vec::with_capacity(traced.files.len() + traced.dirs.len() + traced.env.len() + 1);
+    for (path, hash) in &traced.files {
+        // alloc: as `walked`
+        let name =
+            walked(path.as_path()).unwrap_or_else(|| format!("the file {}", path.display()));
+        reads.push(Part::new(name, seen(0, hash.as_ref().map(|it| &it[..]))));
+    }
+    for (path, hash) in &traced.dirs {
+        // alloc: as `walked`
+        let name = walked(path.as_path())
+            .unwrap_or_else(|| format!("the names in the directory {}", path.display()));
+        reads.push(Part::new(name, seen(1, Some(&hash[..]))));
+    }
+    for (name, value) in &traced.env {
+        let named = match name == trace::ALL_ENV_NAME {
+            true => "the names of every environment variable (it read them all)".to_owned(), // alloc: as `walked`
+            false => format!("the variable {} it read", name.display()), // alloc: as `walked`
+        };
+        let value = value.as_deref().map(trace::os_bytes);
+        reads.push(Part::new(named, seen(2, value.as_deref())));
+    }
+    if !traced.untraceable.is_empty() {
+        let mut names: Vec<&str> =
+            traced.untraceable.iter().map(|it| trace::untraceable_name(*it)).collect(); // alloc: as `reads`
+        names.sort_unstable();
+        names.dedup();
+        let named = format!("what it read that can't be traced ({})", names.join(", ")); // alloc: as `walked`
+        let joined = names.join("\0"); // alloc: as `walked`
+        reads.push(Part::new(named, seen(3, Some(joined.as_bytes()))));
+    }
+    reads.sort();
+    reads.dedup();
+    if reads.len() > READS_NAMED {
+        let mut hasher = blaze_ids::Hasher::new(READ);
+        hasher.update(&[4]);
+        for part in &reads[READS_NAMED..] {
+            hasher.part(part.name.as_bytes());
+            match &part.hash {
+                Some(hash) => _ = hasher.update(&[1]).id(hash),
+                None => _ = hasher.update(&[0]),
+            }
+        }
+        let rest = reads.len() - READS_NAMED;
+        reads.truncate(READS_NAMED);
+        // alloc: as `walked`
+        reads.push(Part::new(
+            format!("its other {rest} reads (more than {READS_NAMED} are not named one by one)"),
+            Some(hasher.finish()),
+        ));
+    }
+    let mut parts = std::mem::take(&mut miss.parts);
+    parts.extend(reads);
+    let mut made = Miss::of_parts(miss.step, miss.subject, miss.item, miss.key, parts);
+    let mut hasher = blaze_ids::Hasher::new(READS_KEY);
+    hasher.id(&miss.key);
+    for part in &made.parts {
+        hasher.part(part.name.as_bytes());
+        match &part.hash {
+            Some(hash) => _ = hasher.update(&[1]).id(hash),
+            None => _ = hasher.update(&[0]),
+        }
+    }
+    made.key = hasher.finish();
+    made.kept = miss.kept;
+    // Nothing is filed past this key: the same key again is a result that was not kept.
+    made.beyond = None;
+    made
 }
 
 /// `spec`, of a sandboxed run of `unit`, with its live record named ([`blaze_usercode::confine::LIVE`])
@@ -1196,6 +1315,7 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
         tag: Tag(tags),
         state: State::Ready(Box::new(start)),
         puts: RunPuts::default(),
+        missed: None,
         span: tracing::Span::none(),
     })
 }
@@ -1495,6 +1615,12 @@ impl Runs<Real> for ScriptRun {
     }
 
     fn take_puts(&mut self) -> RunPuts {
+        // A run over with its miss still held ended before what it read was known.
+        if matches!(self.state, State::Done)
+            && let Some(miss) = self.missed.take()
+        {
+            self.puts.misses.push(miss);
+        }
         std::mem::take(&mut self.puts)
     }
 
@@ -1597,8 +1723,7 @@ impl ScriptRun {
                     }
                     Ok(Begun::Running(run)) => {
                         label_run(self.tag, &start.unit.package.descr());
-                        let miss = run_missed(&self.job, self.unit, prepared);
-                        self.puts.misses.push(miss);
+                        self.missed = Some(run_missed(&self.job, self.unit, prepared));
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));
                         self.state = State::Running {
                             start,
@@ -1673,6 +1798,10 @@ impl ScriptRun {
                         // What the run kept under its sandboxed key, and a retraction it put.
                         self.puts.kept(completed.tickets.iter().copied());
                         self.puts.retraction(completed.retracted);
+                        // Its miss, now that what it read is known: each read a part of it.
+                        if let Some(miss) = self.missed.take() {
+                            self.puts.misses.push(with_reads(miss, &completed.traced));
+                        }
                         let value = completed.value;
                         // A pure key's hit verified across checkouts, run again and otherwise:
                         // retracted before the run is kept under the pure key, which then

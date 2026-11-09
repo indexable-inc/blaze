@@ -67,8 +67,13 @@ that build and that `blaze-history` ended, never answered with an older build's 
      identity was not set when looked up is `Failed`, naming that.
    - **build script run** (`serve/unit/script.rs`, a sandboxed run that starts): the script's
      code and each part of `Given` (`env CC`, its arguments, its standard input, each named
-     part). Past the key are what it traced when it last ran. A run outside the sandbox is
-     `Always`.
+     part). Past the key is what it traced: once the run ends, each read it made is a part
+     of its miss too (`script::with_reads`: a file by path, a directory's names, a variable,
+     cargo's watch of a package or a tree, what can't be traced; past 1024 the rest are one
+     part) and the miss's key covers them, so two runs are told apart by the reads that
+     differ, by name, and two that read the same are `Lost` (the first was not kept). A run
+     that ends with no reads known (it failed or was stopped) gives the miss as its start
+     made it, `Beyond`. A run outside the sandbox is `Always`.
    - **proc-macro expansion**: not given back. Its key is the call's input tokens, nothing
      about the call site ties it to its last expansion, and the expander has no per-build out
      to give a miss through.
@@ -180,9 +185,9 @@ step, `First` reads "no record of this unit's instance".
 
 ## Not yet
 
-- The values behind `Beyond`: a unit's traced variables and proc-macro reads, and a build
-  script's traced reads. Their slots keep the names, not the values, so naming the one that
-  changed needs the read's value kept beside its hash.
+- The values behind `Beyond` for a unit: its traced variables and proc-macro reads. Their
+  slots keep the names, not the values, so naming the one that changed needs the read's value
+  kept beside its hash. (A build script's run names its reads: above.)
 - A call-site identity for proc-macro expansions.
 - Test selection's dropped `Why` (`serve/unit/test.rs`) and link's `LinkHow::Full { why }` are
   not in the answer yet.
