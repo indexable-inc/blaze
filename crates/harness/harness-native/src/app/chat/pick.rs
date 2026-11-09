@@ -293,7 +293,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
-        listed: (&str, &str), ended: bool,
+        listed: (&str, &str), ended: bool, ctx_open: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
@@ -331,11 +331,24 @@ impl App {
         view::for_each_of(meter_slot, shown, |v, (), _| {
             meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink.hot);
             breathe(v, working);
+            // A press opens the popover to the whole account (context.rs), another closes it.
+            let action = Action { name: format!("chat:ctx:{sid}").as_str().into() };
+            if v.entity().try_cloned::<&Action>() != Some(action.clone()) {
+                v.entity().set(action);
+            }
         });
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
         if let Some(pop) = bar.part("pop") {
             let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-            super::context::fill_context_pop(pop, meter_slot.part("context"), context, agent, open.is_some());
+            super::context::fill_context_pop(
+                pop,
+                meter_slot.part("context"),
+                context,
+                agent,
+                open.is_some(),
+                ctx_open,
+                (self.pointer.x, self.pointer.y),
+            );
         }
         // Open, the menu floats above the control, its leading edge on the control's.
         let trigger = open.and_then(|_| pick.part("model"));

@@ -48,10 +48,17 @@ hn {
   template ChatContextSlice {
     prop d: string = ""
     prop ink: string = ""
+    prop dim: bool = false
     (IsA, ui.Node)
     Overlay
     hn.ChatContextInk: {ink: $ink}
     Vector: {d: $d, view_x: 0, view_y: 0, view_w: 100, view_h: 100, stroke_w: 0}
+    // Dimmed while the pointer is on another slice (that one's name is in the middle).
+    if $dim {
+      Pose: {dx: 0, dy: 0, shrink: 0, fade: $chat_ctx_dim, cut: 0}
+    } else {
+      Pose: {dx: 0, dy: 0, shrink: 0, fade: 0, cut: 0}
+    }
   }
 
   // A part: its dot in its ink, its name, then its tokens and its share of the window flush right. A split (`split`,

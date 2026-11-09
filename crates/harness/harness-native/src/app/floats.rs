@@ -11,11 +11,14 @@ use harness_native_ui_layout_api::Screen;
 
 /// One windowed overlay's draw this frame: the `Windowed` node `id`, the part of the main view its window shows (`rect`,
 /// view points: its `Laid`, out to whole device pixels), and what it draws there (`draw`, whose frame's `view` is the
-/// rect's size and `place` its corner).
+/// rect's size and `place` its corner). `glass`: the node is frosted (`Frost`), so its window has the system's
+/// vibrancy behind what it draws, cut to the node's corners (`radius`, view points).
 pub struct Float {
     pub id: u64,
     pub rect: [f32; 4],
     pub draw: Draw,
+    pub glass: bool,
+    pub radius: f32,
 }
 
 impl App {
@@ -83,7 +86,10 @@ pub(super) fn finish(w: WorldRef<'_>, floats: Vec<(u64, Draw)>, sc: f32) -> Vec<
         let rect = [x0, y0, (x1 - x0).max(1.0 / sc), (y1 - y0).max(1.0 / sc)];
         draw.frame.view = [rect[2], rect[3]];
         draw.frame.place = [rect[0], rect[1], 0.0, 0.0];
-        out.push(Float { id, rect, draw });
+        let node = w.entity_from_id(id);
+        let glass = node.has(harness_native_ui_look_api::Frost::id());
+        let radius = node.try_cloned::<&harness_native_ui_look_api::Shape>().map_or(0.0, |s| s.radius);
+        out.push(Float { id, rect, draw, glass, radius });
     }
     out
 }

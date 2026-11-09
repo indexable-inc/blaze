@@ -497,6 +497,11 @@ ui {
   prefab Menu : ui.MenuPlate {
     Placed
     Windowed
+    // Glass: the system's vibrancy behind its window (src/window/overlay.rs), seen through a translucent plate edged by a
+    // faint light hairline, as a floating sheet of glass over the app.
+    Frost: {radius: 20, saturation: 1.6, sheen: 0.08}
+    Fill: $tone_glass
+    Edge: {dark: $tone_glass_edge.dark, light: $tone_glass_edge.light}
     Layer: {level: Overlay}
     Side: {edge: Top, dx: 0, dy: $menu_gap}
     Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}

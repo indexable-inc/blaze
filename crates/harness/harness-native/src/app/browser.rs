@@ -889,6 +889,18 @@ impl App {
         let s = self.web();
         let info = self.browser.views.get(&s.view).cloned();
         if let Some(bar) = pane.part("bar") {
+            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address)
+            // comes only while the address is edited (cmd+L) or the extensions menu is open.
+            let want = if self.browser.url.is_some() || self.browser.menu {
+                view::prefab(self.world.world_ref(), "hn.WebPane").and_then(|p| View::of(p).part("bar")).and_then(|b| b.entity().try_cloned::<&Size>())
+            } else {
+                bar.entity().try_cloned::<&Size>().map(|s| Size { h: Sizing::fixed(0.0), ..s })
+            };
+            if let Some(want) = want
+                && bar.entity().try_cloned::<&Size>() != Some(want)
+            {
+                bar.set(want);
+            }
             for (part, glyph) in
                 [("back", BACK_ICON), ("forward", FORWARD_ICON), ("reload", RELOAD_ICON), ("ext", EXT_ICON), ("close", CLOSE_ICON)]
             {

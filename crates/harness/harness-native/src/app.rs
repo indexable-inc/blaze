@@ -1995,6 +1995,8 @@ impl App {
                 self.chat_pick_spawn(rest);
             } else if let Some(rest) = a.strip_prefix("chat:mention:") {
                 self.chat_mention_action(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:ctx:") {
+                self.chat_ctx_toggle(rest);
             } else if let Some(rest) = a.strip_prefix("chat:unattach:") {
                 self.chat_unattach(rest);
             } else if let Some(rest) = a.strip_prefix("chat:aside_close:") {

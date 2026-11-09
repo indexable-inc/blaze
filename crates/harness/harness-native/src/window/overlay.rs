@@ -12,6 +12,10 @@
 //! the app's windows into its own, so hit-testing, hover, presses and the wheel are the main window's, in the same
 //! points layout placed the overlay in.
 //!
+//! Glass: a frosted overlay (its node has `Frost`) has the window server's vibrancy (`NSVisualEffectView`, the popover
+//! material) behind its view, cut to the node's corners, so what is behind the window shows through its translucent
+//! plate blurred: the app's own glass, the way NSMenu's and NSPopover's windows are. Any other overlay hides it.
+//!
 //! Showing: a panel's layer presents with its transaction, and a panel is ordered in only after its first picture is
 //! drawn, so a window is never seen with nothing or with the overlay it showed last (a reused panel's stale picture).
 use super::HarnessView;
@@ -22,8 +26,9 @@ use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSResponder, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask,
+    NSTrackingAreaOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
@@ -148,6 +153,9 @@ impl OverlayView {
 struct Panel {
     id: u64,
     panel: Retained<NSPanel>,
+    /// The vibrancy behind the view (shown for a frosted overlay), and the corner radius it is cut to (window points).
+    glass: Retained<NSVisualEffectView>,
+    corner: Option<f64>,
     view: Retained<OverlayView>,
     layer: Retained<CAMetalLayer>,
     shown: bool,
@@ -203,6 +211,14 @@ impl Overlays {
             );
             let frame = window.convertRectToScreen(self.main.convertRect_toView(local, None));
             let p = &mut self.panels[at];
+            let corner = f.glass.then(|| f64::from(f.radius) * z);
+            if p.corner != corner {
+                p.corner = corner;
+                p.glass.setHidden(corner.is_none());
+                if let (Some(r), Some(l)) = (corner, p.glass.layer()) {
+                    l.setCornerRadius(r);
+                }
+            }
             if p.frame != frame {
                 p.frame = frame;
                 p.panel.setFrame_display(frame, false);
@@ -326,8 +342,36 @@ impl Overlays {
             NSTrackingArea::initWithRect_options_owner_userInfo(NSTrackingArea::alloc(), NSRect::ZERO, options, Some(&view), None)
         };
         view.addTrackingArea(&area);
-        panel.setContentView(Some(&view));
-        Panel { id, panel, view, layer, shown: false, frame: NSRect::ZERO, pixels: CGSize::new(0.0, 0.0), tip: String::new() }
+        // The glass under the view, filling the panel as the view does; hidden until a frosted overlay takes the panel.
+        let glass = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
+        glass.setMaterial(NSVisualEffectMaterial::Popover);
+        glass.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        glass.setState(NSVisualEffectState::Active);
+        glass.setWantsLayer(true);
+        if let Some(l) = glass.layer() {
+            l.setMasksToBounds(true);
+            // SAFETY: kCACornerCurveContinuous is a valid static corner curve name (the plates' superellipse corners).
+            l.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
+        }
+        glass.setHidden(true);
+        glass.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        // Siblings in a plain container, the glass behind: hiding the glass never hides what the view draws.
+        let content = NSView::initWithFrame(NSView::alloc(mtm), rect);
+        content.addSubview(&glass);
+        content.addSubview(&view);
+        panel.setContentView(Some(&content));
+        Panel {
+            id,
+            panel,
+            glass,
+            corner: None,
+            view,
+            layer,
+            shown: false,
+            frame: NSRect::ZERO,
+            pixels: CGSize::new(0.0, 0.0),
+            tip: String::new(),
+        }
     }
 }
 

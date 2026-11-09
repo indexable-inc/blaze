@@ -24,6 +24,10 @@ export const tone_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.949,
 export const tone_sidebar: Fill = $tone_ground
 export const tone_card: Fill = {dark: {0.067, 0.071, 0.086, 1}, light: {0.965, 0.961, 0.949, 1}}
 export const tone_raised: Fill = {dark: {0.086, 0.094, 0.11, 1}, light: {0.965, 0.961, 0.949, 1}}
+// Glass: what floats in a window of its own (a menu, a popover, a hover card: ui.Menu) over the system's vibrancy, the
+// raised plate let partly through, and the faint light hairline along its edge that makes it read as a sheet of glass.
+export const tone_glass: Fill = {dark: {0.086, 0.094, 0.11, 0.72}, light: {0.965, 0.961, 0.949, 0.78}}
+export const tone_glass_edge: Fill = {dark: {1, 1, 1, 0.1}, light: {0, 0, 0, 0.08}}
 export const tone_well: Fill = {dark: {0.027, 0.031, 0.035, 1}, light: {0.922, 0.918, 0.898, 1}}
 export mut tone_term_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.039, 0.043, 0.051, 1}}
 // Lines: a hairline (a card's edge, a rule, the sidebar's seam; --line) and the stronger one (a floating plate's edge, a
@@ -676,6 +680,8 @@ export const chat_ctx_w = 296
 export const chat_ctx_pad = 10
 export const chat_ctx_gap = 0
 export const chat_ctx_pie = 112
+// How far the other slices fade while the pointer is on one.
+export const chat_ctx_dim = 0.6
 export const size_ctx_pct = 20
 export const line_ctx_pct = 24
 export const chat_ctx_bar_pad = 7
