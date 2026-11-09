@@ -47,11 +47,13 @@ impl App {
     }
 
     /// The window lost the keyboard (another app or window took it): what floats lightly closes, as NSMenu and NSPopover
-    /// do (the picker's menus, a cell's popovers and menus; a cell's dialog stays, as a sheet would). Whether any closed.
+    /// do (the picker's menus, a sidebar row's menu, a cell's popovers and menus; a cell's dialog stays, as a sheet
+    /// would). Whether any closed.
     pub fn close_floats(&mut self) -> bool {
         let pick = self.chat_pick_close();
+        let row = self.row_menu_close();
         let genui = self.genui_blur();
-        pick || genui
+        pick || row || genui
     }
 }
 

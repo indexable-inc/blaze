@@ -15,6 +15,7 @@ hn {
   // line, and trailing how long ago it started or ended, or how it went wrong (`why` its tooltip). On hover its shortcut
   // (`hint`) takes the trailing words' place. `focus`: the selection while the tree has the keyboard. `edit`: its name is
   // being renamed (cmd+R): the name is the field's words (the host sets their caret and selection), its pill the field.
+  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent.
   @tree ChildOf
   template ObjRow : Row {
     prop look: string = "rest"
@@ -28,6 +29,7 @@ hn {
     prop hint: string = ""
     prop focus: bool = false
     prop edit: bool = false
+    prop menu: bool = false
     (IsA, hn.TreeRowLook)
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
@@ -99,6 +101,16 @@ hn {
         HoverShow: {row: 0, keep: false, away: false}
       }
     }
+    // While its menu is open (src/app/row_menu.rs): a ring round it, the selection left where it is.
+    ring : hn.RowMenuMark {
+      plate {
+        if $menu {
+          Edge: {dark: $tone_accent.dark, light: $tone_accent.light}
+        } else {
+          Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+        }
+      }
+    }
     if $selected {
       pill : hn.Selection {
         plate {
@@ -129,6 +141,7 @@ hn {
     prop meta: string = ""
     prop keep: bool = false
     prop focus: bool = false
+    prop menu: bool = false
     (IsA, hn.TreeRowLook)
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
@@ -160,6 +173,16 @@ hn {
         Fill: $tone_ink_faint
       }
       HoverShow: {row: 0, keep: $keep, away: false}
+    }
+    // While its menu is open (src/app/row_menu.rs): a ring round it, the selection left where it is.
+    ring : hn.RowMenuMark {
+      plate {
+        if $menu {
+          Edge: {dark: $tone_accent.dark, light: $tone_accent.light}
+        } else {
+          Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+        }
+      }
     }
     if $selected {
       pill : hn.Selection {

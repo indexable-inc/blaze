@@ -122,6 +122,12 @@ pub fn run(path: &str) -> Result<(), String> {
         .filter(|v| v.len() == 3)
         .collect();
     let mut hovered: Option<(f32, f32)> = None;
+    // HARNESS_NATIVE_SHOT_ROW_MENU `x,y,t[,ctrl]`: a right press on the sidebar row at (x, y) (window points) at t seconds
+    // (with a fourth value of 1, a control-click instead), handed on as the window hands one: that row's menu opens at the
+    // point (src/app/row_menu.rs), and what it offers is logged. HARNESS_NATIVE_SHOT_KEY `none+down,t` then moves its
+    // highlight, `none+return,t` runs it, `none+escape,t` closes it.
+    let mut row_menu =
+        std::env::var("HARNESS_NATIVE_SHOT_ROW_MENU").ok().map(|s| nums(&s)).filter(|v| v.len() == 3 || v.len() == 4);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
@@ -230,6 +236,17 @@ pub fn run(path: &str) -> Result<(), String> {
         }
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);
+        }
+        if let Some(v) = row_menu.take_if(|v| t >= v[2]) {
+            let (b, m) = if v.get(3).is_some_and(|c| *c != 0.0) {
+                (left, crate::app::KeyMods { ctrl: true, ..none })
+            } else {
+                (crate::term::Button::Right, none)
+            };
+            app.pointer_move(v[0], v[1], m);
+            app.pointer_down(v[0], v[1], b, 1, m);
+            app.pointer_up(v[0], v[1], b, m);
+            eprintln!("harness-native: shot row menu at {},{}: {}", v[0], v[1], app.row_menu_line());
         }
         while keys.first().is_some_and(|k| t >= k.1) {
             let (k, _) = keys.remove(0);
