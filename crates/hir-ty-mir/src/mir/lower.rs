@@ -4875,6 +4875,10 @@ pub fn inline_const_at<'db>(
     infer: &InferenceResult<'db>,
     expr: ExprId,
 ) -> Option<AnonConstId<'db>> {
+    // The block's own constant lowers the block in place.
+    if matches!(owner, InferBodyId::AnonConstId(it) if it.loc(db).expr == expr) {
+        return None;
+    }
     if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
         && !hir_ty::effects::const_block_is_comptime(db, owner.expression_store_owner(db), expr)
     {

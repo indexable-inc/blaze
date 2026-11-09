@@ -5738,12 +5738,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         else {
             return Ok(());
         };
-        let bounds = matches!(error, hir_ty::effects::NonConst::Unsatisfied(..));
         let env = ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id };
         let (callee, args) = match self.db.lookup_impl_method(env, func, args) {
             (Either::Left(impl_func), impl_args) => (impl_func, impl_args),
             (Either::Right(_), _) => (func, args),
         };
+        // The function that runs is const, and its `[const]` bounds are what fails; not a
+        // trait's method whose impl is not const.
+        let bounds = matches!(error, hir_ty::effects::NonConst::Unsatisfied(..))
+            && !matches!(callee.lookup(self.db).container, ItemContainerId::TraitId(_))
+            && hir_ty::effects::fn_is_const(self.db, callee);
         let kind = ComptimeErrorKind::NonConstTarget {
             callee: Either::Left(callee),
             args: args.store(),
