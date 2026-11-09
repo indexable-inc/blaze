@@ -56,6 +56,7 @@
 //!     infallible:
 //!     int_bounds:
 //!     int_impl: size_of, transmute
+//!     num_methods:
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -2835,6 +2836,30 @@ impl_int_bounds! {
     i128: -170141183460469231731687303715884105728, 170141183460469231731687303715884105727;
 }
 // endregion:int_bounds
+
+// region:num_methods
+macro_rules! impl_num_methods {
+    ($name:ident: $($t:ty)*) => {
+        $(
+            impl $t {
+                pub fn $name(self, rhs: Self) -> Self {
+                    rhs
+                }
+            }
+        )*
+    }
+}
+
+impl_num_methods! {
+    saturating_add:
+    usize u8 u16 u32 u64 u128
+    isize i8 i16 i32 i64 i128
+}
+
+impl_num_methods! {
+    powf: f32 f64
+}
+// endregion:num_methods
 
 // region:error
 pub mod error {

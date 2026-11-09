@@ -166,3 +166,52 @@ fn a_call_through_fn_of_a_non_tuple_is_e0059() {
         "{found:?}"
     );
 }
+
+/// The methods `f` of `fixture` calls that are not found, each with the numeric variable its
+/// receiver was where the method was looked up.
+fn unresolved_methods(fixture: &str) -> Vec<(String, Option<crate::NumericVar>)> {
+    diagnostics(fixture)
+        .iter()
+        .filter_map(|it| match it {
+            InferenceDiagnostic::UnresolvedMethodCall { name, numeric_var, .. } => {
+                Some((name.as_str().to_owned(), *numeric_var))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A method called on an integer or a float whose type is not decided yet is an error where
+/// it is called, as in rustc (E0689), also when a later use decides the type and the type has
+/// the method: a method call does not wait for later constraints. The error records that the
+/// receiver was the variable, so no message names the type it became.
+#[test]
+fn a_method_on_a_number_of_undecided_type_is_an_error_whatever_decides_it_later() {
+    use crate::NumericVar::{Float, Integer};
+    let core = "//- minicore: sized, num_methods\n";
+    let found = unresolved_methods(&format!(
+        "{core}fn f() {{ let mut pos = 0; let start = pos; let end = start.saturating_add(4); \
+         pos = end; let _: usize = pos; }}"
+    ));
+    assert_eq!(found, [("saturating_add".to_owned(), Some(Integer))]);
+    let found = unresolved_methods(&format!(
+        "{core}fn f() {{ let ratio = 2.0; ratio.powf(2.0); let _: f32 = ratio; }}"
+    ));
+    assert_eq!(found, [("powf".to_owned(), Some(Float))]);
+    let found = unresolved_methods(&format!("{core}fn f() {{ 1.saturating_add(2); }}"));
+    assert_eq!(found, [("saturating_add".to_owned(), Some(Integer))]);
+}
+
+/// The control: once the number's type is decided where the method is called, the method is
+/// found, and one the type lacks is an ordinary unresolved method of that type.
+#[test]
+fn a_method_on_a_number_of_decided_type_is_looked_up_on_it() {
+    let core = "//- minicore: sized, num_methods\n";
+    let found = unresolved_methods(&format!(
+        "{core}fn f() {{ let pos: usize = 0; pos.saturating_add(4); let x = 2.0f32; x.powf(2.0); \
+         let y = 1; let _: u8 = y; y.saturating_add(1); }}"
+    ));
+    assert!(found.is_empty(), "{found:?}");
+    let found = unresolved_methods(&format!("{core}fn f() {{ let pos: usize = 0; pos.nope(); }}"));
+    assert_eq!(found, [("nope".to_owned(), None)]);
+}

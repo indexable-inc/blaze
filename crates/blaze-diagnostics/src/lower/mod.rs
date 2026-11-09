@@ -38,6 +38,7 @@ pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
 pub(crate) mod malformed_derive;
+pub(crate) mod method_on_ambiguous_numeric;
 pub(crate) mod method_on_unknown_raw_pointee;
 pub(crate) mod missing_body;
 pub(crate) mod missing_lifetime;

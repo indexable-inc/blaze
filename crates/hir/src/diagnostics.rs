@@ -911,6 +911,10 @@ pub struct UnresolvedMethodCall<'db> {
     pub name: Name,
     pub field_with_same_name: Option<Type<'db>>,
     pub assoc_func_with_same_name: Option<Function>,
+    /// Set when the method was looked up on an integer or float whose type was not decided
+    /// yet (`{integer}`, `{float}`): `receiver` is then what the variable became afterwards,
+    /// a type it did not have at the call.
+    pub numeric_var: Option<hir_ty::NumericVar>,
 }
 
 #[derive(Debug)]
@@ -4414,6 +4418,7 @@ impl<'db> AnyDiagnostic<'db> {
                 name,
                 field_with_same_name,
                 assoc_func_with_same_name,
+                numeric_var,
             } => {
                 let expr = expr_syntax(*expr)?;
                 UnresolvedMethodCall {
@@ -4424,6 +4429,7 @@ impl<'db> AnyDiagnostic<'db> {
                         .as_ref()
                         .map(|ty| new_ty(ty.as_ref())),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(Into::into),
+                    numeric_var: *numeric_var,
                 }
                 .into()
             }
@@ -5799,6 +5805,18 @@ fn unplaced_inference_text<'db>(
         InferenceDiagnostic::PrivateAssocItem { .. } => "E0624: the associated item used is private".to_owned(),
         InferenceDiagnostic::UnresolvedField { receiver, name, .. } => {
             format!("E0609: no field `{}` on type `{}`", name.as_str(), ty(receiver))
+        }
+        InferenceDiagnostic::UnresolvedMethodCall {
+            name, numeric_var: Some(numeric), ..
+        } => {
+            let var = match numeric {
+                hir_ty::NumericVar::Integer => "{integer}",
+                hir_ty::NumericVar::Float => "{float}",
+            };
+            format!(
+                "E0689: method `{}` is called on `{var}`, a number whose type is not decided where the method is looked up",
+                name.as_str()
+            )
         }
         InferenceDiagnostic::UnresolvedMethodCall { receiver, name, .. } => {
             format!("E0599: no method named `{}` found for `{}`", name.as_str(), ty(receiver))

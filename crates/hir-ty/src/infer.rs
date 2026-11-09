@@ -336,6 +336,13 @@ pub enum ByRef {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BindingMode(pub ByRef, pub Mutability);
 
+/// A numeric value whose type inference has not decided: rustc's `{integer}` and `{float}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NumericVar {
+    Integer,
+    Float,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Hash, TypeVisitable, TypeFoldable)]
 pub enum InferenceDiagnostic {
     NoSuchField {
@@ -416,6 +423,13 @@ pub enum InferenceDiagnostic {
         field_with_same_name: Option<StoredTy>,
         #[type_visitable(ignore)]
         assoc_func_with_same_name: Option<FunctionId>,
+        /// Set when the method was looked up on an integer or a float whose type was not
+        /// decided yet (rustc's `{integer}` and `{float}`): a method call does not wait for
+        /// a later use to decide it, so this is rustc's E0689 when a numeric type has the
+        /// method. `receiver` is then what the rest of the body, or the fallback, made of
+        /// the variable afterwards: a type it did not have where the method was called.
+        #[type_visitable(ignore)]
+        numeric_var: Option<NumericVar>,
     },
     UnresolvedAssocItem {
         #[type_visitable(ignore)]
