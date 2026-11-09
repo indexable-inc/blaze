@@ -44,5 +44,6 @@ swiftui_gallery : ui.Column {
     browser : ex.BrowserDemo {}
     art : ex.ArtDemo {}
     sheen : ex.SheenDemo {}
+    block : ex.BlockDemo {}
   }
 }

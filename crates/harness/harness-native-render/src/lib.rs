@@ -6,6 +6,7 @@
 //! and `paint` walks the draw pass's painted nodes (`harness_native_ui_draw::painted`) into a `Draw`.
 pub mod arrive;
 pub mod atlas;
+pub mod block;
 pub mod boxdraw;
 pub mod caret;
 pub mod draw;
