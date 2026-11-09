@@ -8,11 +8,15 @@
 
 use std::{num::NonZero, sync::Arc};
 
-use crate::io::{Io, Offers};
+use crate::{
+    io::{Io, Missing, Offers},
+    procs::Procs,
+};
 
-/// What a native world offers: everything its target's driver has. The wasi driver keeps no
-/// sockets (blaze-core's `threads` driver runs them on unix only), so there `net` is `None`.
-pub const OFFERS: Offers = Offers { net: !cfg!(target_os = "wasi"), ..Offers::ALL };
+/// What a native world offers: everything its target's driver has an effect for
+/// ([`Offers::NATIVE`]). The wasi driver keeps no sockets (blaze-core's `threads` driver runs
+/// them on unix only), so there `net` is `None`.
+pub const OFFERS: Offers = Offers { net: !cfg!(target_os = "wasi"), ..Offers::NATIVE };
 
 /// What a world says about the machine it runs on.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a test's description of a world
@@ -64,6 +68,17 @@ impl Host {
 
     pub fn name(&self) -> Arc<str> {
         self.io.host_facts(|facts| Arc::clone(&facts.name))
+    }
+
+    /// Other processes, if the host offers them (the simulation does): its own entry of
+    /// [`Offers`], apart from this process's own facts and exit.
+    pub fn procs(&self) -> Option<Procs> {
+        self.io.offered(|it| it.procs).then(|| Procs::new(self.io.clone()))
+    }
+
+    /// Other processes, which `main` requires.
+    pub fn need_procs(&self) -> Result<Procs, Missing> {
+        self.procs().ok_or(Missing { capability: "procs" })
     }
 
     /// The process ends with `status`. In the simulation the calling task unwinds with an

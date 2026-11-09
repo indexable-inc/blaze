@@ -26,6 +26,13 @@
 //!   a [`Path`], an [`env::VarName`], a [`net::HostPort`], each checked as it is made, and a
 //!   literal checked as the crate compiles ([`path!`], [`var!`], [`host!`]).
 //! - Every wait ends in a typed outcome: what it waited for, or a [`Stopped`].
+//! - The rest of the capability set (std.md, "The rest of the set", "Sound, and the device
+//!   capabilities") exists as types with their narrowing: [`term::Term`], [`keys::Keys`],
+//!   [`roots::Roots`], [`locale::Locale`], [`user::User`], [`procs::Procs`], [`code::Code`],
+//!   [`window::Window`], [`automation::Automation`], [`opener::Opener`], [`power::Power`],
+//!   [`audio::AudioOut`] and [`audio::AudioIn`], and the devices of [`device`]. blaze-core has
+//!   no effect for any of them yet, so only the simulation provides them
+//!   ([`hosted::SimHost`]) and a native `Io` withholds them.
 //! - How a pure function's value is got is a value too: [`eval::Eval`] runs a memo point
 //!   (`#[blaze::memo]`), remembers it or hands it to a handler ([`eval`]).
 //!
@@ -79,28 +86,63 @@
 #![register_tool(blaze)]
 
 pub mod args;
+/// Sound: `AudioOut` and `AudioIn`, PCM streams pulled by the device.
+pub mod audio;
+/// Driving other applications: `Automation`, narrowed to one.
+pub mod automation;
 #[expect(
     unsafe_code,
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
 )]
 pub mod cell;
 pub mod clock;
+/// Turning data into instructions: `Code`, executable memory and native modules.
+pub mod code;
 pub mod cx;
+/// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
+/// `Clipboard`, `Notify`.
+pub mod device;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
 pub mod fs;
 pub mod host;
+/// The simulated host behind the capabilities blaze-core has no effect for, and how a call
+/// on one fails.
+pub mod hosted;
 pub mod io;
+/// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
+pub mod keys;
+/// The locale: time zone, language and formats, as plain data.
+pub mod locale;
 pub mod mem;
+/// Typed names: a key's, a device's, a module's, an application's.
+pub mod name;
+mod narrow;
 pub mod net;
+/// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
+pub mod opener;
 pub mod path;
 pub mod pending;
+/// Power: the battery, and keeping the machine awake.
+pub mod power;
+/// Other processes: `Procs`, from `Host`, narrowed to one.
+pub mod procs;
 pub mod quic;
 pub mod rng;
+/// Whom TLS trusts: `Roots`, a set of trust anchors.
+pub mod roots;
 pub mod sync;
 pub mod task;
+/// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
+pub mod term;
 pub mod trace;
+/// Addresses as types: `Scheme`, `Origin`, `Url`.
+pub mod url;
+/// Who is running: `User`, its name, ids and home directory.
+pub mod user;
+/// The program's windows: `Window`, a surface's size and its events.
+pub mod window;
 
 /// Bytes held without a copy: their own `Arc`, a range their owner keeps in place, or a
 /// `'static` slice (blaze-bytes). Not [`mem::Bytes`], which are bytes being written into an
@@ -313,6 +355,9 @@ pub(crate) enum Plant {
     JoinDropsFailure,
     /// Every root accessor of `Io` hands its capability out, offered or not.
     OffersIgnored,
+    /// A narrowing of the capabilities on `narrow::Allowed` (`Keys::only`, `Opener::only`, ...)
+    /// and of `Location` and `Clipboard` gives what was asked for, reached before or not.
+    OnlyWidens,
     /// A tuple's key leaves its last element out: two calls that differ only there share one.
     KeyIgnoresLast,
     /// `Eval::memo` never drops a generation: its entries pass its limit.

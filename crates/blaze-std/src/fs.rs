@@ -254,6 +254,14 @@ impl<#[blaze::linear] P: Rights> fmt::Debug for Dir<P> {
     }
 }
 
+impl Dir<ReadWrite> {
+    /// The directory named `base` under the driver's root, read and write: for a capability
+    /// that holds a directory's name as authority ([`crate::user::User::home`]).
+    pub(crate) fn at(io: &Io, base: FileName) -> Dir<ReadWrite> {
+        Dir { io: io.clone(), base, rights: PhantomData }
+    }
+}
+
 impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Where it is, under the driver's root.
     pub fn name(&self) -> &FileName {

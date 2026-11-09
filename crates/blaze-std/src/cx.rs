@@ -218,6 +218,40 @@ impl Cx {
         }
     }
 
+    /// The one wait, for a condition bstd keeps itself rather than a completion of the
+    /// driver's (bytes in an in-memory pipe, a key the simulated terminal will send): until
+    /// `ready` gives a value, or this context's deadline or cancellation, with the same typed
+    /// stops as [`Cx::wait`]. `ready` is asked before each poll of the driver.
+    ///
+    /// In S1's `Inline` layout nothing else runs while a task waits, so a condition only
+    /// another task could make true ends here at the deadline; a fiber layout parks the task
+    /// on the condition's key instead, and its maker wakes it.
+    pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
+        let deadline = match self.plant {
+            Plant::WaitIgnoresDeadline => Deadline::NEVER,
+            _ => self.deadline,
+        };
+        let mut idle = 0;
+        loop {
+            if let Some(got) = ready() {
+                return Ok(got);
+            }
+            if self.plant != Plant::WaitIgnoresCancel && self.cancelled() {
+                return Err(Stopped::Cancelled { span: self.span });
+            }
+            if deadline.passed(io.now()) {
+                return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
+            }
+            if idle == POLL_FUEL {
+                return Err(Stopped::Stalled { span: self.span, polls: idle });
+            }
+            match io.poll(deadline) {
+                0 => idle += 1,
+                _ => idle = 0,
+            }
+        }
+    }
+
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
     pub(crate) fn stopped_by(&self, now: std::time::Duration) -> Result<(), Stopped> {
         if self.plant != Plant::WaitIgnoresCancel {
