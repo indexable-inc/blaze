@@ -102,7 +102,7 @@
 //! traits [`Identity::hooks`] lists, and every trait of the closure's packages that they name
 //! `dyn`.
 //!
-//! The window it leaves, accepted (AGENTS.md rule 19): the build script hashes the tree once,
+//! The window it leaves, accepted (AGENTS.md rule 22): the build script hashes the tree once,
 //! and cargo compiles the closure's crates before or after it. A file saved in the live tree
 //! between the two gives one binary an identity of other sources than its code, in either order.
 //! [`emit`] refuses a file, lock or manifest read, or a package directory listed, that changed
@@ -418,7 +418,7 @@ pub const RECORD_CUT: &[Cut] = &[
         package: "blaze-history",
         why: "the plane's costs and peaks learned from past runs (`serve::plane`, kept in the daemon's \
               image by `serve::image`): it orders and admits work, and what a unit makes does not \
-              depend on when or beside what it ran (AGENTS.md rule 22)",
+              depend on when or beside what it ran (AGENTS.md rule 25)",
         named_in: &[
             NamedIn {
                 package: "blaze-cargo",
@@ -502,13 +502,13 @@ pub const RECORD_REVIEWED: &[Hook] = &[
         package: "blaze-engine",
         hook: "Holders",
         why: "`Heaps` is the program's global allocator: where a value lives, never its bytes (AGENTS.md \
-              rule 22: no output depends on addresses)",
+              rule 25: no output depends on addresses)",
     },
     Hook {
         package: "blaze-history",
         hook: "Predict",
         why: "`History` predicts a node's time and peak for the plane's admission and critical path: \
-              when work runs, never what it makes (AGENTS.md rule 22)",
+              when work runs, never what it makes (AGENTS.md rule 25)",
     },
 ];
 

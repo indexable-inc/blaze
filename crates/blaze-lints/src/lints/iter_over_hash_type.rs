@@ -1,6 +1,6 @@
 //! `iter_over_hash_type`: a `for` loop over a hash map or set, or one of std's iterators of
 //! one: it runs in the hasher's and the table's order, so whatever it writes out (an object, a
-//! diagnostic's order, a store key) changes with them. AGENTS.md rule 20: nothing iterated into
+//! diagnostic's order, a store key) changes with them. AGENTS.md rule 25: nothing iterated into
 //! output depends on hash-map order.
 //!
 //! Follows clippy's `clippy_lints/src/iter_over_hash_type.rs` (MIT or Apache-2.0), read from

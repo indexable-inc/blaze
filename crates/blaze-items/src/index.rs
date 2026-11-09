@@ -420,7 +420,7 @@ pub(crate) fn seen_impls_value(
 }
 
 /// Per-crate values, `None` for a crate with none, as one: sorted, so the walk's order is not
-/// part of the hash (rule 22); each value covers its impls' keys, so the set of impls is still
+/// part of the hash (rule 25); each value covers its impls' keys, so the set of impls is still
 /// what it hashes. An error of any is the error.
 fn combined(
     owns: impl Iterator<Item = Result<Option<ContentId>, Unhashable>>,

@@ -535,7 +535,7 @@ fn place(refs: &Refs, target: &Target) -> Result<u32, TemplateError> {
 /// non-generic body in a library and in its `--test` crate, `hir-ty-mir`'s `unwind::is_panic`,
 /// its recursive call at place 5), and their templates differ there. So every key a template is
 /// kept or shared under holds this place (`driver::placed`, the memo's
-/// [`crate::backend::Shape::own_place`]), rule 20. `refs` lists each target once, so there is
+/// [`crate::backend::Shape::own_place`]), rule 21. `refs` lists each target once, so there is
 /// at most one.
 pub fn own_place(own: InstanceKey, refs: &Refs) -> Option<u32> {
     let at = refs.iter().position(|it| matches!(it, Target::Direct(key) if *key == own))?;
@@ -1557,7 +1557,7 @@ mod tests {
     /// ([`Ref::Own`]), a call of another instance there a [`Ref::Place`]. The template code
     /// and the IR's shape take the place alike whatever fills it, so the two templates differ
     /// in what [`own_place`] says alone, which is what their keys must hold (`hir-ty-mir`'s
-    /// `unwind::is_panic` in its library and its `--test` crate, rule 20). Two functions that
+    /// `unwind::is_panic` in its library and its `--test` crate, rule 21). Two functions that
     /// each call themselves keep one template, as name-free sharing wants.
     #[test]
     fn a_call_of_itself_is_told_apart_from_a_call_at_its_place() {
@@ -1649,7 +1649,7 @@ mod tests {
     /// Two items written alike in two places share one template held by table, which the
     /// store round-trips byte for byte; each instance made of it is given back its own
     /// positions in its code, its data and its lines, and one with no anchors is refused
-    /// (rule 25: what is persisted restores equal to a fresh build).
+    /// (rule 26: what is persisted restores equal to a fresh build).
     #[test]
     fn a_template_holds_its_own_positions_by_table() {
         let a: [ContentId; OWN_TABLES] = std::array::from_fn(|it| ContentId([10 + it as u8; 32]));

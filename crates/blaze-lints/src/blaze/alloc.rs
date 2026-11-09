@@ -52,7 +52,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 const LONGEST: usize = 256;
 
 /// The set of functions a walk looks for: part of [`reaches_root`]'s key, so the two walks
-/// never share a memo (rule 18).
+/// never share a memo (rule 21).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Roots {
     /// The global allocator: `hot_alloc`, `hot_alloc_call`, `hot_clone`.

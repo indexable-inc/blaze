@@ -20,7 +20,7 @@ use rustc_type_ir::inherent::GenericArgs as _;
 use super::{alloc::written_callee, facts};
 
 /// How many expressions a walk of a subtree visits at most; past it the walk reports it ran out
-/// (rule 15), and the lints asking take that as "not shown", never as a finding.
+/// (rule 18), and the lints asking take that as "not shown", never as a finding.
 pub(super) const FUEL: usize = 8192;
 
 /// How many parents a walk up from an expression follows.

@@ -1,7 +1,7 @@
-//! `lock_across_query`: a lock guard live across a call of a query (AGENTS.md rule 9: a lock is
+//! `lock_across_query`: a lock guard live across a call of a query (AGENTS.md rule 12: a lock is
 //! held only for a field update, never across a query call), whether or not the query parks the
 //! fiber: a query may run long or wait itself, and every task that wants the lock queues behind
-//! it, the convoy rule 9 bans.
+//! it, the convoy rule 12 bans.
 //!
 //! A guard is blaze's (`blaze_core::lock`'s `LockGuard`, `ReadGuard` and `WriteGuard`),
 //! `parking_lot`'s (`lock_api`'s `MutexGuard`, `RwLock` read, write and upgradable guards, the
@@ -203,7 +203,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                         query.say()
                     ),
                 };
-                let note = "a lock is held for a field update, never across a query call (AGENTS.md rule 9): the query \
+                let note = "a lock is held for a field update, never across a query call (AGENTS.md rule 12): the query \
                             may run long or wait, and every task that wants the lock queues behind it meanwhile";
                 facts::push(
                     &mut found,

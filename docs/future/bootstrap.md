@@ -48,10 +48,10 @@ The seed relies on four properties. blaze already promises or has most of them:
 
 | Property the seed needs | blaze today |
 |---|---|
-| Deterministic output: the seed rebuilt by itself is byte-identical | `deterministic-output` (rule 22) already requires it |
+| Deterministic output: the seed rebuilt by itself is byte-identical | `deterministic-output` (rule 25) already requires it |
 | A target-agnostic seed | wasm |
 | A simple runtime to run the seed | Wasmtime's Pulley interpreter, or any spec interpreter, or wasm2c |
-| A seed that cross-compiles to every target | native code is copy-and-patch stencils (rule 8); the stencils are data and can ship inside the seed |
+| A seed that cross-compiles to every target | native code is copy-and-patch stencils (rule 10); the stencils are data and can ship inside the seed |
 
 It also settles a question that is open now: proc-macro crates should be planned with the host's
 cfg (as rustc does) and built for wasm64. When blaze itself can run as wasm, "the host" can be
@@ -108,7 +108,7 @@ stops with an error naming it, never an overflow into the heap.
 The scheduler runs every pool job on a stackful fiber, and a job that waits switches out holding
 no thread. corosensei has no wasm backend and wasm has no native stack to swap, so the seed swaps
 only the layer that switches stacks, `blaze-graph`'s `sched::stack`, chosen by target in that one
-module. The scheduler, pool and wait graph above it are the same code on every target (rule 26),
+module. The scheduler, pool and wait graph above it are the same code on every target (rule 30),
 and native targets always use corosensei (rule 3).
 
 On wasm the layer is the host's fibers, through the seed's own calls (lane wasm64fiber,
@@ -135,7 +135,7 @@ reads only `suspend_points` and `on_fiber`, which are empty then, so it must rep
 The seed builds with panic=abort: that is wasm32-wasip1's `panic-strategy` in the pinned nightly's
 target spec (`rustc +nightly-2026-10-27 -Z unstable-options --print target-spec-json --target
 wasm32-wasip1`). So a job's panic aborts the whole seed, naming it, and the `catch_unwind` around
-each job catches nothing: rule 17 (panics fail one job) can't hold in the seed until blaze's wasm
+each job catches nothing: rule 20 (panics fail one job) can't hold in the seed until blaze's wasm
 codegen supports exception handling (panic=unwind). A wasm fiber's stack has no guard page, so on
 a fiber `stdx::ensure_sufficient_stack` checks the room left and panics, naming it, which aborts
 the seed.

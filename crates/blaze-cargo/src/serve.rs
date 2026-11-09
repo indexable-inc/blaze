@@ -1115,7 +1115,7 @@ pub(crate) fn engine(
     // Keyed by what makes std's records and outputs ([`RecordMakers`]), never the executable's
     // bytes: the shared store holds std units' records and outputs alone, and each std key's
     // outputs are files at fixed paths under it, so two blazes share it only when every byte
-    // either writes there is made by the same code from the same inputs (AGENTS.md rule 22).
+    // either writes there is made by the same code from the same inputs (AGENTS.md rule 25).
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
     let std = machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| {

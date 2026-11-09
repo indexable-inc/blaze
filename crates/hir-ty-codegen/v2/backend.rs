@@ -296,7 +296,7 @@ impl Backends<'_> {
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
             // A panic building one function (an assertion of Cranelift's on the IR, one of
             // ours) fails that function with an error naming it and its crate, and through it
-            // the unit, never the worker (AGENTS.md rule 17). Only a panic with a message is a
+            // the unit, never the worker (AGENTS.md rule 20). Only a panic with a message is a
             // failure: a typed payload (a cancel, name resolution's typed stops) is control
             // flow its catcher reads further up, and keeps unwinding.
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -642,9 +642,9 @@ fn foldable(db: &Db, instance: &HirInstance) -> Result<bool, String> {
 /// The IR of an instance, built as a unit with overflow checks `checked` asks, under the
 /// unit's settings `build`. They come in as an argument, never off the thread: the compile
 /// waits in queries, after which its fiber may be on another thread, or interleaved with
-/// another unit's compile on this one (rule 24). Each body it reads is keyed by the options
+/// another unit's compile on this one (rule 27). Each body it reads is keyed by the options
 /// `build` derives for it ([`Build::options`]), so what it builds follows from its arguments
-/// alone (rule 18). An `asm!` block's code is its text, the same under every unit's settings.
+/// alone (rule 21). An `asm!` block's code is its text, the same under every unit's settings.
 pub(super) fn built(
     db: &Db,
     instance: &HirInstance,

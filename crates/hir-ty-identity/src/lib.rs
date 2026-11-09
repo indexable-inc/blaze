@@ -6,7 +6,7 @@
 //! instance on a cycle other than its own body's ([`hir_ty_share::Unshared::Recursive`]).
 //!
 //! - **Compile identity**, [`instance_identity`] ([`instance`]): what one instance's generated
-//!   code depends on beyond its unit's settings, by rule 18, read so that instances which compile
+//!   code depends on beyond its unit's settings, by rule 21, read so that instances which compile
 //!   to one body have one identity: this is the identity the code generator's ICF folds by and
 //!   puts in place of an instance's arguments in its instance key. In: the body's item key and
 //!   code hash ([`blaze_items`]: each item it refers to by interface, never a position), the
@@ -35,7 +35,7 @@
 //! A function whose constants read the identity of code that runs it depends on itself: a typed
 //! error ([`SELF_READ`]), never a fixpoint. Every hash streams into a [`blaze_ids::Hasher`] in an
 //! order fixed by the source and the graph: MIR order, field order, site order, a component's
-//! canonical order. No hash map's order, address or interned id reaches one (rule 22).
+//! canonical order. No hash map's order, address or interned id reaches one (rule 25).
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]

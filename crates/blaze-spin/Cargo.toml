@@ -1,6 +1,6 @@
 [package]
 name = "blaze-spin"
-description = "blaze's one bounded spin (AGENTS.md rules 9 and 13): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for"
+description = "blaze's one bounded spin (AGENTS.md rules 12 and 18): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for"
 publish = false
 
 version.workspace = true
