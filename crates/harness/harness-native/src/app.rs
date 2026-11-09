@@ -2056,6 +2056,8 @@ impl App {
                 self.chat_pick_set(rest);
             } else if let Some(rest) = a.strip_prefix("chat:spawn:") {
                 self.chat_pick_spawn(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:older:") {
+                self.chat_pick_older(rest);
             } else if let Some(rest) = a.strip_prefix("chat:mention:") {
                 self.chat_mention_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:ctx:") {
