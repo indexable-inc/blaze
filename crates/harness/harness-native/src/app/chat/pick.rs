@@ -1049,8 +1049,8 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             rows.push(Entry::Item {
                 text: String::new(),
                 data: Choice {
-                    label: String::new(),
-                    meta: format!("{hidden} older"),
+                    label: format!("{hidden} older"),
+                    meta: String::new(),
                     detail: "Earlier versions of these models.".to_owned(),
                     on: false,
                     action: format!("chat:older:{}:{kind}", c.sid),
@@ -1101,6 +1101,8 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             Entry::Head(_) => "ui.MenuHead",
             Entry::Sep => "ui.MenuSep",
             Entry::Item { data: Choice { on: true, .. }, .. } => "ui.MenuItemOn",
+            // The fold's row ("4 older"): more of the list, not a model.
+            Entry::Item { data, .. } if data.action.starts_with("chat:older:") => "ui.MenuItemQuiet",
             Entry::Item { .. } => "ui.MenuItem",
             Entry::Note(_) => "ui.MenuNote",
         };

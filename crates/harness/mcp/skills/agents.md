@@ -1,6 +1,6 @@
 ---
 name: agents
-description: Starting and running other agents from ts (spawn / agents.spawn): which kind, model and effort to pick for a task (Opus 5.5 at medium by default, high only where a wrong answer is silent, Fable 5.2 to plan and design hard work while others read the code and Opus implements, Codex or a small model for gathering and read-only work), the name, model and effort every sub agent must state, how to write its prompt, and how to follow, answer and end it. Read before starting any agent.
+description: Starting and running other agents from ts (spawn / agents.spawn): which kind, model and effort to pick for a task (Fable 5.2 at medium by default, high only where a wrong answer is silent, Codex or a small model for gathering, read-only and mechanical work), the name, model and effort every sub agent must state, how to write its prompt, and how to follow, answer and end it. Read before starting any agent.
 ---
 # Starting agents
 
@@ -16,7 +16,7 @@ id. Two agents at once get names a person can tell apart.
 ```ts
 const a = await spawn('claude', {
   name: 'Comptime dyn calls',      // a plain title in words: the sidebar row and how to find it again
-  model: 'claude-opus-5-5',
+  model: 'claude-fable-5-2',
   effort: 'medium',
   cwd: '/path/to/its/worktree',
   prompt: '...',
@@ -28,32 +28,17 @@ await a.reply();                    // waits for its turn to end, returns its la
 
 | The task | Kind, model | Effort |
 |---|---|---|
-| General work: a change, a fix, a design, a review | claude, Opus 5.5 (`claude-opus-5-5`) | medium |
-| Complicated planning: a design across many crates or subsystems, a plan whose mistakes cost days | claude, Fable 5.2 (`claude-fable-5-2`), which plans and spawns the rest (below) | high |
-| A wrong answer would be silent: compiler semantics, const eval, unsafe code, allocators, concurrency, persisted or crash-recovering state | claude, Opus 5.5 | high |
+| General work: a change, a fix, a design, a plan, a review | claude, Fable 5.2 (`claude-fable-5-2`) | medium |
+| A wrong answer would be silent: compiler semantics, const eval, unsafe code, allocators, concurrency, persisted or crash-recovering state | claude, Fable 5.2 | high |
 | Gathering: find, read, list, summarize, collect facts or logs; read-only work | codex, its small fast model from the list; or claude, Haiku 5.5 / Sonnet 5.5 | low |
 | Simple and mechanical: rename across files, fix links, port a pattern where the target is spelled out | codex, or claude Sonnet 5.5 | low or medium |
 
 Pick by what a mistake costs, not by how big the task looks: a long mechanical port is low effort, a ten-line change
-to the const checker is high. Default to medium when unsure. Codex's models are the ones it lists (they are learned
-when a codex first starts, `$HARNESS_HOME/models.cbor`); name one from that list, never a guess. Until codex has
-listed its models the harness takes no effort for it, so give only the model.
-
-## Fable plans, others read and build
-
-Fable 5.2 is the strongest model and by far the most expensive per token, so it spends its tokens on decisions,
-never on reading. Use it to design and plan complicated work, and Opus 5.5 (as usual) to implement the plan.
-
-- **Fable never looks through code itself:** no reading files, searching, listing the tree or reading logs. It asks
-  other agents: a gathering agent (codex's small model, Haiku or Sonnet, low effort) to find and read what it needs
-  and answer in a short report of facts with paths and lines; an Opus agent to work out a question that takes
-  reading plus judgment. It asks follow-up questions of them rather than opening the files.
-- **It hands the building to Opus:** its output is the plan (the design, the steps, what each lane changes, what to
-  prove), and each lane goes to an Opus 5.5 agent with a whole prompt (below). Fable reads their reports, not their
-  diffs.
-- **Its prompt says so:** when you spawn Fable, say in its prompt that it must not read code itself and must gather
-  through other agents, and give it what you already know (the goal, the constraints, the reports gathered so far)
-  so it starts from facts.
+to the const checker is high. Default to Fable 5.2 at medium when unsure. Fable is the strongest model and the most
+expensive per token, so do not spend it on reading: hand gathering and mechanical work to a small model and give
+Fable the report. Codex's models are the ones it lists (they are learned when a codex first starts,
+`$HARNESS_HOME/models.cbor`); name one from that list, never a guess. Until codex has listed its models the harness
+takes no effort for it, so give only the model.
 
 ## The prompt
 

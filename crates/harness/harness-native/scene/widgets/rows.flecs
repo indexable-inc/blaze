@@ -6,7 +6,8 @@
 //
 // Calm one-line rows, no status dots, nothing that moves. How a row stands is in its title's ink (`look`: "on" while
 // selected, "rest" while live, "done" once it ended), its mark's ink (strong while it works, faint else: the host sets
-// it), and a few faint words trailing it (`meta`: what it is doing now), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
+// it), and a few faint words trailing it (`meta`: what it is doing now, how it ended). A failure is its mark in the error
+// ink, never red words (a run's trailing words still are: `alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
 using flecs.script
 
 @tree ChildOf
@@ -25,7 +26,6 @@ hn {
     prop look: string = "rest"
     prop under: string = ""
     prop mark: string = ""
-    prop alarm: bool = false
     prop meta: string = ""
     prop why: string = ""
     prop hint: string = ""
@@ -37,9 +37,9 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
-    // What it is at a glance: an agent's mark or a shell's terminal glyph, in ink only, tree_kind across before its
-    // title (src/app.rs sync_view sets it with look::kind_mark, outside the template's reactive inputs): the strong ink
-    // while it works, the faint ink else.
+    // A mark only when there is something to say, tree_kind across before its title (src/app.rs sync_view sets it,
+    // outside the template's reactive inputs): a dot in the strong ink while its agent works, the same dot in the error
+    // ink when it failed, nothing else; a shell its terminal glyph. Which agent it is ends the row's tooltip.
     kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}
@@ -79,11 +79,6 @@ hn {
     meta : hn.tree.Trail {
       Text: {s: $meta}
       Tooltip: {text: $why}
-      if $alarm {
-        Fill: $tone_error
-      } else {
-        Fill: $tone_ink_faint
-      }
       // Gone while hovered when the shortcut shows in its place.
       if $hint == "" {
         HoverShow: {row: 0, keep: true, away: false}

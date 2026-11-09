@@ -8,6 +8,8 @@
 // 2. Nothing moves on its own, and nothing eases. A hover, a highlight, a menu and a sheet are there at once and gone at
 //    once, so no two states ever show together. Work is said in words and a ticking time; the one motion left is the
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
+// The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
+//    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
 // 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
 //
@@ -150,6 +152,7 @@ export const tree_trail_max = 84
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
 // gutter (tree_mark across: a check in tone_success, a cross in tone_error).
 export const tree_guide_w = 1
+export const tree_guides = 6
 export const tree_mark = 11
 export const tone_guide: Fill = {dark: {0.122, 0.133, 0.153, 1}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tree_pad = 2
@@ -160,6 +163,10 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
+// ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
+// block_turn seconds.
+export const block_size = 24
+export const block_turn = 0.32
 // ui.Shimmer's default Sheen (prims.flecs; harness-video's captions use the primitive, the app's own views do not: rule
 // 2): a pass of sheen_think_period seconds, then sheen_think_rest at rest; the band sheen_think_band points either side
 // of its middle, lifting the letters sheen_think_strength of the way to tone_sheen; sheen_think_ease of an ease-in-out;
@@ -289,9 +296,9 @@ export const arch_time_w = 84
 export const tree_linger_s = 5
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
-// How long after it ended a top-level session from before the daemon started (a chat restored after a restart) stays in
-// the tree before the Archive files it (seconds; a week).
-export const archive_past_after_s = 604800
+// How long after it ended a top-level session (a chat that exited, was stopped or lost its daemon) stays in the tree
+// before the Archive files it on its own (seconds; an hour). A message to it in the Archive brings it back.
+export const archive_done_after_s = 3600
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
@@ -505,7 +512,7 @@ export const result_snippet_h = 36
 // a wide window.
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
-export const chat_fade_len = 28
+export const chat_fade_len = 12
 // A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
 // when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
 // chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what
@@ -679,7 +686,8 @@ export const chat_effort_gap = 1.5
 export const chat_effort_bar_radius = 1
 export const chat_effort_floor = 0.3
 // The picker's menu (hn.ChatPickMenu): chat_pick_menu_w wide whatever it holds, so a model's line about it wraps under
-// the list (chat_pick_detail_*: size, line, insets) instead of being cut; the effort's slider chat_pick_level_t under
+// the list (chat_pick_detail_*: size, line, insets; always chat_pick_detail_h tall, two lines, so the menu never
+// changes height as the highlight moves) instead of being cut; the effort's slider chat_pick_level_t under
 // the hairline and chat_pick_level_b over the plate's foot. A sideways two-finger swipe over the control (or the
 // slider) steps the effort a stop each chat_pick_swipe_step points the fingers travel (detents: momentum never steps
 // it), a pulse on the trackpad at each; the effort is sent chat_pick_commit_secs after the last step (one switch for a
@@ -701,6 +709,7 @@ export const size_chat_pick_detail = 11.5
 export const line_chat_pick_detail = 15
 export const chat_pick_detail_t = 3
 export const chat_pick_detail_b = 4
+export const chat_pick_detail_h = $chat_pick_detail_t + 2 * $line_chat_pick_detail + $chat_pick_detail_b
 export const chat_pick_level_t = 2
 export const chat_pick_level_b = 4
 export const chat_pick_swipe_step = 22
@@ -749,6 +758,9 @@ export const chat_line_inset = 22
 export const chat_nest = $chat_line_inset - $chat_line_pad
 // Between a line's words, its argument and its detail.
 export const chat_line_word_gap = 5
+// A folded line's marks (hn.StepTally): chat_tally_gap between a kind's glyph and its count, chat_tally_between kinds.
+export const chat_tally_gap = 3
+export const chat_tally_between = 10
 // A drawn view's code button's glyph.
 export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.

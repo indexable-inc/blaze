@@ -94,6 +94,10 @@ enum Do {
     Zoom(i32),
 }
 
+/// What cmd+N starts a chat of an agent kind on before the person ever chose for it (kind, model id, effort): Fable 5.2 at
+/// medium for Claude. Any other kind starts as its agent does by default.
+const FIRST_CHOICE: &[(&str, &str, &str)] = &[("claude", "claude-fable-5-2", "medium")];
+
 /// A model and effort remembered for an agent kind (cmd+N's).
 #[derive(Clone, Debug, Default)]
 struct Choice {
@@ -418,7 +422,7 @@ impl App {
         // (seconds).
         world.set(model::ArchiveAfter {
             ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
-            past_ms: (crate::look::width(w, "archive_past_after").max(0.0) as f64 * 1000.0) as u64,
+            done_ms: (crate::look::width(w, "archive_done_after").max(0.0) as f64 * 1000.0) as u64,
         });
         // How long a finished child keeps its row (and its done mark) under a folded node (seconds).
         world.set(model::Linger { ms: (crate::look::width(w, "tree_linger_for").max(0.0) * 1000.0) as u64 });
@@ -1046,7 +1050,6 @@ impl App {
                         &[
                             ("name", Prop::Str(&name)),
                             ("under", Prop::Str(&under)),
-                            ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
@@ -1056,11 +1059,23 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Its kind's mark before its title, in ink only, and the row's one sign of work: the strong ink while its
-                // agent works, the faint ink at rest or ended. Nothing moves.
+                // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
+                // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
+                // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
+                // (scene/widgets/chat_status.flecs), still here. Which agent it is ends the tooltip. A shell keeps its
+                // terminal glyph, since it opens a terminal and not a chat.
                 if let Some(i) = row.part("kind_icon") {
-                    crate::look::kind_mark(w, i.entity(), model::kind_name(o));
-                    let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
+                    let kind = model::kind_name(o);
+                    let agent = matches!(kind, "claude" | "codex" | "cursor");
+                    if agent {
+                        let dot = view::prefab(w, "hn.chat_status.running")
+                            .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
+                            .unwrap_or_else(|| panic!("the scene's hn.chat_status.running has no Icon (scene/widgets/chat_status.flecs)"));
+                        crate::look::show_glyph(i.entity(), if busy || failed { dot.glyph.as_str() } else { "" });
+                    } else {
+                        crate::look::kind_mark(w, i.entity(), kind);
+                    }
+                    let f = tone(w, if failed && agent { "error" } else if busy { "ink_strong" } else { "ink_faint" });
                     if i.entity().try_cloned::<&Fill>() != Some(f) {
                         i.entity().set(f);
                     }
@@ -1667,12 +1682,16 @@ impl App {
         self.choices.insert(kind.to_owned(), c);
     }
 
-    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`).
+    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`); for a kind never chosen for,
+    /// its [`FIRST_CHOICE`] when it has one.
     fn choice_of(&self, kind: &str) -> Choice {
         self.choices.get(kind).cloned().unwrap_or_else(|| {
-            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned()).unwrap_or_default();
-            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
-            Choice { model: s("model"), effort: s("effort") }
+            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned());
+            let s = |k: &str| v.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_str()).map(str::to_owned);
+            match (v.is_some(), FIRST_CHOICE.iter().find(|(k, ..)| *k == kind)) {
+                (false, Some(&(_, model, effort))) => Choice { model: Some(model.to_owned()), effort: Some(effort.to_owned()) },
+                _ => Choice { model: s("model"), effort: s("effort") },
+            }
         })
     }
 
@@ -1850,6 +1869,10 @@ impl App {
         // Words streaming in fade in glyph by glyph (GlyphsArrive): draw until the last has.
         if self.paint.get_mut().arriving {
             self.poke_why("glyphs arriving");
+        }
+        // A block turning to a new face (harness-native-render block.rs): draw until it has.
+        if self.paint.get_mut().turning {
+            self.poke_why("block turning");
         }
         // A caret that jumped sweeps into its place (harness-native-render caret.rs): draw until it has.
         if self.paint.get_mut().gliding {
@@ -2417,7 +2440,8 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
 }
 
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
-/// detail its row trails (the command, the file, the pattern, the page).
+/// detail its row trails (the command, the file, the pattern, the page): only what names a thing. A state alone
+/// (thinking, writing) trails nothing, since the row's dot already says it is at work.
 struct Doing {
     what: &'static str,
     detail: String,
@@ -2445,13 +2469,13 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     // A message still queued is not what it is on.
     let last = (0..t.items.len()).rev().find(|&k| !t.is_queued(k)).map(|k| &t.items[k])?;
     Some(match last {
-        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: String::new() },
         // A harness REPL cell: what its running step does ("blaze check", "Reading chat.rs"), never the tool's name.
         Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
             match t.details[block].effects.iter().rev().find(|e| e.status == "running") {
                 Some(e) if e.kind == "exec" => Doing { what: "Running a command", detail: chat::step_words(e) },
                 Some(e) => Doing { what: "Working", detail: chat::step_words(e) },
-                None => Doing { what: "Running code", detail: "running code".to_owned() },
+                None => Doing { what: "Running code", detail: String::new() },
             }
         }
         Item::Tool { name, input, result: None, .. } => {
@@ -2474,8 +2498,8 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
                 Doing { what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }
         }
-        Item::Text { done: false, .. } => Doing { what: "Writing", detail: "writing".to_owned() },
-        _ => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Text { done: false, .. } => Doing { what: "Writing", detail: String::new() },
+        _ => Doing { what: "Thinking", detail: String::new() },
     })
 }
 

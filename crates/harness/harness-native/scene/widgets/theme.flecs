@@ -71,9 +71,9 @@ hn {
     tree_linger_for {
       Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
-    // The same for a top-level session from before the daemon started.
-    archive_past_after {
-      Size: {w: {kind: Fixed, value: $archive_past_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    // The same for a finished top-level session.
+    archive_done_after {
+      Size: {w: {kind: Fixed, value: $archive_done_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     // A tree level's indent, and a failure badge's padding while it shows.
     indent {

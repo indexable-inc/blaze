@@ -559,6 +559,14 @@ ui {
   prefab MenuItemOn : ui.MenuItem {
     mark : ui.Check { Fill: $tone_ink_strong }
   }
+  // An item that is not a choice but more of the list (a fold's "4 older"): its label quiet, at the meta's size, in
+  // line with the labels over it.
+  prefab MenuItemQuiet : ui.MenuItem {
+    label {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
   // A section's head: small, muted, in line with the items' labels.
   prefab MenuHead : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
@@ -619,6 +627,13 @@ ui {
   // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
+  }
+  // A small block of pixel art, a game's item icon (PixelBlock, harness-native-render block.rs): its face names what it
+  // shows (`exec`, `read`, `edit`, `net`, `think`, ...); set another and it turns a quarter to it over block_turn
+  // seconds, then is still. block_size across, its texels on whole device pixels.
+  prefab Block : ui.Node {
+    PixelBlock: {face: "cell", turn: $block_turn}
+    Size: {w: {kind: Fixed, value: $block_size, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
   }
   // Words with light running through them, the sign that something is at work (a working row's title): a Sheen
   // (harness-native-ui-look-api; drawn by harness-native-render paint.rs, glyph by glyph) sweeps a soft band left to right

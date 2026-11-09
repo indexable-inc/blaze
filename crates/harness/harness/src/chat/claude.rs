@@ -372,7 +372,7 @@ fn models(a: &Value) -> Vec<ModelChoice> {
 /// a model released after the installed Claude Code, which `set_model` and `--model` take by its full id all the same.
 /// Once Claude Code lists one itself, its own entry is the one kept; drop it from here then.
 const OFFERED: &[(&str, &str, &str)] =
-    &[("claude-fable-5-2", "Fable 5.2", "For the hardest planning and design; the most capable and the most expensive")];
+    &[("claude-fable-5-2", "Fable 5.2", "The most capable; the default")];
 
 /// The context window a turn's `result` says its model has (den-claude's reading): `modelUsage[model].contextWindow`,
 /// else the widest window it names; 0 when it names none. What the turn filled is its last main-loop assistant message's

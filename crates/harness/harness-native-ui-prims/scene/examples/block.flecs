@@ -1,0 +1,28 @@
+// ui.Block: a pixel-art block a face (PixelBlock, harness-native-render block.rs), one of every face a step can show.
+
+@tree ChildOf
+ex {
+  prefab BlockDemo : ex.Card {
+    label : ui.Label { Text: {s: "BLOCK, A STEP'S FACE IN PIXEL ART"} }
+    row : ui.Row {
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: true}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      think : ui.Block { PixelBlock: {face: "think", turn: $block_turn} }
+      exec : ui.Block { PixelBlock: {face: "exec", turn: $block_turn} }
+      read : ui.Block { PixelBlock: {face: "read", turn: $block_turn} }
+      edit : ui.Block { PixelBlock: {face: "edit", turn: $block_turn} }
+      write : ui.Block { PixelBlock: {face: "write", turn: $block_turn} }
+      delete : ui.Block { PixelBlock: {face: "delete", turn: $block_turn} }
+      search : ui.Block { PixelBlock: {face: "search", turn: $block_turn} }
+      list : ui.Block { PixelBlock: {face: "list", turn: $block_turn} }
+      build : ui.Block { PixelBlock: {face: "build", turn: $block_turn} }
+      net : ui.Block { PixelBlock: {face: "net", turn: $block_turn} }
+      sql : ui.Block { PixelBlock: {face: "sql", turn: $block_turn} }
+      spawn : ui.Block { PixelBlock: {face: "spawn", turn: $block_turn} }
+      skill : ui.Block { PixelBlock: {face: "skill", turn: $block_turn} }
+      wait : ui.Block { PixelBlock: {face: "wait", turn: $block_turn} }
+      cell : ui.Block { PixelBlock: {face: "cell", turn: $block_turn} }
+      tool : ui.Block { PixelBlock: {face: "tool", turn: $block_turn} }
+    }
+  }
+}

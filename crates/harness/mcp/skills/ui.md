@@ -26,7 +26,8 @@ A report is progressive: the verdict on one line, each part (what changed, risks
 ```
 
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
-records; query, onselect), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
+records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
+draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
 Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut" data={[...]} or series={[{name, data}]} labels={[...]}
 unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand.
