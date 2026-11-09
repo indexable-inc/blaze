@@ -53,6 +53,7 @@ pub mod handle;
 pub mod huge;
 mod os;
 pub mod pool;
+pub mod racy;
 pub mod region;
 pub mod region_vec;
 pub mod revision;
