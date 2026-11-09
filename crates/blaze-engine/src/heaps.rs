@@ -208,7 +208,7 @@ fn theap_for(tag: Tag, slot: &Cell<*mut mi_theap_t>) -> *mut mi_theap_t {
 
 /// Allocates `size` bytes aligned to `align` in `tag`'s heap from this thread's theap of it.
 /// Not inlined, as blaze-graph's `with_local` is not: a job may wait on one thread and resume
-/// on another, so each allocation reads the thread-local afresh (rule 24).
+/// on another, so each allocation reads the thread-local afresh (rule 27).
 #[inline(never)]
 fn alloc_in(tag: Tag, size: usize, align: usize, zeroed: bool) -> *mut u8 {
     settle();

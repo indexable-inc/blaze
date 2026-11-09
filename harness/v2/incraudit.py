@@ -61,9 +61,9 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     command   "check" or "build"
     args      more arguments of every build (a workspace target gets `-p` for each of its crates too)
     edits     the edits to run by name (`1-comment`, ..., `9-generic-body`); empty: all
-    tree      what the blaze under test was built from, a content digest, kept as given (rule 19)
+    tree      what the blaze under test was built from, a content digest, kept as given (rule 22)
     work      the directory everything goes in; "": a new one under /tmp
-    keep      keep the work directory (true: the exact tree measured stays, rule 19)
+    keep      keep the work directory (true: the exact tree measured stays, rule 22)
     step_s    the bound of each command, in seconds (1800)
     history_s the bound on waiting for a build's history rows to be flushed, in seconds (60)
 """

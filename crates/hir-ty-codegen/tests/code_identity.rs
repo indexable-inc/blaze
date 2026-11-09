@@ -8,7 +8,7 @@ use std::path::Path;
 /// rustc read building the code generator's crates, as their dep-info (`<crate>-<hash>.d` beside
 /// this test) says, and every one their build scripts say they read
 /// (`blaze_codegen_code::coverage::hold`). Anything else would be an input missing from every
-/// template's key (AGENTS.md rule 18), and is named here.
+/// template's key (AGENTS.md rule 21), and is named here.
 #[test]
 fn the_code_identity_hashes_every_input_the_code_generator_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -1,4 +1,4 @@
-//! Owned text in an allocator the caller names (AGENTS.md rule 9, bump-allocate): [`String`],
+//! Owned text in an allocator the caller names (AGENTS.md rule 11, bump-allocate): [`String`],
 //! and on unix [`OsString`] and [`PathBuf`], each over a `Vec<u8, A>`, so a task's text lives
 //! in its [`Frame`](crate::Frame) (`String<&Frame>`) or its request's
 //! [`ArenaLocal`](crate::ArenaLocal) rather than on the global heap. std's `String`,

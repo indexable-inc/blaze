@@ -18,7 +18,7 @@
 //!   about to take, making it [`SlotError::Busy`]); one whose filler ended without filling it is
 //!   [`SlotError::Abandoned`]; one by the task that holds its claim is
 //!   [`SlotError::ReadByItsFiller`]. Each names the slot: never a wait with no one to end it
-//!   (rule 15), never a default.
+//!   (rule 18), never a default.
 //! - A claim given back for its filler to run again ([`SlotClaim::give_back`]: the filler's
 //!   wait gave way and its loop will run it again, after the loop or, sooner, in another task
 //!   that claims it anew) makes its readers give way too, as a wait that would close that
@@ -26,7 +26,7 @@
 //!   gives its claim back; any other unwind drops it ([`SlotError::Abandoned`]).
 //! - A maintainer whose pass failed marks every slot it left unfilled abandoned
 //!   ([`Slot::abandon`]), so a reader reads [`SlotError::Abandoned`] at once, never gives way
-//!   for a rerun that will not come (rule 15).
+//!   for a rerun that will not come (rule 18).
 
 use std::{
     cell::UnsafeCell,
@@ -70,7 +70,7 @@ pub enum Filled {
     Again,
 }
 
-/// A second fill of a slot with a value other than the one it holds (rule 18): two different
+/// A second fill of a slot with a value other than the one it holds (rule 21): two different
 /// values under one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotRefused {

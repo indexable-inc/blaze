@@ -6,7 +6,7 @@
 //! reads a clock or the file system.
 //!
 //! Pressure is in permille (0 to 1000), an integer, so the same inputs always give the same
-//! slices (rule 22).
+//! slices (rule 25).
 
 use blaze_serde::{Deserialize, Serialize};
 

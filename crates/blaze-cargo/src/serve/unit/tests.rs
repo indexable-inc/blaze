@@ -1685,7 +1685,7 @@ fn main() { let _ = option_env!(\"CARGO_PRIMARY_PACKAGE\"); }\n";
 /// `CARGO_PRIMARY_PACKAGE` is of the request, not of the unit: `--workspace` makes every member
 /// primary and `-p one` only `one`, so keying every unit by it recompiled every dependency of
 /// `one` after a workspace build (sb3slow, the self-build's link step). A record is keyed by it
-/// only when a crate of its closure read it (rule 18, both ways): a script that never read it
+/// only when a crate of its closure read it (rule 21, both ways): a script that never read it
 /// has one base key and one record whether or not its package is primary; one that read it
 /// has the same base key, but is filed by it, and misses once its package's primary-ness moves.
 #[test]
@@ -2339,7 +2339,7 @@ fn a_reached_only_crate_that_seals_keeps_its_relaxed_impl_in_its_sealed_graph() 
     );
 }
 
-/// Rule 18 for what makes a record: the front end's, the code generator's and the record's code
+/// Rule 21 for what makes a record: the front end's, the code generator's and the record's code
 /// identities ([`crate::serve::RecordMakers`]) are each in a unit's record key, so a record made
 /// by other code of any one of them is never found, and one made by the same code is.
 #[test]
@@ -2385,7 +2385,7 @@ fn each_maker_of_a_record_moves_its_key() {
     }
 }
 
-/// Rule 18 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
+/// Rule 21 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
 /// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
 /// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
 /// refused. The key moves through the unit's identity, which hashes each dependency's identity
@@ -2471,7 +2471,7 @@ fn root_values(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> Vec<Str
 /// A dependency read from its image whose build script's output moves while its front end is
 /// kept (a variable only the script reads, such as `CC`, changed: the front end is kept, the
 /// script runs again and gives another cfg) is served again under its new key, so it resolves
-/// with the cfg its run gives now, never as its image of the old cfg has it (rule 18). Without
+/// with the cfg its run gives now, never as its image of the old cfg has it (rule 21). Without
 /// the serve after the run is applied, what a kept job did before, the old cfg's def map is
 /// what every dependent resolves against. The new cfg's image is then written, and a run giving
 /// either cfg again finds its image.
@@ -2621,7 +2621,7 @@ fn d_generated(generated: &str) -> blaze_lower::Ran {
 
 /// A dependency read from its image whose build script runs again with the same cfg and
 /// variables and changes only a file in `OUT_DIR` that the crate `include!`s is served again
-/// under a new key, never left on its image of the old file (rule 18): a run's files are put
+/// under a new key, never left on its image of the old file (rule 21): a run's files are put
 /// in its package's source root (`blaze_lower`'s `apply_run`), each of whose files' text the
 /// key covers (`hir_def::deps::key`'s `files`), so the file is in the key, not only checked
 /// when the image is fetched.

@@ -801,7 +801,7 @@ const ALIAS_DEPTH: u32 = 3000;
 const BUILT_DEPTH: u32 = 100_000;
 
 /// A type nested `ALIAS_DEPTH` deep with an associated type at the bottom normalizes (review 7,
-/// C4, rule 17): every fold `deeply_normalize` runs goes down through all the levels to reach the
+/// C4, rule 20): every fold `deeply_normalize` runs goes down through all the levels to reach the
 /// alias (`set_aliases_to_non_rigid`'s `RigidnessFolder`, the `NormalizationFolder`, the
 /// resolver), each with one stack guard per level; the first and the last are also run on
 /// their own, as `deeply_normalize`'s input has no rigid alias and no variable. Without the
@@ -873,7 +873,7 @@ fn a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth() {
 const BODY_DEPTH: u32 = if cfg!(debug_assertions) { 500 } else { 2000 };
 const BODY_STEP: u32 = 50;
 
-/// A body whose types nest `BODY_DEPTH` deep has an identity (review 8, rule 17): `caller`'s
+/// A body whose types nest `BODY_DEPTH` deep has an identity (review 8, rule 20): `caller`'s
 /// locals are `Option<..<T::A>..>` up to `BODY_DEPTH` deep, `BODY_STEP` levels more per
 /// statement, so no type is written deeper than `BODY_STEP` and the front end never nests far.
 /// Its MIR checks each local for `Copy` (the solver canonicalizes the type and instantiates the
@@ -914,7 +914,7 @@ fn a_body_naming_a_deep_type_has_an_identity() {
 /// A callee whose identity can't be made for a reason that is no kind of per-instance code (an
 /// intrinsic missing from the table) fails its caller with that reason, never a key of its
 /// arguments; the caller's error names the callee it went through and the body that calls the
-/// intrinsic (rule 16), and says that `above` calls `uses`, never that it calls the intrinsic.
+/// intrinsic (rule 19), and says that `above` calls `uses`, never that it calls the intrinsic.
 #[test]
 fn a_callee_without_an_identity_fails_its_caller() {
     let db = crate_of(
@@ -1365,7 +1365,7 @@ fn identities_made<T>(ask: impl FnOnce() -> T) -> (T, u64) {
 /// `a::<<N::Out as Inc>::Out>`) counts at a fixed depth: from a number of 40 digits it would
 /// take 2^40 steps to grow a digit. Each callee is a projection's value, no sub-list of its
 /// caller's arguments, so it is named by them and the identity is made from one key, with no
-/// growth to wait for (rule 15). `NEAR` (three low zeros under 124 ones, 128 deep) is asked
+/// growth to wait for (rule 18). `NEAR` (three low zeros under 124 ones, 128 deep) is asked
 /// first: without the rule it counts 8 steps and then grows past `SHARED_DEPTH`, so this fails
 /// on the count rather than hanging on `N0`.
 #[test]
@@ -1513,7 +1513,7 @@ fn listed(f: impl Fn(usize) -> String) -> String {
     (1..=PERMUTED.len()).map(f).collect::<Vec<_>>().join(", ")
 }
 
-/// Callees that differ only in their lifetimes are one key (C1 of review 6, rules 15 and 4).
+/// Callees that differ only in their lifetimes are one key (C1 of review 6, rules 18 and 4).
 /// `b` calls `c` with its 8 lifetimes put through π, and `c` calls `b` back, from `'static`
 /// seeded at the head of each cycle. Each lifetime is early-bound by its where-clause (`'l1:
 /// 'l1`; an unused lifetime is late-bound, in rustc too, and takes no explicit argument): the keys `b[x]`, `c[πx]`, `b[πx]`, … would be
@@ -1582,7 +1582,7 @@ fn a_permutation_of_the_caller_s_distinct_arguments_is_not_passed_on() {
 }
 
 /// Const eval's id of a vtable names its type and the `dyn` it is for, as rustc's
-/// `GlobalAlloc::VTable` does (rule 18): `One::V` and `Two::V` have one type and equal bytes, each
+/// `GlobalAlloc::VTable` does (rule 21): `One::V` and `Two::V` have one type and equal bytes, each
 /// the vtable of `u32` for another trait, and are two values to the code generator (one vtable's
 /// slot runs `T1::a`, the other's `T2::b`), so `v::<One>` and `v::<Two>` share no compile
 /// identity (`Again::V` is `One::V` again, and shares), and a body reading one has another code

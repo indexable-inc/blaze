@@ -2828,7 +2828,7 @@ pub(crate) fn ty_query<'db>(db: &'db Db, def: TyDefId) -> EarlyBinder<'db, Ty<'d
         ),
         // An alias of an alias is a query inside a query, one per level of a chain the
         // program writes (`type D130 = Option<D129>`), as deep as it likes: an overflow aborts
-        // the process, so each level makes sure of its stack (rule 17).
+        // the process, so each level makes sure of its stack (rule 20).
         TyDefId::TypeAliasId(it) => stdx::ensure_sufficient_stack(|| {
             db.type_for_type_alias_with_diagnostics(it).value.value.get()
         }),

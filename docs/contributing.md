@@ -427,7 +427,7 @@ the library hashes to the id in its header, and that this id is the pinned one:
 
   The libraries themselves are committed in `crates/blaze-stencil/prebuilt/` (about 570 KB
   each), and the build also stops when what it made differs from them. If nothing the
-  generator reads changed, the output isn't deterministic, which is a bug (rule 22).
+  generator reads changed, the output isn't deterministic, which is a bug (rule 25).
 - The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
   includes the committed libraries in `crates/blaze-stencil/prebuilt/`; no variable points
   elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the

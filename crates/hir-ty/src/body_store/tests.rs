@@ -778,7 +778,7 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
     }));
 }
 
-/// Rule 18, the solver's code: an item kept by the solver before an edit of its source (each
+/// Rule 21, the solver's code: an item kept by the solver before an edit of its source (each
 /// front-end identity as blaze-engine's build script works it out and its main hands it over,
 /// `blaze_codegen_code::FRONT_END`) misses in the item store of the solver after it, and is found
 /// again by the one that kept it.

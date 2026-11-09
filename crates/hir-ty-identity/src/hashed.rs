@@ -1,7 +1,7 @@
 //! What code identity hashes of one constant's or static's value, edge by edge: each vtable as
 //! its concrete type and `dyn`, and each function or closure a pointer in it runs. Test support
 //! for hir-ty-codegen's check that every vtable and function its relocation of the value emits
-//! is among these (rule 18), so the two walks of a value can't drift apart unseen. Not an
+//! is among these (rule 21), so the two walks of a value can't drift apart unseen. Not an
 //! interface: nothing but that test reads it.
 
 use base_db::Db;

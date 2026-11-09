@@ -94,7 +94,7 @@ impl<'f, 'db> Freeze<'f, 'db> {
     /// coinduction). A type's answer that read a type outside it still being walked depends on
     /// that one's guess, so it is not kept; its walk's outermost such type keeps its own.
     /// One level per level of `ty`, as deep as the program built it, each with stack to spare
-    /// (rule 17).
+    /// (rule 20).
     fn walk(&mut self, infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> (bool, u32) {
         match self.known.get(&ty) {
             Some(&Walked::Known(freeze)) => return (freeze, NO_CYCLE),
@@ -189,7 +189,7 @@ pub fn has_drop_glue_in<'db>(
 }
 
 /// One level per level of `ty`, as deep as the program built it, each with stack to spare
-/// (rule 17).
+/// (rule 20).
 fn has_drop_glue_impl<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,
