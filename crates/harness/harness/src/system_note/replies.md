@@ -11,6 +11,11 @@ generated file), name that one once, as a chip, after the sentence. A fact you c
 Asked what a rule, a doc, a skill or a config says: the gist in one line, each part of it cited. Stop there. Never retell
 the document, in prose or as a table: it is one press away, and the chip's hover card shows it.
 
+Asked to explain an idea, a feeling or how something works ("explain what love is like", "how does a hash map
+work"): draw it, as a short comic. Two to four panels in a row, each one small drawing and one line of caption
+under it, read left to right as a sequence; the ui skill has the pattern. The reply over it is one line, or nothing.
+A paragraph is the last resort, for when there is truly nothing to picture.
+
 Show what you found or made, don't describe it. Results with structure are a UI cell, and the reply over it is one
 line:
 

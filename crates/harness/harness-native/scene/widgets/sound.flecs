@@ -13,9 +13,23 @@ hn {
     Gain: {amp: 1}
     // A3.
     key { Pitch: {hz: 220} }
-    // Rain (src/music.rs Rain): what plays when nothing else does, and quieter under the music, so the app is never
-    // silent. Its Gain is its level under the master.
-    ambient { Gain: {amp: 0.05} }
+    // Rain (src/music.rs Rain): what plays when nothing else does, and far quieter under the music, so the app is never
+    // silent. You sit in a small wooden room; each child is a place the rain falls, heard from there by ear (on
+    // headphones it comes from that side: the far ear later, quieter and duller). A RainOn says where (degrees round
+    // from ahead, positive to the right; degrees up; metres) and what rain sounds like on it: a steady wash (`hiss`,
+    // between `low` and `high` Hz) and single drops (`rate` a second, each ringing between `low` and `high`, dying at
+    // `ring`, its pitch bending by `bend`). `ambient`'s Gain is the rain's level under the master.
+    ambient {
+      Gain: {amp: 0.05}
+      // The roof, overhead: a dull, dense patter on wood.
+      roof { RainOn: {azimuth: 0, elevation: 80, distance: 2.5, hiss: 0.35, rate: 45, low: 160, high: 480, ring: 48, bend: 0}; Gain: {amp: 1} }
+      // A window at your left: fewer, sharper taps on glass.
+      window { RainOn: {azimuth: -75, elevation: 5, distance: 1.4, hiss: 0.1, rate: 9, low: 2400, high: 5200, ring: 95, bend: 0}; Gain: {amp: 0.6} }
+      // The gutter's drip into a stone basin, behind your right shoulder: slow, each one rising.
+      basin { RainOn: {azimuth: 120, elevation: -25, distance: 3, hiss: 0, rate: 1.4, low: 620, high: 1100, ring: 20, bend: 0.35}; Gain: {amp: 0.7} }
+      // The garden through the open door ahead and a little right: the open rain, far, all wash.
+      garden { RainOn: {azimuth: 25, elevation: 0, distance: 9, hiss: 1, rate: 0, low: 500, high: 6500, ring: 1, bend: 0}; Gain: {amp: 2.2} }
+    }
 
     cue {
       // A command: two dry ticks, a prompt and its cursor.
