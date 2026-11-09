@@ -193,7 +193,14 @@ hn {
     TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
   }
 
-  // A description's first lines (a pull request's, a page's), in the body ink.
+  // A description in markdown (a pull request's): its blocks as the transcript's own rows (src/app/chat.rs blocks and
+  // fill_row), so a list reads as a list, code as code, a heading as a heading, as they would in the chat.
+  prefab PeekMarkdown : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A description's first lines (a page's), in the body ink.
   prefab PeekBody : ui.Words, Ink {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     TextStyle: {size: $size_peek_body, line: $line_peek_body, role: 0, bold: 0}
