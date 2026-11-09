@@ -5680,6 +5680,14 @@ fn const_eval_failure<'db>(
             // alloc: error path, a reported diagnostic's message
             "encountered dangling pointer in final value of constant".to_owned(),
         ),
+        MirEvalError::Comptime(it) => {
+            span = span.or_else(|| at_own(&it.at));
+            ConstEvalFailure::Failed(hir_ty_mir::mir_pretty::comptime_error_text(
+                db,
+                it,
+                display_target,
+            ))
+        }
         MirEvalError::ConstEvalError(name, inner) => {
             let (failure, inner_span) = const_eval_failure(db, own, inner, display_target)?;
             span = span.or(inner_span);
