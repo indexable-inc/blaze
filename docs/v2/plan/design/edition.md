@@ -68,7 +68,16 @@ it.
   same set is the same type in every crate.
 - `Err(e: io::Error) =>` matches by member. `?` converts when the source set is a subset of the
   target's; otherwise the error names the member that is missing.
-- A union implements a trait when every member does (`Error`, `Debug`, `Display`).
+- **Unions are not only for errors.** `type AnySpec = OsSpec | VmSpec | WasmSpec;` is the closed
+  family "one of these", with no wrapper enum to declare and no `From` impls to keep in step.
+- **A union implements a trait when every member does, by delegation**: calling a method calls
+  the held member's. An associated type of the union is the union of the members' (`Spec::Sandbox`
+  of `AnySpec` is `OsSandbox | Vm | WasmSandbox`), so one call maps a family onto another. A
+  trait whose methods take a second `Self` by value or reference (`PartialEq`, `Add`) is not
+  delegated, since the two values might hold different members; `Debug`, `Display`, `Error`,
+  `Clone` and `Hash` are.
+- **One arm can handle every member**: `match x { each v => f(v) }` checks `f(v)` once per
+  member type and is the delegation rule written by hand, for when no trait fits.
 
 **3. View types.**
 - `&self.{a, b}` and `&mut self.{a}` borrow only those fields; two calls whose views are disjoint
